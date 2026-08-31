@@ -7479,6 +7479,27 @@
         "title": "UpdateDefaultPolicyRequest",
         "type": "object"
       },
+      "UpdateHostRequest": {
+        "description": "Mutable user preference fields for a registered host.",
+        "properties": {
+          "default_workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Workspace"
+          }
+        },
+        "required": [
+          "default_workspace"
+        ],
+        "title": "UpdateHostRequest",
+        "type": "object"
+      },
       "UpdateProjectRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/projects/{project_id}`.\n\nAll fields optional; `None` leaves a field unchanged.",
@@ -8411,6 +8432,59 @@
         "tags": [
           "hosts"
         ]
+      },
+      "patch": {
+        "description": "Set or clear user-owned preferences for one physical host.",
+        "operationId": "update_host_v1_hosts__host_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Host V1 Hosts  Host Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Host",
+        "tags": [
+          "hosts"
+        ]
       }
     },
     "/v1/hosts/{host_id}/credentials/detected": {
@@ -8528,6 +8602,32 @@
             "schema": {
               "title": "Host Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          },
+          {
+            "in": "query",
+            "name": "roots",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Roots",
+              "type": "boolean"
             }
           },
           {

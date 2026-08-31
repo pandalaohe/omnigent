@@ -50,6 +50,17 @@ def _is_windows_absolute_path(path: str) -> bool:
     return bool(_WINDOWS_ABS_PATH_RE.match(path) or _WINDOWS_UNC_PATH_RE.match(path))
 
 
+def restore_host_filesystem_url_path(path: str) -> str:
+    """Restore the leading slash stripped from POSIX path captures.
+
+    Drive-letter, UNC, and tilde-prefixed paths are already complete and
+    must pass through unchanged.
+    """
+    if path.startswith(("~", "//")) or _is_windows_absolute_path(path):
+        return path
+    return path if path.startswith("/") else "/" + path
+
+
 # How long to wait for a host.stat round-trip before giving up. Stat
 # is a single syscall on the host side and a single WS round trip;
 # 5 s is generous for transient network slowness without making

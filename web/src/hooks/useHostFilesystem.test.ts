@@ -72,12 +72,12 @@ describe("buildHostFilesystemUrl", () => {
     );
   });
 
-  it("encodes a Windows drive path without prefixing a slash", () => {
+  it("encodes Windows drive paths as exact query values", () => {
     expect(buildHostFilesystemUrl("host_abc", "C:\\Users\\alice\\work")).toBe(
-      "/v1/hosts/host_abc/filesystem/C%3A/Users/alice/work",
+      "/v1/hosts/host_abc/filesystem?path=C%3A%5CUsers%5Calice%5Cwork",
     );
     expect(buildHostFilesystemUrl("host_abc", "C:/Users/alice/work")).toBe(
-      "/v1/hosts/host_abc/filesystem/C%3A/Users/alice/work",
+      "/v1/hosts/host_abc/filesystem?path=C%3A%2FUsers%2Falice%2Fwork",
     );
   });
 });

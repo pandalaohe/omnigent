@@ -2212,8 +2212,8 @@ class HostProcess:
         if frame.path == "":
             if os.name == "nt":
                 list_drives = getattr(os, "listdrives", None)
-                drives = (
-                    list_drives()
+                drives: list[str] = (
+                    cast(list[str], list_drives())
                     if callable(list_drives)
                     else [
                         f"{letter}:\\"
