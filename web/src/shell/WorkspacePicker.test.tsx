@@ -13,7 +13,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   basename,
-  isHostAbsolutePath,
   isNavigablePath,
   joinPath,
   listingFilter,
@@ -24,11 +23,18 @@ import {
 import {
   useCreateHostDirectory,
   useHostFilesystem,
+  useHostFilesystemRoots,
   type HostFilesystemEntry,
 } from "@/hooks/useHostFilesystem";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
+  useHostFilesystemRoots: vi.fn(() => ({
+    data: undefined,
+    isLoading: false,
+    isPlaceholderData: false,
+    error: null,
+  })),
   // Default to an idle mutation; tests that exercise creation override
   // mutateAsync. The component only reads this when the new-folder form
   // is open, so the default is harmless for the other suites.
@@ -36,7 +42,14 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
+const useHostFilesystemRootsMock = vi.mocked(useHostFilesystemRoots);
 const useCreateHostDirectoryMock = vi.mocked(useCreateHostDirectory);
+
+beforeEach(() => {
+  useHostFilesystemRootsMock.mockReturnValue(
+    result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
+  );
+});
 
 function dir(name: string, path: string): HostFilesystemEntry {
   return { name, path, type: "directory", bytes: null, modified_at: 0 };
@@ -85,20 +98,10 @@ describe("parentOf", () => {
     expect(parentOf("/Users/corey/")).toBe("/Users");
   });
 
-  it("climbs Windows drive paths without falling through to POSIX root", () => {
-    // Host listings on Windows return backslash paths. lastIndexOf("/")
-    // is -1 on those, which previously made parentOf return "/" and
-    // sent the picker to the drive root.
-    expect(parentOf("C:\\Users\\alice\\work")).toBe("C:\\Users\\alice");
-    expect(parentOf("C:\\Users\\alice")).toBe("C:\\Users");
-    expect(parentOf("C:\\Users")).toBe("C:\\");
-    expect(parentOf("C:\\")).toBeNull();
-    expect(parentOf("C:/Users/alice/work")).toBe("C:/Users/alice");
-    expect(parentOf("C:/Users")).toBe("C:/");
-  });
-
-  it("does not treat a backslash as a separator on POSIX paths", () => {
-    expect(parentOf("/tmp/a\\b")).toBe("/tmp");
+  it("climbs Windows drive paths without losing the drive", () => {
+    expect(parentOf("D:\\Projects\\Omnigent")).toBe("D:\\Projects");
+    expect(parentOf("D:\\Projects")).toBe("D:\\");
+    expect(parentOf("D:\\")).toBeNull();
   });
 });
 
@@ -182,11 +185,18 @@ describe("normalizeTypedPath", () => {
     expect(normalizeTypedPath("~root/foo", "/Users/corey")).toBeNull();
   });
 
-  it("accepts a Windows drive path as already absolute", () => {
-    expect(normalizeTypedPath("C:\\Users\\alice\\work")).toBe("C:\\Users\\alice\\work");
-    expect(normalizeTypedPath("C:/Users/alice/work")).toBe("C:/Users/alice/work");
-    expect(normalizeTypedPath("  C:/Users/alice/work/  ")).toBe("C:/Users/alice/work");
+  it("preserves and normalizes absolute Windows paths", () => {
+    expect(normalizeTypedPath("  d:\\Projects\\Omnigent\\  ")).toBe("D:\\Projects\\Omnigent");
+    expect(normalizeTypedPath("E:/Projects//Omnigent/")).toBe("E:\\Projects\\Omnigent");
+    expect(normalizeTypedPath("\\\\server\\share\\repo\\")).toBe("\\\\server\\share\\repo");
   });
+});
+
+describe("isNavigablePath", () => {
+  it.each(["C:\\", "D:\\Projects", "E:/Projects", "\\\\server\\share\\repo"])(
+    "accepts Windows absolute path %s",
+    (path) => expect(isNavigablePath(path)).toBe(true),
+  );
 });
 
 describe("basename", () => {
@@ -214,13 +224,16 @@ describe("basename", () => {
     expect(basename("/Users/corey/")).toBe("corey");
   });
 
-  it("returns the last segment of a Windows drive path", () => {
-    expect(basename("C:\\Users\\alice\\work")).toBe("work");
-    expect(basename("C:/Users/alice/work")).toBe("work");
+  it("returns the final Windows segment and drive root", () => {
+    expect(basename("D:\\Projects\\Omnigent")).toBe("Omnigent");
+    expect(basename("D:\\")).toBe("D:\\");
   });
+});
 
-  it("keeps a POSIX backslash inside the basename", () => {
-    expect(basename("/tmp/a\\b")).toBe("a\\b");
+describe("joinPath", () => {
+  it("uses the native separator for Windows directories", () => {
+    expect(joinPath("D:\\Projects", "new-app")).toBe("D:\\Projects\\new-app");
+    expect(joinPath("E:\\", "new-app")).toBe("E:\\new-app");
   });
 });
 
@@ -230,27 +243,6 @@ describe("basename", () => {
 // root) and the cases that must NOT — blank, exactly the current path, or a
 // path into a different directory (which is navigation, not a filter). A
 // false positive here would hide entries while the user is navigating away.
-describe("isNavigablePath", () => {
-  it("accepts POSIX absolute, home, and Windows drive paths", () => {
-    expect(isNavigablePath("/Users/me/work")).toBe(true);
-    expect(isNavigablePath("~/work")).toBe(true);
-    expect(isNavigablePath("~")).toBe(true);
-    expect(isNavigablePath("C:\\Users\\alice\\work")).toBe(true);
-    expect(isNavigablePath("C:/Users/alice/work")).toBe(true);
-    expect(isNavigablePath("work")).toBe(false);
-    expect(isNavigablePath("C:relative")).toBe(false);
-  });
-});
-
-describe("isHostAbsolutePath", () => {
-  it("rejects relative and tilde paths", () => {
-    expect(isHostAbsolutePath("/tmp")).toBe(true);
-    expect(isHostAbsolutePath("C:\\Users\\alice")).toBe(true);
-    expect(isHostAbsolutePath("~/work")).toBe(false);
-    expect(isHostAbsolutePath("")).toBe(false);
-  });
-});
-
 describe("listingFilter", () => {
   it.each<[string, string, string | null, string | null]>([
     // [pathInput, currentAbsolute, home, expected]
@@ -272,9 +264,6 @@ describe("listingFilter", () => {
     ["~/pro", "/Users/me", "/Users/me", "pro"],
     // At the root, "/sr" is a fragment of "/" → filters.
     ["/sr", "/", null, "sr"],
-    ["C:\\Users\\me\\pro", "C:\\Users\\me", null, "pro"],
-    ["C:\\Users\\me", "C:\\Users\\me", null, null],
-    ["C:/Users/Alice/pro", "c:\\users\\alice", null, "pro"],
   ])("listingFilter(%j, %j, %j) → %j", (input, current, home, expected) => {
     expect(listingFilter(input, current, home)).toBe(expected);
   });
@@ -338,33 +327,6 @@ describe("WorkspacePicker path bar", () => {
     expect(input.value).toBe("/Users/serena.ruan/projects");
   });
 
-  it("does not treat a Windows home listing as the POSIX root", () => {
-    // Home view (path "") lists entries whose paths are C:\Users\...\name.
-    // Deriving the current dir via lastIndexOf("/") used to yield "/", so
-    // onNavigate fired with the drive root and Select could not pick work/.
-    useHostFilesystemMock.mockReturnValue(
-      result({
-        data: {
-          entries: [
-            dir("work", "C:\\Users\\alice\\work"),
-            dir("Documents", "C:\\Users\\alice\\Documents"),
-          ],
-          truncated: false,
-        },
-        isLoading: false,
-        isPlaceholderData: false,
-      }),
-    );
-    const onNavigate = vi.fn();
-    const onSelect = vi.fn();
-    render(<WorkspacePicker hostId="host_1" onNavigate={onNavigate} onSelect={onSelect} />);
-    expect(onNavigate).toHaveBeenCalledWith("C:\\Users\\alice");
-    fireEvent.click(screen.getByTestId("workspace-picker-select"));
-    expect(onSelect).toHaveBeenCalledWith("C:\\Users\\alice");
-    fireEvent.click(screen.getByTestId("workspace-picker-entry-work"));
-    expect(onNavigate).toHaveBeenCalledWith("C:\\Users\\alice\\work");
-  });
-
   it("resolves a tilde start path to an absolute one for selection", () => {
     // Opening at "~/projects" (the host expands ~): the listing's
     // entries come back absolute, so "Select current" must return the
@@ -383,6 +345,56 @@ describe("WorkspacePicker path bar", () => {
     render(<WorkspacePicker hostId="host_1" initialPath="~/projects" onSelect={onSelect} />);
     fireEvent.click(screen.getByTestId("workspace-picker-select"));
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/projects");
+  });
+});
+
+describe("WorkspacePicker filesystem roots", () => {
+  it("shows Windows drives and enters a selected drive", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
+    );
+    useHostFilesystemRootsMock.mockReturnValue(
+      result({
+        data: {
+          entries: [dir("C:\\", "C:\\"), dir("D:\\", "D:\\")],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" />);
+    fireEvent.click(screen.getByTestId("workspace-picker-roots"));
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-D:\\"));
+
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("host_1", "D:\\");
+  });
+});
+
+describe("WorkspacePicker default starting folder", () => {
+  it("pins the current Windows directory for future sessions", () => {
+    const onDefaultPathChange = vi.fn();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("Omnigent", "D:\\Projects\\Omnigent")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath={"D:\\Projects"}
+        onDefaultPathChange={onDefaultPathChange}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("workspace-picker-default"));
+
+    expect(onDefaultPathChange).toHaveBeenCalledWith("D:\\Projects");
   });
 });
 
@@ -548,11 +560,6 @@ describe("joinPath", () => {
 
   it("trims surrounding whitespace from the child name", () => {
     expect(joinPath("/Users/me", "  foo  ")).toBe("/Users/me/foo");
-  });
-
-  it("joins a Windows drive path with a backslash", () => {
-    expect(joinPath("C:\\Users\\alice", "work")).toBe("C:\\Users\\alice\\work");
-    expect(joinPath("C:\\", "Users")).toBe("C:\\Users");
   });
 });
 

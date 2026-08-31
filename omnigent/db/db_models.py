@@ -1296,6 +1296,9 @@ class SqlHost(OmnigentBase):
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # User-selected starting directory for this physical host. Host-native
+    # syntax is preserved (POSIX, Windows drive, or UNC).
+    default_workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
 
     __table_args__ = (
         CheckConstraint(

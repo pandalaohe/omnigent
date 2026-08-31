@@ -282,6 +282,31 @@ async def test_get_host_returns_details(
     assert data["sandbox_provider"] is None
 
 
+async def test_patch_host_default_workspace_persists_and_surfaces(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        patched = await client.patch(
+            f"/v1/hosts/{_HOST_ID}",
+            json={"default_workspace": "D:\\AIProgram\\Projects"},
+        )
+        listed = await client.get("/v1/hosts")
+
+    assert patched.status_code == 200
+    assert patched.json()["default_workspace"] == "D:\\AIProgram\\Projects"
+    assert listed.json()["hosts"][0]["default_workspace"] == "D:\\AIProgram\\Projects"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        missing = await client.patch(f"/v1/hosts/{_HOST_ID}", json={})
+        cleared = await client.patch(f"/v1/hosts/{_HOST_ID}", json={"default_workspace": None})
+    assert missing.status_code == 422
+    assert cleared.status_code == 200
+    assert cleared.json()["default_workspace"] is None
+
+
 async def test_hosts_api_surfaces_configured_harnesses(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
@@ -909,6 +934,27 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+async def test_patch_host_default_workspace_403_wrong_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A user cannot change another user's picker starting directory."""
+    app, _registry, host_store, _cs = multi_user_app
+    host_id = "6a4670481346725470e480959336424b"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            f"/v1/hosts/{host_id}",
+            headers={"x-test-user": "bob@test.com"},
+            json={"default_workspace": "D:\\Bob"},
+        )
+
+    assert response.status_code == 403
+    stored = host_store.get_host(host_id)
+    assert stored is not None
+    assert stored.default_workspace is None
 
 
 async def test_launch_runner_403_wrong_owner(

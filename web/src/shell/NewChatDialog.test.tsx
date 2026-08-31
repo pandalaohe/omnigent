@@ -95,6 +95,12 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
 }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
+  useHostFilesystemRoots: vi.fn(() => ({
+    data: undefined,
+    isLoading: false,
+    isPlaceholderData: false,
+    error: null,
+  })),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
@@ -295,6 +301,12 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("/")).toBe(true);
   });
 
+  it("accepts Windows drive and UNC absolute paths", () => {
+    expect(isValidWorkspace("D:\\AIProgram\\Projects")).toBe(true);
+    expect(isValidWorkspace("E:/Projects/Omnigent")).toBe(true);
+    expect(isValidWorkspace("\\\\server\\share\\repo")).toBe(true);
+  });
+
   it("trims whitespace before checking", () => {
     // Browsers paste with stray whitespace; trim must run before
     // the shape check or "  /Users/corey  " would be rejected.
@@ -342,6 +354,9 @@ describe("normalizeWorkspacePath", () => {
     // Root is preserved, not collapsed away.
     ["/", "/"],
     ["///", "/"],
+    ["D:\\AIProgram\\Projects\\", "D:\\AIProgram\\Projects"],
+    ["E:/Projects/Omnigent/", "E:/Projects/Omnigent"],
+    ["C:\\", "C:\\"],
     // Blank → null (no path) — must NOT become "/", or an empty input would
     // spuriously match a session whose workspace is the root.
     ["", null],
@@ -525,6 +540,10 @@ describe("deriveHomeDir", () => {
     // A home directly under root (e.g. "/root") yields "/" — not "" — so the
     // seeded value is still a valid absolute path.
     expect(deriveHomeDir([fsEntry("/etc")])).toBe("/");
+  });
+
+  it("returns the Windows home directory from a native entry path", () => {
+    expect(deriveHomeDir([fsEntry("C:\\Users\\corey\\Desktop")])).toBe("C:\\Users\\corey");
   });
 
   it("returns null for an empty listing", () => {
@@ -1508,6 +1527,21 @@ describe("NewChatLandingScreen", () => {
     // directory" and submit stuck disabled.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
+  it("prefers the Host default over the browser's recent path", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        default_workspace: "D:\\AIProgram\\Projects",
+      },
+    ]);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "Projects",
+      ),
     );
   });
 

@@ -439,6 +439,14 @@ class CreateDirectoryRequest(BaseModel):
     path: str
 
 
+class UpdateHostRequest(BaseModel):
+    """Mutable user preference fields for a registered host."""
+
+    # Required but nullable: explicit null clears it; an empty or misspelled
+    # PATCH body must not silently erase an existing preference.
+    default_workspace: str | None
+
+
 class StoreHarnessCredentialRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{id}/harnesses/{harness}/credential``.
 
@@ -630,6 +638,7 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    "default_workspace": host.default_workspace,
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
@@ -674,10 +683,48 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "default_workspace": host.default_workspace,
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "runners": [],
+        }
+
+    @router.patch("/hosts/{host_id}")
+    async def update_host(
+        request: Request, host_id: str, body: UpdateHostRequest
+    ) -> dict[str, Any]:
+        """Set or clear user-owned preferences for one physical host."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        value = body.default_workspace
+        if value is not None:
+            value = value.strip()
+            if not value:
+                value = None
+            elif len(value) > 2048 or "\x00" in value:
+                raise HTTPException(status_code=400, detail="invalid default workspace")
+            elif not (
+                value.startswith(("/", "\\\\"))
+                or (
+                    len(value) >= 3
+                    and value[0].isalpha()
+                    and value[1] == ":"
+                    and value[2] in "\\/"
+                )
+            ):
+                raise HTTPException(status_code=400, detail="default workspace must be absolute")
+
+        updated = await asyncio.to_thread(host_store.set_default_workspace, host_id, value)
+        assert updated is not None
+        return {
+            "host_id": updated.host_id,
+            "default_workspace": updated.default_workspace,
         }
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
@@ -1011,6 +1058,8 @@ def create_hosts_router(
     async def list_host_filesystem_root(
         request: Request,
         host_id: str,
+        path: str | None = Query(default=None),
+        roots: bool = Query(default=False),
         limit: int = Query(default=_LIST_DIR_DEFAULT_LIMIT, ge=1, le=_LIST_DIR_MAX_LIMIT),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
@@ -1039,7 +1088,7 @@ def create_hosts_router(
         return await _list_host_filesystem(
             request=request,
             host_id=host_id,
-            path="~",
+            path="" if roots else (path if path else "~"),
             limit=limit,
             after=after,
             before=before,

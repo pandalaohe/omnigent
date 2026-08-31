@@ -28,6 +28,8 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /** Host-native directory opened first for new sessions on this machine. */
+  default_workspace?: string | null;
 }
 
 interface HostsResponse {
@@ -83,6 +85,22 @@ export function useHosts(options: UseHostsOptions = {}) {
     refetchOnWindowFocus: refetchOnFocus,
     refetchInterval: enabled ? 60_000 : false,
   });
+}
+
+/** Persist or clear the default starting workspace for one physical host. */
+export async function setHostDefaultWorkspace(
+  hostId: string,
+  defaultWorkspace: string | null,
+): Promise<void> {
+  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ default_workspace: defaultWorkspace }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(body.detail ?? `Couldn't save the default folder (HTTP ${res.status}).`);
+  }
 }
 
 async function fetchHostModelOptions(

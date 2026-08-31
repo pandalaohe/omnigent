@@ -86,6 +86,7 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    default_workspace: str | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -154,6 +155,7 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        default_workspace=row.default_workspace,
     )
 
 
@@ -357,6 +359,7 @@ class HostStore:
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
+        default_workspace = row.default_workspace
 
         bound_ids = list(
             session.execute(
@@ -399,6 +402,7 @@ class HostStore:
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
             configured_harnesses=harnesses_json,
+            default_workspace=default_workspace,
         )
         session.add(new_row)
         session.flush()
@@ -484,6 +488,7 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            default_workspace=existing.default_workspace,
         )
 
     def set_offline(self, host_id: str) -> None:
@@ -651,6 +656,21 @@ class HostStore:
             ).scalar_one_or_none()
             if row is None:
                 return None
+            return _row_to_host(row)
+
+    def set_default_workspace(self, host_id: str, default_workspace: str | None) -> Host | None:
+        """Persist the directory a host's workspace picker should open first."""
+        with self._session("set_host_default_workspace") as session:
+            row = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            row.default_workspace = default_workspace
+            # updated_at is the host liveness heartbeat. A preference write
+            # must not make a stale `status=online` row look live again.
             return _row_to_host(row)
 
     def register_managed_host(

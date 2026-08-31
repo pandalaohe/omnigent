@@ -141,9 +141,12 @@ export function SwitchHostDialog({
   // home listing must not clobber what the user is entering.
   useEffect(() => {
     if (!open || selectedHostId === null || workspace !== "" || userEditedRef.current) return;
-    const preferred = recent[0] ?? resolvedHome;
+    const hostDefault = targetHosts.find(
+      (host) => host.host_id === selectedHostId,
+    )?.default_workspace;
+    const preferred = hostDefault ?? recent[0] ?? resolvedHome;
     if (preferred) setWorkspace(preferred);
-  }, [open, selectedHostId, workspace, recent, resolvedHome]);
+  }, [open, selectedHostId, workspace, recent, resolvedHome, targetHosts]);
 
   function handleWorkspaceChange(next: string): void {
     userEditedRef.current = true;

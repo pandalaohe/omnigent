@@ -108,7 +108,13 @@ import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  WorkspacePicker,
+  basename,
+  isAbsoluteHostPath,
+  isNavigablePath,
+  parentOf,
+} from "./WorkspacePicker";
 import {
   initialPrefillState,
   prefillDone,
@@ -182,7 +188,12 @@ import {
   CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   CURSOR_NATIVE_EXEC_MODES,
 } from "@/lib/nativeHarnessModes";
-import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import {
+  useHostModelOptions,
+  useHosts,
+  setHostDefaultWorkspace,
+  type Host,
+} from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
@@ -438,7 +449,7 @@ export function ConnectHostInstructions({
  * Return true when ``workspace`` is acceptable to send to the backend.
  *
  * Per designs/SESSION_WORKSPACE_SELECTION.md: only fully-absolute
- * paths (starting with ``/``) are accepted. Tilde-prefixed and
+ * POSIX or Windows paths are accepted. Tilde-prefixed and
  * relative paths are rejected because the server never expands ``~``
  * — that's the host's job, and the workspace request body must be
  * an unambiguous absolute path. Empty / whitespace-only input is
@@ -446,10 +457,10 @@ export function ConnectHostInstructions({
  * has typed something usable.
  *
  * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * @returns true when ``workspace.trim()`` is absolute for the target host.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  return isAbsoluteHostPath(workspace.trim());
 }
 
 /**
@@ -467,7 +478,10 @@ export function isValidWorkspace(workspace: string): boolean {
 export function normalizeWorkspacePath(path: string): string | null {
   const trimmed = path.trim();
   if (trimmed === "") return null;
-  const stripped = trimmed.replace(/\/+$/, "");
+  if (/^[A-Za-z]:[\\/]+$/.test(trimmed)) {
+    return `${trimmed.slice(0, 2)}\\`;
+  }
+  const stripped = trimmed.replace(/[\\/]+$/, "");
   // All-slashes input (e.g. "///") collapses to the root.
   return stripped === "" ? "/" : stripped;
 }
@@ -816,9 +830,7 @@ export function matchSkillInvocation(
 export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
   const first = entries[0];
   if (!first) return null;
-  const slash = first.path.lastIndexOf("/");
-  if (slash < 0) return null;
-  return slash === 0 ? "/" : first.path.slice(0, slash);
+  return parentOf(first.path);
 }
 
 /**
@@ -2711,7 +2723,10 @@ export function NewChatLandingScreen() {
   // the working-directory field is pre-filled and the user can send in one
   // click. Derived from the same home listing the picker uses (entries carry
   // absolute paths); only fetched when there's no recent to fall back to.
-  const needsHomeFallback = selectedHostId !== null && recent.length === 0;
+  const hostDefaultWorkspace =
+    hosts?.find((host) => host.host_id === selectedHostId)?.default_workspace ?? null;
+  const needsHomeFallback =
+    selectedHostId !== null && recent.length === 0 && hostDefaultWorkspace === null;
   const { data: homeListing, isPlaceholderData: homeListingIsPlaceholder } = useHostFilesystem(
     selectedHostId,
     needsHomeFallback ? "" : null,
@@ -2744,7 +2759,10 @@ export function NewChatLandingScreen() {
   // The path the once-per-host auto-seed WOULD land on: the most-recent path,
   // else the derived home. Exposed as a memo so we can probe its repo for
   // worktrees before committing to it (see the fork-fresh redirect below).
-  const autoSeedCandidate = useMemo(() => recent[0] ?? derivedHome ?? null, [recent, derivedHome]);
+  const autoSeedCandidate = useMemo(
+    () => hostDefaultWorkspace ?? recent[0] ?? derivedHome ?? null,
+    [hostDefaultWorkspace, recent, derivedHome],
+  );
   // "Fork fresh from default": when the project defines a default base branch,
   // a fresh new-chat must NOT silently continue in the last-used worktree — it
   // should fork a new branch off that default. The auto-seed can land on a
@@ -3697,9 +3715,7 @@ export function NewChatLandingScreen() {
             : null;
 
   // Chip display labels.
-  const workspaceLabel = workspaceTrimmed
-    ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
-    : "Working directory";
+  const workspaceLabel = workspaceTrimmed ? basename(workspaceTrimmed) : "Working directory";
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
     sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
@@ -5077,6 +5093,11 @@ export function NewChatLandingScreen() {
                     {selectedHostId ? (
                       <WorkspacePicker
                         hostId={selectedHostId}
+                        defaultPath={selectedHost?.default_workspace}
+                        onDefaultPathChange={async (path) => {
+                          await setHostDefaultWorkspace(selectedHostId, path);
+                          await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+                        }}
                         initialPath={
                           isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
                         }
