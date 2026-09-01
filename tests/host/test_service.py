@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import plistlib
 import subprocess
 import sys
@@ -30,7 +31,7 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(service.os, "getuid", lambda: 501)
+    monkeypatch.setattr(service.os, "getuid", lambda: 501, raising=False)
     monkeypatch.setattr(service.sys, "executable", "/opt/omnigent/bin/python")
     calls = _capture_runs(monkeypatch)
 
@@ -61,13 +62,14 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
             str(installed.path),
         ],
     ]
-    assert installed.path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert installed.path.stat().st_mode & 0o777 == 0o600
 
 
 def test_disable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(service.os, "getuid", lambda: 502)
+    monkeypatch.setattr(service.os, "getuid", lambda: 502, raising=False)
     path = tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
     path.parent.mkdir(parents=True)
     path.write_text("old")
@@ -137,6 +139,54 @@ def test_disable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.Monkey
     assert calls == [
         ["systemctl", "--user", "disable", "--now", "omnigent-host.service"],
         ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
+def test_pause_resume_launchd_user_service_preserves_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(service.os, "getuid", lambda: 503, raising=False)
+    path = tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
+    path.parent.mkdir(parents=True)
+    path.write_text("preserve-me")
+    calls = _capture_runs(monkeypatch)
+
+    paused = service.pause_user_host_service()
+    assert paused is not None
+    assert path.read_text() == "preserve-me"
+    service.resume_user_host_service(paused)
+
+    assert path.read_text() == "preserve-me"
+    assert calls == [
+        ["launchctl", "bootout", "gui/503/ai.omnigent.host"],
+        ["launchctl", "print", "gui/503/ai.omnigent.host"],
+        ["launchctl", "bootstrap", "gui/503", str(path)],
+    ]
+
+
+def test_pause_resume_systemd_user_service_preserves_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    path = tmp_path / "xdg/systemd/user/omnigent-host.service"
+    path.parent.mkdir(parents=True)
+    path.write_text("preserve-me")
+    calls = _capture_runs(monkeypatch)
+
+    paused = service.pause_user_host_service()
+    assert paused is not None
+    assert path.read_text() == "preserve-me"
+    service.resume_user_host_service(paused)
+
+    assert path.read_text() == "preserve-me"
+    assert calls == [
+        ["systemctl", "--user", "stop", "omnigent-host.service"],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "start", "omnigent-host.service"],
     ]
 
 

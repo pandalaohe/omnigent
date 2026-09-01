@@ -173,6 +173,8 @@ class _InstalledWheelInfo:
     :param extras: Optional extras recorded by the installer, e.g.
         ``["all"]``. Empty when the installer does not preserve them
         (e.g. ``pip``) or when none were requested.
+    :param extras_known: Whether installer metadata was readable enough to
+        distinguish no extras from an unknown extras set.
     """
 
     install_time_epoch: float
@@ -183,6 +185,7 @@ class _InstalledWheelInfo:
     package_version: str
     detected_installer: str | None
     extras: tuple[str, ...] = ()
+    extras_known: bool = True
 
 
 def maybe_show_update_notice() -> None:
@@ -1168,13 +1171,18 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
 
     # Read requested extras from installer-specific receipts when available.
     extras: list[str] = []
+    extras_known = True
     if detected_installer == "uv":
         uv_extras = _read_uv_tool_extras()
-        if uv_extras is not None:
+        if uv_extras is None:
+            extras_known = False
+        else:
             extras = uv_extras
     elif detected_installer == "pipx":
         pipx_extras = _read_pipx_extras()
-        if pipx_extras is not None:
+        if pipx_extras is None:
+            extras_known = False
+        else:
             extras = pipx_extras
 
     return _InstalledWheelInfo(
@@ -1186,6 +1194,7 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
         package_version=dist.version,
         detected_installer=detected_installer,
         extras=tuple(extras),
+        extras_known=extras_known,
     )
 
 
@@ -1711,7 +1720,12 @@ def _build_nightly_upgrade_suggestion(
     )
 
 
-def _run_upgrade_command(command: str, console: Console) -> int:
+def _run_upgrade_command(
+    command: str,
+    console: Console,
+    *,
+    env: dict[str, str] | None = None,
+) -> int:
     """Run the upgrade command in a foreground subprocess.
 
     The subprocess inherits stdin/stdout/stderr so the user sees
@@ -1723,6 +1737,8 @@ def _run_upgrade_command(command: str, console: Console) -> int:
     :param console: Rich console (stderr) used for the surrounding
         "Running:" / failure status lines, kept consistent with the
         panel above.
+    :param env: Optional complete subprocess environment. ``None`` inherits
+        the current process environment.
     :returns: The subprocess's exit code, or ``-1`` when the binary
         couldn't be started (binary missing from PATH, invalid
         command string). The caller treats any non-zero return as
@@ -1732,7 +1748,12 @@ def _run_upgrade_command(command: str, console: Console) -> int:
 
     console.print(f"[yellow]Running:[/yellow] {command}")
     try:
-        result = subprocess.run(shlex.split(command), check=False)
+        args = shlex.split(command)
+        result = (
+            subprocess.run(args, check=False)
+            if env is None
+            else subprocess.run(args, check=False, env=env)
+        )
     except (OSError, ValueError) as exc:
         # OSError: binary not on PATH. ValueError: shlex.split
         # rejected the command (extremely unlikely for our
