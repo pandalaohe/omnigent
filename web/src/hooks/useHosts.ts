@@ -32,6 +32,24 @@ export interface Host {
   default_workspace?: string | null;
 }
 
+export interface CodexRateLimitWindow {
+  kind: "primary" | "secondary";
+  used_percent: number;
+  window_duration_mins: number;
+  resets_at?: number;
+}
+
+export interface CodexRateLimitBucket {
+  limit_id: string;
+  limit_name?: string;
+  windows: CodexRateLimitWindow[];
+}
+
+export interface CodexRateLimitsSnapshot {
+  captured_at: number;
+  limits: CodexRateLimitBucket[];
+}
+
 interface HostsResponse {
   hosts: Host[];
 }
@@ -84,6 +102,30 @@ export function useHosts(options: UseHostsOptions = {}) {
     staleTime: refetchOnFocus ? 0 : 30_000,
     refetchOnWindowFocus: refetchOnFocus,
     refetchInterval: enabled ? 60_000 : false,
+  });
+}
+
+async function fetchCodexRateLimits(hostId: string): Promise<CodexRateLimitsSnapshot | null> {
+  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/codex-rate-limits`);
+  // Older servers and removed/offline Hosts have no usable snapshot. This is
+  // an optional status indicator, so degrade by hiding it instead of surfacing
+  // an unrelated chat-page error.
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { rate_limits?: CodexRateLimitsSnapshot | null };
+  return body.rate_limits ?? null;
+}
+
+/** Sanitized Codex subscription quota windows reported by one connected Host. */
+export function useCodexRateLimits(hostId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: ["host-codex-rate-limits", hostId],
+    queryFn: () => fetchCodexRateLimits(hostId as string),
+    enabled: enabled && hostId !== null,
+    staleTime: 30_000,
+    refetchInterval: enabled && hostId !== null ? 60_000 : false,
+    refetchOnWindowFocus: true,
+    retry: false,
   });
 }
 

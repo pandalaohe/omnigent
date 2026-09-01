@@ -6,6 +6,7 @@
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "@/lib/routing";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 
 /**
  * @param orderedIds Conversation ids in sidebar render order, visible sections
@@ -24,9 +25,9 @@ export function useSessionSwitchHotkey(
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Cmd/Ctrl, not Alt (Alt+arrow is the message hotkey); Shift left to selection.
-      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+      const previous = eventMatchesShortcutAction(e, "previousSession");
+      const next = eventMatchesShortcutAction(e, "nextSession");
+      if (!previous && !next) return;
 
       // Yield to a focused widget that already claimed this chord for its own
       // list navigation — the command palette (cmdk binds Cmd+↑/↓ to jump to
@@ -38,17 +39,17 @@ export function useSessionSwitchHotkey(
       if (ids.length === 0) return;
 
       e.preventDefault(); // also suppresses the native caret-to-start/end in fields
-      const dir = e.key === "ArrowDown" ? 1 : -1;
+      const dir = next ? 1 : -1;
       const current = active ? ids.indexOf(active) : -1;
       // Off-list: ↓ enters at the top, ↑ at the bottom. Otherwise step + wrap.
-      const next =
+      const nextIndex =
         current === -1
           ? dir === 1
             ? 0
             : ids.length - 1
           : (current + dir + ids.length) % ids.length;
 
-      const nextId = ids[next];
+      const nextId = ids[nextIndex];
       if (nextId && nextId !== active) navigate(`/c/${nextId}`);
     };
 

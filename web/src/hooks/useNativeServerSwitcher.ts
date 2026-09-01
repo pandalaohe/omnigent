@@ -68,6 +68,33 @@ export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean
 }
 
 /**
+ * Tracks the AppShell sidebar state from its DOM contract. ChatPage is rendered
+ * below the shell rather than receiving that state as a prop, and wide native
+ * layouts can dock the sidebar without changing the surface hit-test result.
+ */
+export function useAppShellSidebarOpen(): boolean {
+  const read = () =>
+    typeof document !== "undefined" &&
+    document.querySelector('.app-shell[data-sidebar-open="true"]') !== null;
+  const [open, setOpen] = useState(read);
+
+  useEffect(() => {
+    const sync = () => setOpen(read());
+    sync();
+    if (typeof MutationObserver === "undefined") return;
+    const observer = new MutationObserver(sync);
+    observer.observe(document.body, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-sidebar-open"],
+    });
+    return () => observer.disconnect();
+  }, []);
+
+  return open;
+}
+
+/**
  * Drive the iOS shell's native server switcher overlay so it shows only while
  * `surface` is the frontmost element on screen and `active` is true. The
  * switcher is a native chrome element the web app toggles via the bridge; it

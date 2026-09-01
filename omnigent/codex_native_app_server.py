@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.codex_model_vocabulary import codex_spawn_model
-from omnigent.codex_native_bridge import write_policy_hook_config
+from omnigent.codex_native_bridge import write_codex_context_catalog, write_policy_hook_config
 from omnigent.codex_native_process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
@@ -77,6 +77,7 @@ CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
+_CONTEXT_CATALOG_TIMEOUT_SECONDS = 2.0
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
@@ -1158,6 +1159,7 @@ class CodexNativeAppServer:
     codex_cli_version: tuple[int, int, int] | None = None
     trust_project: bool = False
     router_hooks_registered: bool = False
+    context_catalog_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         """
@@ -1203,6 +1205,10 @@ class CodexNativeAppServer:
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
         config_source = _codex_home_config_source_from_env()
+        self.context_catalog_task = asyncio.create_task(
+            self._populate_context_catalog(config_source),
+            name="codex-native-context-catalog",
+        )
         model_migration_target: str | None = None
         if self.trust_project and self.pinned_model:
             catalog = await asyncio.to_thread(
@@ -1482,10 +1488,30 @@ class CodexNativeAppServer:
             self.stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.stderr_task
+        if self.context_catalog_task is not None:
+            self.context_catalog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.context_catalog_task
         self.proc = None
         self.stderr_task = None
+        self.context_catalog_task = None
         self.process_registry_tag = None
         self.process_owner_lock = None
+
+    async def _populate_context_catalog(self, source_home: Path) -> None:
+        """Best-effort host model metadata for truthful compact progress."""
+        try:
+            catalog = await asyncio.to_thread(
+                read_codex_model_catalog,
+                self.codex_path,
+                source_home,
+                timeout=_CONTEXT_CATALOG_TIMEOUT_SECONDS,
+                bundled=True,
+            )
+            if catalog is not None:
+                await asyncio.to_thread(write_codex_context_catalog, self.bridge_dir, catalog)
+        except Exception:  # noqa: BLE001 - metadata must never block a session.
+            _logger.warning("Could not cache Codex compact metadata", exc_info=True)
 
     async def _wait_until_ready(self) -> None:
         """

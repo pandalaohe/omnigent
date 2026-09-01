@@ -81,16 +81,19 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    ARCHIVE_LOCK_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
+    ArchiveLockWriteResult,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
     CreatedSession,
+    DeletionClaimResult,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -236,6 +239,7 @@ def _to_conversation(
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
         archived=row.archived,
+        archived_at=row.archived_at,
         live_status=(
             decode_session_live_status(meta.live_status)
             if meta and meta.live_status is not None
@@ -1309,6 +1313,144 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._conv_session("set_labels") as session:
             _upsert_labels(session, conversation_id, updates, stamp)
 
+    def claim_conversation_deletion(
+        self,
+        conversation_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+        stale_before: int,
+    ) -> DeletionClaimResult:
+        """Claim one unlocked conversation on its database row.
+
+        The conditional ``UPDATE`` is the linearization point shared by every
+        Server worker.  The correlated label check runs inside that statement,
+        so a committed archive lock and an active delete claim cannot both win.
+        """
+        workspace_id = current_workspace_id()
+        claim_available = or_(
+            SqlConversation.deletion_claim_token.is_(None),
+            SqlConversation.deletion_claimed_at.is_(None),
+            SqlConversation.deletion_claimed_at < stale_before,
+        )
+        with self._conv_session("claim_conversation_deletion") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == workspace_id,
+                        SqlConversation.id == conversation_id,
+                        claim_available,
+                        SqlConversation.archive_locked.is_(False),
+                    )
+                    .values(
+                        deletion_claim_token=token,
+                        deletion_claimed_at=claimed_at,
+                    )
+                ),
+            )
+            if result.rowcount > 0:
+                return "claimed"
+            row = session.get(SqlConversation, (workspace_id, conversation_id))
+            if row is None:
+                return "not_found"
+            return "locked" if row.archive_locked else "busy"
+
+    def release_conversation_deletion(self, conversation_id: str, token: str) -> bool:
+        """Clear a claim only when the opaque owner token still matches."""
+        with self._conv_session("release_conversation_deletion") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.deletion_claim_token == token,
+                    )
+                    .values(deletion_claim_token=None, deletion_claimed_at=None)
+                ),
+            )
+            return result.rowcount > 0
+
+    def renew_conversation_deletion(
+        self,
+        conversation_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+    ) -> bool:
+        """Refresh the lease timestamp without reviving a superseded token."""
+        with self._conv_session("renew_conversation_deletion") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.deletion_claim_token == token,
+                    )
+                    .values(deletion_claimed_at=claimed_at)
+                ),
+            )
+            return result.rowcount > 0
+
+    def set_archive_lock(
+        self,
+        conversation_id: str,
+        locked: bool,
+        *,
+        updated_at: int,
+        stale_before: int,
+    ) -> ArchiveLockWriteResult:
+        """Write archive protection in the same row transaction as the claim gate."""
+        workspace_id = current_workspace_id()
+        claim_available = or_(
+            SqlConversation.deletion_claim_token.is_(None),
+            SqlConversation.deletion_claimed_at.is_(None),
+            SqlConversation.deletion_claimed_at < stale_before,
+        )
+        with self._conv_session("set_archive_lock") as session:
+            # Even when no stale claim exists, this no-op row write serializes
+            # with a competing claim UPDATE on Postgres and SQLite.
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == workspace_id,
+                        SqlConversation.id == conversation_id,
+                        claim_available,
+                    )
+                    .values(
+                        archive_locked=locked,
+                        deletion_claim_token=None,
+                        deletion_claimed_at=None,
+                    )
+                ),
+            )
+            if result.rowcount == 0:
+                row = session.get(SqlConversation, (workspace_id, conversation_id))
+                return "not_found" if row is None else "busy"
+            if locked:
+                _upsert_labels(
+                    session,
+                    conversation_id,
+                    {ARCHIVE_LOCK_LABEL_KEY: "1"},
+                    updated_at,
+                )
+            else:
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key == ARCHIVE_LOCK_LABEL_KEY,
+                    )
+                )
+            return "updated"
+
     def set_session_state(
         self,
         conversation_id: str,
@@ -2233,9 +2375,17 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        host_id: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        updated_after: int | None = None,
+        updated_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
         include_archived: bool = False,
+        archived_only: bool = False,
         project: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
@@ -2271,7 +2421,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"``
-            or ``"updated_at"``.
+            ``"updated_at"``, or ``"archived_at"``.
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
@@ -2326,9 +2476,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         # (kind derived from parent-nullness, archived a real column), so they
         # are filtered directly on the AP query below. The only filters that
         # still require an Omnigent-side prefetch are the permission scopes.
-        needs_meta_filter = (accessible_by is not None) or (owned_by is not None)
+        needs_meta_filter = (
+            (accessible_by is not None) or (owned_by is not None) or (host_id is not None)
+        )
 
         qualifying_ids: list[str] | None = None
+        workspace_matching_ids: list[str] | None = None
         if needs_meta_filter:
             # Pre-fetch permission-qualifying IDs from the Omnigent DB
             # (session_permissions), then filter the AP query. accessible_by and
@@ -2356,12 +2509,40 @@ class SqlAlchemyConversationStore(ConversationStore):
                             )
                         ).scalars()
                     )
-                if accessible_set is not None and owned_set is not None:
-                    qualifying_ids = list(accessible_set & owned_set)
-                else:
-                    qualifying_ids = list(
-                        accessible_set if accessible_set is not None else owned_set or set()
+                qualifying_sets = [
+                    candidate for candidate in (accessible_set, owned_set) if candidate is not None
+                ]
+                if host_id is not None:
+                    qualifying_sets.append(
+                        set(
+                            meta_sess.execute(
+                                select(SqlConversationMetadata.id).where(
+                                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                    SqlConversationMetadata.host_id == host_id,
+                                )
+                            ).scalars()
+                        )
                     )
+                if qualifying_sets:
+                    intersection = qualifying_sets[0]
+                    for candidate in qualifying_sets[1:]:
+                        intersection &= candidate
+                    qualifying_ids = list(intersection)
+
+        if search_query:
+            # Workspace/CWD is metadata-owned. Resolve its matching ids here,
+            # then OR them with title/content matches in the AP query below.
+            with self._session("list_conversations") as meta_sess:
+                workspace_matching_ids = list(
+                    meta_sess.execute(
+                        select(SqlConversationMetadata.id).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            func.lower(SqlConversationMetadata.workspace).like(
+                                f"%{search_query.lower()}%"
+                            ),
+                        )
+                    ).scalars()
+                )
 
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
@@ -2393,8 +2574,23 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             # archived lives on the AP conversations table, so exclude it inline
             # (no metadata prefetch, no post-fetch filtering).
-            if not include_archived:
+            if archived_only:
+                stmt = stmt.where(SqlConversation.archived.is_(True))
+            elif not include_archived:
                 stmt = stmt.where(SqlConversation.archived.is_(False))
+
+            if created_after is not None:
+                stmt = stmt.where(SqlConversation.created_at >= created_after)
+            if created_before is not None:
+                stmt = stmt.where(SqlConversation.created_at < created_before)
+            if updated_after is not None:
+                stmt = stmt.where(SqlConversation.updated_at >= updated_after)
+            if updated_before is not None:
+                stmt = stmt.where(SqlConversation.updated_at < updated_before)
+            if archived_after is not None:
+                stmt = stmt.where(SqlConversation.archived_at >= archived_after)
+            if archived_before is not None:
+                stmt = stmt.where(SqlConversation.archived_at < archived_before)
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -2453,7 +2649,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .exists()
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                workspace_match = SqlConversation.id.in_(workspace_matching_ids or [])
+                stmt = stmt.where(or_(title_match, content_match, workspace_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -2624,7 +2821,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         Map a ``sort_by`` string to the corresponding
         :class:`SqlConversation` column.
 
-        :param sort_by: ``"created_at"`` or ``"updated_at"``.
+        :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"archived_at"``.
         :returns: The mapped column attribute.
         :raises ValueError: If ``sort_by`` is not a valid column
             name.
@@ -2632,6 +2829,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         allowed = {
             "created_at": SqlConversation.created_at,
             "updated_at": SqlConversation.updated_at,
+            "archived_at": SqlConversation.archived_at,
         }
         col = allowed.get(sort_by)
         if col is None:
@@ -2816,8 +3014,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True
             if archived is not None:
                 # archived lives on the AP conversations row; a visible state change.
-                row.archived = archived
-                ap_changed = True
+                if row.archived != archived:
+                    row.archived = archived
+                    row.archived_at = now if archived else None
+                    ap_changed = True
             if ap_changed:
                 row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)

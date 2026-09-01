@@ -309,6 +309,9 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(back).toHaveTextContent("Back");
     expect(back).not.toHaveTextContent("Fix the login bug");
     expect(back.querySelector(".lucide-chevron-left")).not.toBeNull();
+    expect(document.querySelector(".breadcrumb-native-session-title")).toHaveTextContent(
+      "Fix the login bug",
+    );
   });
 
   it("still links back to the parent when the breadcrumb title is unresolved", () => {

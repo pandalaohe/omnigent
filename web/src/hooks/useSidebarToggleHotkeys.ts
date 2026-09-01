@@ -11,6 +11,7 @@
 // app shell, where the sidebar open-state lives.
 
 import { useEffect, useRef } from "react";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 
 export interface SidebarToggleHandlers {
   /** Flip the left (Conversations) sidebar. Bound to ⌘/Ctrl + ⌥/Alt + [. */
@@ -27,9 +28,6 @@ export function useSidebarToggleHotkeys(handlers: SidebarToggleHandlers): void {
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Require Cmd/Ctrl AND Alt (the ⌘⌥ message-nav chord) and additionally
-      // reject Shift, so ⌘⌥⇧ combos stay free for future bindings.
-      if (!(e.metaKey || e.ctrlKey) || !e.altKey || e.shiftKey) return;
       // AltGr often reports as Ctrl+Alt; ignore it so intl-layout typing doesn't
       // accidentally toggle sidebars while focused in an editor/composer. Guard
       // the call: not every environment implements getModifierState, and an
@@ -37,15 +35,11 @@ export function useSidebarToggleHotkeys(handlers: SidebarToggleHandlers): void {
       if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return;
       // Ignore auto-repeat: holding the chord would flap the panel open/closed.
       if (e.repeat) return;
-      // Match the physical key, not the character: ⌥ turns "[" / "]" into "“" /
-      // "‘" on macOS, but e.code is stable across layouts and modifiers.
-      // Claim the chord: preventDefault drops any default action and
-      // stopPropagation keeps it from reaching other keydown listeners.
-      if (e.code === "BracketLeft") {
+      if (eventMatchesShortcutAction(e, "toggleConversationsSidebar")) {
         e.preventDefault();
         e.stopPropagation();
         latest.current.onToggleLeft();
-      } else if (e.code === "BracketRight") {
+      } else if (eventMatchesShortcutAction(e, "toggleWorkspaceSidebar")) {
         e.preventDefault();
         e.stopPropagation();
         latest.current.onToggleRight();

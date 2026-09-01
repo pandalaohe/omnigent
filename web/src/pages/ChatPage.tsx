@@ -39,6 +39,7 @@ import {
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { formatTokenCountShort } from "@/lib/formatCost";
 import {
   Conversation,
   ConversationContent,
@@ -75,8 +76,13 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
-import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
+import { useAppShellSidebarOpen, useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
+import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
+import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import { shouldHideNativeServerSwitcher } from "@/lib/sessionNavigationPreferences";
+import { resolveUsageContextLimits, usageContextSourceKey } from "@/lib/usageContextPreferences";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -125,7 +131,12 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
-import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import {
+  composerNewLineDisposition,
+  isComposerSendKey,
+  readSubmitWithModEnter,
+} from "@/lib/composerSendShortcutPreferences";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -176,8 +187,18 @@ import {
   hostBacksHarnessWithGateway,
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
-import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import {
+  type CodexRateLimitsSnapshot,
+  useCodexRateLimits,
+  useHostModelOptions,
+  useHosts,
+} from "@/hooks/useHosts";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
+import {
+  formatProviderUsageLimits,
+  providerUsageLimitsFromCodex,
+  type FormattedProviderUsageLimits,
+} from "@/lib/providerUsageLimits";
 import {
   Dialog,
   DialogContent,
@@ -1204,6 +1225,14 @@ export function ChatPage() {
     hostProbeHarness ?? "",
     hostProbeHarness !== null && sessionModelOptions.length === 0,
   );
+  // Rate-limit polling belongs to the page data boundary, not the exported
+  // Composer presentation surface. Keeping the query here lets direct
+  // Composer tests (and future non-page consumers) render without having to
+  // provide a React Query client solely for the status-line decoration.
+  const { data: codexRateLimits } = useCodexRateLimits(
+    activeSession?.hostId ?? null,
+    fallbackPickerKind === "codex" && activeSession?.hostId != null,
+  );
   // Identity-stable on purpose: substitute only when the host rows actually
   // exist, else keep the store's own array reference — a fresh [] here would
   // re-render every options consumer (composer, gear, agent-info popover) on
@@ -1378,6 +1407,7 @@ export function ChatPage() {
       showModels={modelPickerKind !== null}
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
+      codexRateLimits={codexRateLimits}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
@@ -1621,6 +1651,8 @@ interface MainAgentSurfaceProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  /** Latest structured Codex account limits reported by the bound Host. */
+  codexRateLimits?: CodexRateLimitsSnapshot | null;
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
@@ -1767,6 +1799,7 @@ function MainAgentSurface({
   showModels,
   modelPickerKind,
   codexModelOptions,
+  codexRateLimits,
   showCodexPlanMode,
   showClaudePermissionMode = false,
   showGoalControl = false,
@@ -1923,10 +1956,18 @@ function MainAgentSurface({
     showTerminal ? terminalSurfaceEl : containerEl,
     !!conversationId,
   );
+  const { nativeMobileHeaderMode } = useSessionNavigationPreferences();
+  const sidebarOpen = useAppShellSidebarOpen();
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!surfaceFrontmost);
-  }, [surfaceFrontmost]);
+    setNativeServerSwitcherHidden(
+      shouldHideNativeServerSwitcher({
+        frontmost: surfaceFrontmost,
+        sidebarOpen,
+        headerMode: nativeMobileHeaderMode,
+      }),
+    );
+  }, [nativeMobileHeaderMode, sidebarOpen, surfaceFrontmost]);
   useEffect(() => {
     if (!isIOSShell()) return;
     return () => setNativeServerSwitcherHidden(true);
@@ -2306,6 +2347,7 @@ function MainAgentSurface({
             showModels={showModels}
             modelPickerKind={modelPickerKind}
             codexModelOptions={codexModelOptions}
+            codexRateLimits={codexRateLimits}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
             showGoalControl={showGoalControl}
@@ -3698,6 +3740,8 @@ interface ComposerProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  /** Latest structured Codex account limits supplied by the page owner. */
+  codexRateLimits?: CodexRateLimitsSnapshot | null;
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
@@ -3821,13 +3865,56 @@ export function buildSlashCommandWithArgsSet(
 /** Circumference of the progress ring (r=5.5). */
 const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
 
-/** Circular progress ring showing how much context window is used, with the used percentage beside it. */
-function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tokensUsed: number }) {
-  const pct = Math.min(tokensUsed / contextWindow, 1);
+/** Select and format the active Codex bucket without inventing missing windows. */
+export function formatCodexRateLimits(
+  snapshot: CodexRateLimitsSnapshot | null | undefined,
+  model: string | null | undefined,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): FormattedProviderUsageLimits | null {
+  return formatProviderUsageLimits(providerUsageLimitsFromCodex(snapshot, model), nowSeconds);
+}
+
+function ProviderUsageLimitsStatus({ value }: { value: FormattedProviderUsageLimits }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          data-testid="composer-provider-usage-limits"
+          className="whitespace-nowrap text-xs tabular-nums text-muted-foreground"
+          aria-label={value.ariaLabel}
+        >
+          {value.text}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-56 text-center text-sm">
+        <p>{value.scope} usage.</p>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/** Circular progress ring for either the full context window or the reported compact budget. */
+function ContextRing({
+  contextWindow,
+  autoCompactTokenLimit,
+  tokensUsed,
+}: {
+  contextWindow: number;
+  autoCompactTokenLimit: number | null;
+  tokensUsed: number;
+}) {
+  const mode = useContextIndicatorMode();
+  const compactMode = mode === "compact" && autoCompactTokenLimit != null;
+  const denominator = compactMode ? autoCompactTokenLimit : contextWindow;
+  const pct = Math.min(tokensUsed / denominator, 1);
   // Arc, %, label, and tooltip all encode context USED: a fresh session
   // shows an empty ring at 0% and the ring fills as context is consumed.
   const usedArc = pct * RING_CIRCUMFERENCE;
   const usedPct = Math.round(pct * 100);
+  const accessibleLabel = compactMode
+    ? `${usedPct}% of compact budget used`
+    : `${usedPct}% of context used`;
+  const compactUsage = `${formatTokenCountShort(tokensUsed)}/${formatTokenCountShort(denominator)}`;
 
   const color =
     pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
@@ -3835,10 +3922,7 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span
-          className={cn("flex items-center gap-1.5", color)}
-          aria-label={`${usedPct}% of context used`}
-        >
+        <span className={cn("flex items-center gap-1.5", color)} aria-label={accessibleLabel}>
           <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
             {/* Track */}
             <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
@@ -3857,12 +3941,19 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
             )}
           </svg>
           <span className="text-sm tabular-nums" aria-hidden="true">
-            {usedPct}%
+            {usedPct}% · {compactUsage}
           </span>
         </span>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-44 text-center text-sm">
-        <p className="tabular-nums">{usedPct}% of context used.</p>
+        <p className="tabular-nums">
+          {tokensUsed.toLocaleString()} / {denominator.toLocaleString()} tokens · {usedPct}%
+        </p>
+        {compactMode && (
+          <p className="text-muted-foreground">
+            {Math.max(autoCompactTokenLimit - tokensUsed, 0).toLocaleString()} to Compact
+          </p>
+        )}
       </TooltipContent>
     </Tooltip>
   );
@@ -3979,9 +4070,11 @@ function ComposerStatusLine({
   goal,
   isSubAgentSession,
   onHostReconnect,
+  codexRateLimits,
 }: {
   goal: Goal | null;
   isSubAgentSession: boolean;
+  codexRateLimits?: CodexRateLimitsSnapshot | null;
   /**
    * Opens the reconnect help dialog, handed to the host badge — which turns
    * itself into a clickable reconnect affordance when its bound host is
@@ -3991,8 +4084,14 @@ function ComposerStatusLine({
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
+  const autoCompactTokenLimit = useChatStore((s) => s.autoCompactTokenLimit);
+  const sessionProviderUsageLimits = useChatStore((s) => s.providerUsageLimits);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
+  const llmModel = useChatStore((s) => s.llmModel);
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const boundAgentName = useChatStore((s) => s.boundAgentName);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
+  const usageContextPreferences = useUsageContextPreferences();
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
@@ -4002,6 +4101,23 @@ function ComposerStatusLine({
   // from the same source the badge does so the tray's render guard matches.
   const { session } = useSession(conversationId);
   const isHostBound = !!session?.hostId;
+  const isCodexSession = sessionHarness === "codex" || sessionHarness === "codex-native";
+  const formattedRateLimits = formatProviderUsageLimits(
+    isCodexSession
+      ? providerUsageLimitsFromCodex(codexRateLimits, llmModel)
+      : sessionProviderUsageLimits,
+  );
+  const resolvedLimits = resolveUsageContextLimits(
+    usageContextPreferences,
+    usageContextSourceKey({
+      hostId: session?.hostId,
+      agentName: boundAgentName,
+      harness: sessionHarness,
+      model: llmModel,
+    }),
+    contextWindow,
+    autoCompactTokenLimit,
+  );
 
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
@@ -4014,7 +4130,14 @@ function ComposerStatusLine({
   const showGoal = !!conversationId && goal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
-    !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
+    !!conversationId &&
+    resolvedLimits.contextWindow != null &&
+    resolvedLimits.contextWindow > 0 &&
+    tokensUsed != null;
+  const showRateLimits =
+    !!conversationId &&
+    usageContextPreferences.showProviderUsageLimits &&
+    formattedRateLimits != null;
   // A host-bound session shows the badge, so the tray must render for it even
   // with no branch/ring yet — otherwise the host + context footer vanishes for
   // sessions with no worktree branch (e.g. codex) until the ring populates.
@@ -4022,7 +4145,8 @@ function ComposerStatusLine({
   // the badge is where it lives and an unreachable session often has no
   // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showRateLimits && !showHostBadge)
+    return null;
 
   return (
     <div
@@ -4059,7 +4183,16 @@ function ComposerStatusLine({
           </span>
         )}
         {showGoal && goal && <GoalStatusPill goal={goal} />}
-        {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
+        {showRateLimits && formattedRateLimits && (
+          <ProviderUsageLimitsStatus value={formattedRateLimits} />
+        )}
+        {showRing && (
+          <ContextRing
+            contextWindow={resolvedLimits.contextWindow!}
+            autoCompactTokenLimit={resolvedLimits.autoCompactTokenLimit}
+            tokensUsed={tokensUsed}
+          />
+        )}
       </div>
     </div>
   );
@@ -4305,6 +4438,7 @@ export function Composer({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
+  codexRateLimits = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -5044,6 +5178,20 @@ export function Composer({
     const shouldSubmitFromKeyboard = isComposerSendKey(
       {
         key: e.key,
+        code: e.code,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        isComposing: e.nativeEvent.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    const newLineDisposition = composerNewLineDisposition(
+      {
+        key: e.key,
+        code: e.code,
         shiftKey: e.shiftKey,
         metaKey: e.metaKey,
         ctrlKey: e.ctrlKey,
@@ -5066,32 +5214,45 @@ export function Composer({
     // Enter/Tab complete the highlighted item. These take priority over
     // history recall and normal submission.
     if (menuOpen && menuMatches.length > 0) {
-      if (e.key === "ArrowDown") {
+      if (eventMatchesShortcutAction(e.nativeEvent, "nextSuggestion")) {
         e.preventDefault();
         setMenuIndex((i) => (i + 1) % menuMatches.length);
         return;
       }
-      if (e.key === "ArrowUp") {
+      if (eventMatchesShortcutAction(e.nativeEvent, "previousSuggestion")) {
         e.preventDefault();
         setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
         return;
       }
       if (
         !shouldPreferSendOverCompletion &&
-        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) &&
+        eventMatchesShortcutAction(e.nativeEvent, "applySuggestion") &&
         menuIndex >= 0
       ) {
         e.preventDefault();
         applyMenuSelection(menuMatches[menuIndex]!);
         return;
       }
-      if (e.key === "Escape") {
+      if (eventMatchesShortcutAction(e.nativeEvent, "dismissSuggestions")) {
         e.preventDefault();
         // Dismiss the menu by clearing the input so the user can start fresh.
         setValue("");
         setMenuIndex(-1);
         return;
       }
+    }
+
+    if (newLineDisposition !== "none") {
+      e.preventDefault();
+      if (newLineDisposition === "block") return;
+      const ta = e.currentTarget;
+      const start = ta.selectionStart;
+      const end = ta.selectionEnd;
+      const next = `${value.slice(0, start)}\n${value.slice(end)}`;
+      setValue(next);
+      dirtyRef.current = true;
+      queueMicrotask(() => ta.setSelectionRange(start + 1, start + 1));
+      return;
     }
 
     // Mobile Enter behavior takes precedence over this desktop preference:
@@ -5108,7 +5269,7 @@ export function Composer({
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isStreaming) {
+    if (eventMatchesShortcutAction(e.nativeEvent, "stopResponse") && isStreaming) {
       e.preventDefault();
       onStop();
       return;
@@ -5125,15 +5286,17 @@ export function Composer({
     // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
     // fire even mid-compose; without this guard the recall below intercepts
     // them (replacing the draft) and the hotkeys appear broken in the composer.
-    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    const recallsPrevious = eventMatchesShortcutAction(e.nativeEvent, "recallPreviousPrompt");
+    const recallsNext = eventMatchesShortcutAction(e.nativeEvent, "recallNextPrompt");
+    if (recallsPrevious || recallsNext) {
       const ta = e.currentTarget;
-      if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+      if (recallsPrevious && ta.selectionStart === 0) {
         const recalled = recallPrevious(value);
         if (recalled !== null) {
           e.preventDefault();
           applyRecall(ta, recalled);
         }
-      } else if (e.key === "ArrowDown" && ta.selectionEnd === ta.value.length) {
+      } else if (recallsNext && ta.selectionEnd === ta.value.length) {
         const recalled = recallNext();
         if (recalled !== null) {
           e.preventDefault();
@@ -5637,6 +5800,7 @@ export function Composer({
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
         onHostReconnect={onShowReconnectHelp}
+        codexRateLimits={codexRateLimits}
       />
     </form>
   );

@@ -7,6 +7,12 @@
 // holds a non-default value.
 
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { CONTEXT_INDICATOR_STORAGE_KEY } from "./contextIndicatorPreferences";
+import { KEYBOARD_SHORTCUTS_STORAGE_KEY } from "./keyboardShortcutPreferences";
+import { MOBILE_ASSISTANT_STORAGE_KEY } from "./mobileAssistantPreferences";
+import { SESSION_NAVIGATION_STORAGE_KEY } from "./sessionNavigationPreferences";
+import { USAGE_CONTEXT_STORAGE_KEY } from "./usageContextPreferences";
+import { syncAllUserPreferencesFromLocal } from "./userPreferencesSync";
 
 /** localStorage keys that constitute exportable user preferences. */
 const EXPORTABLE_KEYS = [
@@ -24,6 +30,11 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
+  CONTEXT_INDICATOR_STORAGE_KEY,
+  KEYBOARD_SHORTCUTS_STORAGE_KEY,
+  MOBILE_ASSISTANT_STORAGE_KEY,
+  SESSION_NAVIGATION_STORAGE_KEY,
+  USAGE_CONTEXT_STORAGE_KEY,
   "web-theme",
 ] as const;
 
@@ -138,5 +149,9 @@ export function applyImportedSettings(imported: ExportedSettings): number {
       // Swallow individual write failures.
     }
   }
+  // The browser's native `storage` event does not fire in the same tab that
+  // performs the import. Notify every synchronized preference owner and queue
+  // its server patch so the current device and the user's other devices agree.
+  syncAllUserPreferencesFromLocal();
   return count;
 }

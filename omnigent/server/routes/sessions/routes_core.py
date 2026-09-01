@@ -187,13 +187,15 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
-    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
-)
-from omnigent.stores.conversation_store import (
+    ARCHIVE_LOCK_LABEL_KEY,
+    DELETION_CLAIM_STALE_AFTER_S,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
+)
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
@@ -892,9 +894,20 @@ def register_core_routes(
         agent_id: str | None = Query(default=None),
         agent_name: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-        sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
+        sort_by: str = Query(
+            default="created_at",
+            pattern="^(created_at|updated_at|archived_at)$",
+        ),
         search_query: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
+        archived_only: bool = Query(default=False),
+        host_id: str | None = Query(default=None),
+        created_after: int | None = Query(default=None, ge=0),
+        created_before: int | None = Query(default=None, ge=0),
+        updated_after: int | None = Query(default=None, ge=0),
+        updated_before: int | None = Query(default=None, ge=0),
+        archived_after: int | None = Query(default=None, ge=0),
+        archived_before: int | None = Query(default=None, ge=0),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
@@ -921,8 +934,8 @@ def register_core_routes(
             have distinct bundles. ``None`` disables the filter.
         :param order: Sort direction, ``"desc"`` (newest-first)
             or ``"asc"`` (oldest-first).
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Column to sort on, ``"created_at"``,
+            ``"updated_at"``, or ``"archived_at"``.
         :param search_query: Case-insensitive substring filter on
             the session title or conversation content. ``None``
             or empty string disables the filter. A session
@@ -961,6 +974,11 @@ def register_core_routes(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        if sort_by == "archived_at" and not archived_only:
+            raise OmnigentError(
+                "sort_by='archived_at' requires archived_only=true",
+                code=ErrorCode.INVALID_INPUT,
+            )
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
         # like-named project belongs on "Shared with me", not in this folder.
@@ -987,6 +1005,14 @@ def register_core_routes(
             sort_by=sort_by,
             search_query=normalized_query,
             include_archived=include_archived,
+            archived_only=archived_only,
+            host_id=host_id,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            updated_before=updated_before,
+            archived_after=archived_after,
+            archived_before=archived_before,
             project=project,
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.
@@ -1598,7 +1624,7 @@ def register_core_routes(
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project:
+        elif body.archived is not None or body.archive_locked is not None or set_project:
             required_level = LEVEL_OWNER
         else:
             required_level = LEVEL_EDIT
@@ -1862,6 +1888,23 @@ def register_core_routes(
                     code=ErrorCode.NOT_FOUND,
                 )
 
+        if body.archive_locked is not None:
+            _lock_now = int(time.time())
+            _lock_result = await asyncio.to_thread(
+                conversation_store.set_archive_lock,
+                session_id,
+                body.archive_locked,
+                updated_at=_lock_now,
+                stale_before=_lock_now - DELETION_CLAIM_STALE_AFTER_S,
+            )
+            if _lock_result == "not_found":
+                raise _session_not_found()
+            if _lock_result == "busy":
+                raise OmnigentError(
+                    "Session deletion is already in progress.",
+                    code=ErrorCode.CONFLICT,
+                )
+
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2009,10 +2052,16 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+        _labels_to_clear: list[str] = []
+        for _clear_key in (
+            PROJECT_LABEL_KEY,
+            pinned_label_key(user_id),
+        ):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
-                await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
+                _labels_to_clear.append(_clear_key)
+        for _clear_key in _labels_to_clear:
+            await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         # Only when the switch was forwarded: a silent PATCH writes no label,

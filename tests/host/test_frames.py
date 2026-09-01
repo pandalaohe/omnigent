@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -342,6 +343,51 @@ def test_harness_readiness_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
+
+
+def test_codex_rate_limits_survive_hello_and_refresh_frames() -> None:
+    """Only the bounded sanitized quota shape crosses the Host wire."""
+    snapshot = {
+        "captured_at": 1_900_000_000,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 11.0,
+                        "window_duration_mins": 300,
+                    }
+                ],
+            }
+        ],
+    }
+    hello = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="laptop",
+        codex_rate_limits=snapshot,
+    )
+    decoded_hello = decode_host_frame(encode_host_frame(hello))
+    assert isinstance(decoded_hello, HostHelloFrame)
+    assert decoded_hello.codex_rate_limits == snapshot
+
+    refresh = HostCodexRateLimitsFrame(codex_rate_limits=snapshot)
+    decoded_refresh = decode_host_frame(encode_host_frame(refresh))
+    assert isinstance(decoded_refresh, HostCodexRateLimitsFrame)
+    assert decoded_refresh.codex_rate_limits == snapshot
+
+
+def test_codex_rate_limits_frame_rejects_unbounded_payload() -> None:
+    with pytest.raises(ValueError, match="codex rate-limit snapshot"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.codex_rate_limits",
+                    "codex_rate_limits": {"account": {"email": "private@example.com"}},
+                }
+            )
+        )
 
 
 def test_hello_frame_gateway_inference_round_trip() -> None:

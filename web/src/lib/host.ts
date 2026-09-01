@@ -94,6 +94,13 @@ export type OmnigentAnalyticsEvent =
 
 export interface OmnigentHostConfig {
   /**
+   * Stable identity of the selected Omnigent Server, normally its canonical
+   * base URL. Embedded/native hosts that can switch Servers must keep this
+   * value stable across reconnects and reloads so pending preference writes
+   * return to the correct Server. Standalone web falls back to its origin.
+   */
+  serverId?: string;
+  /**
    * Maps an web API path (always starting with `/v1`, `/health`, or
    * `/api/...`) to a `Response`. The host implementation is responsible for
    * prefixing the real API base and attaching auth (e.g. the monolith's

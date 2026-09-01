@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
 from tests.server.helpers import create_test_agent
@@ -2278,6 +2280,8 @@ async def test_patch_session_archive_hides_from_default_list(
     resp = await client.patch(f"/v1/sessions/{sid}", json={"archived": True})
     assert resp.status_code == 200
     assert resp.json()["archived"] is True
+    archived_at = resp.json()["archived_at"]
+    assert isinstance(archived_at, int)
 
     # Default listing excludes it.
     default_ids = {s["id"] for s in (await client.get("/v1/sessions")).json()["data"]}
@@ -2290,13 +2294,200 @@ async def test_patch_session_archive_hides_from_default_list(
     archived_row = next((s for s in archived_list if s["id"] == sid), None)
     assert archived_row is not None, "include_archived=true must return the archived session"
     assert archived_row["archived"] is True, "list item must carry archived=true"
+    assert archived_row["archived_at"] == archived_at
+
+    renamed = await client.patch(f"/v1/sessions/{sid}", json={"title": "renamed later"})
+    assert renamed.status_code == 200
+    assert renamed.json()["archived_at"] == archived_at
+
+    filtered = await client.get(
+        "/v1/sessions",
+        params={
+            "archived_only": "true",
+            "sort_by": "archived_at",
+            "archived_after": str(archived_at),
+        },
+    )
+    assert filtered.status_code == 200
+    assert sid in {row["id"] for row in filtered.json()["data"]}
+
+    invalid_mixed_sort = await client.get(
+        "/v1/sessions",
+        params={"include_archived": "true", "sort_by": "archived_at"},
+    )
+    assert invalid_mixed_sort.status_code == 400
 
     # Unarchive restores it to the default list.
     resp = await client.patch(f"/v1/sessions/{sid}", json={"archived": False})
     assert resp.status_code == 200
     assert resp.json()["archived"] is False
+    assert resp.json()["archived_at"] is None
     default_ids_after = {s["id"] for s in (await client.get("/v1/sessions")).json()["data"]}
     assert sid in default_ids_after, "unarchived session must reappear in the default list"
+
+
+async def test_archive_lock_blocks_delete_until_unlocked(
+    client: httpx.AsyncClient,
+) -> None:
+    """Archive locks persist and are enforced by DELETE, not only by a disabled button."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="keep-this-archive")
+    sid = session["id"]
+
+    raw_label = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"labels": {"omnigent.archive_locked": "1"}},
+    )
+    assert raw_label.status_code == 400
+    assert "archive_locked" in raw_label.text
+
+    locked = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"archived": True, "archive_locked": True},
+    )
+    assert locked.status_code == 200, locked.text
+    assert locked.json()["labels"]["omnigent.archive_locked"] == "1"
+
+    archived_only = await client.get("/v1/sessions", params={"archived_only": "true"})
+    assert archived_only.status_code == 200
+    assert sid in {row["id"] for row in archived_only.json()["data"]}
+
+    blocked = await client.delete(f"/v1/sessions/{sid}")
+    assert blocked.status_code == 409
+    assert "Unlock" in blocked.text
+
+    unlocked = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"archive_locked": False},
+    )
+    assert unlocked.status_code == 200, unlocked.text
+    assert "omnigent.archive_locked" not in unlocked.json()["labels"]
+
+    deleted = await client.delete(f"/v1/sessions/{sid}")
+    assert deleted.status_code == 200, deleted.text
+
+
+async def test_archive_lock_and_delete_are_serialized(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lock write cannot report success after DELETE passed its lock check."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="delete-lock-race")
+    sid = session["id"]
+    delete_entered = asyncio.Event()
+    allow_delete = asyncio.Event()
+
+    async def _blocking_stop(*_args: object, **_kwargs: object) -> None:
+        delete_entered.set()
+        await allow_delete.wait()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._best_effort_stop",
+        _blocking_stop,
+    )
+
+    delete_task = asyncio.create_task(client.delete(f"/v1/sessions/{sid}"))
+    await asyncio.wait_for(delete_entered.wait(), timeout=2)
+    lock_result = await client.patch(
+        f"/v1/sessions/{sid}", json={"archive_locked": True}
+    )
+    assert lock_result.status_code == 409, lock_result.text
+    assert "deletion" in lock_result.text.lower()
+
+    allow_delete.set()
+    deleted = await delete_task
+    assert deleted.status_code == 200, deleted.text
+
+
+async def test_active_delete_renews_claim_past_stale_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Long cleanup remains active rather than becoming takeover-eligible."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="heartbeat-delete-claim")
+    sid = session["id"]
+    delete_entered = asyncio.Event()
+    allow_delete = asyncio.Event()
+
+    async def _blocking_stop(*_args: object, **_kwargs: object) -> None:
+        delete_entered.set()
+        await allow_delete.wait()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._best_effort_stop",
+        _blocking_stop,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events.DELETION_CLAIM_HEARTBEAT_INTERVAL_S",
+        0.05,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events.DELETION_CLAIM_STALE_AFTER_S",
+        1,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_core.DELETION_CLAIM_STALE_AFTER_S",
+        1,
+    )
+
+    delete_task = asyncio.create_task(client.delete(f"/v1/sessions/{sid}"))
+    await asyncio.wait_for(delete_entered.wait(), timeout=2)
+    await asyncio.sleep(2.2)
+    lock_result = await client.patch(
+        f"/v1/sessions/{sid}", json={"archive_locked": True}
+    )
+    assert lock_result.status_code == 409, lock_result.text
+
+    allow_delete.set()
+    deleted = await delete_task
+    assert deleted.status_code == 200, deleted.text
+
+
+async def test_cancelled_delete_keeps_claim_until_to_thread_cleanup_finishes(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Request cancellation cannot expose a lock write during live cleanup."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="cancel-delete-worker")
+    sid = session["id"]
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+
+    def _blocking_file_cleanup(_self: object, _session_id: str) -> list[str]:
+        cleanup_entered.set()
+        assert allow_cleanup.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr(
+        SqlAlchemyFileStore,
+        "delete_all_for_session",
+        _blocking_file_cleanup,
+    )
+
+    delete_task = asyncio.create_task(client.delete(f"/v1/sessions/{sid}"))
+    assert await asyncio.to_thread(cleanup_entered.wait, 2)
+    delete_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delete_task
+
+    blocked = await client.patch(
+        f"/v1/sessions/{sid}", json={"archive_locked": True}
+    )
+    assert blocked.status_code == 409, blocked.text
+    allow_cleanup.set()
+
+    locked: httpx.Response | None = None
+    for _ in range(40):
+        locked = await client.patch(
+            f"/v1/sessions/{sid}", json={"archive_locked": True}
+        )
+        if locked.status_code == 200:
+            break
+        await asyncio.sleep(0.025)
+    assert locked is not None and locked.status_code == 200, locked.text if locked else ""
 
 
 @pytest.mark.parametrize("reasoning_effort", ["high", "xhigh", "max"])
@@ -4876,7 +5067,11 @@ async def test_post_external_session_usage_dynamic_context_window_overrides_snap
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_session_usage",
-            "data": {"context_tokens": 250_000, "context_window": 1_000_000},
+            "data": {
+                "context_tokens": 250_000,
+                "context_window": 1_000_000,
+                "auto_compact_token_limit": 900_000,
+            },
         },
     )
     assert resp.status_code == 202, resp.text
@@ -4884,10 +5079,12 @@ async def test_post_external_session_usage_dynamic_context_window_overrides_snap
     assert [event["type"] for _, event in published] == ["session.usage"]
     assert published[0][1]["context_tokens"] == 250_000
     assert published[0][1]["context_window"] == 1_000_000
+    assert published[0][1]["auto_compact_token_limit"] == 900_000
 
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["last_total_tokens"] == 250_000
     assert snapshot["context_window"] == 1_000_000
+    assert snapshot["auto_compact_token_limit"] == 900_000
 
 
 async def test_post_external_session_usage_window_only_payload_persists_window(
@@ -4927,6 +5124,80 @@ async def test_post_external_session_usage_window_only_payload_persists_window(
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["last_total_tokens"] == 100
     assert snapshot["context_window"] == 1_000_000
+
+
+async def test_post_external_session_usage_null_compact_limit_clears_previous_model(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved new Host/model clears the prior model's compact point."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    endpoint = f"/v1/sessions/{session['id']}/events"
+
+    seeded = await client.post(
+        endpoint,
+        json={
+            "type": "external_session_usage",
+            "data": {"auto_compact_token_limit": 180_000},
+        },
+    )
+    assert seeded.status_code == 202, seeded.text
+
+    cleared = await client.post(
+        endpoint,
+        json={
+            "type": "external_session_usage",
+            "data": {"auto_compact_token_limit": None},
+        },
+    )
+    assert cleared.status_code == 202, cleared.text
+    assert published[-1][1]["auto_compact_token_limit"] is None
+
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["auto_compact_token_limit"] is None
+
+
+async def test_external_session_usage_persists_provider_allowance_windows(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness allowance snapshot survives reload and is broadcast live."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    limits = {
+        "provider": "Claude",
+        "scope": "Claude plan",
+        "captured_at": 1_900_000_000,
+        "windows": [
+            {
+                "label": "5h",
+                "aria_label": "5 hour",
+                "used_percent": 11.4,
+                "duration_mins": 300,
+            }
+        ],
+    }
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": {"provider_usage_limits": limits}},
+    )
+    assert response.status_code == 202, response.text
+    assert published[-1][1]["provider_usage_limits"] == limits
+
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["provider_usage_limits"] == limits
 
 
 async def test_post_external_session_usage_rejects_empty_payload(

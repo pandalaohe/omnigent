@@ -11,6 +11,12 @@
 // consume — see `focusOwnsHotkey`.
 
 import { useEffect, useRef } from "react";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+} from "@/lib/keyboardShortcutPreferences";
 
 /** Monaco: ⌘K and Ctrl+K are both chord prefixes, on every platform. */
 const CHORD_PREFIX_SURFACE = ".monaco-editor";
@@ -20,12 +26,16 @@ const PTY_SURFACE = ".xterm";
 
 /** True when the event is the command-palette chord: Cmd/Ctrl+K, no Alt/Shift. */
 export function isCommandPaletteHotkey(e: globalThis.KeyboardEvent): boolean {
-  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return false;
   // AltGr reports as Ctrl+Alt on some layouts; the altKey check above already
   // rejects it, but guard explicitly so intl typing never triggers the palette.
   if (e.getModifierState("AltGraph")) return false;
   // Match the letter, not a physical code — ⌘ doesn't remap "k" across layouts.
-  return e.key === "k" || e.key === "K";
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("commandPalette")) return false;
+  if (!hasCustomShortcutBindings("commandPalette")) {
+    const hasPrimary = (e.ctrlKey || e.metaKey) && !(e.ctrlKey && e.metaKey);
+    return hasPrimary && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k";
+  }
+  return eventMatchesShortcutAction(e, "commandPalette");
 }
 
 /**

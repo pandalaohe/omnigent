@@ -16,6 +16,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import type { TerminalSoftKeyEventDetail } from "@/lib/mobileAssistantPreferences";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -23,6 +24,23 @@ import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/code
 const CARD_LIGHT = "#ffffff";
 const CARD_DARK = "#131517";
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
+
+export function terminalSoftKeyPayload(
+  action: TerminalSoftKeyEventDetail["action"],
+  applicationCursor: boolean,
+): string {
+  const prefix = applicationCursor ? "\u001bO" : "\u001b[";
+  const payloads: Record<TerminalSoftKeyEventDetail["action"], string> = {
+    escape: "\u001b",
+    tab: "\t",
+    enter: "\r",
+    arrowUp: `${prefix}A`,
+    arrowDown: `${prefix}B`,
+    arrowRight: `${prefix}C`,
+    arrowLeft: `${prefix}D`,
+  };
+  return payloads[action];
+}
 
 function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
   return {
@@ -715,6 +733,15 @@ export class TerminalSession {
    */
   setTheme(isDark: boolean): void {
     this.term.options.theme = terminalTheme(isDark);
+  }
+
+  /** Feed a mobile assistant key through xterm's normal onData path. */
+  sendSoftKey(action: TerminalSoftKeyEventDetail["action"]): void {
+    this.term.input(
+      terminalSoftKeyPayload(action, this.term.modes.applicationCursorKeysMode),
+      true,
+    );
+    this.term.focus();
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */

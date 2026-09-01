@@ -9,6 +9,7 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 
 const mocks = vi.hoisted(() => ({
@@ -17,6 +18,8 @@ const mocks = vi.hoisted(() => ({
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
   bulkArchiveMutate: vi.fn(),
+  archiveLockMutate: vi.fn(),
+  bulkLockMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
@@ -35,6 +38,10 @@ const mocks = vi.hoisted(() => ({
   // Picker options come from useArchivedProjectNames (a dedicated scan), not
   // from the loaded rows — so tests set them independently of `conversations`.
   projectNames: [] as string[],
+  hostIds: [] as string[],
+  agentNames: [] as string[],
+  hosts: [] as { host_id: string; name: string }[],
+  archivedFilters: undefined as Record<string, unknown> | undefined,
   hasNextPage: false,
   fetchNextPage: vi.fn(),
 }));
@@ -66,21 +73,37 @@ vi.mock("@/hooks/useConversations", async () => {
   const { useState } = await import("react");
   return {
     PROJECT_LABEL_KEY: "omni_project",
+    ARCHIVE_LOCK_LABEL_KEY: "omnigent.archive_locked",
     // The Archived view drives the visible list from this hook; filter on the
     // fourth (`project`) arg so the mock mirrors the server-side ?project=
     // scoping.
-    useConversations: (
-      _searchQuery?: string,
-      _includeArchived?: boolean,
-      _options?: unknown,
-      project?: string,
-    ) => {
+    useArchivedConversations: (filters: {
+      project?: string;
+      hostId?: string;
+      agentName?: string;
+      searchQuery?: string;
+    }) => {
+      mocks.archivedFilters = filters;
       // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
       // otherwise serve a single page of `mocks.conversations`.
       const source = mocks.pages ?? [mocks.conversations];
       const [shown, setShown] = useState(1);
       const pages = source.slice(0, shown).map((rows) => ({
-        data: project ? rows.filter((c) => c.labels?.["omni_project"] === project) : rows,
+        data: rows.filter((conversation) => {
+          if (conversation.archived !== true) return false;
+          if (filters.project && conversation.labels?.["omni_project"] !== filters.project) {
+            return false;
+          }
+          if (filters.hostId && conversation.host_id !== filters.hostId) return false;
+          if (filters.agentName && conversation.agent_name !== filters.agentName) return false;
+          const query = filters.searchQuery?.toLowerCase();
+          return (
+            !query ||
+            `${conversation.title ?? ""} ${conversation.workspace ?? ""}`
+              .toLowerCase()
+              .includes(query)
+          );
+        }),
       }));
       return {
         data: { pages },
@@ -95,7 +118,10 @@ vi.mock("@/hooks/useConversations", async () => {
     },
     // Picker options are sourced from this dedicated scan, decoupled from the
     // loaded rows so archived-only projects on later pages still appear.
-    useArchivedProjectNames: () => ({ data: mocks.projectNames }),
+    useArchivedSessionFacets: () => ({
+      data: { projects: mocks.projectNames, hostIds: mocks.hostIds, agentNames: mocks.agentNames },
+    }),
+    useProjects: () => ({ data: [] }),
     useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     // Mirrors react-query's mutate: per-call `onSuccess` runs once the
     // mutation settles, which is what drives the post-unarchive navigation.
@@ -107,6 +133,10 @@ vi.mock("@/hooks/useConversations", async () => {
       isPending: false,
     }),
     useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
+    useArchiveLockConversation: () => ({
+      mutate: mocks.archiveLockMutate,
+      isPending: false,
+    }),
     useBulkArchiveConversations: () => ({
       mutate: mocks.bulkArchiveMutate,
       isPending: false,
@@ -117,8 +147,16 @@ vi.mock("@/hooks/useConversations", async () => {
       isPending: false,
       isError: false,
     }),
+    useBulkArchiveLockConversations: () => ({
+      mutate: mocks.bulkLockMutate,
+      isPending: false,
+      isError: false,
+    }),
   };
 });
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: () => ({ data: mocks.hosts }),
+}));
 // Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
 // native <select> so tests can drive both the color-theme dropdown and the
 // archived project filter. The real page puts data-testid on SelectTrigger,
@@ -161,6 +199,14 @@ vi.mock("@/components/ui/select", async () => {
     ),
   };
 });
+vi.mock("@/components/ContextUsageSettings", () => ({
+  ContextUsageSettings: () => (
+    <div data-testid="context-usage-settings">
+      Context source and overrides
+      <span>Show provider usage limits</span>
+    </div>
+  ),
+}));
 // The admin management surfaces are lazy-loaded and own heavy data layers of
 // their own; stub them so these tests only assert SettingsPage's section
 // routing (that /settings/members and /settings/policies render the right one).
@@ -202,11 +248,18 @@ function renderPage(path = "/settings") {
   );
 }
 
+function chooseArchiveFilter(label: string, option: string) {
+  fireEvent.click(screen.getByRole("combobox", { name: label }));
+  fireEvent.click(screen.getByRole("option", { name: option }));
+}
+
 beforeEach(() => {
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
   mocks.bulkArchiveMutate.mockReset();
+  mocks.archiveLockMutate.mockReset();
+  mocks.bulkLockMutate.mockReset();
   mocks.bulkDeleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
   mocks.theme = "system";
@@ -216,6 +269,10 @@ beforeEach(() => {
   mocks.conversations = [];
   mocks.pages = undefined;
   mocks.projectNames = [];
+  mocks.hostIds = [];
+  mocks.agentNames = [];
+  mocks.hosts = [];
+  mocks.archivedFilters = undefined;
   mocks.hasNextPage = false;
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
@@ -301,6 +358,43 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("theme-system")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByTestId("theme-dark"));
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("keeps compact progress and usage status in their own section", () => {
+    renderPage("/settings/context-usage");
+    const toggle = screen.getByTestId("compact-progress-indicator-toggle");
+
+    expect(screen.getByRole("heading", { name: "Context & usage" })).toBeInTheDocument();
+    expect(screen.getByTestId("context-usage-settings")).toHaveTextContent(
+      "Context source and overrides",
+    );
+    expect(screen.getByTestId("context-usage-settings")).toHaveTextContent(
+      "Show provider usage limits",
+    );
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem(CONTEXT_INDICATOR_STORAGE_KEY)).toBeNull();
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem(CONTEXT_INDICATOR_STORAGE_KEY)).toBe("compact");
+  });
+
+  it("keeps polling and mobile controls together under shortcuts", () => {
+    const shortcuts = renderPage("/settings/shortcuts");
+    expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeInTheDocument();
+    expect(screen.getByTestId("session-navigation-settings")).toBeInTheDocument();
+    expect(screen.getByLabelText("Enable mobile floating assistant")).toBeInTheDocument();
+    shortcuts.unmount();
+
+    const navigation = renderPage("/settings/navigation");
+    expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeInTheDocument();
+    expect(screen.getByTestId("session-navigation-settings")).toBeInTheDocument();
+    navigation.unmount();
+
+    renderPage("/settings/mobile-controls");
+    expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Enable mobile floating assistant")).toBeInTheDocument();
   });
 
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
@@ -963,20 +1057,13 @@ describe("SettingsPage", () => {
 
     // "All projects" (default) lists every archived session.
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
-    const select = screen.getByTestId("archived-project-filter");
-    expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
-    expect(within(select).getByRole("option", { name: "Alpha" })).toBeInTheDocument();
-    expect(within(select).getByRole("option", { name: "Beta" })).toBeInTheDocument();
-
-    // Picking a project narrows the list to that project's archived sessions.
-    // Select values are discriminated (`project:<name>`), never the raw name.
-    fireEvent.change(select, { target: { value: "project:Alpha" } });
+    chooseArchiveFilter("Filter archived sessions by project", "Alpha");
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
 
     // Back to "All projects" restores the full list.
-    fireEvent.change(select, { target: { value: "all" } });
+    chooseArchiveFilter("Filter archived sessions by project", "All projects");
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
   });
 
@@ -984,7 +1071,7 @@ describe("SettingsPage", () => {
     mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
     renderPage("/settings/archived");
 
-    expect(screen.queryByTestId("archived-project-filter")).toBeNull();
+    expect(screen.getByTestId("archived-project-filter")).toBeInTheDocument();
     expect(screen.getByTestId("archived-row")).toBeInTheDocument();
   });
 
@@ -992,8 +1079,8 @@ describe("SettingsPage", () => {
     mocks.conversations = [conv("conv_active")];
     renderPage("/settings/archived");
 
-    expect(screen.getByText("No archived sessions.")).toBeInTheDocument();
-    expect(screen.queryByTestId("archived-project-filter")).toBeNull();
+    expect(screen.getByText("No archived sessions match.")).toBeInTheDocument();
+    expect(screen.getByTestId("archived-project-filter")).toBeInTheDocument();
   });
 
   it("shows a project-scoped empty state when the picked project has no rows", () => {
@@ -1003,12 +1090,11 @@ describe("SettingsPage", () => {
     ];
     renderPage("/settings/archived");
 
-    const select = screen.getByTestId("archived-project-filter");
     // Drop Alpha's only session so the filtered fetch returns nothing, then
     // pick Alpha (still an option because it's in the scanned name set).
     mocks.conversations = [];
-    fireEvent.change(select, { target: { value: "project:Alpha" } });
-    expect(screen.getByText("No archived sessions in this project.")).toBeInTheDocument();
+    chooseArchiveFilter("Filter archived sessions by project", "Alpha");
+    expect(screen.getByText("No archived sessions match.")).toBeInTheDocument();
   });
 
   it("offers archived-only projects whose sessions are beyond the first loaded page", () => {
@@ -1019,9 +1105,8 @@ describe("SettingsPage", () => {
     mocks.conversations = [conv("p1", { archived: true, title: "Page-one chat" })];
     renderPage("/settings/archived");
 
-    const select = screen.getByTestId("archived-project-filter");
-    // Gamma is offered even though no Gamma row is in the loaded page.
-    expect(within(select).getByRole("option", { name: "Gamma" })).toBeInTheDocument();
+    chooseArchiveFilter("Filter archived sessions by project", "Gamma");
+    expect(screen.getByText("Gamma")).toBeInTheDocument();
   });
 
   it("treats a project literally named __all__ as a real project, not the clear-filter sentinel", () => {
@@ -1032,10 +1117,9 @@ describe("SettingsPage", () => {
     ];
     renderPage("/settings/archived");
 
-    const select = screen.getByTestId("archived-project-filter");
     // Picking the "__all__" project must FILTER to it (discriminated value
     // `project:__all__`), not clear the filter.
-    fireEvent.change(select, { target: { value: "project:__all__" } });
+    chooseArchiveFilter("Filter archived sessions by project", "__all__");
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Edge chat")).toBeInTheDocument();
@@ -1061,8 +1145,7 @@ describe("SettingsPage", () => {
 
     // No archived rows on page 1, but more pages exist → not the definitive
     // empty state; a pager is offered instead.
-    expect(screen.queryByText("No archived sessions.")).toBeNull();
-    expect(screen.getByText("No archived sessions on this page.")).toBeInTheDocument();
+    expect(screen.queryByText("No archived sessions match these filters.")).toBeNull();
     expect(screen.getByTestId("archived-load-more")).toBeInTheDocument();
 
     // Paging forward surfaces the archived row that lived on page 2.
@@ -1088,11 +1171,15 @@ describe("SettingsPage", () => {
       const oldSec = oldDate.getTime() / 1000;
 
       mocks.conversations = [
-        conv("c_today", { archived: true, title: "Today chat", updated_at: todaySec }),
-        conv("c_yesterday", { archived: true, title: "Yesterday chat", updated_at: yesterdaySec }),
-        conv("c_week", { archived: true, title: "This week chat", updated_at: fiveDaysAgoSec }),
-        conv("c_month", { archived: true, title: "This month chat", updated_at: twentyDaysAgoSec }),
-        conv("c_old", { archived: true, title: "Old chat", updated_at: oldSec }),
+        conv("c_today", { archived: true, title: "Today chat", archived_at: todaySec }),
+        conv("c_yesterday", { archived: true, title: "Yesterday chat", archived_at: yesterdaySec }),
+        conv("c_week", { archived: true, title: "This week chat", archived_at: fiveDaysAgoSec }),
+        conv("c_month", {
+          archived: true,
+          title: "This month chat",
+          archived_at: twentyDaysAgoSec,
+        }),
+        conv("c_old", { archived: true, title: "Old chat", archived_at: oldSec }),
       ];
       renderPage("/settings/archived");
 
@@ -1150,7 +1237,7 @@ describe("SettingsPage", () => {
     fireEvent.click(rows[1]);
 
     fireEvent.click(screen.getByTestId("archived-bulk-delete"));
-    fireEvent.click(screen.getByRole("button", { name: /Delete 2 session/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
     expect(mocks.bulkDeleteMutate).toHaveBeenCalledWith({ ids: ["a1", "a2"] }, expect.anything());
   });
 
@@ -1165,6 +1252,8 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getAllByTestId("archived-row")[0]);
 
     fireEvent.click(screen.getByTestId("archived-bulk-unarchive"));
+    expect(mocks.bulkArchiveMutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
     expect(mocks.bulkArchiveMutate).toHaveBeenCalledWith(
       { ids: ["a1"], archived: false },
       expect.anything(),
@@ -1193,11 +1282,86 @@ describe("SettingsPage", () => {
     renderPage("/settings/archived");
 
     fireEvent.click(screen.getByTestId("archived-toggle-selection"));
-    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    fireEvent.click(screen.getByRole("button", { name: "Select visible" }));
     expect(screen.getByText("3 selected")).toBeInTheDocument();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: "Deselect all" }));
-    expect(screen.getByText("None selected")).toBeInTheDocument();
+  it("shows recorded CWD, Host, Agent, archive date, and create date", () => {
+    mocks.hostIds = ["host-win"];
+    mocks.agentNames = ["codex-native"];
+    mocks.hosts = [{ host_id: "host-win", name: "Windows Workstation" }];
+    mocks.conversations = [
+      conv("a1", {
+        archived: true,
+        title: "Archive details",
+        host_id: "host-win",
+        agent_name: "codex-native",
+        workspace: "D:/AIProgram/Projects/Omnigent",
+      }),
+    ];
+
+    renderPage("/settings/archived");
+
+    expect(screen.getByText("D:/AIProgram/Projects/Omnigent")).toBeInTheDocument();
+    expect(screen.getByText("Windows Workstation")).toBeInTheDocument();
+    expect(screen.getByText("codex-native")).toBeInTheDocument();
+    expect(screen.getByText(/^Archived \d/)).toBeInTheDocument();
+    expect(screen.getByText(/^Created \d/)).toBeInTheDocument();
+  });
+
+  it("persists the compact archive view options", async () => {
+    renderPage("/settings/archived");
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Age" }), {
+      target: { value: "gt90d" },
+    });
+
+    await waitFor(() => {
+      const stored = JSON.parse(
+        localStorage.getItem("omnigent:archived-sessions-view-v1") ?? "{}",
+      ) as Record<string, unknown>;
+      expect(stored.agePreset).toBe("gt90d");
+      expect(mocks.archivedFilters?.agePreset).toBe("gt90d");
+    });
+  });
+
+  it("locks a row and protects it from delete", () => {
+    mocks.conversations = [
+      conv("a1", {
+        archived: true,
+        labels: { "omnigent.archive_locked": "1" },
+      }),
+    ];
+    renderPage("/settings/archived");
+
+    expect(screen.getByTestId("delete-archived")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("archive-lock-toggle"));
+    expect(mocks.archiveLockMutate).toHaveBeenCalledWith({ id: "a1", locked: false });
+  });
+
+  it("requires confirmation for bulk lock and skips locked rows on bulk delete", () => {
+    mocks.conversations = [
+      conv("open", { archived: true }),
+      conv("locked", {
+        archived: true,
+        labels: { "omnigent.archive_locked": "1" },
+      }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getByRole("button", { name: "Select visible" }));
+    fireEvent.click(screen.getByTestId("archived-bulk-lock"));
+    expect(mocks.bulkLockMutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(mocks.bulkLockMutate).toHaveBeenCalledWith(
+      { ids: ["open", "locked"], locked: true },
+      expect.anything(),
+    );
+
+    fireEvent.click(screen.getByTestId("archived-bulk-delete"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(mocks.bulkDeleteMutate).toHaveBeenCalledWith({ ids: ["open"] }, expect.anything());
   });
 
   it("hides the Select button when there are no archived sessions", () => {

@@ -17,7 +17,12 @@ import pytest
 import tomllib
 import yaml
 
-from omnigent import codex_native, codex_native_app_server, codex_native_forwarder
+from omnigent import (
+    codex_native,
+    codex_native_app_server,
+    codex_native_bridge,
+    codex_native_forwarder,
+)
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
@@ -9200,6 +9205,120 @@ def test_session_usage_data_uses_effective_model_context_window() -> None:
     assert data["context_window"] == 258_400
 
 
+def test_session_usage_data_includes_resolved_auto_compact_limit(tmp_path: Path) -> None:
+    """The usage report carries the current host/model compact point."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = bridge_dir / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    codex_native_bridge.write_codex_context_catalog(
+        bridge_dir,
+        {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "max_context_window": 872_000,
+                    "auto_compact_token_limit": 244_800,
+                    "effective_context_window_percent": 95,
+                }
+            ]
+        },
+    )
+    params = {
+        "tokenUsage": {
+            "modelContextWindow": 258_400,
+            "total": {"inputTokens": 100_000, "outputTokens": 10_000},
+        }
+    }
+
+    data = codex_native_forwarder._session_usage_data_from_params(
+        params,
+        bridge_dir=bridge_dir,
+        model="gpt-5.6-sol",
+    )
+
+    assert data is not None
+    assert data["auto_compact_token_limit"] == 244_800
+
+
+def test_session_usage_data_does_not_invent_compact_limit_from_percentage(
+    tmp_path: Path,
+) -> None:
+    """A catalog percentage alone is context sizing, not a Compact policy."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = bridge_dir / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    codex_native_bridge.write_codex_context_catalog(
+        bridge_dir,
+        {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "auto_compact_token_limit": None,
+                    "effective_context_window_percent": 95,
+                }
+            ]
+        },
+    )
+
+    data = codex_native_forwarder._session_usage_data_from_params(
+        {"tokenUsage": {"modelContextWindow": 258_400, "total": {"inputTokens": 1}}},
+        bridge_dir=bridge_dir,
+        model="gpt-5.6-sol",
+    )
+
+    assert data is not None
+    assert data["auto_compact_token_limit"] is None
+
+
+def test_session_usage_data_omits_compact_limit_for_body_after_prefix_scope(
+    tmp_path: Path,
+) -> None:
+    """A prefix-relative limit cannot be truthfully drawn on the total-context ring."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = bridge_dir / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-5.6-sol"\nmodel_auto_compact_token_limit_scope = "body_after_prefix"\n',
+        encoding="utf-8",
+    )
+    codex_native_bridge.write_codex_context_catalog(
+        bridge_dir,
+        {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "max_context_window": 872_000,
+                    "auto_compact_token_limit": None,
+                    "effective_context_window_percent": 95,
+                }
+            ]
+        },
+    )
+    params = {
+        "tokenUsage": {
+            "modelContextWindow": 258_400,
+            "total": {"inputTokens": 100_000, "outputTokens": 10_000},
+        }
+    }
+
+    data = codex_native_forwarder._session_usage_data_from_params(
+        params,
+        bridge_dir=bridge_dir,
+        model="gpt-5.6-sol",
+    )
+
+    assert data is not None
+    assert data["auto_compact_token_limit"] is None
+
+
 def test_session_usage_data_prefers_effective_context_window_over_legacy() -> None:
     """Codex's effective window takes precedence over the legacy total field."""
     params = {
@@ -11205,6 +11324,7 @@ def test_codex_discover_thread_login_required_records_error_before_waiting(
             bridge_dir=bridge_dir,
             codex_ws_url="ws://127.0.0.1:9999",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_FakeClient(),
             routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
             login_required=True,
@@ -11260,6 +11380,7 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
             bridge_dir=bridge_dir,
             codex_ws_url="ws://127.0.0.1:9999",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_FakeClient(),
             routing_summary="Codex CLI login (no provider configured)",
             login_required=True,

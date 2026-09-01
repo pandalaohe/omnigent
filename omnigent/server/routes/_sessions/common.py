@@ -257,6 +257,10 @@ _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
 
+_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY: str = "omnigent.last_auto_compact_token_limit"
+
+_LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY: str = "omnigent.last_provider_usage_limits"
+
 
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 

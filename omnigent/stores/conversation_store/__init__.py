@@ -5,7 +5,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.entities import (
     Agent,
@@ -85,6 +85,12 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+ARCHIVE_LOCK_LABEL_KEY = "omnigent.archive_locked"
+DELETION_CLAIM_STALE_AFTER_S = 15 * 60
+DELETION_CLAIM_HEARTBEAT_INTERVAL_S = 60
+
+DeletionClaimResult = Literal["claimed", "locked", "busy", "not_found"]
+ArchiveLockWriteResult = Literal["updated", "busy", "not_found"]
 
 # Reserved label-key PREFIX that records whether a session is "pinned" in the
 # sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
@@ -165,8 +171,10 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
+        "omnigent.last_auto_compact_token_limit",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.last_provider_usage_limits",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
@@ -641,9 +649,17 @@ class ConversationStore(ABC):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        host_id: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        updated_after: int | None = None,
+        updated_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
         include_archived: bool = False,
+        archived_only: bool = False,
         project: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
@@ -713,8 +729,8 @@ class ConversationStore(ABC):
             filter is disabled. Powers the ``GET /v1/sessions``
             list endpoint.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Column to sort on, ``"created_at"``,
+            ``"updated_at"``, or ``"archived_at"``.
         :param search_query: Case-insensitive substring filter on
             the conversation title OR conversation item content
             (``search_text``). ``None`` or empty string disables
@@ -938,6 +954,51 @@ class ConversationStore(ABC):
             rather than wall-clock drift between evaluate()
             and the actual DB write.
         """
+        ...
+
+    @abstractmethod
+    def claim_conversation_deletion(
+        self,
+        conversation_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+        stale_before: int,
+    ) -> DeletionClaimResult:
+        """Atomically claim an unlocked conversation for destructive cleanup.
+
+        A claim blocks archive-lock changes across processes. Claims older than
+        ``stale_before`` may be replaced so a process crash cannot strand a
+        session permanently.
+        """
+        ...
+
+    @abstractmethod
+    def release_conversation_deletion(self, conversation_id: str, token: str) -> bool:
+        """Release only the deletion claim owned by ``token``."""
+        ...
+
+    @abstractmethod
+    def renew_conversation_deletion(
+        self,
+        conversation_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+    ) -> bool:
+        """Refresh an active claim only while ``token`` still owns it."""
+        ...
+
+    @abstractmethod
+    def set_archive_lock(
+        self,
+        conversation_id: str,
+        locked: bool,
+        *,
+        updated_at: int,
+        stale_before: int,
+    ) -> ArchiveLockWriteResult:
+        """Atomically change archive protection unless deletion is active."""
         ...
 
     @abstractmethod

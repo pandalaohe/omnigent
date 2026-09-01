@@ -950,6 +950,19 @@ describe("session.usage (FLAT envelope)", () => {
     expect(ev.contextWindow).toBe(1000000);
   });
 
+  it("lifts the host-reported automatic compact point", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      context_tokens: 20000,
+      context_window: 100000,
+      auto_compact_token_limit: 80000,
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionUsageEvent;
+    expect(ev.autoCompactTokenLimit).toBe(80000);
+  });
+
   it("accepts window-only broadcasts (no context_tokens)", () => {
     // The forwarder may send just context_window when the user
     // switches models without producing a new message.usage block.
@@ -962,6 +975,22 @@ describe("session.usage (FLAT envelope)", () => {
     const ev = out[0] as SessionUsageEvent;
     expect(ev.contextTokens).toBeUndefined();
     expect(ev.contextWindow).toBe(1000000);
+  });
+
+  it("lifts provider-neutral allowance windows", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      provider_usage_limits: {
+        provider: "Claude",
+        scope: "Claude plan",
+        captured_at: 1_900_000_000,
+        windows: [{ label: "5h", aria_label: "5 hour", used_percent: 11, duration_mins: 300 }],
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as SessionUsageEvent).providerUsageLimits?.provider).toBe("Claude");
+    expect((out[0] as SessionUsageEvent).providerUsageLimits?.windows[0]?.usedPercent).toBe(11);
   });
 
   it("rejects payloads with neither field", () => {
@@ -1000,6 +1029,25 @@ describe("session.usage (FLAT envelope)", () => {
       context_window: 0,
     });
     expect(out).toEqual([]);
+  });
+
+  it("rejects a non-positive automatic compact point", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      auto_compact_token_limit: 0,
+    });
+    expect(out).toEqual([]);
+  });
+
+  it("accepts null to clear a compact point from the previous model", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      auto_compact_token_limit: null,
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as SessionUsageEvent).autoCompactTokenLimit).toBeNull();
   });
 
   it("accepts cost-only broadcasts (relay path, no context fields)", () => {

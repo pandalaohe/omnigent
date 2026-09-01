@@ -62,6 +62,40 @@ def _allow_tmp_path_as_bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
 
 
+def test_provider_usage_limits_post_only_on_change_or_refresh() -> None:
+    baseline: dict[str, object] = {
+        "provider": "Claude",
+        "captured_at": 1_000,
+        "windows": [{"label": "5h", "used_percent": 21}],
+    }
+    assert forwarder._provider_usage_limits_should_post(baseline, None) is True
+    assert (
+        forwarder._provider_usage_limits_should_post(
+            {**baseline, "captured_at": 1_299},
+            baseline,
+        )
+        is False
+    )
+    assert (
+        forwarder._provider_usage_limits_should_post(
+            {**baseline, "captured_at": 1_300},
+            baseline,
+        )
+        is True
+    )
+    assert (
+        forwarder._provider_usage_limits_should_post(
+            {
+                **baseline,
+                "captured_at": 1_001,
+                "windows": [{"label": "5h", "used_percent": 22}],
+            },
+            baseline,
+        )
+        is True
+    )
+
+
 class _RecordingHTTPServer(ThreadingHTTPServer):
     """
     HTTP server that records JSON POST bodies.
@@ -2078,7 +2112,7 @@ async def test_forwarder_start_at_end_uses_byte_offset_for_new_lines(
         '{"type":"assistant","uuid":"new-assistant","message":{"role":"assistant",'
         '"content":[{"type":"text","text":"new only"}]}'
     )
-    transcript_path.write_text(old_prefix + partial_record, encoding="utf-8")
+    transcript_path.write_text(old_prefix + partial_record, encoding="utf-8", newline="")
     record_hook_event(
         bridge_dir,
         {
@@ -2431,7 +2465,7 @@ async def test_forwarder_skips_to_end_on_stale_byte_cursor_state(tmp_path: Path)
         )
         + "\n"
     )
-    transcript_path.write_text(existing_content, encoding="utf-8")
+    transcript_path.write_text(existing_content, encoding="utf-8", newline="")
     record_hook_event(
         bridge_dir,
         {
@@ -2544,7 +2578,7 @@ async def test_forwarder_skips_to_end_on_out_of_range_byte_cursor_without_finger
         )
         + "\n"
     )
-    transcript_path.write_text(existing_content, encoding="utf-8")
+    transcript_path.write_text(existing_content, encoding="utf-8", newline="")
     record_hook_event(
         bridge_dir,
         {
@@ -2661,7 +2695,7 @@ async def test_forwarder_does_not_replay_after_compaction(tmp_path: Path) -> Non
         + "\n"
         for i in range(5)
     )
-    transcript_path.write_text(original_records, encoding="utf-8")
+    transcript_path.write_text(original_records, encoding="utf-8", newline="")
     original_end = len(original_records.encode())
     original_fingerprint = forwarder._jsonl_cursor_fingerprint(transcript_path, original_end)
 
@@ -2681,7 +2715,7 @@ async def test_forwarder_does_not_replay_after_compaction(tmp_path: Path) -> Non
         + "\n"
         for i in range(3)
     )
-    transcript_path.write_text(compacted_records, encoding="utf-8")
+    transcript_path.write_text(compacted_records, encoding="utf-8", newline="")
     compacted_end = len(compacted_records.encode())
 
     record_hook_event(
@@ -4287,7 +4321,7 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
         )
         + "\n"
     )
-    transcript_path.write_text(original_content, encoding="utf-8")
+    transcript_path.write_text(original_content, encoding="utf-8", newline="")
     original_fingerprint = forwarder._jsonl_cursor_fingerprint(
         transcript_path, len(original_content.encode())
     )
@@ -4303,7 +4337,7 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
         )
         + "\n"
     )
-    transcript_path.write_text(replacement_content, encoding="utf-8")
+    transcript_path.write_text(replacement_content, encoding="utf-8", newline="")
 
     caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
 

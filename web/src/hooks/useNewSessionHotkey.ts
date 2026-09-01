@@ -1,6 +1,12 @@
 import { useEffect } from "react";
 
 import { useNavigate } from "@/lib/routing";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+} from "@/lib/keyboardShortcutPreferences";
 
 function isMacPlatform(): boolean {
   if (typeof navigator === "undefined") return false;
@@ -11,9 +17,14 @@ function isMacPlatform(): boolean {
 
 /** True for Cmd+N on Apple platforms or Ctrl+N elsewhere, without extra modifiers. */
 export function isNewSessionHotkey(e: globalThis.KeyboardEvent, isMac = isMacPlatform()): boolean {
-  const platformModifier = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
-  if (!platformModifier || e.altKey || e.shiftKey || e.getModifierState("AltGraph")) return false;
-  return e.key === "n" || e.key === "N";
+  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("newSession")) return false;
+  if (!hasCustomShortcutBindings("newSession")) {
+    const platformModifier = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+    if (!platformModifier || e.altKey || e.shiftKey) return false;
+    return e.key === "n" || e.key === "N";
+  }
+  return eventMatchesShortcutAction(e, "newSession");
 }
 
 /** Navigate to the same new-session route used by the command palette. */

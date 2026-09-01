@@ -70,6 +70,7 @@ import type {
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
 import { routingExtrasFromWire } from "./routingDecision";
+import { providerUsageLimitsFromWire } from "./providerUsageLimits";
 import type { BackgroundTaskInfo, ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
@@ -581,6 +582,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const raw = data as Record<string, unknown>;
     const rawTokens = raw.context_tokens;
     const rawWindow = raw.context_window;
+    const rawAutoCompactTokenLimit = raw.auto_compact_token_limit;
+    const hasProviderUsageLimits = Object.hasOwn(raw, "provider_usage_limits");
+    const providerUsageLimits = hasProviderUsageLimits
+      ? providerUsageLimitsFromWire(raw.provider_usage_limits)
+      : undefined;
+    if (
+      hasProviderUsageLimits &&
+      raw.provider_usage_limits !== null &&
+      providerUsageLimits === null
+    ) {
+      return null;
+    }
     // Validate present fields; absent fields fall through so the
     // store keeps the cached value.
     let contextTokens: number | undefined;
@@ -596,6 +609,19 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         return null;
       }
       contextWindow = rawWindow;
+    }
+    let autoCompactTokenLimit: number | null | undefined;
+    if (rawAutoCompactTokenLimit === null) {
+      autoCompactTokenLimit = null;
+    } else if (rawAutoCompactTokenLimit !== undefined) {
+      if (
+        typeof rawAutoCompactTokenLimit !== "number" ||
+        !Number.isFinite(rawAutoCompactTokenLimit) ||
+        rawAutoCompactTokenLimit <= 0
+      ) {
+        return null;
+      }
+      autoCompactTokenLimit = rawAutoCompactTokenLimit;
     }
     // Cumulative session cost (USD). Present only on a priced session;
     // absent fields fall through so the store keeps the cached value.
@@ -618,6 +644,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (
       contextTokens === undefined &&
       contextWindow === undefined &&
+      autoCompactTokenLimit === undefined &&
+      providerUsageLimits === undefined &&
       totalCostUsd === undefined &&
       usageByModel === undefined
     ) {
@@ -628,6 +656,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       ...(contextTokens !== undefined ? { contextTokens } : {}),
       ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(autoCompactTokenLimit !== undefined ? { autoCompactTokenLimit } : {}),
+      ...(providerUsageLimits !== undefined ? { providerUsageLimits } : {}),
       ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
       ...(usageByModel !== undefined ? { usageByModel } : {}),
     } satisfies SessionUsageEvent;

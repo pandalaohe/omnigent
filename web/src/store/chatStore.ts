@@ -107,6 +107,7 @@ import type {
   SessionStatus,
   SkillSummary,
 } from "@/lib/types";
+import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
 import { uploadFile } from "@/lib/filesApi";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
@@ -460,6 +461,10 @@ export interface ConversationState {
    * model is not in litellm's registry.
    */
   contextWindow: number | null;
+  /** Host/model-reported automatic compaction point; null when unavailable. */
+  autoCompactTokenLimit: number | null;
+  /** Account allowance windows reported by the active session's harness. */
+  providerUsageLimits: ProviderUsageLimitsSnapshot | null;
   /**
    * Provider-reported input token count from the most recent
    * ``response.completed`` SSE event's ``usage.input_tokens``.
@@ -1331,6 +1336,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionHarness: null,
   subAgentName: null,
   contextWindow: null,
+  autoCompactTokenLimit: null,
+  providerUsageLimits: null,
   tokensUsed: null,
   sessionCostUsd: null,
   sessionUsageByModel: null,
@@ -2954,6 +2961,8 @@ function sessionBindingPatch(
   | "codexPlanMode"
   | "claudePermissionMode"
   | "contextWindow"
+  | "autoCompactTokenLimit"
+  | "providerUsageLimits"
   | "gitBranch"
   | "skills"
   | "codexModelOptions"
@@ -2982,6 +2991,8 @@ function sessionBindingPatch(
       ? (claudePermissionModeFromSession(session) ?? "")
       : "",
     contextWindow: session.contextWindow ?? null,
+    autoCompactTokenLimit: session.autoCompactTokenLimit ?? null,
+    providerUsageLimits: session.providerUsageLimits ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
     codexModelOptions: session.codexModelOptions ?? [],
@@ -3497,6 +3508,7 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
+  patch.autoCompactTokenLimit = session.autoCompactTokenLimit ?? null;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
@@ -5203,6 +5215,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       const patch: {
         tokensUsed?: number;
         contextWindow?: number;
+        autoCompactTokenLimit?: number | null;
+        providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
         sessionCostUsd?: number;
         sessionUsageByModel?: Record<string, ModelUsage>;
       } = {};
@@ -5211,6 +5225,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       if (event.contextWindow !== undefined) {
         patch.contextWindow = event.contextWindow;
+      }
+      if (event.autoCompactTokenLimit !== undefined) {
+        patch.autoCompactTokenLimit = event.autoCompactTokenLimit;
+      }
+      if (event.providerUsageLimits !== undefined) {
+        patch.providerUsageLimits = event.providerUsageLimits;
       }
       if (event.totalCostUsd !== undefined) {
         patch.sessionCostUsd = event.totalCostUsd;

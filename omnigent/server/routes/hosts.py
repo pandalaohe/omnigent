@@ -24,6 +24,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from omnigent.codex_rate_limits import CODEX_RATE_LIMITS_HARD_TTL_S
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -726,6 +727,28 @@ def create_hosts_router(
             "host_id": updated.host_id,
             "default_workspace": updated.default_workspace,
         }
+
+    @router.get("/hosts/{host_id}/codex-rate-limits")
+    async def get_host_codex_rate_limits(request: Request, host_id: str) -> dict[str, Any]:
+        """Return the live Host's sanitized Codex subscription quota snapshot."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        conn = host_registry.get(host.host_id)
+        snapshot = conn.hello.codex_rate_limits if conn is not None else None
+        captured_at = snapshot.get("captured_at") if isinstance(snapshot, dict) else None
+        current_time = now_epoch()
+        if (
+            not isinstance(captured_at, int)
+            or captured_at > current_time + 300
+            or current_time - captured_at > CODEX_RATE_LIMITS_HARD_TTL_S
+        ):
+            snapshot = None
+        return {"rate_limits": snapshot}
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(

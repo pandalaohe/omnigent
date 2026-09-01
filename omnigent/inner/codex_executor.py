@@ -1413,7 +1413,7 @@ def extended_model_catalog(
 # Cached ``codex debug models`` result, keyed by (binary, CODEX_HOME). The
 # catalog is a property of the installed CLI, not of a session, so a successful
 # probe is paid once per host process rather than once per session.
-_MODEL_CATALOG_CACHE: dict[tuple[str, str, int, int], dict[str, Any]] = {}
+_MODEL_CATALOG_CACHE: dict[tuple[str, str, int, int, bool], dict[str, Any]] = {}
 
 # Failures are cached only briefly, keyed the same way and holding the
 # monotonic time the negative expires. Caching them forever turned one
@@ -1422,7 +1422,7 @@ _MODEL_CATALOG_CACHE: dict[tuple[str, str, int, int], dict[str, Any]] = {}
 # from every later session's ``spawn_agent``. Caching them not at all would pay
 # the full timeout per session on a genuinely broken CLI.
 _MODEL_CATALOG_FAILURE_TTL_S = 60.0
-_MODEL_CATALOG_FAILURES: dict[tuple[str, str, int, int], float] = {}
+_MODEL_CATALOG_FAILURES: dict[tuple[str, str, int, int, bool], float] = {}
 
 # Both caches are host-process globals reached from worker threads (every
 # caller populates a codex home through ``asyncio.to_thread``), and the probe
@@ -1432,7 +1432,12 @@ _MODEL_CATALOG_FAILURES: dict[tuple[str, str, int, int], float] = {}
 _MODEL_CATALOG_LOCK = threading.Lock()
 
 
-def _model_catalog_cache_key(codex_path: str, source_home: Path) -> tuple[str, str, int, int]:
+def _model_catalog_cache_key(
+    codex_path: str,
+    source_home: Path,
+    *,
+    bundled: bool = False,
+) -> tuple[str, str, int, int, bool]:
     """
     Key the catalog cache so an in-place codex upgrade re-probes.
 
@@ -1449,8 +1454,8 @@ def _model_catalog_cache_key(codex_path: str, source_home: Path) -> tuple[str, s
     try:
         stat = os.stat(codex_path)
     except OSError:
-        return (codex_path, str(source_home), -1, -1)
-    return (codex_path, str(source_home), stat.st_mtime_ns, stat.st_size)
+        return (codex_path, str(source_home), -1, -1, bundled)
+    return (codex_path, str(source_home), stat.st_mtime_ns, stat.st_size, bundled)
 
 
 def _valid_model_catalog(catalog: object) -> bool:
@@ -1485,6 +1490,7 @@ def read_codex_model_catalog(
     source_home: Path,
     *,
     timeout: float = 10.0,
+    bundled: bool = False,
 ) -> dict[str, Any] | None:
     """
     Ask the codex CLI for its own model catalog, once per host process.
@@ -1499,9 +1505,11 @@ def read_codex_model_catalog(
     :param codex_path: The codex binary.
     :param source_home: ``CODEX_HOME`` to resolve config from.
     :param timeout: Seconds to wait; a slow probe must not delay session boot.
+    :param bundled: Read Codex's built-in catalog rather than any configured
+        replacement catalog.
     :returns: ``{"models": [...]}``, or ``None`` on any failure.
     """
-    cache_key = _model_catalog_cache_key(codex_path, source_home)
+    cache_key = _model_catalog_cache_key(codex_path, source_home, bundled=bundled)
     with _MODEL_CATALOG_LOCK:
         cached = _MODEL_CATALOG_CACHE.get(cache_key)
         if cached is not None:
@@ -1511,7 +1519,15 @@ def read_codex_model_catalog(
             if time.monotonic() < failed_until:
                 return None
             del _MODEL_CATALOG_FAILURES[cache_key]
-        catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
+        if bundled:
+            catalog = _probe_codex_model_catalog(
+                codex_path,
+                source_home,
+                timeout=timeout,
+                bundled=True,
+            )
+        else:
+            catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
         if catalog is None:
             _MODEL_CATALOG_FAILURES[cache_key] = time.monotonic() + _MODEL_CATALOG_FAILURE_TTL_S
             return None
@@ -1524,11 +1540,15 @@ def _probe_codex_model_catalog(
     source_home: Path,
     *,
     timeout: float,
+    bundled: bool = False,
 ) -> dict[str, Any] | None:
     """Run ``codex debug models``, returning ``None`` on any failure."""
     try:
+        argv = [codex_path, "debug", "models"]
+        if bundled:
+            argv.append("--bundled")
         completed = subprocess.run(
-            [codex_path, "debug", "models"],
+            argv,
             capture_output=True,
             text=True,
             timeout=timeout,

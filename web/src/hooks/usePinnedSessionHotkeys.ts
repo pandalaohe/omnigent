@@ -13,6 +13,12 @@
 import { useEffect, useRef } from "react";
 import { useNavigate } from "@/lib/routing";
 import { isNativeShell } from "@/lib/nativeBridge";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+} from "@/lib/keyboardShortcutPreferences";
 
 /** Index → the digit key that selects it (native path; matched against e.key).
  *  Single source of truth shared with the shortcuts dialog so binding and label
@@ -50,11 +56,18 @@ export function usePinnedSessionHotkeys(
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Cmd/Ctrl required; Shift left to other bindings.
-      if (e.shiftKey || !(e.metaKey || e.ctrlKey)) return;
-
       let index: number;
-      if (isNativeShell()) {
+      if (isShortcutRecordingActive() || !isShortcutActionEnabled("pinnedSession")) return;
+      const customized = hasCustomShortcutBindings("pinnedSession");
+      if (customized) {
+        if (!eventMatchesShortcutAction(e, "pinnedSession")) return;
+        index = PINNED_HOTKEY_CODES.indexOf(e.code as (typeof PINNED_HOTKEY_CODES)[number]);
+        if (index === -1) {
+          index = PINNED_HOTKEY_DIGITS.indexOf(e.key as (typeof PINNED_HOTKEY_DIGITS)[number]);
+        }
+      } else if ((!e.metaKey && !e.ctrlKey) || (e.metaKey && e.ctrlKey) || e.shiftKey) {
+        return;
+      } else if (isNativeShell()) {
         // Desktop owns plain Cmd/Ctrl+digit (Alt+chord is the message hotkey).
         if (e.altKey) return;
         index = PINNED_HOTKEY_DIGITS.indexOf(e.key as (typeof PINNED_HOTKEY_DIGITS)[number]);

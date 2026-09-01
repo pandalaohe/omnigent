@@ -16,7 +16,12 @@
  */
 
 import { getCachedServerInfo } from "./capabilities";
-import { getOmnigentHostConfig, hostFetch, isDatabricksWorkspace } from "./host";
+import {
+  getOmnigentHostConfig,
+  getOmnigentHostGeneration,
+  hostFetch,
+  isDatabricksWorkspace,
+} from "./host";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -24,6 +29,7 @@ import {
   markHostKeyless,
   modalHostId,
 } from "@/lib/sessionHost";
+import { initializeUserPreferencesSync } from "./userPreferencesSync";
 
 // Single-user sentinel from `GET /v1/me` (server's RESERVED_USER_LOCAL);
 // not a real actor, so never used as an author label.
@@ -337,9 +343,21 @@ export async function resolveIdentity(): Promise<string | null> {
         const data = (await res.json()) as {
           user_id: string | null;
           is_admin?: boolean;
+          preferences?: unknown | null;
         };
         currentUserId = data.user_id;
         currentIsAdmin = data.is_admin ?? false;
+        const stablePreferenceServerId =
+          getOmnigentHostConfig().serverId ??
+          (typeof window === "undefined" ? "server" : window.location.origin);
+        const preferenceConnectionId = `${stablePreferenceServerId}:${getOmnigentHostGeneration()}`;
+        await initializeUserPreferencesSync(
+          data.preferences,
+          authenticatedFetch,
+          data.user_id,
+          stablePreferenceServerId,
+          preferenceConnectionId,
+        );
       }
     } catch {
       // Server unreachable — leave as null.

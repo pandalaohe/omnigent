@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    HostCodexRateLimitsFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     encode_host_frame,
@@ -216,6 +217,70 @@ async def test_list_hosts_returns_connected_host(
     # field must be present and None so clients can tell it apart from
     # server-managed hosts without a schema sniff.
     assert hosts[0]["sandbox_provider"] is None
+
+
+async def test_codex_rate_limits_refresh_is_available_only_from_live_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A Host refresh becomes a sanitized REST snapshot and vanishes offline."""
+    app, registry, _hs, _cs = host_api_app
+    comm = await _connect_host(app, registry)
+    snapshot = {
+        "captured_at": int(time.time()),
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 11.0,
+                        "window_duration_mins": 300,
+                    },
+                    {
+                        "kind": "secondary",
+                        "used_percent": 6.0,
+                        "window_duration_mins": 10_080,
+                    },
+                ],
+            }
+        ],
+    }
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(HostCodexRateLimitsFrame(codex_rate_limits=snapshot)),
+        }
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for _ in range(50):
+            response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
+            if response.json()["rate_limits"] is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert response.status_code == 200
+        assert response.json() == {"rate_limits": snapshot}
+
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        stale_snapshot = {**snapshot, "captured_at": int(time.time()) - 3601}
+        conn.hello.codex_rate_limits = stale_snapshot
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
+        assert response.json() == {"rate_limits": None}
+
+        future_snapshot = {**snapshot, "captured_at": int(time.time()) + 301}
+        conn.hello.codex_rate_limits = future_snapshot
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
+        assert response.json() == {"rate_limits": None}
+
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        for _ in range(50):
+            if registry.get(_HOST_ID) is None:
+                break
+            await asyncio.sleep(0.01)
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
+        assert response.status_code == 200
+        assert response.json() == {"rate_limits": None}
 
 
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(

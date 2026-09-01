@@ -65,6 +65,7 @@ from omnigent.policies.types import (
     EvaluationContext,
     PolicyResult,
 )
+from omnigent.provider_usage_limits import validate_provider_usage_limits_snapshot
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
@@ -150,8 +151,10 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _FENCE_EXEMPT_EVENT_TYPES,
+    _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
     _LAST_CONTEXT_TOKENS_LABEL_KEY,
     _LAST_CONTEXT_WINDOW_LABEL_KEY,
+    _LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY,
     _MANAGED_RESUMABLE_TUNNEL_STALE_S,
     _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
     _MODEL_TOKEN_KEYS,
@@ -848,6 +851,7 @@ def _build_session_list_item(
         status=_session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
+        archived_at=conv.archived_at,
         title=title_without_closed_marker(conv.title),
         # Collapse per-user pin keys to the canonical bare key for this viewer
         # (never leak another user's pin key), then add the closed marker.
@@ -1068,6 +1072,21 @@ def _build_session_response(
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
+    raw_auto_compact_token_limit = conv.labels.get(_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY)
+    auto_compact_token_limit = (
+        int(raw_auto_compact_token_limit)
+        if isinstance(raw_auto_compact_token_limit, str)
+        and raw_auto_compact_token_limit.isdigit()
+        and int(raw_auto_compact_token_limit) > 0
+        else None
+    )
+    provider_usage_limits = None
+    raw_provider_usage_limits = conv.labels.get(_LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY)
+    if isinstance(raw_provider_usage_limits, str):
+        with contextlib.suppress(json.JSONDecodeError, ValueError):
+            provider_usage_limits = validate_provider_usage_limits_snapshot(
+                json.loads(raw_provider_usage_limits)
+            )
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     return SessionResponse(
@@ -1079,6 +1098,7 @@ def _build_session_response(
         background_tasks=background_tasks,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
+        archived_at=conv.archived_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
         runner_id=conv.runner_id,
@@ -1103,6 +1123,8 @@ def _build_session_response(
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
         context_window=context_window,
+        auto_compact_token_limit=auto_compact_token_limit,
+        provider_usage_limits=provider_usage_limits,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
         # total (this session + its sub-agents) when the caller computed
@@ -1590,6 +1612,30 @@ async def _persist_external_session_usage(
             "external_session_usage data.context_window must be a positive int",
             code=ErrorCode.INVALID_INPUT,
         )
+    has_auto_compact_token_limit = "auto_compact_token_limit" in body.data
+    raw_auto_compact_token_limit = body.data.get("auto_compact_token_limit")
+    if (
+        has_auto_compact_token_limit
+        and raw_auto_compact_token_limit is not None
+        and (
+            isinstance(raw_auto_compact_token_limit, bool)
+            or not isinstance(raw_auto_compact_token_limit, int)
+            or raw_auto_compact_token_limit <= 0
+        )
+    ):
+        raise OmnigentError(
+            "external_session_usage data.auto_compact_token_limit must be a positive int",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    has_provider_usage_limits = "provider_usage_limits" in body.data
+    raw_provider_usage_limits = body.data.get("provider_usage_limits")
+    try:
+        provider_usage_limits = validate_provider_usage_limits_snapshot(raw_provider_usage_limits)
+    except ValueError as exc:
+        raise OmnigentError(
+            f"external_session_usage data.provider_usage_limits is invalid: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
     _CUMULATIVE_USAGE_KEYS = (
         "cumulative_cost_usd",
         # ``policy_cost_usd`` alone is a valid post: mid-turn the displayed
@@ -1600,10 +1646,18 @@ async def _persist_external_session_usage(
         "cumulative_output_tokens",
     )
     has_cumulative = any(body.data.get(k) is not None for k in _CUMULATIVE_USAGE_KEYS)
-    if raw_tokens is None and raw_window is None and not has_cumulative:
+    if (
+        raw_tokens is None
+        and raw_window is None
+        and not has_auto_compact_token_limit
+        and not has_provider_usage_limits
+        and not has_cumulative
+    ):
         raise OmnigentError(
             "external_session_usage requires at least one of "
-            "data.context_tokens, data.context_window, or a cumulative usage field",
+            "data.context_tokens, data.context_window, data.auto_compact_token_limit, "
+            "data.provider_usage_limits, "
+            "or a cumulative usage field",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -1637,11 +1691,30 @@ async def _persist_external_session_usage(
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
     if raw_window is not None:
         label_updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(raw_window)
-    await asyncio.to_thread(
-        conversation_store.set_labels,
-        session_id,
-        label_updates,
-    )
+    if has_auto_compact_token_limit and raw_auto_compact_token_limit is not None:
+        label_updates[_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY] = str(raw_auto_compact_token_limit)
+    if has_provider_usage_limits and provider_usage_limits is not None:
+        label_updates[_LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY] = json.dumps(
+            provider_usage_limits, separators=(",", ":")
+        )
+    if label_updates:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            label_updates,
+        )
+    if has_auto_compact_token_limit and raw_auto_compact_token_limit is None:
+        await asyncio.to_thread(
+            conversation_store.delete_label,
+            session_id,
+            _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
+        )
+    if has_provider_usage_limits and provider_usage_limits is None:
+        await asyncio.to_thread(
+            conversation_store.delete_label,
+            session_id,
+            _LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY,
+        )
     # The displayed cost is this session's SUBTREE total (itself + its
     # sub-agents), matching the GET snapshot. A sub-agent persists its spend on
     # its own child conversation, so broadcasting only this session's own cost
@@ -1665,12 +1738,18 @@ async def _persist_external_session_usage(
         event_payload["context_tokens"] = raw_tokens
     if raw_window is not None:
         event_payload["context_window"] = raw_window
+    if has_auto_compact_token_limit:
+        event_payload["auto_compact_token_limit"] = raw_auto_compact_token_limit
+    if has_provider_usage_limits:
+        event_payload["provider_usage_limits"] = provider_usage_limits
     if subtree_cost is not None:
         event_payload["total_cost_usd"] = subtree_cost
     if usage_by_model is not None:
         event_payload["usage_by_model"] = usage_by_model
     event = SessionUsageEvent(**event_payload)
-    session_stream.publish(session_id, event.model_dump(exclude_none=True))
+    # ``exclude_unset`` preserves an explicit compact-limit null, which clears
+    # a stale threshold after the current Host/model becomes unresolvable.
+    session_stream.publish(session_id, event.model_dump(exclude_unset=True))
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.

@@ -5556,12 +5556,24 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           type: "session_usage",
           conversationId: "conv_bg",
           contextTokens: 99_999,
+          autoCompactTokenLimit: 180_000,
           totalCostUsd: 42,
         },
         "conv_bg",
       );
       expect(bg.get().tokensUsed).toBe(99_999);
+      expect(bg.get().autoCompactTokenLimit).toBe(180_000);
       expect(bg.get().sessionCostUsd).toBe(42);
+
+      handleSessionEvent(
+        {
+          type: "session_usage",
+          conversationId: "conv_bg",
+          autoCompactTokenLimit: null,
+        },
+        "conv_bg",
+      );
+      expect(bg.get().autoCompactTokenLimit).toBeNull();
       expect(useChatStore.getState().tokensUsed).toBe(100);
       expect(useChatStore.getState().sessionCostUsd).toBe(1);
     });

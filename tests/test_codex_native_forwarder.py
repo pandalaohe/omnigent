@@ -621,6 +621,19 @@ async def test_usage_coalescer_unseeded_omits_model() -> None:
     assert "model" not in body["data"]
 
 
+@pytest.mark.asyncio
+async def test_usage_coalescer_posts_first_explicit_null() -> None:
+    """A first-frame null clears a threshold left by an older forwarder."""
+    client = _RecordingClient()
+    coalescer = fwd._SessionUsageCoalescer(client, "conv_child")
+    coalescer._pending["auto_compact_token_limit"] = None
+
+    await coalescer.flush()
+
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"] == {"auto_compact_token_limit": None}
+
+
 class _FlakyElicitationClient:
     """
     Elicitation client stub: configurable failures, then HTTP 200.

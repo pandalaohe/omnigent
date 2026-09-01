@@ -9,6 +9,7 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  terminalSoftKeyPayload,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
@@ -231,6 +232,19 @@ describe("terminalKeyEventPayload", () => {
     expect(
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
+  });
+});
+
+describe("terminalSoftKeyPayload", () => {
+  it("uses normal and application cursor sequences for arrow buttons", () => {
+    expect(terminalSoftKeyPayload("arrowUp", false)).toBe("\u001b[A");
+    expect(terminalSoftKeyPayload("arrowUp", true)).toBe("\u001bOA");
+  });
+
+  it("maps the non-arrow mobile keys to terminal control bytes", () => {
+    expect(terminalSoftKeyPayload("escape", false)).toBe("\u001b");
+    expect(terminalSoftKeyPayload("tab", false)).toBe("\t");
+    expect(terminalSoftKeyPayload("enter", false)).toBe("\r");
   });
 });
 
@@ -526,6 +540,20 @@ describe("TerminalSession", () => {
       (m) => typeof m === "string" && m.includes('"type":"resize"'),
     );
     expect(resizeFrame).toBeDefined();
+    session.dispose();
+  });
+
+  it("sends mobile soft keys through xterm's onData websocket path", () => {
+    const onInput = vi.fn();
+    const { socket, session } = makeSession(undefined, onInput);
+    socket.open();
+    socket.sent = [];
+
+    session.sendSoftKey("arrowUp");
+
+    expect(onInput).toHaveBeenCalledOnce();
+    expect(socket.sent).toHaveLength(1);
+    expect(new TextDecoder().decode(socket.sent[0] as Uint8Array)).toBe("\u001b[A");
     session.dispose();
   });
 

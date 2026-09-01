@@ -43,8 +43,11 @@ import {
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  CheckIcon,
+  ChevronsUpDownIcon,
   DownloadIcon,
   KeyRoundIcon,
+  LockIcon,
   Loader2Icon,
   LaptopMinimalIcon,
   LogOutIcon,
@@ -60,9 +63,9 @@ import {
   SquareIcon,
   TerminalIcon,
   Trash2Icon,
+  UnlockIcon,
   UploadIcon,
   UserCogIcon,
-  XIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -75,6 +78,15 @@ import {
 } from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Command,
+  CommandEmpty,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import {
   Select,
@@ -94,20 +106,43 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { MOD_KEY } from "@/components/KeyboardShortcut";
-import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
+import { KeyboardShortcutEditor } from "@/components/KeyboardShortcutEditor";
+import { ContextUsageSettings } from "@/components/ContextUsageSettings";
+import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
+import {
+  MobileSessionTitleSetting,
+  SessionNavigationSettings,
+} from "@/components/SessionNavigationSettings";
+import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
+import {
+  CONTEXT_INDICATOR_DEFAULT,
+  writeContextIndicatorMode,
+} from "@/lib/contextIndicatorPreferences";
+import {
+  readSessionNavigationPreferences,
+  writeSessionNavigationPreferences,
+} from "@/lib/sessionNavigationPreferences";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
+  ARCHIVE_LOCK_LABEL_KEY,
+  type ArchivedAgePreset,
+  type ArchivedConversationFilters,
+  type ArchivedDateField,
   useArchiveConversation,
-  useArchivedProjectNames,
+  useArchiveLockConversation,
+  useArchivedConversations,
+  useArchivedSessionFacets,
   useBulkArchiveConversations,
+  useBulkArchiveLockConversations,
   useBulkDeleteConversations,
-  useConversations,
+  useProjects,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
+import { useHosts } from "@/hooks/useHosts";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
@@ -303,6 +338,7 @@ export function SettingsPage() {
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
+      {section === "context-usage" && <ContextUsageSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
@@ -744,6 +780,37 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+function CompactProgressIndicatorControl() {
+  const enabled = useContextIndicatorMode() === "compact";
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    writeContextIndicatorMode(next ? "compact" : CONTEXT_INDICATOR_DEFAULT);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Compact progress
+        </span>
+        <span
+          className="text-sm text-muted-foreground"
+          title="Make the context ring reach 100% at the automatic Compact point instead of the full context total."
+        >
+          Fill the ring to the Compact point.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="compact-progress-indicator-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.context_usage.compact_progress_indicator"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
   // replace it with a note (plus a link to the host's own theme settings when
@@ -774,6 +841,11 @@ function AppearanceSection() {
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
+
+    writeSessionNavigationPreferences({
+      ...readSessionNavigationPreferences(),
+      nativeMobileHeaderMode: "server",
+    });
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
@@ -848,7 +920,7 @@ function AppearanceSection() {
   return (
     <Section
       title="Appearance"
-      description="Choose how Omnigent looks on this device."
+      description="Choose how Omnigent looks."
       descriptionClassName="text-sm"
     >
       <div key={resetKey} className="flex flex-col gap-8">
@@ -884,6 +956,8 @@ function AppearanceSection() {
         <WorkspacePanelDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
+
+        <MobileSessionTitleSetting />
 
         <UiFontSizeControl />
 
@@ -1580,8 +1654,31 @@ function StepperButton({
 
 function ShortcutsSection() {
   return (
-    <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList />
+    <Section title="Keyboard shortcuts" description="Record and override shortcuts.">
+      <div className="flex flex-col gap-8">
+        <KeyboardShortcutEditor />
+        <div className="[&>section]:mt-0">
+          <SessionNavigationSettings />
+        </div>
+        <div className="border-t border-border pt-6">
+          <h2 className="text-ui font-medium">Mobile controls</h2>
+          <p className="mt-1 text-sm text-muted-foreground">Customize the mobile assistant.</p>
+          <div className="mt-5">
+            <MobileAssistantSettings />
+          </div>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+function ContextUsageSection() {
+  return (
+    <Section title="Context & usage" description="Context, Compact, and provider limits.">
+      <div className="flex flex-col gap-6">
+        <CompactProgressIndicatorControl />
+        <ContextUsageSettings />
+      </div>
     </Section>
   );
 }
@@ -2044,21 +2141,127 @@ function AccountSection() {
   );
 }
 
-// Discriminated Select values so the "no filter" sentinel can never collide
-// with a real project name: the reset option is a fixed token that no project
-// value can equal, and every project is namespaced under a prefix so its name
-// carries through verbatim. A project literally named "all" (or "__all__")
-// therefore still filters correctly instead of clearing the filter.
-const ALL_PROJECTS_VALUE = "all";
-const PROJECT_VALUE_PREFIX = "project:";
+const ARCHIVED_VIEW_STORAGE_KEY = "omnigent:archived-sessions-view-v1";
 
-function projectToSelectValue(project: string | undefined): string {
-  return project === undefined ? ALL_PROJECTS_VALUE : PROJECT_VALUE_PREFIX + project;
+interface ArchivedViewPreferences extends ArchivedConversationFilters {
+  project?: string;
+  hostId?: string;
+  agentName?: string;
 }
 
-function selectValueToProject(value: string): string | undefined {
-  if (value === ALL_PROJECTS_VALUE) return undefined;
-  return value.slice(PROJECT_VALUE_PREFIX.length);
+const DEFAULT_ARCHIVED_VIEW: ArchivedViewPreferences = {
+  searchQuery: "",
+  dateField: "archived_at",
+  sortField: "archived_at",
+  agePreset: "any",
+  order: "desc",
+};
+
+function readArchivedViewPreferences(): ArchivedViewPreferences {
+  try {
+    const stored = JSON.parse(
+      localStorage.getItem(ARCHIVED_VIEW_STORAGE_KEY) ?? "null",
+    ) as Partial<ArchivedViewPreferences> | null;
+    if (!stored) return DEFAULT_ARCHIVED_VIEW;
+    return {
+      ...DEFAULT_ARCHIVED_VIEW,
+      ...stored,
+      dateField: stored.dateField === "created_at" ? "created_at" : "archived_at",
+      sortField: stored.sortField === "created_at" ? "created_at" : "archived_at",
+      order: stored.order === "asc" ? "asc" : "desc",
+    };
+  } catch {
+    return DEFAULT_ARCHIVED_VIEW;
+  }
+}
+
+function isArchiveLocked(conversation: Conversation): boolean {
+  return conversation.labels?.[ARCHIVE_LOCK_LABEL_KEY] === "1";
+}
+
+function archivedTimestamp(
+  conversation: Conversation,
+  field: ArchivedDateField = "archived_at",
+): number {
+  if (field === "created_at") return conversation.created_at;
+  // Older Servers do not expose archived_at. updated_at is retained only as
+  // a compatibility fallback; current Servers provide the stable timestamp.
+  return conversation.archived_at ?? conversation.updated_at ?? conversation.created_at;
+}
+
+interface ArchiveFilterOption {
+  value: string;
+  label: string;
+  keywords?: string;
+}
+
+function ArchiveFilterCombobox({
+  label,
+  allLabel,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  allLabel: string;
+  value?: string;
+  options: ArchiveFilterOption[];
+  onChange: (value: string | undefined) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const current = options.find((option) => option.value === value);
+  return (
+    <div className="min-w-0">
+      <span className="mb-1 block text-xs text-muted-foreground">{label}</span>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="outline"
+            role="combobox"
+            aria-label={`Filter archived sessions by ${label.toLowerCase()}`}
+            data-testid={`archived-${label.toLowerCase()}-filter`}
+            aria-expanded={open}
+            className="h-9 w-full justify-between px-3 font-normal"
+          >
+            <span className="truncate">{current?.label ?? allLabel}</span>
+            <ChevronsUpDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent align="start" className="w-(--radix-popover-trigger-width) p-0">
+          <Command>
+            <CommandInput placeholder={`Search ${label.toLowerCase()}…`} />
+            <CommandList>
+              <CommandEmpty>No match.</CommandEmpty>
+              <CommandItem
+                value={allLabel}
+                data-checked={value === undefined}
+                onSelect={() => {
+                  onChange(undefined);
+                  setOpen(false);
+                }}
+              >
+                {allLabel}
+              </CommandItem>
+              {options.map((option) => (
+                <CommandItem
+                  key={option.value}
+                  value={`${option.label} ${option.keywords ?? ""}`}
+                  data-checked={option.value === value}
+                  onSelect={() => {
+                    onChange(option.value);
+                    setOpen(false);
+                  }}
+                >
+                  <span className="truncate">{option.label}</span>
+                </CommandItem>
+              ))}
+            </CommandList>
+          </Command>
+        </PopoverContent>
+      </Popover>
+    </div>
+  );
 }
 
 function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
@@ -2093,37 +2296,52 @@ function ImportSection() {
 }
 
 function ArchivedSection() {
-  // `undefined` = all projects; a name scopes the list to that project.
-  const [project, setProject] = useState<string | undefined>(undefined);
-
-  // Picker options: every project that has an archived session. Sourced from a
-  // dedicated hook that pages through ALL archived sessions server-side —
-  // `useProjects()` omits all-archived projects, and deriving options from only
-  // the visible list's loaded first page would hide archived-only projects
-  // whose sessions sit on later pages.
-  const namesQuery = useArchivedProjectNames();
-  const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
-
-  // A picked project can vanish from the option set for good (its last
-  // archived session deleted or restored, possibly by another client). Once
-  // the scan settles without it, fall back to "All projects" rather than
-  // pinning a defunct filter with a project-scoped empty state.
-  useEffect(() => {
-    if (
-      project !== undefined &&
-      namesQuery.isSuccess &&
-      !namesQuery.isFetching &&
-      !projectNames.includes(project)
-    ) {
-      setProject(undefined);
-    }
-  }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
-
-  // The visible list, filtered server-side via ?project= when one is picked.
-  const listQuery = useConversations("", true, undefined, project);
+  const [view, setView] = useState<ArchivedViewPreferences>(readArchivedViewPreferences);
+  const facetsQuery = useArchivedSessionFacets();
+  const projectsQuery = useProjects();
+  const hostsQuery = useHosts({ includeSandbox: true });
+  const listQuery = useArchivedConversations(view);
   const archived = useMemo(
-    () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
+    () => (listQuery.data?.pages ?? []).flatMap((page) => page.data),
     [listQuery.data],
+  );
+
+  useEffect(() => {
+    localStorage.setItem(ARCHIVED_VIEW_STORAGE_KEY, JSON.stringify(view));
+  }, [view]);
+
+  const setFilter = useCallback(
+    <K extends keyof ArchivedViewPreferences>(key: K, value: ArchivedViewPreferences[K]) => {
+      setView((current) => ({ ...current, [key]: value }));
+    },
+    [],
+  );
+
+  const hostNames = useMemo(
+    () => new Map((hostsQuery.data ?? []).map((host) => [host.host_id, host.name])),
+    [hostsQuery.data],
+  );
+  const projectOptions = useMemo(() => {
+    const names = new Set([
+      ...(facetsQuery.data?.projects ?? []),
+      ...(projectsQuery.data ?? []).map((project) => project.name),
+    ]);
+    return [...names]
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => ({ value: name, label: name }));
+  }, [facetsQuery.data, projectsQuery.data]);
+  const hostOptions = useMemo(
+    () =>
+      (facetsQuery.data?.hostIds ?? []).map((hostId) => ({
+        value: hostId,
+        label: hostNames.get(hostId) ?? hostId,
+        keywords: hostId,
+      })),
+    [facetsQuery.data, hostNames],
+  );
+  const agentOptions = useMemo(
+    () => (facetsQuery.data?.agentNames ?? []).map((name) => ({ value: name, label: name })),
+    [facetsQuery.data],
   );
 
   const groupedArchived = useMemo(() => {
@@ -2131,7 +2349,7 @@ function ArchivedSection() {
     const groups: { label: string; conversations: typeof archived }[] = [];
     let currentLabel = "";
     for (const conv of archived) {
-      const label = dateGroupLabel(conv.updated_at, now);
+      const label = dateGroupLabel(archivedTimestamp(conv, view.sortField), now);
       if (label !== currentLabel) {
         currentLabel = label;
         groups.push({ label, conversations: [] });
@@ -2139,13 +2357,7 @@ function ArchivedSection() {
       groups[groups.length - 1].conversations.push(conv);
     }
     return groups;
-  }, [archived]);
-
-  // Keep a picked project listed even if it drops out of the option set (its
-  // last archived session was just unarchived) so the trigger never shows a
-  // blank, orphaned value while the refetch settles.
-  const items =
-    project && !projectNames.includes(project) ? [project, ...projectNames] : projectNames;
+  }, [archived, view.sortField]);
 
   // ── Bulk selection ──
   const [selectionMode, setSelectionMode] = useState(false);
@@ -2182,64 +2394,165 @@ function ArchivedSection() {
     });
   }, [archived]);
 
+  const hasFilters = Boolean(
+    view.searchQuery || view.project || view.hostId || view.agentName || view.agePreset !== "any",
+  );
+
   return (
-    <Section
-      title="Archived sessions"
-      description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
-    >
-      <div className="mb-4 flex items-center gap-2">
-        {items.length > 0 && (
-          <>
-            <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
-              Project
-            </label>
-            <Select
-              value={projectToSelectValue(project)}
-              onValueChange={(value) => setProject(selectValueToProject(value))}
-            >
-              <SelectTrigger
-                id="archived-project-filter"
-                aria-label="Filter archived sessions by project"
-                data-testid="archived-project-filter"
-                className="w-56"
+    <section>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <h1 className="mr-auto text-xl font-semibold">Archived sessions</h1>
+        {archived.length > 0 &&
+          (selectionMode ? (
+            <>
+              <Button type="button" variant="ghost" size="sm" onClick={selectAll}>
+                <CheckIcon className="size-3.5" /> Select visible
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                data-testid="archived-exit-selection"
+                onClick={exitSelectionMode}
               >
+                Done
+              </Button>
+            </>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="archived-toggle-selection"
+              onClick={() => setSelectionMode(true)}
+            >
+              Select
+            </Button>
+          ))}
+      </div>
+
+      <div className="mb-3 rounded-lg border bg-muted/20 p-3">
+        <Input
+          type="search"
+          aria-label="Search archived session title or CWD"
+          placeholder="Search title or CWD…"
+          className="h-9"
+          value={view.searchQuery ?? ""}
+          onChange={(event) => setFilter("searchQuery", event.target.value)}
+        />
+
+        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <ArchiveFilterCombobox
+            label="Project"
+            allLabel="All projects"
+            value={view.project}
+            options={projectOptions}
+            onChange={(value) => setFilter("project", value)}
+          />
+          <ArchiveFilterCombobox
+            label="Host"
+            allLabel="All hosts"
+            value={view.hostId}
+            options={hostOptions}
+            onChange={(value) => setFilter("hostId", value)}
+          />
+        </div>
+
+        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+          <ArchiveFilterCombobox
+            label="Agent"
+            allLabel="All agents"
+            value={view.agentName}
+            options={agentOptions}
+            onChange={(value) => setFilter("agentName", value)}
+          />
+          <label className="min-w-0">
+            <span className="mb-1 block text-xs text-muted-foreground">Date</span>
+            <Select
+              value={view.dateField}
+              onValueChange={(value) => setFilter("dateField", value as ArchivedDateField)}
+            >
+              <SelectTrigger className="h-9 w-full" aria-label="Archived date field">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
-                {items.map((name) => (
-                  <SelectItem
-                    key={name}
-                    value={projectToSelectValue(name)}
-                    data-testid={`archived-project-option-${name}`}
-                  >
-                    {name}
-                  </SelectItem>
-                ))}
+              <SelectContent>
+                <SelectItem value="archived_at">Archive date</SelectItem>
+                <SelectItem value="created_at">Create date</SelectItem>
               </SelectContent>
             </Select>
-          </>
-        )}
-        {!selectionMode && archived.length > 0 && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            data-testid="archived-toggle-selection"
-            onClick={() => setSelectionMode(true)}
-          >
-            Select
-          </Button>
-        )}
+          </label>
+          <label className="min-w-0">
+            <span className="mb-1 block text-xs text-muted-foreground">Age</span>
+            <Select
+              value={view.agePreset}
+              onValueChange={(value) => setFilter("agePreset", value as ArchivedAgePreset)}
+            >
+              <SelectTrigger className="h-9 w-full" aria-label="Archived session age">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="any">Any</SelectItem>
+                <SelectItem value="lt24h">&lt;24h</SelectItem>
+                <SelectItem value="lt7d">&lt;7d</SelectItem>
+                <SelectItem value="gt7d">&gt;7d</SelectItem>
+                <SelectItem value="gt30d">&gt;30d</SelectItem>
+                <SelectItem value="gt90d">&gt;90d</SelectItem>
+                <SelectItem value="gt180d">&gt;180d</SelectItem>
+                <SelectItem value="gt365d">&gt;365d</SelectItem>
+              </SelectContent>
+            </Select>
+          </label>
+        </div>
+
+        <div className="mt-2 flex flex-wrap items-end gap-2 border-t pt-2">
+          <label className="min-w-40 flex-1">
+            <span className="mb-1 block text-xs text-muted-foreground">Sort by</span>
+            <Select
+              value={view.sortField}
+              onValueChange={(value) => setFilter("sortField", value as ArchivedDateField)}
+            >
+              <SelectTrigger className="h-9 w-full" aria-label="Sort archived sessions by">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="archived_at">Archive date</SelectItem>
+                <SelectItem value="created_at">Create date</SelectItem>
+              </SelectContent>
+            </Select>
+          </label>
+          <label className="min-w-40 flex-1">
+            <span className="mb-1 block text-xs text-muted-foreground">Order</span>
+            <Select
+              value={view.order}
+              onValueChange={(value) => setFilter("order", value as "asc" | "desc")}
+            >
+              <SelectTrigger className="h-9 w-full" aria-label="Archived session sort order">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="desc">Newest first</SelectItem>
+                <SelectItem value="asc">Oldest first</SelectItem>
+              </SelectContent>
+            </Select>
+          </label>
+          {hasFilters && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setView(DEFAULT_ARCHIVED_VIEW)}
+            >
+              Clear filters
+            </Button>
+          )}
+        </div>
       </div>
 
       {selectionMode && (
         <ArchivedBulkActionBar
           selectedIds={selectedIds}
           allArchived={archived}
-          onSelectAll={selectAll}
           onDeselectAll={deselectAll}
-          onExit={exitSelectionMode}
         />
       )}
 
@@ -2248,9 +2561,7 @@ function ArchivedSection() {
       ) : archived.length === 0 && !listQuery.hasNextPage ? (
         // Definitive empty only when there are no archived rows AND no further
         // pages to fetch.
-        <p className="text-ui text-muted-foreground">
-          {project ? "No archived sessions in this project." : "No archived sessions."}
-        </p>
+        <p className="text-ui text-muted-foreground">No archived sessions match.</p>
       ) : (
         <>
           {archived.length > 0 && (
@@ -2265,6 +2576,7 @@ function ArchivedSection() {
                       <ArchivedRow
                         key={conv.id}
                         conversation={conv}
+                        hostName={hostNames.get(conv.host_id ?? "")}
                         selectionMode={selectionMode}
                         isSelected={selectedIds.has(conv.id)}
                         onToggleSelected={toggleSelected}
@@ -2275,20 +2587,6 @@ function ArchivedSection() {
               ))}
             </div>
           )}
-          {archived.length === 0 && (
-            // The list fetches a mixed page (active + archived rows) and filters
-            // to archived client-side; archived sessions are older and can sort
-            // onto later pages, so a page with none isn't the end. Offer to page
-            // forward instead of dead-ending on the definitive empty state.
-            <p className="text-ui text-muted-foreground">
-              {project
-                ? "No archived sessions in this project on this page."
-                : "No archived sessions on this page."}
-            </p>
-          )}
-          {/* Keep the pager visible whenever more pages exist, independent of the
-              current page's archived count — otherwise a first page of only
-              active rows would hide the archived rows on later pages. */}
           {listQuery.hasNextPage && (
             <div className="mt-3">
               <Button
@@ -2305,7 +2603,7 @@ function ArchivedSection() {
           )}
         </>
       )}
-    </Section>
+    </section>
   );
 }
 
@@ -2317,17 +2615,14 @@ function ArchivedSection() {
 function ArchivedBulkActionBar({
   selectedIds,
   allArchived,
-  onSelectAll,
   onDeselectAll,
-  onExit,
 }: {
   selectedIds: Set<string>;
   allArchived: Conversation[];
-  onSelectAll: () => void;
   onDeselectAll: () => void;
-  onExit: () => void;
 }) {
   const bulkArchive = useBulkArchiveConversations();
+  const bulkLock = useBulkArchiveLockConversations();
   const bulkDelete = useBulkDeleteConversations();
   const viewerId = useViewerId();
 
@@ -2340,121 +2635,136 @@ function ArchivedBulkActionBar({
   }, [allArchived, selectedIds, viewerId]);
 
   const count = selectedIds.size;
-  const allSelected = count > 0 && count === allArchived.length;
-  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
-  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const deletableSelected = ownedSelected.filter((conversation) => !isArchiveLocked(conversation));
+  const unlock = ownedSelected.length > 0 && ownedSelected.every(isArchiveLocked);
+  const isBusy = bulkArchive.isPending || bulkLock.isPending || bulkDelete.isPending;
+  const [confirmAction, setConfirmAction] = useState<"lock" | "unarchive" | "delete" | null>(null);
 
-  function handleUnarchive() {
-    if (ownedSelected.length === 0) return;
-    bulkArchive.mutate(
-      { ids: ownedSelected.map((c) => c.id), archived: false },
-      { onSuccess: onDeselectAll },
-    );
+  function applyConfirmedAction() {
+    const ids = ownedSelected.map((conversation) => conversation.id);
+    if (confirmAction === "unarchive") {
+      bulkArchive.mutate({ ids, archived: false }, { onSuccess: onDeselectAll });
+    } else if (confirmAction === "lock") {
+      bulkLock.mutate({ ids, locked: !unlock }, { onSuccess: onDeselectAll });
+    } else if (confirmAction === "delete") {
+      bulkDelete.mutate(
+        { ids: deletableSelected.map((conversation) => conversation.id) },
+        { onSuccess: onDeselectAll },
+      );
+    }
+    setConfirmAction(null);
   }
 
-  function handleDelete() {
-    const ids = ownedSelected.map((c) => c.id);
-    if (ids.length === 0) return;
-    setConfirmDeleteOpen(false);
-    bulkDelete.mutate({ ids }, { onSuccess: onDeselectAll });
-  }
+  const dialogTitle =
+    confirmAction === "delete"
+      ? `Delete ${deletableSelected.length} session(s)?`
+      : confirmAction === "unarchive"
+        ? `Unarchive ${ownedSelected.length} session(s)?`
+        : `${unlock ? "Unlock" : "Lock"} ${ownedSelected.length} session(s)?`;
 
   return (
     <>
-      <div className="relative mb-4 flex flex-col gap-1.5 rounded-md border bg-muted/50 p-2">
-        <div className="relative flex min-h-8 items-center gap-1.5 pr-9">
-          <span className="shrink-0 whitespace-nowrap text-sm text-muted-foreground">
-            {count === 0 ? "None selected" : `${count} selected`}
-          </span>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-6 px-1.5 text-sm"
-            onClick={allSelected ? onDeselectAll : onSelectAll}
-          >
-            {allSelected ? "Deselect all" : "Select all"}
-          </Button>
-          <Button
-            type="button"
-            variant="secondary"
-            size="icon-sm"
-            className="-translate-y-1/2 absolute top-1/2 right-1 shrink-0 rounded-full"
-            aria-label="Exit selection mode"
-            data-testid="archived-exit-selection"
-            onClick={onExit}
-          >
-            <XIcon className="size-3.5" />
-          </Button>
-        </div>
+      <div className="mb-3 flex min-h-10 flex-wrap items-center gap-1.5 rounded-md border bg-muted/50 px-2 py-1.5">
+        <span className="mr-auto text-sm text-muted-foreground">
+          {count === 0 ? "None selected" : `${count} selected`}
+        </span>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-sm"
+              aria-label={unlock ? "Unlock selected sessions" : "Lock selected sessions"}
+              disabled={isBusy || ownedSelected.length === 0}
+              onClick={() => setConfirmAction("lock")}
+              data-testid="archived-bulk-lock"
+            >
+              {unlock ? <UnlockIcon className="size-3.5" /> : <LockIcon className="size-3.5" />}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{unlock ? "Unlock selected" : "Lock selected"}</TooltipContent>
+        </Tooltip>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-7 gap-1.5 text-xs"
+          disabled={isBusy || ownedSelected.length === 0}
+          onClick={() => setConfirmAction("unarchive")}
+          data-testid="archived-bulk-unarchive"
+        >
+          {bulkArchive.isPending ? (
+            <Loader2Icon className="size-3 animate-spin" />
+          ) : (
+            <ArchiveRestoreIcon className="size-3" />
+          )}
+          Unarchive {ownedSelected.length > 0 ? ownedSelected.length : ""}
+        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-sm"
+              className="text-destructive"
+              aria-label="Delete selected sessions"
+              disabled={isBusy || deletableSelected.length === 0}
+              onClick={() => setConfirmAction("delete")}
+              data-testid="archived-bulk-delete"
+            >
+              {bulkDelete.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <Trash2Icon className="size-3.5" />
+              )}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            Delete selected
+            {ownedSelected.length !== deletableSelected.length ? " (locked skipped)" : ""}
+          </TooltipContent>
+        </Tooltip>
 
-        <div className="flex items-center gap-1.5">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-7 gap-1.5 text-xs"
-            disabled={isBusy || ownedSelected.length === 0}
-            onClick={handleUnarchive}
-            data-testid="archived-bulk-unarchive"
-          >
-            {bulkArchive.isPending ? (
-              <Loader2Icon className="size-3 animate-spin" />
-            ) : (
-              <ArchiveRestoreIcon className="size-3" />
-            )}
-            Unarchive {ownedSelected.length > 0 ? ownedSelected.length : ""}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
-            disabled={isBusy || ownedSelected.length === 0}
-            onClick={() => setConfirmDeleteOpen(true)}
-            data-testid="archived-bulk-delete"
-          >
-            {bulkDelete.isPending ? (
-              <Loader2Icon className="size-3 animate-spin" />
-            ) : (
-              <Trash2Icon className="size-3" />
-            )}
-            Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
-          </Button>
-        </div>
-
-        {(bulkArchive.isError || bulkDelete.isError) && (
+        {(bulkArchive.isError || bulkLock.isError || bulkDelete.isError) && (
           <p className="text-xs text-destructive" role="alert">
-            Some actions failed. Retry or dismiss.
+            Some actions failed.
           </p>
         )}
       </div>
 
-      <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+      <Dialog
+        open={confirmAction !== null}
+        onOpenChange={(open) => !open && setConfirmAction(null)}
+      >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
+            <DialogTitle>{dialogTitle}</DialogTitle>
             <DialogDescription>
-              This will permanently delete the selected sessions and all their history. This cannot
-              be undone.
+              {confirmAction === "delete"
+                ? `Permanently removes session history. ${ownedSelected.length - deletableSelected.length} locked session(s) skipped.`
+                : confirmAction === "unarchive"
+                  ? "Returns the selected sessions to the sidebar."
+                  : unlock
+                    ? "Removes deletion protection."
+                    : "Protects the selected sessions from deletion."}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button
               type="button"
               variant="ghost"
-              onClick={() => setConfirmDeleteOpen(false)}
-              disabled={bulkDelete.isPending}
+              onClick={() => setConfirmAction(null)}
+              disabled={isBusy}
             >
               Cancel
             </Button>
             <Button
               type="button"
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={bulkDelete.isPending}
+              variant={confirmAction === "delete" ? "destructive" : "default"}
+              onClick={applyConfirmedAction}
+              disabled={isBusy}
             >
-              Delete {ownedSelected.length} session(s)
+              Confirm
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -2472,27 +2782,31 @@ function ArchivedBulkActionBar({
  */
 function ArchivedRow({
   conversation,
+  hostName,
   selectionMode,
   isSelected,
   onToggleSelected,
 }: {
   conversation: Conversation;
+  hostName?: string;
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (id: string) => void;
 }) {
   const navigate = useNavigate();
   const archive = useArchiveConversation();
+  const archiveLock = useArchiveLockConversation();
   const del = useStopAndDeleteConversation();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const label = conversationDisplayLabel(conversation);
-  const busy = archive.isPending || del.isPending;
+  const locked = isArchiveLocked(conversation);
+  const busy = archive.isPending || archiveLock.isPending || del.isPending;
 
   return (
     <li
       data-testid="archived-row"
       className={cn(
-        "group relative flex items-center gap-2 rounded-md px-3 py-2 hover:bg-muted",
+        "group relative flex items-center gap-2 rounded-md border border-transparent px-3 py-2 hover:border-border hover:bg-muted/60",
         selectionMode && "cursor-pointer",
         isSelected && "bg-muted",
       )}
@@ -2508,35 +2822,73 @@ function ArchivedRow({
         </span>
       )}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-ui font-medium" title={label}>
-          {label}
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate text-ui font-medium" title={label}>
+            {label}
+          </span>
+          {conversation.labels?.omni_project && (
+            <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+              {conversation.labels.omni_project}
+            </span>
+          )}
         </div>
-        <div className="text-sm text-muted-foreground">
-          {absoluteTime(conversation.updated_at * 1000)}
+        <div
+          className="truncate font-mono text-xs text-muted-foreground"
+          title={conversation.workspace ?? "CWD not recorded"}
+        >
+          {conversation.workspace ?? "CWD not recorded"}
+        </div>
+        <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+          <span>{hostName ?? conversation.host_id ?? "Host not recorded"}</span>
+          <span>{conversation.agent_name ?? "Agent not recorded"}</span>
+          <span>Archived {absoluteTime(archivedTimestamp(conversation) * 1000)}</span>
+          <span>Created {absoluteTime(conversation.created_at * 1000)}</span>
         </div>
       </div>
-      {/* Actions reveal on hover (desktop) / always shown on touch.
-          Hidden in selection mode — bulk bar owns the actions. */}
       {!selectionMode && (
-        <div className="flex shrink-0 items-center gap-1 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Delete session"
-            data-testid="delete-archived"
-            disabled={busy}
-            onClick={() => setDeleteOpen(true)}
-          >
-            <Trash2Icon className="size-4 text-destructive" />
-          </Button>
+        <div className="flex shrink-0 items-center gap-1">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={locked ? "Unlock session" : "Lock session"}
+                data-testid="archive-lock-toggle"
+                disabled={busy}
+                onClick={() => archiveLock.mutate({ id: conversation.id, locked: !locked })}
+              >
+                {locked ? <LockIcon className="size-4" /> : <UnlockIcon className="size-4" />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {locked ? "Locked · delete protected" : "Protect from delete"}
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Delete session"
+                  data-testid="delete-archived"
+                  disabled={busy || locked}
+                  onClick={() => setDeleteOpen(true)}
+                >
+                  <Trash2Icon className="size-4 text-destructive" />
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              {locked ? "Unlock before deleting" : "Delete permanently"}
+            </TooltipContent>
+          </Tooltip>
           <Button
             type="button"
             variant="ghost"
             size="sm"
-            // No background in light mode (ghost). Dark mode needs a fill so the
-            // button reads against the dark row — borrow the secondary tokens
-            // there only, without touching the text color.
             className="gap-1.5 dark:bg-secondary dark:hover:bg-secondary/80"
             data-testid="unarchive-conversation"
             disabled={busy}

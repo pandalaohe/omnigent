@@ -1,6 +1,7 @@
 import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
 
 import type { MentionItem, MentionState } from "@/lib/composerMentions";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -124,30 +125,35 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
     if (!mentionOpen) return false;
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
-    if (e.key === "ArrowDown") {
+    if (eventMatchesShortcutAction(e.nativeEvent, "nextSuggestion")) {
       e.preventDefault();
       setMentionIndex((i) => (i + 1) % mentionEntries.length);
       return true;
     }
-    if (e.key === "ArrowUp") {
+    if (eventMatchesShortcutAction(e.nativeEvent, "previousSuggestion")) {
       e.preventDefault();
       setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
       return true;
     }
     // Enter: open a folder (drill in) or attach a file. Tab: attach the
     // highlighted row as a unit — whole folder or file — without drilling.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile && active) {
+    if (
+      eventMatchesShortcutAction(e.nativeEvent, "applySuggestion") &&
+      e.key === "Enter" &&
+      !isMobile &&
+      active
+    ) {
       e.preventDefault();
       if (active.type === "directory") openMentionDir(active.path);
       else attachMention(active.path, false);
       return true;
     }
-    if (e.key === "Tab" && active) {
+    if (eventMatchesShortcutAction(e.nativeEvent, "applySuggestion") && active) {
       e.preventDefault();
       attachMention(active.path, active.type === "directory");
       return true;
     }
-    if (e.key === "Escape") {
+    if (eventMatchesShortcutAction(e.nativeEvent, "dismissSuggestions")) {
       e.preventDefault();
       dismiss();
       return true;

@@ -7,6 +7,7 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
 import { useChatStore } from "@/store/chatStore";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
@@ -26,11 +27,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // renders deterministically without a QueryClient / RunnerHealth provider. The
 // default is "not host-bound", so the badge self-hides and the existing branch/
 // ring/harness assertions are unchanged; host-aware tests override per case.
-const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(() => ({
-  useSessionMock: vi.fn(),
-  useHostsMock: vi.fn(),
-  useSessionHostOnlineMock: vi.fn(),
-}));
+const { useSessionMock, useHostsMock, useCodexRateLimitsMock, useSessionHostOnlineMock } =
+  vi.hoisted(() => ({
+    useSessionMock: vi.fn(),
+    useHostsMock: vi.fn(),
+    useCodexRateLimitsMock: vi.fn(),
+    useSessionHostOnlineMock: vi.fn(),
+  }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
   useSession: (id: string | null | undefined) => useSessionMock(id),
@@ -38,6 +41,8 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: (opts: unknown) => useHostsMock(opts),
+  useCodexRateLimits: (hostId: string | null, enabled: boolean) =>
+    useCodexRateLimitsMock(hostId, enabled),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof RunnerHealthProviderModule>()),
@@ -56,7 +61,12 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
-import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
+import {
+  Composer,
+  composerHarnessLabel,
+  formatCodexRateLimits,
+  formatModelEffortStatusLabel,
+} from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
 // it shows the worktree branch (truncated so the tray never wraps), current
@@ -120,6 +130,7 @@ function bindHost(name: string) {
 
 describe("Composer status line (branch + context ring)", () => {
   beforeEach(() => {
+    localStorage.removeItem(CONTEXT_INDICATOR_STORAGE_KEY);
     // Default: no host bound, so HostBadge renders nothing.
     useSessionMock.mockReset().mockReturnValue({
       session: { hostId: null },
@@ -127,11 +138,14 @@ describe("Composer status line (branch + context ring)", () => {
       error: null,
     });
     useHostsMock.mockReset().mockReturnValue({ data: [] });
+    useCodexRateLimitsMock.mockReset().mockReturnValue({ data: null });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
     useChatStore.setState({
       conversationId: "conv_test",
       skills: [],
       contextWindow: null,
+      autoCompactTokenLimit: null,
+      providerUsageLimits: null,
       tokensUsed: null,
       sessionCostUsd: null,
       gitBranch: null,
@@ -175,6 +189,33 @@ describe("Composer status line (branch + context ring)", () => {
     // 25k of 100k → 25% used; a wrong value means the ring wired the
     // wrong store fields through its props.
     expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
+  });
+
+  it("shows progress to the host model's compact point when the replacement is enabled", () => {
+    localStorage.setItem(CONTEXT_INDICATOR_STORAGE_KEY, "compact");
+    useChatStore.setState({
+      contextWindow: 100_000,
+      autoCompactTokenLimit: 80_000,
+      tokensUsed: 20_000,
+    });
+
+    renderComposer();
+
+    expect(screen.getByLabelText("25% of compact budget used")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/of context used/)).toBeNull();
+  });
+
+  it("falls back to context usage when the host cannot report a compact point", () => {
+    localStorage.setItem(CONTEXT_INDICATOR_STORAGE_KEY, "compact");
+    useChatStore.setState({
+      contextWindow: 100_000,
+      autoCompactTokenLimit: null,
+      tokensUsed: 20_000,
+    });
+
+    renderComposer();
+
+    expect(screen.getByLabelText("20% of context used")).toBeInTheDocument();
   });
 
   it("no longer renders the harness label in the status tray (moved to the config gear)", () => {
@@ -286,9 +327,63 @@ describe("Composer status line (branch + context ring)", () => {
 
     const plan = screen.getByTestId("composer-plan-mode");
     const ring = screen.getByLabelText("25% of context used");
+    expect(ring).toHaveTextContent("25% · 25k/100k");
     expect(plan.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
+  });
+
+  it("shows Codex quota usage immediately left of the context percentage", () => {
+    bindHost("mac-laptop");
+    const codexRateLimits: NonNullable<Parameters<typeof Composer>[0]["codexRateLimits"]> = {
+      captured_at: Math.floor(Date.now() / 1000),
+      limits: [
+        {
+          limit_id: "codex",
+          windows: [
+            { kind: "primary", used_percent: 11, window_duration_mins: 300 },
+            { kind: "secondary", used_percent: 6, window_duration_mins: 10_080 },
+          ],
+        },
+      ],
+    };
+    useChatStore.setState({
+      sessionHarness: "codex-native",
+      llmModel: "gpt-5.6-sol",
+      contextWindow: 100_000,
+      tokensUsed: 25_000,
+    });
+
+    renderComposer({ codexRateLimits });
+
+    const quota = screen.getByTestId("composer-provider-usage-limits");
+    const ring = screen.getByLabelText("25% of context used");
+    expect(quota).toHaveTextContent("5h:11% w:6%");
+    expect(quota).not.toHaveTextContent("m:");
+    expect(quota.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("shows Claude plan windows from the session harness adapter", () => {
+    useChatStore.setState({
+      sessionHarness: "claude-native",
+      contextWindow: 200_000,
+      tokensUsed: 50_000,
+      providerUsageLimits: {
+        provider: "Claude",
+        scope: "Claude plan",
+        capturedAt: Math.floor(Date.now() / 1000),
+        windows: [
+          { label: "5h", ariaLabel: "5 hour", usedPercent: 21 },
+          { label: "w", ariaLabel: "weekly", usedPercent: 9 },
+        ],
+      },
+    });
+
+    renderComposer({ modelPickerKind: "claude" });
+
+    expect(screen.getByTestId("composer-provider-usage-limits")).toHaveTextContent("5h:21% w:9%");
   });
 
   it("renders the tray for a host-bound session with no branch or ring", () => {
@@ -358,6 +453,52 @@ describe("Composer status line (branch + context ring)", () => {
 
     expect(screen.queryByTestId("host-badge")).toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
+  });
+});
+
+describe("formatCodexRateLimits", () => {
+  it("prefers the active model bucket and omits unavailable periods", () => {
+    expect(
+      formatCodexRateLimits(
+        {
+          captured_at: 1_900_000_000,
+          limits: [
+            {
+              limit_id: "codex",
+              windows: [{ kind: "primary", used_percent: 40, window_duration_mins: 300 }],
+            },
+            {
+              limit_id: "spark",
+              limit_name: "gpt-5.6-luna",
+              windows: [
+                { kind: "primary", used_percent: 2.4, window_duration_mins: 300 },
+                { kind: "secondary", used_percent: 9.7, window_duration_mins: 10_080 },
+              ],
+            },
+          ],
+        },
+        "gpt-5.6-luna",
+        1_900_000_100,
+      )?.text,
+    ).toBe("5h:2% w:10%");
+  });
+
+  it("hides stale data", () => {
+    expect(
+      formatCodexRateLimits(
+        {
+          captured_at: 1,
+          limits: [
+            {
+              limit_id: "codex",
+              windows: [{ kind: "primary", used_percent: 1, window_duration_mins: 300 }],
+            },
+          ],
+        },
+        null,
+        3602,
+      ),
+    ).toBeNull();
   });
 });
 

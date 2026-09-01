@@ -30,6 +30,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -923,6 +924,57 @@ async def test_live_host_full_refresh_detects_auth_completion(
     refresh = decode_host_frame(ws.sent[0])
     assert isinstance(refresh, HostHarnessReadinessFrame)
     assert refresh.configured_harnesses == {"codex": True}
+    _cleanup_host(host)
+
+
+async def test_live_host_publishes_sanitized_codex_rate_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ready Codex Host publishes the collector's bounded snapshot."""
+    snapshot = {
+        "captured_at": 1_900_000_000,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 11.0,
+                        "window_duration_mins": 300,
+                    }
+                ],
+            }
+        ],
+    }
+
+    async def _read() -> dict[str, object]:
+        return snapshot
+
+    monkeypatch.setattr("omnigent.host.connect.read_codex_rate_limits_snapshot", _read)
+    host = _make_host_process()
+    host._configured_harnesses = {"codex": True}
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    assert host._codex_rate_limits == snapshot
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostCodexRateLimitsFrame)
+    assert refresh.codex_rate_limits == snapshot
+    _cleanup_host(host)
+
+
+async def test_live_host_skips_codex_probe_until_harness_is_ready() -> None:
+    """An unavailable Codex CLI never starts an advisory app-server."""
+    host = _make_host_process()
+    host._configured_harnesses = {"codex": "needs-auth"}
+    assert host._codex_rate_limits_enabled() is False
+    host._configured_harnesses = {"codex-native": True}
+    assert host._codex_rate_limits_enabled() is True
     _cleanup_host(host)
 
 

@@ -2,10 +2,16 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isCommandPaletteHotkey, useCommandPaletteHotkey } from "./useCommandPaletteHotkey";
+import {
+  setShortcutRecordingActive,
+  writeShortcutPreference,
+} from "@/lib/keyboardShortcutPreferences";
 
 afterEach(() => {
   cleanup();
   document.body.innerHTML = "";
+  localStorage.clear();
+  setShortcutRecordingActive(false);
 });
 
 function press(init: KeyboardEventInit): KeyboardEvent {
@@ -44,6 +50,30 @@ describe("isCommandPaletteHotkey", () => {
 
   it("rejects other keys with the modifier", () => {
     expect(isCommandPaletteHotkey(new KeyboardEvent("keydown", { key: "j", metaKey: true }))).toBe(
+      false,
+    );
+  });
+
+  it("keeps the default character-based on non-QWERTY layouts", () => {
+    expect(
+      isCommandPaletteHotkey(
+        new KeyboardEvent("keydown", { key: "k", code: "KeyS", ctrlKey: true }),
+      ),
+    ).toBe(true);
+
+    writeShortcutPreference("commandPalette", {
+      common: [{ code: "KeyK", modifiers: ["primary"] }],
+    });
+    expect(
+      isCommandPaletteHotkey(
+        new KeyboardEvent("keydown", { key: "k", code: "KeyS", ctrlKey: true }),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not trigger a global action while the shortcut recorder is active", () => {
+    setShortcutRecordingActive(true);
+    expect(isCommandPaletteHotkey(new KeyboardEvent("keydown", { key: "k", ctrlKey: true }))).toBe(
       false,
     );
   });

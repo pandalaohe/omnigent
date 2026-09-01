@@ -206,6 +206,8 @@ class Conversation:
         listing (and the sidebar), surfacing only when the caller
         passes ``include_archived=True``. ``False`` for normal
         sessions; toggled via ``PATCH /v1/sessions/{id}``.
+    :param archived_at: Unix epoch seconds when the session most recently
+        transitioned into the archived state. ``None`` while active.
     :param project_id: The first-class project this session is filed
         under, or ``None`` if unfiled. Owner-private membership; see
         ``designs/PROJECTS_PRD.md``.
@@ -243,6 +245,7 @@ class Conversation:
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    archived_at: int | None = None
     # Live-state fields written by the replica holding the runner tunnel
     # so any replica's session list can serve them. ``live_status`` is the
     # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useDetectedCredentials,
+  useCodexRateLimits,
   useHostModelOptions,
   useHosts,
   useInstallHarness,
@@ -275,6 +276,33 @@ describe("useHosts", () => {
 
     expect(result.current.error).toBeInstanceOf(Error);
     expect((result.current.error as Error).message).toContain("503");
+  });
+});
+
+describe("useCodexRateLimits", () => {
+  it("fetches the Host-scoped sanitized snapshot", async () => {
+    const snapshot = {
+      captured_at: 1_900_000_000,
+      limits: [
+        {
+          limit_id: "codex",
+          windows: [{ kind: "primary", used_percent: 11, window_duration_mins: 300 }],
+        },
+      ],
+    };
+    fetchMock.mockResolvedValueOnce(mockResponse({ rate_limits: snapshot }));
+
+    const { result } = renderHook(() => useCodexRateLimits("host/a"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/hosts/host%2Fa/codex-rate-limits");
+    expect(result.current.data).toEqual(snapshot);
+  });
+
+  it("does not fetch without an eligible Host", async () => {
+    renderHook(() => useCodexRateLimits(null, false), { wrapper });
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

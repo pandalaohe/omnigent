@@ -13,6 +13,7 @@
 import type { ConversationItem } from "./conversationItems";
 import type { McpServerStartup } from "./events";
 import type { MessageContentBlock } from "./blocks";
+import type { ProviderUsageLimitsSnapshot } from "./providerUsageLimits";
 
 /** Reference to a conversation, as returned on response objects. */
 export interface ConversationRef {
@@ -365,6 +366,10 @@ export interface Session {
   subagentRoutingOverride?: "on" | "off" | null;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
+  /** Auto-compaction point comparable with the context ring's token count. */
+  autoCompactTokenLimit?: number | null;
+  /** Sanitized account allowance windows reported by the active harness. */
+  providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
   /**
    * Input token count from the most recently completed task's usage.
    * ``null`` when no task has completed yet. Lets the context-ring

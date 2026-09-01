@@ -23,6 +23,7 @@ CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_
 
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
+_CONTEXT_CATALOG_FILE = "context_catalog.json"
 _STARTUP_ERROR_FILE = "startup_error.json"
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
@@ -316,6 +317,105 @@ def codex_home_for_bridge_dir(bridge_dir: Path) -> Path:
     :returns: Absolute per-session ``CODEX_HOME`` directory.
     """
     return bridge_dir / "codex-home"
+
+
+def write_codex_context_catalog(bridge_dir: Path, catalog: dict[str, object]) -> None:
+    """Persist only context-management fields from a Codex model catalog."""
+    models = catalog.get("models")
+    reduced: list[dict[str, object]] = []
+    if isinstance(models, list):
+        for entry in models:
+            if not isinstance(entry, dict):
+                continue
+            slug = entry.get("slug")
+            if not isinstance(slug, str) or not slug:
+                continue
+            reduced.append(
+                {
+                    key: entry.get(key)
+                    for key in (
+                        "slug",
+                        "context_window",
+                        "max_context_window",
+                        "auto_compact_token_limit",
+                        "effective_context_window_percent",
+                    )
+                }
+            )
+    if not reduced:
+        return
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _CONTEXT_CATALOG_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_CONTEXT_CATALOG_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"models": reduced}, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def resolve_codex_auto_compact_token_limit(
+    bridge_dir: Path,
+    *,
+    model: str,
+    effective_context_window: int,
+) -> int | None:
+    """Resolve a total-scope compact point for the current host/model."""
+    if effective_context_window <= 0:
+        return None
+    try:
+        catalog = json.loads((bridge_dir / _CONTEXT_CATALOG_FILE).read_text(encoding="utf-8"))
+        config = tomllib.loads(
+            (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, tomllib.TOMLDecodeError):
+        return None
+    if config.get("model_auto_compact_token_limit_scope", "total") != "total":
+        return None
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list):
+        return None
+    entry = next(
+        (item for item in models if isinstance(item, dict) and item.get("slug") == model),
+        None,
+    )
+    if entry is None:
+        return None
+    percent = entry.get("effective_context_window_percent")
+    if isinstance(percent, bool) or not isinstance(percent, int) or percent <= 0 or percent > 100:
+        return None
+    configured_window = config.get("model_context_window")
+    catalog_window = entry.get("context_window")
+    max_window = entry.get("max_context_window")
+    raw_window = (
+        configured_window
+        if isinstance(configured_window, int) and not isinstance(configured_window, bool)
+        else catalog_window
+    )
+    if isinstance(raw_window, bool) or not isinstance(raw_window, int) or raw_window <= 0:
+        return None
+    if isinstance(max_window, int) and not isinstance(max_window, bool) and max_window > 0:
+        raw_window = min(raw_window, max_window)
+    # Runtime usage is authoritative. If a provider/model override produced a
+    # different effective window, invert the catalog percentage conservatively.
+    if raw_window * percent // 100 != effective_context_window:
+        raw_window = effective_context_window * 100 // percent
+    configured_limit = config.get("model_auto_compact_token_limit")
+    catalog_limit = entry.get("auto_compact_token_limit")
+    requested = (
+        configured_limit
+        if isinstance(configured_limit, int) and not isinstance(configured_limit, bool)
+        else catalog_limit
+    )
+    if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0:
+        return min(requested, raw_window)
+    # Do not invent a runtime threshold from a fixed percentage. Codex's
+    # policy can change independently; only an explicit config/catalog limit
+    # is truthful enough to label as the resolved Compact point.
+    return None
 
 
 def read_codex_config_model(bridge_dir: Path) -> str | None:

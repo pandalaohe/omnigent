@@ -88,6 +88,10 @@ _DEFAULT_POLL_INTERVAL_S = 0.25
 # it runs well below the poll interval; a mode switch is a human action and 2s
 # of lag is imperceptible.
 _PERMISSION_MODE_POLL_INTERVAL_S = 2.0
+# Claude's statusLine refreshes ``captured_at`` on every render even when the
+# provider allowance windows are unchanged. Refresh a stable snapshot every
+# five minutes instead of persisting and broadcasting every render.
+_PROVIDER_USAGE_LIMITS_REFRESH_INTERVAL_S = 300
 # Hard ceiling on one poll iteration of the forward loop. A silently stalled
 # await anywhere in the pipeline used to stop mirroring, status and the busy
 # signal forever; the deadline cancels the stall (the traceback names it) and
@@ -543,6 +547,7 @@ class _ForwardDedupeState:
 
     usage: dict[str, float] | None = None
     context_window: int | None = None
+    provider_usage_limits: dict[str, object] | None = None
     recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
     posted_model: str | None = None
@@ -579,6 +584,27 @@ class _ForwardDedupeState:
     # prevents the limiter from recovering.
     cost_retry_not_before: float = 0.0
     cost_retry_failures: int = 0
+
+
+def _provider_usage_limits_should_post(
+    current: dict[str, object] | None,
+    previous: dict[str, object] | None,
+) -> bool:
+    """Return whether a provider snapshot is materially new or due for refresh."""
+    if current is None:
+        return False
+    if previous is None:
+        return True
+    current_content = {key: value for key, value in current.items() if key != "captured_at"}
+    previous_content = {key: value for key, value in previous.items() if key != "captured_at"}
+    if current_content != previous_content:
+        return True
+    current_captured = current.get("captured_at")
+    previous_captured = previous.get("captured_at")
+    if type(current_captured) is not int or type(previous_captured) is not int:
+        return current != previous
+    elapsed = current_captured - previous_captured
+    return elapsed < 0 or elapsed >= _PROVIDER_USAGE_LIMITS_REFRESH_INTERVAL_S
 
 
 @dataclass(frozen=True)
@@ -3599,6 +3625,16 @@ async def _forward_available_items(
     window_changed = (
         resolved_context_window is not None and resolved_context_window != dedupe.context_window
     )
+    raw_provider_usage_limits = (
+        status_state.get("provider_usage_limits") if status_state is not None else None
+    )
+    provider_usage_limits = (
+        dict(raw_provider_usage_limits) if isinstance(raw_provider_usage_limits, dict) else None
+    )
+    provider_limits_changed = _provider_usage_limits_should_post(
+        provider_usage_limits,
+        dedupe.provider_usage_limits,
+    )
     # OTel token usage is sourced from the transcript, NOT from ``posted_usage``.
     # ``posted_usage`` prefers the statusLine gauge, which is re-read every poll
     # and moves while a message is still streaming, so recording it would emit
@@ -3609,19 +3645,22 @@ async def _forward_available_items(
     # provider actually charged for.
     token_usage = _gen_ai_usage_tokens(result.latest_usage)
     record_token_usage = token_usage if token_usage != dedupe.recorded_token_usage else None
-    if usage_changed or window_changed:
+    if usage_changed or window_changed or provider_limits_changed:
         try:
             await _post_external_session_usage(
                 client,
                 session_id=session_id,
                 usage=posted_usage,
                 context_window=resolved_context_window,
+                provider_usage_limits=provider_usage_limits,
                 token_usage=record_token_usage,
             )
             if usage_changed:
                 dedupe.usage = posted_usage
             if window_changed:
                 dedupe.context_window = resolved_context_window
+            if provider_limits_changed:
+                dedupe.provider_usage_limits = provider_usage_limits
             if record_token_usage is not None:
                 dedupe.recorded_token_usage = record_token_usage
         except httpx.HTTPError as exc:
@@ -4161,12 +4200,13 @@ async def _post_external_session_usage(
     session_id: str,
     usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
+    provider_usage_limits: dict[str, object] | None = None,
     token_usage: dict[str, int] | None = None,
 ) -> None:
     """
     Post one ``external_session_usage`` event to the Sessions API.
 
-    At least one of ``usage`` / ``context_window`` must be set; a
+    At least one of ``usage`` / ``context_window`` / ``provider_usage_limits`` must be set; a
     payload with neither is a no-op (the server would 400 it).
 
     :param client: Omnigent HTTP client.
@@ -4188,6 +4228,8 @@ async def _post_external_session_usage(
         payload.update(usage)
     if context_window is not None:
         payload["context_window"] = context_window
+    if provider_usage_limits is not None:
+        payload["provider_usage_limits"] = provider_usage_limits
     if not payload:
         return
     from omnigent.runtime import telemetry

@@ -375,6 +375,10 @@ class SqlUser(OmnigentBase):
     :param last_login_at: Unix epoch seconds of the most recent
         successful ``/auth/login`` (accounts mode). ``NULL`` until
         the first login.
+    :param preferences: Versioned JSON envelope for cross-device user
+        preferences. ``NULL`` means the user has never initialized synced
+        preferences; an envelope with empty ``settings`` means they explicitly
+        initialized and are using all defaults.
     """
 
     __tablename__ = "users"
@@ -392,6 +396,9 @@ class SqlUser(OmnigentBase):
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Opaque JSON, never SQL-filtered. Compression keeps shortcut/button
+    # payloads compact without leaking persistence details into API callers.
+    preferences: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
 
 class SqlAccountToken(OmnigentBase):
@@ -816,12 +823,33 @@ class SqlConversation(ConversationBase):
     archived: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # Timestamp of the most recent transition into archived state. Unlike
+    # updated_at, later title/model/label edits do not move this value.
+    archived_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Row-local mirror of the public archive-lock label. Keeping the delete
+    # gate on this row makes lock-vs-claim a single conditional UPDATE across
+    # Postgres/SQLite workers; the label remains the wire-compatible surface.
+    archive_locked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    # Short-lived, opaque ownership claim held while destructive session
+    # cleanup runs.  It lives on the conversation row so archive-lock writes
+    # and delete claims linearize on the same database record across workers.
+    deletion_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deletion_claimed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # No bare created_at/updated_at indexes: the sessions list is ACL-scoped
         # (id IN (...)) and resolves via the PK; the default sidebar (archived=
         # false, updated_at DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
+        Index(
+            "ix_conversations_archived_archived_at",
+            "workspace_id",
+            "archived",
+            "archived_at",
+            "id",
+        ),
         Index(
             "ix_conversations_root_conversation_id",
             "workspace_id",

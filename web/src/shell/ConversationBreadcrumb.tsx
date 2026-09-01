@@ -108,27 +108,41 @@ export function ConversationBreadcrumb({
           </div>
         ))}
       {titleLinkTo ? (
-        <Link
-          to={titleLinkTo}
-          aria-label="Back to parent session"
-          className={cn(
-            "breadcrumb-parent-link min-w-0 text-muted-foreground hover:text-foreground",
-            nativeMobileBack
-              ? "inline-flex shrink-0 items-center gap-0.5"
-              : "truncate hover:underline",
-          )}
-        >
-          {nativeMobileBack ? (
-            <>
-              <ChevronLeftIcon className="size-4" />
-              <span>Back</span>
-            </>
-          ) : (
-            conversationTitle
-          )}
-        </Link>
+        <>
+          <Link
+            to={titleLinkTo}
+            aria-label="Back to parent session"
+            className={cn(
+              "breadcrumb-parent-link min-w-0 text-muted-foreground hover:text-foreground",
+              nativeMobileBack
+                ? "inline-flex shrink-0 items-center gap-0.5"
+                : "truncate hover:underline",
+            )}
+          >
+            {nativeMobileBack ? (
+              <>
+                <ChevronLeftIcon className="size-4" />
+                <span>Back</span>
+              </>
+            ) : (
+              conversationTitle
+            )}
+          </Link>
+          {/* The optional iOS title mode keeps Back as the actual navigation
+              control while revealing a separately truncatable session title. */}
+          <span
+            aria-hidden
+            className="breadcrumb-native-session-title min-w-0 truncate text-foreground"
+          >
+            {conversationTitle}
+          </span>
+        </>
       ) : (
-        (titleSlot ?? <span className="min-w-0 truncate text-foreground">{conversationTitle}</span>)
+        (titleSlot ?? (
+          <span className="breadcrumb-session-title min-w-0 truncate text-foreground">
+            {conversationTitle}
+          </span>
+        ))
       )}
       {actions}
       {isChildSession && (

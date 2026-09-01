@@ -11,6 +11,7 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   DownloadIcon,
+  GaugeIcon,
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
@@ -35,6 +36,7 @@ export type SettingsSectionId =
   | "general"
   | "git"
   | "shortcuts"
+  | "context-usage"
   | "import"
   | "account"
   | "members"
@@ -49,6 +51,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "general",
   "git",
   "shortcuts",
+  "context-usage",
   "import",
   "account",
   "members",
@@ -91,7 +94,8 @@ export function settingsNavGroups(
     { id: "general", label: "General", icon: SettingsIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
-    { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
+    { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },
+    { id: "context-usage", label: "Context & usage", icon: GaugeIcon },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
   if (hasAuthSession) {
@@ -152,6 +156,11 @@ export function useSettingsRoute(): { inSettings: boolean; section: SettingsSect
   const idx = segments.lastIndexOf("settings");
   if (idx === -1) return { inSettings: false, section: defaultSection };
   const next = segments[idx + 1];
+  // Preserve old deep links after Navigation and Mobile controls moved into
+  // Keyboard shortcuts. They no longer appear as duplicate sidebar sections.
+  if (next === "navigation" || next === "mobile-controls") {
+    return { inSettings: true, section: "shortcuts" };
+  }
   // Members / Policies / Sharing are admin sections valid in ANY multi-user
   // mode (accounts AND OIDC). They're gated in the nav on `is_admin` and the
   // pages self-gate + the server 403s, so no accounts-mode carve-out here.

@@ -75,13 +75,14 @@ describe("settingsNavGroups", () => {
     });
   });
 
-  it("flags Keyboard shortcuts as hidden on mobile, but not the other items", () => {
+  it("keeps Keyboard shortcuts reachable on mobile for floating-assistant setup", () => {
     const items = settingsNavGroups(false, false).flatMap((g) => g.items);
     const shortcuts = items.find((i) => i.id === "shortcuts");
-    expect(shortcuts?.hideOnMobile).toBe(true);
-    for (const item of items) {
-      if (item.id !== "shortcuts") expect(item.hideOnMobile).toBeFalsy();
-    }
+    expect(shortcuts?.hideOnMobile).toBeFalsy();
+    expect(items.map((item) => item.id)).toEqual(
+      expect.arrayContaining(["shortcuts", "context-usage"]),
+    );
+    for (const item of items) expect(item.hideOnMobile).toBeFalsy();
   });
 
   it("includes Account (leading) whenever a login session exists (accounts OR OIDC)", () => {
@@ -200,9 +201,9 @@ describe("SettingsSidebarBody", () => {
     expect(heading.parentElement).not.toHaveClass("gap-0.5");
   });
 
-  it("marks the Keyboard shortcuts nav item hidden on mobile via max-md:hidden", () => {
+  it("keeps the Keyboard shortcuts nav item visible on mobile", () => {
     renderBody();
-    expect(screen.getByTestId("settings-nav-shortcuts").className).toContain("max-md:hidden");
+    expect(screen.getByTestId("settings-nav-shortcuts").className).not.toContain("max-md:hidden");
     // Sibling items stay visible on every viewport.
     expect(screen.getByTestId("settings-nav-appearance").className).not.toContain("max-md:hidden");
     expect(screen.getByTestId("settings-nav-archived").className).not.toContain("max-md:hidden");
@@ -374,6 +375,18 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/updates")).toEqual({
       inSettings: true,
       section: "updates",
+    });
+    expect(routeHook("/settings/navigation")).toEqual({
+      inSettings: true,
+      section: "shortcuts",
+    });
+    expect(routeHook("/settings/mobile-controls")).toEqual({
+      inSettings: true,
+      section: "shortcuts",
+    });
+    expect(routeHook("/settings/context-usage")).toEqual({
+      inSettings: true,
+      section: "context-usage",
     });
     expect(routeHook("/settings")).toEqual({ inSettings: true, section: "general" });
     expect(routeHook("/settings/not-a-section")).toEqual({

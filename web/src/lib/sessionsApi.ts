@@ -17,6 +17,7 @@ import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
 import { parseBackgroundTasks } from "./sse";
+import { providerUsageLimitsFromWire } from "./providerUsageLimits";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -168,6 +169,8 @@ interface SessionResponseWire {
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
   subagent_routing_override?: "on" | "off" | null;
   context_window?: number | null;
+  auto_compact_token_limit?: number | null;
+  provider_usage_limits?: unknown;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
   /**
@@ -330,6 +333,10 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
     contextWindow: wire.context_window,
+    autoCompactTokenLimit: wire.auto_compact_token_limit,
+    ...(wire.provider_usage_limits !== undefined
+      ? { providerUsageLimits: providerUsageLimitsFromWire(wire.provider_usage_limits) }
+      : {}),
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
     usageByModel: usageByModelFromWire(wire.usage_by_model),

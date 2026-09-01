@@ -14,13 +14,22 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    Strict,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.server.user_preferences_store import validate_preferences_envelope
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -49,6 +58,37 @@ class PaginatedList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+
+
+UserPreferenceNamespace = Literal[
+    "keyboard_shortcuts",
+    "mobile_assistant",
+    "session_navigation",
+    "context_indicator",
+    "usage_context",
+]
+
+
+class UserPreferencesEnvelope(BaseModel):
+    """Versioned, allowlisted cross-device preference payload."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: Literal[1]
+    settings: dict[UserPreferenceNamespace, JsonValue]
+
+    @model_validator(mode="after")
+    def _validate_persisted_contract(self) -> UserPreferencesEnvelope:
+        validate_preferences_envelope(self.model_dump(mode="python"))
+        return self
+
+
+class UserPreferenceNamespacePatchRequest(BaseModel):
+    """Atomic partial update for one preference namespace."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    value: JsonValue | None
 
 
 # ── Agents ──────────────────────────────────────────────────────
@@ -1806,6 +1846,8 @@ class SessionResponse(BaseModel):
         so a reload can restore each shell's description/command. ``None`` when
         none are tracked (or when an older runner reported only the count).
     :param created_at: Unix epoch seconds of creation.
+    :param archived_at: Unix epoch seconds of the most recent transition into
+        the archived state. ``None`` while active.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -2036,6 +2078,7 @@ class SessionResponse(BaseModel):
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
     updated_at: int | None = None
+    archived_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -2056,6 +2099,11 @@ class SessionResponse(BaseModel):
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     context_window: int | None = None
+    # Native host/model runtime threshold, omitted when it cannot be mapped
+    # truthfully to total context occupancy.
+    auto_compact_token_limit: int | None = None
+    # Sanitized account allowance windows reported by the active harness.
+    provider_usage_limits: dict[str, Any] | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
@@ -2177,6 +2225,9 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param archive_locked: Protect this session from deletion while ``True``.
+        ``False`` removes the protection and ``None`` leaves it unchanged.
+        Owner-only; intended for the archived-session cleanup surface.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2199,6 +2250,7 @@ class UpdateSessionRequest(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    archive_locked: bool | None = None
     project_id: str | None = None
     silent: bool = False
 
@@ -2458,6 +2510,8 @@ class SessionListItem(BaseModel):
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
+    :param archived_at: Unix epoch seconds of the most recent transition into
+        the archived state. ``None`` while active.
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
@@ -2551,6 +2605,7 @@ class SessionListItem(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
+    archived_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -2911,8 +2966,9 @@ class SessionUsageEvent(_SSEEventBase):
         no per-model change, so the client keeps its cached map.
 
     Category: **transient** (SSE-only). On reconnect, clients seed
-    the ring from the session snapshot's ``last_total_tokens`` and
-    ``context_window``, the cost indicator from ``total_cost_usd``,
+    the ring from the session snapshot's ``last_total_tokens``,
+    ``context_window``, and ``auto_compact_token_limit``; the cost indicator
+    from ``total_cost_usd``,
     and the per-model token breakdown from ``usage_by_model``.
     """
 
@@ -2920,6 +2976,8 @@ class SessionUsageEvent(_SSEEventBase):
     conversation_id: str
     context_tokens: int | None = None
     context_window: int | None = None
+    auto_compact_token_limit: int | None = None
+    provider_usage_limits: dict[str, Any] | None = None
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
 

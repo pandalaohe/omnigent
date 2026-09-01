@@ -9,6 +9,7 @@
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
 import type { RoutingDecisionExtras } from "./routingDecision";
+import type { ProviderUsageLimitsSnapshot } from "./providerUsageLimits";
 import type {
   BackgroundTaskInfo,
   ErrorInfo,
@@ -512,6 +513,8 @@ export interface SessionUsageEvent {
   conversationId: string;
   contextTokens?: number;
   contextWindow?: number;
+  autoCompactTokenLimit?: number | null;
+  providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
   totalCostUsd?: number;
   usageByModel?: Record<string, ModelUsage>;
 }

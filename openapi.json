@@ -2453,6 +2453,7 @@
         "title": "IncompleteEvent",
         "type": "object"
       },
+      "JsonValue": {},
       "LaunchRunnerRequest": {
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
@@ -4991,6 +4992,19 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds of the most recent transition into the archived state. `None` while active.",
+            "title": "Archived At"
+          },
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
@@ -5775,6 +5789,31 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds of the most recent transition into the archived state. `None` while active.",
+            "title": "Archived At"
+          },
+          "auto_compact_token_limit": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Compact Token Limit"
+          },
           "background_task_count": {
             "anyOf": [
               {
@@ -6053,6 +6092,18 @@
               }
             ],
             "title": "Project Id"
+          },
+          "provider_usage_limits": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Usage Limits"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -6813,6 +6864,19 @@
       "SessionUsageEvent": {
         "description": "Token-usage update from a terminal-backed integration.\n\nEmitted after an `external_session_usage` POST from an\nout-of-AP runtime (e.g. the `omnigent claude` transcript\nforwarder). Either field may be absent; clients should leave\ncached values untouched for missing fields.",
         "properties": {
+          "auto_compact_token_limit": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Auto Compact Token Limit"
+          },
           "context_tokens": {
             "anyOf": [
               {
@@ -6845,6 +6909,19 @@
             "description": "Session identifier.",
             "title": "Conversation Id",
             "type": "string"
+          },
+          "provider_usage_limits": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Provider Usage Limits"
           },
           "sequence_number": {
             "anyOf": [
@@ -6892,7 +6969,7 @@
               }
             ],
             "default": null,
-            "description": "Per-model breakdown of the same subtree usage after this update, keyed by raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` (stripped by `exclude_none`) on a broadcast that carries no per-model change, so the client keeps its cached map. Category: **transient** (SSE-only). On reconnect, clients seed the ring from the session snapshot's `last_total_tokens` and `context_window`, the cost indicator from `total_cost_usd`, and the per-model token breakdown from `usage_by_model`.",
+            "description": "Per-model breakdown of the same subtree usage after this update, keyed by raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` (stripped by `exclude_none`) on a broadcast that carries no per-model change, so the client keeps its cached map. Category: **transient** (SSE-only). On reconnect, clients seed the ring from the session snapshot's `last_total_tokens`, `context_window`, and `auto_compact_token_limit`; the cost indicator from `total_cost_usd`, and the per-model token breakdown from `usage_by_model`.",
             "title": "Usage By Model"
           }
         },
@@ -7581,6 +7658,18 @@
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{id}`.\n\nThe Alpha runner-state pivot makes this endpoint the mutable\nsession affinity primitive when `runner_id` is provided. The\nserver validates that the runner is online, then replaces\n`conversations.runner_id`. Existing session metadata updates\nremain supported for clients that update title, labels, or\nreasoning effort through the sessions API.",
         "properties": {
+          "archive_locked": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Protect this session from deletion while `True`. `False` removes the protection and `None` leaves it unchanged. Owner-only; intended for the archived-session cleanup surface.",
+            "title": "Archive Locked"
+          },
           "archived": {
             "anyOf": [
               {
@@ -7991,6 +8080,40 @@
           }
         },
         "title": "UsageReport",
+        "type": "object"
+      },
+      "UserPreferencesEnvelope": {
+        "additionalProperties": false,
+        "description": "Versioned, allowlisted cross-device preference payload.",
+        "properties": {
+          "settings": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "propertyNames": {
+              "enum": [
+                "keyboard_shortcuts",
+                "mobile_assistant",
+                "session_navigation",
+                "context_indicator",
+                "usage_context"
+              ]
+            },
+            "title": "Settings",
+            "type": "object"
+          },
+          "version": {
+            "const": 1,
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "settings"
+        ],
+        "title": "UserPreferencesEnvelope",
         "type": "object"
       },
       "ValidationError": {
@@ -8482,6 +8605,51 @@
           }
         },
         "summary": "Update Host",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/codex-rate-limits": {
+      "get": {
+        "description": "Return the live Host's sanitized Codex subscription quota snapshot.",
+        "operationId": "get_host_codex_rate_limits_v1_hosts__host_id__codex_rate_limits_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Host Codex Rate Limits V1 Hosts  Host Id  Codex Rate Limits Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Codex Rate Limits",
         "tags": [
           "hosts"
         ]
@@ -9228,6 +9396,72 @@
         ]
       }
     },
+    "/v1/me/preferences": {
+      "put": {
+        "description": "Initialize the caller's full preference envelope exactly once.",
+        "operationId": "initialize_user_preferences_v1_me_preferences_put",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserPreferencesEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Initialize User Preferences"
+      }
+    },
+    "/v1/me/preferences/{namespace}": {
+      "patch": {
+        "description": "Atomically merge or remove one namespace for the current user.",
+        "operationId": "patch_user_preferences_namespace_v1_me_preferences__namespace__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "enum": [
+                "keyboard_shortcuts",
+                "mobile_assistant",
+                "session_navigation",
+                "context_indicator",
+                "usage_context"
+              ],
+              "title": "Namespace",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserPreferencesEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch User Preferences Namespace"
+      }
+    },
     "/v1/policies": {
       "get": {
         "description": "List all default policies.\n\nRequires authentication in multi-user mode.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
@@ -9911,13 +10145,13 @@
             }
           },
           {
-            "description": "Column to sort on, `\"created_at\"` or `\"updated_at\"`.",
+            "description": "Column to sort on, `\"created_at\"`, `\"updated_at\"`, or `\"archived_at\"`.",
             "in": "query",
             "name": "sort_by",
             "required": false,
             "schema": {
               "default": "created_at",
-              "pattern": "^(created_at|updated_at)$",
+              "pattern": "^(created_at|updated_at|archived_at)$",
               "title": "Sort By",
               "type": "string"
             }
@@ -9948,6 +10182,134 @@
               "default": false,
               "title": "Include Archived",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Archived Only",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updated After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updated_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updated Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived Before"
             }
           },
           {

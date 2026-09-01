@@ -25,6 +25,10 @@ import {
 } from "@/lib/terminalThemePreferences";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
+  TERMINAL_SOFT_KEY_EVENT,
+  type TerminalSoftKeyEventDetail,
+} from "@/lib/mobileAssistantPreferences";
+import {
   type ConnectionState,
   type TerminalActivityListener,
   type TerminalInputListener,
@@ -202,6 +206,7 @@ export function TerminalView({
   const isDarkRef = useRef(isDark);
   isDarkRef.current = isDark;
   const sessionRef = useRef<TerminalSession | null>(null);
+  const terminalNodeRef = useRef<HTMLDivElement | null>(null);
   // Stable refs so callback prop changes never recreate the WS session.
   const onStateChangeRef = useRef(onStateChange);
   onStateChangeRef.current = onStateChange;
@@ -211,6 +216,24 @@ export function TerminalView({
   onInputRef.current = onInput;
   const activeRef = useRef(active);
   activeRef.current = active;
+
+  useEffect(() => {
+    const handleSoftKey = (event: Event) => {
+      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
+      if (detail.handled || !activeRef.current || readOnly || !sessionRef.current) return;
+      const session = sessionRef.current;
+      const node = terminalNodeRef.current;
+      (detail.candidates ??= []).push({
+        focused: Boolean(node?.contains(document.activeElement)),
+        ownsPreferredTarget: Boolean(
+          detail.preferredTarget && node?.contains(detail.preferredTarget),
+        ),
+        send: () => session.sendSoftKey(detail.action),
+      });
+    };
+    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
+    return () => window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
+  }, [readOnly]);
   // Track whether this terminal has already tried a keyless re-dial after a
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
@@ -503,6 +526,7 @@ export function TerminalView({
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
       if (node === null) return;
+      terminalNodeRef.current = node;
       // React re-runs a ref callback for the *same* node whenever the
       // callback's identity changes — here, when the runner's
       // direct-attach advert lands after mount. Retire the previous
@@ -591,6 +615,7 @@ export function TerminalView({
         upgradeCtl.abort();
         terminalSession?.dispose();
         sessionRef.current = null;
+        if (terminalNodeRef.current === node) terminalNodeRef.current = null;
         onStateChangeRef.current?.(null);
       };
     },

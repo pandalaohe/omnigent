@@ -28,6 +28,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import set_current_user_id
 from omnigent.host.frames import (
+    HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -561,6 +562,12 @@ async def _receive_loop(
                     await on_host_update(host_id, conn.owner)
                 except Exception:
                     _logger.exception("on_host_update callback failed for %s", host_id)
+            continue
+
+        if isinstance(frame, HostCodexRateLimitsFrame):
+            # Delivered Host-local account state: already schema-validated and
+            # stripped of auth/account fields by the shared frame decoder.
+            conn.hello.codex_rate_limits = frame.codex_rate_limits
             continue
 
         if isinstance(frame, HostLaunchRunnerResultFrame):

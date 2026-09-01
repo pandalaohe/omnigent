@@ -102,6 +102,48 @@ def test_status_wrapper_captures_cost(tmp_path: Path, monkeypatch: pytest.Monkey
     assert persisted["total_cost_usd"] == 0.42
 
 
+def test_status_wrapper_captures_sanitized_claude_plan_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude's statusLine plan windows reach the bridge without identity data."""
+    monkeypatch.setattr(claude_native_status.time, "time", lambda: 1_900_000_000)
+    stdin = json.dumps(
+        {
+            "session_id": "private-session-id",
+            "account": {"email": "must-not-cross@example.com"},
+            "context_window": {"context_window_size": 200_000},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 11.4, "resets_at": 2_000_000_000},
+                "seven_day": {"used_percentage": 6},
+            },
+        }
+    )
+
+    assert _run(stdin_payload=stdin, bridge_dir=tmp_path, monkeypatch=monkeypatch) == 0
+    persisted = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
+    assert persisted["provider_usage_limits"] == {
+        "provider": "Claude",
+        "scope": "Claude plan",
+        "captured_at": 1_900_000_000,
+        "windows": [
+            {
+                "label": "5h",
+                "aria_label": "5 hour",
+                "used_percent": 11.4,
+                "duration_mins": 300,
+                "resets_at": 2_000_000_000,
+            },
+            {
+                "label": "w",
+                "aria_label": "weekly",
+                "used_percent": 6.0,
+                "duration_mins": 10_080,
+            },
+        ],
+    }
+    assert "account" not in persisted
+
+
 def test_status_wrapper_drops_payload_without_context_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

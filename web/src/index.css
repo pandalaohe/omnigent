@@ -665,6 +665,51 @@ aside[aria-label="Workspace"][data-maximized] {
 [data-android-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link) {
   display: none;
 }
+.breadcrumb-native-session-title {
+  display: none;
+}
+
+/* Optional native-mobile title mode. The official default above stays intact;
+ * opting in swaps the main top pill for the existing Web title. Only the title
+ * node is restored: the desktop folder and session actions stay hidden. Child
+ * sessions keep Back and gain a separately truncatable title. */
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)) {
+  display: flex;
+}
+
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb {
+  max-width: min(56vw, 16rem);
+}
+
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb
+  > .breadcrumb-session-title,
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb
+  > .breadcrumb-native-session-title {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* In title mode the native Server pill reappears only while the mobile sidebar
+ * is open. Its centred native overlay occupies this header row, so hide the
+ * redundant brand link and leave the right-side Search/Close controls intact. */
+@media (width < 48rem) {
+  :is(
+      [data-ios-native],
+      [data-android-native]
+    )[data-native-mobile-header="conversation-title"][data-sidebar-open="true"]
+    .conversations-sidebar
+    .sidebar-brand {
+    visibility: hidden;
+    pointer-events: none;
+  }
+}
 
 /* iOS native shell (SwiftUI/WKWebView) runs the webview full-screen under the
  * system status bar and home indicator. Keep the web app visually full-bleed,

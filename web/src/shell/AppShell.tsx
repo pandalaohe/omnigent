@@ -11,6 +11,7 @@ import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebar
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -106,6 +107,7 @@ import {
 import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+import { MobileFloatingAssistant } from "@/components/MobileFloatingAssistant";
 import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
@@ -177,6 +179,7 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 }
 
 export function AppShell() {
+  const { nativeMobileHeaderMode } = useSessionNavigationPreferences();
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -1756,6 +1759,7 @@ export function AppShell() {
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
+            data-native-mobile-header={nativeMobileHeaderMode}
           >
             {/* Frameless-window titlebar stand-in (macOS Electron only): the
           sidebar's electron top margin (see index.css) frees this strip of
@@ -2126,6 +2130,7 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          <MobileFloatingAssistant />
           {/* Global command palette (⌘K). Ungated so it works on every route
               and in embedded mode — the sidebar's "Search" button opens it
               there even though the ⌘K hotkey is disabled (it belongs to the

@@ -164,6 +164,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { useSessionPollingHotkeys } from "@/hooks/useSessionPollingHotkeys";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -1864,6 +1865,71 @@ function ConversationList({
       ...visible("Chats", sections.sessions),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
+
+  const pollingArchive = useArchiveConversation();
+  const conversationPages = conversationsQuery.data?.pages;
+  const hasNextConversationPage = conversationsQuery.hasNextPage;
+  const fetchNextConversationPage = conversationsQuery.fetchNextPage;
+  const getPollingConversations = useCallback(async () => {
+    let pages = conversationPages ?? [];
+    let hasMore = hasNextConversationPage;
+    while (hasMore) {
+      // Cursor pagination is sequential: each request needs the cursor returned by the prior page.
+      // eslint-disable-next-line no-await-in-loop
+      const result = await fetchNextConversationPage();
+      pages = result.data?.pages ?? pages;
+      hasMore = result.hasNextPage ?? false;
+    }
+    const allWithPinned = dedupeConversationsById([
+      ...pages.flatMap((page) => page.data),
+      ...pinnedConversations,
+    ]).filter((conversation) => conversation.archived !== true);
+    const pinned = orderByPinnedTimestamp(
+      allWithPinned.filter((conversation) => pinnedSet.has(conversation.id)),
+    );
+    const pinnedIds = new Set(pinned.map((conversation) => conversation.id));
+    const projectRows: Conversation[] = [];
+    const filedIds = new Set<string>();
+    for (const project of projects) {
+      const rows = sortByUpdatedAtDesc(
+        allWithPinned.filter(
+          (conversation) =>
+            isOwnedByViewer(conversation, viewerId) &&
+            !pinnedIds.has(conversation.id) &&
+            ((project.id !== null && conversation.project_id === project.id) ||
+              conversation.labels?.[PROJECT_LABEL_KEY] === project.name),
+        ),
+        activeOverride,
+      );
+      for (const row of rows) filedIds.add(row.id);
+      projectRows.push(...rows);
+    }
+    const rest = sortByUpdatedAtDesc(
+      allWithPinned.filter(
+        (conversation) => !pinnedIds.has(conversation.id) && !filedIds.has(conversation.id),
+      ),
+      activeOverride,
+    );
+    return [...pinned, ...projectRows, ...rest];
+  }, [
+    conversationPages,
+    hasNextConversationPage,
+    fetchNextConversationPage,
+    pinnedConversations,
+    pinnedSet,
+    projects,
+    viewerId,
+    activeOverride,
+  ]);
+  useSessionPollingHotkeys({
+    activeId,
+    getConversations: getPollingConversations,
+    onArchive: async (id) => {
+      await pollingArchive.mutateAsync({ id, archived: true });
+      showArchivedToast();
+    },
+    canArchive: (conversation) => isOwnedByViewer(conversation, viewerId),
+  });
   // Getter for the shift-select range, built on demand (at click time). Scopes
   // to whichever section is selectable: the flat Sessions list, or the sessions
   // across expanded project folders (in render order). For projects scope the

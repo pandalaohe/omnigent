@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from sqlalchemy import event, text
 
@@ -451,6 +453,133 @@ def test_update_archived_bumps_updated_at(
         f"{created_at + 100}, got {updated.updated_at}. If it equals "
         f"{created_at}, the archive write didn't mark the row changed."
     )
+    assert updated.archived_at == created_at + 100
+
+    # Later edits still advance updated_at, but must not rewrite the archive
+    # timestamp used by cleanup filters and Archive-date sorting.
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        lambda: created_at + 200,
+    )
+    renamed = conversation_store.update_conversation(conv.id, title="Renamed later")
+    assert renamed is not None
+    assert renamed.updated_at == created_at + 200
+    assert renamed.archived_at == created_at + 100
+
+    unarchived = conversation_store.update_conversation(conv.id, archived=False)
+    assert unarchived is not None
+    assert unarchived.archived_at is None
+
+
+def test_deletion_claim_and_archive_lock_are_mutually_exclusive(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    assert (
+        conversation_store.set_archive_lock(
+            conv.id, True, updated_at=1_000, stale_before=100
+        )
+        == "updated"
+    )
+    assert (
+        conversation_store.claim_conversation_deletion(
+            conv.id, "delete-a", claimed_at=1_001, stale_before=100
+        )
+        == "locked"
+    )
+    assert (
+        conversation_store.set_archive_lock(
+            conv.id, False, updated_at=1_002, stale_before=100
+        )
+        == "updated"
+    )
+    assert (
+        conversation_store.claim_conversation_deletion(
+            conv.id, "delete-a", claimed_at=1_003, stale_before=100
+        )
+        == "claimed"
+    )
+    assert (
+        conversation_store.set_archive_lock(
+            conv.id, True, updated_at=1_004, stale_before=100
+        )
+        == "busy"
+    )
+    assert (
+        conversation_store.renew_conversation_deletion(
+            conv.id, "wrong-token", claimed_at=2_000
+        )
+        is False
+    )
+    assert (
+        conversation_store.renew_conversation_deletion(
+            conv.id, "delete-a", claimed_at=2_000
+        )
+        is True
+    )
+    assert (
+        conversation_store.set_archive_lock(
+            conv.id, True, updated_at=2_001, stale_before=1_500
+        )
+        == "busy"
+    )
+    assert conversation_store.release_conversation_deletion(conv.id, "wrong-token") is False
+    assert conversation_store.release_conversation_deletion(conv.id, "delete-a") is True
+    assert (
+        conversation_store.set_archive_lock(
+            conv.id, True, updated_at=1_005, stale_before=100
+        )
+        == "updated"
+    )
+
+
+def test_stale_deletion_claim_recovers_in_a_new_store(db_uri: str) -> None:
+    first = SqlAlchemyConversationStore(db_uri)
+    conv = first.create_conversation()
+    assert (
+        first.claim_conversation_deletion(
+            conv.id, "crashed-worker", claimed_at=1_000, stale_before=100
+        )
+        == "claimed"
+    )
+
+    restarted = SqlAlchemyConversationStore(db_uri)
+    assert (
+        restarted.set_archive_lock(
+            conv.id, True, updated_at=2_001, stale_before=2_000
+        )
+        == "updated"
+    )
+    assert (
+        first.claim_conversation_deletion(
+            conv.id, "new-delete", claimed_at=2_002, stale_before=2_000
+        )
+        == "locked"
+    )
+
+
+def test_only_one_store_worker_can_claim_deletion(db_uri: str) -> None:
+    first = SqlAlchemyConversationStore(db_uri)
+    second = SqlAlchemyConversationStore(db_uri)
+    conv = first.create_conversation()
+
+    def claim(store: SqlAlchemyConversationStore, token: str) -> str:
+        return store.claim_conversation_deletion(
+            conv.id,
+            token,
+            claimed_at=2_000,
+            stale_before=1_000,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda args: claim(*args),
+                [(first, "worker-a"), (second, "worker-b")],
+            )
+        )
+
+    assert sorted(results) == ["busy", "claimed"]
 
 
 # ── Append & list items ──────────────────────────────
@@ -1611,6 +1740,80 @@ def test_list_conversations_excludes_archived_by_default(
     assert all_ids >= {active.id, archived.id}, (
         f"include_archived=True must return both active and archived sessions; got {all_ids}"
     )
+
+
+def test_archive_manager_filters_archived_host_cwd_and_dates(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Archive cleanup filters are pushed into the store, not applied to one UI page."""
+    host_id = "a" * 32
+    other_host_id = "b" * 32
+    _register_host(db_uri, host_id)
+    _register_host(db_uri, other_host_id)
+    wanted = conversation_store.create_conversation(
+        title="wanted",
+        host_id=host_id,
+        workspace="D:/AIProgram/Projects/Omnigent",
+    )
+    other = conversation_store.create_conversation(
+        title="other",
+        host_id=other_host_id,
+        workspace="D:/AIProgram/Projects/Elsewhere",
+    )
+    active = conversation_store.create_conversation(title="active")
+    conversation_store.update_conversation(wanted.id, archived=True)
+    conversation_store.update_conversation(other.id, archived=True)
+
+    archived_ids = {
+        row.id for row in conversation_store.list_conversations(archived_only=True).data
+    }
+    assert wanted.id in archived_ids and other.id in archived_ids
+    assert active.id not in archived_ids
+
+    host_ids = {
+        row.id
+        for row in conversation_store.list_conversations(
+            archived_only=True,
+            host_id=host_id,
+        ).data
+    }
+    assert host_ids == {wanted.id}
+
+    cwd_ids = {
+        row.id
+        for row in conversation_store.list_conversations(
+            archived_only=True,
+            search_query="omnigent",
+        ).data
+    }
+    assert cwd_ids == {wanted.id}
+
+    assert wanted.id in {
+        row.id
+        for row in conversation_store.list_conversations(
+            archived_only=True,
+            created_after=wanted.created_at - 1,
+        ).data
+    }
+    assert wanted.id not in {
+        row.id
+        for row in conversation_store.list_conversations(
+            archived_only=True,
+            created_before=wanted.created_at,
+        ).data
+    }
+    assert wanted.archived_at is None
+    archived_wanted = conversation_store.get_conversation(wanted.id)
+    assert archived_wanted is not None and archived_wanted.archived_at is not None
+    assert wanted.id in {
+        row.id
+        for row in conversation_store.list_conversations(
+            archived_only=True,
+            archived_after=archived_wanted.archived_at,
+            sort_by="archived_at",
+        ).data
+    }
 
 
 def test_list_conversations_kind_filter_returns_only_matching(
@@ -3840,8 +4043,10 @@ def test_fork_conversation_drops_instance_scoped_labels(
         {
             "omnigent.claude_native.bridge_id": source.id,
             "omnigent.codex_native.bridge_id": source.id,
+            "omnigent.last_auto_compact_token_limit": "900000",
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
+            "omnigent.last_provider_usage_limits": '{"source":"claude"}',
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             # An ordinary, non-instance label that SHOULD carry over.
@@ -4459,6 +4664,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         conv_id,
         {
             instance_label: "1",
+            "omnigent.last_provider_usage_limits": '{"source":"claude"}',
             # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
             # switch (a new agent/harness context) drops it rather than
             # silently re-arming bypass without a fresh typed confirmation.
@@ -4517,6 +4723,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
     assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "52adb39f0c5ea92b5563da5327dac08f"
     assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
+    assert "omnigent.last_provider_usage_limits" not in updated.labels
     assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
         "the dangerous bypass opt-in must not survive a switch (re-confirm per context)"
     )

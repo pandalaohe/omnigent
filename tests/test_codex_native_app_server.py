@@ -1038,6 +1038,62 @@ def _mcp_tool_approvals(codex_home: Path) -> dict[str, Any]:
     return parsed["mcp_servers"]["omnigent"]["tools"]
 
 
+async def test_context_catalog_caches_bundled_host_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private bridge gets only the host Codex compact metadata."""
+    from omnigent import codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        bridge_dir,
+        tmp_path / "workspace",
+    )
+    calls: list[tuple[str, Path, float, bool]] = []
+
+    def _read(
+        codex_path: str,
+        home: Path,
+        *,
+        timeout: float,
+        bundled: bool,
+    ) -> dict[str, Any]:
+        calls.append((codex_path, home, timeout, bundled))
+        return {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "effective_context_window_percent": 95,
+                    "base_instructions": "must not be copied",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(codex_native_app_server, "read_codex_model_catalog", _read)
+
+    await server._populate_context_catalog(source_home)
+
+    assert calls == [(server.codex_path, source_home, 2.0, True)]
+    cached = json.loads((bridge_dir / "context_catalog.json").read_text(encoding="utf-8"))
+    assert cached == {
+        "models": [
+            {
+                "auto_compact_token_limit": None,
+                "context_window": 272_000,
+                "effective_context_window_percent": 95,
+                "max_context_window": None,
+                "slug": "gpt-5.6-sol",
+            }
+        ]
+    }
+
+
 def _hook_matchers(codex_home: Path, event: str) -> list[str | None]:
     payload = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
     return [entry.get("matcher") for entry in payload["hooks"].get(event, [])]

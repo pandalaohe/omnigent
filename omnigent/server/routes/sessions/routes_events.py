@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
+import time
 import weakref
 from collections.abc import Callable
 from typing import Any, Literal, cast
@@ -210,6 +212,10 @@ from omnigent.session_lifecycle import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.conversation_store import (
+    DELETION_CLAIM_HEARTBEAT_INTERVAL_S,
+    DELETION_CLAIM_STALE_AFTER_S,
+)
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -224,6 +230,87 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 _retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+
+
+class _DeletionClaimLease:
+    """Keep a DB deletion claim until all shielded cleanup workers settle."""
+
+    def __init__(
+        self,
+        conversation_store: ConversationStore,
+        session_id: str,
+        token: str,
+    ) -> None:
+        self._conversation_store = conversation_store
+        self._session_id = session_id
+        self._token = token
+        self._workers: set[asyncio.Task[Any]] = set()
+        self._release_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
+
+    def start_heartbeat(self) -> None:
+        """Renew the claim until cleanup settles or ownership is lost."""
+        if self._heartbeat_task is None:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    async def _heartbeat(self) -> None:
+        while True:
+            await asyncio.sleep(DELETION_CLAIM_HEARTBEAT_INTERVAL_S)
+            try:
+                renewed = await asyncio.to_thread(
+                    self._conversation_store.renew_conversation_deletion,
+                    self._session_id,
+                    self._token,
+                    claimed_at=int(time.time()),
+                )
+            except Exception:
+                # A transient DB failure must not terminate renewal after one
+                # miss; later beats can still arrive before the stale window.
+                _logger.warning(
+                    "Failed to renew deletion claim for session %s",
+                    self._session_id,
+                    exc_info=True,
+                )
+                continue
+            if not renewed:
+                return
+
+    async def run(self, awaitable: Any) -> Any:
+        """Shield one cleanup operation from request-task cancellation."""
+        worker = asyncio.create_task(awaitable)
+        self._workers.add(worker)
+        return await asyncio.shield(worker)
+
+    async def to_thread(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """Run a synchronous cleanup while retaining its worker identity."""
+        return await self.run(asyncio.to_thread(func, *args, **kwargs))
+
+    def _ensure_release_task(self) -> asyncio.Task[None]:
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(self._release_when_settled())
+        return self._release_task
+
+    async def _release_when_settled(self) -> None:
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._heartbeat_task
+        await asyncio.to_thread(
+            self._conversation_store.release_conversation_deletion,
+            self._session_id,
+            self._token,
+        )
+
+    async def release(self) -> None:
+        """Release idempotently after every started worker is done."""
+        await asyncio.shield(self._ensure_release_task())
+
+    def schedule_release(self) -> None:
+        """Outer-task completion fallback; stale recovery covers loop shutdown."""
+        with contextlib.suppress(RuntimeError):
+            self._ensure_release_task()
 
 
 def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
@@ -2192,10 +2279,40 @@ def register_events_routes(
                         "Conversation not found",
                         code=ErrorCode.NOT_FOUND,
                     )
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None:
+        claim_token = secrets.token_hex(16)
+        delete_lease = _DeletionClaimLease(conversation_store, session_id, claim_token)
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            current_task.add_done_callback(lambda _task: delete_lease.schedule_release())
+        claim_now = int(time.time())
+        claim_result = await delete_lease.to_thread(
+            conversation_store.claim_conversation_deletion,
+            session_id,
+            claim_token,
+            claimed_at=claim_now,
+            stale_before=claim_now - DELETION_CLAIM_STALE_AFTER_S,
+        )
+        if claim_result == "not_found":
+            await delete_lease.release()
             raise _session_not_found()
-        await _best_effort_stop(session_id, conversation_store, runner_router)
+        if claim_result == "locked":
+            await delete_lease.release()
+            raise OmnigentError(
+                "This archived session is locked. Unlock it before deleting.",
+                code=ErrorCode.CONFLICT,
+            )
+        if claim_result == "busy":
+            await delete_lease.release()
+            raise OmnigentError(
+                "Session deletion is already in progress.",
+                code=ErrorCode.CONFLICT,
+            )
+        delete_lease.start_heartbeat()
+        conv = await delete_lease.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            await delete_lease.release()
+            raise _session_not_found()
+        await delete_lease.run(_best_effort_stop(session_id, conversation_store, runner_router))
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -2203,7 +2320,9 @@ def register_events_routes(
         # resources are gone with the runner anyway.
         runner_client: httpx.AsyncClient | None = None
         try:
-            runner_client = await _get_runner_client_for_resource_access(session_id)
+            runner_client = await delete_lease.run(
+                _get_runner_client_for_resource_access(session_id)
+            )
         except OmnigentError as exc:
             _logger.info(
                 "Skipping runner-side cleanup for %s; proceeding with server-side delete: %s",
@@ -2212,9 +2331,11 @@ def register_events_routes(
             )
         if runner_client is not None:
             try:
-                await runner_client.delete(
-                    f"/v1/sessions/{session_id}",
-                    timeout=10.0,
+                await delete_lease.run(
+                    runner_client.delete(
+                        f"/v1/sessions/{session_id}",
+                        timeout=10.0,
+                    )
                 )
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
@@ -2222,19 +2343,19 @@ def register_events_routes(
                     session_id,
                 )
         else:
-            import contextlib
-
             from omnigent.runtime import get_terminal_registry
 
             with contextlib.suppress(RuntimeError):
-                await get_terminal_registry().cleanup_conversation(session_id)
+                await delete_lease.run(
+                    get_terminal_registry().cleanup_conversation(session_id)
+                )
         # Session file cleanup.
         if file_store is not None and artifact_store is not None:
-            deleted_file_ids = await asyncio.to_thread(
+            deleted_file_ids = await delete_lease.to_thread(
                 file_store.delete_all_for_session, session_id
             )
             for fid in deleted_file_ids:
-                await asyncio.to_thread(artifact_store.delete, fid)
+                await delete_lease.to_thread(artifact_store.delete, fid)
         # Opt-in git worktree cleanup: only when delete_branch=true and
         # the session has a server-created worktree. Runs after runner
         # teardown; best-effort (designs/SESSION_GIT_WORKTREE.md).
@@ -2244,19 +2365,21 @@ def register_events_routes(
             and conv.workspace is not None
             and conv.host_id is not None
         ):
-            await _remove_session_worktree_best_effort(
-                host_id=conv.host_id,
-                worktree_path=conv.workspace,
-                branch=conv.git_branch,
-                delete_branch=True,
-                request=request,
-                reason="session-delete",
-                conversation_store=conversation_store,
-                exclude_conversation_id=conv.id,
+            await delete_lease.run(
+                _remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=True,
+                    request=request,
+                    reason="session-delete",
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=conv.id,
+                )
             )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
-        deleted = await conversation_store.delete_conversation(session_id)
+        deleted = await delete_lease.run(conversation_store.delete_conversation(session_id))
         if not deleted:
             raise _session_not_found()
         # The session is gone, so is its launch-progress state. Failed
@@ -2294,17 +2417,21 @@ def register_events_routes(
         # sandbox_id and are never touched.
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
-            bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
+            bound_host = await delete_lease.to_thread(
+                host_store_for_managed.get_host, conv.host_id
+            )
             if bound_host is not None and bound_host.sandbox_id is not None:
                 from omnigent.server.managed_hosts import terminate_managed_host
 
-                await terminate_managed_host(
-                    bound_host,
-                    host_store_for_managed,
-                    # Supplies the launcher for the provider-side
-                    # terminate; None (config removed since launch)
-                    # still deletes the row and revokes the token.
-                    getattr(request.app.state, "sandbox_config", None),
+                await delete_lease.run(
+                    terminate_managed_host(
+                        bound_host,
+                        host_store_for_managed,
+                        # Supplies the launcher for the provider-side
+                        # terminate; None (config removed since launch)
+                        # still deletes the row and revokes the token.
+                        getattr(request.app.state, "sandbox_config", None),
+                    )
                 )
         try:
             import hashlib as _hashlib
@@ -2332,4 +2459,5 @@ def register_events_routes(
             )
         except Exception:
             pass
+        await delete_lease.release()
         return ConversationDeleted(id=session_id)

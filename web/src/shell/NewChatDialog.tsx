@@ -80,7 +80,12 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import {
+  composerNewLineDisposition,
+  isComposerSendKey,
+  readSubmitWithModEnter,
+} from "@/lib/composerSendShortcutPreferences";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -4420,6 +4425,20 @@ export function NewChatLandingScreen() {
                   const shouldSubmitFromKeyboard = isComposerSendKey(
                     {
                       key: e.key,
+                      code: e.code,
+                      shiftKey: e.shiftKey,
+                      metaKey: e.metaKey,
+                      ctrlKey: e.ctrlKey,
+                      altKey: e.altKey,
+                      isComposing: e.nativeEvent.isComposing,
+                    },
+                    submitWithModEnter,
+                    preventsKeyboardSubmit,
+                  );
+                  const newLineDisposition = composerNewLineDisposition(
+                    {
+                      key: e.key,
+                      code: e.code,
                       shiftKey: e.shiftKey,
                       metaKey: e.metaKey,
                       ctrlKey: e.ctrlKey,
@@ -4442,26 +4461,26 @@ export function NewChatLandingScreen() {
                   // priority over submission (same UX as the in-session
                   // composer).
                   if (slashMenuOpen && slashMenuMatches.length > 0) {
-                    if (e.key === "ArrowDown") {
+                    if (eventMatchesShortcutAction(e.nativeEvent, "nextSuggestion")) {
                       e.preventDefault();
                       setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
                       return;
                     }
-                    if (e.key === "ArrowUp") {
+                    if (eventMatchesShortcutAction(e.nativeEvent, "previousSuggestion")) {
                       e.preventDefault();
                       setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
                       return;
                     }
                     if (
                       !shouldPreferSendOverCompletion &&
-                      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
+                      eventMatchesShortcutAction(e.nativeEvent, "applySuggestion") &&
                       slashMenuIndex >= 0
                     ) {
                       e.preventDefault();
                       applySlashSelection(slashMenuMatches[slashMenuIndex]!);
                       return;
                     }
-                    if (e.key === "Escape") {
+                    if (eventMatchesShortcutAction(e.nativeEvent, "dismissSuggestions")) {
                       e.preventDefault();
                       // Dismiss the menu by clearing the draft so the user can
                       // start fresh.
@@ -4469,6 +4488,17 @@ export function NewChatLandingScreen() {
                       setSlashMenuIndex(-1);
                       return;
                     }
+                  }
+                  if (newLineDisposition !== "none") {
+                    e.preventDefault();
+                    if (newLineDisposition === "block") return;
+                    const ta = e.currentTarget;
+                    const start = ta.selectionStart;
+                    const end = ta.selectionEnd;
+                    const next = `${message.slice(0, start)}\n${message.slice(end)}`;
+                    setMessage(next);
+                    queueMicrotask(() => ta.setSelectionRange(start + 1, start + 1));
+                    return;
                   }
                   if (shouldSubmitFromKeyboard) {
                     e.preventDefault();

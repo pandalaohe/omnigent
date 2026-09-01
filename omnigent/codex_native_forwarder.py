@@ -44,6 +44,7 @@ from omnigent.codex_native_bridge import (
     read_codex_config_developer_instructions_state,
     read_codex_config_model,
     read_mcp_startup,
+    resolve_codex_auto_compact_token_limit,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -1425,6 +1426,7 @@ class _SessionUsageCoalescer:
         client: httpx.AsyncClient,
         session_id: str,
         model: str | None = None,
+        bridge_dir: Path | None = None,
     ) -> None:
         """
         Initialize the usage coalescer.
@@ -1436,13 +1438,16 @@ class _SessionUsageCoalescer:
             ``None`` and ``record()`` receives no model — without it the server
             cannot price the child's cumulative tokens. ``None`` for the parent
             coalescer, which learns its model via :meth:`record`.
+        :param bridge_dir: Native bridge directory containing the host's
+            per-session Codex config and compact-threshold catalog.
         :returns: None.
         """
         self._client = client
         self._session_id = session_id
-        self._pending: dict[str, int] = {}
-        self._last_posted: dict[str, int] = {}
+        self._pending: dict[str, int | None] = {}
+        self._last_posted: dict[str, int | None] = {}
         self._model: str | None = model
+        self._bridge_dir = bridge_dir
 
     def record(self, params: _JsonObject, model: str | None = None) -> None:
         """
@@ -1459,7 +1464,11 @@ class _SessionUsageCoalescer:
         """
         if model:
             self._model = model
-        data = _session_usage_data_from_params(params)
+        data = _session_usage_data_from_params(
+            params,
+            bridge_dir=self._bridge_dir,
+            model=self._model,
+        )
         if data is None:
             return
         self._pending.update(data)
@@ -1476,7 +1485,7 @@ class _SessionUsageCoalescer:
         data = {
             key: value
             for key, value in self._pending.items()
-            if self._last_posted.get(key) != value
+            if key not in self._last_posted or self._last_posted[key] != value
         }
         if not data:
             self._pending.clear()
@@ -1885,7 +1894,7 @@ async def supervise_forwarder(
             session_id=session_id,
             thread_id=thread_id,
             delta_coalescer=_OutputTextDeltaCoalescer(ap_client, session_id),
-            usage_coalescer=_SessionUsageCoalescer(ap_client, session_id),
+            usage_coalescer=_SessionUsageCoalescer(ap_client, session_id, bridge_dir=bridge_dir),
             elicitation_tracker=_CodexElicitationTaskTracker(),
         )
         forwarder_state = _CodexForwarderState(
@@ -2036,7 +2045,11 @@ async def _maybe_rotate_session_on_thread_started(
     target.session_id = new_session_id
     target.thread_id = new_thread_id
     target.delta_coalescer = _OutputTextDeltaCoalescer(ap_client, new_session_id)
-    target.usage_coalescer = _SessionUsageCoalescer(ap_client, new_session_id)
+    target.usage_coalescer = _SessionUsageCoalescer(
+        ap_client,
+        new_session_id,
+        bridge_dir=bridge_dir,
+    )
     target.elicitation_tracker = _CodexElicitationTaskTracker()
     await old_delta_coalescer.close()
     await old_usage_coalescer.close()
@@ -2671,6 +2684,7 @@ async def _handle_event(
             client,
             route_session_id,
             model=forwarder_state.model if forwarder_state is not None else None,
+            bridge_dir=bridge_dir,
         )
         if is_child
         else None
@@ -6407,7 +6421,12 @@ async def _post_session_interrupted(
     _log_failed_session_event_post(_EXTERNAL_SESSION_INTERRUPTED_TYPE, response)
 
 
-def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | None:
+def _session_usage_data_from_params(
+    params: _JsonObject,
+    *,
+    bridge_dir: Path | None = None,
+    model: str | None = None,
+) -> dict[str, int | None] | None:
     """
     Extract Omnigent session-usage fields from a Codex usage notification.
 
@@ -6431,7 +6450,7 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
         context_window = total.get("contextWindow")
     output_tokens = total.get("outputTokens")
     cached_input_tokens = total.get("cachedInputTokens")
-    data: dict[str, int] = {}
+    data: dict[str, int | None] = {}
     if isinstance(cumulative_input_tokens, int) and cumulative_input_tokens >= 0:
         # Codex's ``tokenUsage.total`` is CUMULATIVE across the whole thread
         # (the CLI subtracts prior totals to recover per-turn deltas), so
@@ -6464,6 +6483,15 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
         data["cumulative_output_tokens"] = output_tokens
     if isinstance(context_window, int) and context_window > 0:
         data["context_window"] = context_window
+        if bridge_dir is not None and model:
+            auto_compact_token_limit = resolve_codex_auto_compact_token_limit(
+                bridge_dir,
+                model=model,
+                effective_context_window=context_window,
+            )
+            # Explicit null clears a threshold reported by the previous model,
+            # so the web immediately falls back to ordinary context usage.
+            data["auto_compact_token_limit"] = auto_compact_token_limit
     if not data:
         return None
     return data
