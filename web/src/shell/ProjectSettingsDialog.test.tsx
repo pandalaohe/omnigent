@@ -12,13 +12,10 @@ vi.mock("@/lib/projectsApi", () => ({
 }));
 // Hoisted so the vi.mock factory below can reference it; per-test overrides
 // let cases control the agent catalog (the default is set in beforeEach).
-const { availableAgentsMock, workspacePickerPropsMock, setHostDefaultWorkspaceMock } = vi.hoisted(
-  () => ({
-    availableAgentsMock: vi.fn(),
-    workspacePickerPropsMock: vi.fn(),
-    setHostDefaultWorkspaceMock: vi.fn(),
-  }),
-);
+const { availableAgentsMock, workspacePickerPropsMock } = vi.hoisted(() => ({
+  availableAgentsMock: vi.fn(),
+  workspacePickerPropsMock: vi.fn(),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({
     data: [
@@ -31,7 +28,6 @@ vi.mock("@/hooks/useHosts", () => ({
       },
     ],
   }),
-  setHostDefaultWorkspace: setHostDefaultWorkspaceMock,
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: availableAgentsMock,
@@ -58,21 +54,12 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 // the live workspace update without the host-filesystem plumbing.
 vi.mock("./WorkspacePicker", () => ({
   isNavigablePath: (p: string) => p.startsWith("/"),
-  WorkspacePicker: (props: {
-    onNavigate: (p: string) => void;
-    onDefaultPathChange?: (p: string | null) => Promise<void>;
-  }) => {
+  HostWorkspacePicker: (props: { onNavigate: (p: string) => void }) => {
     workspacePickerPropsMock(props);
     return (
       <div data-testid="mock-workspace-picker">
         <button type="button" onClick={() => props.onNavigate("/picked/dir")}>
           pick dir
-        </button>
-        <button
-          type="button"
-          onClick={() => void props.onDefaultPathChange?.("/Users/me/Projects")}
-        >
-          pin dir
         </button>
       </div>
     );
@@ -98,8 +85,6 @@ beforeEach(() => {
   createMock.mockReset();
   availableAgentsMock.mockReset();
   workspacePickerPropsMock.mockReset();
-  setHostDefaultWorkspaceMock.mockReset();
-  setHostDefaultWorkspaceMock.mockResolvedValue(undefined);
   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
@@ -298,7 +283,7 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
-  it("starts from and updates the selected Host's pinned folder", async () => {
+  it("uses the shared Host-aware picker for the selected machine", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
     renderDialog();
 
@@ -309,14 +294,7 @@ describe("ProjectSettingsDialog", () => {
       expect.objectContaining({
         hostId: "h1",
         initialPath: undefined,
-        defaultPath: "/Users/me/Projects",
-        defaultPathHostName: "Laptop",
       }),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "pin dir" }));
-    await waitFor(() =>
-      expect(setHostDefaultWorkspaceMock).toHaveBeenCalledWith("h1", "/Users/me/Projects"),
     );
   });
 

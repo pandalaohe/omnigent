@@ -14,7 +14,6 @@
 // all-default dialog stores an empty config.
 
 import { ChevronDownIcon } from "lucide-react";
-import { useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -35,7 +34,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { setHostDefaultWorkspace, useHosts } from "@/hooks/useHosts";
+import { useHosts } from "@/hooks/useHosts";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -45,7 +44,7 @@ import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
-import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
+import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
 const NONE = "__none__";
@@ -104,7 +103,6 @@ export function ProjectSettingsDialog({
   const loadFailed = projectId !== null && isError;
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
-  const queryClient = useQueryClient();
   // Pin the stored default agent into discovery so an already-configured
   // session-scoped agent (archived / paginated out of the scan) still
   // resolves here — matching what the composer's prefill will see.
@@ -232,7 +230,6 @@ export function ProjectSettingsDialog({
   // / an offline stored host). Otherwise the field is a plain path input.
   const browsableHostId =
     hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
-  const selectedHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
 
   // A working directory belongs to one Host. When the Host changes, discard
   // the prior Host's path; opening the browser will then start at the newly
@@ -370,15 +367,9 @@ export function ProjectSettingsDialog({
                       onClick={() => setWorkspaceOpen(false)}
                     />
                     <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:border-white/10 dark:backdrop-blur-xl dark:backdrop-saturate-150 [&>[data-testid=workspace-picker]]:border-0">
-                      <WorkspacePicker
+                      <HostWorkspacePicker
                         hostId={browsableHostId}
                         initialPath={isNavigablePath(workspace) ? workspace : undefined}
-                        defaultPath={selectedHost?.default_workspace}
-                        defaultPathHostName={selectedHost?.name}
-                        onDefaultPathChange={async (path) => {
-                          await setHostDefaultWorkspace(browsableHostId, path);
-                          await queryClient.invalidateQueries({ queryKey: ["hosts"] });
-                        }}
                         onNavigate={setWorkspace}
                       />
                     </div>

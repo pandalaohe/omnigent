@@ -109,7 +109,7 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import {
-  WorkspacePicker,
+  HostWorkspacePicker,
   basename,
   isAbsoluteHostPath,
   isNavigablePath,
@@ -188,12 +188,7 @@ import {
   CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   CURSOR_NATIVE_EXEC_MODES,
 } from "@/lib/nativeHarnessModes";
-import {
-  useHostModelOptions,
-  useHosts,
-  setHostDefaultWorkspace,
-  type Host,
-} from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
@@ -5091,14 +5086,8 @@ export function NewChatLandingScreen() {
                   narrow screen; desktop still gets the full width. */}
                   <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
                     {selectedHostId ? (
-                      <WorkspacePicker
+                      <HostWorkspacePicker
                         hostId={selectedHostId}
-                        defaultPath={selectedHost?.default_workspace}
-                        defaultPathHostName={selectedHost?.name}
-                        onDefaultPathChange={async (path) => {
-                          await setHostDefaultWorkspace(selectedHostId, path);
-                          await queryClient.invalidateQueries({ queryKey: ["hosts"] });
-                        }}
                         initialPath={
                           isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
                         }

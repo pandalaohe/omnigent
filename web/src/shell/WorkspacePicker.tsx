@@ -14,6 +14,7 @@ import {
   PinIcon,
   SearchIcon,
 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,7 @@ import {
   useHostFilesystem,
   useHostFilesystemRoots,
 } from "@/hooks/useHostFilesystem";
+import { setHostDefaultWorkspace, useHosts } from "@/hooks/useHosts";
 
 const WINDOWS_DRIVE_ROOT_RE = /^[A-Za-z]:[\\/]$/;
 const WINDOWS_ABSOLUTE_RE = /^[A-Za-z]:[\\/]/;
@@ -262,7 +264,7 @@ function PickerIconButton({
   );
 }
 
-interface WorkspacePickerProps {
+export interface WorkspacePickerProps {
   /** Host to browse, or ``null`` to render an empty state. */
   hostId: string | null;
   /**
@@ -314,6 +316,42 @@ interface WorkspacePickerProps {
   defaultPathHostName?: string;
   /** Set or clear the host-level starting folder. */
   onDefaultPathChange?: (path: string | null) => void | Promise<void>;
+}
+
+export type HostWorkspacePickerProps = Omit<
+  WorkspacePickerProps,
+  "defaultPath" | "defaultPathHostName" | "onDefaultPathChange"
+>;
+
+/**
+ * Host-aware workspace browser used by every product entry point.
+ *
+ * Keeping the Host preference lookup and mutation here prevents new-session,
+ * project settings, fork/resume/switch, scheduled-task, and an existing
+ * conversation's Working folder from drifting into different browsers. The
+ * lower-level {@link WorkspacePicker} stays injectable for stories and focused
+ * rendering tests.
+ */
+export function HostWorkspacePicker(props: HostWorkspacePickerProps) {
+  const queryClient = useQueryClient();
+  const { data: hosts } = useHosts({ enabled: props.hostId !== null });
+  const host = hosts?.find((candidate) => candidate.host_id === props.hostId);
+
+  return (
+    <WorkspacePicker
+      {...props}
+      defaultPath={host?.default_workspace}
+      defaultPathHostName={host?.name ?? props.hostId ?? undefined}
+      onDefaultPathChange={
+        props.hostId === null
+          ? undefined
+          : async (path) => {
+              await setHostDefaultWorkspace(props.hostId as string, path);
+              await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+            }
+      }
+    />
+  );
 }
 
 /**

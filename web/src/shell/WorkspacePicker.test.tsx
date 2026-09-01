@@ -7,18 +7,21 @@
 //      but a late-arriving listing (home resolving) must NOT clobber
 //      what the user is typing.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   basename,
+  HostWorkspacePicker,
   isNavigablePath,
   joinPath,
   normalizeTypedPath,
   parentOf,
   WorkspacePicker,
 } from "./WorkspacePicker";
+import { setHostDefaultWorkspace, useHosts } from "@/hooks/useHosts";
 import {
   useCreateHostDirectory,
   useHostFilesystem,
@@ -39,15 +42,65 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // is open, so the default is harmless for the other suites.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  setHostDefaultWorkspace: vi.fn(),
+}));
 
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useHostFilesystemRootsMock = vi.mocked(useHostFilesystemRoots);
 const useCreateHostDirectoryMock = vi.mocked(useCreateHostDirectory);
+const useHostsMock = vi.mocked(useHosts);
+const setHostDefaultWorkspaceMock = vi.mocked(setHostDefaultWorkspace);
 
 beforeEach(() => {
   useHostFilesystemRootsMock.mockReturnValue(
     result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
   );
+  useHostsMock.mockReturnValue({ data: [] } as unknown as ReturnType<typeof useHosts>);
+  setHostDefaultWorkspaceMock.mockReset();
+  setHostDefaultWorkspaceMock.mockResolvedValue(undefined);
+});
+
+describe("HostWorkspacePicker shared preference wiring", () => {
+  it("shows and updates the selected Host's pinned folder in every entry point", async () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [dir("Projects", "D:\\AIProgram\\Projects")],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "win_host",
+          name: "Windows desktop",
+          owner: "me",
+          status: "online",
+          default_workspace: "D:\\AIProgram\\Projects",
+        },
+      ],
+    } as ReturnType<typeof useHosts>);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={client}>
+        <HostWorkspacePicker hostId="win_host" initialPath={"D:\\AIProgram\\Projects"} />
+      </QueryClientProvider>,
+    );
+
+    const pin = screen.getByTestId("workspace-picker-default");
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue(
+      "D:\\AIProgram\\Projects",
+    );
+    expect(pin).toHaveAttribute("aria-label", "Clear default starting folder for Windows desktop");
+    fireEvent.click(pin);
+    await waitFor(() => expect(setHostDefaultWorkspaceMock).toHaveBeenCalledWith("win_host", null));
+  });
 });
 
 function dir(name: string, path: string): HostFilesystemEntry {
