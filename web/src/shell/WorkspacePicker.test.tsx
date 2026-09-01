@@ -15,7 +15,6 @@ import {
   basename,
   isNavigablePath,
   joinPath,
-  listingFilter,
   normalizeTypedPath,
   parentOf,
   WorkspacePicker,
@@ -237,38 +236,6 @@ describe("joinPath", () => {
   });
 });
 
-// listingFilter decides whether (and how) the path-bar text narrows the
-// current directory's listing. The table pins both the cases that DO filter
-// (a bare fragment, or a trailing segment under the current dir, incl. ~ and
-// root) and the cases that must NOT — blank, exactly the current path, or a
-// path into a different directory (which is navigation, not a filter). A
-// false positive here would hide entries while the user is navigating away.
-describe("listingFilter", () => {
-  it.each<[string, string, string | null, string | null]>([
-    // [pathInput, currentAbsolute, home, expected]
-    // Bare fragment, no slash → filters the current directory by it.
-    ["pro", "/Users/me", null, "pro"],
-    // Trailing segment whose parent IS the current directory → filters.
-    ["/Users/me/pro", "/Users/me", null, "pro"],
-    // Exactly the current path (the mirrored value) → not a filter.
-    ["/Users/me", "/Users/me", null, null],
-    // Blank input → no filter.
-    ["", "/Users/me", null, null],
-    ["   ", "/Users/me", null, null],
-    // "<dir>/" with nothing past the slash yet → no filter.
-    ["/Users/me/", "/Users/me", null, null],
-    // A path into a *different* directory → navigation, not a filter.
-    ["/etc", "/Users/me", null, null],
-    ["/var/lo", "/Users/me", null, null],
-    // ~ expands against home, so "~/pro" filters when home is the current dir.
-    ["~/pro", "/Users/me", "/Users/me", "pro"],
-    // At the root, "/sr" is a fragment of "/" → filters.
-    ["/sr", "/", null, "sr"],
-  ])("listingFilter(%j, %j, %j) → %j", (input, current, home, expected) => {
-    expect(listingFilter(input, current, home)).toBe(expected);
-  });
-});
-
 describe("WorkspacePicker path bar", () => {
   beforeEach(() => {
     useHostFilesystemMock.mockReset();
@@ -327,6 +294,17 @@ describe("WorkspacePicker path bar", () => {
     expect(input.value).toBe("/Users/serena.ruan/projects");
   });
 
+  it("explains that the address bar accepts an absolute path", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false }),
+    );
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveAttribute(
+      "aria-label",
+      "Folder path. Type an absolute path and press Enter to open it.",
+    );
+  });
+
   it("resolves a tilde start path to an absolute one for selection", () => {
     // Opening at "~/projects" (the host expands ~): the listing's
     // entries come back absolute, so "Select current" must return the
@@ -374,6 +352,20 @@ describe("WorkspacePicker filesystem roots", () => {
 });
 
 describe("WorkspacePicker default starting folder", () => {
+  it("opens each Host at its own pinned folder", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
+    );
+
+    const { rerender } = render(
+      <WorkspacePicker hostId="mac_host" defaultPath="/Users/me/Projects" />,
+    );
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("mac_host", "/Users/me/Projects");
+
+    rerender(<WorkspacePicker hostId="windows_host" defaultPath={"D:\\AIProgram\\Projects"} />);
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("windows_host", "D:\\AIProgram\\Projects");
+  });
+
   it("pins the current Windows directory for future sessions", () => {
     const onDefaultPathChange = vi.fn();
     useHostFilesystemMock.mockReturnValue(
@@ -389,8 +381,13 @@ describe("WorkspacePicker default starting folder", () => {
       <WorkspacePicker
         hostId="host_1"
         initialPath={"D:\\Projects"}
+        defaultPathHostName="Windows desktop"
         onDefaultPathChange={onDefaultPathChange}
       />,
+    );
+    expect(screen.getByTestId("workspace-picker-default")).toHaveAttribute(
+      "aria-label",
+      "Use this folder as the default starting folder for Windows desktop",
     );
     fireEvent.click(screen.getByTestId("workspace-picker-default"));
 
@@ -492,10 +489,10 @@ describe("WorkspacePicker live selection (onNavigate)", () => {
   });
 });
 
-// Filter-as-you-type: typing a fragment in the path bar narrows the current
-// directory's listing (the listingFilter unit tests cover the parsing; these
-// confirm the wiring through to the rendered rows).
-describe("WorkspacePicker listing filter", () => {
+// Folder search is a separate right-side control so the address bar always
+// means exact-path navigation. It filters only the current level because the
+// Host API does not provide a recursive machine-wide search index.
+describe("WorkspacePicker folder search", () => {
   beforeEach(() => {
     useHostFilesystemMock.mockReset();
     useHostFilesystemMock.mockReturnValue(
@@ -517,28 +514,26 @@ describe("WorkspacePicker listing filter", () => {
     cleanup();
   });
 
-  it("narrows the listing to entries matching the typed fragment", () => {
+  it("finds current-level folders by a case-insensitive name fragment", () => {
     render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
-    // All three show before any filter.
+    // All three show before search opens.
     expect(screen.getByTestId("workspace-picker-entry-src")).toBeTruthy();
     expect(screen.getByTestId("workspace-picker-entry-docs")).toBeTruthy();
-    // Typing "s" keeps only the names starting with "s".
-    fireEvent.change(screen.getByTestId("workspace-picker-path-input"), {
-      target: { value: "s" },
+    fireEvent.change(screen.getByTestId("workspace-picker-search-input"), {
+      // Substring rather than prefix: Finder-style filtering finds "styles".
+      target: { value: "YLE" },
     });
-    expect(screen.getByTestId("workspace-picker-entry-src")).toBeTruthy();
     expect(screen.getByTestId("workspace-picker-entry-styles")).toBeTruthy();
+    expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
     expect(screen.queryByTestId("workspace-picker-entry-docs")).toBeNull();
   });
 
-  it("shows a no-matches message when nothing matches the fragment", () => {
+  it("shows a scoped no-matches message", () => {
     render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
-    fireEvent.change(screen.getByTestId("workspace-picker-path-input"), {
+    fireEvent.change(screen.getByTestId("workspace-picker-search-input"), {
       target: { value: "zzz" },
     });
-    // Distinct from "(empty directory)" so the user knows it's the filter,
-    // not an actually-empty folder.
-    expect(screen.getByText("No matching entries")).toBeTruthy();
+    expect(screen.getByText("No matching folders in this directory")).toBeTruthy();
     expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
   });
 });

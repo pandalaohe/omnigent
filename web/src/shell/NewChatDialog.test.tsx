@@ -1545,6 +1545,28 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("opens the footer CWD picker with the selected Host's default-folder control", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        default_workspace: "/Users/corey/Projects",
+      },
+    ]);
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "Projects",
+      ),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+
+    expect(screen.getByTestId("workspace-picker-default")).toHaveAttribute(
+      "aria-label",
+      "Clear default starting folder for machine-1",
+    );
+  });
+
   it("falls back to the host's home directory when there is no recent", async () => {
     // No recents for this host → the field seeds from the home listing
     // (parent of the first entry), so a first-ever session is still one click.

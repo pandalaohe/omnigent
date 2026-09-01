@@ -12,6 +12,7 @@ import {
   AlertTriangleIcon,
   HardDriveIcon,
   PinIcon,
+  SearchIcon,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 
@@ -198,42 +199,6 @@ export function isNavigablePath(path: string): boolean {
 }
 
 /**
- * Live filter for the listing, derived from the path-bar text.
- *
- * Returns the fragment to match the current directory's entries against
- * (case-insensitive prefix), or ``null`` when the text isn't filtering the
- * current directory — it's blank, it's exactly the current path, or it's a
- * path into a *different* directory the user is navigating to (Enter jumps
- * there). Mirrors shell tab-completion: a bare fragment (``"pro"``) or a
- * trailing segment under the current dir (``"/Users/me/pro"``) narrows the
- * list; anything else leaves it whole.
- *
- * @param pathInput Raw path-bar text, e.g. ``"pro"`` or ``"/Users/me/pro"``.
- * @param currentAbsolute Absolute path of the directory currently shown.
- * @param home Resolved home dir (for ``~`` expansion), or ``null``.
- * @returns The fragment to filter by, or ``null`` for no filter.
- */
-export function listingFilter(
-  pathInput: string,
-  currentAbsolute: string,
-  home: string | null = null,
-): string | null {
-  const trimmed = pathInput.trim();
-  if (trimmed === "") return null;
-  const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-  if (slash === -1) {
-    // Bare fragment, no directory part → filter the current dir by it.
-    return trimmed;
-  }
-  const partial = trimmed.slice(slash + 1);
-  if (partial === "") return null; // "<dir>/" — nothing typed past the slash.
-  // A fragment only filters when its directory part IS the current directory;
-  // otherwise the user is typing a path elsewhere (navigation, not a filter).
-  const dirText = trimmed.slice(0, slash) || "/";
-  return normalizeTypedPath(dirText, home) === currentAbsolute ? partial : null;
-}
-
-/**
  * Icon button in the picker header, with a styled hover tooltip.
  *
  * The tooltip hangs off a wrapping span rather than the button so it still
@@ -321,9 +286,9 @@ interface WorkspacePickerProps {
   onClose?: () => void;
   /**
    * Absolute path to open the picker at on mount, e.g.
-   * ``"/Users/corey/projects"``. ``undefined`` starts at the host's
-   * home directory. Read only at mount time; later changes are
-   * ignored (navigate via the picker UI instead).
+   * ``"/Users/corey/projects"``. ``undefined`` starts at ``defaultPath``
+   * when present, otherwise at the Host's home directory. Read only at
+   * mount time; later changes are ignored (navigate via the picker UI instead).
    */
   initialPath?: string;
   /**
@@ -345,6 +310,8 @@ interface WorkspacePickerProps {
   workspacePath?: string;
   /** Host-level starting folder currently persisted for new sessions. */
   defaultPath?: string | null;
+  /** Human-readable Host name used to make the pin action's scope explicit. */
+  defaultPathHostName?: string;
   /** Set or clear the host-level starting folder. */
   onDefaultPathChange?: (path: string | null) => void | Promise<void>;
 }
@@ -352,11 +319,11 @@ interface WorkspacePickerProps {
 /**
  * Flat-list directory picker for choosing a workspace.
  *
- * A header (up / home / editable path / show-hidden / select / close)
- * sits above the current directory's entries; clicking a folder
- * navigates into it. The header "Select" button picks the directory
- * currently shown — kept in the always-visible header so it doesn't
- * fall below the fold on short screens. Files are grayed out —
+ * Two compact header rows sit above the current directory's entries:
+ * navigation and actions first, then exact-path input, optional Host pin,
+ * and current-level folder search. Clicking a folder navigates into it.
+ * The "Select" button stays in the always-visible action row so it doesn't
+ * fall below the fold on short screens. Files are grayed out because
  * workspaces must be directories.
  *
  * @param hostId Host whose filesystem to browse.
@@ -366,7 +333,7 @@ interface WorkspacePickerProps {
  * @param onNavigate Fired with the current directory on every navigation,
  *   for a live-updating picker with no "Select" button.
  * @param initialPath Absolute path to open at on mount; defaults to
- *   the host's home directory.
+ *   the Host's pinned starting folder, then its home directory.
  * @param occupancyForPath Returns how many other live agents occupy a given
  *   absolute directory; drives the conflict banner. Omit to disable it.
  */
@@ -379,6 +346,7 @@ export function WorkspacePicker({
   occupancyForPath,
   workspacePath,
   defaultPath,
+  defaultPathHostName,
   onDefaultPathChange,
 }: WorkspacePickerProps) {
   // "" means home — the server forwards ~ to list_dir. initialPath
@@ -402,6 +370,9 @@ export function WorkspacePicker({
   const [newFolderName, setNewFolderName] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [defaultError, setDefaultError] = useState<string | null>(null);
+  // Folder-name search is separate from the address bar: the latter always
+  // means "open this exact path", while this field filters the current level.
+  const [searchQuery, setSearchQuery] = useState("");
   const createDir = useCreateHostDirectory();
 
   // Reset to home when the host *changes* — a path from the old host
@@ -420,6 +391,7 @@ export function WorkspacePicker({
     setNewFolderName(null);
     setCreateError(null);
     setDefaultError(null);
+    setSearchQuery("");
   }, [hostId, defaultPath]);
 
   const directoryQuery = useHostFilesystem(hostId, showRoots ? null : path);
@@ -498,20 +470,21 @@ export function WorkspacePicker({
 
   const parent = parentOf(currentAbsolute);
 
-  // Live filter from the path-bar text (shell-style: type a fragment to
-  // narrow the current directory). Null when not filtering.
-  const activeFilter = listingFilter(pathInput, currentAbsolute, resolvedHome);
-  // Typing a dot-prefixed fragment reveals hidden entries even with the
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+  // Searching a dot-prefixed name reveals hidden entries even with the
   // toggle off, so ".env" can be found without flipping "Show hidden".
-  const includeHidden = showHidden || (activeFilter?.startsWith(".") ?? false);
+  const includeHidden = showHidden || normalizedSearch.startsWith(".");
 
   // Directories first, then files, alphabetical. Dot-prefixed entries
-  // are hidden unless "Show hidden" is on; the active filter narrows by a
-  // case-insensitive name prefix.
+  // are hidden unless "Show hidden" is on. Search is intentionally limited
+  // to folders in the current directory; the Host API does not recursively
+  // index the machine, so the UI must not imply a full-disk search.
   const entries = (data?.entries ?? [])
     .filter((e) => includeHidden || !e.name.startsWith("."))
     .filter(
-      (e) => activeFilter === null || e.name.toLowerCase().startsWith(activeFilter.toLowerCase()),
+      (e) =>
+        normalizedSearch === "" ||
+        (e.type === "directory" && e.name.toLowerCase().includes(normalizedSearch)),
     )
     .sort((a, b) => {
       if (a.type === "directory" && b.type !== "directory") return -1;
@@ -525,12 +498,14 @@ export function WorkspacePicker({
     userEditedRef.current = false;
     setShowRoots(false);
     setPath(next);
+    setSearchQuery("");
   }
 
   function navigateToRoots() {
     userEditedRef.current = false;
     setShowRoots(true);
     setPathInput("");
+    setSearchQuery("");
   }
 
   function commitPathInput() {
@@ -644,49 +619,7 @@ export function WorkspacePicker({
           onClick={() => navigateTo("")}
           testId="workspace-picker-home"
         />
-        {onDefaultPathChange && (
-          <PickerIconButton
-            label={
-              currentAbsolute !== "" && currentAbsolute === defaultPath
-                ? "Clear default starting folder"
-                : "Use this folder for new sessions on this computer"
-            }
-            icon={
-              <PinIcon
-                className={
-                  currentAbsolute !== "" && currentAbsolute === defaultPath
-                    ? "size-4 fill-current"
-                    : "size-4"
-                }
-              />
-            }
-            onClick={() => void toggleDefaultPath()}
-            disabled={showRoots || !isAbsoluteHostPath(currentAbsolute)}
-            testId="workspace-picker-default"
-          />
-        )}
-        <input
-          type="text"
-          value={pathInput}
-          onChange={(e) => {
-            userEditedRef.current = true;
-            setPathInput(e.target.value);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              commitPathInput();
-            }
-          }}
-          onBlur={commitPathInput}
-          placeholder={showRoots ? "Computer" : "~"}
-          disabled={showRoots}
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          className="min-w-0 flex-1 bg-transparent text-sm text-muted-foreground focus:outline-none"
-          data-testid="workspace-picker-path-input"
-        />
+        <div className="flex-1" />
         <PickerIconButton
           label={showHidden ? "Hide hidden files" : "Show hidden files"}
           icon={showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
@@ -722,6 +655,88 @@ export function WorkspacePicker({
             testId="workspace-picker-close"
           />
         )}
+      </div>
+      <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <input
+                type="text"
+                value={pathInput}
+                onChange={(e) => {
+                  userEditedRef.current = true;
+                  setPathInput(e.target.value);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitPathInput();
+                  }
+                }}
+                onBlur={commitPathInput}
+                placeholder={showRoots ? "Computer" : "~"}
+                aria-label="Folder path. Type an absolute path and press Enter to open it."
+                disabled={showRoots}
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+                className="min-w-0 flex-1 rounded-md bg-muted/40 px-2 py-1 text-sm text-muted-foreground focus:outline-none"
+                data-testid="workspace-picker-path-input"
+              />
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Type an absolute path and press Enter</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+        {onDefaultPathChange && (
+          <PickerIconButton
+            label={
+              currentAbsolute !== "" && currentAbsolute === defaultPath
+                ? `Clear default starting folder for ${defaultPathHostName ?? "this Host"}`
+                : `Use this folder as the default starting folder for ${defaultPathHostName ?? "this Host"}`
+            }
+            icon={
+              <PinIcon
+                className={
+                  currentAbsolute !== "" && currentAbsolute === defaultPath
+                    ? "size-4 fill-current"
+                    : "size-4"
+                }
+              />
+            }
+            onClick={() => void toggleDefaultPath()}
+            disabled={showRoots || !isAbsoluteHostPath(currentAbsolute)}
+            testId="workspace-picker-default"
+          />
+        )}
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md bg-muted/40 px-2 py-1">
+          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setSearchQuery("");
+              }
+            }}
+            placeholder={showRoots ? "Open a root to search" : "Search folders here"}
+            aria-label="Search folders in this directory"
+            disabled={showRoots}
+            className="min-w-0 flex-1 bg-transparent text-sm text-foreground focus:outline-none disabled:opacity-50"
+            data-testid="workspace-picker-search-input"
+          />
+          {searchQuery !== "" && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery("")}
+              aria-label="Clear folder search"
+              className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+            >
+              <XIcon className="size-3.5" />
+            </button>
+          )}
+        </div>
       </div>
       {defaultError !== null && (
         <div className="border-b px-3 py-2 text-sm text-destructive" role="alert">
@@ -818,7 +833,9 @@ export function WorkspacePicker({
         )}
         {!isLoading && error === null && entries.length === 0 && (
           <div className="px-3 py-3 text-sm text-muted-foreground">
-            {activeFilter !== null ? "No matching entries" : "(empty directory)"}
+            {normalizedSearch !== ""
+              ? "No matching folders in this directory"
+              : "(empty directory)"}
           </div>
         )}
         {entries.map((entry) => {
@@ -828,10 +845,9 @@ export function WorkspacePicker({
               key={entry.path}
               type="button"
               disabled={!isDir}
-              // preventDefault keeps focus on the path input so a click while
-              // a filter is typed doesn't blur → commit → re-sort the list out
-              // from under the click. onClick still does the navigation (and
-              // fires for keyboard activation, where mousedown doesn't).
+              // Preventing the mouse-down focus shift keeps an edited path from
+              // blurring and committing before the folder click can navigate.
+              // onClick still fires for pointer and keyboard activation.
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => isDir && navigateTo(entry.path)}
               className={

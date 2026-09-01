@@ -5094,6 +5094,7 @@ export function NewChatLandingScreen() {
                       <WorkspacePicker
                         hostId={selectedHostId}
                         defaultPath={selectedHost?.default_workspace}
+                        defaultPathHostName={selectedHost?.name}
                         onDefaultPathChange={async (path) => {
                           await setHostDefaultWorkspace(selectedHostId, path);
                           await queryClient.invalidateQueries({ queryKey: ["hosts"] });
