@@ -1887,7 +1887,14 @@ def _split_vcs_url(vcs_url: str) -> tuple[str, str | None]:
     # make ``git ls-remote`` query a nonexistent ref and silently return None.
     url = url.split("#", 1)[0]
     at = url.rfind("@")
-    if at > url.rfind("/"):  # '@' past the final path segment → revision suffix
+    scheme = url.find("://")
+    path_start = url.find("/", scheme + 3) if scheme >= 0 else -1
+    if (path_start >= 0 and at > path_start) or (path_start < 0 and at > url.rfind("/")):
+        # For URL transports, any final '@' after the authority starts the
+        # revision. The revision itself may contain slashes, so comparing
+        # against the final slash loses valid branch names. For scp/local-style
+        # inputs, retain the narrower legacy heuristic to avoid treating
+        # git@host as a revision.
         return url[:at], (url[at + 1 :] or None)
     return url, None
 
