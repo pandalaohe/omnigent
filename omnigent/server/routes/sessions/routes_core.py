@@ -164,6 +164,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_archive_stop,
 )
 from omnigent.server.schemas import (
+    ArchivedSessionFacetsResponse,
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
     CreatedSessionResponse,
@@ -727,6 +728,30 @@ def register_core_routes(
             return [by_name[name] for name in sorted(by_name)]
 
         return await asyncio.to_thread(_list_union)
+
+    @router.get(
+        "/sessions/archived-facets",
+        response_model=ArchivedSessionFacetsResponse,
+    )
+    async def list_archived_session_facets(
+        request: Request,
+        response: Response,
+    ) -> ArchivedSessionFacetsResponse:
+        """Return compact, distinct filter values for visible archived sessions."""
+        response.headers["Cache-Control"] = "no-store"
+        user_id = _require_user(request, auth_provider)
+        facets = await asyncio.to_thread(
+            conversation_store.list_archived_facets,
+            accessible_by=user_id,
+        )
+        agent_names_by_id = await asyncio.to_thread(agent_store.get_names, facets.agent_ids)
+        return ArchivedSessionFacetsResponse(
+            projects=facets.projects,
+            host_ids=facets.host_ids,
+            agent_names=sorted(
+                {name for name in agent_names_by_id.values() if isinstance(name, str) and name}
+            ),
+        )
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
     #

@@ -88,6 +88,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
+    ArchivedConversationFacets,
     ArchiveLockWriteResult,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
@@ -2338,6 +2339,121 @@ class SqlAlchemyConversationStore(ConversationStore):
             if permission_ids is not None:
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(permission_ids))
             return [row[0] for row in ap_sess.execute(stmt).all()]
+
+    def list_archived_facets(
+        self,
+        accessible_by: str | None = None,
+    ) -> ArchivedConversationFacets:
+        """Aggregate archive filter values without loading conversation rows."""
+        permission_subquery: Any | None = None
+        permission_ids: list[str] | None = None
+        same_database = self._conv_engine is self._engine
+
+        if accessible_by is not None:
+            permission_stmt = select(SqlSessionPermission.conversation_id).where(
+                SqlSessionPermission.workspace_id == current_workspace_id(),
+                SqlSessionPermission.user_id == accessible_by,
+            )
+            if same_database:
+                permission_subquery = permission_stmt
+            else:
+                with self._session("list_archived_facets_permissions") as meta_sess:
+                    permission_ids = list(meta_sess.execute(permission_stmt).scalars())
+                if not permission_ids:
+                    return ArchivedConversationFacets(projects=[], host_ids=[], agent_ids=[])
+
+        # Cross-database installations cannot join AP conversations to the
+        # permission/host metadata tables. Batch the bridge ids so even a large
+        # archive never creates an oversized IN clause.
+        scope_batches: list[list[str] | None]
+        if permission_ids is None:
+            scope_batches = [None]
+        else:
+            scope_batches = [
+                permission_ids[index : index + 500]
+                for index in range(0, len(permission_ids), 500)
+            ]
+
+        projects: set[str] = set()
+        host_ids: set[str] = set()
+        agent_ids: set[str] = set()
+        split_archived_ids: list[str] = []
+
+        with self._conv_session("list_archived_facets") as ap_sess:
+            for permission_batch in scope_batches:
+                predicates = [
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.archived.is_(True),
+                    SqlConversation.parent_conversation_id.is_(None),
+                    SqlConversation.agent_id.is_not(None),
+                ]
+                if permission_subquery is not None:
+                    predicates.append(SqlConversation.id.in_(permission_subquery))
+                elif permission_batch is not None:
+                    predicates.append(SqlConversation.id.in_(permission_batch))
+
+                archived_ids = select(SqlConversation.id).where(*predicates)
+                projects.update(
+                    value
+                    for value in ap_sess.execute(
+                        select(SqlConversationLabel.value)
+                        .where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                            SqlConversationLabel.conversation_id.in_(archived_ids),
+                        )
+                        .distinct()
+                    ).scalars()
+                    if value
+                )
+                agent_ids.update(
+                    agent_id
+                    for agent_id in ap_sess.execute(
+                        select(SqlConversation.agent_id).where(*predicates).distinct()
+                    ).scalars()
+                    if agent_id
+                )
+
+                if same_database:
+                    host_ids.update(
+                        host_id
+                        for host_id in ap_sess.execute(
+                            select(SqlConversationMetadata.host_id)
+                            .where(
+                                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                SqlConversationMetadata.host_id.is_not(None),
+                                SqlConversationMetadata.id.in_(archived_ids),
+                            )
+                            .distinct()
+                        ).scalars()
+                        if host_id
+                    )
+                else:
+                    split_archived_ids.extend(ap_sess.execute(archived_ids).scalars())
+
+        if split_archived_ids:
+            with self._session("list_archived_facets_hosts") as meta_sess:
+                for index in range(0, len(split_archived_ids), 500):
+                    id_batch = split_archived_ids[index : index + 500]
+                    host_ids.update(
+                        host_id
+                        for host_id in meta_sess.execute(
+                            select(SqlConversationMetadata.host_id)
+                            .where(
+                                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                SqlConversationMetadata.host_id.is_not(None),
+                                SqlConversationMetadata.id.in_(id_batch),
+                            )
+                            .distinct()
+                        ).scalars()
+                        if host_id
+                    )
+
+        return ArchivedConversationFacets(
+            projects=sorted(projects),
+            host_ids=sorted(host_ids),
+            agent_ids=sorted(agent_ids),
+        )
 
     def delete_label(
         self,

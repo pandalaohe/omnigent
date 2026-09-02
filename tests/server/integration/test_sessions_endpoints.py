@@ -2326,6 +2326,53 @@ async def test_patch_session_archive_hides_from_default_list(
     assert sid in default_ids_after, "unarchived session must reappear in the default list"
 
 
+async def test_archived_facets_returns_distinct_server_aggregates(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The Archive page gets filter options in one compact Server response."""
+    codex = await create_test_agent(client, name="codex-native")
+    claude = await create_test_agent(client, name="claude-native")
+    codex_session = await _create_session(
+        client,
+        codex["id"],
+        title="archived codex",
+        labels={"omni_project": "Core"},
+    )
+    claude_session = await _create_session(
+        client,
+        claude["id"],
+        title="archived claude",
+        labels={"omni_project": "Agents"},
+    )
+    active = await _create_session(
+        client,
+        codex["id"],
+        title="active only",
+        labels={"omni_project": "Active only"},
+    )
+    host = HostStore(db_uri).upsert_on_connect(
+        "6b9c07bfb42f687d53af44f018adebec",
+        "archive-host",
+        "owner@example.com",
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(codex_session["id"], host_id=host.host_id, workspace="/work/core")
+    for session in (codex_session, claude_session):
+        archived = await client.patch(f"/v1/sessions/{session['id']}", json={"archived": True})
+        assert archived.status_code == 200, archived.text
+
+    response = await client.get("/v1/sessions/archived-facets")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["projects"] == ["Agents", "Core"]
+    assert body["host_ids"] == [host.host_id]
+    assert body["agent_names"] == ["claude-native", "codex-native"]
+    assert "Active only" not in body["projects"]
+    assert active["id"] not in response.text
+
+
 async def test_archive_lock_blocks_delete_until_unlocked(
     client: httpx.AsyncClient,
 ) -> None:

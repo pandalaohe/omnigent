@@ -11,7 +11,7 @@ import { setOmnigentHostConfig } from "@/lib/host";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
-  fetchAllArchivedProjectNames,
+  fetchArchivedSessionFacets,
   renameConversation,
   resetArchivedQueryCompatibilityForTests,
   useArchiveConversation,
@@ -296,59 +296,25 @@ describe("useConversations search timeout", () => {
   });
 });
 
-describe("fetchAllArchivedProjectNames", () => {
-  it("pages through all archived sessions and returns distinct sorted project names", async () => {
-    fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "a", archived: true, labels: { omni_project: "Beta" } },
-            // Active row — include_archived returns it, but it's not filterable here.
-            { id: "b", archived: false, labels: { omni_project: "Zeta" } },
-            // Archived but unfiled — no project label to collect.
-            { id: "c", archived: true, labels: {} },
-          ],
-          first_id: "a",
-          last_id: "c",
-          has_more: true,
-        }),
-      )
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "d", archived: true, labels: { omni_project: "Alpha" } },
-            // Duplicate project across pages collapses to one entry.
-            { id: "e", archived: true, labels: { omni_project: "Beta" } },
-          ],
-          first_id: "d",
-          last_id: "e",
-          has_more: false,
-        }),
-      );
-
-    const names = await fetchAllArchivedProjectNames();
-
-    // Distinct + sorted; active and unfiled rows contribute nothing.
-    expect(names).toEqual(["Alpha", "Beta"]);
-    // Page 1: archived, large page size, no project filter, no cursor.
-    const url1 = fetchMock.mock.calls[0][0] as string;
-    expect(url1).toContain("archived_only=true");
-    expect(url1).toContain("limit=100");
-    expect(url1).not.toContain("project=");
-    expect(url1).not.toContain("after=");
-    // Page 2 follows the previous page's last_id cursor.
-    expect(fetchMock.mock.calls[1][0]).toContain("after=c");
-  });
-
-  it("stops after one request when the first page has no more", async () => {
+describe("fetchArchivedSessionFacets", () => {
+  it("uses one aggregate request instead of paging through archived sessions", async () => {
     fetchMock.mockResolvedValueOnce(
-      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      mockResponse({
+        projects: ["Alpha", "Beta"],
+        host_ids: ["host-mac", "host-win"],
+        agent_names: ["claude-native", "codex-native"],
+      }),
     );
 
-    const names = await fetchAllArchivedProjectNames();
+    const facets = await fetchArchivedSessionFacets();
 
-    expect(names).toEqual([]);
+    expect(facets).toEqual({
+      projects: ["Alpha", "Beta"],
+      hostIds: ["host-mac", "host-win"],
+      agentNames: ["claude-native", "codex-native"],
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/archived-facets");
   });
 });
 
@@ -365,16 +331,19 @@ describe("useArchivedConversations", () => {
 
     renderHook(
       () =>
-        useArchivedConversations({
-          searchQuery: "Omnigent",
-          project: "Core",
-          hostId: "host-win",
-          agentName: "codex-native",
-          dateField: "archived_at",
-          sortField: "created_at",
-          agePreset: "gt90d",
-          order: "asc",
-        }),
+        useArchivedConversations(
+          {
+            searchQuery: "Omnigent",
+            project: "Core",
+            hostId: "host-win",
+            agentName: "codex-native",
+            dateField: "archived_at",
+            sortField: "created_at",
+            agePreset: "gt90d",
+            order: "asc",
+          },
+          "cursor-page-2",
+        ),
       { wrapper },
     );
 
@@ -387,6 +356,8 @@ describe("useArchivedConversations", () => {
     expect(url.searchParams.get("agent_name")).toBe("codex-native");
     expect(url.searchParams.get("sort_by")).toBe("created_at");
     expect(url.searchParams.get("order")).toBe("asc");
+    expect(url.searchParams.get("limit")).toBe("20");
+    expect(url.searchParams.get("after")).toBe("cursor-page-2");
     expect(url.searchParams.get("archived_before")).toBe(
       String(Math.floor(now / 1000) - 90 * 86_400),
     );

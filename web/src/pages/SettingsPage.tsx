@@ -44,10 +44,12 @@ import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
   CheckIcon,
+  ChevronDownIcon,
   ChevronsUpDownIcon,
   DownloadIcon,
   KeyRoundIcon,
   LockIcon,
+  ListFilterIcon,
   Loader2Icon,
   LaptopMinimalIcon,
   LogOutIcon,
@@ -58,6 +60,7 @@ import {
   PanelRightCloseIcon,
   PanelRightIcon,
   PlusIcon,
+  SearchIcon,
   SunIcon,
   SquareCheckIcon,
   SquareIcon,
@@ -143,6 +146,7 @@ import {
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
@@ -2297,14 +2301,16 @@ function ImportSection() {
 
 function ArchivedSection() {
   const [view, setView] = useState<ArchivedViewPreferences>(readArchivedViewPreferences);
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+  const [pageCursors, setPageCursors] = useState<(string | undefined)[]>([undefined]);
+  const paginationAnchorRef = useRef<HTMLElement>(null);
+  const isMobileViewport = useIsMobileViewport();
   const facetsQuery = useArchivedSessionFacets();
   const projectsQuery = useProjects();
   const hostsQuery = useHosts({ includeSandbox: true });
-  const listQuery = useArchivedConversations(view);
-  const archived = useMemo(
-    () => (listQuery.data?.pages ?? []).flatMap((page) => page.data),
-    [listQuery.data],
-  );
+  const pageNumber = pageCursors.length;
+  const listQuery = useArchivedConversations(view, pageCursors.at(-1));
+  const archived = useMemo(() => listQuery.data?.data ?? [], [listQuery.data]);
 
   useEffect(() => {
     localStorage.setItem(ARCHIVED_VIEW_STORAGE_KEY, JSON.stringify(view));
@@ -2312,6 +2318,7 @@ function ArchivedSection() {
 
   const setFilter = useCallback(
     <K extends keyof ArchivedViewPreferences>(key: K, value: ArchivedViewPreferences[K]) => {
+      setPageCursors([undefined]);
       setView((current) => ({ ...current, [key]: value }));
     },
     [],
@@ -2394,12 +2401,38 @@ function ArchivedSection() {
     });
   }, [archived]);
 
+  useEffect(() => {
+    if (
+      pageCursors.length > 1 &&
+      listQuery.data !== undefined &&
+      !listQuery.isFetching &&
+      archived.length === 0
+    ) {
+      setPageCursors((current) => current.slice(0, -1));
+    }
+  }, [archived.length, listQuery.data, listQuery.isFetching, pageCursors.length]);
+
+  const goToPreviousPage = useCallback(() => {
+    setPageCursors((current) => (current.length > 1 ? current.slice(0, -1) : current));
+    paginationAnchorRef.current?.scrollIntoView({ block: "start" });
+  }, []);
+
+  const goToNextPage = useCallback(() => {
+    const cursor = listQuery.data?.last_id;
+    if (!listQuery.data?.has_more || !cursor) return;
+    setPageCursors((current) => [...current, cursor]);
+    paginationAnchorRef.current?.scrollIntoView({ block: "start" });
+  }, [listQuery.data]);
+
   const hasFilters = Boolean(
     view.searchQuery || view.project || view.hostId || view.agentName || view.agePreset !== "any",
   );
+  const showFilterPanel = !isMobileViewport || mobileFiltersOpen;
+  const sortFieldLabel = view.sortField === "created_at" ? "Create date" : "Archive date";
+  const sortOrderLabel = view.order === "asc" ? "Oldest first" : "Newest first";
 
   return (
-    <section>
+    <section ref={paginationAnchorRef} className="scroll-mt-16">
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <h1 className="mr-auto text-xl font-semibold">Archived sessions</h1>
         {archived.length > 0 &&
@@ -2431,121 +2464,173 @@ function ArchivedSection() {
           ))}
       </div>
 
-      <div className="mb-3 rounded-lg border bg-muted/20 p-3">
-        <Input
-          type="search"
-          aria-label="Search archived session title or CWD"
-          placeholder="Search title or CWD…"
-          className="h-9"
-          value={view.searchQuery ?? ""}
-          onChange={(event) => setFilter("searchQuery", event.target.value)}
-        />
-
-        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
-          <ArchiveFilterCombobox
-            label="Project"
-            allLabel="All projects"
-            value={view.project}
-            options={projectOptions}
-            onChange={(value) => setFilter("project", value)}
-          />
-          <ArchiveFilterCombobox
-            label="Host"
-            allLabel="All hosts"
-            value={view.hostId}
-            options={hostOptions}
-            onChange={(value) => setFilter("hostId", value)}
-          />
-        </div>
-
-        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
-          <ArchiveFilterCombobox
-            label="Agent"
-            allLabel="All agents"
-            value={view.agentName}
-            options={agentOptions}
-            onChange={(value) => setFilter("agentName", value)}
-          />
-          <label className="min-w-0">
-            <span className="mb-1 block text-xs text-muted-foreground">Date</span>
-            <Select
-              value={view.dateField}
-              onValueChange={(value) => setFilter("dateField", value as ArchivedDateField)}
-            >
-              <SelectTrigger className="h-9 w-full" aria-label="Archived date field">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="archived_at">Archive date</SelectItem>
-                <SelectItem value="created_at">Create date</SelectItem>
-              </SelectContent>
-            </Select>
-          </label>
-          <label className="min-w-0">
-            <span className="mb-1 block text-xs text-muted-foreground">Age</span>
-            <Select
-              value={view.agePreset}
-              onValueChange={(value) => setFilter("agePreset", value as ArchivedAgePreset)}
-            >
-              <SelectTrigger className="h-9 w-full" aria-label="Archived session age">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="any">Any</SelectItem>
-                <SelectItem value="lt24h">&lt;24h</SelectItem>
-                <SelectItem value="lt7d">&lt;7d</SelectItem>
-                <SelectItem value="gt7d">&gt;7d</SelectItem>
-                <SelectItem value="gt30d">&gt;30d</SelectItem>
-                <SelectItem value="gt90d">&gt;90d</SelectItem>
-                <SelectItem value="gt180d">&gt;180d</SelectItem>
-                <SelectItem value="gt365d">&gt;365d</SelectItem>
-              </SelectContent>
-            </Select>
-          </label>
-        </div>
-
-        <div className="mt-2 flex flex-wrap items-end gap-2 border-t pt-2">
-          <label className="min-w-40 flex-1">
-            <span className="mb-1 block text-xs text-muted-foreground">Sort by</span>
-            <Select
-              value={view.sortField}
-              onValueChange={(value) => setFilter("sortField", value as ArchivedDateField)}
-            >
-              <SelectTrigger className="h-9 w-full" aria-label="Sort archived sessions by">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="archived_at">Archive date</SelectItem>
-                <SelectItem value="created_at">Create date</SelectItem>
-              </SelectContent>
-            </Select>
-          </label>
-          <label className="min-w-40 flex-1">
-            <span className="mb-1 block text-xs text-muted-foreground">Order</span>
-            <Select
-              value={view.order}
-              onValueChange={(value) => setFilter("order", value as "asc" | "desc")}
-            >
-              <SelectTrigger className="h-9 w-full" aria-label="Archived session sort order">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="desc">Newest first</SelectItem>
-                <SelectItem value="asc">Oldest first</SelectItem>
-              </SelectContent>
-            </Select>
-          </label>
-          {hasFilters && (
+      <div className="mb-3">
+        <div className="flex min-w-0 gap-2">
+          <div className="relative min-w-0 flex-1">
+            <SearchIcon
+              className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
+              aria-hidden="true"
+            />
+            <Input
+              type="search"
+              aria-label="Search archived session title or CWD"
+              placeholder="Search title or CWD…"
+              className="h-10 pl-9 text-base md:h-9 md:text-sm"
+              value={view.searchQuery ?? ""}
+              onChange={(event) => setFilter("searchQuery", event.target.value)}
+            />
+          </div>
+          {isMobileViewport && (
             <Button
               type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setView(DEFAULT_ARCHIVED_VIEW)}
+              variant="outline"
+              className="h-10 shrink-0 gap-2 px-3"
+              aria-expanded={mobileFiltersOpen}
+              aria-controls="archived-filter-panel"
+              data-testid="archived-filter-toggle"
+              onClick={() => setMobileFiltersOpen((open) => !open)}
             >
-              Clear filters
+              <ListFilterIcon className="size-4" />
+              Filters
+              <ChevronDownIcon
+                className={cn("size-3.5 transition-transform", mobileFiltersOpen && "rotate-180")}
+                aria-hidden="true"
+              />
             </Button>
           )}
         </div>
+
+        {isMobileViewport && !mobileFiltersOpen && (
+          <button
+            type="button"
+            className="mt-1 flex min-h-9 w-full items-center gap-1.5 px-1 text-left text-xs text-muted-foreground"
+            aria-label={`Change archive sorting: ${sortFieldLabel}, ${sortOrderLabel}`}
+            onClick={() => setMobileFiltersOpen(true)}
+          >
+            <span>{sortFieldLabel}</span>
+            <span aria-hidden="true">·</span>
+            <span>{sortOrderLabel}</span>
+            <ChevronDownIcon className="ml-auto size-3.5" aria-hidden="true" />
+          </button>
+        )}
+
+        {showFilterPanel && (
+          <div
+            id="archived-filter-panel"
+            data-testid="archived-filter-panel"
+            className="mt-2 rounded-lg border bg-muted/20 p-3"
+          >
+            <div className="grid grid-cols-2 gap-2">
+              <ArchiveFilterCombobox
+                label="Project"
+                allLabel="All projects"
+                value={view.project}
+                options={projectOptions}
+                onChange={(value) => setFilter("project", value)}
+              />
+              <ArchiveFilterCombobox
+                label="Host"
+                allLabel="All hosts"
+                value={view.hostId}
+                options={hostOptions}
+                onChange={(value) => setFilter("hostId", value)}
+              />
+            </div>
+
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+              <ArchiveFilterCombobox
+                label="Agent"
+                allLabel="All agents"
+                value={view.agentName}
+                options={agentOptions}
+                onChange={(value) => setFilter("agentName", value)}
+              />
+              <label className="min-w-0">
+                <span className="mb-1 block text-xs text-muted-foreground">Date</span>
+                <Select
+                  value={view.dateField}
+                  onValueChange={(value) => setFilter("dateField", value as ArchivedDateField)}
+                >
+                  <SelectTrigger className="h-9 w-full" aria-label="Archived date field">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="archived_at">Archive date</SelectItem>
+                    <SelectItem value="created_at">Create date</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+              <label className="min-w-0">
+                <span className="mb-1 block text-xs text-muted-foreground">Age</span>
+                <Select
+                  value={view.agePreset}
+                  onValueChange={(value) => setFilter("agePreset", value as ArchivedAgePreset)}
+                >
+                  <SelectTrigger className="h-9 w-full" aria-label="Archived session age">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="any">Any</SelectItem>
+                    <SelectItem value="lt24h">&lt;24h</SelectItem>
+                    <SelectItem value="lt7d">&lt;7d</SelectItem>
+                    <SelectItem value="gt7d">&gt;7d</SelectItem>
+                    <SelectItem value="gt30d">&gt;30d</SelectItem>
+                    <SelectItem value="gt90d">&gt;90d</SelectItem>
+                    <SelectItem value="gt180d">&gt;180d</SelectItem>
+                    <SelectItem value="gt365d">&gt;365d</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+            </div>
+
+            <div className="mt-2 grid grid-cols-2 items-end gap-2 border-t pt-2">
+              <label className="min-w-0">
+                <span className="mb-1 block text-xs text-muted-foreground">Sort by</span>
+                <Select
+                  value={view.sortField}
+                  onValueChange={(value) => setFilter("sortField", value as ArchivedDateField)}
+                >
+                  <SelectTrigger className="h-9 w-full" aria-label="Sort archived sessions by">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="archived_at">Archive date</SelectItem>
+                    <SelectItem value="created_at">Create date</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+              <label className="min-w-0">
+                <span className="mb-1 block text-xs text-muted-foreground">Order</span>
+                <Select
+                  value={view.order}
+                  onValueChange={(value) => setFilter("order", value as "asc" | "desc")}
+                >
+                  <SelectTrigger className="h-9 w-full" aria-label="Archived session sort order">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="desc">Newest first</SelectItem>
+                    <SelectItem value="asc">Oldest first</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+              {hasFilters && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="col-span-2 justify-self-end"
+                  onClick={() => {
+                    setPageCursors([undefined]);
+                    setView(DEFAULT_ARCHIVED_VIEW);
+                  }}
+                >
+                  Clear filters
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {selectionMode && (
@@ -2558,48 +2643,63 @@ function ArchivedSection() {
 
       {listQuery.isLoading ? (
         <p className="text-ui text-muted-foreground">Loading…</p>
-      ) : archived.length === 0 && !listQuery.hasNextPage ? (
-        // Definitive empty only when there are no archived rows AND no further
-        // pages to fetch.
+      ) : archived.length === 0 ? (
         <p className="text-ui text-muted-foreground">No archived sessions match.</p>
       ) : (
         <>
-          {archived.length > 0 && (
-            <div className="flex flex-col gap-4">
-              {groupedArchived.map((group) => (
-                <div key={group.label}>
-                  <h3 className="mb-1 px-3 text-sm font-medium text-muted-foreground">
-                    {group.label}
-                  </h3>
-                  <ul className="flex flex-col gap-0.5">
-                    {group.conversations.map((conv) => (
-                      <ArchivedRow
-                        key={conv.id}
-                        conversation={conv}
-                        hostName={hostNames.get(conv.host_id ?? "")}
-                        selectionMode={selectionMode}
-                        isSelected={selectedIds.has(conv.id)}
-                        onToggleSelected={toggleSelected}
-                      />
-                    ))}
-                  </ul>
-                </div>
-              ))}
-            </div>
-          )}
-          {listQuery.hasNextPage && (
-            <div className="mt-3">
+          <div className="flex flex-col gap-4">
+            {groupedArchived.map((group) => (
+              <div key={group.label}>
+                <h3 className="mb-1 px-3 text-sm font-medium text-muted-foreground">
+                  {group.label}
+                </h3>
+                <ul className="flex flex-col gap-2 md:gap-0.5">
+                  {group.conversations.map((conv) => (
+                    <ArchivedRow
+                      key={conv.id}
+                      conversation={conv}
+                      hostName={hostNames.get(conv.host_id ?? "")}
+                      selectionMode={selectionMode}
+                      isSelected={selectedIds.has(conv.id)}
+                      onToggleSelected={toggleSelected}
+                    />
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+          {(pageNumber > 1 || listQuery.data?.has_more) && (
+            <nav
+              className="mt-4 flex items-center justify-center gap-3"
+              aria-label="Archived session pages"
+            >
               <Button
                 type="button"
-                variant="ghost"
+                variant="outline"
                 size="sm"
-                data-testid="archived-load-more"
-                disabled={listQuery.isFetchingNextPage}
-                onClick={() => void listQuery.fetchNextPage()}
+                data-testid="archived-page-previous"
+                disabled={pageNumber === 1 || listQuery.isFetching}
+                onClick={goToPreviousPage}
               >
-                {listQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+                Previous
               </Button>
-            </div>
+              <span
+                className="min-w-14 text-center text-sm text-muted-foreground"
+                aria-live="polite"
+              >
+                Page {pageNumber}
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                data-testid="archived-page-next"
+                disabled={!listQuery.data?.has_more || listQuery.isFetching}
+                onClick={goToNextPage}
+              >
+                Next
+              </Button>
+            </nav>
           )}
         </>
       )}
@@ -2684,22 +2784,26 @@ function ArchivedBulkActionBar({
           </TooltipTrigger>
           <TooltipContent>{unlock ? "Unlock selected" : "Lock selected"}</TooltipContent>
         </Tooltip>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="h-7 gap-1.5 text-xs"
-          disabled={isBusy || ownedSelected.length === 0}
-          onClick={() => setConfirmAction("unarchive")}
-          data-testid="archived-bulk-unarchive"
-        >
-          {bulkArchive.isPending ? (
-            <Loader2Icon className="size-3 animate-spin" />
-          ) : (
-            <ArchiveRestoreIcon className="size-3" />
-          )}
-          Unarchive {ownedSelected.length > 0 ? ownedSelected.length : ""}
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-sm"
+              aria-label={`Unarchive ${ownedSelected.length} selected session${ownedSelected.length === 1 ? "" : "s"}`}
+              disabled={isBusy || ownedSelected.length === 0}
+              onClick={() => setConfirmAction("unarchive")}
+              data-testid="archived-bulk-unarchive"
+            >
+              {bulkArchive.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <ArchiveRestoreIcon className="size-3.5" />
+              )}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Unarchive selected</TooltipContent>
+        </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -2801,12 +2905,16 @@ function ArchivedRow({
   const label = conversationDisplayLabel(conversation);
   const locked = isArchiveLocked(conversation);
   const busy = archive.isPending || archiveLock.isPending || del.isPending;
+  const archivedAtMs = archivedTimestamp(conversation) * 1000;
+  const createdAtMs = conversation.created_at * 1000;
+  const resolvedHostName = hostName ?? conversation.host_id ?? "Host not recorded";
+  const resolvedAgentName = conversation.agent_name ?? "Agent not recorded";
 
   return (
     <li
       data-testid="archived-row"
       className={cn(
-        "group relative flex items-center gap-2 rounded-md border border-transparent px-3 py-2 hover:border-border hover:bg-muted/60",
+        "group relative flex items-center gap-2 rounded-md border border-transparent px-3 py-2 hover:border-border hover:bg-muted/60 max-md:flex-wrap max-md:border-border/60 max-md:bg-muted/20 max-md:py-3",
         selectionMode && "cursor-pointer",
         isSelected && "bg-muted",
       )}
@@ -2821,38 +2929,76 @@ function ArchivedRow({
           )}
         </span>
       )}
-      <div className="min-w-0 flex-1">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-ui font-medium" title={label}>
-            {label}
-          </span>
-          {conversation.labels?.omni_project && (
-            <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-              {conversation.labels.omni_project}
+      <div
+        className={cn(
+          "grid min-w-0 flex-1 gap-x-4 gap-y-2 lg:grid-cols-[minmax(0,1fr)_13.25rem] lg:items-center",
+          !selectionMode && "max-md:basis-full",
+        )}
+      >
+        <div className="min-w-0">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate text-ui font-medium" title={label}>
+              {label}
             </span>
-          )}
+            {conversation.labels?.omni_project && (
+              <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                {conversation.labels.omni_project}
+              </span>
+            )}
+          </div>
+          <div
+            className="truncate font-mono text-xs text-info/90"
+            title={conversation.workspace ?? "CWD not recorded"}
+          >
+            {conversation.workspace ?? "CWD not recorded"}
+          </div>
+          <div
+            className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground"
+            data-testid="archived-context"
+          >
+            <span className="truncate" title={resolvedHostName}>
+              {resolvedHostName}
+            </span>
+            <span className="shrink-0 text-border" aria-hidden="true">
+              •
+            </span>
+            <span className="truncate" title={resolvedAgentName}>
+              {resolvedAgentName}
+            </span>
+          </div>
         </div>
-        <div
-          className="truncate font-mono text-xs text-muted-foreground"
-          title={conversation.workspace ?? "CWD not recorded"}
+        <dl
+          className="grid grid-cols-[3.25rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs lg:border-l lg:pl-3"
+          data-testid="archived-time-column"
         >
-          {conversation.workspace ?? "CWD not recorded"}
-        </div>
-        <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
-          <span>{hostName ?? conversation.host_id ?? "Host not recorded"}</span>
-          <span>{conversation.agent_name ?? "Agent not recorded"}</span>
-          <span>Archived {absoluteTime(archivedTimestamp(conversation) * 1000)}</span>
-          <span>Created {absoluteTime(conversation.created_at * 1000)}</span>
-        </div>
+          <dt className="text-[10px] leading-4 tracking-wide text-info uppercase">Archived</dt>
+          <dd className="min-w-0 truncate leading-4 font-medium text-foreground">
+            <time
+              dateTime={new Date(archivedAtMs).toISOString()}
+              title={absoluteTime(archivedAtMs)}
+            >
+              {absoluteTime(archivedAtMs)}
+            </time>
+          </dd>
+          <dt className="text-[10px] leading-4 tracking-wide text-muted-foreground uppercase">
+            Created
+          </dt>
+          <dd className="min-w-0 truncate leading-4 text-muted-foreground">
+            <time dateTime={new Date(createdAtMs).toISOString()} title={absoluteTime(createdAtMs)}>
+              {absoluteTime(createdAtMs)}
+            </time>
+          </dd>
+        </dl>
       </div>
       {!selectionMode && (
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1 max-md:mr-14 max-md:ml-auto">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 type="button"
                 variant="ghost"
                 size="icon-sm"
+                className="max-md:size-11"
                 aria-label={locked ? "Unlock session" : "Lock session"}
                 data-testid="archive-lock-toggle"
                 disabled={busy}
@@ -2872,6 +3018,7 @@ function ArchivedRow({
                   type="button"
                   variant="ghost"
                   size="icon-sm"
+                  className="max-md:size-11"
                   aria-label="Delete session"
                   data-testid="delete-archived"
                   disabled={busy || locked}
@@ -2885,23 +3032,28 @@ function ArchivedRow({
               {locked ? "Unlock before deleting" : "Delete permanently"}
             </TooltipContent>
           </Tooltip>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="gap-1.5 dark:bg-secondary dark:hover:bg-secondary/80"
-            data-testid="unarchive-conversation"
-            disabled={busy}
-            onClick={() =>
-              archive.mutate(
-                { id: conversation.id, archived: false },
-                { onSuccess: () => navigate(`/c/${conversation.id}`) },
-              )
-            }
-          >
-            <ArchiveRestoreIcon className="size-3.5" />
-            Unarchive
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="dark:bg-secondary dark:hover:bg-secondary/80 max-md:size-11"
+                aria-label="Unarchive session"
+                data-testid="unarchive-conversation"
+                disabled={busy}
+                onClick={() =>
+                  archive.mutate(
+                    { id: conversation.id, archived: false },
+                    { onSuccess: () => navigate(`/c/${conversation.id}`) },
+                  )
+                }
+              >
+                <ArchiveRestoreIcon className="size-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Unarchive</TooltipContent>
+          </Tooltip>
         </div>
       )}
 

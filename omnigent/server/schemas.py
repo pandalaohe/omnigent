@@ -2642,6 +2642,14 @@ class SessionList(BaseModel):
     has_more: bool = False
 
 
+class ArchivedSessionFacetsResponse(BaseModel):
+    """Compact filter values for ``GET /v1/sessions/archived-facets``."""
+
+    projects: list[str] = Field(default_factory=list)
+    host_ids: list[str] = Field(default_factory=list)
+    agent_names: list[str] = Field(default_factory=list)
+
+
 class ChildSessionList(BaseModel):
     """Paginated list of child sessions; ``data`` is a page of ``ChildSessionSummary``."""
 

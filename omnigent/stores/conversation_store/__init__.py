@@ -240,6 +240,15 @@ class SessionConnectivity:
     runner_last_seen: int | None = None
 
 
+@dataclass(frozen=True)
+class ArchivedConversationFacets:
+    """Distinct filter values for the caller-visible archived session set."""
+
+    projects: list[str]
+    host_ids: list[str]
+    agent_ids: list[str]
+
+
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
 # replica refreshes live runners every ~30s (the tunnel ping interval),
 # so 3 missed refreshes = offline — the same budget the tunnel's own
@@ -1048,6 +1057,23 @@ class ConversationStore(ABC):
             project owned by someone else — but with a session shared to
             the user — from appearing as one of the user's own folders.
         :returns: List of project names ordered alphabetically.
+        """
+        ...
+
+    @abstractmethod
+    def list_archived_facets(
+        self,
+        accessible_by: str | None = None,
+    ) -> ArchivedConversationFacets:
+        """Return distinct Project, Host, and Agent ids for archived sessions.
+
+        Implementations aggregate in the database and return only facet values;
+        they must not materialize full conversation entities or page through the
+        public session-list contract.
+
+        :param accessible_by: When set, restrict to sessions visible to this user.
+            ``None`` disables the permission filter for auth-disabled servers.
+        :returns: Alphabetically sorted distinct facet values.
         """
         ...
 

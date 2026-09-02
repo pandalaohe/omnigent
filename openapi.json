@@ -170,6 +170,34 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "ArchivedSessionFacetsResponse": {
+        "description": "Compact filter values for `GET /v1/sessions/archived-facets`.",
+        "properties": {
+          "agent_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Agent Names",
+            "type": "array"
+          },
+          "host_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Host Ids",
+            "type": "array"
+          },
+          "projects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Projects",
+            "type": "array"
+          }
+        },
+        "title": "ArchivedSessionFacetsResponse",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Request body for the current-agent automatic rename endpoint.",
@@ -10393,6 +10421,28 @@
           }
         },
         "summary": "Create Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/archived-facets": {
+      "get": {
+        "description": "Return compact, distinct filter values for visible archived sessions.",
+        "operationId": "list_archived_session_facets_v1_sessions_archived_facets_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchivedSessionFacetsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Archived Session Facets",
         "tags": [
           "sessions"
         ]

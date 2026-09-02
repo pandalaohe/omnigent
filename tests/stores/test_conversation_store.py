@@ -1816,6 +1816,68 @@ def test_archive_manager_filters_archived_host_cwd_and_dates(
     }
 
 
+def test_archived_facets_are_aggregated_without_loading_conversation_rows(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Archive filter values come from bounded distinct queries, not list pagination."""
+    host_a = "c" * 32
+    host_b = "d" * 32
+    _register_host(db_uri, host_a)
+    _register_host(db_uri, host_b)
+    archived_a = conversation_store.create_conversation(
+        title="archived-a",
+        agent_id="a" * 32,
+        host_id=host_a,
+        workspace="/work/a",
+    )
+    archived_b = conversation_store.create_conversation(
+        title="archived-b",
+        agent_id="b" * 32,
+        host_id=host_b,
+        workspace="/work/b",
+    )
+    active = conversation_store.create_conversation(
+        title="active",
+        agent_id="e" * 32,
+        host_id=host_b,
+        workspace="/work/active",
+    )
+    conversation_store.set_labels(archived_a.id, {"omni_project": "Beta"})
+    conversation_store.set_labels(archived_b.id, {"omni_project": "Alpha"})
+    conversation_store.set_labels(active.id, {"omni_project": "Active only"})
+    conversation_store.update_conversation(archived_a.id, archived=True)
+    conversation_store.update_conversation(archived_b.id, archived=True)
+
+    facets = conversation_store.list_archived_facets()
+
+    assert facets.projects == ["Alpha", "Beta"]
+    assert facets.host_ids == [host_a, host_b]
+    assert facets.agent_ids == ["a" * 32, "b" * 32]
+
+
+def test_archived_facets_support_split_conversation_and_metadata_databases(
+    split_db_conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Host facets remain correct when AP and Omnigent metadata use separate DBs."""
+    host_id = "f" * 32
+    _register_host(split_db_conversation_store.storage_location, host_id)
+    archived = split_db_conversation_store.create_conversation(
+        title="split archive",
+        agent_id="a" * 32,
+        host_id=host_id,
+        workspace="/work/split",
+    )
+    split_db_conversation_store.set_labels(archived.id, {"omni_project": "Split"})
+    split_db_conversation_store.update_conversation(archived.id, archived=True)
+
+    facets = split_db_conversation_store.list_archived_facets()
+
+    assert facets.projects == ["Split"]
+    assert facets.host_ids == [host_id]
+    assert facets.agent_ids == ["a" * 32]
+
+
 def test_list_conversations_kind_filter_returns_only_matching(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
