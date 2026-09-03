@@ -4053,15 +4053,34 @@ def _is_box_rule(line: str) -> bool:
 
     Claude Code frames the input box with a row of ``─``
     (:data:`_BOX_RULE_CHARS`), with or without corner glyphs depending on
-    the version. Both spellings count: :func:`_composer_row` anchors on
-    the rule directly above the composer, so it is the position that
-    identifies the box, not the corners.
+    the version. A renamed session decorates the opening rule with its title,
+    surrounded by spaces and rule runs. All three spellings count:
+    :func:`_composer_row` anchors on the rule directly above the composer, so
+    it is the position that identifies the box, not the corners or title.
 
     :param line: A single pane line, e.g. ``"──────────"``.
     :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
-    return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
+    if len(stripped) < 3:
+        return False
+    if all(ch in _BOX_RULE_CHARS for ch in stripped):
+        return True
+
+    prefix_len = 0
+    while prefix_len < len(stripped) and stripped[prefix_len] in _BOX_RULE_CHARS:
+        prefix_len += 1
+    suffix_start = len(stripped)
+    while suffix_start > prefix_len and stripped[suffix_start - 1] in _BOX_RULE_CHARS:
+        suffix_start -= 1
+    decoration = stripped[prefix_len:suffix_start]
+    return (
+        prefix_len >= 3
+        and len(stripped) - suffix_start >= 1
+        and decoration.startswith(" ")
+        and decoration.endswith(" ")
+        and bool(decoration.strip())
+    )
 
 
 def _submit_needle(content: str) -> str:

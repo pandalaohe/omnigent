@@ -6697,6 +6697,26 @@ def test_claude_prompt_rendered_sees_prompt_above_default_footer() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_below_named_border() -> None:
+    """A named session in the input box's top border remains injectable.
+
+    Claude Code renders a renamed session inside the opening rule.  The
+    readiness gate must still recognize the framed composer; otherwise a
+    healthy idle pane times out and the runner reaps it before delivery.
+    """
+    pane = "\n".join(
+        [
+            "──────────────────────────── TGH01-0903_1255 ─",  # named top rule
+            "❯ ",  # live chat prompt
+            "────────────────────────────────────────",  # closing rule
+            "  [Opus 5 (1M context)] │ core git:(master*) │ ⏱️  2m",
+            "  Context 111k/1.0M │ 5h: 11% (4h 2m) | 7d: 42% (2d 12h)",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
 def test_claude_prompt_rendered_sees_prompt_above_running_turn_footer() -> None:
     """
     The readiness scan reaches the prompt above a tall running-turn footer.
