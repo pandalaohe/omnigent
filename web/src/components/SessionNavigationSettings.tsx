@@ -73,6 +73,25 @@ export function SessionNavigationSettings() {
       </div>
       <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
         <div className="min-w-0 flex-1">
+          <span className="text-sm font-medium text-foreground">Open at latest</span>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Scroll to the bottom when switching sessions, including with Poll.
+          </p>
+        </div>
+        <Switch
+          aria-label="Scroll to the bottom when opening a session"
+          checked={preferences.scrollToBottomOnSessionOpen}
+          onCheckedChange={(enabled) =>
+            writeSessionNavigationPreferences({
+              ...preferences,
+              scrollToBottomOnSessionOpen: enabled,
+            })
+          }
+          className="shrink-0"
+        />
+      </div>
+      <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
+        <div className="min-w-0 flex-1">
           <span className="text-sm font-medium text-foreground">Background sessions</span>
           <p
             className="mt-1 text-sm text-muted-foreground"

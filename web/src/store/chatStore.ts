@@ -3501,8 +3501,18 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  * already-running native session) would leave the turn's bubble non-streaming
  * and its tool cards static for the rest of the turn.
  */
-function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState> {
+function reconnectStatusPatch(
+  session: Session,
+  s: ChatState,
+  todosAtReconnectStart?: ChatState["todos"],
+): Partial<ChatState> {
   const patch: Partial<ChatState> = { sessionStatus: session.status };
+  // The new stream is already live while reconnect history is reconciled. Do
+  // not let an older fetched snapshot overwrite a session.todos event that
+  // arrived during those requests.
+  if (todosAtReconnectStart === undefined || s.todos === todosAtReconnectStart) {
+    patch.todos = session.todos ?? [];
+  }
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
@@ -3750,6 +3760,7 @@ async function rehydrateWindowOnReconnect(
   session: Session,
   preGapIds: Set<string>,
   preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
+  todosAtReconnectStart: ChatState["todos"],
   set: Setter,
   get: Getter,
 ): Promise<void> {
@@ -3781,7 +3792,7 @@ async function rehydrateWindowOnReconnect(
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
     return {
-      ...reconnectStatusPatch(session, s),
+      ...reconnectStatusPatch(session, s, todosAtReconnectStart),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -3840,6 +3851,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
   // before the snapshot fetch are eligible for its flips — see
   // `reconcileElicitationBlocks`.
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks);
+  const todosAtReconnectStart = get().todos;
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
@@ -3886,7 +3898,15 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
   }
   /* oxlint-enable no-await-in-loop */
   if (!covered) {
-    await rehydrateWindowOnReconnect(id, session, preGapIds, preGapElicitations, set, get);
+    await rehydrateWindowOnReconnect(
+      id,
+      session,
+      preGapIds,
+      preGapElicitations,
+      todosAtReconnectStart,
+      set,
+      get,
+    );
     return;
   }
 
@@ -3897,7 +3917,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
       s.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
-    const patch: Partial<ChatState> = reconnectStatusPatch(session, s);
+    const patch: Partial<ChatState> = reconnectStatusPatch(session, s, todosAtReconnectStart);
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(
@@ -5326,10 +5346,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // lifecycle) from a fresh snapshot — the event is the only signal
       // an in-place switch produces; the URL doesn't change, so the
       // switchTo/bindStream path never re-runs.
-      applyToNamedConversation(event.conversationId, {
+      applyToNamedConversation(event.conversationId, (s) => ({
         boundAgentId: event.agentId,
         boundAgentName: event.agentName,
-      });
+        ...(s.boundAgentId !== event.agentId ? { todos: [] } : {}),
+      }));
       void refreshSessionBinding(event.conversationId);
       // Refresh the header's agent card and the sidebar row for every
       // connected client (the switching client's dialog already does

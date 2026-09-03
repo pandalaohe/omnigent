@@ -65,7 +65,10 @@ from omnigent.policies.types import (
     EvaluationContext,
     PolicyResult,
 )
-from omnigent.provider_usage_limits import validate_provider_usage_limits_snapshot
+from omnigent.provider_usage_limits import (
+    parse_provider_usage_limits_snapshot_json,
+    validate_provider_usage_limits_snapshot,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
@@ -255,6 +258,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_terminal_name_for_harness,
     _NativeTerminalEnsureOutcome,
     _owner_from_grants,
+    _parse_background_tasks,
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
@@ -1085,13 +1089,16 @@ def _build_session_response(
         and int(raw_auto_compact_token_limit) > 0
         else None
     )
-    provider_usage_limits = None
+    provider_usage_limits = conv.provider_usage_limits
     raw_provider_usage_limits = conv.labels.get(_LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY)
-    if isinstance(raw_provider_usage_limits, str):
-        with contextlib.suppress(json.JSONDecodeError, ValueError):
-            provider_usage_limits = validate_provider_usage_limits_snapshot(
-                json.loads(raw_provider_usage_limits)
-            )
+    if provider_usage_limits is None and isinstance(raw_provider_usage_limits, str):
+        # Split-DB deployments migrate metadata and labels through separate
+        # connections, so Alembic cannot backfill the legacy label there. Read
+        # it compatibly until the next Host report writes first-class metadata.
+        provider_usage_limits = parse_provider_usage_limits_snapshot_json(
+            raw_provider_usage_limits,
+            repair_clipped_label=True,
+        )
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     return SessionResponse(
@@ -1162,10 +1169,9 @@ def _build_session_response(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
-        # Replay the latest todo list for claude-native sessions.
-        # Populated by _handle_external_session_todos; empty list for
-        # non-claude-native sessions or before the first poll tick.
-        todos=_session_todos_cache.get(conv.id, []),
+        # Prefer the live cache and fall back to persisted metadata after a
+        # Server restart/deployment. Empty before the first harness report.
+        todos=_session_todos_cache.get(conv.id, conv.session_todos),
         skills=skills or [],
         model_options=[
             NativeModelOption.model_validate(option) for option in (model_options or [])
@@ -1698,10 +1704,6 @@ async def _persist_external_session_usage(
         label_updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(raw_window)
     if has_auto_compact_token_limit and raw_auto_compact_token_limit is not None:
         label_updates[_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY] = str(raw_auto_compact_token_limit)
-    if has_provider_usage_limits and provider_usage_limits is not None:
-        label_updates[_LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY] = json.dumps(
-            provider_usage_limits, separators=(",", ":")
-        )
     if label_updates:
         await asyncio.to_thread(
             conversation_store.set_labels,
@@ -1714,7 +1716,14 @@ async def _persist_external_session_usage(
             session_id,
             _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
         )
-    if has_provider_usage_limits and provider_usage_limits is None:
+    if has_provider_usage_limits:
+        await asyncio.to_thread(
+            conversation_store.set_provider_usage_limits,
+            session_id,
+            provider_usage_limits,
+        )
+        # Remove the legacy label after the metadata write. Old snapshots can
+        # exceed conversation_labels.value (256 chars) and become invalid JSON.
         await asyncio.to_thread(
             conversation_store.delete_label,
             session_id,
@@ -6219,10 +6228,23 @@ async def _relay_runner_stream_once(
                             # — the PTY idle oscillates on mid-turn lulls and
                             # would deliver a premature, lock-out completion.
                             raw_blocked_on = event.get("blocked_on")
+                            raw_background_task_count = event.get("background_task_count")
+                            background_task_count = (
+                                raw_background_task_count
+                                if isinstance(raw_background_task_count, int)
+                                and not isinstance(raw_background_task_count, bool)
+                                and raw_background_task_count >= 0
+                                else None
+                            )
+                            background_tasks = _parse_background_tasks(
+                                event.get("background_tasks")
+                            )
                             _publish_status(
                                 session_id,
                                 status,
                                 status_error,
+                                background_task_count=background_task_count,
+                                background_tasks=background_tasks,
                                 blocked_on=(
                                     raw_blocked_on
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on

@@ -881,6 +881,89 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
 
 
 @pytest.mark.asyncio
+async def test_relay_preserves_and_clears_exact_background_shell_state() -> None:
+    """Runner replay restores ``B · N`` after a server restart, then clears it."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    tasks = [
+        {
+            "id": "shell-1",
+            "type": "shell",
+            "status": "running",
+            "command": "sleep 120",
+        },
+        {
+            "id": "shell-2",
+            "type": "shell",
+            "status": "running",
+            "command": "sleep 240",
+        },
+    ]
+    events = [
+        {
+            "type": "session.status",
+            "status": "idle",
+            "background_task_count": 2,
+            "background_tasks": tasks,
+        },
+        {
+            "type": "session.status",
+            "status": "idle",
+            "background_task_count": 0,
+        },
+    ]
+    fake_runner = _ScriptedRunnerClient(gate, events)
+    session_id = "4b2fc5978e244a719ef752f06ca86883"
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_background_replay",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=None,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+
+        relayed = [
+            await asyncio.wait_for(collector.queue.get(), timeout=2.0),
+            await asyncio.wait_for(collector.queue.get(), timeout=2.0),
+        ]
+        assert relayed[0]["background_task_count"] == 2
+        assert [task["id"] for task in relayed[0]["background_tasks"]] == [
+            "shell-1",
+            "shell-2",
+        ]
+        assert [task["command"] for task in relayed[0]["background_tasks"]] == [
+            "sleep 120",
+            "sleep 240",
+        ]
+        assert relayed[1]["background_task_count"] == 0
+        assert "background_tasks" not in relayed[1]
+        assert sessions_module._session_background_task_count_cache.get(session_id) is None
+        assert sessions_module._session_background_tasks_cache.get(session_id) is None
+        await asyncio.wait_for(handle.task, timeout=2.0)
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_task_count_cache.pop(session_id, None)
+        sessions_module._session_background_tasks_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -34,6 +34,7 @@ import {
   LaptopIcon,
   Loader2Icon,
   MailIcon,
+  MailOpenIcon,
   MessageCircleDashedIcon,
   Maximize2Icon,
   Minimize2Icon,
@@ -159,6 +160,7 @@ import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
+  markConversationsSeen,
   markConversationUnread,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
@@ -1444,6 +1446,17 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
+  useUnseenTick();
+  const unreadConversations = allConversations.filter(
+    (conversation) =>
+      isExplicitlyUnread(conversation.id) ||
+      isConversationUnseen(
+        conversation.id,
+        conversation.updated_at,
+        getConversationForegroundStatus(conversation),
+      ),
+  );
+
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
@@ -2175,28 +2188,52 @@ function ConversationList({
                       }
                       headerAction={
                         // The filter stays reachable while bulk-selecting;
-                        // switching scope just exits selection. Only the
-                        // "select" entry point hides, being already active.
+                        // switching scope just exits selection. The read-all
+                        // and select entry points hide while selection owns
+                        // the header.
                         !selectionMode ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label="Select sessions"
-                                data-testid="toggle-selection-mode"
-                                className="text-muted-foreground"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onEnterSelectionMode("sessions");
-                                }}
-                              >
-                                <ListChecksIcon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Select sessions</TooltipContent>
-                          </Tooltip>
+                          <>
+                            {unreadConversations.length > 0 && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon-xs"
+                                    aria-label="Mark all sessions as read"
+                                    data-testid="mark-all-sessions-read"
+                                    className="text-muted-foreground"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      markConversationsSeen(unreadConversations);
+                                    }}
+                                  >
+                                    <MailOpenIcon className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="bottom">Mark all as read</TooltipContent>
+                              </Tooltip>
+                            )}
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="Select sessions"
+                                  data-testid="toggle-selection-mode"
+                                  className="text-muted-foreground"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onEnterSelectionMode("sessions");
+                                  }}
+                                >
+                                  <ListChecksIcon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Select sessions</TooltipContent>
+                            </Tooltip>
+                          </>
                         ) : undefined
                       }
                       persistentHeaderAction={

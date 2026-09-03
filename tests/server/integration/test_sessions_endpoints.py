@@ -2426,6 +2426,77 @@ async def test_archive_lock_blocks_delete_until_unlocked(
     assert deleted.status_code == 200, deleted.text
 
 
+async def test_delete_session_evicts_todos_cache(
+    client: httpx.AsyncClient,
+) -> None:
+    """Deleting a session must not retain its durable-plan fast-path entry."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="delete-todos-cache")
+    sid = session["id"]
+    sessions_module._session_todos_cache[sid] = [
+        {"content": "Old plan", "status": "pending", "activeForm": "Planning"}
+    ]
+
+    deleted = await client.delete(f"/v1/sessions/{sid}")
+
+    assert deleted.status_code == 200, deleted.text
+    assert sid not in sessions_module._session_todos_cache
+
+
+async def test_in_flight_todos_update_cannot_repopulate_deleted_session_cache(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A todo write that loses a delete race must not recreate dead cache state."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="delete-todos-race")
+    sid = session["id"]
+    write_entered = threading.Event()
+    allow_write = threading.Event()
+    original = SqlAlchemyConversationStore.set_session_todos
+
+    def _delayed_write(
+        self: SqlAlchemyConversationStore,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        write_entered.set()
+        assert allow_write.wait(timeout=5)
+        return original(self, conversation_id, todos)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_session_todos", _delayed_write)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "external_session_todos",
+                "data": {
+                    "todos": [
+                        {
+                            "content": "Racing plan",
+                            "status": "in_progress",
+                            "activeForm": "Racing",
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    assert await asyncio.to_thread(write_entered.wait, 2)
+
+    deleted = await client.delete(f"/v1/sessions/{sid}")
+    assert deleted.status_code == 200, deleted.text
+    allow_write.set()
+    posted = await post_task
+
+    assert posted.status_code in (200, 202), posted.text
+    assert sid not in sessions_module._session_todos_cache
+
+
 async def test_archive_lock_and_delete_are_serialized(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2448,9 +2519,7 @@ async def test_archive_lock_and_delete_are_serialized(
 
     delete_task = asyncio.create_task(client.delete(f"/v1/sessions/{sid}"))
     await asyncio.wait_for(delete_entered.wait(), timeout=2)
-    lock_result = await client.patch(
-        f"/v1/sessions/{sid}", json={"archive_locked": True}
-    )
+    lock_result = await client.patch(f"/v1/sessions/{sid}", json={"archive_locked": True})
     assert lock_result.status_code == 409, lock_result.text
     assert "deletion" in lock_result.text.lower()
 
@@ -2494,9 +2563,7 @@ async def test_active_delete_renews_claim_past_stale_window(
     delete_task = asyncio.create_task(client.delete(f"/v1/sessions/{sid}"))
     await asyncio.wait_for(delete_entered.wait(), timeout=2)
     await asyncio.sleep(2.2)
-    lock_result = await client.patch(
-        f"/v1/sessions/{sid}", json={"archive_locked": True}
-    )
+    lock_result = await client.patch(f"/v1/sessions/{sid}", json={"archive_locked": True})
     assert lock_result.status_code == 409, lock_result.text
 
     allow_delete.set()
@@ -2532,17 +2599,13 @@ async def test_cancelled_delete_keeps_claim_until_to_thread_cleanup_finishes(
     with pytest.raises(asyncio.CancelledError):
         await delete_task
 
-    blocked = await client.patch(
-        f"/v1/sessions/{sid}", json={"archive_locked": True}
-    )
+    blocked = await client.patch(f"/v1/sessions/{sid}", json={"archive_locked": True})
     assert blocked.status_code == 409, blocked.text
     allow_cleanup.set()
 
     locked: httpx.Response | None = None
     for _ in range(40):
-        locked = await client.patch(
-            f"/v1/sessions/{sid}", json={"archive_locked": True}
-        )
+        locked = await client.patch(f"/v1/sessions/{sid}", json={"archive_locked": True})
         if locked.status_code == 200:
             break
         await asyncio.sleep(0.025)
@@ -3015,6 +3078,7 @@ async def test_get_session_agent_name_is_spec_name_after_switch(
     Drives the REAL switch route end-to-end: source session → seeded
     bindable built-in → ``POST .../switch-agent`` → ``GET`` snapshot.
     """
+    from omnigent.server.routes import sessions as sessions_module
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 
     # Source session bound to a session-scoped "nessie" agent.
@@ -3034,13 +3098,21 @@ async def test_get_session_agent_name_is_spec_name_after_switch(
         target_row.bundle_location,
     )
 
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/switch-agent",
-        json={"agent_id": builtin.id},
-    )
-    assert resp.status_code == 200, resp.text
+    old_todos = [{"content": "Old plan", "status": "in_progress", "activeForm": "Planning"}]
+    SqlAlchemyConversationStore(db_uri).set_session_todos(session_id, old_todos)
+    sessions_module._session_todos_cache[session_id] = old_todos
 
-    snap = (await client.get(f"/v1/sessions/{session_id}")).json()
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/switch-agent",
+            json={"agent_id": builtin.id},
+        )
+        assert resp.status_code == 200, resp.text
+
+        snap = (await client.get(f"/v1/sessions/{session_id}")).json()
+        assert snap["todos"] == [], "the switched-to harness must not inherit the old plan"
+    finally:
+        sessions_module._session_todos_cache.pop(session_id, None)
     # Preconditions that make this test meaningful: the session is
     # bound to a freshly created CLONE whose row name carries the
     # "(switch …)" disambiguation suffix — i.e. row name ≠ spec name.
@@ -3850,6 +3922,71 @@ async def test_post_external_session_status_publishes_session_status(
     assert published[0][1]["status"] == "idle"
     assert published[0][1]["conversation_id"] == session["id"]
     assert "response_id" not in published[0][1]
+
+
+async def test_external_status_forwards_only_bounded_background_task_detail(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconnect-persistent Runner state receives only the Server projection."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    raw_tasks = [
+        {
+            "id": f"shell-{index}",
+            "type": "shell",
+            "status": "running",
+            "command": f"sleep {index}",
+            "ignored_nested": {"do_not_forward": True},
+        }
+        for index in range(101)
+    ]
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "background_task_count": 101,
+                    "background_tasks": raw_tasks,
+                },
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    forwarded_tasks = forwarded[-1]["data"]["background_tasks"]
+    assert len(forwarded_tasks) == 100
+    assert forwarded_tasks[0] == {
+        "id": "shell-0",
+        "type": "shell",
+        "status": "running",
+        "command": "sleep 0",
+    }
+    assert forwarded[-1]["data"]["background_task_count"] == 101
 
 
 async def test_post_external_session_status_failed_surfaces_output_and_reauth(
@@ -5225,6 +5362,7 @@ async def test_post_external_session_usage_null_compact_limit_clears_previous_mo
 async def test_external_session_usage_persists_provider_allowance_windows(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A harness allowance snapshot survives reload and is broadcast live."""
     published: list[tuple[str, dict[str, Any]]] = []
@@ -5244,7 +5382,15 @@ async def test_external_session_usage_persists_provider_allowance_windows(
                 "aria_label": "5 hour",
                 "used_percent": 11.4,
                 "duration_mins": 300,
-            }
+                "resets_at": 2_000_000_000,
+            },
+            {
+                "label": "w",
+                "aria_label": "weekly",
+                "used_percent": 6.0,
+                "duration_mins": 10_080,
+                "resets_at": 2_000_600_000,
+            },
         ],
     }
 
@@ -5257,6 +5403,13 @@ async def test_external_session_usage_persists_provider_allowance_windows(
 
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["provider_usage_limits"] == limits
+    # Regression: the old label path truncated this normal two-window JSON at
+    # 256 characters, so the GET snapshot parsed it back as null.
+    assert len(json.dumps(limits, separators=(",", ":"))) > 256
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
+    assert stored is not None
+    assert stored.provider_usage_limits == limits
+    assert "omnigent.last_provider_usage_limits" not in stored.labels
 
 
 async def test_post_external_session_usage_rejects_empty_payload(
@@ -7909,14 +8062,11 @@ async def test_post_external_session_todos_updates_snapshot(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``external_session_todos`` persists the list in the in-memory cache so
-    the snapshot returned by GET /v1/sessions/{id} reflects it.
+    ``external_session_todos`` survives a Server-process restart.
 
-    The root bug this tests: ``_EXTERNAL_SESSION_TODOS_TYPE`` was missing
-    from ``_ALLOWED_EVENT_TYPES``, so every POST was rejected with a 400
-    before ``_handle_external_session_todos`` could populate the cache.
-    As a result the snapshot always returned ``todos: []`` even when
-    Claude had active tasks.
+    The native TUI owns and continues to display its plan independently.
+    The Web snapshot must therefore persist the forwarded list instead of
+    relying only on process memory, which is cleared by every deployment.
     """
     from omnigent.server.routes import sessions as sessions_module
 
@@ -7934,10 +8084,10 @@ async def test_post_external_session_todos_updates_snapshot(
         )
         assert resp.status_code in (200, 202), resp.text
 
+        # Simulate a Server restart: the process-local fast path is gone, but
+        # the session snapshot must still recover the TUI's latest plan.
+        sessions_module._session_todos_cache.pop(session["id"], None)
         snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-        # The snapshot todos field must match exactly what was posted.
-        # A failure here means _session_todos_cache was not populated (the
-        # original bug), or the snapshot builder ignores the cache.
         assert snapshot["todos"] == todos
     finally:
         sessions_module._session_todos_cache.pop(session["id"], None)
@@ -8043,7 +8193,7 @@ async def test_post_external_session_todos_filters_malformed_items(
 
     good = {"content": "Real task", "status": "in_progress", "activeForm": "Doing it"}
     todos = [
-        good,
+        {**good, "untrusted": {"nested": "payload"}},
         {"content": "Bad status", "status": "not-a-status", "activeForm": "x"},
         {"content": 123, "status": "pending", "activeForm": "x"},  # non-str content
         {"content": "No active form", "status": "completed", "activeForm": None},  # non-str
@@ -8067,6 +8217,24 @@ async def test_post_external_session_todos_filters_malformed_items(
         assert snapshot["todos"] == [good]
     finally:
         sessions_module._session_todos_cache.pop(session["id"], None)
+
+
+async def test_post_external_session_todos_rejects_oversized_payload(
+    client: httpx.AsyncClient,
+) -> None:
+    """A forwarded plan cannot turn every snapshot into an unbounded response."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_todos",
+            "data": {
+                "todos": [{"content": "x" * 4097, "status": "pending", "activeForm": "Working"}]
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
 
 
 async def test_post_external_mcp_startup_publishes_session_mcp_startup(

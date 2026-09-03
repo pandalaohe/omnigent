@@ -1,4 +1,5 @@
 import { useEffect, useReducer, useRef, useState, type PointerEvent } from "react";
+import { createPortal } from "react-dom";
 import { KeyboardIcon, PencilIcon, PlusIcon, RotateCcwIcon, Trash2Icon } from "lucide-react";
 
 import { Kbd } from "@/components/KeyboardShortcut";
@@ -113,33 +114,60 @@ function moveButtonToSlot(
   return next;
 }
 
-function circleSlotFromPointer(
-  event: PointerEvent<HTMLElement>,
+function circleSlotFromPoint(
+  clientX: number,
+  clientY: number,
   circle: HTMLElement,
   count: number,
-): number {
-  if (count <= 1) return 0;
+): number | null {
+  if (count === 0) return null;
   const rect = circle.getBoundingClientRect();
   const centerX = rect.left + rect.width / 2;
   const centerY = rect.top + rect.height / 2;
-  const angleFromTop = Math.atan2(event.clientY - centerY, event.clientX - centerX) + Math.PI / 2;
-  const normalized = (angleFromTop + Math.PI * 2) % (Math.PI * 2);
-  return Math.round(normalized / ((Math.PI * 2) / count)) % count;
+  const radius = Math.min(rect.width, rect.height) / 2;
+  if (Math.hypot(clientX - centerX, clientY - centerY) > radius) return null;
+  if (count === 1) return 0;
+
+  const slots = layoutMobileAssistantActions(
+    count,
+    { x: rect.width / 2, y: rect.height / 2 },
+    { width: rect.width, height: rect.height },
+  );
+  let nearestIndex = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  slots.forEach((slot, index) => {
+    const distance = Math.hypot(clientX - (rect.left + slot.x), clientY - (rect.top + slot.y));
+    if (distance < nearestDistance) {
+      nearestIndex = index;
+      nearestDistance = distance;
+    }
+  });
+  return nearestIndex;
+}
+
+interface PreviewDrag {
+  buttonId: string;
+  clientX: number;
+  clientY: number;
+  targetIndex: number | null;
 }
 
 export function MobileAssistantSettings() {
   const [, refresh] = useReducer((version: number) => version + 1, 0);
   const [draft, setDraft] = useState<ButtonDraft | null>(null);
   const [recording, setRecording] = useState(false);
-  const [previewButtons, setPreviewButtons] = useState<MobileAssistantButton[] | null>(null);
+  const [previewDrag, setPreviewDrag] = useState<PreviewDrag | null>(null);
   const circleRef = useRef<HTMLDivElement>(null);
   const previewDragRef = useRef<{
     pointerId: number;
     buttonId: string;
     buttons: MobileAssistantButton[];
+    targetIndex: number | null;
   } | null>(null);
   const preferences = readMobileAssistantPreferences();
-  const displayedButtons = previewButtons ?? preferences.buttons;
+  const draggedButton = previewDrag
+    ? preferences.buttons.find((button) => button.id === previewDrag.buttonId)
+    : undefined;
 
   useEffect(() => {
     const onChanged = () => refresh();
@@ -180,11 +208,15 @@ export function MobileAssistantSettings() {
   };
 
   const beginPreviewDrag = (buttonId: string, event: PointerEvent<HTMLButtonElement>) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || previewDragRef.current) return;
     event.preventDefault();
+    const circle = circleRef.current;
     const buttons = [...preferences.buttons];
-    previewDragRef.current = { pointerId: event.pointerId, buttonId, buttons };
-    setPreviewButtons(buttons);
+    const targetIndex = circle
+      ? circleSlotFromPoint(event.clientX, event.clientY, circle, buttons.length)
+      : null;
+    previewDragRef.current = { pointerId: event.pointerId, buttonId, buttons, targetIndex };
+    setPreviewDrag({ buttonId, clientX: event.clientX, clientY: event.clientY, targetIndex });
     event.currentTarget.setPointerCapture?.(event.pointerId);
   };
 
@@ -193,20 +225,33 @@ export function MobileAssistantSettings() {
     const circle = circleRef.current;
     if (!drag || drag.pointerId !== event.pointerId || !circle) return;
     event.preventDefault();
-    const targetIndex = circleSlotFromPointer(event, circle, drag.buttons.length);
-    const next = moveButtonToSlot(drag.buttons, drag.buttonId, targetIndex);
-    if (next === drag.buttons) return;
-    drag.buttons = next;
-    setPreviewButtons(next);
+    const currentCount = readMobileAssistantPreferences().buttons.length;
+    const targetIndex = circleSlotFromPoint(event.clientX, event.clientY, circle, currentCount);
+    drag.targetIndex = targetIndex;
+    setPreviewDrag({
+      buttonId: drag.buttonId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      targetIndex,
+    });
   };
 
-  const finishPreviewDrag = (pointerId: number, commit: boolean) => {
+  const finishPreviewDrag = (event: PointerEvent<HTMLButtonElement>, commit: boolean) => {
     const drag = previewDragRef.current;
-    if (!drag || drag.pointerId !== pointerId) return;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const circle = circleRef.current;
+    const current = readMobileAssistantPreferences();
+    const targetIndex =
+      commit && circle
+        ? circleSlotFromPoint(event.clientX, event.clientY, circle, current.buttons.length)
+        : null;
     previewDragRef.current = null;
-    setPreviewButtons(null);
-    if (commit) {
-      writeMobileAssistantPreferences({ ...preferences, buttons: drag.buttons });
+    setPreviewDrag(null);
+    if (targetIndex !== null) {
+      const buttons = moveButtonToSlot(current.buttons, drag.buttonId, targetIndex);
+      if (buttons !== current.buttons) {
+        writeMobileAssistantPreferences({ ...current, buttons });
+      }
     }
   };
 
@@ -245,7 +290,7 @@ export function MobileAssistantSettings() {
           <h3 className="text-sm font-medium text-foreground">Mobile floating assistant</h3>
           <p
             className="mt-1 text-sm text-muted-foreground"
-            title="Drag buttons around the preview to insert them into a new position. The first slot stays at the top. Drag the live assistant to an edge to collapse it."
+            title="Move a button freely, then release anywhere inside the circle to insert it. Releasing outside cancels."
           >
             Drag to reorder. Edge-drag to collapse.
           </p>
@@ -263,15 +308,16 @@ export function MobileAssistantSettings() {
         <div
           ref={circleRef}
           data-testid="mobile-assistant-circle-preview"
-          className="relative mx-auto h-[240px] w-[240px] touch-none rounded-full bg-muted/35"
+          data-drop-valid={previewDrag ? previewDrag.targetIndex !== null : undefined}
+          className="relative mx-auto h-[240px] w-[240px] touch-none rounded-full bg-muted/35 ring-offset-background transition-shadow data-[drop-valid=false]:ring-2 data-[drop-valid=false]:ring-destructive/45 data-[drop-valid=true]:ring-2 data-[drop-valid=true]:ring-primary/35"
           aria-label="Floating assistant circle preview"
         >
           {layoutMobileAssistantActions(
-            displayedButtons.length,
+            preferences.buttons.length,
             { x: 120, y: 120 },
             { width: 240, height: 240 },
           ).map((position, index) => {
-            const button = displayedButtons[index];
+            const button = preferences.buttons[index];
             if (!button) return null;
             return (
               <button
@@ -279,12 +325,13 @@ export function MobileAssistantSettings() {
                 key={button.id}
                 aria-label={`${button.label}, position ${index + 1}; drag to reorder`}
                 data-testid={`mobile-assistant-preview-button-${button.id}`}
-                data-dragging={previewDragRef.current?.buttonId === button.id || undefined}
+                data-dragging={previewDrag?.buttonId === button.id || undefined}
+                data-drop-target={previewDrag?.targetIndex === index || undefined}
                 onPointerDown={(event) => beginPreviewDrag(button.id, event)}
                 onPointerMove={updatePreviewDrag}
-                onPointerUp={(event) => finishPreviewDrag(event.pointerId, true)}
-                onPointerCancel={(event) => finishPreviewDrag(event.pointerId, false)}
-                onLostPointerCapture={(event) => finishPreviewDrag(event.pointerId, false)}
+                onPointerUp={(event) => finishPreviewDrag(event, true)}
+                onPointerCancel={(event) => finishPreviewDrag(event, false)}
+                onLostPointerCapture={(event) => finishPreviewDrag(event, false)}
                 onKeyDown={(event) => {
                   if (!["ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"].includes(event.key))
                     return;
@@ -294,7 +341,7 @@ export function MobileAssistantSettings() {
                     (index + offset + preferences.buttons.length) % preferences.buttons.length;
                   persistButtonSlot(button.id, target);
                 }}
-                className="absolute flex h-9 w-9 touch-none cursor-grab items-center justify-center rounded-full border border-border bg-popover px-1 text-[10px] font-semibold text-popover-foreground shadow-sm transition-[left,top,transform] focus-visible:ring-2 focus-visible:ring-ring active:cursor-grabbing active:scale-105 data-[dragging=true]:border-primary data-[dragging=true]:ring-2 data-[dragging=true]:ring-primary/30"
+                className="absolute flex h-9 w-9 touch-none cursor-grab items-center justify-center rounded-full border border-border bg-popover px-1 text-[10px] font-semibold text-popover-foreground shadow-sm transition-[left,top,transform,opacity] focus-visible:ring-2 focus-visible:ring-ring active:cursor-grabbing data-[dragging=true]:opacity-25 data-[drop-target=true]:border-primary data-[drop-target=true]:ring-2 data-[drop-target=true]:ring-primary/45"
                 style={{
                   left: position.x,
                   top: position.y,
@@ -317,12 +364,30 @@ export function MobileAssistantSettings() {
           <p className="text-sm font-medium text-foreground">Drag to arrange</p>
           <p
             className="text-xs text-muted-foreground"
-            title="The preview updates while you drag; release to save the order used on mobile."
+            title="The button follows your pointer. Release outside the circle to keep the current order."
           >
-            Drop onto a numbered slot.
+            Release inside to place · outside to cancel
           </p>
         </div>
       </div>
+
+      {previewDrag && draggedButton
+        ? createPortal(
+            <div
+              aria-hidden
+              data-testid="mobile-assistant-drag-preview"
+              className="pointer-events-none fixed z-[100] flex h-9 w-9 items-center justify-center rounded-full border border-primary bg-popover px-1 text-[10px] font-semibold text-popover-foreground shadow-lg ring-2 ring-primary/35"
+              style={{
+                left: previewDrag.clientX,
+                top: previewDrag.clientY,
+                transform: "translate(-50%, -50%) scale(1.08)",
+              }}
+            >
+              <MobileAssistantButtonContent button={draggedButton} className="h-3.5 w-3.5" />
+            </div>,
+            document.body,
+          )
+        : null}
 
       <div className="mt-3 overflow-hidden rounded-xl border border-border">
         {preferences.buttons.length === 0 ? (

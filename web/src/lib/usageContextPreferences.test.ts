@@ -1,15 +1,25 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { queueUserPreferencePatch } from "./userPreferencesSync";
+
+vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
 
 import {
   DEFAULT_USAGE_CONTEXT_PREFERENCES,
   readUsageContextPreferences,
+  providerUsageLimitsForSource,
   resolveUsageContextLimits,
+  usageContextSourceFromKey,
   usageContextSourceKey,
   writeUsageContextOverride,
   writeUsageContextPreferences,
+  writeLastProviderUsageLimits,
 } from "./usageContextPreferences";
 
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  vi.mocked(queueUserPreferencePatch).mockClear();
+});
 
 describe("usage/context preferences", () => {
   const source = usageContextSourceKey({
@@ -17,6 +27,16 @@ describe("usage/context preferences", () => {
     agentName: "codex",
     harness: "codex",
     model: "gpt-5.6",
+  });
+
+  it("round-trips the four-field source used for saved profiles", () => {
+    expect(usageContextSourceFromKey(source)).toEqual({
+      hostId: "host-a",
+      agentName: "codex",
+      harness: "codex",
+      model: "gpt-5.6",
+    });
+    expect(usageContextSourceFromKey("not-json")).toBeNull();
   });
 
   it("follows reported Host and model values by default", () => {
@@ -29,9 +49,10 @@ describe("usage/context preferences", () => {
   it("uses a manual context total and Compact threshold when supplied", () => {
     writeUsageContextOverride(
       {
-        version: 3,
+        version: 4,
         showProviderUsageLimits: false,
         overrides: {},
+        lastProviderUsageLimits: {},
       },
       source,
       {
@@ -49,11 +70,12 @@ describe("usage/context preferences", () => {
 
   it("does not leak a manual override into a different Host or model", () => {
     writeUsageContextPreferences({
-      version: 3,
+      version: 4,
       showProviderUsageLimits: false,
       overrides: {
         [source]: { contextWindowTokens: 330_000, autoCompactThresholdPercent: 93 },
       },
+      lastProviderUsageLimits: {},
     });
     const preferences = readUsageContextPreferences();
     const other = usageContextSourceKey({
@@ -79,5 +101,81 @@ describe("usage/context preferences", () => {
       }),
     );
     expect(readUsageContextPreferences()).toEqual(DEFAULT_USAGE_CONTEXT_PREFERENCES);
+  });
+
+  it("retains provider usage only for the exact Host, agent, harness, and model", () => {
+    const snapshot = {
+      provider: "Codex",
+      scope: "Codex",
+      capturedAt: 1_900_000_000,
+      windows: [{ label: "5h", ariaLabel: "5 hour", usedPercent: 11 }],
+    };
+    writeLastProviderUsageLimits(DEFAULT_USAGE_CONTEXT_PREFERENCES, source, snapshot);
+    const preferences = readUsageContextPreferences();
+    expect(providerUsageLimitsForSource(preferences, source)).toEqual(snapshot);
+
+    const claudeSource = usageContextSourceKey({
+      hostId: "host-a",
+      agentName: "claude",
+      harness: "claude-native",
+      model: "opus",
+    });
+    expect(providerUsageLimitsForSource(preferences, claudeSource)).toBeNull();
+  });
+
+  it("refreshes an unchanged provider reading locally without syncing it again", () => {
+    const first = {
+      provider: "Codex",
+      scope: "Codex",
+      capturedAt: 1_900_000_000,
+      windows: [{ label: "5h", ariaLabel: "5 hour", usedPercent: 11 }],
+    };
+    writeLastProviderUsageLimits(DEFAULT_USAGE_CONTEXT_PREFERENCES, source, first);
+    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
+
+    const preferences = readUsageContextPreferences();
+    writeLastProviderUsageLimits(preferences, source, {
+      ...first,
+      capturedAt: first.capturedAt + 60_000,
+    });
+
+    expect(providerUsageLimitsForSource(readUsageContextPreferences(), source)?.capturedAt).toBe(
+      first.capturedAt + 60_000,
+    );
+    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not sync provider changes that render identically", () => {
+    const first = {
+      provider: "Claude",
+      scope: "Account",
+      capturedAt: 1_900_000_000,
+      windows: [
+        {
+          label: "5h",
+          ariaLabel: "5 hour",
+          usedPercent: 11.1,
+          durationMinutes: 300,
+          resetsAt: 1_900_010_000,
+        },
+      ],
+    };
+    writeLastProviderUsageLimits(DEFAULT_USAGE_CONTEXT_PREFERENCES, source, first);
+    writeLastProviderUsageLimits(readUsageContextPreferences(), source, {
+      ...first,
+      capturedAt: first.capturedAt + 60_000,
+      windows: [
+        {
+          ...first.windows[0]!,
+          usedPercent: 11.4,
+          resetsAt: 1_900_020_000,
+        },
+      ],
+    });
+
+    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
+    expect(providerUsageLimitsForSource(readUsageContextPreferences(), source)?.capturedAt).toBe(
+      first.capturedAt + 60_000,
+    );
   });
 });

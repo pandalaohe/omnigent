@@ -3247,6 +3247,67 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
 
 
 @pytest.mark.asyncio
+async def test_external_status_background_state_replays_after_reconnect(tmp_path: Path) -> None:
+    """The runner endpoint retains exact background shells for tunnel resync."""
+    from omnigent.runner import app as runner_app
+
+    conv_id = uuid.uuid4().hex
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    resource_registry = app.state.session_resource_registry
+    tasks = [
+        {
+            "id": "shell-replay",
+            "type": "shell",
+            "status": "running",
+            "command": "sleep 120",
+        }
+    ]
+
+    runner_app._session_event_queues_ref.pop(conv_id, None)
+    try:
+        async with _runner_client(app) as client:
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "idle",
+                        "background_task_count": 1,
+                        "background_tasks": [
+                            {
+                                **tasks[0],
+                                "ignored_nested": {"do_not_retain": True},
+                            },
+                            *[{"id": f"extra-{index}", "type": "shell"} for index in range(100)],
+                        ],
+                    },
+                },
+            )
+        assert response.status_code == 204, response.text
+
+        resource_registry.resync_session_statuses()
+        replayed = _drain_session_event_queue(runner_app._session_event_queues_ref.get(conv_id))
+    finally:
+        runner_app._session_event_queues_ref.pop(conv_id, None)
+
+    assert replayed == [
+        {
+            "type": "session.status",
+            "status": "idle",
+            "background_task_count": 1,
+            "background_tasks": [
+                tasks[0],
+                *[{"id": f"extra-{index}", "type": "shell"} for index in range(99)],
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path: Path) -> None:
     """
     A structured native ``idle`` status prevents a later pane close from failing.

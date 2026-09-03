@@ -16,7 +16,7 @@ import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
-  applyDesktopUiFontSize,
+  applyUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
   readUiFontSizePx,
@@ -68,8 +68,8 @@ const bootIdentity = resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
-// Apply the saved desktop UI font size and family before first paint so there's no flash.
-applyDesktopUiFontSize(readUiFontSizePx());
+// Apply the saved device-local UI font size and family before first paint so there's no flash.
+applyUiFontSize(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
 
 // The standalone sidebar font size control was removed. Clear its legacy value

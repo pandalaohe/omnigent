@@ -777,6 +777,15 @@ aside[aria-label="Workspace"][data-maximized] {
     top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
   }
 
+  /* The plan is a normal flex row, but its old fixed mt-14 only cleared the
+     56px Web header. Native status-bar safe space moves that header lower;
+     reserve the same safe-area + header band so Plan always starts beneath
+     the title instead of crossing it. */
+  [data-ios-native] .chat-plan-accordion,
+  [data-android-native] .chat-plan-accordion {
+    margin-top: calc(var(--omnigent-safe-top) + var(--omnigent-header-height));
+  }
+
   [data-ios-native] .chat-conversation-content,
   [data-android-native] .chat-conversation-content {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
@@ -1039,11 +1048,21 @@ aside[aria-label="Workspace"][data-maximized] {
 /* Mobile-specific sidebar geometry. The root remains at the global 16px so
  * rem-based typography and controls keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile uses its own base size while preserving the desktop hierarchy. */
+  /* Mobile uses its own device-local base size while preserving the desktop
+   * hierarchy. Appearance writes this variable only on the current device. */
   :root {
     --mobile-ui-font-size: 14px;
+    --ui-ramp-anchor: calc(var(--mobile-ui-font-size) * (16 / 13));
     --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
     --text-ui: var(--mobile-ui-font-size);
+    --text-base: var(--mobile-ui-font-size);
+    --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
+    --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
+    --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
+  }
+
+  body {
+    font-size: var(--mobile-ui-font-size);
   }
 
   /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */

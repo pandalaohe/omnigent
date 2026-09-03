@@ -150,6 +150,7 @@ describe("useSessionPollingHotkeys", () => {
     writeSessionNavigationPreferences({
       pollingActiveWindowHours: 2,
       deprioritizeBackgroundSessions: true,
+      scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
     });
     const rows = [
@@ -179,6 +180,7 @@ describe("useSessionPollingHotkeys", () => {
     writeSessionNavigationPreferences({
       pollingActiveWindowHours: 1,
       deprioritizeBackgroundSessions: true,
+      scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
     });
     renderHook(() =>

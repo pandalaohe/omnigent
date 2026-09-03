@@ -39,7 +39,6 @@ import {
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { formatTokenCountShort } from "@/lib/formatCost";
 import {
   Conversation,
   ConversationContent,
@@ -80,6 +79,7 @@ import { useAppShellSidebarOpen, useSurfaceFrontmost } from "@/hooks/useNativeSe
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { shouldHideNativeServerSwitcher } from "@/lib/sessionNavigationPreferences";
 import { resolveUsageContextLimits, usageContextSourceKey } from "@/lib/usageContextPreferences";
@@ -1956,7 +1956,7 @@ function MainAgentSurface({
     showTerminal ? terminalSurfaceEl : containerEl,
     !!conversationId,
   );
-  const { nativeMobileHeaderMode } = useSessionNavigationPreferences();
+  const { nativeMobileHeaderMode, scrollToBottomOnSessionOpen } = useSessionNavigationPreferences();
   const sidebarOpen = useAppShellSidebarOpen();
   useEffect(() => {
     if (!isIOSShell()) return;
@@ -1977,6 +1977,9 @@ function MainAgentSurface({
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
   // read and drive the scroll.
   const [scroller, setScroller] = useState<ConversationScroller | null>(null);
+  // Persists while Chat is temporarily replaced by the Terminal surface so
+  // returning to Chat does not look like another session open.
+  const autoScrolledConversationIdRef = useRef<string | null>(null);
   // While the iOS edge-swipe is driving the sidebar drawer, make the transcript
   // ignore the finger so it doesn't scroll along with the drag. On iOS the page
   // is viewport-locked, so the transcript scrolls as an inner overflow:auto
@@ -2179,6 +2182,11 @@ function MainAgentSurface({
                 )}
               >
                 {/* Scroll helpers — must live inside StickToBottom to access context. */}
+                <ScrollToBottomOnSessionOpen
+                  conversationId={conversationId}
+                  enabled={scrollToBottomOnSessionOpen}
+                  openedConversationIdRef={autoScrolledConversationIdRef}
+                />
                 <ScrollToBottomOnSend nonce={sendScrollNonce} />
                 <KeepBottomOnViewportResize />
                 <ConversationScrollRefBridge onScroller={setScroller} />
@@ -2457,6 +2465,35 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
   }, [nonce, scrollToBottom]);
+
+  return null;
+}
+
+/** Apply the shared session-open preference after the selected transcript mounts. */
+export function ScrollToBottomOnSessionOpen({
+  conversationId,
+  enabled,
+  openedConversationIdRef,
+}: {
+  conversationId: string | null;
+  enabled: boolean;
+  openedConversationIdRef?: { current: string | null };
+}) {
+  const { scrollToBottom } = useStickToBottomContext();
+  const localOpenedConversationIdRef = useRef<string | null>(null);
+  const openedRef = openedConversationIdRef ?? localOpenedConversationIdRef;
+
+  useLayoutEffect(() => {
+    if (!conversationId) {
+      openedRef.current = null;
+      return;
+    }
+    if (conversationId === openedRef.current) return;
+    openedRef.current = conversationId;
+    if (!enabled) return;
+    scrollToBottom("instant");
+    requestAnimationFrame(() => scrollToBottom("instant"));
+  }, [conversationId, enabled, openedRef, scrollToBottom]);
 
   return null;
 }
@@ -3914,8 +3951,6 @@ function ContextRing({
   const accessibleLabel = compactMode
     ? `${usedPct}% of compact budget used`
     : `${usedPct}% of context used`;
-  const compactUsage = `${formatTokenCountShort(tokensUsed)}/${formatTokenCountShort(denominator)}`;
-
   const color =
     pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
 
@@ -3941,19 +3976,14 @@ function ContextRing({
             )}
           </svg>
           <span className="text-sm tabular-nums" aria-hidden="true">
-            {usedPct}% · {compactUsage}
+            {usedPct}%
           </span>
         </span>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-44 text-center text-sm">
         <p className="tabular-nums">
-          {tokensUsed.toLocaleString()} / {denominator.toLocaleString()} tokens · {usedPct}%
+          {tokensUsed.toLocaleString()} / {denominator.toLocaleString()} tokens
         </p>
-        {compactMode && (
-          <p className="text-muted-foreground">
-            {Math.max(autoCompactTokenLimit - tokensUsed, 0).toLocaleString()} to Compact
-          </p>
-        )}
       </TooltipContent>
     </Tooltip>
   );
@@ -4102,19 +4132,25 @@ function ComposerStatusLine({
   const { session } = useSession(conversationId);
   const isHostBound = !!session?.hostId;
   const isCodexSession = sessionHarness === "codex" || sessionHarness === "codex-native";
-  const formattedRateLimits = formatProviderUsageLimits(
-    isCodexSession
+  const usageSourceKey = usageContextSourceKey({
+    hostId: session?.hostId,
+    agentName: boundAgentName,
+    harness: sessionHarness,
+    model: llmModel,
+  });
+  const stableProviderUsageLimits = useStableProviderUsageLimits({
+    preferences: usageContextPreferences,
+    sourceKey: usageSourceKey,
+    fresh: isCodexSession
       ? providerUsageLimitsFromCodex(codexRateLimits, llmModel)
       : sessionProviderUsageLimits,
-  );
+    agentName: boundAgentName,
+    harness: sessionHarness,
+  });
+  const formattedRateLimits = formatProviderUsageLimits(stableProviderUsageLimits);
   const resolvedLimits = resolveUsageContextLimits(
     usageContextPreferences,
-    usageContextSourceKey({
-      hostId: session?.hostId,
-      agentName: boundAgentName,
-      harness: sessionHarness,
-      model: llmModel,
-    }),
+    usageSourceKey,
     contextWindow,
     autoCompactTokenLimit,
   );

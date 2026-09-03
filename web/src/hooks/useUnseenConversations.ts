@@ -21,6 +21,7 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { isIOSShell } from "@/lib/nativeBridge";
 
 // Bumped whenever the local mirror is written, so in-tab subscribers (the
 // sidebar rows, the dock badge) recompute unseen state right away — a PUT's
@@ -262,6 +263,31 @@ export function markConversationSeen(conversationId: string, atSeconds?: number)
 }
 
 /**
+ * Explicitly marks a group of conversations read in one local update.
+ * Unlike the automatic single-thread path, this clears deliberate unread
+ * overrides because the user requested the bulk action. Server mirrors remain
+ * best-effort and are sent once per changed conversation.
+ */
+export function markConversationsSeen(
+  conversations: readonly { id: string; updated_at: number }[],
+): void {
+  const now = nowSeconds();
+  const changedIds: string[] = [];
+  for (const conversation of conversations) {
+    const baseline = Math.max(now, conversation.updated_at);
+    const clearedOverride = explicitlyUnread.delete(conversation.id);
+    const stored = lastSeenMap[conversation.id];
+    if (!clearedOverride && stored !== undefined && stored >= baseline) continue;
+    lastSeenMap[conversation.id] = Math.max(stored ?? baseline, baseline);
+    changedIds.push(conversation.id);
+  }
+  if (changedIds.length === 0) return;
+  persistToStorage();
+  notifySubscribers();
+  for (const id of changedIds) void syncReadState(id);
+}
+
+/**
  * Forces a conversation back to "unseen" — the inverse of
  * {@link markConversationSeen}, backing the kebab's "Mark as unread".
  * The dot's condition is `updated_at > stored`, so the baseline is
@@ -322,6 +348,10 @@ export function isConversationUnseen(
 /** True when the app window currently has focus (SSR-safe default true). */
 function windowHasFocus(): boolean {
   if (typeof document === "undefined") return true;
+  // WKWebView can report `document.hasFocus() === false` while the iOS app is
+  // visibly foregrounded. Page Visibility tracks the native scene lifecycle
+  // reliably, so a visible iOS page is safe to treat as focused/read.
+  if (isIOSShell()) return document.visibilityState === "visible";
   return typeof document.hasFocus === "function" ? document.hasFocus() : true;
 }
 
@@ -375,8 +405,10 @@ export function useMarkConversationSeen(
     };
     markIfFocused();
     window.addEventListener("focus", markIfFocused);
+    document.addEventListener("visibilitychange", markIfFocused);
     return () => {
       window.removeEventListener("focus", markIfFocused);
+      document.removeEventListener("visibilitychange", markIfFocused);
       // Navigation away normally happens via user interaction (focused);
       // an unmount in a blurred window (e.g. the session deleted from
       // another client) must not silently mark the thread read.

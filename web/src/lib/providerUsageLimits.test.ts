@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatProviderUsageLimits,
   providerUsageLimitsFromCodex,
+  providerUsageLimitsMatchesSource,
   providerUsageLimitsFromWire,
 } from "./providerUsageLimits";
 
@@ -48,5 +49,31 @@ describe("provider usage limits", () => {
       "gpt-5.6",
     );
     expect(formatProviderUsageLimits(snapshot, 1_900_000_010)?.text).toBe("5h:11% w:6%");
+  });
+
+  it("stops presenting a cached reading as current after one hour", () => {
+    const snapshot = providerUsageLimitsFromWire({
+      provider: "Claude",
+      captured_at: 1_900_000_000,
+      windows: [{ label: "5h", aria_label: "5 hour", used_percent: 7 }],
+    });
+    expect(formatProviderUsageLimits(snapshot, 1_900_003_601)).toBeNull();
+  });
+
+  it("rejects a provider snapshot from another native agent family", () => {
+    const claude = providerUsageLimitsFromWire({
+      provider: "Claude",
+      captured_at: 1_900_000_000,
+      windows: [{ label: "5h", aria_label: "5 hour", used_percent: 7 }],
+    });
+    expect(providerUsageLimitsMatchesSource(claude, { agentName: "codex", harness: "codex" })).toBe(
+      false,
+    );
+    expect(
+      providerUsageLimitsMatchesSource(claude, {
+        agentName: "claude-native",
+        harness: "claude-native",
+      }),
+    ).toBe(true);
   });
 });

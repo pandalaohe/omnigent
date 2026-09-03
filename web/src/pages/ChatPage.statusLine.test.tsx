@@ -4,10 +4,11 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
+import { USAGE_CONTEXT_STORAGE_KEY, usageContextSourceKey } from "@/lib/usageContextPreferences";
 import { useChatStore } from "@/store/chatStore";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
@@ -131,6 +132,7 @@ function bindHost(name: string) {
 describe("Composer status line (branch + context ring)", () => {
   beforeEach(() => {
     localStorage.removeItem(CONTEXT_INDICATOR_STORAGE_KEY);
+    localStorage.removeItem(USAGE_CONTEXT_STORAGE_KEY);
     // Default: no host bound, so HostBadge renders nothing.
     useSessionMock.mockReset().mockReturnValue({
       session: { hostId: null },
@@ -156,6 +158,7 @@ describe("Composer status line (branch + context ring)", () => {
       codexPlanMode: false,
       nativeVendorOwnsModel: false,
       sessionHarness: null,
+      boundAgentName: null,
       subAgentName: null,
     });
   });
@@ -201,8 +204,28 @@ describe("Composer status line (branch + context ring)", () => {
 
     renderComposer();
 
-    expect(screen.getByLabelText("25% of compact budget used")).toBeInTheDocument();
+    const trigger = screen.getByLabelText("25% of compact budget used");
+    expect(trigger).toBeInTheDocument();
+    expect(trigger).toHaveTextContent("25%");
+    expect(trigger).not.toHaveTextContent("20k/80k");
     expect(screen.queryByLabelText(/of context used/)).toBeNull();
+  });
+
+  it("keeps the compact tooltip to token counts without repeating the percentage", async () => {
+    localStorage.setItem(CONTEXT_INDICATOR_STORAGE_KEY, "compact");
+    useChatStore.setState({
+      contextWindow: 100_000,
+      autoCompactTokenLimit: 80_000,
+      tokensUsed: 20_000,
+    });
+    renderComposer();
+
+    const trigger = screen.getByLabelText("25% of compact budget used");
+    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+
+    await waitFor(() => expect(screen.getByText("20,000 / 80,000 tokens")).toBeInTheDocument());
+    expect(screen.queryByText("20,000 / 80,000 tokens · 25%")).toBeNull();
+    expect(screen.queryByText(/to Compact/i)).toBeNull();
   });
 
   it("falls back to context usage when the host cannot report a compact point", () => {
@@ -327,7 +350,8 @@ describe("Composer status line (branch + context ring)", () => {
 
     const plan = screen.getByTestId("composer-plan-mode");
     const ring = screen.getByLabelText("25% of context used");
-    expect(ring).toHaveTextContent("25% · 25k/100k");
+    expect(ring).toHaveTextContent("25%");
+    expect(ring).not.toHaveTextContent("25k/100k");
     expect(plan.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
@@ -363,6 +387,75 @@ describe("Composer status line (branch + context ring)", () => {
     expect(quota.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
+  });
+
+  it("keeps the last Codex reading when the Host has no fresh measurement", () => {
+    bindHost("windows-pc");
+    const sourceKey = usageContextSourceKey({
+      hostId: "host_a1b2",
+      agentName: "codex",
+      harness: "codex",
+      model: "gpt-5.6-sol",
+    });
+    localStorage.setItem(
+      USAGE_CONTEXT_STORAGE_KEY,
+      JSON.stringify({
+        version: 4,
+        showProviderUsageLimits: true,
+        overrides: {},
+        lastProviderUsageLimits: {
+          [sourceKey]: {
+            provider: "Codex",
+            scope: "Codex",
+            capturedAt: 1_900_000_000,
+            windows: [{ label: "5h", ariaLabel: "5 hour", usedPercent: 13 }],
+          },
+        },
+      }),
+    );
+    useChatStore.setState({
+      boundAgentName: "codex",
+      sessionHarness: "codex",
+      llmModel: "gpt-5.6-sol",
+    });
+
+    renderComposer({ modelPickerKind: "codex", codexRateLimits: null });
+
+    expect(screen.getByTestId("composer-provider-usage-limits")).toHaveTextContent("5h:13%");
+  });
+
+  it("does not reuse a Claude reading for a Codex source", () => {
+    bindHost("shared-host");
+    const sourceKey = usageContextSourceKey({
+      hostId: "host_a1b2",
+      agentName: "codex",
+      harness: "codex",
+      model: "gpt-5.6-sol",
+    });
+    localStorage.setItem(
+      USAGE_CONTEXT_STORAGE_KEY,
+      JSON.stringify({
+        version: 4,
+        showProviderUsageLimits: true,
+        overrides: {},
+        lastProviderUsageLimits: {
+          [sourceKey]: {
+            provider: "Claude",
+            capturedAt: 1_900_000_000,
+            windows: [{ label: "5h", ariaLabel: "5 hour", usedPercent: 77 }],
+          },
+        },
+      }),
+    );
+    useChatStore.setState({
+      boundAgentName: "codex",
+      sessionHarness: "codex",
+      llmModel: "gpt-5.6-sol",
+    });
+
+    renderComposer({ modelPickerKind: "codex", codexRateLimits: null });
+
+    expect(screen.queryByTestId("composer-provider-usage-limits")).toBeNull();
   });
 
   it("shows Claude plan windows from the session harness adapter", () => {
@@ -483,7 +576,7 @@ describe("formatCodexRateLimits", () => {
     ).toBe("5h:2% w:10%");
   });
 
-  it("hides stale data", () => {
+  it("expires the last measured data when no newer sample exists", () => {
     expect(
       formatCodexRateLimits(
         {

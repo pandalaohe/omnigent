@@ -101,6 +101,12 @@ class Conversation:
         nested ``by_model`` object. Persisted as a JSON column and
         loaded by the policy engine builder at workflow start. Empty
         dict when no LLM calls have been recorded yet.
+    :param provider_usage_limits: Latest sanitized account allowance
+        snapshot reported by the active harness. ``None`` until a harness
+        reports comparable windows. Stored with conversation metadata rather
+        than labels because the snapshot can exceed the label value limit.
+    :param session_todos: Latest validated native-harness plan forwarded for
+        Web display. Persisted so the snapshot survives Server restarts.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
         Set at session creation via ``POST /v1/sessions`` metadata
@@ -232,6 +238,8 @@ class Conversation:
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)
+    provider_usage_limits: dict[str, Any] | None = None
+    session_todos: list[dict[str, Any]] = field(default_factory=list)
     reasoning_effort: str | None = None
     model_override: str | None = None
     reported_model: str | None = None

@@ -200,6 +200,24 @@ def _to_conversation(
     session_usage: dict[str, Any] = {}
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
+    provider_usage_limits: dict[str, Any] | None = None
+    if meta and meta.provider_usage_limits:
+        from omnigent.provider_usage_limits import validate_provider_usage_limits_snapshot
+
+        try:
+            provider_usage_limits = validate_provider_usage_limits_snapshot(
+                json.loads(meta.provider_usage_limits)
+            )
+        except (json.JSONDecodeError, ValueError):
+            provider_usage_limits = None
+    session_todos: list[dict[str, Any]] = []
+    if meta and meta.session_todos:
+        from omnigent.session_todos import validate_session_todos
+
+        try:
+            session_todos = validate_session_todos(json.loads(meta.session_todos))
+        except (json.JSONDecodeError, ValueError):
+            session_todos = []
     overrides = _decode_session_overrides(row.session_overrides)
     return Conversation(
         id=row.id,
@@ -219,6 +237,8 @@ def _to_conversation(
         labels=labels if labels is not None else {},
         session_state=session_state,
         session_usage=session_usage,
+        provider_usage_limits=provider_usage_limits,
+        session_todos=session_todos,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
         reported_model=overrides["reported_model"],
@@ -1508,6 +1528,41 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(session_usage=json.dumps(usage))
             )
+
+    def set_provider_usage_limits(
+        self,
+        conversation_id: str,
+        snapshot: dict[str, Any] | None,
+    ) -> None:
+        """Persist or clear the latest provider allowance snapshot."""
+        payload = json.dumps(snapshot, separators=(",", ":")) if snapshot is not None else None
+        with self._session("set_provider_usage_limits") as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(provider_usage_limits=payload)
+            )
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist the latest plan, returning false if the session was deleted."""
+        payload = json.dumps(todos, separators=(",", ":"))
+        with self._session("set_session_todos") as session:
+            result = session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(session_todos=payload)
+            )
+            return result.rowcount > 0
 
     def set_conversation_project(
         self,
@@ -4350,6 +4405,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is not None:
                 meta.external_session_id = None
+                meta.provider_usage_limits = None
+                meta.session_todos = None
                 # Launch flags are CLI-specific: a switch to a different CLI
                 # (e.g. claude-code → pi) leaves the prior CLI's flags stale —
                 # Claude Code's ``--permission-mode`` makes pi exit 1 at launch.

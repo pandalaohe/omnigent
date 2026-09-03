@@ -367,7 +367,11 @@ class SessionResourceRegistry:
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
         self._session_status_publisher: (
-            Callable[[str, str, str | None, int | None], None] | None
+            Callable[
+                [str, str, str | None, int | None, list[dict[str, object]] | None],
+                None,
+            ]
+            | None
         ) = None
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
@@ -381,6 +385,11 @@ class SessionResourceRegistry:
         # which the turn-start hook also writes — deduping against that one
         # would swallow the turn's real ``running``.
         self._published_session_status: dict[str, tuple[str, str | None, int | None]] = {}
+        # Exact background-shell state last observed from the native forwarder.
+        # Unlike the server's cache this runner survives a server restart, so it
+        # can replay the tally/detail when the tunnel reconnects. An explicit
+        # zero or failed status removes the entry; absent counts leave it alone.
+        self._background_task_replay: dict[str, tuple[int, list[dict[str, object]] | None]] = {}
         # Live claude-native status-file pollers, per session. Held so a
         # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
         # poller keeps its own edge/mtime baselines on the watcher thread, and
@@ -415,7 +424,10 @@ class SessionResourceRegistry:
 
     def set_session_status_publisher(
         self,
-        publisher: Callable[[str, str, str | None, int | None], None],
+        publisher: Callable[
+            [str, str, str | None, int | None, list[dict[str, object]] | None],
+            None,
+        ],
     ) -> None:
         """Install the PTY-activity-derived session-status publisher.
 
@@ -428,7 +440,7 @@ class SessionResourceRegistry:
         it — see :meth:`_start_terminal_activity_watcher`.
 
         :param publisher: Callable ``(session_id, status, blocked_on,
-            background_task_count) -> None`` where *status* is ``"running"``
+            background_task_count, background_tasks) -> None`` where *status* is ``"running"``
             or ``"idle"``, *blocked_on* is a short reason the agent is parked
             on a dialog (e.g. ``"permission prompt"``), and an explicit
             background count is supplied only when the status source can prove
@@ -479,6 +491,7 @@ class SessionResourceRegistry:
         with self._lock:
             self._published_session_status.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
+            self._background_task_replay.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
 
     def _claim_status_edge(
@@ -538,6 +551,19 @@ class SessionResourceRegistry:
             sessions = sorted(self._published_session_status)
             self._published_session_status.clear()
             pollers = list(self._status_pollers.values())
+            background_replays = [
+                (
+                    session_id,
+                    self._last_session_status.get(session_id, "idle"),
+                    count,
+                    [dict(task) for task in tasks] if tasks is not None else None,
+                )
+                for session_id, (count, tasks) in self._background_task_replay.items()
+            ]
+        publisher = self._session_status_publisher
+        if publisher is not None:
+            for session_id, status, count, tasks in background_replays:
+                publisher(session_id, status, None, count, tasks)
         for poller in pollers:
             poller.resync()
         if sessions or pollers:
@@ -562,7 +588,14 @@ class SessionResourceRegistry:
         """
         self._set_session_status_memo(session_id, "running")
 
-    def note_external_session_status(self, session_id: str, status: str) -> None:
+    def note_external_session_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        background_task_count: int | None = None,
+        background_tasks: list[dict[str, object]] | None = None,
+    ) -> None:
         """Record a terminal-observed external status for exit classification.
 
         Structured native forwarders can know turn completion more reliably than
@@ -579,11 +612,25 @@ class SessionResourceRegistry:
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
+        :param background_task_count: Authoritative background-shell tally from
+            the native Stop edge. ``None`` preserves the prior replay state.
+        :param background_tasks: Optional per-shell detail backing a positive
+            tally. Copied before retention so request-owned data cannot mutate it.
         """
         if status == "idle":
             self._set_session_status_memo(session_id, "idle")
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
+        with self._lock:
+            if status == "failed" or background_task_count == 0:
+                self._background_task_replay.pop(session_id, None)
+            elif background_task_count is not None and background_task_count > 0:
+                self._background_task_replay[session_id] = (
+                    background_task_count,
+                    [dict(task) for task in background_tasks]
+                    if background_tasks is not None
+                    else None,
+                )
         self._sync_status_edge(session_id, status)
 
     @property
@@ -1222,6 +1269,12 @@ class SessionResourceRegistry:
             # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
+            # Claude's status-file poller owns the authoritative shell-finished
+            # zero. Clear the reconnect replay before deduping/publishing so a
+            # later Server restart cannot resurrect an already-finished B.
+            if background_task_count == 0:
+                with self._lock:
+                    self._background_task_replay.pop(session_id, None)
             if not self._claim_status_edge(session_id, status, blocked_on, background_task_count):
                 return
             self._set_session_status_memo(session_id, status)
@@ -1231,6 +1284,7 @@ class SessionResourceRegistry:
                 status,
                 blocked_on,
                 background_task_count,
+                None,
             )
 
         def _file_owns_status() -> bool:

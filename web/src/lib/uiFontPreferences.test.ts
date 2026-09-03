@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { setEmbedScopeRoot } from "./host";
 import {
-  applyDesktopUiFontSize,
   applyUiFontFamily,
+  applyUiFontSize,
+  defaultUiFontSizePx,
   readUiFontFamily,
   readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
   UI_FONT_SIZE_DEFAULT,
+  UI_FONT_SIZE_MOBILE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
   writeUiFontFamily,
@@ -19,7 +21,9 @@ const FAMILY_STORAGE_KEY = "omnigent:ui-font-family";
 afterEach(() => {
   localStorage.clear();
   setEmbedScopeRoot(null);
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 });
   document.documentElement.style.removeProperty("--desktop-ui-font-size");
+  document.documentElement.style.removeProperty("--mobile-ui-font-size");
   document.documentElement.style.removeProperty("--ui-font-family");
 });
 
@@ -27,6 +31,17 @@ describe("uiFontPreferences", () => {
   it("returns the default when nothing is stored", () => {
     expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
     expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+  });
+
+  it("uses and applies the mobile default on a mobile viewport", () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+
+    expect(defaultUiFontSizePx()).toBe(UI_FONT_SIZE_MOBILE_DEFAULT);
+    expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_MOBILE_DEFAULT);
+
+    applyUiFontSize(17);
+    expect(document.documentElement.style.getPropertyValue("--mobile-ui-font-size")).toBe("17px");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("17px");
   });
 
   it("round-trips a valid size", () => {
@@ -63,12 +78,13 @@ describe("uiFontPreferences", () => {
   });
 
   it("applies the discrete desktop size on the document root", () => {
-    applyDesktopUiFontSize(18);
+    applyUiFontSize(18);
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
+    expect(document.documentElement.style.getPropertyValue("--mobile-ui-font-size")).toBe("18px");
   });
 
   it("clamps before applying the desktop size", () => {
-    applyDesktopUiFontSize(99);
+    applyUiFontSize(99);
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
   });
 
@@ -78,9 +94,10 @@ describe("uiFontPreferences", () => {
     // scope root instead.
     const scope = document.createElement("div");
     setEmbedScopeRoot(scope);
-    applyDesktopUiFontSize(16);
+    applyUiFontSize(16);
     applyUiFontFamily("Comic Sans");
     expect(scope.style.getPropertyValue("--desktop-ui-font-size")).toBe("16px");
+    expect(scope.style.getPropertyValue("--mobile-ui-font-size")).toBe("16px");
     expect(scope.style.getPropertyValue("--ui-font-family")).toBe("Comic Sans, var(--font-sans)");
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");

@@ -635,6 +635,14 @@ class SqlConversationMetadata(OmnigentBase):
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Latest provider allowance snapshot (5h / weekly / monthly, when reported).
+    # This is structured runtime metadata, not a guardrail label: label values
+    # are capped at 256 characters and silently truncate a normal two-window
+    # snapshot before it can be parsed on session reload.
+    provider_usage_limits: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Latest native-harness plan forwarded for Web snapshot recovery. The
+    # process cache is only a live fast path; deployments must not erase it.
+    session_todos: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.
     terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.

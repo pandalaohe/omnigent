@@ -452,6 +452,31 @@ _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 # Matches the AP-side ``_SESSION_STREAM_HEARTBEAT_INTERVAL_S``.
 _SESSION_STREAM_HEARTBEAT_S = 15.0
 
+# Match the Server's background-task projection. Native status input is an
+# external boundary, so retain only the five display fields and cap the list
+# before it becomes reconnect-persistent runner state.
+_MAX_BACKGROUND_TASK_REPLAY_ITEMS = 100
+_BACKGROUND_TASK_REPLAY_FIELDS = ("id", "type", "status", "description", "command")
+
+
+def _normalize_background_tasks_for_replay(raw: object) -> list[dict[str, object]] | None:
+    """Return a bounded, display-only background-task list for reconnect replay."""
+    if not isinstance(raw, list):
+        return None
+    normalized: list[dict[str, object]] = []
+    for entry in raw[:_MAX_BACKGROUND_TASK_REPLAY_ITEMS]:
+        if not isinstance(entry, dict):
+            continue
+        normalized.append(
+            {
+                field: value
+                for field in _BACKGROUND_TASK_REPLAY_FIELDS
+                if isinstance((value := entry.get(field)), str)
+            }
+        )
+    return normalized or None
+
+
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
 # /v1/summarize endpoint is optional). The concrete type is imported only
@@ -2691,12 +2716,15 @@ def create_runner_app(
         status: str,
         blocked_on: str | None = None,
         background_task_count: int | None = None,
+        background_tasks: list[dict[str, object]] | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         if background_task_count is not None:
             event["background_task_count"] = background_task_count
+        if background_tasks is not None:
+            event["background_tasks"] = background_tasks
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -7919,7 +7947,25 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
-                resource_registry.note_external_session_status(conversation_id, status)
+                raw_background_task_count = (
+                    data.get("background_task_count") if isinstance(data, dict) else None
+                )
+                background_task_count = (
+                    raw_background_task_count
+                    if isinstance(raw_background_task_count, int)
+                    and not isinstance(raw_background_task_count, bool)
+                    and raw_background_task_count >= 0
+                    else None
+                )
+                background_tasks = _normalize_background_tasks_for_replay(
+                    data.get("background_tasks") if isinstance(data, dict) else None
+                )
+                resource_registry.note_external_session_status(
+                    conversation_id,
+                    status,
+                    background_task_count=background_task_count,
+                    background_tasks=background_tasks,
+                )
                 _fan_out_child_delta_to_parent(
                     conversation_id,
                     {"type": "session.status", "status": status},

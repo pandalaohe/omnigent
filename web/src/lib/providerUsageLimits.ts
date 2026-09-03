@@ -22,6 +22,85 @@ export interface FormattedProviderUsageLimits {
   scope: string;
 }
 
+/** Validate the camel-case shape stored in user-scoped display preferences. */
+export function providerUsageLimitsFromStoredValue(
+  value: unknown,
+): ProviderUsageLimitsSnapshot | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  if (
+    typeof raw.provider !== "string" ||
+    raw.provider.trim().length === 0 ||
+    raw.provider.length > 64 ||
+    typeof raw.capturedAt !== "number" ||
+    !Number.isInteger(raw.capturedAt) ||
+    raw.capturedAt <= 0 ||
+    !Array.isArray(raw.windows) ||
+    raw.windows.length > 8
+  ) {
+    return null;
+  }
+  const windows: ProviderUsageWindow[] = [];
+  for (const candidate of raw.windows) {
+    if (!candidate || typeof candidate !== "object") return null;
+    const window = candidate as Record<string, unknown>;
+    if (
+      typeof window.label !== "string" ||
+      window.label.trim().length === 0 ||
+      window.label.length > 16 ||
+      typeof window.ariaLabel !== "string" ||
+      window.ariaLabel.trim().length === 0 ||
+      window.ariaLabel.length > 64 ||
+      typeof window.usedPercent !== "number" ||
+      !Number.isFinite(window.usedPercent) ||
+      window.usedPercent < 0 ||
+      window.usedPercent > 100
+    ) {
+      return null;
+    }
+    windows.push({
+      label: window.label.trim(),
+      ariaLabel: window.ariaLabel.trim(),
+      usedPercent: window.usedPercent,
+      ...(typeof window.durationMinutes === "number" &&
+      Number.isInteger(window.durationMinutes) &&
+      window.durationMinutes > 0
+        ? { durationMinutes: window.durationMinutes }
+        : {}),
+      ...(typeof window.resetsAt === "number" &&
+      Number.isInteger(window.resetsAt) &&
+      window.resetsAt > 0
+        ? { resetsAt: window.resetsAt }
+        : {}),
+    });
+  }
+  return {
+    provider: raw.provider.trim(),
+    ...(typeof raw.scope === "string" && raw.scope.trim().length > 0 && raw.scope.length <= 64
+      ? { scope: raw.scope.trim() }
+      : {}),
+    capturedAt: raw.capturedAt,
+    windows,
+  };
+}
+
+/** Reject a stale snapshot from a different native agent family. */
+export function providerUsageLimitsMatchesSource(
+  snapshot: ProviderUsageLimitsSnapshot | null | undefined,
+  source: {
+    agentName: string | null | undefined;
+    harness: string | null | undefined;
+  },
+): snapshot is ProviderUsageLimitsSnapshot {
+  if (!snapshot) return false;
+  const identity = `${source.agentName ?? ""} ${source.harness ?? ""}`.toLowerCase();
+  const provider = snapshot.provider.toLowerCase();
+  if (identity.includes("codex")) return provider.includes("codex");
+  if (identity.includes("claude")) return provider.includes("claude");
+  if (identity.includes("opencode")) return provider.includes("opencode");
+  return true;
+}
+
 /** Parse the server's bounded snake-case snapshot at the HTTP/SSE boundary. */
 export function providerUsageLimitsFromWire(value: unknown): ProviderUsageLimitsSnapshot | null {
   if (!value || typeof value !== "object") return null;
@@ -71,7 +150,6 @@ const CODEX_WINDOW_TARGETS = [
   { label: "m", ariaLabel: "monthly", minutes: 43_200 },
 ] as const;
 const HARD_TTL_SECONDS = 3600;
-
 function normalizedLimitName(value: string | null | undefined): string {
   return (value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
@@ -122,7 +200,7 @@ export function providerUsageLimitsFromCodex(
   };
 }
 
-/** Format only truthful windows; missing provider data renders nothing. */
+/** Format only fresh truthful windows; cached snapshots age out after one hour. */
 export function formatProviderUsageLimits(
   snapshot: ProviderUsageLimitsSnapshot | null | undefined,
   nowSeconds = Math.floor(Date.now() / 1000),

@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 
 import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import {
+  shouldHideNativeServerSwitcher,
+  type NativeMobileHeaderMode,
+} from "@/lib/sessionNavigationPreferences";
 
 /**
  * Tracks whether `surface` is the frontmost element at its own centre — i.e.
@@ -95,11 +99,9 @@ export function useAppShellSidebarOpen(): boolean {
 }
 
 /**
- * Drive the iOS shell's native server switcher overlay so it shows only while
- * `surface` is the frontmost element on screen and `active` is true. The
- * switcher is a native chrome element the web app toggles via the bridge; it
- * must hide whenever the sidebar (or any other overlay) covers the main
- * surface, and whenever the surface is unmounted.
+ * Drive the iOS shell's native server switcher overlay. Official server mode
+ * follows the frontmost main surface; conversation-title mode keeps that top
+ * row clear and shows the switcher only over the open sidebar.
  *
  * No-ops outside the iOS shell. Used by both the in-session main surface
  * (ChatPage) and the new-session landing screen (NewChatDialog).
@@ -107,12 +109,21 @@ export function useAppShellSidebarOpen(): boolean {
 export function useNativeServerSwitcherForMainSurface(
   surface: HTMLElement | null,
   active: boolean,
+  {
+    headerMode = "server",
+    sidebarOpen = false,
+  }: {
+    headerMode?: NativeMobileHeaderMode;
+    sidebarOpen?: boolean;
+  } = {},
 ) {
   const frontmost = useSurfaceFrontmost(surface, active);
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!frontmost);
-  }, [frontmost]);
+    setNativeServerSwitcherHidden(
+      !active || shouldHideNativeServerSwitcher({ frontmost, sidebarOpen, headerMode }),
+    );
+  }, [active, frontmost, headerMode, sidebarOpen]);
   useEffect(() => {
     if (!isIOSShell()) return;
     return () => setNativeServerSwitcherHidden(true);

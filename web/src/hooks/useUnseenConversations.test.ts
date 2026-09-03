@@ -56,6 +56,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  delete (window as unknown as { omnigentNative?: unknown }).omnigentNative;
 });
 
 describe("seedReadState", () => {
@@ -155,6 +156,36 @@ describe("markConversationSeen", () => {
 
     expect(authFetch).not.toHaveBeenCalled(); // guarded: no write, no PUT
     expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+});
+
+describe("markConversationsSeen", () => {
+  it("clears unread overrides and advances every supplied baseline atomically", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 999, viewer_unread: true },
+      { id: "conv-2", viewer_last_seen: 1_999, viewer_unread: true },
+    ]);
+    authFetch.mockClear();
+    vi.useFakeTimers({ now: 5_000_000 });
+
+    mod.markConversationsSeen([
+      { id: "conv-1", updated_at: 1_000 },
+      { id: "conv-2", updated_at: 6_000 },
+    ]);
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isExplicitlyUnread("conv-2")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 1_000, "idle")).toBe(false);
+    expect(mod.isConversationUnseen("conv-2", 6_000, "idle")).toBe(false);
+    expect(putCount()).toBe(2);
+    const bodies = authFetch.mock.calls.map(([, init]) =>
+      JSON.parse((init as { body: string }).body),
+    );
+    expect(bodies).toEqual([
+      { last_seen: 5_000, unread: false },
+      { last_seen: 6_000, unread: false },
+    ]);
   });
 });
 
@@ -263,6 +294,21 @@ describe("useMarkConversationSeen", () => {
     renderHook(() => mod.useMarkConversationSeen("conv-1", 4_000));
 
     expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(false); // no baseline written
+  });
+
+  it("marks the visible iOS app thread seen when WKWebView reports no document focus", async () => {
+    (window as unknown as { omnigentNative: unknown }).omnigentNative = { kind: "ios" };
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 3_999 }]);
+    authFetch.mockClear();
+    setWindowFocused(false);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.useFakeTimers({ now: 5_000_000 });
+
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 4_000));
+
+    expect(mod.isConversationUnseen("conv-1", 4_000, "idle")).toBe(false);
+    expect(lastPutBody()).toEqual({ last_seen: 5_000, unread: false });
   });
 
   it("preserves a seeded explicit-unread on reload (first mount does not clear)", async () => {

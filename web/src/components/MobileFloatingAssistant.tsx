@@ -33,6 +33,7 @@ import { cn } from "@/lib/utils";
 const MAIN_SIZE = 52;
 const ACTION_SIZE = 46;
 const ACTION_GAP = 8;
+const ACTION_EDGE_MARGIN = 6;
 const HANDLE_THICKNESS = 18;
 const HANDLE_LENGTH = 48;
 const DOCK_THRESHOLD = 38;
@@ -62,35 +63,121 @@ export interface MobileAssistantCircleLayout {
   center: Point;
   radius: number;
   actions: Point[];
+  actionSize: number;
+  twoRings: boolean;
+  innerCount: number;
 }
 
-/** Keep one stable top origin so list order maps directly to a visible circle. */
+function smoothstep(value: number): number {
+  const normalized = clamp(value, 0, 1);
+  return normalized * normalized * (3 - 2 * normalized);
+}
+
+/**
+ * Keep the configured order visible from the top. The center stays where the
+ * user placed it: a full circle is used in open space, while an edge/corner
+ * folds the same ordered buttons into two inward-facing arcs.
+ */
 export function layoutMobileAssistantCircle(
   count: number,
   requestedCenter: Point,
   viewport: ViewportSize,
 ): MobileAssistantCircleLayout {
-  const margin = ACTION_SIZE / 2 + 6;
-  const minimumChord = ACTION_SIZE + ACTION_GAP;
-  const minimumRadius = count > 1 ? minimumChord / (2 * Math.sin(Math.PI / count)) : 0;
-  const availableRadius = Math.max(
-    64,
-    (Math.min(viewport.width, viewport.height) - margin * 2) / 2,
-  );
-  const radius = Math.min(Math.max(82, minimumRadius), availableRadius);
   const center = {
-    x: clamp(requestedCenter.x, margin + radius, viewport.width - margin - radius),
-    y: clamp(requestedCenter.y, margin + radius, viewport.height - margin - radius),
+    x: clamp(requestedCenter.x, MAIN_SIZE / 2, viewport.width - MAIN_SIZE / 2),
+    y: clamp(requestedCenter.y, MAIN_SIZE / 2, viewport.height - MAIN_SIZE / 2),
   };
-  const step = (Math.PI * 2) / Math.max(count, 1);
-  const actions = Array.from({ length: count }, (_, index) => {
-    const angle = -Math.PI / 2 + step * index;
-    return {
-      x: center.x + Math.cos(angle) * radius,
-      y: center.y + Math.sin(angle) * radius,
-    };
-  });
-  return { center, radius, actions };
+  const fullChord = ACTION_SIZE + ACTION_GAP;
+  const fullNeededRadius = count > 1 ? fullChord / (2 * Math.sin(Math.PI / Math.max(count, 2))) : 0;
+  const fullRadius = Math.max(82, Math.min(210, fullNeededRadius));
+  const layoutThreshold = fullRadius + ACTION_SIZE / 2 + ACTION_EDGE_MARGIN;
+  const pressureRange = layoutThreshold - MAIN_SIZE / 2;
+  const left = smoothstep((layoutThreshold - center.x) / pressureRange);
+  const right = smoothstep((layoutThreshold - (viewport.width - center.x)) / pressureRange);
+  const top = smoothstep((layoutThreshold - center.y) / pressureRange);
+  const bottom = smoothstep((layoutThreshold - (viewport.height - center.y)) / pressureRange);
+  const horizontalPressure = Math.max(left, right);
+  const verticalPressure = Math.max(top, bottom);
+  const edgePressure = Math.max(horizontalPressure, verticalPressure);
+  const cornerPressure = Math.min(horizontalPressure, verticalPressure);
+  const compression = clamp(edgePressure + cornerPressure * 0.55, 0, 1);
+  const twoRings = edgePressure > 0 && count > 0;
+  const actionSize = ACTION_SIZE - compression * 3;
+  const gap = ACTION_GAP - compression * 4;
+  const chord = actionSize + gap;
+  const innerCount = twoRings ? Math.ceil(count / 2) : count;
+  const outerCount = twoRings ? count - innerCount : 0;
+  const largestRing = Math.max(innerCount, outerCount, 1);
+  let constrainHorizontal = twoRings && horizontalPressure > 0;
+  let constrainVertical = twoRings && verticalPressure > 0;
+  const spanForConstraints = (): number =>
+    twoRings ? (constrainHorizontal && constrainVertical ? Math.PI / 2 : Math.PI) : Math.PI * 2;
+  const radiiForSpan = (arcSpan: number): { radius: number; outerRadius: number } => {
+    const divisor = twoRings ? Math.max(largestRing - 1, 1) : Math.max(count, 1);
+    const step = arcSpan / divisor;
+    const neededRadius = largestRing > 1 ? chord / (2 * Math.sin(Math.max(step, 0.05) / 2)) : 0;
+    const radius = Math.max(twoRings ? 66 : fullRadius, Math.min(210, neededRadius));
+    return { radius, outerRadius: radius + chord * 0.96 };
+  };
+
+  let span = spanForConstraints();
+  let { radius, outerRadius } = radiiForSpan(span);
+  if (twoRings) {
+    const outerExtent = outerRadius + actionSize / 2 + ACTION_EDGE_MARGIN;
+    constrainHorizontal ||= Math.min(center.x, viewport.width - center.x) < outerExtent;
+    constrainVertical ||= Math.min(center.y, viewport.height - center.y) < outerExtent;
+    span = spanForConstraints();
+    ({ radius, outerRadius } = radiiForSpan(span));
+  }
+
+  const horizontalDirection = center.x <= viewport.width - center.x ? 1 : -1;
+  const verticalDirection = center.y <= viewport.height - center.y ? 1 : -1;
+  const inward = {
+    x: constrainHorizontal ? horizontalDirection : 0,
+    y: constrainVertical ? verticalDirection : 0,
+  };
+  const inwardAngle = Math.hypot(inward.x, inward.y) > 0.01 ? Math.atan2(inward.y, inward.x) : 0;
+  const start = twoRings ? inwardAngle - span / 2 : -Math.PI / 2;
+  const end = start + span;
+  const startVector = { x: Math.cos(start), y: Math.sin(start) };
+  const endVector = { x: Math.cos(end), y: Math.sin(end) };
+  const reverseArc =
+    twoRings &&
+    (startVector.y > endVector.y + 0.001 ||
+      (Math.abs(startVector.y - endVector.y) <= 0.001 && startVector.x > endVector.x));
+  const orderedStart = reverseArc ? end : start;
+  const direction = reverseArc ? -1 : 1;
+  const ringPositions = (ringCount: number, ringRadius: number): Point[] => {
+    if (ringCount === 0) return [];
+    const ringStep = twoRings ? span / Math.max(ringCount - 1, 1) : span / ringCount;
+    return Array.from({ length: ringCount }, (_, slot) => {
+      const angle = orderedStart + direction * ringStep * slot;
+      return {
+        x: center.x + Math.cos(angle) * ringRadius,
+        y: center.y + Math.sin(angle) * ringRadius,
+      };
+    });
+  };
+  const rawActions = twoRings
+    ? [...ringPositions(innerCount, radius), ...ringPositions(outerCount, outerRadius)]
+    : ringPositions(count, radius);
+  const inset = actionSize / 2;
+  const minX = Math.min(...rawActions.map((point) => point.x));
+  const maxX = Math.max(...rawActions.map((point) => point.x));
+  const minY = Math.min(...rawActions.map((point) => point.y));
+  const maxY = Math.max(...rawActions.map((point) => point.y));
+  const translateAxis = (minimum: number, maximum: number, limit: number): number => {
+    const lower = inset - minimum;
+    const upper = limit - inset - maximum;
+    return lower <= upper ? clamp(0, lower, upper) : (lower + upper) / 2;
+  };
+  const translateX = rawActions.length > 0 ? translateAxis(minX, maxX, viewport.width) : 0;
+  const translateY = rawActions.length > 0 ? translateAxis(minY, maxY, viewport.height) : 0;
+  const actions = rawActions.map((point) => ({
+    x: point.x + translateX,
+    y: point.y + translateY,
+  }));
+  return { center, radius, actions, actionSize, twoRings, innerCount };
 }
 
 export function layoutMobileAssistantActions(
@@ -417,12 +504,14 @@ export function MobileFloatingAssistant() {
                       fireButton(button);
                     }}
                     className={cn(
-                      "pointer-events-auto fixed flex h-[46px] w-[46px] items-center justify-center rounded-full border border-border bg-popover px-1 text-xs font-semibold text-popover-foreground shadow-lg",
+                      "pointer-events-auto fixed flex items-center justify-center rounded-full border border-border bg-popover px-1 text-xs font-semibold text-popover-foreground shadow-lg",
                       "touch-manipulation select-none active:scale-95",
                     )}
                     style={{
                       left: position.x,
                       top: position.y,
+                      width: circle.actionSize,
+                      height: circle.actionSize,
                       transform: "translate(-50%, -50%)",
                     }}
                   >

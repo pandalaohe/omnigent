@@ -16,12 +16,14 @@ describe("sessionNavigationPreferences", () => {
     expect(readSessionNavigationPreferences()).toEqual({
       pollingActiveWindowHours: null,
       deprioritizeBackgroundSessions: true,
+      scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
     });
     localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, "{broken");
     expect(readSessionNavigationPreferences()).toEqual({
       pollingActiveWindowHours: null,
       deprioritizeBackgroundSessions: true,
+      scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
     });
   });
@@ -32,12 +34,14 @@ describe("sessionNavigationPreferences", () => {
       JSON.stringify({
         pollingActiveWindowHours: MAX_SESSION_POLLING_WINDOW_HOURS + 10,
         deprioritizeBackgroundSessions: false,
+        scrollToBottomOnSessionOpen: false,
         nativeMobileHeaderMode: "conversation-title",
       }),
     );
     expect(readSessionNavigationPreferences()).toEqual({
       pollingActiveWindowHours: MAX_SESSION_POLLING_WINDOW_HOURS,
       deprioritizeBackgroundSessions: false,
+      scrollToBottomOnSessionOpen: false,
       nativeMobileHeaderMode: "conversation-title",
     });
   });
@@ -46,6 +50,7 @@ describe("sessionNavigationPreferences", () => {
     writeSessionNavigationPreferences({
       pollingActiveWindowHours: 24,
       deprioritizeBackgroundSessions: false,
+      scrollToBottomOnSessionOpen: false,
       nativeMobileHeaderMode: "conversation-title",
     });
     expect(localStorage.getItem(SESSION_NAVIGATION_STORAGE_KEY)).not.toBeNull();
@@ -53,6 +58,7 @@ describe("sessionNavigationPreferences", () => {
     writeSessionNavigationPreferences({
       pollingActiveWindowHours: null,
       deprioritizeBackgroundSessions: true,
+      scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
     });
     expect(localStorage.getItem(SESSION_NAVIGATION_STORAGE_KEY)).toBeNull();

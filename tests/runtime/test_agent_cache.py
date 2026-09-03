@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import tarfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 # Minimal valid config.yaml for a spec_version=1 agent
@@ -108,6 +111,41 @@ def test_load_memory_cache_hit(
     # Same spec object (identity check — memory cache returns same ref)
     assert first.spec is second.spec
     assert first.workdir == second.workdir
+
+
+def test_concurrent_cache_miss_extracts_once(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent misses cannot observe a partially extracted bundle."""
+    loc = "agent-concurrent/abc123"
+    _store_bundle(artifact_store, loc)
+
+    first_extract_started = threading.Event()
+    release_first_extract = threading.Event()
+    extract_calls = 0
+    original_extract = agent_cache._extract_and_cache
+
+    def blocked_extract(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal extract_calls
+        extract_calls += 1
+        first_extract_started.set()
+        assert release_first_extract.wait(timeout=5)
+        return original_extract(*args, **kwargs)
+
+    monkeypatch.setattr(agent_cache, "_extract_and_cache", blocked_extract)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(agent_cache.load, "agent-concurrent", loc)
+        assert first_extract_started.wait(timeout=5)
+        second = executor.submit(agent_cache.load, "agent-concurrent", loc)
+        release_first_extract.set()
+        first_loaded = first.result(timeout=5)
+        second_loaded = second.result(timeout=5)
+
+    assert extract_calls == 1
+    assert first_loaded.spec is second_loaded.spec
 
 
 def test_load_disk_cache_hit(
@@ -359,3 +397,54 @@ def test_replace_swaps_spec(
     # Subsequent load() returns the new spec from memory cache
     loaded_again = agent_cache.load("agent-5", loc_v2)
     assert loaded_again.spec is loaded_v2.spec
+
+
+def test_concurrent_load_waits_for_replace_disk_swap(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache hit cannot pair the new spec with the old workdir."""
+    loc_v1 = "agent-replace-race/v1"
+    _store_bundle(artifact_store, loc_v1)
+    agent_cache.load("agent-replace-race", loc_v1)
+
+    new_config = yaml.dump(
+        {
+            "spec_version": 1,
+            "name": "test-agent",
+            "description": "replacement",
+            "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        }
+    )
+    new_bytes = _make_bundle_bytes({"config.yaml": new_config})
+    rename_started = threading.Event()
+    release_rename = threading.Event()
+    original_rename = Path.rename
+
+    def blocked_rename(path: Path, target: Path) -> Path:
+        if path == cache_dir / "agent-replace-race_staging":
+            rename_started.set()
+            assert release_rename.wait(timeout=5)
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", blocked_rename)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        replacing = executor.submit(
+            agent_cache.replace,
+            "agent-replace-race",
+            "agent-replace-race/v2",
+            new_bytes,
+        )
+        assert rename_started.wait(timeout=5)
+        loading = executor.submit(agent_cache.load, "agent-replace-race", loc_v1)
+        assert not loading.done(), "load must wait until the disk swap is complete"
+        release_rename.set()
+        replaced = replacing.result(timeout=5)
+        loaded = loading.result(timeout=5)
+
+    assert replaced.spec.description == "replacement"
+    assert loaded.spec is replaced.spec
+    assert loaded.workdir == cache_dir / "agent-replace-race"
+    assert load_spec(loaded.workdir).description == "replacement"

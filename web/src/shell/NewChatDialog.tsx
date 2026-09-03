@@ -216,7 +216,11 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
-import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
+import {
+  useAppShellSidebarOpen,
+  useNativeServerSwitcherForMainSurface,
+} from "@/hooks/useNativeServerSwitcher";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
@@ -2142,11 +2146,16 @@ export function NewChatLandingScreen() {
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
 
-  // Surface element backing the iOS native server switcher overlay, which
-  // the in-session view shows too — the picker stays reachable while starting
-  // a new session. The hook hides it whenever the sidebar covers the surface.
+  // Surface element backing the iOS native server switcher overlay. In title
+  // mode the top row stays clear on every main surface, including this landing
+  // screen; opening the sidebar moves the switcher there just like ChatPage.
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherForMainSurface(landingSurface, true);
+  const { nativeMobileHeaderMode } = useSessionNavigationPreferences();
+  const sidebarOpen = useAppShellSidebarOpen();
+  useNativeServerSwitcherForMainSurface(landingSurface, true, {
+    headerMode: nativeMobileHeaderMode,
+    sidebarOpen,
+  });
 
   // Draft restore is project-scoped: the user's text and attachments always
   // come back, but agent/host/workspace slots parked under another project's

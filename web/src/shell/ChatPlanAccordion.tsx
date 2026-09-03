@@ -17,17 +17,19 @@ export function ChatPlanAccordion({ className }: { className?: string }) {
   const todos = useChatStore((s) => s.todos);
   if (todos.length === 0) return null;
   const completed = todos.filter((t) => t.status === "completed").length;
+  const current =
+    todos.find((t) => t.status === "in_progress") ?? todos.find((t) => t.status === "pending");
 
   return (
     // Full-width layout row with side gutters; the card centers on the chat
     // column so it lines up with the message thread below.
-    <div className={cn("shrink-0 px-3 md:px-4", className)}>
+    <div className={cn("chat-plan-accordion shrink-0 px-0 md:px-4", className)}>
       <details
         data-testid="plan-tracker"
-        className="group mx-auto max-w-3xl overflow-hidden rounded-xl border border-accent-foreground/20 bg-card shadow-sm mb-1"
+        className="group mx-auto mb-0 max-w-3xl overflow-hidden border-y border-accent-foreground/20 bg-card shadow-sm md:mb-1 md:rounded-xl md:border"
       >
-        <summary className="flex cursor-pointer list-none select-none items-center gap-2 bg-accent px-3 py-2 text-ui font-medium text-accent-foreground [&::-webkit-details-marker]:hidden">
-          <ListTodoIcon className="size-4 shrink-0" />
+        <summary className="flex h-8 cursor-pointer list-none select-none items-center gap-1.5 bg-accent px-3 text-xs font-medium text-accent-foreground md:h-auto md:gap-2 md:py-2 md:text-ui [&::-webkit-details-marker]:hidden">
+          <ListTodoIcon className="size-3.5 shrink-0 md:size-4" />
           <span>Plan</span>
           <span
             className="opacity-70"
@@ -35,6 +37,14 @@ export function ChatPlanAccordion({ className }: { className?: string }) {
           >
             ({completed}/{todos.length})
           </span>
+          {current ? (
+            <span
+              data-testid="plan-current-task"
+              className="min-w-0 flex-1 truncate opacity-80 md:hidden"
+            >
+              {current.activeForm || current.content}
+            </span>
+          ) : null}
           <ChevronDownIcon className="ml-auto size-4 shrink-0 transition-transform group-open:rotate-180" />
         </summary>
         {/* Cap the expanded list at 150px so a long plan can't swallow the

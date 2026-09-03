@@ -12,6 +12,8 @@ export interface SessionNavigationPreferences {
   pollingActiveWindowHours: number | null;
   /** Keep sessions carrying the B marker behind non-background poll targets. */
   deprioritizeBackgroundSessions: boolean;
+  /** Open a selected session at its newest transcript content. */
+  scrollToBottomOnSessionOpen: boolean;
   /** Native iOS defaults to its official top-of-screen Server switcher. */
   nativeMobileHeaderMode: NativeMobileHeaderMode;
 }
@@ -19,6 +21,7 @@ export interface SessionNavigationPreferences {
 const DEFAULT_PREFERENCES: SessionNavigationPreferences = {
   pollingActiveWindowHours: null,
   deprioritizeBackgroundSessions: true,
+  scrollToBottomOnSessionOpen: true,
   nativeMobileHeaderMode: "server",
 };
 
@@ -36,6 +39,7 @@ function normalizePreferences(value: unknown): SessionNavigationPreferences {
   return {
     pollingActiveWindowHours: normalizePollingWindow(candidate.pollingActiveWindowHours),
     deprioritizeBackgroundSessions: candidate.deprioritizeBackgroundSessions !== false,
+    scrollToBottomOnSessionOpen: candidate.scrollToBottomOnSessionOpen !== false,
     nativeMobileHeaderMode:
       candidate.nativeMobileHeaderMode === "conversation-title" ? "conversation-title" : "server",
   };
@@ -58,6 +62,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
     if (
       normalized.pollingActiveWindowHours === null &&
       normalized.deprioritizeBackgroundSessions &&
+      normalized.scrollToBottomOnSessionOpen &&
       normalized.nativeMobileHeaderMode === "server"
     ) {
       window.localStorage.removeItem(SESSION_NAVIGATION_STORAGE_KEY);
@@ -72,6 +77,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
     "session_navigation",
     normalized.pollingActiveWindowHours === null &&
       normalized.deprioritizeBackgroundSessions &&
+      normalized.scrollToBottomOnSessionOpen &&
       normalized.nativeMobileHeaderMode === "server"
       ? null
       : normalized,

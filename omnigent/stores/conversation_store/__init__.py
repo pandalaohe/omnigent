@@ -1122,6 +1122,30 @@ class ConversationStore(ABC):
         """
         ...
 
+    def set_provider_usage_limits(
+        self,
+        conversation_id: str,
+        snapshot: dict[str, Any] | None,
+    ) -> None:
+        """Persist the latest provider allowance snapshot for a session.
+
+        Backends that support terminal/native sessions should override this.
+        It is intentionally a first-class metadata value: serialized snapshots
+        can exceed the 256-character conversation-label limit.
+
+        :param conversation_id: Conversation to update.
+        :param snapshot: Sanitized snapshot, or ``None`` to clear it.
+        """
+        raise NotImplementedError
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist the native-harness plan; return whether the session existed."""
+        raise NotImplementedError
+
     @abstractmethod
     def set_conversation_project(
         self,

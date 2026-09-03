@@ -4115,6 +4115,25 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.wrapper": "claude-code-native-ui",
         },
     )
+    conversation_store.set_provider_usage_limits(
+        source.id,
+        {
+            "provider": "Claude",
+            "captured_at": 2_000_000_000,
+            "windows": [
+                {
+                    "label": "5h",
+                    "aria_label": "5 hour",
+                    "used_percent": 3.0,
+                    "duration_mins": 300,
+                }
+            ],
+        },
+    )
+    conversation_store.set_session_todos(
+        source.id,
+        [{"content": "Old plan", "status": "in_progress", "activeForm": "Planning"}],
+    )
 
     fork = conversation_store.fork_conversation(source.id)
 
@@ -4125,6 +4144,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
     assert fork.labels == {"omnigent.wrapper": "claude-code-native-ui"}, (
         f"Fork must drop instance-scoped labels, kept {fork.labels!r}"
     )
+    assert fork.provider_usage_limits is None, "Fork must not inherit the source's account usage"
+    assert fork.session_todos == [], "Fork must not inherit the source's native plan"
 
 
 def test_fork_extra_labels_rearm_bypass_over_the_always_drop(
@@ -4735,6 +4756,25 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
             WRAPPER_LABEL_KEY: "claude-code-native-ui",
         },
     )
+    conversation_store.set_provider_usage_limits(
+        conv_id,
+        {
+            "provider": "Claude",
+            "captured_at": 2_000_000_000,
+            "windows": [
+                {
+                    "label": "5h",
+                    "aria_label": "5 hour",
+                    "used_percent": 3.0,
+                    "duration_mins": 300,
+                }
+            ],
+        },
+    )
+    conversation_store.set_session_todos(
+        conv_id,
+        [{"content": "Old plan", "status": "in_progress", "activeForm": "Planning"}],
+    )
     conversation_store.append(
         conv_id,
         [
@@ -4778,6 +4818,8 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     # Native runtime state belongs to the old harness → cleared so the next
     # turn cold-starts and rebuilds from items.
     assert updated.external_session_id is None
+    assert updated.provider_usage_limits is None
+    assert updated.session_todos == []
     # Labels: target ui/wrapper applied, carry-history + previous-builtin
     # stamped, and the old instance-scoped stopped marker dropped.
     assert updated.labels[UI_MODE_LABEL_KEY] == UI_MODE_TERMINAL_VALUE

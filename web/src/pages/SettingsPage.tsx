@@ -159,13 +159,13 @@ import {
   type ThemeMode,
 } from "@/components/theme/themeMode";
 import {
-  applyDesktopUiFontSize,
+  applyUiFontSize,
   applyUiFontFamily,
   clampUiFontSizePx,
   readUiFontFamily,
   readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
-  UI_FONT_SIZE_DEFAULT,
+  defaultUiFontSizePx,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
   UI_FONT_SIZE_STEP,
@@ -849,10 +849,11 @@ function AppearanceSection() {
     writeSessionNavigationPreferences({
       ...readSessionNavigationPreferences(),
       deprioritizeBackgroundSessions: true,
+      scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
     });
 
-    applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
+    applyUiFontSize(defaultUiFontSizePx());
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
@@ -910,7 +911,7 @@ function AppearanceSection() {
       // Note: web-theme is stored as plain string by next-themes, not JSON.
       const themeMode = imported.settings["web-theme"];
       if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
-      applyDesktopUiFontSize(readUiFontSizePx());
+      applyUiFontSize(readUiFontSizePx());
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
       applyCustomTheme(readCustomTheme());
@@ -1260,10 +1261,9 @@ function DefaultBaseBranchControl() {
 }
 
 /**
- * Desktop UI font size stepper. Maps one of the supported discrete px values
- * into typography tokens via --desktop-ui-font-size (see
- * lib/uiFontPreferences.ts) without resizing layout or icons. Mobile keeps its
- * independent responsive size.
+ * Device-local UI font size stepper. Maps one of the supported discrete px
+ * values into the active desktop/mobile typography tokens without resizing
+ * layout or icons.
  */
 function UiFontSizeControl() {
   // `px` is the committed value: clamped, persisted, and applied to the UI.
@@ -1280,7 +1280,7 @@ function UiFontSizeControl() {
     setPx(clamped);
     setDraft(String(clamped));
     writeUiFontSizePx(clamped);
-    applyDesktopUiFontSize(clamped);
+    applyUiFontSize(clamped);
   }, []);
 
   const onDraftChange = useCallback((text: string) => {
@@ -1292,7 +1292,7 @@ function UiFontSizeControl() {
       if (value >= UI_FONT_SIZE_MIN && value <= UI_FONT_SIZE_MAX) {
         setPx(value);
         writeUiFontSizePx(value);
-        applyDesktopUiFontSize(value);
+        applyUiFontSize(value);
       }
     }
   }, []);
@@ -1312,7 +1312,7 @@ function UiFontSizeControl() {
       <div className="flex flex-col">
         <span className="text-ui font-medium">Interface font size</span>
         <span className="text-sm text-muted-foreground">
-          Set text across the desktop interface. Icons and spacing stay fixed.
+          Set text across this device's interface. Icons and spacing stay fixed.
         </span>
       </div>
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
@@ -1479,7 +1479,7 @@ function UiCodeFontSizeControl() {
       <div className="flex flex-col">
         <span className="text-ui font-medium">Code font size</span>
         <span className="text-sm text-muted-foreground">
-          Size of code in the editor and terminal.
+          Size of code in the editor and terminal on this device.
         </span>
       </div>
       {/* One cohesive pill: [ −  | value px |  + ] — same shell as the UI
@@ -1679,7 +1679,7 @@ function ShortcutsSection() {
 
 function ContextUsageSection() {
   return (
-    <Section title="Context & usage" description="Context, Compact, and provider limits.">
+    <Section title="Context & usage" description="Context and usage limits.">
       <div className="flex flex-col gap-6">
         <CompactProgressIndicatorControl />
         <ContextUsageSettings />

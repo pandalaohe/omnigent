@@ -242,6 +242,10 @@ let sessionPendingInputs: Map<
   string,
   { pending_id: string; content: unknown[]; created_by?: string }[]
 >;
+let sessionTodos: Map<
+  string,
+  { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }[]
+>;
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
 let sessionCostControlOverrides: Map<string, "on" | "off">;
@@ -364,6 +368,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       labels: sessionLabels.get(sessionId) ?? {},
       pending_elicitations: sessionPendingElicitations.get(sessionId) ?? [],
       pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
+      todos: sessionTodos.get(sessionId) ?? [],
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
       subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
     });
@@ -465,6 +470,7 @@ beforeEach(() => {
   sessionItems = new Map();
   sessionPendingElicitations = new Map();
   sessionPendingInputs = new Map();
+  sessionTodos = new Map();
   sessionCostControlOverrides = new Map();
   sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
@@ -544,6 +550,13 @@ function seedPendingInputs(
   inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
+}
+
+function seedTodos(
+  id: string,
+  todos: { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }[],
+): void {
+  sessionTodos.set(id, todos);
 }
 
 describe("test harness teardown", () => {
@@ -4219,7 +4232,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("applies the event's binding immediately and leaves transcript state untouched", async () => {
+    it("applies the event's binding immediately, clears old todos, and leaves transcript untouched", async () => {
       const items: ConversationItem[] = [
         userMessage("resp_1", "before switch"),
         assistantMessage("resp_1", "answer"),
@@ -4231,7 +4244,10 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const pending = [
         { tempId: "pend_keep", content: [{ type: "input_text" as const, text: "queued" }] },
       ];
-      useChatStore.setState({ pendingUserMessages: pending });
+      useChatStore.setState({
+        pendingUserMessages: pending,
+        todos: [{ content: "Old agent plan", status: "in_progress", activeForm: "Working" }],
+      });
       const spy = vi.spyOn(client, "invalidateQueries");
 
       serveNativeSnapshot();
@@ -4260,6 +4276,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       // was touched) nor drop un-acked optimistic bubbles.
       expect(state.blocks).toBe(blocksBefore);
       expect(state.pendingUserMessages).toEqual(pending);
+      expect(state.todos).toEqual([]);
     });
 
     it("resets the switched session's terminal cache and refetches it", async () => {
@@ -4287,6 +4304,23 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       // …and the authoritative list is refetched (the new agent's
       // terminal still lands via its own `created` event regardless).
       expect(spy).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_sw") });
+      await tick();
+    });
+
+    it("keeps todos when the event refreshes the same agent after MCP configuration", async () => {
+      seedSession("conv_sw", []);
+      await useChatStore.getState().switchTo("conv_sw");
+      const todos = [{ content: "Keep plan", status: "in_progress" as const, activeForm: "Doing" }];
+      useChatStore.setState({ boundAgentId: "agent_xyz", todos });
+
+      handleSessionEvent({
+        type: "session_agent_changed",
+        conversationId: "conv_sw",
+        agentId: "agent_xyz",
+        agentName: "Same agent, refreshed",
+      });
+
+      expect(useChatStore.getState().todos).toEqual(todos);
       await tick();
     });
 
@@ -8459,6 +8493,88 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
     last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("restores the durable todo snapshot after a reconnect gap", async () => {
+    seedSession("conv_reconnect_todos", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_todos",
+      abortController: controller,
+      todos: [{ content: "Stale", status: "pending", activeForm: "Waiting" }],
+    });
+
+    const loop = startStreamPump("conv_reconnect_todos", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    const durableTodos = [
+      { content: "Recovered", status: "in_progress" as const, activeForm: "Recovering" },
+    ];
+    seedTodos("conv_reconnect_todos", durableTodos);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    expect(useChatStore.getState().todos).toEqual(durableTodos);
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("does not overwrite a newer todo event with an older reconnect snapshot", async () => {
+    seedSession("conv_reconnect_todo_race", []);
+    const oldTodos = [{ content: "Old", status: "pending" as const, activeForm: "Waiting" }];
+    const newTodos = [{ content: "New", status: "in_progress" as const, activeForm: "Doing" }];
+    seedTodos("conv_reconnect_todo_race", oldTodos);
+    const sinks: StreamSink[] = [];
+    let holdItems = false;
+    let releaseItems: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (holdItems && /\/v1\/sessions\/conv_reconnect_todo_race\/items/.test(url)) {
+        return new Promise<Response>((resolve) => {
+          releaseItems = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_todo_race",
+      abortController: controller,
+      todos: oldTodos,
+    });
+
+    const loop = startStreamPump("conv_reconnect_todo_race", controller, setState, getState);
+    await drainAsync();
+    holdItems = true;
+    sinks[0]!.error();
+    await drainAsync();
+    expect(releaseItems).not.toBeNull();
+
+    handleSessionEvent(
+      { type: "session_todos", conversationId: "conv_reconnect_todo_race", todos: newTodos },
+      "conv_reconnect_todo_race",
+    );
+    holdItems = false;
+    releaseItems!(
+      defaultFetchHandler("/v1/sessions/conv_reconnect_todo_race/items?limit=100&order=desc"),
+    );
+    await drainAsync();
+    expect(useChatStore.getState().todos).toEqual(newTodos);
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
     await drainAsync(2);
     await loop;
   });

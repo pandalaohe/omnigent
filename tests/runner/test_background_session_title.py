@@ -21,7 +21,13 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.background_titles import BackgroundTitleContext
 from omnigent.runner.background_titles import claude_native as claude_native_titles
 from omnigent.runner.background_titles import codex_native as codex_native_titles
-from omnigent.runner.background_titles.service import build_background_title_instructions
+from omnigent.runner.background_titles.service import (
+    BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
+    CUSTOM_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
+    FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
+    background_title_max_output_tokens,
+    build_background_title_instructions,
+)
 from tests.runner.helpers import NullServerClient
 
 
@@ -167,7 +173,37 @@ def test_custom_background_title_instructions_include_date_and_keep_guardrails()
 
     assert "The current date is 2026-08-26." in instructions
     assert "Use the format mon-dd-PR-number-slug." in instructions
+    assert "same primary language as the user's message" in instructions
     assert instructions.endswith("Return only the title with no quotes or markdown.")
+
+
+def test_default_background_title_follows_user_message_language() -> None:
+    instructions = build_background_title_instructions(None)
+
+    assert "same primary language as the user's message" in instructions
+    assert "equally short phrase" in instructions
+
+
+def test_forwarded_framework_language_rule_keeps_default_runner_prompt() -> None:
+    instructions = build_background_title_instructions(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
+
+    assert instructions == build_background_title_instructions(None)
+    assert instructions.count(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION) == 1
+    assert (
+        background_title_max_output_tokens(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
+        == BACKGROUND_TITLE_MAX_OUTPUT_TOKENS
+    )
+
+
+def test_operator_language_override_stays_custom_after_framework_suffix() -> None:
+    forwarded = f"Always use English.\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
+    instructions = build_background_title_instructions(forwarded)
+
+    assert "Always use English." in instructions
+    assert instructions.count(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION) == 1
+    assert (
+        background_title_max_output_tokens(forwarded) == CUSTOM_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS
+    )
 
 
 @pytest.mark.parametrize(

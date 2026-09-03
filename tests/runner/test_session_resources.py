@@ -153,7 +153,9 @@ class _CapturingResourceRegistry:
 
     def set_session_status_publisher(
         self,
-        publisher: Callable[[str, str, str | None, int | None], None],
+        publisher: Callable[
+            [str, str, str | None, int | None, list[dict[str, object]] | None], None
+        ],
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -1642,7 +1644,7 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
     status_edges: list[_StatusEdge] = []
     registry.set_terminal_activity_publisher(lambda _sid, _tid: None)
     registry.set_session_status_publisher(
-        lambda sid, status, _reason=None, _count=None: status_edges.append(
+        lambda sid, status, _reason=None, _count=None, _tasks=None: status_edges.append(
             _StatusEdge(session_id=sid, status=status)
         )
     )
@@ -1707,7 +1709,7 @@ async def test_generic_terminal_does_not_drive_session_status(
     activity_pulses: list[str] = []
     registry.set_terminal_activity_publisher(lambda _sid, tid: activity_pulses.append(tid))
     registry.set_session_status_publisher(
-        lambda sid, status, _reason=None, _count=None: status_edges.append(
+        lambda sid, status, _reason=None, _count=None, _tasks=None: status_edges.append(
             _StatusEdge(session_id=sid, status=status)
         )
     )
@@ -1774,7 +1776,9 @@ async def test_terminal_activity_pulses_throttled_to_one_per_second(
     registry.set_terminal_activity_publisher(lambda _sid, tid: activity_pulses.append(tid))
     # The idle-reset behaviour is only wired for the claude-native role, so
     # the status publisher must be installed to exercise on_idle.
-    registry.set_session_status_publisher(lambda _sid, _status, _reason=None, _count=None: None)
+    registry.set_session_status_publisher(
+        lambda _sid, _status, _reason=None, _count=None, _tasks=None: None
+    )
 
     await registry.launch_required_terminal(
         session_id="conv_throttle",

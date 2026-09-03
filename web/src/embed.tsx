@@ -42,7 +42,7 @@ import {
 } from "./lib/host";
 import { resolveIdentity } from "./lib/identity";
 import {
-  applyDesktopUiFontSize,
+  applyUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
   readUiFontSizePx,
@@ -181,7 +181,7 @@ function OmnigentProviders({
   const scopeRootRef = useCallback((el: HTMLDivElement | null) => {
     setEmbedScopeRoot(el);
     if (el) {
-      applyDesktopUiFontSize(readUiFontSizePx());
+      applyUiFontSize(readUiFontSizePx());
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
       applyCustomTheme(readCustomTheme());

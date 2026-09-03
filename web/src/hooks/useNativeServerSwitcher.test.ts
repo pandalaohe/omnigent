@@ -2,7 +2,20 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { act } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { isSurfaceFrontmost, useAppShellSidebarOpen } from "./useNativeServerSwitcher";
+const nativeBridge = vi.hoisted(() => ({
+  setNativeServerSwitcherHidden: vi.fn(),
+}));
+
+vi.mock("@/lib/nativeBridge", () => ({
+  isIOSShell: () => true,
+  setNativeServerSwitcherHidden: nativeBridge.setNativeServerSwitcherHidden,
+}));
+
+import {
+  isSurfaceFrontmost,
+  useAppShellSidebarOpen,
+  useNativeServerSwitcherForMainSurface,
+} from "./useNativeServerSwitcher";
 
 // The native Liquid Glass Chat/Terminal bar floats over the web view, so DOM
 // stacking can't hide it — its visibility rides on `isSurfaceFrontmost`. A
@@ -55,9 +68,31 @@ function makeOpenSidebar(): HTMLElement {
 }
 
 afterEach(() => {
+  nativeBridge.setNativeServerSwitcherHidden.mockClear();
   vi.unstubAllGlobals();
   delete (document as unknown as Record<string, unknown>).elementFromPoint;
   document.body.innerHTML = "";
+});
+
+describe("useNativeServerSwitcherForMainSurface", () => {
+  it("keeps the landing top clear and moves the switcher to the sidebar in title mode", () => {
+    const { rerender, unmount } = renderHook(
+      ({ sidebarOpen }) =>
+        useNativeServerSwitcherForMainSurface(null, true, {
+          headerMode: "conversation-title",
+          sidebarOpen,
+        }),
+      { initialProps: { sidebarOpen: false } },
+    );
+
+    expect(nativeBridge.setNativeServerSwitcherHidden).toHaveBeenLastCalledWith(true);
+
+    rerender({ sidebarOpen: true });
+    expect(nativeBridge.setNativeServerSwitcherHidden).toHaveBeenLastCalledWith(false);
+
+    unmount();
+    expect(nativeBridge.setNativeServerSwitcherHidden).toHaveBeenLastCalledWith(true);
+  });
 });
 
 describe("isSurfaceFrontmost", () => {

@@ -984,6 +984,43 @@ describe("mark as unread", () => {
   });
 });
 
+describe("mark all as read", () => {
+  it("clears every loaded unread dot from the Sessions header in one tap", () => {
+    const second = {
+      ...CONV,
+      id: "conv_2",
+      title: "Another Session",
+      updated_at: CONV.updated_at + 10,
+    };
+    mockConversations([CONV, second]);
+    seedReadState([
+      { id: CONV.id, viewer_last_seen: CONV.updated_at - 1 },
+      { id: second.id, viewer_last_seen: second.updated_at - 1 },
+    ]);
+    renderSidebar();
+
+    expect(screen.getAllByText("(unread)")).toHaveLength(2);
+
+    fireEvent.click(screen.getByTestId("mark-all-sessions-read"));
+
+    expect(screen.queryByText("(unread)")).toBeNull();
+    expect(screen.queryByTestId("mark-all-sessions-read")).toBeNull();
+  });
+
+  it("keeps a needs-response state visible after its content is marked read", () => {
+    const awaiting = { ...CONV, pending_elicitations_count: 1 };
+    mockConversations([awaiting]);
+    seedReadState([{ id: awaiting.id, viewer_last_seen: awaiting.updated_at - 1 }]);
+    renderSidebar();
+
+    expect(screen.getByText("Needs response")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("mark-all-sessions-read"));
+
+    expect(screen.getByText("Needs response")).toBeInTheDocument();
+    expect(screen.queryByTestId("mark-all-sessions-read")).toBeNull();
+  });
+});
+
 describe("right-click context menu", () => {
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();

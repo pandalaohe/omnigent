@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 _MAX_WINDOWS = 8
@@ -78,4 +79,31 @@ def validate_provider_usage_limits_snapshot(snapshot: object) -> dict[str, Any] 
     return result
 
 
-__all__ = ["validate_provider_usage_limits_snapshot"]
+def parse_provider_usage_limits_snapshot_json(
+    value: str,
+    *,
+    repair_clipped_label: bool = False,
+) -> dict[str, Any] | None:
+    """Parse a stored snapshot, optionally repairing the known label truncation.
+
+    Legacy snapshots were written into a 256-character label. A normal Claude
+    two-window payload can be exactly 257 characters, leaving only its final
+    closing brace clipped. Repair is deliberately limited to that observed
+    shape and still passes through the normal snapshot validator.
+    """
+    candidates = [value]
+    if repair_clipped_label and len(value) == 256:
+        candidates.append(f"{value}}}")
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            return validate_provider_usage_limits_snapshot(parsed)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+__all__ = [
+    "parse_provider_usage_limits_snapshot_json",
+    "validate_provider_usage_limits_snapshot",
+]

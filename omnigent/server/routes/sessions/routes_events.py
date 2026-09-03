@@ -120,6 +120,7 @@ from omnigent.server.routes._sessions.common import (
     _pushed_model_options_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
+    _session_todos_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -1297,6 +1298,19 @@ def register_events_routes(
             data = await _enrich_terminal_status_with_subagent_output(
                 body.data, status, session_id, conversation_store
             )
+            # Forward only the same bounded, typed display detail that the
+            # Server accepted. The Runner retains this across reconnects, so
+            # raw/nested/oversized task objects must not become resident there.
+            if bg_count is None:
+                data.pop("background_task_count", None)
+            else:
+                data["background_task_count"] = bg_count
+            if bg_tasks is None:
+                data.pop("background_tasks", None)
+            else:
+                data["background_tasks"] = [
+                    task.model_dump(exclude_none=True) for task in bg_tasks
+                ]
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
             # last_task_error, not only the sub-agent parent-inbox path.
@@ -1509,7 +1523,7 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
-            _handle_external_session_todos(session_id, body)
+            await _handle_external_session_todos(session_id, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id = await _persist_external_subagent_start(
@@ -2346,9 +2360,7 @@ def register_events_routes(
             from omnigent.runtime import get_terminal_registry
 
             with contextlib.suppress(RuntimeError):
-                await delete_lease.run(
-                    get_terminal_registry().cleanup_conversation(session_id)
-                )
+                await delete_lease.run(get_terminal_registry().cleanup_conversation(session_id))
         # Session file cleanup.
         if file_store is not None and artifact_store is not None:
             deleted_file_ids = await delete_lease.to_thread(
@@ -2396,6 +2408,9 @@ def register_events_routes(
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.
         _pushed_model_options_cache.pop(session_id, None)
+        # The durable todo snapshot is deleted with the conversation, so its
+        # process-local fast path must go too.
+        _session_todos_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.

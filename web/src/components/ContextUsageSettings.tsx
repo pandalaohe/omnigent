@@ -3,16 +3,19 @@ import { useEffect, useState } from "react";
 import { useCodexRateLimits, useHosts } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { formatTokenCountShort } from "@/lib/formatCost";
 import {
+  formatProviderUsageLimits,
   providerUsageLimitsFromCodex,
   type ProviderUsageLimitsSnapshot,
 } from "@/lib/providerUsageLimits";
 import {
   usageContextOverrideFor,
+  usageContextSourceFromKey,
   usageContextSourceKey,
   writeUsageContextOverride,
   writeUsageContextPreferences,
@@ -88,23 +91,34 @@ export function ContextUsageSettings() {
     ? (hosts.find((host) => host.host_id === session.hostId)?.name ?? "Unknown computer")
     : "Server";
   const harnessName = harness ? (BRAIN_HARNESS_LABELS[harness] ?? harness) : "Unknown";
-  const providerLimits: ProviderUsageLimitsSnapshot | null = codexSession
-    ? providerUsageLimitsFromCodex(codexRateLimits, model)
-    : sessionProviderUsageLimits;
+  const providerLimits: ProviderUsageLimitsSnapshot | null = useStableProviderUsageLimits({
+    preferences,
+    sourceKey,
+    fresh: codexSession
+      ? providerUsageLimitsFromCodex(codexRateLimits, model)
+      : sessionProviderUsageLimits,
+    agentName,
+    harness,
+  });
   const savedOverrideCount = Object.keys(preferences.overrides).length;
-  const providerStatusDetail = rateLimitsLoading
-    ? "Checking the active computer for provider allowance windows."
-    : providerLimits?.windows.length
-      ? `${providerLimits.provider} reported ${providerLimits.windows.length} usage window${providerLimits.windows.length === 1 ? "" : "s"}.`
+  const savedSources = Object.entries(preferences.overrides).flatMap(([key, override]) => {
+    const source = usageContextSourceFromKey(key);
+    return source ? [{ key, source, override }] : [];
+  });
+  const currentProviderLimits = formatProviderUsageLimits(providerLimits) ? providerLimits : null;
+  const providerStatusDetail = currentProviderLimits
+    ? `${currentProviderLimits.provider} usage limits for this session.`
+    : rateLimitsLoading
+      ? "Checking usage limits."
       : harness
-        ? `${harnessName} has not reported comparable plan windows for this session.`
-        : "Open a session to inspect provider usage.";
-  const providerStatus = rateLimitsLoading
-    ? "Checking…"
-    : providerLimits?.windows.length
-      ? `${providerLimits.provider} · ${providerLimits.windows.length} window${providerLimits.windows.length === 1 ? "" : "s"}`
+        ? `No usage limits received from ${harnessName} for this session.`
+        : "Open a session to view usage limits.";
+  const providerStatus = currentProviderLimits
+    ? `${currentProviderLimits.provider} · ${currentProviderLimits.windows.length}`
+    : rateLimitsLoading
+      ? "Checking…"
       : harness
-        ? "Not reported"
+        ? "No data"
         : "Open a session";
 
   return (
@@ -116,7 +130,7 @@ export function ContextUsageSettings() {
             className="mt-1 text-sm text-muted-foreground"
             title="Overrides are saved for this exact computer, agent, harness, and model. Reported values alone do not create a saved override."
           >
-            Overrides apply to this source.
+            Overrides are remembered when all four fields match.
           </p>
         </div>
         <div className="grid gap-2 rounded-xl border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2">
@@ -166,13 +180,65 @@ export function ContextUsageSettings() {
           {calculatedCompactPoint != null
             ? ` · Compact ${formatTokenCountShort(calculatedCompactPoint)}`
             : " · Compact unavailable"}
-          {savedOverrideCount > 0 ? ` · ${savedOverrideCount} saved` : ""}
+          {savedOverrideCount > 0
+            ? ` · ${savedOverrideCount} source${savedOverrideCount === 1 ? "" : "s"} saved`
+            : ""}
         </p>
+        <p className="text-xs text-muted-foreground">
+          Auto follows values reported by the active session. It does not learn after a Compact or
+          change when the agent compacts; manual values only correct this indicator.
+        </p>
+        {savedSources.length > 0 ? (
+          <div
+            className="grid gap-2 border-t border-border pt-4"
+            data-testid="saved-context-sources"
+          >
+            <div>
+              <h4 className="text-sm font-medium text-foreground">Saved sources</h4>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Each computer, agent, harness, and model combination keeps its own values.
+              </p>
+            </div>
+            <div className="divide-y divide-border overflow-hidden rounded-lg border border-border">
+              {savedSources.map(({ key, source, override }) => {
+                const savedHostName = source.hostId
+                  ? (hosts.find((host) => host.host_id === source.hostId)?.name ?? source.hostId)
+                  : "Server";
+                const savedHarnessName = source.harness
+                  ? (BRAIN_HARNESS_LABELS[source.harness] ?? source.harness)
+                  : "Unknown";
+                const isCurrent = key === sourceKey;
+                return (
+                  <div key={key} className="grid gap-2 px-3 py-2.5 text-xs sm:grid-cols-2">
+                    <div className="flex min-w-0 items-center gap-2 sm:col-span-2">
+                      <span className="truncate font-medium text-foreground">{savedHostName}</span>
+                      {isCurrent ? (
+                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
+                          Current
+                        </span>
+                      ) : null}
+                    </div>
+                    <span className="truncate text-muted-foreground">
+                      {source.agentName || "Unknown agent"} · {savedHarnessName} ·{" "}
+                      {source.model || "Auto model"}
+                    </span>
+                    <span className="tabular-nums text-muted-foreground sm:text-right">
+                      Context {override.contextWindowTokens?.toLocaleString() ?? "Auto"} · Compact{" "}
+                      {override.autoCompactThresholdPercent != null
+                        ? `${override.autoCompactThresholdPercent}%`
+                        : "Auto"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <div className="flex items-start justify-between gap-6 border-t border-border pt-5">
         <div className="flex min-w-0 flex-col">
-          <span className="text-ui font-medium">Provider limits</span>
+          <span className="text-ui font-medium">Usage limits</span>
           <span
             className="mt-1 text-xs text-muted-foreground"
             data-testid="provider-usage-source-status"
@@ -186,7 +252,7 @@ export function ContextUsageSettings() {
           onCheckedChange={(showProviderUsageLimits) =>
             writeUsageContextPreferences({ ...preferences, showProviderUsageLimits })
           }
-          aria-label="Show provider usage limits"
+          aria-label="Show usage limits"
         />
       </div>
     </div>

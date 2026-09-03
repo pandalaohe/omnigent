@@ -40,9 +40,13 @@ describe("ChatPlanAccordion", () => {
       { content: "b", status: "in_progress", activeForm: "b" },
       { content: "c", status: "pending", activeForm: "c" },
     ];
-    render(<ChatPlanAccordion />);
+    const { container } = render(<ChatPlanAccordion />);
     expect(screen.getByText("Plan")).toBeInTheDocument();
     expect(screen.getByText("(1/3)")).toBeInTheDocument();
+    expect(screen.getByTestId("plan-current-task")).toHaveTextContent("b");
+    expect(screen.getByTestId("plan-current-task")).toHaveClass("truncate");
+    expect(container.firstChild).toHaveClass("chat-plan-accordion");
+    expect(screen.getByTestId("plan-tracker")).toHaveClass("md:rounded-xl");
   });
 
   it("lists the tasks in the expandable body", () => {

@@ -275,6 +275,7 @@ from omnigent.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+from omnigent.session_todos import validate_session_todos
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -2660,21 +2661,20 @@ def _merge_claude_permission_launch_args(
     return merged
 
 
-def _handle_external_session_todos(
+async def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,
+    conversation_store: ConversationStore,
 ) -> None:
     """
-    Cache and broadcast a todo-list update from a native forwarder.
+    Persist, cache, and broadcast a todo-list update from a native forwarder.
 
     Sent by the claude-native forwarder (from ``TodoWrite``) and the
     codex-native forwarder (from Codex plan updates); the panel is
     harness-agnostic.
 
-    Updates the in-memory ``_session_todos_cache`` so subsequent
-    ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``
-    field without a file read. Then publishes a ``session.todos`` SSE event
-    so connected web clients update their todo panel immediately.
+    Persistence makes the snapshot survive Server deployments; the in-memory
+    cache remains the live fast path. The SSE event updates connected clients.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -2689,19 +2689,18 @@ def _handle_external_session_todos(
             "external_session_todos requires data.todos to be a list",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Filter to well-formed items before caching so that malformed entries
-    # from a buggy forwarder version don't persist in the snapshot.  The
-    # same filter is applied by sse.ts on the live-event path; keeping the
-    # two in sync means the snapshot and live panel always show the same set.
-    valid_statuses = {"pending", "in_progress", "completed"}
-    validated: list[dict[str, Any]] = [
-        t
-        for t in todos
-        if isinstance(t, dict)
-        and isinstance(t.get("content"), str)
-        and t.get("status") in valid_statuses
-        and isinstance(t.get("activeForm"), str)
-    ]
+    try:
+        validated = validate_session_todos(todos)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    persisted = await asyncio.to_thread(
+        conversation_store.set_session_todos, session_id, validated
+    )
+    if not persisted:
+        # A concurrent DELETE may win after this request's access check. The
+        # missing DB row is authoritative; do not recreate process-local state
+        # or broadcast a plan for a session that no longer exists.
+        return
     _session_todos_cache[session_id] = validated
     event = SessionTodosEvent(
         type="session.todos",

@@ -393,7 +393,9 @@ async def _observe_native_agent_terminal_and_capture(
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
     # A status publisher is required for the native agent terminal's watcher to
     # wire its running/idle edges (and thus record the PTY status).
-    registry.set_session_status_publisher(lambda _sid, _status, _reason=None, _count=None: None)
+    registry.set_session_status_publisher(
+        lambda _sid, _status, _reason=None, _count=None, _tasks=None: None
+    )
     await registry.observe_required_terminal(
         session_id,
         instance.name,  # type: ignore[attr-defined]
@@ -472,6 +474,7 @@ async def _observe_native_with_fake_poller(
         status: str,
         _reason: str | None = None,
         count: int | None = None,
+        _tasks: list[dict[str, object]] | None = None,
     ) -> None:
         statuses.append(status)
         background_counts.append(count)
@@ -672,6 +675,88 @@ async def test_reconnect_resync_republishes_a_running_session(tmp_path: Path) ->
     poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_resync_replays_exact_background_shell_state(tmp_path: Path) -> None:
+    """A restarted server relearns the exact shells that outlive the turn."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    published: list[tuple[str, str, str | None, int | None, list[dict[str, object]] | None]] = []
+    registry.set_session_status_publisher(
+        lambda session_id, status, blocked_on=None, count=None, tasks=None: published.append(
+            (session_id, status, blocked_on, count, tasks)
+        )
+    )
+    tasks: list[dict[str, object]] = [
+        {
+            "id": "shell-1",
+            "type": "shell",
+            "status": "running",
+            "command": "sleep 120",
+        },
+        {
+            "id": "shell-2",
+            "type": "shell",
+            "status": "running",
+            "command": "sleep 240",
+        },
+    ]
+
+    registry.note_external_session_status(
+        "conv_background_restart",
+        "idle",
+        background_task_count=2,
+        background_tasks=tasks,
+    )
+    registry.resync_session_statuses()
+
+    assert published == [("conv_background_restart", "idle", None, 2, tasks)]
+
+    # The later status-file ``shell -> idle`` zero is authoritative. Once it
+    # clears the remembered state, another reconnect must not resurrect B.
+    registry.note_external_session_status(
+        "conv_background_restart",
+        "idle",
+        background_task_count=0,
+    )
+    published.clear()
+    registry.resync_session_statuses()
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_status_file_zero_clears_background_replay_before_reconnect(tmp_path: Path) -> None:
+    """The real status-file zero prevents an old positive B from resurfacing."""
+    _callbacks, statuses, counts, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_shell_replay_clear"
+    )
+    poller = pollers[0]
+    poller.active = True
+    registry.note_external_session_status(
+        "conv_shell_replay_clear",
+        "idle",
+        background_task_count=1,
+        background_tasks=[
+            {
+                "id": "shell-finished",
+                "type": "shell",
+                "status": "running",
+                "command": "sleep 1",
+            }
+        ],
+    )
+
+    poller.emit("idle", background_task_count=0)
+    await asyncio.sleep(0)
+    assert statuses == ["idle"]
+    assert counts == [0]
+
+    statuses.clear()
+    counts.clear()
+    registry.resync_session_statuses()
+    assert statuses == []
+    assert counts == []
 
 
 @pytest.mark.asyncio
@@ -1464,7 +1549,7 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
     edges: list[tuple[str, str | None]] = []
     pollers: list[_FakeStatusPoller] = []
     registry.set_session_status_publisher(
-        lambda _sid, status, reason=None, _count=None: edges.append((status, reason))
+        lambda _sid, status, reason=None, _count=None, _tasks=None: edges.append((status, reason))
     )
 
     def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:

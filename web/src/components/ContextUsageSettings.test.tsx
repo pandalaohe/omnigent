@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { readUsageContextPreferences, usageContextSourceKey } from "@/lib/usageContextPreferences";
+import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
 
 const mocks = vi.hoisted(() => ({
   conversationId: "session-1" as string | null,
@@ -10,7 +11,7 @@ const mocks = vi.hoisted(() => ({
   model: "model-a" as string | null,
   contextWindow: 330_000 as number | null,
   autoCompactTokenLimit: null as number | null,
-  providerUsageLimits: null,
+  providerUsageLimits: null as ProviderUsageLimitsSnapshot | null,
 }));
 
 vi.mock("@/store/chatStore", () => ({
@@ -64,10 +65,10 @@ describe("ContextUsageSettings", () => {
     expect(screen.getByText("Office MacBook")).toBeInTheDocument();
     expect(screen.getByText("Pi")).toBeInTheDocument();
     expect(screen.queryByText("host-friendly")).not.toBeInTheDocument();
-    expect(screen.getByTestId("provider-usage-source-status")).toHaveTextContent("Not reported");
+    expect(screen.getByTestId("provider-usage-source-status")).toHaveTextContent("No data");
     expect(screen.getByTestId("provider-usage-source-status")).toHaveAttribute(
       "title",
-      expect.stringContaining("Pi has not reported comparable plan windows"),
+      expect.stringContaining("No usage limits received from Pi"),
     );
 
     const contextInput = screen.getByLabelText("Context window override in tokens");
@@ -117,5 +118,28 @@ describe("ContextUsageSettings", () => {
         autoCompactThresholdPercent: 80,
       });
     });
+    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("Saved sources");
+    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-a");
+    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-b");
+    expect(screen.getByText(/2 sources saved/)).toBeInTheDocument();
+    expect(screen.getByText(/does not learn after a Compact/)).toBeInTheDocument();
+  });
+
+  it("does not present an expired cached usage snapshot as current", () => {
+    mocks.agentName = "claude-native";
+    mocks.harness = "claude-native";
+    mocks.providerUsageLimits = {
+      provider: "Claude",
+      capturedAt: Math.floor(Date.now() / 1000) - 3601,
+      windows: [{ label: "5h", ariaLabel: "5 hour", usedPercent: 12 }],
+    };
+
+    render(<ContextUsageSettings />);
+
+    expect(screen.getByTestId("provider-usage-source-status")).toHaveTextContent("No data");
+    expect(screen.getByTestId("provider-usage-source-status")).toHaveAttribute(
+      "title",
+      expect.stringContaining("No usage limits received"),
+    );
   });
 });

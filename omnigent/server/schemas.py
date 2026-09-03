@@ -2019,12 +2019,9 @@ class SessionResponse(BaseModel):
         sessions are hidden from the default sidebar listing and
         surface only behind the "Show archived" toggle. ``False``
         for normal sessions. Toggled via ``PATCH /v1/sessions/{id}``.
-    :param todos: Current Claude Code todo list items for
-        ``omnigent claude`` sessions, as raw dicts from Claude's
-        todo JSON file. Each dict has ``content``, ``status``,
-        and ``activeForm`` keys. Empty list for non-claude-native
-        sessions or when no todos have been reported yet. Sourced
-        from the Omnigent server's in-memory ``_session_todos_cache``.
+    :param todos: Current native-harness plan items. Each dict has
+        ``content``, ``status``, and ``activeForm`` keys. Empty when no plan
+        has been reported. Persisted for snapshot recovery and live-cached.
     :param skills: Skills the bound agent has access to — the
         merged result of the agent spec's bundled ``skills``
         and the host-scope skills discovered along the agent
@@ -3170,9 +3167,8 @@ class SessionTodosEvent(_SSEEventBase):
         keys, e.g. ``[{"content": "Fix the bug", "status":
         "in_progress", "activeForm": "Fixing the bug"}]``.
 
-    Category: **transient** (SSE-only). On reconnect, clients seed
-    the panel from the session snapshot's ``todos`` field, which is
-    populated by ``_session_todos_cache`` at snapshot build time.
+    Category: **transient** (SSE-only). On reconnect, clients seed the panel
+    from the persisted session snapshot's ``todos`` field.
     """
 
     type: Literal["session.todos"]

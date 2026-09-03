@@ -36,6 +36,19 @@ describe("SessionNavigationSettings", () => {
     );
   });
 
+  it("opens sessions at the newest content by default and lets the user disable it", async () => {
+    render(<SessionNavigationSettings />);
+    const toggle = screen.getByRole("switch", {
+      name: "Scroll to the bottom when opening a session",
+    });
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(readSessionNavigationPreferences().scrollToBottomOnSessionOpen).toBe(false),
+    );
+  });
+
   it("opts into the mobile title layout without changing the default", async () => {
     render(<MobileSessionTitleSetting />);
     const toggle = screen.getByRole("switch", {
