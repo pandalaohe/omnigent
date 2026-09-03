@@ -1240,6 +1240,25 @@ def _session_status_with_child_rollup(
     return own_status
 
 
+def _session_background_activity_count(
+    conversation_id: str,
+    child_session_ids: list[str],
+    db_status: str | None = None,
+) -> int:
+    """Count live work that does not own the parent session's prompt."""
+    own_status = _session_status_from_cache(conversation_id, db_status)
+    shell_count = (
+        0
+        if own_status == "failed"
+        else _session_background_task_count_cache.get(conversation_id, 0)
+    )
+    child_count = sum(
+        _session_status_cache.get(child_id) in ("running", "waiting")
+        for child_id in child_session_ids
+    )
+    return shell_count + child_count
+
+
 async def _collect_descendant_conversation_ids(
     conversation_store: ConversationStore,
     root_id: str,
@@ -10204,6 +10223,7 @@ __all__ = [
     "_same_provider_family_impl",
     "_seed_missing_title",
     "_seed_missing_title_from_user_message",
+    "_session_background_activity_count",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
     "_set_read_state",

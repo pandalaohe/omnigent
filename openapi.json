@@ -5033,6 +5033,13 @@
             "description": "Unix epoch seconds of the most recent transition into the archived state. `None` while active.",
             "title": "Archived At"
           },
+          "background_activity_count": {
+            "description": "Number of active direct sub-agents plus background shells owned by this session. `0` means none are known.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Background Activity Count",
+            "type": "integer"
+          },
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
@@ -5070,6 +5077,16 @@
             ],
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Lets the sidebar / picker render a runtime badge without a follow-up GET.",
             "title": "External Session Id"
+          },
+          "foreground_status": {
+            "description": "Status of this session's own turn, excluding child-session rollup. This distinguishes a busy main turn from background-only activity while preserving `status` for compatibility.",
+            "enum": [
+              "idle",
+              "running",
+              "failed"
+            ],
+            "title": "Foreground Status",
+            "type": "string"
           },
           "git_branch": {
             "anyOf": [
@@ -5287,6 +5304,8 @@
           "id",
           "agent_id",
           "status",
+          "foreground_status",
+          "background_activity_count",
           "created_at",
           "updated_at"
         ],

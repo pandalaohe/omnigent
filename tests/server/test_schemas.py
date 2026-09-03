@@ -990,7 +990,15 @@ def test_session_list_item_status_accepts_canonical_set(status: str) -> None:
     """``SessionListItem.status`` accepts the same canonical set as the snapshot."""
     from omnigent.server.schemas import SessionListItem
 
-    item = SessionListItem(id="conv_x", agent_id="ag_x", status=status, created_at=0, updated_at=0)
+    item = SessionListItem(
+        id="conv_x",
+        agent_id="ag_x",
+        status=status,
+        foreground_status="idle",
+        background_activity_count=0,
+        created_at=0,
+        updated_at=0,
+    )
     assert item.status == status
 
 

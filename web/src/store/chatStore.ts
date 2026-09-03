@@ -5906,17 +5906,16 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
  * of lagging up to one ``useConversations`` poll (4 s) behind the chat's
  * "Working…" indicator.
  *
- * Mirrors the server's list-status collapse (``GET /v1/sessions`` in
- * ``sessions.py``): ``running``/``waiting`` → ``"running"``, ``failed``
- * → ``"failed"``, ``idle`` → ``"idle"``. The next list poll re-confirms
- * the same value — the server's ``_session_status_cache`` was written by
- * the same event — so this never fights the poller. Only the active
+ * Mirrors the server's foreground-status collapse: ``running``/``waiting``
+ * → ``"running"``, ``failed`` → ``"failed"``, ``idle`` → ``"idle"``.
+ * The legacy aggregate ``status`` is patched too for consumers that have not
+ * moved to ``foreground_status`` yet. Only the active
  * session has a bound stream, so only its row updates live; other rows
  * still reconcile on the poll, which is exactly the badge the user
  * compares against the open chat.
  *
  * No-ops (returns the cached reference unchanged) when the row is absent
- * or already shows the target status, so repeated ``running`` ticks
+ * or already shows both target statuses, so repeated ``running`` ticks
  * don't churn the sidebar.
  */
 function patchConversationStatusInCache(
@@ -5937,10 +5936,18 @@ function patchConversationStatusInCache(
       let mutated = false;
       const pages = data.pages.map((page) => {
         const idx = page.data.findIndex((c) => c.id === conversationId);
-        if (idx === -1 || page.data[idx].status === listStatus) return page;
+        if (
+          idx === -1 ||
+          (page.data[idx].status === listStatus && page.data[idx].foreground_status === listStatus)
+        )
+          return page;
         mutated = true;
         const nextData = [...page.data];
-        nextData[idx] = { ...nextData[idx], status: listStatus };
+        nextData[idx] = {
+          ...nextData[idx],
+          status: listStatus,
+          foreground_status: listStatus,
+        };
         return { ...page, data: nextData };
       });
       return mutated ? { ...data, pages } : data;

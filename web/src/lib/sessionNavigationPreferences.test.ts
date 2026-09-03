@@ -15,11 +15,13 @@ describe("sessionNavigationPreferences", () => {
   it("keeps official navigation behavior when unset or corrupt", () => {
     expect(readSessionNavigationPreferences()).toEqual({
       pollingActiveWindowHours: null,
+      deprioritizeBackgroundSessions: true,
       nativeMobileHeaderMode: "server",
     });
     localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, "{broken");
     expect(readSessionNavigationPreferences()).toEqual({
       pollingActiveWindowHours: null,
+      deprioritizeBackgroundSessions: true,
       nativeMobileHeaderMode: "server",
     });
   });
@@ -29,11 +31,13 @@ describe("sessionNavigationPreferences", () => {
       SESSION_NAVIGATION_STORAGE_KEY,
       JSON.stringify({
         pollingActiveWindowHours: MAX_SESSION_POLLING_WINDOW_HOURS + 10,
+        deprioritizeBackgroundSessions: false,
         nativeMobileHeaderMode: "conversation-title",
       }),
     );
     expect(readSessionNavigationPreferences()).toEqual({
       pollingActiveWindowHours: MAX_SESSION_POLLING_WINDOW_HOURS,
+      deprioritizeBackgroundSessions: false,
       nativeMobileHeaderMode: "conversation-title",
     });
   });
@@ -41,12 +45,14 @@ describe("sessionNavigationPreferences", () => {
   it("removes storage when preferences return to official defaults", () => {
     writeSessionNavigationPreferences({
       pollingActiveWindowHours: 24,
+      deprioritizeBackgroundSessions: false,
       nativeMobileHeaderMode: "conversation-title",
     });
     expect(localStorage.getItem(SESSION_NAVIGATION_STORAGE_KEY)).not.toBeNull();
 
     writeSessionNavigationPreferences({
       pollingActiveWindowHours: null,
+      deprioritizeBackgroundSessions: true,
       nativeMobileHeaderMode: "server",
     });
     expect(localStorage.getItem(SESSION_NAVIGATION_STORAGE_KEY)).toBeNull();

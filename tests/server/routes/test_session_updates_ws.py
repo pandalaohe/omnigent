@@ -233,14 +233,50 @@ def test_child_busy_rollup_flows_through_updates_stream(
             snapshot = _recv_until(ws, {"snapshot"})
             snapshot_items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
             assert snapshot_items[parent_id]["status"] == "running"
+            assert snapshot_items[parent_id]["foreground_status"] == "idle"
+            assert snapshot_items[parent_id]["background_activity_count"] == 1
 
             sessions_routes._session_status_cache[child.id] = "idle"
             changed = _recv_until(ws, {"changed"})
             changed_items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
             assert changed_items[parent_id]["status"] == "idle"
+            assert changed_items[parent_id]["foreground_status"] == "idle"
+            assert changed_items[parent_id]["background_activity_count"] == 0
     finally:
         sessions_routes._session_status_cache.pop(parent_id, None)
         sessions_routes._session_status_cache.pop(child.id, None)
+
+
+def test_background_shell_count_flows_through_updates_stream(
+    app: FastAPI,
+    stores,
+    fast_rescan: None,
+) -> None:
+    """A B-only row updates even while its foreground status stays idle."""
+    session_id = _seed_session(stores, owner=ALICE, title="background shell")
+    sessions_routes._session_status_cache[session_id] = "idle"
+    sessions_routes._session_background_task_count_cache[session_id] = 1
+    try:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws:
+            ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+            snapshot = _recv_until(ws, {"snapshot"})
+            item = next(item for item in snapshot["items"] if item["id"] == session_id)  # type: ignore[index]
+            assert item["status"] == "idle"
+            assert item["foreground_status"] == "idle"
+            assert item["background_activity_count"] == 1
+
+            # The status-file poller emits this authoritative zero when Claude's
+            # raw state changes from ``shell`` to ``idle``.
+            sessions_routes._publish_status(session_id, "idle", background_task_count=0)
+            changed = _recv_until(ws, {"changed"})
+            item = next(item for item in changed["items"] if item["id"] == session_id)  # type: ignore[index]
+            assert item["status"] == "idle"
+            assert item["background_activity_count"] == 0
+    finally:
+        sessions_routes._session_status_cache.pop(session_id, None)
+        sessions_routes._session_background_task_count_cache.pop(session_id, None)
 
 
 def test_runner_offline_pushes_changed_frame(

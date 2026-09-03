@@ -9,7 +9,11 @@ import {
   type ConversationStatus,
 } from "./idleTransitions";
 
-function conv(id: string, status?: Conversation["status"]): Conversation {
+function conv(
+  id: string,
+  status?: Conversation["status"],
+  overrides: Partial<Conversation> = {},
+): Conversation {
   return {
     id,
     object: "conversation",
@@ -19,6 +23,7 @@ function conv(id: string, status?: Conversation["status"]): Conversation {
     labels: {},
     permission_level: null,
     status,
+    ...overrides,
   };
 }
 
@@ -38,6 +43,16 @@ describe("buildStatusMap", () => {
     expect(map.has("a")).toBe(false);
     expect(map.get("b")).toBe("idle");
   });
+
+  it("records foreground status instead of the background rollup", () => {
+    const map = buildStatusMap([
+      conv("background", "running", {
+        foreground_status: "idle",
+        background_activity_count: 1,
+      }),
+    ]);
+    expect(map.get("background")).toBe("idle");
+  });
 });
 
 describe("detectIdleTransitions", () => {
@@ -50,6 +65,14 @@ describe("detectIdleTransitions", () => {
   it("detects running -> failed", () => {
     const prev = statusMap({ a: "running" });
     const result = detectIdleTransitions(prev, [conv("a", "failed")]);
+    expect(result.map((c) => c.id)).toEqual(["a"]);
+  });
+
+  it("detects foreground completion while aggregate status stays running", () => {
+    const prev = statusMap({ a: "running" });
+    const result = detectIdleTransitions(prev, [
+      conv("a", "running", { foreground_status: "idle", background_activity_count: 1 }),
+    ]);
     expect(result.map((c) => c.id)).toEqual(["a"]);
   });
 
@@ -255,6 +278,26 @@ describe("computeUnreadBadgeIds", () => {
       },
     );
     expect(calls).toEqual([{ id: "a", updatedAt: 42, status: "failed" }]);
+  });
+
+  it("passes foreground status to the unseen predicate for B sessions", () => {
+    const calls: (string | undefined)[] = [];
+    computeUnreadBadgeIds(
+      [
+        {
+          ...convB("background", { status: "running" }),
+          foreground_status: "idle",
+          background_activity_count: 1,
+        },
+      ],
+      undefined,
+      true,
+      (_id, _updatedAt, status) => {
+        calls.push(status);
+        return true;
+      },
+    );
+    expect(calls).toEqual(["idle"]);
   });
 
   it("returns an empty set for an empty list", () => {

@@ -10,12 +10,15 @@ export type NativeMobileHeaderMode = "server" | "conversation-title";
 export interface SessionNavigationPreferences {
   /** Null keeps the official behavior: every non-archived session participates. */
   pollingActiveWindowHours: number | null;
+  /** Keep sessions carrying the B marker behind non-background poll targets. */
+  deprioritizeBackgroundSessions: boolean;
   /** Native iOS defaults to its official top-of-screen Server switcher. */
   nativeMobileHeaderMode: NativeMobileHeaderMode;
 }
 
 const DEFAULT_PREFERENCES: SessionNavigationPreferences = {
   pollingActiveWindowHours: null,
+  deprioritizeBackgroundSessions: true,
   nativeMobileHeaderMode: "server",
 };
 
@@ -32,6 +35,7 @@ function normalizePreferences(value: unknown): SessionNavigationPreferences {
   const candidate = value as Partial<SessionNavigationPreferences>;
   return {
     pollingActiveWindowHours: normalizePollingWindow(candidate.pollingActiveWindowHours),
+    deprioritizeBackgroundSessions: candidate.deprioritizeBackgroundSessions !== false,
     nativeMobileHeaderMode:
       candidate.nativeMobileHeaderMode === "conversation-title" ? "conversation-title" : "server",
   };
@@ -53,6 +57,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
   try {
     if (
       normalized.pollingActiveWindowHours === null &&
+      normalized.deprioritizeBackgroundSessions &&
       normalized.nativeMobileHeaderMode === "server"
     ) {
       window.localStorage.removeItem(SESSION_NAVIGATION_STORAGE_KEY);
@@ -65,7 +70,9 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
   window.dispatchEvent(new Event(SESSION_NAVIGATION_CHANGED_EVENT));
   queueUserPreferencePatch(
     "session_navigation",
-    normalized.pollingActiveWindowHours === null && normalized.nativeMobileHeaderMode === "server"
+    normalized.pollingActiveWindowHours === null &&
+      normalized.deprioritizeBackgroundSessions &&
+      normalized.nativeMobileHeaderMode === "server"
       ? null
       : normalized,
   );

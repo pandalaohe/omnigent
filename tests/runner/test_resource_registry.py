@@ -393,7 +393,7 @@ async def _observe_native_agent_terminal_and_capture(
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
     # A status publisher is required for the native agent terminal's watcher to
     # wire its running/idle edges (and thus record the PTY status).
-    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
+    registry.set_session_status_publisher(lambda _sid, _status, _reason=None, _count=None: None)
     await registry.observe_required_terminal(
         session_id,
         instance.name,  # type: ignore[attr-defined]
@@ -431,19 +431,30 @@ class _FakeStatusPoller:
     def resync(self) -> None:
         self.resyncs += 1
 
-    def emit(self, status: str, blocked_on: str | None = None) -> None:
+    def emit(
+        self,
+        status: str,
+        blocked_on: str | None = None,
+        background_task_count: int | None = None,
+    ) -> None:
         """Simulate the file reporting a new status."""
-        self._on_status(status, blocked_on)
+        self._on_status(status, blocked_on, background_task_count)
 
 
 async def _observe_native_with_fake_poller(
     tmp_path: Path,
     session_id: str,
-) -> tuple[dict[str, object], list[str], list[_FakeStatusPoller], SessionResourceRegistry]:
+) -> tuple[
+    dict[str, object],
+    list[str],
+    list[int | None],
+    list[_FakeStatusPoller],
+    SessionResourceRegistry,
+]:
     """Observe a claude-native terminal with an injected fake poller.
 
-    :returns: ``(callbacks, statuses, pollers, registry)`` — the wired watcher
-        callbacks, the list the status publisher appends to, the
+    :returns: ``(callbacks, statuses, background_counts, pollers, registry)`` —
+        the wired watcher callbacks, the lists the status publisher appends to, the
         single-element list holding the injected poller (so the test can
         drive ``active`` / ``running_level`` / ``emit``), and the registry
         itself (so the test can post external status edges).
@@ -453,10 +464,19 @@ async def _observe_native_with_fake_poller(
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
     statuses: list[str] = []
+    background_counts: list[int | None] = []
     pollers: list[_FakeStatusPoller] = []
-    registry.set_session_status_publisher(
-        lambda _sid, status, _reason=None: statuses.append(status)
-    )
+
+    def _capture_status(
+        _sid: str,
+        status: str,
+        _reason: str | None = None,
+        count: int | None = None,
+    ) -> None:
+        statuses.append(status)
+        background_counts.append(count)
+
+    registry.set_session_status_publisher(_capture_status)
 
     def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
         del session_id, instance
@@ -488,14 +508,14 @@ async def _observe_native_with_fake_poller(
     await registry.observe_required_terminal(
         session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
     )
-    return callbacks, statuses, pollers, registry
+    return callbacks, statuses, background_counts, pollers, registry
 
 
 @pytest.mark.asyncio
 async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
     """The claude-native watcher is wired with an ``on_tick`` that drives
     the status-file poller."""
-    callbacks, _statuses, pollers, _registry = await _observe_native_with_fake_poller(
+    callbacks, _statuses, _counts, pollers, _registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_tick"
     )
     assert len(pollers) == 1
@@ -516,7 +536,7 @@ async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -
     freshness window to arbitrate — so while the file is readable it decides,
     and the pane's edges are dropped.
     """
-    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+    callbacks, statuses, _counts, pollers, _registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_file_owns"
     )
     poller = pollers[0]
@@ -535,6 +555,24 @@ async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_status_file_zero_survives_registry_dedup(tmp_path: Path) -> None:
+    """A shell-completion zero publishes even though foreground stays idle."""
+    callbacks, statuses, counts, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_shell_done"
+    )
+    poller = pollers[0]
+    poller.active = True
+
+    poller.emit("idle")  # raw ``shell`` maps to idle without a count
+    poller.emit("idle", background_task_count=0)  # later raw ``idle`` proves completion
+    await asyncio.sleep(0)
+
+    assert statuses == ["idle", "idle"]
+    assert counts == [None, 0]
+    del callbacks
+
+
+@pytest.mark.asyncio
 async def test_parked_pane_stays_running_then_recovers_on_pane_death(tmp_path: Path) -> None:
     """A dialog keeps the session running; a dead pane still ends it.
 
@@ -544,7 +582,7 @@ async def test_parked_pane_stays_running_then_recovers_on_pane_death(tmp_path: P
     pane death retires the poller and the PTY side owns the outcome. Without
     that, the session would spin forever.
     """
-    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+    callbacks, statuses, _counts, pollers, _registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_parked"
     )
     poller = pollers[0]
@@ -575,7 +613,7 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
     idempotent: the file's own ``idle`` lands on the same edge and is collapsed,
     so the two agree regardless of which arrives first.
     """
-    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+    callbacks, statuses, _counts, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_resync"
     )
     poller = pollers[0]
@@ -611,7 +649,7 @@ async def test_reconnect_resync_republishes_a_running_session(tmp_path: Path) ->
     so nothing re-asserts on its own. Without the resync the session would show
     no spinner and no stop button for the rest of the turn.
     """
-    _callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+    _callbacks, statuses, _counts, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_restart"
     )
     poller = pollers[0]
@@ -645,7 +683,7 @@ async def test_reconnect_resync_keeps_the_exit_classification_memo(tmp_path: Pat
     server has heard, so a reconnect must leave it alone — clearing it would make
     a crash right after a reconnect look like a tidy exit.
     """
-    _callbacks, _statuses, pollers, registry = await _observe_native_with_fake_poller(
+    _callbacks, _statuses, _counts, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_memo"
     )
     pollers[0].active = True
@@ -661,7 +699,7 @@ async def test_reconnect_resync_keeps_the_exit_classification_memo(tmp_path: Pat
 async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> None:
     """With no file (poller inactive), the PTY pane edges remain the status
     source — the fallback path for old Claude versions."""
-    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+    callbacks, statuses, _counts, pollers, _registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_fallback"
     )
     # Poller stays inactive (file never resolved).
@@ -1426,7 +1464,7 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
     edges: list[tuple[str, str | None]] = []
     pollers: list[_FakeStatusPoller] = []
     registry.set_session_status_publisher(
-        lambda _sid, status, reason=None: edges.append((status, reason))
+        lambda _sid, status, reason=None, _count=None: edges.append((status, reason))
     )
 
     def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:

@@ -2690,10 +2690,13 @@ def create_runner_app(
         session_id: str,
         status: str,
         blocked_on: str | None = None,
+        background_task_count: int | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if background_task_count is not None:
+            event["background_task_count"] = background_task_count
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)

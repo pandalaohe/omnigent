@@ -23,6 +23,19 @@ describe("SessionNavigationSettings", () => {
     );
   });
 
+  it("deprioritizes B sessions by default and lets the user disable it", async () => {
+    render(<SessionNavigationSettings />);
+    const toggle = screen.getByRole("switch", {
+      name: "Deprioritize background sessions while polling",
+    });
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(readSessionNavigationPreferences().deprioritizeBackgroundSessions).toBe(false),
+    );
+  });
+
   it("opts into the mobile title layout without changing the default", async () => {
     render(<MobileSessionTitleSetting />);
     const toggle = screen.getByRole("switch", {

@@ -59,6 +59,62 @@ describe("choosePolledConversation", () => {
   it("never returns the active session as its own unread target", () => {
     expect(choosePolledConversation([conversation("only")], "only", () => true)).toBeNull();
   });
+
+  it("keeps every B session behind actionable and unread non-background targets", () => {
+    const candidates = [
+      conversation("active"),
+      conversation("background-response", 4, {
+        pending_elicitations_count: 1,
+        background_activity_count: 1,
+      }),
+      conversation("background-result", 3, { background_activity_count: 2 }),
+      conversation("plain-result", 2),
+    ];
+    const unread = (row: Conversation) =>
+      row.id === "background-result" || row.id === "plain-result";
+
+    expect(choosePolledConversation(candidates, "active", unread, true)?.id).toBe("plain-result");
+    expect(choosePolledConversation(candidates, "active", unread, false)?.id).toBe(
+      "background-response",
+    );
+  });
+
+  it("still visits a B response before ordinary sessions in the secondary pass", () => {
+    const candidates = [
+      conversation("active"),
+      conversation("plain-idle"),
+      conversation("background-response", 2, {
+        pending_elicitations_count: 1,
+        background_activity_count: 1,
+      }),
+    ];
+    expect(choosePolledConversation(candidates, "active", () => false, true)?.id).toBe(
+      "background-response",
+    );
+  });
+
+  it("keeps an ordinary B session behind ordinary non-background sessions", () => {
+    const candidates = [
+      conversation("active"),
+      conversation("background-idle", 3, { background_activity_count: 1 }),
+      conversation("plain-idle", 2),
+    ];
+
+    expect(choosePolledConversation(candidates, "active", () => false, true)?.id).toBe(
+      "plain-idle",
+    );
+    expect(
+      choosePolledConversation(
+        [
+          conversation("active"),
+          conversation("background-idle", 3, { background_activity_count: 1 }),
+        ],
+        "active",
+        () => false,
+        true,
+      )?.id,
+    ).toBe("background-idle");
+  });
 });
 
 describe("useSessionPollingHotkeys", () => {
@@ -93,6 +149,7 @@ describe("useSessionPollingHotkeys", () => {
     const nowSeconds = Date.now() / 1000;
     writeSessionNavigationPreferences({
       pollingActiveWindowHours: 2,
+      deprioritizeBackgroundSessions: true,
       nativeMobileHeaderMode: "server",
     });
     const rows = [
@@ -121,6 +178,7 @@ describe("useSessionPollingHotkeys", () => {
       .mockResolvedValue([conversation("outside", Date.now() / 1000 - 2 * 60 * 60)]);
     writeSessionNavigationPreferences({
       pollingActiveWindowHours: 1,
+      deprioritizeBackgroundSessions: true,
       nativeMobileHeaderMode: "server",
     });
     renderHook(() =>
@@ -154,6 +212,30 @@ describe("useSessionPollingHotkeys", () => {
     act(() => window.dispatchEvent(new Event(POLL_SESSIONS_ACTION_EVENT)));
 
     await waitFor(() => expect(navigate).toHaveBeenLastCalledWith("/c/seed-unread"));
+  });
+
+  it("recognizes a finished B session as unread from its foreground status", async () => {
+    const rows = [
+      conversation("active", 10),
+      conversation("background-result", 20, {
+        status: "running",
+        foreground_status: "idle",
+        background_activity_count: 1,
+        viewer_last_seen: 10,
+      }),
+      conversation("plain-idle", 30, { viewer_last_seen: 30 }),
+    ];
+    renderHook(() =>
+      useSessionPollingHotkeys({
+        activeId: "active",
+        getConversations: async () => rows,
+        onArchive: vi.fn(),
+      }),
+    );
+
+    act(() => window.dispatchEvent(new Event(POLL_SESSIONS_ACTION_EVENT)));
+
+    await waitFor(() => expect(navigate).toHaveBeenLastCalledWith("/c/background-result"));
   });
 
   it("does not navigate from a poll that resolves after the active route changes", async () => {

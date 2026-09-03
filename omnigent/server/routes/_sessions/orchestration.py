@@ -293,6 +293,7 @@ from omnigent.server.routes._sessions.helpers import (
     _routing_decision_item_from_sse,
     _RunnerForwardResult,
     _seed_missing_title_from_user_message,
+    _session_background_activity_count,
     _session_status_from_cache,
     _session_status_with_child_rollup,
     _SessionEventDispatchResult,
@@ -849,6 +850,10 @@ def _build_session_list_item(
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
         status=_session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
+        foreground_status=_session_status_from_cache(conv.id, conv.live_status),
+        background_activity_count=_session_background_activity_count(
+            conv.id, child_session_ids, conv.live_status
+        ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         archived_at=conv.archived_at,

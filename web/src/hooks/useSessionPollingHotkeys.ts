@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
+import { getConversationForegroundStatus } from "@/hooks/useSessionState";
 import { isConversationUnseen, seedReadState } from "@/hooks/useUnseenConversations";
 import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import { useNavigate } from "@/lib/routing";
@@ -18,27 +19,49 @@ export function dispatchArchiveSession(): void {
   if (typeof window !== "undefined") window.dispatchEvent(new Event(ARCHIVE_SESSION_ACTION_EVENT));
 }
 
-/** Select unread-first in circular list order, otherwise select the next row. */
+function pollingPriority(
+  conversation: Conversation,
+  unread: boolean,
+  deprioritizeBackgroundSessions: boolean,
+): number {
+  const actionable = (conversation.pending_elicitations_count ?? 0) > 0;
+  if (!deprioritizeBackgroundSessions) {
+    if (actionable) return 0;
+    return unread ? 1 : 2;
+  }
+
+  const background = (conversation.background_activity_count ?? 0) > 0;
+  if (!background) {
+    if (actionable) return 0;
+    return unread ? 1 : 4;
+  }
+  if (actionable) return 2;
+  return unread ? 3 : 5;
+}
+
+/** Select action/result-first in circular order, optionally keeping B rows secondary. */
 export function choosePolledConversation(
   conversations: readonly Conversation[],
   activeId: string | undefined,
   isUnread: (conversation: Conversation) => boolean,
+  deprioritizeBackgroundSessions = false,
 ): Conversation | null {
   if (conversations.length === 0) return null;
   const activeIndex = activeId ? conversations.findIndex((row) => row.id === activeId) : -1;
   const start = activeIndex >= 0 ? activeIndex + 1 : 0;
-
+  let selected: Conversation | null = null;
+  let selectedPriority = Number.POSITIVE_INFINITY;
   for (let offset = 0; offset < conversations.length; offset++) {
     const candidate = conversations[(start + offset) % conversations.length];
-    if (candidate && candidate.id !== activeId && isUnread(candidate)) return candidate;
+    if (!candidate || candidate.id === activeId) continue;
+    const unread = isUnread(candidate);
+    const priority = pollingPriority(candidate, unread, deprioritizeBackgroundSessions);
+    if (priority < selectedPriority) {
+      selected = candidate;
+      selectedPriority = priority;
+    }
   }
-
-  if (conversations.length === 1 && conversations[0]?.id === activeId) return null;
-  for (let offset = 0; offset < conversations.length; offset++) {
-    const candidate = conversations[(start + offset) % conversations.length];
-    if (candidate && candidate.id !== activeId) return candidate;
-  }
-  return null;
+  return selected;
 }
 
 export interface SessionPollingHotkeysOptions {
@@ -51,9 +74,14 @@ export interface SessionPollingHotkeysOptions {
 
 export function useSessionPollingHotkeys(options: SessionPollingHotkeysOptions): void {
   const navigate = useNavigate();
-  const { pollingActiveWindowHours } = useSessionNavigationPreferences();
-  const latest = useRef({ ...options, pollingActiveWindowHours });
-  latest.current = { ...options, pollingActiveWindowHours };
+  const { pollingActiveWindowHours, deprioritizeBackgroundSessions } =
+    useSessionNavigationPreferences();
+  const latest = useRef({
+    ...options,
+    pollingActiveWindowHours,
+    deprioritizeBackgroundSessions,
+  });
+  latest.current = { ...options, pollingActiveWindowHours, deprioritizeBackgroundSessions };
   const busy = useRef(false);
 
   useEffect(() => {
@@ -65,13 +93,22 @@ export function useSessionPollingHotkeys(options: SessionPollingHotkeysOptions):
       seedReadState(allRows);
       const unread = (conversation: Conversation) =>
         operation.isUnread?.(conversation) ??
-        isConversationUnseen(conversation.id, conversation.updated_at, conversation.status);
+        isConversationUnseen(
+          conversation.id,
+          conversation.updated_at,
+          getConversationForegroundStatus(conversation),
+        );
       const eligibleRows = allRows.filter((row) =>
         isSessionInsidePollingWindow(row.updated_at, operation.pollingActiveWindowHours),
       );
       return {
         allRows,
-        target: choosePolledConversation(eligibleRows, operation.activeId, unread),
+        target: choosePolledConversation(
+          eligibleRows,
+          operation.activeId,
+          unread,
+          operation.deprioritizeBackgroundSessions,
+        ),
       };
     };
 

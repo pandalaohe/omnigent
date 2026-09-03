@@ -161,6 +161,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
+import { seedReadState } from "@/hooks/useUnseenConversations";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -414,6 +415,71 @@ describe("Sidebar session list", () => {
     const slot = screen.getByTestId("session-state-badge").parentElement!;
     expect(slot).toHaveClass("right-1");
     expect(slot).not.toHaveClass("w-6");
+  });
+
+  it("shows B independently beside foreground and response states", () => {
+    mockConversations([
+      conv("conv_background", "Claude Code", {
+        title: "Background only",
+        status: "running",
+        foreground_status: "idle",
+        background_activity_count: 2,
+      }),
+      conv("conv_both", "Claude Code", {
+        title: "Foreground and background",
+        status: "running",
+        foreground_status: "running",
+        background_activity_count: 1,
+      }),
+      conv("conv_response_background", "Claude Code", {
+        title: "Response and background",
+        foreground_status: "idle",
+        pending_elicitations_count: 1,
+        background_activity_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    const backgroundOnly = screen.getByText("Background only").closest("li")!;
+    expect(within(backgroundOnly).queryByTestId("session-state-badge")).toBeNull();
+    expect(within(backgroundOnly).getByTestId("background-activity-badge")).toHaveTextContent("B");
+
+    const both = screen.getByText("Foreground and background").closest("li")!;
+    expect(within(both).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "running",
+    );
+    expect(within(both).getByTestId("background-activity-badge")).toHaveAccessibleName(
+      "1 background activity running",
+    );
+
+    const response = screen.getByText("Response and background").closest("li")!;
+    expect(within(response).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "awaiting",
+    );
+    expect(within(response).getByTestId("background-activity-badge")).toBeInTheDocument();
+  });
+
+  it("shows unread plus B when only the background rollup is running", () => {
+    const row = conv("conv_background_unread", "Claude Code", {
+      title: "Finished foreground",
+      status: "running",
+      foreground_status: "idle",
+      background_activity_count: 1,
+      updated_at: 20,
+      viewer_last_seen: 10,
+    });
+    seedReadState([row]);
+    mockConversations([row]);
+    renderSidebar();
+
+    const renderedRow = screen.getByText("Finished foreground").closest("li")!;
+    expect(within(renderedRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "unseen",
+    );
+    expect(within(renderedRow).getByTestId("background-activity-badge")).toBeInTheDocument();
   });
 
   it("offers the four display filters and defaults to My sessions", () => {
@@ -1768,6 +1834,30 @@ describe("Sidebar collapsed project marker", () => {
     const header = screen.getByRole("button", { name: /^Customer X/ });
     expect(header).toHaveAttribute("aria-expanded", "false");
     expect(within(header).getByText("Needs response")).toBeInTheDocument();
+  });
+
+  it("keeps foreground and B markers distinct on a collapsed project", () => {
+    projectsMock.push("Customer B");
+    const row = conv("conv_project_background", "Claude Code", {
+      labels: { omni_project: "Customer B" },
+      status: "running",
+      foreground_status: "idle",
+      background_activity_count: 2,
+      updated_at: 20,
+      viewer_last_seen: 10,
+    });
+    seedReadState([row]);
+    mockConversations([row]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer B/ });
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "unseen",
+    );
+    expect(within(header).getByTestId("background-activity-badge")).toHaveAccessibleName(
+      "2 background activities running",
+    );
   });
 
   it("drops the header marker once the project is expanded", () => {

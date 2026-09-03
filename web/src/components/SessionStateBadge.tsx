@@ -13,6 +13,10 @@ export interface SessionStateBadgeProps {
   state: SessionState;
 }
 
+export interface BackgroundActivityBadgeProps {
+  count: number;
+}
+
 interface Visual {
   kind: SessionState["kind"];
   ariaLabel: string;
@@ -85,6 +89,25 @@ export function SessionStateBadge({ state }: SessionStateBadgeProps) {
       {/* Opens left: the badge sits at the right edge of the narrow
           sidebar, so a right-opening tooltip would overflow the panel. */}
       <TooltipContent side="left">{visual.tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+export function BackgroundActivityBadge({ count }: BackgroundActivityBadgeProps) {
+  const label = `${count} background activit${count === 1 ? "y" : "ies"} running`;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          data-testid="background-activity-badge"
+          role="img"
+          aria-label={label}
+          className="inline-flex size-4 shrink-0 items-center justify-center rounded border border-info/45 bg-info/10 font-semibold text-[10px] text-info leading-none"
+        >
+          B
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="left">{label}</TooltipContent>
     </Tooltip>
   );
 }

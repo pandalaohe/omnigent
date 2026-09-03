@@ -164,7 +164,7 @@ def test_poller_publishes_edges_only(tmp_path: Path) -> None:
     _write_session_file(sessions, pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, _reason: published.append(status),
+        on_status=lambda status, _reason, _count: published.append(status),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -188,7 +188,7 @@ def test_poller_gives_up_when_file_never_appears(tmp_path: Path) -> None:
     (tmp_path / "sessions").mkdir()
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, _reason: published.append(status),
+        on_status=lambda status, _reason, _count: published.append(status),
         pane_pid_getter=_StubPidGetter(404),
         session_id_getter=lambda: None,
         config_dir=tmp_path,
@@ -207,7 +207,7 @@ def test_poller_deactivates_when_file_vanishes(tmp_path: Path) -> None:
     path = _write_session_file(sessions, pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, _reason: published.append(status),
+        on_status=lambda status, _reason, _count: published.append(status),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -234,6 +234,26 @@ def test_shell_status_maps_to_idle(tmp_path: Path) -> None:
     assert status.raw_status == "shell"
 
 
+def test_shell_completion_publishes_authoritative_zero(tmp_path: Path) -> None:
+    """``shell`` → ``idle`` clears the sticky tally despite both mapping idle."""
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=7, session_id="s", status="shell")
+    published: list[tuple[str, str | None, int | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason, count: published.append((status, reason, count)),
+        pane_pid_getter=_StubPidGetter(7),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+
+    poller.tick()
+    assert published == [(IDLE, None, None)]
+
+    _write_session_file(sessions, pid=7, session_id="s", status="idle")
+    poller.tick()
+    assert published == [(IDLE, None, None), (IDLE, None, 0)]
+
+
 def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> None:
     """An unrecognized literal must not swallow the next real edge.
 
@@ -246,7 +266,7 @@ def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> N
     _write_session_file(sessions, pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, _reason: published.append(status),
+        on_status=lambda status, _reason, _count: published.append(status),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -285,7 +305,7 @@ def test_stale_busy_is_reported_as_written(tmp_path: Path) -> None:
     )
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, _reason: published.append(status),
+        on_status=lambda status, _reason, _count: published.append(status),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -310,7 +330,7 @@ def test_retire_stops_the_file_owning_status(tmp_path: Path) -> None:
     )
     published: list[tuple[str, str | None]] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, reason: published.append((status, reason)),
+        on_status=lambda status, reason, _count: published.append((status, reason)),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -341,7 +361,7 @@ def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
     _write_session_file(sessions, pid=1, session_id="s", status="busy")
     published: list[tuple[str, str | None]] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, reason: published.append((status, reason)),
+        on_status=lambda status, reason, _count: published.append((status, reason)),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -372,7 +392,7 @@ def test_resync_does_not_revive_a_retired_poller(tmp_path: Path) -> None:
     _write_session_file(sessions, pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, _reason: published.append(status),
+        on_status=lambda status, _reason, _count: published.append(status),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -416,7 +436,7 @@ def test_poller_publishes_when_only_the_reason_changes(tmp_path: Path) -> None:
     _write_session_file(sessions, pid=1, session_id="s", status="busy")
     published: list[tuple[str, str | None]] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, reason: published.append((status, reason)),
+        on_status=lambda status, reason, _count: published.append((status, reason)),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -451,7 +471,7 @@ def test_parked_session_stays_running_indefinitely(tmp_path: Path) -> None:
     )
     published: list[tuple[str, str | None]] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, reason: published.append((status, reason)),
+        on_status=lambda status, reason, _count: published.append((status, reason)),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,

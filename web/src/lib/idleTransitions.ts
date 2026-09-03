@@ -7,6 +7,7 @@
 // diffs two snapshots.
 
 import type { Conversation } from "@/hooks/useConversations";
+import { getConversationForegroundStatus } from "@/hooks/useSessionState";
 
 // Statuses that mean "the agent stopped working and is waiting on the
 // user" — the moment worth surfacing. "running" is excluded (still
@@ -19,7 +20,8 @@ export type ConversationStatus = NonNullable<Conversation["status"]>;
 export function buildStatusMap(conversations: Conversation[]): Map<string, ConversationStatus> {
   const map = new Map<string, ConversationStatus>();
   for (const conversation of conversations) {
-    if (conversation.status !== undefined) map.set(conversation.id, conversation.status);
+    const status = getConversationForegroundStatus(conversation);
+    if (status !== undefined) map.set(conversation.id, status);
   }
   return map;
 }
@@ -37,7 +39,7 @@ export function detectIdleTransitions(
   conversations: Conversation[],
 ): Conversation[] {
   return conversations.filter((conversation) => {
-    const status = conversation.status;
+    const status = getConversationForegroundStatus(conversation);
     if (status === undefined || !TERMINAL_STATUSES.has(status)) return false;
     return previous.get(conversation.id) === "running";
   });
@@ -110,7 +112,14 @@ export function computeUnreadBadgeIds(
   for (const conversation of conversations) {
     if (windowFocused && conversation.id === activeId) continue;
     const awaiting = (conversation.pending_elicitations_count ?? 0) > 0;
-    if (awaiting || isUnseen(conversation.id, conversation.updated_at, conversation.status)) {
+    if (
+      awaiting ||
+      isUnseen(
+        conversation.id,
+        conversation.updated_at,
+        getConversationForegroundStatus(conversation),
+      )
+    ) {
       unread.add(conversation.id);
     }
   }

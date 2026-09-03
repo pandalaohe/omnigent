@@ -4088,6 +4088,22 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(rows.find((c) => c.id === "conv_other")?.status).toBe("idle");
     });
 
+    it("patches foreground status even when aggregate status already matches", () => {
+      seedConversationsCache([
+        {
+          ...conv("conv_abc", "running"),
+          foreground_status: "idle",
+          background_activity_count: 1,
+        },
+      ]);
+
+      handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "running" });
+
+      const row = readConversationRows().find((c) => c.id === "conv_abc");
+      expect(row?.status).toBe("running");
+      expect(row?.foreground_status).toBe("running");
+    });
+
     it("collapses live 'waiting' to the list's 'running' (server-list parity)", () => {
       // GET /v1/sessions maps running/waiting → "running"; the live patch must
       // match so the badge agrees with the next poll instead of flapping.

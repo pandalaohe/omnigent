@@ -2508,6 +2508,11 @@ class SessionListItem(BaseModel):
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
     :param status: Derived session lifecycle status.
+    :param foreground_status: Status of this session's own turn, excluding
+        child-session rollup. This distinguishes a busy main turn from
+        background-only activity while preserving ``status`` for compatibility.
+    :param background_activity_count: Number of active direct sub-agents plus
+        background shells owned by this session. ``0`` means none are known.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
     :param archived_at: Unix epoch seconds of the most recent transition into
@@ -2603,6 +2608,8 @@ class SessionListItem(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    foreground_status: Literal["idle", "running", "failed"]
+    background_activity_count: int = Field(ge=0)
     created_at: int
     updated_at: int
     archived_at: int | None = None

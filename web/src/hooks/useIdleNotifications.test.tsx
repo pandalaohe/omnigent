@@ -167,6 +167,23 @@ describe("useIdleNotifications turn-end transitions", () => {
     });
   });
 
+  it("notifies when foreground stops while background activity keeps aggregate status running", async () => {
+    setConversations([{ ...conv("a", "running"), foreground_status: "running" }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([
+      {
+        ...conv("a", "running"),
+        foreground_status: "idle",
+        background_activity_count: 1,
+      },
+    ]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
   it("uses the agent's final message text as the body when available", async () => {
     fetchPreviewMock.mockResolvedValue("Fixed the badge bug and shipped it.");
     setConversations([conv("a", "running")]);

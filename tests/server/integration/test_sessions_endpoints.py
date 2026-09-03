@@ -645,20 +645,32 @@ async def test_list_sessions_rolls_up_busy_child_status(
         agent_id=agent["id"],
     )
 
-    sessions_module._session_status_cache.pop(parent["id"], None)
+    sessions_module._session_status_cache[parent["id"]] = "idle"
     sessions_module._session_status_cache.pop(other["id"], None)
     sessions_module._session_status_cache[child.id] = "waiting"
+    sessions_module._session_background_task_count_cache[parent["id"]] = 2
     try:
         resp = await client.get("/v1/sessions")
         assert resp.status_code == 200
         items_by_id = {item["id"]: item for item in resp.json()["data"]}
 
         assert items_by_id[parent["id"]]["status"] == "running"
+        assert items_by_id[parent["id"]]["foreground_status"] == "idle"
+        assert items_by_id[parent["id"]]["background_activity_count"] == 3
         assert items_by_id[other["id"]]["status"] == "idle"
+        assert items_by_id[other["id"]]["foreground_status"] == "idle"
+        assert items_by_id[other["id"]]["background_activity_count"] == 0
+
+        sessions_module._session_status_cache[parent["id"]] = "running"
+        resp = await client.get("/v1/sessions")
+        items_by_id = {item["id"]: item for item in resp.json()["data"]}
+        assert items_by_id[parent["id"]]["foreground_status"] == "running"
+        assert items_by_id[parent["id"]]["background_activity_count"] == 3
     finally:
         sessions_module._session_status_cache.pop(parent["id"], None)
         sessions_module._session_status_cache.pop(other["id"], None)
         sessions_module._session_status_cache.pop(child.id, None)
+        sessions_module._session_background_task_count_cache.pop(parent["id"], None)
 
 
 async def test_session_snapshot_defaults_terminal_pending_false(

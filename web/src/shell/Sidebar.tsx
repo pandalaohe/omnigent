@@ -141,7 +141,7 @@ import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
-import { SessionStateBadge } from "@/components/SessionStateBadge";
+import { BackgroundActivityBadge, SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
@@ -150,7 +150,11 @@ import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import {
+  getConversationForegroundStatus,
+  getSessionState,
+  type SessionState,
+} from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -1185,7 +1189,7 @@ function ProjectFolder({
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
-  marker: SessionState | null;
+  marker: ProjectMarkerState;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
   activeOverride: ActiveChatOverride | null;
@@ -1275,7 +1279,8 @@ function ProjectFolder({
           )
         }
         active={active}
-        marker={marker}
+        marker={marker.state}
+        backgroundActivityCount={marker.backgroundActivityCount}
         conversations={conversations}
         pinnedConversationIds={pinnedConversationIds}
         // Projects default collapsed: shown only when explicitly expanded.
@@ -1439,7 +1444,6 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
-
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
@@ -2316,37 +2320,50 @@ function UngroupDropZone() {
 
 /**
  * Aggregate the sidebar marker for a project from its conversations, using
- * the same precedence a row uses (awaiting > unseen > running). Returned as a
- * {@link SessionState} so a collapsed project header can render the exact
- * same {@link SessionStateBadge} the rows do. ``null`` = no marker.
+ * the same foreground precedence a row uses (awaiting > unseen > running),
+ * while summing background activity independently so both can be rendered.
  */
-function projectMarkerState(conversations: Conversation[]): SessionState | null {
+interface ProjectMarkerState {
+  state: SessionState | null;
+  backgroundActivityCount: number;
+}
+
+function projectMarkerState(conversations: Conversation[]): ProjectMarkerState {
   let awaiting = 0;
   let unseen = false;
   let running = false;
+  let backgroundActivityCount = 0;
   for (const c of conversations) {
+    const foregroundStatus = getConversationForegroundStatus(c);
+    backgroundActivityCount += c.background_activity_count ?? 0;
     const pending = c.pending_elicitations_count ?? 0;
     if (pending > 0) {
       awaiting += pending;
-    } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
+    } else if (isConversationUnseen(c.id, c.updated_at, foregroundStatus)) {
       unseen = true;
-    } else if (c.status === "running") {
+    } else if (foregroundStatus === "running") {
       running = true;
     }
   }
-  if (awaiting > 0) return { kind: "awaiting", count: awaiting };
-  if (unseen) return { kind: "unseen" };
-  if (running) return { kind: "running" };
-  return null;
+  const state: SessionState | null =
+    awaiting > 0
+      ? { kind: "awaiting", count: awaiting }
+      : unseen
+        ? { kind: "unseen" }
+        : running
+          ? { kind: "running" }
+          : null;
+  return { state, backgroundActivityCount };
 }
 
 // The shared collapsible header used by every sidebar section and section
 // group, so they all align and animate identically (icon · title · marker ·
-// hover-chevron). Headers carry no count badge.
+// hover-chevron).
 function SectionHeader({
   title,
   icon,
   marker,
+  backgroundActivityCount = 0,
   active = false,
   hasAction,
   collapsed,
@@ -2355,6 +2372,8 @@ function SectionHeader({
   title: string;
   icon?: ReactNode;
   marker?: SessionState | null;
+  /** Sum of background work hidden inside this collapsed section. */
+  backgroundActivityCount?: number;
   /** Whether this header represents the current page context. */
   active?: boolean;
   /** Whether the section also renders a hover-revealed header action (the
@@ -2413,9 +2432,9 @@ function SectionHeader({
               : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
           )}
         />
-        {/* A hidden row inside this collapsed section carries a marker — surface
-            the exact same badge a row would show, pinned to the right edge. */}
-        {collapsed && marker && (
+        {/* Hidden rows inside this collapsed section carry their foreground and
+            background markers up to the header, pinned to the right edge. */}
+        {collapsed && (marker || backgroundActivityCount > 0) && (
           <span
             className={cn(
               // Match the session rows' badge slot so the marker lines up
@@ -2424,12 +2443,12 @@ function SectionHeader({
               // headers use pr-0), so offset each to the same right-1 edge:
               // -mr-1 trims the folder's 8px padding to 4px; mr-1 pushes the
               // padless header out to 4px.
-              "ml-auto flex shrink-0 items-center justify-center transition-opacity",
+              "ml-auto flex shrink-0 items-center justify-center gap-1 transition-opacity",
               icon ? "-mr-1" : "mr-1",
               // Dot/spinner markers get the fixed size-6 centered box (center
               // lands 16px from the edge, matching the rows). The "awaiting"
               // pill keeps its natural width so its label isn't clipped.
-              isDotMarker(marker) && "w-6",
+              isDotMarker(marker ?? null) && backgroundActivityCount === 0 && "w-6",
               // When the header also carries a hover-revealed kebab, keep the
               // marker clear of it the same way a row's time/marker slot does:
               // reserve space on mobile (kebab always shown) and fade out on
@@ -2442,7 +2461,10 @@ function SectionHeader({
                 ),
             )}
           >
-            <SessionStateBadge state={marker} />
+            {marker && <SessionStateBadge state={marker} />}
+            {backgroundActivityCount > 0 && (
+              <BackgroundActivityBadge count={backgroundActivityCount} />
+            )}
           </span>
         )}
       </button>
@@ -2641,6 +2663,7 @@ function ConversationSection({
   title,
   icon,
   marker,
+  backgroundActivityCount,
   active,
   conversations,
   pinnedConversationIds,
@@ -2664,6 +2687,8 @@ function ConversationSection({
   icon?: ReactNode;
   /** When collapsed, the aggregate marker of hidden rows (same badge as a row). */
   marker?: SessionState | null;
+  /** Aggregate background work surfaced only while the section is collapsed. */
+  backgroundActivityCount?: number;
   /** Whether this section header represents the current page context. */
   active?: boolean;
   conversations: Conversation[];
@@ -2708,6 +2733,7 @@ function ConversationSection({
             title={title}
             icon={icon}
             marker={marker}
+            backgroundActivityCount={backgroundActivityCount}
             active={active}
             hasAction={headerAction != null || persistentHeaderAction != null}
             collapsed={isCollapsed}
@@ -3362,7 +3388,11 @@ function ConversationRow({
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
   const hasUnseenMessages =
-    isConversationUnseen(conversation.id, conversation.updated_at, conversation.status) &&
+    isConversationUnseen(
+      conversation.id,
+      conversation.updated_at,
+      getConversationForegroundStatus(conversation),
+    ) &&
     (!isActive || isExplicitlyUnread(conversation.id));
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
@@ -3387,11 +3417,13 @@ function ConversationRow({
       : hasUnseenMessages
         ? { kind: "unseen" as const }
         : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
+  const backgroundActivityCount = Math.max(0, conversation.background_activity_count ?? 0);
+  const hasBackgroundActivity = backgroundActivityCount > 0;
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
-  const showDraftIndicator = hasDraft && !isActive;
-  const hasTrailingIndicator = sessionState !== null || showDraftIndicator;
+  const showDraftIndicator = hasDraft && !isActive && !hasBackgroundActivity;
+  const hasTrailingIndicator = sessionState !== null || hasBackgroundActivity || showDraftIndicator;
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -3569,7 +3601,15 @@ function ConversationRow({
         // reserves only what the badge needs — the same width desktop uses at
         // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting" ? "pr-29" : hasTrailingIndicator ? "pr-8" : "pr-2"),
+          (sessionState?.kind === "awaiting"
+            ? hasBackgroundActivity
+              ? "pr-[8.75rem]"
+              : "pr-29"
+            : sessionState !== null && hasBackgroundActivity
+              ? "pr-11"
+              : hasTrailingIndicator
+                ? "pr-8"
+                : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -3725,12 +3765,16 @@ function ConversationRow({
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in
             // the fixed centered box so it lines up under the kebab.
-            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
+            isDotMarker(sessionState) &&
+              (sessionState !== null && hasBackgroundActivity
+                ? "w-11 justify-center gap-1"
+                : SESSION_STATE_DOT_SLOT_CLASS),
+            sessionState?.kind === "awaiting" && hasBackgroundActivity && "gap-1",
           )}
         >
           {sessionState !== null ? (
             <SessionStateBadge state={sessionState} />
-          ) : (
+          ) : showDraftIndicator ? (
             <span
               role="img"
               aria-label="Draft"
@@ -3739,7 +3783,8 @@ function ConversationRow({
             >
               <MessageCircleDashedIcon aria-hidden className="size-3.5" />
             </span>
-          )}
+          ) : null}
+          {hasBackgroundActivity && <BackgroundActivityBadge count={backgroundActivityCount} />}
         </span>
       ) : null}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex

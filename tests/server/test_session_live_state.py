@@ -385,6 +385,8 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
             id=session_id,
             agent_id="ag_1",
             status="idle",
+            foreground_status="idle",
+            background_activity_count=0,
             created_at=1,
             updated_at=1,
             pending_elicitations_count=3,

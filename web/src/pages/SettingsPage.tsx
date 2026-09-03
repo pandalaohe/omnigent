@@ -848,6 +848,7 @@ function AppearanceSection() {
 
     writeSessionNavigationPreferences({
       ...readSessionNavigationPreferences(),
+      deprioritizeBackgroundSessions: true,
       nativeMobileHeaderMode: "server",
     });
 

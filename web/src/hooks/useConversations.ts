@@ -166,6 +166,10 @@ export interface Conversation {
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
   status?: "idle" | "running" | "failed";
+  /** This session's own turn status, excluding active child-session rollup. */
+  foreground_status?: "idle" | "running" | "failed";
+  /** Active direct sub-agents plus background shells owned by this session. */
+  background_activity_count?: number;
   /**
    * Whether the session's runner is reachable, matching `GET /health`.
    * `GET /v1/sessions` and the `WS /v1/sessions/updates` stream include

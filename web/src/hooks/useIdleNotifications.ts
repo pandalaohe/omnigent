@@ -60,6 +60,7 @@ import {
   detectNewElicitations,
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
+import { getConversationForegroundStatus } from "@/hooks/useSessionState";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
@@ -299,7 +300,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
     // Resume cancels a pending turn-end: any session back to `running` was just
     // between steps, not finished — drop its deferred cue before it fires.
     for (const conversation of conversations) {
-      if (conversation.status !== "running") continue;
+      if (getConversationForegroundStatus(conversation) !== "running") continue;
       const pending = timers.get(conversation.id);
       if (pending !== undefined) {
         clearTimeout(pending);
