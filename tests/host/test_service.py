@@ -166,6 +166,40 @@ def test_pause_resume_launchd_user_service_preserves_definition(
     ]
 
 
+def test_pause_launchd_user_service_waits_for_async_bootout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(service.os, "getuid", lambda: 504, raising=False)
+    path = tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
+    path.parent.mkdir(parents=True)
+    path.write_text("preserve-me")
+    print_results = iter([0, 0, 1])
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def _run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        returncode = next(print_results) if args[:2] == ["launchctl", "print"] else 0
+        return subprocess.CompletedProcess(args, returncode, "", "")
+
+    monkeypatch.setattr(service.subprocess, "run", _run)
+    monkeypatch.setattr(service.time, "sleep", sleeps.append)
+
+    paused = service.pause_user_host_service()
+
+    assert paused is not None
+    assert path.read_text() == "preserve-me"
+    assert calls == [
+        ["launchctl", "bootout", "gui/504/ai.omnigent.host"],
+        ["launchctl", "print", "gui/504/ai.omnigent.host"],
+        ["launchctl", "print", "gui/504/ai.omnigent.host"],
+        ["launchctl", "print", "gui/504/ai.omnigent.host"],
+    ]
+    assert sleeps == [0.1, 0.1]
+
+
 def test_pause_resume_systemd_user_service_preserves_definition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

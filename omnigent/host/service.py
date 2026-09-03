@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,8 @@ from omnigent.process_logging import data_dir
 LAUNCHD_LABEL = "ai.omnigent.host"
 SYSTEMD_UNIT = "omnigent-host.service"
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_LAUNCHD_STOP_TIMEOUT_S = 5.0
+_LAUNCHD_STOP_POLL_S = 0.1
 
 
 class HostServiceError(RuntimeError):
@@ -202,6 +205,19 @@ def _run_best_effort(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         raise HostServiceError(f"Required service manager {args[0]!r} was not found.") from exc
 
 
+def _wait_for_launchd_stop(service_target: str) -> None:
+    """Wait for launchd's asynchronous ``bootout`` to remove a service."""
+    deadline = time.monotonic() + _LAUNCHD_STOP_TIMEOUT_S
+    while _run_best_effort(["launchctl", "print", service_target]).returncode == 0:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HostServiceError(
+                f"launchd service {LAUNCHD_LABEL!r} is still running after "
+                f"{_LAUNCHD_STOP_TIMEOUT_S:g}s."
+            )
+        time.sleep(min(_LAUNCHD_STOP_POLL_S, remaining))
+
+
 def _restore_file(path: Path, previous: bytes | None) -> None:
     """Restore a service definition after a manager command fails."""
     if previous is None:
@@ -303,8 +319,7 @@ def disable_user_host_service() -> HostService:
         domain = f"gui/{_current_uid()}"
         service_target = f"{domain}/{service.label}"
         _run_best_effort(["launchctl", "bootout", service_target])
-        if _run_best_effort(["launchctl", "print", service_target]).returncode == 0:
-            raise HostServiceError(f"launchd service {service.label!r} is still running.")
+        _wait_for_launchd_stop(service_target)
         service.path.unlink(missing_ok=True)
     else:
         disable_args = ["systemctl", "--user", "disable", "--now", service.label]
@@ -332,8 +347,7 @@ def pause_user_host_service() -> HostService | None:
         domain = f"gui/{_current_uid()}"
         service_target = f"{domain}/{service.label}"
         _run_best_effort(["launchctl", "bootout", service_target])
-        if _run_best_effort(["launchctl", "print", service_target]).returncode == 0:
-            raise HostServiceError(f"launchd service {service.label!r} is still running.")
+        _wait_for_launchd_stop(service_target)
     else:
         _run_checked(["systemctl", "--user", "stop", service.label])
     return service
