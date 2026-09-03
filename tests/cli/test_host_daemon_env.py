@@ -136,3 +136,29 @@ def test_runner_env_preserves_claude_tool_search_flags() -> None:
 
     # Then
     assert {name: env.get(name) for name in _CLAUDE_TOOL_SEARCH_ENV} == _CLAUDE_TOOL_SEARCH_ENV
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_defaults_pythonutf8_on(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Both daemon modes force UTF-8 mode so status glyphs can't kill stdio."""
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+
+    env = _build_host_daemon_env(server_url=server_url)
+
+    assert env.get("PYTHONUTF8") == "1"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_keeps_explicit_pythonutf8(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """An explicit user PYTHONUTF8 value stays authoritative over the default."""
+    monkeypatch.setenv("PYTHONUTF8", "0")
+
+    env = _build_host_daemon_env(server_url=server_url)
+
+    assert env.get("PYTHONUTF8") == "0"
