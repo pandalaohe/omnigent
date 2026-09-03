@@ -5023,6 +5023,393 @@ def _seed_subagent_on_disk(
     return jsonl_path
 
 
+def _task_notification_record(
+    *,
+    tool_use_id: str,
+    status: str,
+    result: str,
+) -> dict[str, Any]:
+    """Build the correlated parent row emitted when a Claude Task ends."""
+    text = (
+        "<task-notification>\n"
+        "<task-id>task-test</task-id>\n"
+        f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+        f"<status>{status}</status>\n"
+        f"<result>{result}</result>\n"
+        "</task-notification>"
+    )
+    return {
+        "type": "user",
+        "uuid": f"notification-{status}",
+        "message": {"role": "user", "content": text},
+    }
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "stopped", "killed"])
+async def test_subagent_watcher_uses_correlated_terminal_notification(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    """The parent task notification, not child silence, ends native work."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    terminal_output = f"terminal-{status}"
+    transcript_path.write_text(
+        json.dumps(
+            _task_notification_record(
+                tool_use_id="toolu_terminal",
+                status=status,
+                result=terminal_output,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="terminal1",
+        agent_type="Explore",
+        description="finish reliably",
+        tool_use_id="toolu_terminal",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "assistant-opener",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "I will inspect it."}],
+                },
+            },
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "assistant-tool",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_child_read",
+                            "name": "Read",
+                            "input": {"file_path": "spec.md"},
+                        }
+                    ],
+                },
+            },
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "child-tool-result",
+                "parentUuid": "assistant-tool",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_child_read",
+                            "content": "spec contents",
+                            "is_error": False,
+                        }
+                    ],
+                },
+            },
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "terminal1": forwarder.SubagentEntry(
+                subagent_id="terminal1",
+                child_conversation_id="conv_child_terminal",
+                tool_use_id="toolu_terminal",
+            )
+        }
+    )
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            status_posts.append(body["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        result = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert status_posts == [{"status": status, "output": terminal_output}]
+    child_state = result.subagents["terminal1"]
+    assert child_state.terminal_status == status
+    assert child_state.terminal_output == terminal_output
+    assert child_state.last_status == status
+
+
+async def test_subagent_watcher_never_completes_from_tool_result_silence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trailing async receipt stays running even after the quiet threshold."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="async1",
+        agent_type="Explore",
+        description="long async task",
+        tool_use_id="toolu_async_parent",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "assistant-opener-async",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Starting the check."}],
+                },
+            },
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "async-tool-result",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_async_child",
+                            "content": "Task is running in the background",
+                            "is_error": False,
+                        }
+                    ],
+                },
+                "toolUseResult": {"status": "running", "isAsync": True},
+            },
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "async1": forwarder.SubagentEntry(
+                subagent_id="async1",
+                child_conversation_id="conv_child_async",
+                tool_use_id="toolu_async_parent",
+            )
+        }
+    )
+    now = [100.0]
+    monkeypatch.setattr(forwarder.time, "time", lambda: now[0])
+    statuses: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            statuses.append(body["data"]["status"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        now[0] += forwarder._SUBAGENT_TERMINAL_QUIESCENCE_S + 1
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert statuses == ["running"]
+    assert second.subagents["async1"].quiet_terminal_output is None
+
+
+async def test_subagent_watcher_falls_back_only_after_final_assistant_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy transcripts can settle only when their final item is an answer."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="legacy1",
+        agent_type="Explore",
+        description="legacy task",
+        tool_use_id="toolu_legacy",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "assistant-final-legacy",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Final legacy result."}],
+                },
+            }
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "legacy1": forwarder.SubagentEntry(
+                subagent_id="legacy1",
+                child_conversation_id="conv_child_legacy",
+                tool_use_id="toolu_legacy",
+            )
+        }
+    )
+    now = [200.0]
+    monkeypatch.setattr(forwarder.time, "time", lambda: now[0])
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            status_posts.append(body["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        trackers = {
+            "start_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+            "item_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+            "status_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+        }
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            **trackers,
+        )
+        now[0] += forwarder._SUBAGENT_TERMINAL_QUIESCENCE_S + 1
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            **trackers,
+        )
+
+    assert status_posts == [
+        {"status": "running"},
+        {"status": "completed", "output": "Final legacy result."},
+    ]
+    assert second.subagents["legacy1"].last_status == "completed"
+
+
+async def test_subagent_terminal_notification_retries_after_state_reload(
+    tmp_path: Path,
+) -> None:
+    """A failed terminal POST is retried from durable correlated state."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            _task_notification_record(
+                tool_use_id="toolu_restart",
+                status="completed",
+                result="Recovered result.",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="restart1",
+        agent_type="Explore",
+        description="retry after restart",
+        tool_use_id="toolu_restart",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "restart1": forwarder.SubagentEntry(
+                subagent_id="restart1",
+                child_conversation_id="conv_child_restart",
+                tool_use_id="toolu_restart",
+            )
+        }
+    )
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") != "external_session_status":
+            return httpx.Response(202, json={})
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, json={"error": "runner reconnecting"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        reloaded = forwarder._read_subagent_forward_state(bridge_dir)
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=reloaded,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert attempts == 2
+    assert first.subagents["restart1"].terminal_status == "completed"
+    assert first.subagents["restart1"].last_status is None
+    assert second.subagents["restart1"].last_status == "completed"
+
+
 async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
     tmp_path: Path,
 ) -> None:

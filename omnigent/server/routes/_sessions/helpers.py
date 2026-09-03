@@ -45,6 +45,7 @@ from omnigent.cost_plan import (
 )
 from omnigent.db.utils import generate_task_id
 from omnigent.entities import (
+    NON_CONTENT_ITEM_TYPES,
     USER_SESSION_TITLE_MAX_CHARS,
     Agent,
     Conversation,
@@ -3940,12 +3941,13 @@ def _latest_assistant_text_from_store(
     session_id: str,
 ) -> str | None:
     """
-    Return the latest persisted assistant message text for a session.
+    Return assistant text only when it is the latest meaningful content.
 
-    Native harnesses mirror completed transcript items to the AP
-    server, not necessarily to the runner's in-memory history. This
-    helper lets Omnigent forward the durable assistant output with the
-    terminal-observed idle edge.
+    Native harnesses mirror completed transcript items to the AP server, not
+    necessarily to the runner's in-memory history. A historical assistant
+    opener followed by function calls/results is not a final result. Scanning
+    every content item in descending order prevents that opener from being
+    attached to a later terminal edge.
 
     :param conversation_store: Store used to read conversation items.
     :param session_id: Session/conversation id, e.g.
@@ -3957,16 +3959,20 @@ def _latest_assistant_text_from_store(
         session_id,
         limit=_EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
         order="desc",
-        type="message",
     )
     for item in page.data:
+        if item.type in NON_CONTENT_ITEM_TYPES:
+            continue
         if not isinstance(item.data, MessageData):
+            return None
+        if item.data.is_meta:
             continue
-        if item.data.role != "assistant" or item.data.is_meta:
-            continue
+        if item.data.role != "assistant":
+            return None
         text = _message_text(item.data.content)
-        if text is not None:
+        if text is not None and text.strip():
             return text
+        return None
     return None
 
 

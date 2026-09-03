@@ -1311,6 +1311,9 @@ def register_events_routes(
                 data["background_tasks"] = [
                     task.model_dump(exclude_none=True) for task in bg_tasks
                 ]
+            published_status = "idle" if status in {"completed", "stopped", "killed"} else status
+            if status in {"completed", "failed", "stopped", "killed"} and bg_count is None:
+                bg_count = 0
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
             # last_task_error, not only the sub-agent parent-inbox path.
@@ -1337,7 +1340,7 @@ def register_events_routes(
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
             _publish_status(
                 session_id,
-                status,
+                published_status,
                 status_error,
                 response_id=response_id,
                 background_task_count=bg_count,
@@ -1347,12 +1350,18 @@ def register_events_routes(
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
             # No latency or token deltas are available on this path.
-            if status in {"idle", "failed"}:
+            if status in {"idle", "completed", "failed", "stopped", "killed"}:
                 _tel_emit(
                     _TelTurnEndEvent(
                         installation_id=_get_installation_id(),
                         session_id=session_id,
-                        status="completed" if status == "idle" else "failed",
+                        status=(
+                            "failed"
+                            if status == "failed"
+                            else "cancelled"
+                            if status in {"stopped", "killed"}
+                            else "completed"
+                        ),
                         latency_ms=None,
                         model=None,
                         input_tokens=None,
@@ -1369,7 +1378,7 @@ def register_events_routes(
             )
             if (
                 conv.kind == "sub_agent"
-                and status in {"idle", "failed"}
+                and status in {"idle", "completed", "failed", "stopped", "killed"}
                 and not _is_codex_native_subagent(conv)
             ):
                 # Codex-internal children are tracked inside the same

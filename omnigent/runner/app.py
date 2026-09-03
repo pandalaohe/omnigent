@@ -390,7 +390,7 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 
 _NO_BODY_STATUS_CODES = {204, 304}
-_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "stopped", "killed"})
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
 _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
@@ -1718,8 +1718,8 @@ def mark_subagent_work_terminal(
     Mark a sub-agent dispatch terminal and notify the parent inbox.
 
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
-    :param status: Terminal status: ``"completed"``, ``"failed"``, or
-        ``"cancelled"``.
+    :param status: Terminal status: ``"completed"``, ``"failed"``,
+        ``"cancelled"``, ``"stopped"``, or ``"killed"``.
     :param output: Child output or error text. ``None`` means the
         completion had no assistant text to deliver.
         If an earlier terminal report could not be delivered, a later
@@ -2117,9 +2117,20 @@ def _session_status_to_task_status(status: object) -> str | None:
         return "in_progress"
     if status == "idle":
         return "completed"
+    if status in ("completed", "stopped", "killed"):
+        return status
     if status == "failed":
         return "failed"
     return None
+
+
+def _safe_subagent_terminal_output(status: str) -> str:
+    """Return an honest fallback that cannot expose stale transcript text."""
+    return {
+        "failed": "Error: native sub-agent turn failed without a reliable detail.",
+        "stopped": "Sub-agent stopped before producing a reliable final result.",
+        "killed": "Sub-agent was killed before producing a reliable final result.",
+    }.get(status, "Sub-agent ended without a reliable final result.")
 
 
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
@@ -7946,7 +7957,8 @@ def create_runner_app(
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
-            if status in ("running", "waiting", "idle", "failed"):
+            display_status = "idle" if status in ("completed", "stopped", "killed") else status
+            if display_status in ("running", "waiting", "idle", "failed"):
                 raw_background_task_count = (
                     data.get("background_task_count") if isinstance(data, dict) else None
                 )
@@ -7962,7 +7974,7 @@ def create_runner_app(
                 )
                 resource_registry.note_external_session_status(
                     conversation_id,
-                    status,
+                    display_status,
                     background_task_count=background_task_count,
                     background_tasks=background_tasks,
                 )
@@ -7972,19 +7984,19 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
-            if status in ("idle", "failed"):
+            if status in ("idle", "completed", "failed", "stopped", "killed"):
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
-            if status == "idle":
+            if status in ("idle", "completed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
                     status="completed",
                     output=output if output is not None else "",
                 )
-            elif status == "failed":
+            elif status in ("failed", "stopped", "killed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
-                    status="failed",
-                    output=output or "Error: native sub-agent turn failed",
+                    status=status,
+                    output=output or _safe_subagent_terminal_output(status),
                 )
             if delivery_ack is not None:
                 is_known = (

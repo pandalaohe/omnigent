@@ -101,7 +101,7 @@ _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 
 
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed"}
+    {"idle", "running", "waiting", "completed", "failed", "stopped", "killed"}
 )
 
 

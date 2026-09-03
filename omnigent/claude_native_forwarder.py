@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -70,13 +70,13 @@ _MAX_PERSISTED_COMPACTION_SEQS = 16
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
 
-# Seconds of transcript inactivity after which we publish ``idle`` for
-# a sub-agent. The transcript is the only signal we have for sub-agent
-# completion in Phase A (no SubagentStop hook is subscribed); 5s is the
-# shortest window that comfortably absorbs a stalled tool call without
-# flickering the badge. Phase B will replace this with an authoritative
-# hook signal and drop the heuristic.
-_SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+# Structured task notifications are the authoritative sub-agent terminal
+# signal. This longer window is only a compatibility fallback for Claude runs
+# that never emit one, and it is eligible solely when the last child record is
+# a real assistant answer (never a tool call/result or opening text followed by
+# tool activity).
+_SUBAGENT_TERMINAL_QUIESCENCE_S = 30.0
+_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -375,9 +375,8 @@ class SubagentEntry:
 
     One of these per Claude-side sub-agent. Tracks the Omnigent child
     Conversation id we minted (so subsequent items POST to the
-    right session), the transcript file byte offset already
-    forwarded, and the wall-clock timestamp of the last item we
-    saw (for the idle-status heuristic).
+    right session), transcript cursor, correlated Task tool id, durable
+    terminal signal, and the narrowly-scoped legacy quiet fallback.
 
     :param subagent_id: Stable Claude-side identifier, also the
         ``agent-<id>`` filename stem, e.g. ``"a5c7effac5a9a35ab"``.
@@ -392,24 +391,29 @@ class SubagentEntry:
         so a failed later item can leave the cursor behind without
         re-posting earlier accepted items on the next poll.
     :param last_activity_ts: Unix timestamp of the most recent item
-        observed in this sub-agent's transcript. Used by the idle
-        heuristic — when ``now - last_activity_ts >
-        _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
-        ``external_session_status: idle`` event. ``None`` when no
-        items have been seen yet (so the heuristic doesn't fire
-        before there's anything to be quiescent about).
+        observed in this sub-agent's transcript.
     :param last_status: Last status string POSTed for this
         sub-agent — used to dedupe so we don't spam ``running`` or
-        ``idle`` events on every tick when nothing changed. ``None``
-        means no status has been posted yet.
+        terminal events on every tick when nothing changed. ``None`` means no
+        status has been posted yet.
+    :param quiet_terminal_output: Assistant result eligible for the legacy
+        long-quiet fallback. A newer call, result, user input, or meta item
+        clears it.
+    :param terminal_status: Correlated structured status from the parent Task
+        notification, retained until the Server acknowledges delivery.
+    :param terminal_output: Result carried by the correlated Task notification.
     """
 
     subagent_id: str
     child_conversation_id: str
+    tool_use_id: str | None = None
     byte_offset: int = 0
     seen_source_ids: tuple[str, ...] = ()
     last_activity_ts: float | None = None
     last_status: str | None = None
+    quiet_terminal_output: str | None = None
+    terminal_status: str | None = None
+    terminal_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -426,9 +430,15 @@ class SubagentForwardState:
         per-sub-agent entry. New sub-agents discovered on disk are
         inserted here after the Omnigent server returns a child
         Conversation id.
+    :param parent_byte_offset: Byte cursor for structured Task notifications
+        in the parent transcript.
+    :param parent_line_cursor: Matching legacy line cursor for diagnostics and
+        cursor migration.
     """
 
     subagents: dict[str, SubagentEntry]
+    parent_byte_offset: int = 0
+    parent_line_cursor: int = 0
 
 
 @dataclass(frozen=True)
@@ -1135,6 +1145,12 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
     subagents_raw = raw.get("subagents", {})
     if not isinstance(subagents_raw, dict):
         return SubagentForwardState(subagents={})
+    parent_byte_offset = raw.get("parent_byte_offset", 0)
+    parent_line_cursor = raw.get("parent_line_cursor", 0)
+    if not isinstance(parent_byte_offset, int) or parent_byte_offset < 0:
+        parent_byte_offset = 0
+    if not isinstance(parent_line_cursor, int) or parent_line_cursor < 0:
+        parent_line_cursor = 0
     entries: dict[str, SubagentEntry] = {}
     for subagent_id, row in subagents_raw.items():
         if not isinstance(subagent_id, str) or not isinstance(row, dict):
@@ -1144,6 +1160,10 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         seen_source_ids = row.get("seen_source_ids", [])
         last_activity_ts = row.get("last_activity_ts")
         last_status = row.get("last_status")
+        tool_use_id = row.get("tool_use_id")
+        quiet_terminal_output = row.get("quiet_terminal_output")
+        terminal_status = row.get("terminal_status")
+        terminal_output = row.get("terminal_output")
         # Empty string is a valid parked sentinel written by
         # ``_forward_available_subagents`` after the start POST exhausts
         # its permanent-failure budget. Preserving it across restarts is
@@ -1160,15 +1180,31 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             last_activity_ts = None
         if last_status is not None and not isinstance(last_status, str):
             last_status = None
+        if tool_use_id is not None and not isinstance(tool_use_id, str):
+            tool_use_id = None
+        if quiet_terminal_output is not None and not isinstance(quiet_terminal_output, str):
+            quiet_terminal_output = None
+        if terminal_status not in _SUBAGENT_TERMINAL_STATUSES:
+            terminal_status = None
+        if terminal_output is not None and not isinstance(terminal_output, str):
+            terminal_output = None
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
             child_conversation_id=child_id,
+            tool_use_id=tool_use_id,
             byte_offset=byte_offset,
             seen_source_ids=tuple(seen_source_ids),
             last_activity_ts=last_activity_ts,
             last_status=last_status,
+            quiet_terminal_output=quiet_terminal_output,
+            terminal_status=terminal_status,
+            terminal_output=terminal_output,
         )
-    return SubagentForwardState(subagents=entries)
+    return SubagentForwardState(
+        subagents=entries,
+        parent_byte_offset=parent_byte_offset,
+        parent_line_cursor=parent_line_cursor,
+    )
 
 
 def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState) -> None:
@@ -1184,13 +1220,19 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
         "subagents": {
             entry.subagent_id: {
                 "child_conversation_id": entry.child_conversation_id,
+                "tool_use_id": entry.tool_use_id,
                 "byte_offset": entry.byte_offset,
                 "seen_source_ids": list(entry.seen_source_ids),
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
+                "quiet_terminal_output": entry.quiet_terminal_output,
+                "terminal_status": entry.terminal_status,
+                "terminal_output": entry.terminal_output,
             }
             for entry in state.subagents.values()
         },
+        "parent_byte_offset": state.parent_byte_offset,
+        "parent_line_cursor": state.parent_line_cursor,
         "updated_at": time.time(),
     }
     _write_json_atomic(bridge_dir / _SUBAGENT_STATE_FILE, payload)
@@ -1335,6 +1377,32 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     }
 
 
+def _subagent_quiet_terminal_output(item: ClaudeTranscriptItem) -> str | None:
+    """Return final-answer text only when this item is terminal-shaped.
+
+    Every non-assistant item clears the fallback candidate. In particular, a
+    tool result after an opening sentence must remain ``running`` until Claude
+    writes a final assistant answer or the parent records a task notification.
+    """
+    if item.item_type != "message":
+        return None
+    if item.data.get("role") != "assistant" or item.data.get("is_meta") is True:
+        return None
+    content = item.data.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        text
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "output_text"
+        and isinstance((text := block.get("text")), str)
+        and text
+    ]
+    output = "\n".join(parts).strip()
+    return output or None
+
+
 async def _forward_available_subagents(
     *,
     client: httpx.AsyncClient,
@@ -1349,8 +1417,8 @@ async def _forward_available_subagents(
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
-    conversations for them, tail their transcripts, and publish
-    quiescence-based status.
+    conversations for them, tail their transcripts, and publish status from
+    structured task notifications with a conservative transcript fallback.
 
     Idempotent across forwarder restarts: ``state`` (persisted to
     ``subagent_forwarder.json``) holds the Omnigent child id and byte
@@ -1440,14 +1508,16 @@ async def _forward_available_subagents(
                 # Park this sub-agent: insert a sentinel entry so we
                 # don't keep retrying. ``child_conversation_id=""``
                 # is filtered out by the tail / status loops below.
-                updated = SubagentForwardState(
+                updated = replace(
+                    updated,
                     subagents={
                         **updated.subagents,
                         subagent_id: SubagentEntry(
                             subagent_id=subagent_id,
                             child_conversation_id="",
+                            tool_use_id=meta["toolUseId"],
                         ),
-                    }
+                    },
                 )
                 await _write_subagent_forward_state_async(bridge_dir, updated)
                 continue
@@ -1466,15 +1536,75 @@ async def _forward_available_subagents(
             )
             continue
         start_retry_tracker.clear(retry_key)
-        updated = SubagentForwardState(
+        updated = replace(
+            updated,
             subagents={
                 **updated.subagents,
                 subagent_id: SubagentEntry(
                     subagent_id=subagent_id,
                     child_conversation_id=child_id,
+                    tool_use_id=meta["toolUseId"],
                 ),
-            }
+            },
         )
+        await _write_subagent_forward_state_async(bridge_dir, updated)
+
+    parent_state_before_scan = updated
+    # Older durable rows predate ``tool_use_id``. Recover it from the still-
+    # canonical meta file so a completion notification can be correlated after
+    # a forwarder restart or in-place upgrade.
+    for subagent_id, entry in list(updated.subagents.items()):
+        if entry.tool_use_id is not None:
+            continue
+        meta = await asyncio.to_thread(
+            _read_subagent_meta, subagents_dir / f"agent-{subagent_id}.meta.json"
+        )
+        if meta is None:
+            continue
+        recovered = replace(entry, tool_use_id=meta["toolUseId"])
+        updated = replace(updated, subagents={**updated.subagents, subagent_id: recovered})
+
+    # Task notifications live in the PARENT transcript, not the child JSONL.
+    # Tail them with an independent durable cursor: the ordinary transcript
+    # cursor may already have advanced when terminal delivery is retried after a
+    # disconnect/restart. Re-reading from zero once upgrades legacy state safely.
+    parent_result = await asyncio.to_thread(
+        read_transcript_items_from_offset,
+        transcript_path,
+        updated.parent_byte_offset,
+        start_line=updated.parent_line_cursor,
+        agent_name=agent_name,
+    )
+    notifications_by_tool = {
+        notification.tool_use_id: notification
+        for notification in parent_result.task_notifications
+        if notification.tool_use_id is not None
+        and notification.status in _SUBAGENT_TERMINAL_STATUSES
+    }
+    if notifications_by_tool:
+        entries = dict(updated.subagents)
+        for subagent_id, entry in entries.items():
+            if entry.tool_use_id is None:
+                continue
+            notification = notifications_by_tool.get(entry.tool_use_id)
+            if notification is None:
+                continue
+            entries[subagent_id] = replace(
+                entry,
+                terminal_status=notification.status,
+                terminal_output=notification.result,
+            )
+        updated = replace(updated, subagents=entries)
+    if (
+        parent_result.byte_offset != updated.parent_byte_offset
+        or parent_result.line_cursor != updated.parent_line_cursor
+    ):
+        updated = replace(
+            updated,
+            parent_byte_offset=parent_result.byte_offset,
+            parent_line_cursor=parent_result.line_cursor,
+        )
+    if updated != parent_state_before_scan:
         await _write_subagent_forward_state_async(bridge_dir, updated)
 
     # ── Tail each tracked sub-agent's transcript ────────
@@ -1557,16 +1687,14 @@ async def _forward_available_subagents(
                     # someone needs to recover it.
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
+                    new_entry = replace(
+                        new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
+                        quiet_terminal_output=_subagent_quiet_terminal_output(item),
                     )
-                    updated = SubagentForwardState(
-                        subagents={**updated.subagents, subagent_id: new_entry}
+                    updated = replace(
+                        updated, subagents={**updated.subagents, subagent_id: new_entry}
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
@@ -1586,16 +1714,14 @@ async def _forward_available_subagents(
                     item_retry_tracker.clear(retry_key)
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
+                    new_entry = replace(
+                        new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
+                        quiet_terminal_output=_subagent_quiet_terminal_output(item),
                     )
-                    updated = SubagentForwardState(
-                        subagents={**updated.subagents, subagent_id: new_entry}
+                    updated = replace(
+                        updated, subagents={**updated.subagents, subagent_id: new_entry}
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
@@ -1622,56 +1748,57 @@ async def _forward_available_subagents(
             had_item = True
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
-                byte_offset=entry.byte_offset,
+            new_entry = replace(
+                new_entry,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=new_entry.last_status,
+                quiet_terminal_output=_subagent_quiet_terminal_output(item),
             )
-            updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
+            updated = replace(updated, subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
         # Only advance the cursor when every item this tick was
         # posted successfully (or there were no items at all).
         # Advancing past a failed item permanently skips it.
         if not items_failed and (result.byte_offset != entry.byte_offset or had_item):
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
+            new_entry = replace(
+                new_entry,
                 byte_offset=result.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now if had_item else entry.last_activity_ts,
-                last_status=entry.last_status,
             )
         elif had_item:
             # Items DID flow but a later post failed — still record
             # the activity timestamp so the status badge advances,
             # but leave byte_offset at the previous tick's value so
             # the failed items get retried.
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
+            new_entry = replace(
+                new_entry,
                 byte_offset=entry.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=entry.last_status,
             )
 
-        # Quiescence-based status. Sub-agent transcripts don't carry
-        # an explicit "done" record (Claude doesn't expose one), so
-        # we infer "running" from item flow and "idle" from quiet
-        # time. The dedupe on ``last_status`` avoids spamming the
-        # cache on every tick when nothing changed.
+        # Structured parent notifications are authoritative. For older Claude
+        # runs that omit them, silence is only a fallback when the child JSONL
+        # itself ends in a real assistant answer. A trailing function call or
+        # result is never completion, however long it stays quiet.
         desired_status: str | None = None
-        if had_item:
+        desired_output: str | None = None
+        if new_entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES:
+            desired_status = new_entry.terminal_status
+            desired_output = new_entry.terminal_output
+        elif new_entry.last_status in _SUBAGENT_TERMINAL_STATUSES:
+            desired_status = None
+        elif had_item:
             desired_status = "running"
         elif (
             new_entry.last_activity_ts is not None
-            and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
-            and new_entry.last_status != "idle"
+            and new_entry.quiet_terminal_output is not None
+            and now - new_entry.last_activity_ts > _SUBAGENT_TERMINAL_QUIESCENCE_S
+            and new_entry.last_status != "completed"
         ):
-            desired_status = "idle"
+            desired_status = "completed"
+            desired_output = new_entry.quiet_terminal_output
         if desired_status is not None and desired_status != new_entry.last_status:
             retry_key = f"subagent_status:{entry.child_conversation_id}"
             if status_retry_tracker.retry_delay_s(retry_key) is None:
@@ -1680,6 +1807,7 @@ async def _forward_available_subagents(
                         client,
                         session_id=entry.child_conversation_id,
                         status=desired_status,
+                        output=desired_output,
                     )
                 except httpx.HTTPError as exc:
                     decision = status_retry_tracker.record_failure(retry_key, exc)
@@ -1696,17 +1824,10 @@ async def _forward_available_subagents(
                     )
                 else:
                     status_retry_tracker.clear(retry_key)
-                    new_entry = SubagentEntry(
-                        subagent_id=new_entry.subagent_id,
-                        child_conversation_id=new_entry.child_conversation_id,
-                        byte_offset=new_entry.byte_offset,
-                        seen_source_ids=new_entry.seen_source_ids,
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=desired_status,
-                    )
+                    new_entry = replace(new_entry, last_status=desired_status)
 
         if new_entry is not entry:
-            updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
+            updated = replace(updated, subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
 
     return updated
@@ -2750,11 +2871,11 @@ async def _forward_available_status_events(
         )
         # Subagent lifecycle hooks land in the same hooks.jsonl as parent
         # events because subagent processes inherit the parent's hook
-        # settings. With running/idle now PTY-derived, the only mapped
-        # status left is ``StopFailure`` → ``failed``: a subagent's
-        # failure must NOT flip the parent session to ``failed`` — the
-        # parent turn is still running while it awaits the Agent tool
-        # result.
+        # settings. Parent ``Stop`` remains the authoritative turn-end idle
+        # edge (including response-id settle and shell tally); PTY activity
+        # owns only running transitions. A child ``Stop``/``StopFailure`` must
+        # not flip the parent: child completion is correlated separately by
+        # the subagent watcher via the parent's structured task notification.
         if status is not None and _is_subagent_hook_record(record):
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
