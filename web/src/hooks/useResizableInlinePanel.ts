@@ -6,7 +6,8 @@
 // while the inline panel starts at a compact sidebar width.
 
 import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
+import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.99;
@@ -60,18 +61,16 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
 // effective (viewport-clamped) width. Keeping the preference in
 // memory lets the resize handler re-derive the effective width from it —
 // restoring the larger choice when space returns — without touching disk.
-// Both start null: the active session's saved width is loaded once the hook
-// learns its storage key (see loadSession), since width is scoped by the caller.
+// Both start from the device-local preference so every session opens with the
+// last layout the user adjusted on this browser/device.
 let currentSessionId: string | null = null;
-let preferredWidth: number | null = null;
-let storedWidth: number | null = null;
+let preferredWidth: number | null = readPanelSizePreference("inlinePanelWidthPx");
+let storedWidth: number | null = preferredWidth;
 const listeners = new Set<() => void>();
 
 function persistWidth(value: number | null) {
   preferredWidth = value;
-  if (currentSessionId !== null && value !== null) {
-    writeSessionWorkspaceState(currentSessionId, { widthPx: value });
-  }
+  writePanelSizePreference("inlinePanelWidthPx", value);
 }
 
 function setStoredWidthRaw(value: number | null, persist = false) {
@@ -95,21 +94,26 @@ function subscribe(cb: () => void): () => void {
   return () => listeners.delete(cb);
 }
 
-// Re-seed the module store from a storage key's saved width. A key with no
-// saved width falls back to the viewport-derived default.
+// Width used to be stored per session. If this device has no global preference
+// yet, seed it once from the first session that carries a legacy width. After
+// that, session switches deliberately leave the live width untouched.
 function loadSession(sessionId: string | null): void {
   if (sessionId === currentSessionId) return;
   currentSessionId = sessionId;
-  preferredWidth =
-    sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null;
-  setStoredWidthRaw(preferredWidth);
+  if (preferredWidth !== null || sessionId === null) return;
+
+  const legacyWidth = readSessionWorkspaceState(sessionId).widthPx ?? null;
+  if (legacyWidth === null) return;
+  preferredWidth = legacyWidth;
+  writePanelSizePreference("inlinePanelWidthPx", legacyWidth);
+  setStoredWidthRaw(legacyWidth);
 }
 
 /** Reset all module-level state. Only for use in tests. */
 export function resetWidthStoreForTesting(): void {
   currentSessionId = null;
-  preferredWidth = null;
-  setStoredWidthRaw(null);
+  preferredWidth = readPanelSizePreference("inlinePanelWidthPx");
+  setStoredWidthRaw(preferredWidth);
 }
 
 function getSnapshot(): number | null {
@@ -133,17 +137,18 @@ function getServerSnapshot(): number | null {
  * handle element. Intended for desktop-only use — callers should not render
  * the handle on mobile.
  *
- * `sessionId` scopes the persisted width. AppShell passes the root session so
- * one agent tree shares a rail width. Pass `null` when there is no active
- * conversation (the panel then uses the default width and resizes are not
- * persisted).
+ * Width is a device-local layout preference shared by every session. The
+ * `sessionId` remains only to migrate a legacy per-session width on first use.
+ * Pass `null` when there is no active conversation (the panel then uses the
+ * device preference or default width, and resizes are not persisted).
  *
  * `reservedPx` is layout width the panel may not claim — the open sidebar. It
  * tightens the ceiling without touching the persisted preference, so opening
  * the sidebar temporarily shrinks the panel and collapsing it restores the
  * user's width.
  *
- * `persistEnabled` disables manual resizing while the storage key is tentative.
+ * `persistEnabled` disables manual resizing while AppShell is still resolving
+ * which conversation tree owns the visible rail.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
@@ -152,16 +157,12 @@ export function useResizableInlinePanel(
   persistEnabled = true,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-  // On a session switch the module store still holds the previous session's
-  // width until the effect below re-seeds it after commit. Derive this render's
-  // width straight from the incoming session's saved value so the panel doesn't
-  // flash the old width for a frame. Once the effect runs `currentSessionId`
-  // catches up and we fall back to the live store value (which the drag and
-  // keyboard handlers mutate in place).
+  // Before the one-time migration effect commits, derive this render from the
+  // incoming session's legacy width so upgraded users do not see a default-
+  // width flash. A device preference always wins and survives session changes.
   let effectiveRaw = raw;
-  if (sessionId !== currentSessionId) {
-    effectiveRaw =
-      sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null;
+  if (preferredWidth === null && sessionId !== null && sessionId !== currentSessionId) {
+    effectiveRaw = readSessionWorkspaceState(sessionId).widthPx ?? null;
   }
   // Clamped at render time only — the store keeps the user's preferred width, so
   // a temporary squeeze (sidebar opening) is undone when the space returns.
@@ -202,9 +203,8 @@ export function useResizableInlinePanel(
     overlayRef.current = null;
   }, []);
 
-  // Load the active session's saved width into the module store (and re-load
-  // when it changes) so the live store and the drag handlers operate on the
-  // right session.
+  // Migrate a legacy per-session width once. Subsequent session changes keep
+  // the same device-local layout.
   useEffect(() => {
     loadSession(sessionId);
   }, [sessionId]);

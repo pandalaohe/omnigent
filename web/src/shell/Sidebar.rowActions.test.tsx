@@ -985,7 +985,7 @@ describe("mark as unread", () => {
 });
 
 describe("mark all as read", () => {
-  it("clears every loaded unread dot from the Sessions header in one tap", () => {
+  it("shows a clear mobile top action and clears every loaded unread dot in one tap", () => {
     const second = {
       ...CONV,
       id: "conv_2",
@@ -1001,10 +1001,16 @@ describe("mark all as read", () => {
 
     expect(screen.getAllByText("(unread)")).toHaveLength(2);
 
-    fireEvent.click(screen.getByTestId("mark-all-sessions-read"));
+    const mobileAction = screen.getByTestId("mark-all-sessions-read-mobile");
+    expect(mobileAction).toHaveTextContent("Mark all read");
+    expect(mobileAction).toHaveClass("md:hidden", "h-9", "rounded-full");
+    expect(screen.getByTestId("mark-all-sessions-read")).toHaveClass("max-md:hidden");
+
+    fireEvent.click(mobileAction);
 
     expect(screen.queryByText("(unread)")).toBeNull();
     expect(screen.queryByTestId("mark-all-sessions-read")).toBeNull();
+    expect(screen.queryByTestId("mark-all-sessions-read-mobile")).toBeNull();
   });
 
   it("keeps a needs-response state visible after its content is marked read", () => {

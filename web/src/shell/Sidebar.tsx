@@ -601,6 +601,16 @@ export function Sidebar({
     () => (conversationsQuery.data?.pages ?? []).flatMap((page) => page.data),
     [conversationsQuery.data],
   );
+  useUnseenTick();
+  const unreadConversations = loadedRows.filter(
+    (conversation) =>
+      isExplicitlyUnread(conversation.id) ||
+      isConversationUnseen(
+        conversation.id,
+        conversation.updated_at,
+        getConversationForegroundStatus(conversation),
+      ),
+  );
   const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
   // Plus unseen file comments — the badge counts everything the Inbox
   // page lists. Comment queries are shared with the page/FileViewer
@@ -853,8 +863,22 @@ export function Sidebar({
           this row shares the window's top strip with the traffic lights: the
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
-          Inert in a browser and on other platforms, which keep the row below. */}
+            Inert in a browser and on other platforms, which keep the row below. */}
             <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+              {unreadConversations.length > 0 && !selectionMode && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Mark all sessions as read"
+                  data-testid="mark-all-sessions-read-mobile"
+                  className="sidebar-glass-chip h-9 shrink-0 gap-1.5 rounded-full px-3 text-xs font-medium text-foreground md:hidden"
+                  onClick={() => markConversationsSeen(unreadConversations)}
+                >
+                  <MailOpenIcon className="size-4 shrink-0 text-primary" />
+                  <span>Mark all read</span>
+                </Button>
+              )}
               {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -866,7 +890,10 @@ export function Sidebar({
                 onClick={onNavClick}
                 data-testid="sidebar-brand"
                 componentId="sidebar.home"
-                className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
+                className={cn(
+                  "sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70",
+                  unreadConversations.length > 0 && !selectionMode && "max-md:hidden",
+                )}
               >
                 {branding.app_name ? (
                   <span className="text-[15px] font-semibold tracking-tight">
@@ -1048,6 +1075,7 @@ export function Sidebar({
               >
                 <ConversationList
                   conversationsQuery={conversationsQuery}
+                  unreadConversations={unreadConversations}
                   scrollContainerRef={scrollContainerRef}
                   onRowClick={onNavClick}
                   searchQuery=""
@@ -1341,6 +1369,7 @@ function ProjectFolder({
 
 interface ConversationListProps {
   conversationsQuery: ReturnType<typeof useConversations>;
+  unreadConversations: Conversation[];
   // The scrollable ancestor, used as the infinite-scroll observer root.
   scrollContainerRef: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -1412,6 +1441,7 @@ function useViewerId(): string | null {
 
 function ConversationList({
   conversationsQuery,
+  unreadConversations,
   scrollContainerRef,
   onRowClick,
   searchQuery,
@@ -1446,17 +1476,6 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
-  useUnseenTick();
-  const unreadConversations = allConversations.filter(
-    (conversation) =>
-      isExplicitlyUnread(conversation.id) ||
-      isConversationUnseen(
-        conversation.id,
-        conversation.updated_at,
-        getConversationForegroundStatus(conversation),
-      ),
-  );
-
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
@@ -2202,7 +2221,7 @@ function ConversationList({
                                     size="icon-xs"
                                     aria-label="Mark all sessions as read"
                                     data-testid="mark-all-sessions-read"
-                                    className="text-muted-foreground"
+                                    className="text-muted-foreground max-md:hidden"
                                     onClick={(event) => {
                                       event.stopPropagation();
                                       markConversationsSeen(unreadConversations);
