@@ -8807,18 +8807,21 @@ def _run_windows_host_service(wrapper: Path, action: Literal["start", "stop"]) -
     pwsh = shutil.which("pwsh")
     if pwsh is None:
         raise click.ClickException("PowerShell 7 is required to control the Windows Host service.")
+    child_env = os.environ.copy()
+    child_env["OMNIGENT_HOST_SERVICE_WRAPPER"] = str(wrapper)
+    child_env["OMNIGENT_HOST_SERVICE_ACTION"] = action
     try:
         result = subprocess.run(
             [
                 pwsh,
                 "-NoProfile",
                 "-Command",
-                "& $args[0] $args[1]",
-                str(wrapper),
-                action,
+                "& $env:OMNIGENT_HOST_SERVICE_WRAPPER "
+                "$env:OMNIGENT_HOST_SERVICE_ACTION; exit $LASTEXITCODE",
             ],
             check=False,
             timeout=60,
+            env=child_env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise click.ClickException(

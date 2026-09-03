@@ -437,6 +437,40 @@ def test_windows_custom_supervisor_uses_existing_wrapper(
     assert actions == ["stop", "start"]
 
 
+def test_windows_custom_supervisor_passes_wrapper_through_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PowerShell receives trusted wrapper/action values without broken ``$args`` binding."""
+    import omnigent.cli as cli_module
+
+    wrapper = tmp_path / "omni-host-service.cmd"
+    wrapper.write_text("@echo off\n")
+    captured: dict[str, object] = {}
+
+    def _run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: "pwsh.exe")
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    cli_module._run_windows_host_service(wrapper, "stop")
+
+    assert captured["argv"] == [
+        "pwsh.exe",
+        "-NoProfile",
+        "-Command",
+        "& $env:OMNIGENT_HOST_SERVICE_WRAPPER "
+        "$env:OMNIGENT_HOST_SERVICE_ACTION; exit $LASTEXITCODE",
+    ]
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["OMNIGENT_HOST_SERVICE_WRAPPER"] == str(wrapper)
+    assert child_env["OMNIGENT_HOST_SERVICE_ACTION"] == "stop"
+
+
 def test_windows_custom_update_schedules_detached_helper(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
