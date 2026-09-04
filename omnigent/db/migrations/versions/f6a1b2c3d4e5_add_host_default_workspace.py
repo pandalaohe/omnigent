@@ -1,7 +1,7 @@
 """add per-host default workspace
 
 Revision ID: f6a1b2c3d4e5
-Revises: e5d9bc8ac650
+Revises: ga1b2c3d4e5f
 Create Date: 2026-08-31 00:00:00.000000
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "f6a1b2c3d4e5"
-down_revision: str | None = "e5d9bc8ac650"
+down_revision: str | None = "ga1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

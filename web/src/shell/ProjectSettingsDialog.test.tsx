@@ -12,8 +12,9 @@ vi.mock("@/lib/projectsApi", () => ({
 }));
 // Hoisted so the vi.mock factory below can reference it; per-test overrides
 // let cases control the agent catalog (the default is set in beforeEach).
-const { availableAgentsMock, workspacePickerPropsMock } = vi.hoisted(() => ({
+const { availableAgentsMock, hostModelOptionsMock, workspacePickerPropsMock } = vi.hoisted(() => ({
   availableAgentsMock: vi.fn(),
+  hostModelOptionsMock: vi.fn(),
   workspacePickerPropsMock: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({
@@ -28,6 +29,7 @@ vi.mock("@/hooks/useHosts", () => ({
       },
     ],
   }),
+  useHostModelOptions: hostModelOptionsMock,
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: availableAgentsMock,
@@ -84,8 +86,10 @@ beforeEach(() => {
   updateMock.mockReset();
   createMock.mockReset();
   availableAgentsMock.mockReset();
+  hostModelOptionsMock.mockReset();
   workspacePickerPropsMock.mockReset();
   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
+  hostModelOptionsMock.mockReturnValue({ data: [] });
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 

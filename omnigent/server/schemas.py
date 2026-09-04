@@ -12,15 +12,17 @@ delineator further down:
 from __future__ import annotations
 
 import re
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, Literal, Self, get_args
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     Strict,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -78,7 +80,7 @@ class UserPreferencesEnvelope(BaseModel):
     settings: dict[UserPreferenceNamespace, JsonValue]
 
     @model_validator(mode="after")
-    def _validate_persisted_contract(self) -> UserPreferencesEnvelope:
+    def _validate_persisted_contract(self) -> Self:
         validate_preferences_envelope(self.model_dump(mode="python"))
         return self
 
@@ -1237,6 +1239,9 @@ class ElicitationResult(BaseModel):
         binary approve/reject elicitations and for ``decline`` /
         ``cancel`` actions. Values are restricted to JSON scalars
         and string lists per the MCP spec.
+    :param meta: Optional MCP result metadata. Codex uses
+        ``_meta.persist`` to distinguish one-time, session-scoped,
+        and persistent MCP tool approvals.
     """
 
     action: Literal["accept", "decline", "cancel"]
@@ -1244,6 +1249,21 @@ class ElicitationResult(BaseModel):
     # ElicitResult.content value type — keep them aligned so an MCP
     # client can bridge to our endpoint without translation.
     content: dict[str, str | int | float | bool | list[str] | None] | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+    # ``_meta`` must serialize under its alias so the verdict survives the
+    # resolve route's dump -> re-validate round-trip, but an unset ``_meta``
+    # must not appear at all: hook replies are compared verbatim.
+    model_config = ConfigDict(serialize_by_alias=True)
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_meta(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Drop ``_meta`` when unset, keeping other ``None`` fields intact."""
+        data = handler(self)
+        if self.meta is None:
+            data.pop("_meta", None)
+            data.pop("meta", None)
+        return data
 
 
 # ── Sessions (/v1/sessions) ────────────────────────────────────
@@ -1320,29 +1340,41 @@ class SessionGitOptions(BaseModel):
         invalid with ``existing_worktree``.
     :param existing_worktree: When ``True``, bind to the pre-existing
         worktree at ``workspace`` instead of creating one (see above).
+    :param existing_branch: When ``True``, ``branch_name`` already
+        exists and the host checks it out into a fresh worktree (the
+        deleted-worktree recreate path) instead of creating a new
+        branch. Create mode only; invalid with ``existing_worktree``
+        and with ``base_branch`` (an existing branch has no base to
+        fork).
     """
 
     branch_name: str
     base_branch: str | None = None
     existing_worktree: bool = False
+    existing_branch: bool = False
 
     @model_validator(mode="after")
     def _check_existing_worktree(self) -> SessionGitOptions:
-        """Reject ``base_branch`` in bind mode (422).
+        """Reject incoherent mode combinations (422).
 
         ``base_branch`` selects the ref a *new* branch forks from; it is
-        meaningless when binding to a worktree that already exists.
+        meaningless when binding to a worktree that already exists or
+        when checking out an existing branch. ``existing_worktree`` and
+        ``existing_branch`` are distinct modes and cannot combine.
 
         :returns: The validated instance.
-        :raises ValueError: If ``base_branch`` is set with
-            ``existing_worktree``.
+        :raises ValueError: If the flags combine incoherently.
         """
         if self.existing_worktree and self.base_branch is not None:
             raise ValueError("base_branch cannot be set when existing_worktree is true")
+        if self.existing_branch and self.base_branch is not None:
+            raise ValueError("base_branch cannot be set when existing_branch is true")
+        if self.existing_branch and self.existing_worktree:
+            raise ValueError("existing_branch and existing_worktree cannot both be true")
         return self
 
 
-class SessionCreateRequest(BaseModel):
+class _SessionCreateRequestBase(BaseModel):
     """
     JSON request body for ``POST /v1/sessions``.
 
@@ -1475,7 +1507,10 @@ class SessionCreateRequest(BaseModel):
         message event instead.
     """
 
-    agent_id: str
+    # Declared here, in the legacy field position, so validation errors keep
+    # main's ordering. Concrete public models narrow the wire type below.
+    agent_id: Any
+    project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1495,7 +1530,7 @@ class SessionCreateRequest(BaseModel):
     smart_routing_message: str | None = None
 
     @model_validator(mode="after")
-    def _check_git_requires_host(self) -> SessionCreateRequest:
+    def _check_git_requires_host(self) -> Self:
         """
         Reject ``git`` without ``host_id`` at validation time.
 
@@ -1507,12 +1542,12 @@ class SessionCreateRequest(BaseModel):
         :returns: The validated instance.
         :raises ValueError: If ``git`` is set but ``host_id`` is not.
         """
-        if self.git is not None and self.host_id is None:
+        if self.git is not None and self.host_id is None and self.project_id is None:
             raise ValueError("git worktree creation requires host_id")
         return self
 
     @model_validator(mode="after")
-    def _check_managed_host_fields(self) -> SessionCreateRequest:
+    def _check_managed_host_fields(self) -> Self:
         """
         Enforce the per-``host_type`` workspace and host-id contract.
 
@@ -1563,6 +1598,26 @@ class SessionCreateRequest(BaseModel):
                 "external hosts take an absolute path on the host"
             )
         return self
+
+
+class SessionCreateRequest(_SessionCreateRequestBase):
+    """Legacy create shape, preserving required-string ``agent_id``."""
+
+    agent_id: str
+
+
+class ProjectSessionCreateRequest(_SessionCreateRequestBase):
+    """Project-opted create shape whose agent may be filled by the server.
+
+    The public legacy :class:`SessionCreateRequest` deliberately keeps
+    ``agent_id`` required so requests without ``project_id`` retain their exact
+    validation and OpenAPI contract.
+    """
+
+    agent_id: str | None = None
+
+
+SessionCreateInput = SessionCreateRequest | ProjectSessionCreateRequest
 
 
 class SessionCreateMetadata(BaseModel):
@@ -1620,6 +1675,7 @@ class SessionCreateMetadata(BaseModel):
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+    project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     host_id: str | None = None
@@ -1846,8 +1902,6 @@ class SessionResponse(BaseModel):
         so a reload can restore each shell's description/command. ``None`` when
         none are tracked (or when an older runner reported only the count).
     :param created_at: Unix epoch seconds of creation.
-    :param archived_at: Unix epoch seconds of the most recent transition into
-        the archived state. ``None`` while active.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -2019,9 +2073,12 @@ class SessionResponse(BaseModel):
         sessions are hidden from the default sidebar listing and
         surface only behind the "Show archived" toggle. ``False``
         for normal sessions. Toggled via ``PATCH /v1/sessions/{id}``.
-    :param todos: Current native-harness plan items. Each dict has
-        ``content``, ``status``, and ``activeForm`` keys. Empty when no plan
-        has been reported. Persisted for snapshot recovery and live-cached.
+    :param todos: Current Claude Code todo list items for
+        ``omnigent claude`` sessions, as raw dicts from Claude's
+        todo JSON file. Each dict has ``content``, ``status``,
+        and ``activeForm`` keys. Empty list for non-claude-native
+        sessions or when no todos have been reported yet. Sourced
+        from the Omnigent server's in-memory ``_session_todos_cache``.
     :param skills: Skills the bound agent has access to — the
         merged result of the agent spec's bundled ``skills``
         and the host-scope skills discovered along the agent
@@ -2181,6 +2238,16 @@ class UpdateSessionRequest(BaseModel):
         fields here the switch is applied by the live TUI, so a failure
         to reach the mode is surfaced as an error rather than persisted.
         Omitted leaves unchanged.
+    :param approval_mode: Codex-native approval mode to switch a running
+        session to, one of ``"ask-for-approval"``, ``"approve-for-me"``,
+        ``"full-access"``, ``"read-only"`` — Codex's own ``/permissions``
+        presets (the set is codex-version-dependent, so an older build may not
+        offer every one). Only valid for sessions stamped with the codex-native
+        wrapper label. The runner applies it by driving Codex's ``/permissions``
+        popup and confirms the switch echoed before returning, so a failure to
+        reach the mode surfaces as an error. The confirmed mode is stored on the
+        read-back label only (Codex owns the durable approval state), so it is
+        not written to ``terminal_launch_args``. Omitted leaves unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -2222,9 +2289,9 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
-    :param archive_locked: Protect this session from deletion while ``True``.
-        ``False`` removes the protection and ``None`` leaves it unchanged.
-        Owner-only; intended for the archived-session cleanup surface.
+    :param archive_locked: Protect an archived session from bulk deletion.
+        ``True`` locks it, ``False`` unlocks it, and ``None`` leaves the
+        current lock unchanged. Owner-only.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2242,6 +2309,7 @@ class UpdateSessionRequest(BaseModel):
     model_override: str | None = None
     collaboration_mode: str | None = None
     permission_mode: str | None = None
+    approval_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     external_session_id: str | None = None
@@ -2505,15 +2573,8 @@ class SessionListItem(BaseModel):
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
     :param status: Derived session lifecycle status.
-    :param foreground_status: Status of this session's own turn, excluding
-        child-session rollup. This distinguishes a busy main turn from
-        background-only activity while preserving ``status`` for compatibility.
-    :param background_activity_count: Number of active direct sub-agents plus
-        background shells owned by this session. ``0`` means none are known.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
-    :param archived_at: Unix epoch seconds of the most recent transition into
-        the archived state. ``None`` while active.
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
@@ -2978,9 +3039,8 @@ class SessionUsageEvent(_SSEEventBase):
         no per-model change, so the client keeps its cached map.
 
     Category: **transient** (SSE-only). On reconnect, clients seed
-    the ring from the session snapshot's ``last_total_tokens``,
-    ``context_window``, and ``auto_compact_token_limit``; the cost indicator
-    from ``total_cost_usd``,
+    the ring from the session snapshot's ``last_total_tokens`` and
+    ``context_window``, the cost indicator from ``total_cost_usd``,
     and the per-model token breakdown from ``usage_by_model``.
     """
 
@@ -2996,12 +3056,11 @@ class SessionUsageEvent(_SSEEventBase):
 
 class SessionModelEvent(_SSEEventBase):
     """
-    Active-model report from a terminal-backed integration.
+    Active-model report from a harness integration.
 
     Emitted after an ``external_model_change`` POST from a native
-    forwarder — the launch's own model report, or a switch made inside
-    the pane (a ``/model`` command or the in-TUI picker). Every surface
-    re-renders its model display from this.
+    forwarder or when an SDK relay reports its concrete model in terminal
+    response usage. Every surface re-renders its model display from this.
 
     :param type: Always ``"session.model"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
@@ -3115,6 +3174,32 @@ class SessionPermissionModeEvent(_SSEEventBase):
     permission_mode: str
 
 
+class SessionCodexApprovalModeEvent(_SSEEventBase):
+    """
+    Active approval/sandbox-mode update from a codex-native session.
+
+    Emitted after the web UI switches the mode, and after the Codex forwarder
+    observes a ``thread/settings/updated`` notification — an approval change the
+    user made inside Codex's ``/permissions`` popup, which Omnigent has no other
+    way to see. Lets the composer's approval picker track the thread without a
+    reload.
+
+    :param type: Always ``"session.codex_approval_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param approval_mode: The active mode, one of ``"ask-for-approval"``,
+        ``"approve-for-me"``, ``"full-access"``, ``"read-only"``.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.codex_native.approval_mode`` on the conversation labels (and
+    ``terminal_launch_args``), so reconnecting clients restore the same state
+    from the session snapshot.
+    """
+
+    type: Literal["session.codex_approval_mode"]
+    conversation_id: str
+    approval_mode: str
+
+
 class SessionAgentChangedEvent(_SSEEventBase):
     """
     Bound-agent change on a live session.
@@ -3167,8 +3252,9 @@ class SessionTodosEvent(_SSEEventBase):
         keys, e.g. ``[{"content": "Fix the bug", "status":
         "in_progress", "activeForm": "Fixing the bug"}]``.
 
-    Category: **transient** (SSE-only). On reconnect, clients seed the panel
-    from the persisted session snapshot's ``todos`` field.
+    Category: **transient** (SSE-only). On reconnect, clients seed
+    the panel from the session snapshot's ``todos`` field, which is
+    populated by ``_session_todos_cache`` at snapshot build time.
     """
 
     type: Literal["session.todos"]
@@ -4117,11 +4203,16 @@ class FailedEvent(_SSEEventBase):
     be absent when the failure occurs before response allocation.
 
     :param type: Always ``"response.failed"``.
+    :param source: Where the fault originated -- ``"llm"`` for
+        inference/context errors, ``"harness"`` for Claude Code/harness
+        process failures, ``"execution"`` for runner configuration
+        or infrastructure failures.
     :param response: The failure response object with ``status="failed"``
         and ``error`` populated.
     """
 
     type: Literal["response.failed"]
+    source: Literal["llm", "execution", "tool", "harness"] = "execution"
     response: ResponseObject | FailedResponseObject
 
 
@@ -4222,16 +4313,16 @@ class ErrorEvent(_SSEEventBase):
     (``except Exception``). Wire shape matches those emits.
 
     :param type: Always ``"response.error"``.
-    :param source: Origin of the error — ``"llm"`` for LLM-call
+    :param source: Origin of the error -- ``"llm"`` for LLM-call
         failures, ``"execution"`` for timeouts, ``"tool"`` for
-        tool failures (currently emitted by retry exhaustion paths).
+        tool failures, ``"harness"`` for harness process failures.
     :param tool_name: Tool identifier when ``source == "tool"``;
         ``None`` for the other sources.
     :param error: Classified error description.
     """
 
     type: Literal["response.error"]
-    source: Literal["llm", "execution", "tool"]
+    source: Literal["llm", "execution", "tool", "harness"]
     tool_name: str | None = None
     error: RetryErrorDetail
 
@@ -4514,6 +4605,7 @@ ServerStreamEvent = Annotated[
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
     | SessionPermissionModeEvent
+    | SessionCodexApprovalModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent

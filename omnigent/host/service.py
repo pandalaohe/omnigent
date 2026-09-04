@@ -19,9 +19,10 @@ from omnigent.process_logging import data_dir
 
 LAUNCHD_LABEL = "ai.omnigent.host"
 SYSTEMD_UNIT = "omnigent-host.service"
+# launchctl bootout returns before the job is gone; poll for the unload to land.
+_LAUNCHD_UNLOAD_TIMEOUT = 10.0
+_LAUNCHD_UNLOAD_POLL_INTERVAL = 0.2
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_LAUNCHD_STOP_TIMEOUT_S = 5.0
-_LAUNCHD_STOP_POLL_S = 0.1
 
 
 class HostServiceError(RuntimeError):
@@ -205,17 +206,19 @@ def _run_best_effort(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         raise HostServiceError(f"Required service manager {args[0]!r} was not found.") from exc
 
 
-def _wait_for_launchd_stop(service_target: str) -> None:
-    """Wait for launchd's asynchronous ``bootout`` to remove a service."""
-    deadline = time.monotonic() + _LAUNCHD_STOP_TIMEOUT_S
-    while _run_best_effort(["launchctl", "print", service_target]).returncode == 0:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise HostServiceError(
-                f"launchd service {LAUNCHD_LABEL!r} is still running after "
-                f"{_LAUNCHD_STOP_TIMEOUT_S:g}s."
-            )
-        time.sleep(min(_LAUNCHD_STOP_POLL_S, remaining))
+def _wait_for_launchd_unload(service_target: str) -> bool:
+    """Wait for launchd to finish unloading a booted-out job.
+
+    ``launchctl bootout`` unloads asynchronously, so a ``launchctl print``
+    issued right after it can still report the job during the unload window.
+    """
+    deadline = time.monotonic() + _LAUNCHD_UNLOAD_TIMEOUT
+    while True:
+        if _run_best_effort(["launchctl", "print", service_target]).returncode != 0:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_LAUNCHD_UNLOAD_POLL_INTERVAL)
 
 
 def _restore_file(path: Path, previous: bytes | None) -> None:
@@ -315,11 +318,14 @@ def enable_user_host_service(
 def disable_user_host_service() -> HostService:
     """Stop, disable, and remove the current user's host service."""
     service = _service_for_current_platform()
+    still_running = False
     if service.kind == "launchd":
         domain = f"gui/{_current_uid()}"
         service_target = f"{domain}/{service.label}"
         _run_best_effort(["launchctl", "bootout", service_target])
-        _wait_for_launchd_stop(service_target)
+        still_running = not _wait_for_launchd_unload(service_target)
+        # Unlink even when the job lingers: a retained RunAtLoad plist would
+        # silently restore the service at the next login.
         service.path.unlink(missing_ok=True)
     else:
         disable_args = ["systemctl", "--user", "disable", "--now", service.label]
@@ -330,16 +336,16 @@ def disable_user_host_service() -> HostService:
         service.path.unlink(missing_ok=True)
         _run_checked(["systemctl", "--user", "daemon-reload"])
     _forget_service(service)
+    if still_running:
+        raise HostServiceError(
+            f"launchd service {service.label!r} is still running; its definition "
+            "was removed, so it will not return at the next login."
+        )
     return service
 
 
 def pause_user_host_service() -> HostService | None:
-    """Stop the current user's host service without changing its definition.
-
-    Returns ``None`` when no service definition is installed.  The custom
-    updater uses this narrower operation so an upgrade can stop the process,
-    replace the tool, and start the exact same launchd/systemd definition.
-    """
+    """Stop the user's Host service while preserving its definition."""
     service = _service_for_current_platform()
     if not service.path.exists():
         return None
@@ -347,7 +353,10 @@ def pause_user_host_service() -> HostService | None:
         domain = f"gui/{_current_uid()}"
         service_target = f"{domain}/{service.label}"
         _run_best_effort(["launchctl", "bootout", service_target])
-        _wait_for_launchd_stop(service_target)
+        if not _wait_for_launchd_unload(service_target):
+            raise HostServiceError(
+                f"launchd service {service.label!r} did not stop before the update."
+            )
     else:
         _run_checked(["systemctl", "--user", "stop", service.label])
     return service

@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.llms.context_window import ModelPricing
 
+from omnigent import native_bridge_common
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
@@ -174,6 +175,9 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud.
 _SUBMIT_VERIFY_TIMEOUT_S = 10.0
+# UserPromptSubmit is the terminal's delivery acknowledgement. Composer
+# state alone is ambiguous because an in-pane restart also clears it.
+_DELIVERY_ACK_TIMEOUT_S = 10.0
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit
 # (so a slow-but-successful first Enter isn't double-tapped), short
@@ -229,6 +233,14 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
 SWITCH_MODEL_DIALOG_HINT = "Switch model?"
 EFFORT_DIALOG_HINT = "Change effort level?"
 _CONFIRM_DIALOG_HINTS = (SWITCH_MODEL_DIALOG_HINT, EFFORT_DIALOG_HINT)
+# Footer rows the ctrl+r prompt-history search renders directly under the
+# input box's closing rule since Claude Code 2.1.212, where the search rides
+# the framed composer as its filter field instead of drawing its own overlay.
+# The frame and ``❯`` glyph then read exactly like a free composer; this
+# footer is the only tell. Compared case-insensitively — the search chrome's
+# casing has already drifted across releases ("Search prompts" →
+# "search prompts:").
+_HISTORY_SEARCH_FOOTER_PREFIXES = ("search prompts:", "no matching prompt:")
 # Surfaces a confirm Enter must never land on: they are never a slash command's
 # own confirmation, and their default answer commits something the person did
 # not ask for — the ``/model`` picker writes a new global default into
@@ -436,6 +448,13 @@ class ClaudeTranscriptItem:
         :func:`omnigent.claude_native_forwarder._forward_available_items`)
         instead of rendering the summary as a user bubble. Defaults to
         ``False`` for every ordinary transcript item.
+    :param is_compact_noop: ``True`` when this item was parsed from the
+        ``<local-command-stdout>`` record Claude writes when it declines a
+        ``/compact`` (e.g. "Not enough messages to compact."). No real
+        compaction runs, so no ``isCompactSummary`` / ``SessionStart
+        source=compact`` completion signal follows; the forwarder uses this
+        flag to dismiss the stranded "Compacting…" spinner. Never rendered
+        as a bubble. Defaults to ``False``.
     """
 
     source_id: str
@@ -443,6 +462,7 @@ class ClaudeTranscriptItem:
     data: _JsonObject
     response_id: str
     is_compact_summary: bool = False
+    is_compact_noop: bool = False
 
 
 @dataclass(frozen=True)
@@ -515,6 +535,8 @@ class ClaudeHookRecord:
         advance past it.
     :param source: Claude ``SessionStart`` source, e.g. ``"clear"``,
         or ``None`` for hook records without a source field.
+    :param prompt: User text from a ``UserPromptSubmit`` hook, or
+        ``None`` for other hook events.
     :param claude_session_id: Claude-native session uuid from the hook
         payload, e.g. ``"a1b2c3d4-1234-5678-9abc-def012345678"``,
         or ``None`` when absent.
@@ -571,6 +593,7 @@ class ClaudeHookRecord:
     event_name: str | None
     recorded_at: float | None = None
     source: str | None = None
+    prompt: str | None = None
     claude_session_id: str | None = None
     transcript_path: Path | None = None
     previous_claude_session_id: str | None = None
@@ -1081,7 +1104,24 @@ def prepare_bridge_dir(
     ):
         with contextlib.suppress(FileNotFoundError):
             (bridge_dir / filename).unlink()
+    # Owner-pid marker for the periodic dead-owner prune; refreshed every
+    # turn so it always names the current runner. See native_bridge_common.
+    native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """
+    Remove claude-native bridge dirs whose owner process is provably dead.
+
+    Delegates to the shared sweep against this harness's bridge root; the
+    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    at startup to reclaim dirs leaked by a prior runner that died without
+    running the explicit delete path.
+
+    :returns: The number of orphaned bridge dirs removed.
+    """
+    return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
 
 
 def ensure_claude_workspace_trusted(workspace: Path) -> None:
@@ -2421,7 +2461,7 @@ def read_transcript_items_since_with_position(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=items,
+        items=_dedupe_compact_noop_echo(items),
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
@@ -2518,7 +2558,7 @@ def read_transcript_items_from_offset(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=items,
+        items=_dedupe_compact_noop_echo(items),
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
@@ -2774,6 +2814,94 @@ def read_hook_events_from_offset(
     )
 
 
+def _hook_file_size(bridge_dir: Path) -> int:
+    """Return the hook log size used to snapshot future events."""
+    path = bridge_dir / _HOOKS_FILE
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _is_subagent_hook_record(record: ClaudeHookRecord) -> bool:
+    """Return whether a hook record belongs to a Claude subagent."""
+    if record.transcript_path is None:
+        return False
+    path_parts = str(record.transcript_path).replace("\\", "/").split("/")
+    return "subagents" in (part.casefold() for part in path_parts)
+
+
+def _normalized_delivery_prompt(prompt: str) -> str:
+    """Normalize hook and injected prompt text for acknowledgement matching."""
+    return prompt.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+
+
+def _wait_for_user_prompt_submit_ack(
+    bridge_dir: Path,
+    *,
+    byte_offset: int,
+    expected_prompt: str,
+    expected_claude_session_id: str | None,
+    timeout_s: float | None = None,
+) -> None:
+    """Wait for Claude to acknowledge the exact prompt submitted after an offset."""
+    if timeout_s is None:
+        timeout_s = _DELIVERY_ACK_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
+    current_session_id = expected_claude_session_id
+    if byte_offset:
+        prior = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0)
+        for record in prior.records:
+            if record.byte_offset > byte_offset:
+                break
+            if (
+                record.event_name == "SessionStart"
+                and record.claude_session_id
+                and not _is_subagent_hook_record(record)
+            ):
+                current_session_id = record.claude_session_id
+    restart_seen = False
+    expected = _normalized_delivery_prompt(expected_prompt)
+    offset = byte_offset
+    first_poll = True
+    while first_poll or time.monotonic() < deadline:
+        # Even if the historical identity scan consumed a very short timeout,
+        # inspect events that are already on disk before declaring failure.
+        first_poll = False
+        result = read_hook_events_from_offset(
+            bridge_dir,
+            offset,
+            start_event_count=0,
+        )
+        offset = result.byte_offset
+        for record in result.records:
+            if _is_subagent_hook_record(record):
+                continue
+            if record.event_name == "SessionStart" and record.claude_session_id:
+                if current_session_id and record.claude_session_id != current_session_id:
+                    restart_seen = True
+                current_session_id = record.claude_session_id
+                continue
+            if record.event_name != "UserPromptSubmit" or record.prompt is None:
+                continue
+            if _normalized_delivery_prompt(record.prompt) != expected:
+                continue
+            if current_session_id and record.claude_session_id != current_session_id:
+                continue
+            return
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+    if restart_seen:
+        raise RuntimeError(
+            "Claude Code restarted while the message was being submitted and the new "
+            "session did not acknowledge it. The message was not delivered."
+        )
+    raise RuntimeError(
+        f"Claude Code did not acknowledge the submitted message within {timeout_s}s. "
+        "The message may not have been delivered."
+    )
+
+
 def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     """
     Return whether Claude reported a stop event after a hook cursor.
@@ -2805,7 +2933,10 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                     transcript_path = (
                         payload.get("transcript_path") if isinstance(payload, dict) else None
                     )
-                    if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                    if isinstance(transcript_path, str) and "subagents" in (
+                        part.casefold()
+                        for part in transcript_path.replace("\\", "/").split("/")
+                    ):
                         continue
                     return True
     except FileNotFoundError:
@@ -2876,6 +3007,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     if isinstance(raw_event_name, str) and raw_event_name:
         event_name = raw_event_name
     raw_source = payload.get("source") if isinstance(payload, dict) else None
+    raw_prompt = payload.get("prompt") if isinstance(payload, dict) else None
     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
@@ -2966,6 +3098,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         if isinstance(raw_recorded_at, (int, float)) and not isinstance(raw_recorded_at, bool)
         else None,
         source=raw_source if isinstance(raw_source, str) and raw_source else None,
+        prompt=raw_prompt if isinstance(raw_prompt, str) else None,
         claude_session_id=(
             raw_claude_session_id
             if isinstance(raw_claude_session_id, str) and raw_claude_session_id
@@ -3146,14 +3279,16 @@ def inject_user_message(
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
 
-    The submit is **verified, not fire-and-forget**: Claude Code
+    The submit is **acknowledged, not fire-and-forget**: Claude Code
     coalesces rapid stdin bursts into a paste, so an Enter that lands
     while the TUI is still consuming the paste is folded in as a
     newline and the draft sits unsent. This helper first polls
     ``capture-pane`` until the draft is visible in the input box (the
     paste was committed), sends Enter, then polls that the draft left
     the box — re-sending Enter while it hasn't — and raises if the
-    message never submits.
+    message never submits. An empty composer is not sufficient evidence:
+    after it clears, this helper also waits for the matching
+    ``UserPromptSubmit`` hook from the active Claude session.
 
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
@@ -3162,8 +3297,11 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, or if the draft never leaves the input box
-        after repeated submit Enters (message not delivered).
+        invocation fails, if the paste draft was never confirmed in the
+        input box after ``_PASTE_COMMIT_TIMEOUT_S`` (the TUI was still
+        consuming the paste — message not submitted), or if the draft
+        never leaves the input box after repeated submit Enters, or Claude
+        never acknowledges the submitted prompt.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # A surface left occupying the composer swallows everything typed
@@ -3192,6 +3330,15 @@ def inject_user_message(
     # that Omnigent cannot drive. Allowed commands (``/clear``,
     # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
     injected_text = _escape_unsupported_slash_command(content)
+    command_name = _first_slash_command_name(content)
+    needle = _submit_needle(content)
+    # Built-in lifecycle commands do not consistently emit UserPromptSubmit;
+    # whitespace-only submissions do not emit it at all.
+    require_delivery_ack = bool(needle) and (
+        command_name not in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS
+    )
+    hook_offset = _hook_file_size(bridge_dir) if require_delivery_ack else 0
+    expected_claude_session_id = read_claude_session_id(bridge_dir)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -3200,10 +3347,12 @@ def inject_user_message(
     # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
     # interior newlines (mapped to CR below) stay data instead of becoming
     # per-line submits. See anthropics/claude-code#52126.
+    paste_payload = _paste_payload_bytes(injected_text + "\n")
+    expected_delivery_prompt = _normalized_delivery_prompt(paste_payload.decode("utf-8"))
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(injected_text + "\n"))
+        paste_file.write(paste_payload)
         paste_path = paste_file.name
     try:
         _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
@@ -3225,11 +3374,13 @@ def inject_user_message(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
-    needle = _submit_needle(content)
+    # load / large payloads); polling is deterministic.
+    # When the draft never becomes visible (timeout expired) AND the
+    # content has an identifiable needle, raise rather than submit blind:
+    # a blind Enter races the still-consuming TUI and would silently drop
+    # the message (the caller gets no error but the turn never runs).
+    # When the needle is empty (whitespace-only content) the draft cannot
+    # be confirmed either way; fall through to best-effort blind submit.
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -3237,12 +3388,21 @@ def inject_user_message(
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    if not draft_seen:
+        if not needle:
+            # Content has no identifiable first line (e.g. whitespace-only).
+            # The draft position cannot be confirmed, so fall through to a
+            # best-effort blind submit rather than hard-failing.
+            time.sleep(_PASTE_SETTLE_S)
+            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+            return
+        raise RuntimeError(
+            f"The pasted draft was never visible in Claude Code's input box after "
+            f"{_PASTE_COMMIT_TIMEOUT_S}s (needle={needle!r}). The TUI may still be "
+            "consuming the paste — the message was not submitted. Retry the send."
+        )
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-    if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -3255,14 +3415,22 @@ def inject_user_message(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(info["socket_path"], info["tmux_target"])
         if not _draft_in_input_box(pane, needle):
-            return
+            break
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
             _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
             last_enter = time.monotonic()
-    raise RuntimeError(
-        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
-    )
+    else:
+        raise RuntimeError(
+            f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
+            "(the draft is still in the input box). The message was not delivered."
+        )
+    if require_delivery_ack:
+        _wait_for_user_prompt_submit_ack(
+            bridge_dir,
+            byte_offset=hook_offset,
+            expected_prompt=expected_delivery_prompt,
+            expected_claude_session_id=expected_claude_session_id,
+        )
 
 
 def inject_interrupt(
@@ -3988,6 +4156,13 @@ def _occupying_surface(pane: str) -> str | None:
     is drawn over the box; a row led by another mode's glyph means the
     box itself is not taking chat input.
 
+    One surface defeats that structural read: since Claude Code 2.1.212
+    the ctrl+r prompt-history search rides the framed composer as its
+    filter field, so the frame and ``❯`` glyph look exactly like a free
+    input box while every keystroke filters history and Enter replays an
+    old prompt. Its footer (:func:`_history_search_footer_shown`) is the
+    only tell, so that one surface is read from the footer region.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: A short description for the log, e.g. ``"shell mode"``, or
         ``None`` when the chat composer is free — and also when the
@@ -3996,6 +4171,8 @@ def _occupying_surface(pane: str) -> str | None:
     """
     if not pane.strip():
         return None
+    if _history_search_footer_shown(pane):
+        return "the prompt-history search"
     row = _composer_row(pane)
     if row is None:
         return "an overlay"
@@ -4062,11 +4239,43 @@ def _claude_prompt_rendered(pane: str) -> bool:
     rows below the box are unbounded, while the opening rule directly
     above it is not.
 
+    Since Claude Code 2.1.212 the ctrl+r history search rides the framed
+    composer as its filter field, so the frame and glyph alone would read
+    it as ready while a typed message filters history instead of sending;
+    its footer (:func:`_history_search_footer_shown`) rules it out.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when the chat input box appears mounted.
     """
     row = _composer_row(pane)
-    return row is not None and row.strip().startswith(_CLAUDE_PROMPT_GLYPH)
+    if row is None or not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
+        return False
+    return not _history_search_footer_shown(pane)
+
+
+def _history_search_footer_shown(pane: str) -> bool:
+    """
+    Return whether the ctrl+r history search's footer is on screen.
+
+    The footer sits in the region below the input box's closing rule
+    (the same anchoring as :func:`_permission_mode_from_pane`), so
+    transcript text discussing the search cannot be misread as live.
+    Prefix-matched case-insensitively: the chrome's casing has drifted
+    across Claude Code releases.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a footer row names the history search.
+    """
+    lines = [line for line in pane.splitlines() if line.strip()]
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_PROMPT_SCAN_TAIL_LINES:]
+    # A narrow pane wraps the footer's left cell across rows ("search" /
+    # "prompts:"), interleaving the right cell's text, so no single row
+    # carries the whole marker. Each row's left-cell fragment is the text
+    # before the first multi-space column gap; rejoined in order they
+    # spell the footer out again.
+    fragments = (re.split(r"\s{2,}", line.strip(), maxsplit=1)[0] for line in region)
+    return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
 
 
 def _is_box_rule(line: str) -> bool:
@@ -4973,6 +5182,122 @@ def _stdio_jsonrpc_loop(
         )
 
 
+_MCP_PROGRESS_INTERVAL_S: float = 15.0
+
+
+def _extract_progress_token(params: object) -> str | int | None:
+    """
+    Extract a progress token from MCP request params, if present.
+
+    :param params: Decoded MCP request params (usually a dict).
+    :returns: Progress token (str or int) or None.
+    """
+    if not isinstance(params, dict):
+        return None
+    meta = params.get("_meta")
+    if isinstance(meta, dict):
+        token = meta.get("progressToken")
+        if isinstance(token, (str, int)) and not isinstance(token, bool):
+            return token
+    token = params.get("progressToken")
+    if isinstance(token, (str, int)) and not isinstance(token, bool):
+        return token
+    return None
+
+
+def _is_relay_tool_call(params: object, bridge_dir: Path) -> bool:
+    """
+    Whether a ``tools/call`` targets a tool routed through the Omnigent relay.
+
+    :param params: Decoded MCP request params (usually a dict).
+    :param bridge_dir: Bridge directory used to resolve the active relay.
+    :returns: ``True`` when the named tool is served by the relay.
+    """
+    if not isinstance(params, dict):
+        return False
+    name = params.get("name")
+    if not isinstance(name, str) or not name:
+        return False
+    try:
+        return name in _read_relay_tool_names(bridge_dir)
+    except Exception:  # noqa: BLE001 - relay lookup failure means "not relayed"
+        return False
+
+
+class _McpProgressHeartbeat:
+    """Context manager emitting periodic MCP progress notifications to reset client timeouts."""
+
+    def __init__(
+        self,
+        progress_token: str | int | None,
+        stdout_lock: threading.Lock,
+        *,
+        framed: bool = False,
+        interval_s: float = _MCP_PROGRESS_INTERVAL_S,
+    ) -> None:
+        self._progress_token = progress_token
+        self._stdout_lock = stdout_lock
+        self._framed = framed
+        self._interval_s = interval_s
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._progress_token is None or self._interval_s <= 0:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mcp-progress-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            # Only forget a thread that actually exited; a writer blocked on a
+            # full stdout pipe stays tracked (it exits on its next stop check).
+            if not thread.is_alive():
+                self._thread = None
+
+    def _run(self) -> None:
+        # Emit an immediate first tick so the client learns the call is alive
+        # right away, then keep ticking every interval. MCP requires
+        # ``progress`` to increase on every notification; a constant value may
+        # be ignored (or rejected) by conforming clients.
+        tick = 0
+        while not self._stop_event.is_set():
+            tick += 1
+            notification: _JsonObject = {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": self._progress_token,
+                    "progress": tick,
+                },
+            }
+            try:
+                _write_jsonrpc(notification, self._stdout_lock, framed=self._framed)
+            except Exception:  # noqa: BLE001 - progress failure must not interrupt execution
+                break
+            if self._stop_event.wait(self._interval_s):
+                break
+
+    def __enter__(self) -> _McpProgressHeartbeat:
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_val: object,
+        exc_tb: object,
+    ) -> None:
+        self.stop()
+
+
 def _handle_and_write_mcp_request(
     request_id: object,
     method: str,
@@ -4997,8 +5322,19 @@ def _handle_and_write_mcp_request(
     :returns: None after the response is written.
     """
     # A request failure must not tear down the long-lived MCP server.
+    # Heartbeat only relay-routed calls: the relay's own 300 s budget
+    # guarantees they terminate, so keep-alive is safe. A hung LOCAL tool
+    # must stay killable by the client's static timeout, so it gets no
+    # heartbeat that would reset that deadline forever.
+    progress_token = (
+        _extract_progress_token(params)
+        if method == "tools/call" and _is_relay_tool_call(params, bridge_dir)
+        else None
+    )
+    heartbeat = _McpProgressHeartbeat(progress_token, stdout_lock, framed=framed)
     try:
-        result = _handle_mcp_request(method, params, tools, bridge_dir)
+        with heartbeat:
+            result = _handle_mcp_request(method, params, tools, bridge_dir)
         response: _JsonObject = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -5671,6 +6007,7 @@ def _transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
+            agent_name=agent_name,
             current_response_id=current_response_id,
         )
     message = entry.get("message")
@@ -5767,6 +6104,70 @@ _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-id>",
     "</task-notification>",
 )
+
+# Substrings Claude Code writes to a ``/compact`` command's
+# ``<local-command-stdout>`` when it declines to compact (context too small
+# to summarize). Claude fires the ``PreCompact`` hook — which raises the web
+# "Compacting conversation…" spinner — BEFORE deciding there's nothing to do,
+# then aborts without any ``isCompactSummary`` / ``SessionStart
+# source=compact`` completion signal, so the spinner is stranded. Matched
+# case-insensitively so the forwarder can dismiss the spinner.
+_COMPACT_NOOP_STDOUT_MARKERS: tuple[str, ...] = (
+    # Observed refusal text.
+    "not enough messages to compact",
+    # Defensive variant against wording drift.
+    "nothing to compact",
+)
+
+
+def _dedupe_compact_noop_echo(
+    items: list[ClaudeTranscriptItem],
+) -> list[ClaudeTranscriptItem]:
+    """
+    Drop the bare ``/compact`` echo when its refusal item is in the same batch.
+
+    Claude records a declined ``/compact`` as two records: the command echo
+    (a ``slash_command`` item with no output) and a standalone stdout record
+    (surfaced as the ``is_compact_noop`` item carrying the refusal text). They
+    are written together and normally read in one poll, so rendering both
+    yields two "Command compact" bubbles. Keep only the refusal item — it
+    carries the message — so the web shows a single bubble like the terminal.
+
+    :param items: Items parsed from one read batch, in order.
+    :returns: The items with any redundant bare ``/compact`` echo removed;
+        unchanged when the batch holds no ``is_compact_noop`` item.
+    """
+    if not any(item.is_compact_noop for item in items):
+        return items
+    return [
+        item
+        for item in items
+        if not (
+            not item.is_compact_noop
+            and item.item_type == "slash_command"
+            and item.data.get("name") == "compact"
+            and not item.data.get("output")
+        )
+    ]
+
+
+def _compact_noop_stdout(content: str) -> str | None:
+    """
+    Return the ``/compact`` "nothing to compact" refusal text, if this is one.
+
+    :param content: Raw ``local_command`` record ``content``, expected to hold a
+        ``<local-command-stdout>`` block.
+    :returns: The stdout text (e.g. "Not enough messages to compact.") when it
+        matches a known compact-refusal marker, else ``None``.
+    """
+    stdout_match = _COMMAND_STDOUT_RE.search(content)
+    if stdout_match is None:
+        return None
+    stdout = stdout_match.group(1)
+    if any(marker in stdout.lower() for marker in _COMPACT_NOOP_STDOUT_MARKERS):
+        return stdout.strip()
+    return None
+
 
 # Markers that prefix a ``role=user`` record produced by Claude
 # Code's CLI scaffolding (not user-typed content). ``<command-
@@ -6018,6 +6419,7 @@ def _local_command_transcript_items_from_entry(
     *,
     line_number: int,
     record_offset: int | None,
+    agent_name: str,
     current_response_id: str | None,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
@@ -6034,6 +6436,7 @@ def _local_command_transcript_items_from_entry(
     :param line_number: One-based transcript line number.
     :param record_offset: Byte offset where the transcript record
         starts, or ``None`` for legacy line-cursor reads.
+    :param agent_name: Agent/model name stamped on surfaced items.
     :param current_response_id: Response id for an in-progress shell
         command group, if the input record was parsed in an earlier
         line.
@@ -6044,6 +6447,29 @@ def _local_command_transcript_items_from_entry(
     if not isinstance(content, str) or not content:
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
+    # A ``/compact`` refusal ("Not enough messages to compact.") lands as a
+    # standalone ``local_command`` stdout record, separate from the
+    # ``/compact`` command echo. Surface it as a ``slash_command`` item
+    # carrying the refusal as ``output`` — so the web shows the same message
+    # Claude did — and flag it so the forwarder also dismisses the stranded
+    # "Compacting…" spinner.
+    compact_noop = _compact_noop_stdout(content)
+    if compact_noop is not None:
+        return current_response_id, [
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, 0, "compact_noop"),
+                item_type="slash_command",
+                data={
+                    "agent": agent_name,
+                    "kind": "command",
+                    "name": "compact",
+                    "arguments": "",
+                    "output": compact_noop,
+                },
+                response_id=current_response_id or _response_id_from_source(source_key),
+                is_compact_noop=True,
+            )
+        ]
     fallback_response_id = _response_id_from_source(source_key)
     response_id = (
         fallback_response_id

@@ -8,6 +8,7 @@ import errno
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -394,16 +395,17 @@ async def test_handle_launch_spawns_subprocess(
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         """Capture the env vars and spawn a no-op process.
 
-        :param args: Command args (ignored — we spawn a real sleep).
+        :param args: Command args (ignored — we spawn a real sleeper).
         :param kwargs: Popen kwargs including env and stdin.
         :returns: A real subprocess handle.
         """
         env = kwargs.get("env", {})
         spawned_env.update(env)
         spawned_kwargs.update(kwargs)
-        # Spawn a real process that sleeps briefly so poll() returns None.
+        # Use the active interpreter rather than the POSIX-only ``sleep``
+        # executable so this lifecycle assertion also runs on Windows.
         return original_popen(
-            ["sleep", "10"],
+            [sys.executable, "-c", "import time; time.sleep(10)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -446,7 +448,7 @@ async def test_handle_launch_spawns_subprocess(
         "runner subprocess must be spawned with cwd=<session workspace>"
     )
 
-    # Clean up the spawned sleep process (and its exit watcher).
+    # Clean up the spawned sleeper process (and its exit watcher).
     _cleanup_host(host)
 
 
@@ -588,12 +590,12 @@ async def test_handle_launch_configured_harness_proceeds_to_spawn(
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         """Spawn a no-op process so poll() returns None.
 
-        :param args: Command args (ignored — we spawn a real sleep).
+        :param args: Command args (ignored — we spawn a real sleeper).
         :param kwargs: Popen kwargs (ignored).
         :returns: A real subprocess handle.
         """
         return original_popen(
-            ["sleep", "10"],
+            [sys.executable, "-c", "import time; time.sleep(10)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -612,7 +614,7 @@ async def test_handle_launch_configured_harness_proceeds_to_spawn(
     )
     assert result.error_code is None
 
-    # Clean up the spawned sleep process (and its exit watcher).
+    # Clean up the spawned sleeper process (and its exit watcher).
     _cleanup_host(host)
 
 
@@ -650,12 +652,12 @@ async def test_handle_launch_without_harness_skips_check(
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         """Spawn a no-op process so poll() returns None.
 
-        :param args: Command args (ignored — we spawn a real sleep).
+        :param args: Command args (ignored — we spawn a real sleeper).
         :param kwargs: Popen kwargs (ignored).
         :returns: A real subprocess handle.
         """
         return original_popen(
-            ["sleep", "10"],
+            [sys.executable, "-c", "import time; time.sleep(10)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -670,7 +672,7 @@ async def test_handle_launch_without_harness_skips_check(
 
     assert result.status == "launched"
 
-    # Clean up the spawned sleep process (and its exit watcher).
+    # Clean up the spawned sleeper process (and its exit watcher).
     _cleanup_host(host)
 
 
@@ -703,14 +705,14 @@ async def test_handle_launch_prints_exact_runner_log_path(
     original_popen = subprocess.Popen
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-        """Spawn a harmless sleep so poll() reports the runner as alive.
+        """Spawn a harmless sleeper so poll() reports the runner as alive.
 
-        :param args: Command args (ignored — a real sleep is spawned).
+        :param args: Command args (ignored — a real sleeper is spawned).
         :param kwargs: Popen kwargs (ignored).
         :returns: A real subprocess handle.
         """
         return original_popen(
-            ["sleep", "10"],
+            [sys.executable, "-c", "import time; time.sleep(10)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -726,7 +728,8 @@ async def test_handle_launch_prints_exact_runner_log_path(
     out = capsys.readouterr().out
     assert "↑ Runner started:" in out
     # The exact file path is printed, home-collapsed to ``~`` for readability.
-    assert f"log: ~/.omnigent/logs/runner/{log_files[0].name}" in out
+    displayed_log_path = Path(".omnigent/logs/runner") / log_files[0].name
+    assert f"log: ~/{displayed_log_path}" in out
     assert "session: conv_log" in out
 
     _cleanup_host(host)
@@ -1002,10 +1005,12 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
     task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         # Let at least two full refreshes recompute-and-compare before stopping.
-        for _ in range(400):
+        for _ in range(100):
             if calls["n"] >= 2:
                 break
-            await asyncio.sleep(0.005)
+            # Stay above the coarse Windows event-loop timer resolution so
+            # the readiness task gets real wall-clock time to refresh.
+            await asyncio.sleep(0.02)
     finally:
         await _cancel(task)
 
@@ -1077,13 +1082,19 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
         output lands exactly where the daemon will read the tail from,
         and waits for exit so ``poll()`` reports the death immediately.
 
-        :param args: Command args (ignored — a failing sh is spawned).
+        :param args: Command args (ignored — a failing Python is spawned).
         :param kwargs: Popen kwargs from production, including the log
             file handles.
         :returns: A finished subprocess handle with returncode 7.
         """
         proc = original_popen(
-            ["sh", "-c", "echo 'RuntimeError: boom-traceback' >&2; exit 7"],
+            [
+                sys.executable,
+                "-c",
+                "import sys; "
+                "print('RuntimeError: boom-traceback', file=sys.stderr); "
+                "raise SystemExit(7)",
+            ],
             stdin=subprocess.DEVNULL,
             stdout=kwargs["stdout"],
             stderr=kwargs["stderr"],
@@ -1104,7 +1115,8 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     # The exit code identifies the failure class without log-reading.
     assert "code 7" in error
     # The log path lets the user fetch the full log on the host.
-    assert "~/.omnigent/logs/runner/runner-" in error
+    assert f"~/{Path('.omnigent/logs/runner')}" in error
+    assert "runner-" in error
     # The tail carries the actual cause — the whole point of the report.
     assert "RuntimeError: boom-traceback" in error
 
@@ -1144,7 +1156,13 @@ async def test_watch_runner_reports_unexpected_exit(
         :returns: A live subprocess handle.
         """
         return original_popen(
-            ["sh", "-c", "echo 'tunnel rejected: crash-cause' >&2; sleep 0.2; exit 3"],
+            [
+                sys.executable,
+                "-c",
+                "import sys,time; "
+                "print('tunnel rejected: crash-cause', file=sys.stderr, flush=True); "
+                "time.sleep(0.2); raise SystemExit(3)",
+            ],
             stdin=subprocess.DEVNULL,
             stdout=kwargs["stdout"],
             stderr=kwargs["stderr"],
@@ -1202,7 +1220,7 @@ async def test_watch_runner_silent_on_intentional_stop(
         :returns: A live subprocess handle.
         """
         return original_popen(
-            ["sleep", "60"],
+            [sys.executable, "-c", "import time; time.sleep(60)"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1269,7 +1287,7 @@ async def test_watch_runner_silent_on_clean_exit(
         :returns: A live subprocess handle.
         """
         return original_popen(
-            ["sh", "-c", "sleep 0.2; exit 0"],
+            [sys.executable, "-c", "import time; time.sleep(0.2)"],
             stdin=subprocess.DEVNULL,
             stdout=kwargs["stdout"],
             stderr=kwargs["stderr"],
@@ -1406,7 +1424,7 @@ async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     host = _make_host_process()
     proc = subprocess.Popen(
-        ["sleep", "60"],
+        [sys.executable, "-c", "import time; time.sleep(60)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1456,7 +1474,7 @@ async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) ->
     """
     host = _make_host_process()
     proc = subprocess.Popen(
-        ["sleep", "60"],
+        [sys.executable, "-c", "import time; time.sleep(60)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1486,7 +1504,7 @@ async def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> N
     """
     host = _make_host_process()
     proc = subprocess.Popen(
-        ["true"],
+        [sys.executable, "-c", "pass"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1528,12 +1546,12 @@ def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
     host = _make_host_process()
 
     alive_proc = subprocess.Popen(
-        ["sleep", "60"],
+        [sys.executable, "-c", "import time; time.sleep(60)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     dead_proc = subprocess.Popen(
-        ["true"],
+        [sys.executable, "-c", "pass"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1567,7 +1585,7 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
     procs = []
     for name in ("runner_a", "runner_b", "runner_c"):
         proc = subprocess.Popen(
-            ["sleep", "60"],
+            [sys.executable, "-c", "import time; time.sleep(60)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1583,6 +1601,7 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
     assert host._runners == {}
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork/waitpid")
 def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
     """Regression for #1782: orphaned children are reaped, not leaked.
 
@@ -1637,7 +1656,7 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     host = _make_host_process()
 
     # A tracked runner that exits non-zero (a "crash").
-    runner = subprocess.Popen(["python3", "-c", "import sys; sys.exit(42)"])
+    runner = subprocess.Popen([sys.executable, "-c", "raise SystemExit(42)"])
     host._runners["runner_crash"] = _RunnerHandle(
         proc=runner, log_path=tmp_path / "runner-crash.log"
     )
@@ -1677,7 +1696,7 @@ def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -
     # A host-owned subprocess (git stand-in) that FAILS with a distinctive
     # code. NOT a tracked runner — indistinguishable from an orphan to a naive
     # reaper.
-    proc = subprocess.Popen(["sh", "-c", "exit 42"])
+    proc = subprocess.Popen([sys.executable, "-c", "raise SystemExit(42)"])
     # Let it exit so it is reapable (the dangerous window subprocess.run has
     # between the child exiting and its internal wait()).
     time.sleep(0.3)
@@ -1789,7 +1808,7 @@ def test_host_spawned_runner_has_parent_pid_env(
         env = kwargs.get("env", {})
         spawned_env.update(env)
         return original_popen(
-            ["sleep", "10"],
+            [sys.executable, "-c", "import time; time.sleep(10)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1984,8 +2003,10 @@ def test_handle_stat_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     handler skipped expansion, agent specs with ``cwd: ~/foo``
     would never resolve and validation would fail on every host.
     """
-    # Point HOME at our tmp_path so ~ resolves predictably.
+    # Point the POSIX and Windows home selectors at tmp_path so ``~`` resolves
+    # predictably on every supported Host platform.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     target = tmp_path / "subdir"
     target.mkdir()
 
@@ -2219,6 +2240,48 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert env["MY_GATEWAY_URL"] == "https://llm.internal.example.com"
     # Anything unnamed stays behind the allowlist.
     assert "UNLISTED_SECRET" not in env
+
+
+def test_dispatch_trace_context_reaches_runner_but_not_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The dispatch-blessed caller trace context must reach runner (and thus
+    harness) subprocesses via the OMNIGENT_OTEL_ allowlist prefix, but a
+    long-lived host daemon must NOT inherit it: the daemon outlives the
+    dispatch and is reused, so a stale caller context stuck to it would
+    funnel every later run into the first caller's dead trace.
+    """
+    from omnigent.cli import _build_host_daemon_env
+    from omnigent.runtime.telemetry import (
+        DISPATCH_TRACEPARENT_ENV_VAR,
+        DISPATCH_TRACESTATE_ENV_VAR,
+    )
+
+    traceparent = "00-9fb2e1cf8fbe9c5ecb7742f04c351500-662a3348b2576ccf-01"
+
+    runner_env = _build_runner_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            DISPATCH_TRACEPARENT_ENV_VAR: traceparent,
+            DISPATCH_TRACESTATE_ENV_VAR: "vendor=abc",
+        },
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert runner_env[DISPATCH_TRACEPARENT_ENV_VAR] == traceparent
+    assert runner_env[DISPATCH_TRACESTATE_ENV_VAR] == "vendor=abc"
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(DISPATCH_TRACEPARENT_ENV_VAR, traceparent)
+    monkeypatch.setenv(DISPATCH_TRACESTATE_ENV_VAR, "vendor=abc")
+    for server_url in (None, "https://example.databricksapps.com"):
+        daemon_env = _build_host_daemon_env(server_url=server_url)
+        assert DISPATCH_TRACEPARENT_ENV_VAR not in daemon_env
+        assert DISPATCH_TRACESTATE_ENV_VAR not in daemon_env
 
 
 def test_build_runner_env_passthrough_survives_remote_daemon_hop(
@@ -2499,6 +2562,7 @@ def test_handle_list_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     literal subdir named ``~`` and fail with ENOENT.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     (tmp_path / "subdir").mkdir()
     (tmp_path / "subdir" / "x.txt").write_text("data")
 
@@ -2707,6 +2771,7 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     would become a literal ``~`` subdir of the process cwd.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
     host = _make_host_process()
     result = host._handle_create_dir(HostCreateDirFrame(request_id="m5", path="~/scratch"))
@@ -3774,6 +3839,34 @@ async def test_reconnect_uses_shorter_handshake_timeout(
     assert [call["open_timeout"] for call in spy.calls] == [10.0, 3.0]
 
 
+async def test_host_records_accepted_connection_and_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host reports lifecycle metrics only after an accepted upgrade."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    spy = _ConnectSpy([None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    connected: list[tuple[str, bool]] = []
+    disconnected: list[tuple[str, BaseException | None]] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.record_websocket_connected",
+        lambda kind, *, reconnect: connected.append((kind, reconnect)),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.record_websocket_disconnected",
+        lambda kind, error, **_kwargs: disconnected.append((kind, error)),
+    )
+
+    await _host().run()
+
+    assert connected == [("host", False)]
+    assert len(disconnected) == 1
+    assert disconnected[0][0] == "host"
+    assert isinstance(disconnected[0][1], ConnectionClosedError)
+
+
 def _refused_exc() -> ConnectionRefusedError:
     """A single-stack connection-refused, as asyncio raises it.
 
@@ -3948,6 +4041,26 @@ async def test_run_host_process_invalid_host_id_exits_actionably(
     assert "not-a-uuid" in err
 
 
+def test_run_host_process_mirrors_structured_logs_on_foreground_tty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Foreground ``omnigent host`` mirrors logs like ``omnigent server``."""
+    monkeypatch.delenv("OMNIGENT_LOG_TO_STDERR", raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    with patch(
+        "omnigent.host.connect.configure_process_logging",
+        return_value=tmp_path / "host.log",
+    ) as configure_logging:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    configure_logging.assert_called_once_with("host", log_to_stderr=True)
+
+
 def test_run_host_process_announces_session_log_dir_on_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3972,8 +4085,58 @@ def test_run_host_process_announces_session_log_dir_on_start(
     )
 
     out = capsys.readouterr().out
-    assert "Session logs: ~/.omnigent/logs/runner/" in out
-    assert "This host's log: ~/.omnigent/logs/host/host-" in out
+    assert f"Session logs: ~/{Path('.omnigent/logs/runner')}/" in out
+    assert f"This host's log: ~/{Path('.omnigent/logs/host')}{os.sep}host-" in out
+
+
+async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host startup reclaims native bridge dirs orphaned by a crashed runner.
+
+    A runner that dies uncleanly (SIGKILL / crash / host restart mid-run)
+    never runs its explicit-delete cleanup, and if no new runner ever
+    launches on the machine the runner-side startup sweep never fires
+    either — so ``~/.omnigent`` grows without bound. The host daemon's own
+    (re)start is the reliable moment to reap: ``run()`` must invoke the
+    cross-harness bridge-dir sweep before entering the connect loop.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    sweeps: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: sweeps.append(1) or 3,
+    )
+    host = _host()
+
+    await host.run()
+
+    assert sweeps == [1]
+
+
+async def test_run_survives_a_failing_native_bridge_dir_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising bridge-dir sweep must not abort host startup.
+
+    The sweep is best-effort housekeeping; a broken bridge module or an
+    unreadable bridge root must never prevent the host from registering.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    def _boom() -> int:
+        raise OSError("bridge root unreadable")
+
+    monkeypatch.setattr(
+        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        _boom,
+    )
+    host = _host()
+
+    # Startup completes (run returns via the clean cancel) despite the raise.
+    await host.run()
 
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
@@ -4006,7 +4169,7 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
         :returns: A real subprocess handle.
         """
         proc = original_popen(
-            ["sleep", "60"],
+            [sys.executable, "-c", "import time; time.sleep(60)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -4049,9 +4212,9 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
 ) -> None:
     """A Databricks-routed Codex request is answered by the harness probe.
 
-    The probe rows pass through verbatim with their ids as the routable
-    set, and the second request is served from the fingerprint cache —
-    the harness is booted once.
+    The probe rows retain their fields and gain the host's sanitized provider
+    source, with their ids as the routable set. The second request is served
+    from the fingerprint cache — the harness is booted once.
     """
     from omnigent import codex_native_app_server
 
@@ -4087,8 +4250,25 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
         request_id="req_1",
         status="ok",
         models=[
-            {"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"},
-            {"id": "gpt-5.4", "displayName": "gpt-5.4", "isDefault": True},
+            {
+                "id": "gpt-5.6-sol",
+                "displayName": "GPT-5.6-Sol",
+                "source": {
+                    "kind": "subscription",
+                    "label": "Subscription",
+                    "name": "codex",
+                },
+            },
+            {
+                "id": "gpt-5.4",
+                "displayName": "gpt-5.4",
+                "isDefault": True,
+                "source": {
+                    "kind": "subscription",
+                    "label": "Subscription",
+                    "name": "codex",
+                },
+            },
         ],
         routable_models=["gpt-5.6-sol", "gpt-5.4"],
     )
@@ -4223,8 +4403,105 @@ async def test_model_options_frame_replies_off_the_receive_loop(
     assert isinstance(reply, HostModelOptionsResultFrame)
     assert reply.request_id == "req_slow"
     assert reply.status == "ok"
-    assert reply.models == [{"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"}]
+    assert reply.models == [
+        {
+            "id": "gpt-5.6-sol",
+            "displayName": "GPT-5.6-Sol",
+            "source": {
+                "kind": "subscription",
+                "label": "Subscription",
+                "name": "codex",
+            },
+        }
+    ]
     _cleanup_host(host)
+
+
+async def test_dns_errno_failure_is_not_a_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Windows errno 11001 (getaddrinfo failed) is not close code 1001.
+
+    The old substring classifier matched "1001" inside "11001", so a
+    sustained DNS outage (VPN down) classified every failure as an explicit
+    recycle and reconnected at the 0.5s prompt cadence indefinitely — 2
+    attempts/second, 122k attempts overnight in the field report.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    dns_failure = OSError(11001, "getaddrinfo failed")
+    spy = _ConnectSpy([dns_failure, dns_failure, dns_failure, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    assert spy.call_count == 4
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 3
+    assert not any("(recycle" in r for r in reconnects), (
+        "a DNS resolution failure must take the backoff ladder, not the prompt recycle cadence"
+    )
+
+
+@pytest.mark.parametrize("port", [502, 1001, 1012])
+async def test_endpoint_port_is_not_a_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    port: int,
+) -> None:
+    """Standalone numbers in transport errors are not protocol status codes."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    failure = OSError(f"Connect call failed ('203.0.113.1', {port})")
+    spy = _ConnectSpy([failure, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await _host().run()
+
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 1
+    assert "(recycle" not in reconnects[0]
+
+
+async def test_sustained_recycle_failures_fall_back_to_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sustained run of recycle-classified failures is an outage, not a cycle.
+
+    The prompt cadence exists for a brief ingress recycle; when the same
+    classification fires attempt after attempt without a connection ever
+    establishing (proxy 502 while the server is down), the daemon must back
+    off instead of hammering the endpoint twice a second forever.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECYCLE_PROMPT_MAX_STREAK", 3)
+    # Raised AT CONNECT TIME (never accepted): an ingress-classified outage.
+    rejected = _invalid_status(502)
+    spy = _ConnectSpy([rejected] * 6 + [asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    assert spy.call_count == 7
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 6
+    prompt = [i for i, r in enumerate(reconnects) if "(recycle" in r]
+    # The first _RECYCLE_PROMPT_MAX_STREAK attempts are prompt; every attempt
+    # after that takes the backoff ladder.
+    assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
 
 
 async def test_silent_connect_streak_escalates_and_slows_reconnects(
@@ -4894,6 +5171,43 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
 
 
+async def test_launch_harness_probe_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The readiness probe must not run inline on the daemon's event loop.
+
+    It shells out to ``<cli> --version``, so inline a hung CLI would stall the
+    keepalive pong the server counts as liveness.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    loop_thread_id = threading.get_ident()
+    probe_thread_ids: list[int] = []
+
+    def _record_thread(harness: str) -> bool:
+        probe_thread_ids.append(threading.get_ident())
+        return False
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _record_thread)
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_probe_thread",
+            binding_token="token_abc",
+            workspace=str(workspace),
+            harness="codex",
+        )
+    )
+
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert probe_thread_ids, "the harness probe should still run"
+    assert loop_thread_id not in probe_thread_ids, (
+        "harness readiness probe ran on the event loop thread"
+    )
+
+
 async def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
     """A refusal that carries a body (what ``_refuse_upgrade`` sends, e.g. the
     server's malformed-host-id 400) is surfaced verbatim — the client passes the
@@ -4940,7 +5254,7 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         return original_popen(
-            ["sleep", "30"],
+            [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -4993,7 +5307,7 @@ async def test_handle_launch_leaves_other_sessions_runners_alone(
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         return original_popen(
-            ["sleep", "30"],
+            [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -5045,7 +5359,7 @@ async def test_handle_launch_spawn_failure_preserves_previous_runner(
         if calls["n"] > 1:
             raise OSError("fork failed")
         return original_popen(
-            ["sleep", "30"],
+            [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -5105,7 +5419,7 @@ async def test_supersede_stop_does_not_block_the_launch(
                 stderr=subprocess.DEVNULL,
             )
         return original_popen(
-            ["sleep", "30"],
+            [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

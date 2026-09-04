@@ -23,6 +23,8 @@ export function ChatPlanAccordion({ className }: { className?: string }) {
   return (
     // Full-width layout row with side gutters; the card centers on the chat
     // column so it lines up with the message thread below.
+    // chat-plan-accordion is the stylesheet hook: index.css folds the native
+    // shells' safe-area header shift into this row's top margin.
     <div className={cn("chat-plan-accordion shrink-0 px-0 md:px-4", className)}>
       <details
         data-testid="plan-tracker"

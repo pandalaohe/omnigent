@@ -12,6 +12,7 @@ import type { RoutingDecisionExtras } from "./routingDecision";
 import type { ProviderUsageLimitsSnapshot } from "./providerUsageLimits";
 import type {
   BackgroundTaskInfo,
+  CodexPersistMode,
   ErrorInfo,
   ModelUsage,
   RememberScope,
@@ -269,6 +270,8 @@ export interface ElicitationRequest {
    * where the allow rule is meaningful.
    */
   rememberScope?: RememberScope | null;
+  /** Codex-native MCP approval persistence modes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
 }
 
 /**
@@ -584,6 +587,18 @@ export interface SessionPermissionModeEvent {
   type: "session_permission_mode";
   conversationId: string;
   permissionMode: string;
+}
+
+/**
+ * `session.codex_approval_mode` — active codex-native approval/sandbox switch.
+ *
+ * Emitted when the web picker switches the mode, and when the Codex forwarder
+ * sees a `thread/settings/updated` (a `/permissions` change made in the TUI).
+ */
+export interface SessionCodexApprovalModeEvent {
+  type: "session_codex_approval_mode";
+  conversationId: string;
+  approvalMode: string;
 }
 
 /**
@@ -948,6 +963,7 @@ export type StreamEvent =
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
+  | SessionCodexApprovalModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

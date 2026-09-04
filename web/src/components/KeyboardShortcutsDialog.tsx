@@ -30,13 +30,6 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isNativeShell } from "@/lib/nativeBridge";
-import {
-  eventMatchesShortcutAction,
-  hasCustomShortcutBindings,
-  resolveShortcutBindings,
-  shortcutBindingLabels,
-  type ShortcutActionId,
-} from "@/lib/keyboardShortcutPreferences";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -54,7 +47,6 @@ const DOWN = "↓";
 
 interface Shortcut {
   label: string;
-  actionId?: ShortcutActionId;
   /** Keys rendered left→right as chips. A chord (held together) or, for the
    *  arrow-pairs, the two interchangeable keys for that action. */
   keys: string[];
@@ -73,47 +65,34 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
     items: [
-      { label: "Start a new session", actionId: "newSession", keys: [MOD_KEY, "N"] },
-      { label: "Open command palette", actionId: "commandPalette", keys: [MOD_KEY, "K"] },
-      { label: "Show keyboard shortcuts", actionId: "showShortcuts", keys: [MOD_KEY, "/"] },
+      { label: "Start a new session", keys: [MOD_KEY, "N"] },
+      { label: "Open command palette", keys: [MOD_KEY, "K"] },
+      { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
   {
     title: "In chats",
     items: [
-      { label: "Recall previous prompt", actionId: "recallPreviousPrompt", keys: [UP] },
-      { label: "Recall next prompt", actionId: "recallNextPrompt", keys: [DOWN] },
-      { label: "Accept approval prompt", actionId: "approvePrompt", keys: [MOD_KEY, ENTER_KEY] },
-      {
-        label: "Toggle voice dictation",
-        actionId: "voiceDictation",
-        keys: [MOD_KEY, ALT_KEY, "V"],
-      },
-      { label: "Stop response", actionId: "stopResponse", keys: ["Esc"] },
+      { label: "Recall previous prompt", keys: [UP] },
+      { label: "Recall next prompt", keys: [DOWN] },
+      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
+      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
+      { label: "Stop response", keys: ["Esc"] },
     ],
   },
   {
     title: "Navigation",
     items: [
-      { label: "Previous session", actionId: "previousSession", keys: [MOD_KEY, UP] },
-      { label: "Next session", actionId: "nextSession", keys: [MOD_KEY, DOWN] },
-      { label: "Poll sessions", actionId: "pollSessions", keys: [ALT_KEY, "~"] },
-      { label: "Archive current session", actionId: "archiveSession", keys: [ALT_KEY, "W"] },
+      { label: "Previous session", keys: [MOD_KEY, UP] },
+      { label: "Next session", keys: [MOD_KEY, DOWN] },
     ],
   },
   {
     title: "View",
     items: [
-      {
-        label: "Toggle conversations sidebar",
-        actionId: "toggleConversationsSidebar",
-        keys: [MOD_KEY, ALT_KEY, "["],
-      },
-      {
-        label: "Toggle workspace sidebar",
-        actionId: "toggleWorkspaceSidebar",
-        keys: [MOD_KEY, ALT_KEY, "]"],
-      },
+      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
+      { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
     ],
   },
   {
@@ -121,8 +100,8 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     note: "while the suggestions menu is open",
     items: [
       { label: "Navigate suggestions", keys: [UP, DOWN] },
-      { label: "Apply highlighted command", actionId: "applySuggestion", keys: ["Tab"] },
-      { label: "Dismiss menu", actionId: "dismissSuggestions", keys: ["Esc"] },
+      { label: "Apply highlighted command", keys: ["Tab"] },
+      { label: "Dismiss menu", keys: ["Esc"] },
     ],
   },
 ];
@@ -134,7 +113,6 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
 function pinnedSessionShortcut(native: boolean): Shortcut {
   return {
     label: "Jump to pinned session (1–10)",
-    actionId: "pinnedSession",
     keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
   };
 }
@@ -145,52 +123,24 @@ function shortcutGroupsFor(
   submitWithModEnter: boolean,
   preventsKeyboardSubmit: boolean,
 ): ShortcutGroup[] {
-  const effectiveKeys = (item: Shortcut): string[] => {
-    if (!item.actionId || !hasCustomShortcutBindings(item.actionId)) return item.keys;
-    return resolveShortcutBindings(item.actionId).flatMap((binding) =>
-      shortcutBindingLabels(binding),
-    );
-  };
   return SHORTCUT_GROUPS.map((group) => {
     if (group.title === "In chats" && !preventsKeyboardSubmit) {
       return {
         ...group,
         items: [
-          {
-            label: "Send message",
-            actionId: "sendMessage",
-            keys: hasCustomShortcutBindings("sendMessage")
-              ? resolveShortcutBindings("sendMessage").flatMap((binding) =>
-                  shortcutBindingLabels(binding),
-                )
-              : composerSendShortcutKeys(submitWithModEnter),
-          },
+          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
           {
             label: "New line in message",
-            actionId: "newLine",
-            keys: hasCustomShortcutBindings("newLine")
-              ? resolveShortcutBindings("newLine").flatMap((binding) =>
-                  shortcutBindingLabels(binding),
-                )
-              : composerNewLineShortcutKeys(submitWithModEnter),
+            keys: composerNewLineShortcutKeys(submitWithModEnter),
           },
-          ...group.items.map((item) => ({ ...item, keys: effectiveKeys(item) })),
+          ...group.items,
         ],
       };
     }
     if (group.title === "Navigation") {
-      const pinned = pinnedSessionShortcut(native);
-      return {
-        ...group,
-        items: [
-          ...group.items.map((item) => ({ ...item, keys: effectiveKeys(item) })),
-          hasCustomShortcutBindings("pinnedSession")
-            ? { ...pinned, keys: effectiveKeys(pinned) }
-            : pinned,
-        ],
-      };
+      return { ...group, items: [...group.items, pinnedSessionShortcut(native)] };
     }
-    return { ...group, items: group.items.map((item) => ({ ...item, keys: effectiveKeys(item) })) };
+    return group;
   });
 }
 
@@ -245,10 +195,9 @@ export function KeyboardShortcutsDialog() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat) return;
       // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
       // trigger, so require the modifier and no Shift/Alt to avoid clashing.
-      if (eventMatchesShortcutAction(e, "showShortcuts")) {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "/") {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

@@ -1735,6 +1735,105 @@ async def test_forwarder_posts_compaction_in_progress_on_precompact_hook(
 
 
 @pytest.mark.asyncio
+async def test_compact_refusal_in_progress_precedes_failed_same_poll(
+    tmp_path: Path,
+) -> None:
+    """
+    A same-poll ``/compact`` refusal posts ``in_progress`` BEFORE ``failed``.
+
+    Regression for the stranded spinner: the ``PreCompact`` hook (→
+    ``in_progress``, which raises the spinner) is forwarded AFTER transcript
+    items each poll, and Claude writes the refusal (transcript) and the
+    ``PreCompact`` (hook) close enough to land in one poll. If the dismissal
+    fired during the transcript phase it would clear nothing, then the hook
+    would raise a spinner that never clears. The dismissal is deferred to
+    after the hook phase, so the ordered posts are ``in_progress`` then
+    ``failed`` — a net-dismissed spinner.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    # The two records Claude writes for a declined /compact: the command echo
+    # and the standalone refusal stdout.
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "compact-cmd",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/compact</command-name>\n<command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "local_command",
+                        "uuid": "compact-stdout",
+                        "isMeta": False,
+                        "content": (
+                            "<local-command-stdout>Not enough messages to compact."
+                            "</local-command-stdout>"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Collect compaction-status posts until both edges are seen.
+        statuses: list[str] = []
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "failed" not in statuses and asyncio.get_running_loop().time() < deadline:
+            request = await _get_recorded_request(server)
+            if request["body"].get("type") == "external_compaction_status":
+                statuses.append(request["body"]["data"]["status"])
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    # in_progress (spinner raised by the hook) must land before failed
+    # (the deferred dismissal), so the net effect is a dismissed spinner.
+    assert statuses == ["in_progress", "failed"], (
+        f"expected in_progress then failed, got {statuses!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_forwarder_posts_compaction_completed_on_compact_session_start(
     tmp_path: Path,
 ) -> None:
@@ -5156,6 +5255,79 @@ async def test_subagent_watcher_uses_correlated_terminal_notification(
     assert child_state.last_status == status
 
 
+async def test_subagent_terminal_notification_waits_for_late_meta_registration(
+    tmp_path: Path,
+) -> None:
+    """A parent terminal record is retained until its child meta file appears."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            _task_notification_record(
+                tool_use_id="toolu_late_meta",
+                status="completed",
+                result="late registration result",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True)
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_subagent_start":
+            return httpx.Response(202, json={"child_session_id": "conv_child_late"})
+        if body.get("type") == "external_session_status":
+            status_posts.append(body["data"])
+        return httpx.Response(202, json={})
+
+    trackers = {
+        "start_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+        "item_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+        "status_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            **trackers,
+        )
+        assert first.pending_terminal_notifications == {
+            "toolu_late_meta": ("completed", "late registration result")
+        }
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id="late1",
+            agent_type="Explore",
+            description="late metadata",
+            tool_use_id="toolu_late_meta",
+        )
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder._read_subagent_forward_state(bridge_dir),
+            agent_name="claude-native-ui",
+            **trackers,
+        )
+
+    assert status_posts == [
+        {"status": "completed", "output": "late registration result"}
+    ]
+    assert second.pending_terminal_notifications == {}
+    assert second.subagents["late1"].last_status == "completed"
+
+
 async def test_subagent_watcher_never_completes_from_tool_result_silence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5250,11 +5422,11 @@ async def test_subagent_watcher_never_completes_from_tool_result_silence(
     assert second.subagents["async1"].quiet_terminal_output is None
 
 
-async def test_subagent_watcher_falls_back_only_after_final_assistant_text(
+async def test_subagent_watcher_does_not_complete_from_assistant_text_silence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Legacy transcripts can settle only when their final item is an answer."""
+    """Assistant text plus silence is not proof that a sub-agent turn ended."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -5324,11 +5496,8 @@ async def test_subagent_watcher_falls_back_only_after_final_assistant_text(
             **trackers,
         )
 
-    assert status_posts == [
-        {"status": "running"},
-        {"status": "completed", "output": "Final legacy result."},
-    ]
-    assert second.subagents["legacy1"].last_status == "completed"
+    assert status_posts == [{"status": "running"}]
+    assert second.subagents["legacy1"].last_status == "running"
 
 
 async def test_subagent_terminal_notification_retries_after_state_reload(
@@ -6007,6 +6176,122 @@ async def test_effort_sync_swallows_patch_failure() -> None:
     # Attempted exactly once and the 503 swallowed (no exception escaped the await).
     assert len(captured) == 1
     assert captured[0].method == "PATCH"
+
+
+async def _run_dismiss_stranded_spinner(
+    *,
+    bridge_dir: Path,
+    seq: int,
+    status: int = 200,
+) -> list[_CapturedRequest]:
+    """
+    Drive ``_maybe_dismiss_stranded_compaction_spinner`` against a mock AP.
+
+    :param bridge_dir: Bridge dir holding the compaction state.
+    :param seq: The refused compaction's ``PreCompact`` seq to dismiss.
+    :param status: HTTP status the mock endpoint returns.
+    :returns: Every request the helper issued, in order.
+    """
+    captured: list[_CapturedRequest] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the request and return a canned response."""
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        captured.append(_CapturedRequest(method=request.method, path=request.url.path, body=body))
+        return httpx.Response(status, json={"queued": False})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._maybe_dismiss_stranded_compaction_spinner(
+            client, session_id="conv_x", bridge_dir=bridge_dir, seq=seq
+        )
+    return captured
+
+
+async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> None:
+    """
+    A ``/compact`` refusal posts ``failed`` and drops the refused token.
+
+    Claude fired ``PreCompact`` (raising the spinner) but declined to
+    compact, so no completion signal follows. The forwarder must dismiss
+    the "Compacting…" spinner with ``external_compaction_status: failed``
+    and clear the dangling ``PreCompact`` token for that seq.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq)
+
+    assert captured == [
+        _CapturedRequest(
+            method="POST",
+            path="/v1/sessions/conv_x/events",
+            body={"type": "external_compaction_status", "data": {"status": "failed"}},
+        )
+    ], f"expected one failed compaction-status POST, got {captured!r}"
+    # Dangling token cleared so a later genuine compaction reconciles cleanly.
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
+
+
+async def test_compact_refusal_without_pending_token_no_ops(tmp_path: Path) -> None:
+    """
+    A refusal whose ``PreCompact`` was missed posts nothing.
+
+    No pending token means the ``PreCompact`` was never observed, so no
+    spinner is up and a ``failed`` post would be spurious.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=1)
+
+    assert captured == [], f"expected no POST without a pending token, got {captured!r}"
+
+
+async def test_compact_refusal_does_not_dismiss_a_different_compaction(tmp_path: Path) -> None:
+    """
+    A stale refusal seq never dismisses a later genuine compaction's token.
+
+    Regression for the flag-leak hazard: a refusal armed for seq N must not
+    fire against a fresh seq N+1 minted by a subsequent real ``/compact`` —
+    doing so would clear that live spinner and discard its boundary token.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A genuine, later compaction is pending (seq 1); the refusal we're
+    # flushing was armed for a missed earlier compaction (seq 0).
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    live_seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=live_seq - 1)
+
+    assert captured == [], f"a stale refusal seq must post nothing, got {captured!r}"
+    # The genuine compaction's token is untouched.
+    assert forwarder._read_compaction_state(bridge_dir).pending.seq == live_seq
+
+
+async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
+    """A failed dismissal POST is best-effort — attempted, logged, never raised."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq, status=503)
+
+    # Attempted once, the 503 swallowed. The token is still cleared (the
+    # spinner-owning PreCompact will never complete regardless).
+    assert len(captured) == 1
+    assert captured[0].method == "POST"
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
 
 
 def test_usage_from_status_state_surfaces_cumulative_cost() -> None:
@@ -8806,12 +9091,99 @@ def test_permanent_4xx_still_exhausts_at_three() -> None:
 
 def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     yes = _http_status_error(503, {"error": "subagent_delivery_not_confirmed"})
+    wrapped = _http_status_error(
+        503,
+        {
+            "error": {
+                "code": "runner_unavailable",
+                "message": "runner returned 503: subagent_delivery_not_confirmed",
+            }
+        },
+    )
     no_status = _http_status_error(500, {"error": "subagent_delivery_not_confirmed"})
     no_body = _http_status_error(503, {"error": "something_else"})
     assert forwarder._is_subagent_delivery_not_confirmed(yes) is True
+    assert forwarder._is_subagent_delivery_not_confirmed(wrapped) is True
     assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
     assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
+
+
+async def test_subagent_status_stops_after_not_confirmed_retry_budget(tmp_path: Path) -> None:
+    """A deterministic runner rejection is bounded and preserved in dead-letter."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="bounded1",
+        agent_type="Explore",
+        description="bounded retry",
+        tool_use_id="toolu_bounded",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "bounded1": forwarder.SubagentEntry(
+                subagent_id="bounded1",
+                child_conversation_id="conv_child_bounded",
+                tool_use_id="toolu_bounded",
+                terminal_status="completed",
+                terminal_output="done",
+            )
+        }
+    )
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            attempts += 1
+            return httpx.Response(
+                503,
+                json={
+                    "error": {
+                        "code": "runner_unavailable",
+                        "message": "runner returned 503: subagent_delivery_not_confirmed",
+                    }
+                },
+            )
+        return httpx.Response(202, json={})
+
+    tracker = forwarder._PostRetryTracker(
+        max_not_confirmed_attempts=2, base_delay_s=0.0
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=tracker,
+        )
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=tracker,
+        )
+
+    assert attempts == 2
+    assert second.subagents["bounded1"].last_status == "completed"
+    record = json.loads((bridge_dir / "dead_letter.jsonl").read_text("utf-8"))
+    assert record["event_type"] == "external_session_status"
+    assert record["payload"] == {"status": "completed", "output": "done"}
 
 
 @pytest.mark.asyncio

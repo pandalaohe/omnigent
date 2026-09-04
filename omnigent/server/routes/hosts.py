@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from omnigent.codex_rate_limits import CODEX_RATE_LIMITS_HARD_TTL_S
 from omnigent.db.utils import now_epoch
+from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -917,6 +918,7 @@ def create_hosts_router(
                         repo_path=workspace,
                         branch_name=body.git.branch_name,
                         base_branch=body.git.base_branch,
+                        existing_branch=body.git.existing_branch,
                     )
                 except WorktreeHostUnavailableError as exc:
                     # Host offline / unresponsive — infra, not user input.
@@ -937,6 +939,11 @@ def create_hosts_router(
             worktree (and no orphan branch) on the host. Never raises —
             a cleanup failure is logged and the original error still
             propagates.
+
+            A recreated worktree (``existing_branch``) checks out a branch
+            that predates this request — the directory is ours to remove,
+            but the branch (and its unpushed commits) is the user's, so it
+            must survive the rollback.
             """
             if worktree is None:
                 return
@@ -951,7 +958,7 @@ def create_hosts_router(
                     host_conn=conn,
                     worktree_path=worktree.worktree_path,
                     branch=worktree.branch,
-                    delete_branch=True,
+                    delete_branch=body.git is None or not body.git.existing_branch,
                 )
             except WorktreeProxyError:
                 _logger.warning(
@@ -1072,6 +1079,10 @@ def create_hosts_router(
                 detail=f"host failed to launch runner: {result.get('error')}",
             )
 
+        # The runner is bound to a session carried in the body (not the request
+        # path); the middleware promotes a bag session_id to the audit row's
+        # session_id column. Host is an attribute.
+        add_audit_attrs(session_id=body.session_id, host_id=host_id, runner_id=runner_id)
         return {
             "runner_id": runner_id,
             "status": "launching",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Final
 
 import pytest
@@ -45,7 +46,16 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     env = _build_host_daemon_env(server_url=server_url)
 
     # Then
-    assert {name: env.get(name) for name in _PROXY_ENV} == _PROXY_ENV
+    # Windows environment keys are case-insensitive, so upper- and lower-case
+    # spellings cannot hold distinct values there. Assert against the proxy
+    # variables the current OS can actually represent; POSIX still exercises
+    # all eight spellings and values.
+    actual_proxy_env = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+    }
+    assert {name: env.get(name) for name in actual_proxy_env} == actual_proxy_env
     assert env["DATABRICKS_CONFIG_PROFILE"] == "corp"
     assert ("OPENAI_API_KEY" in env) is keeps_provider_secret
 

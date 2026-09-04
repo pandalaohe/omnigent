@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 
-import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import {
+  isIOSShell,
+  setNativeServerSwitcherHidden,
+  supportsNativeServerPicker,
+} from "@/lib/nativeBridge";
 import {
   shouldHideNativeServerSwitcher,
   type NativeMobileHeaderMode,
@@ -71,11 +75,7 @@ export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean
   return frontmost;
 }
 
-/**
- * Tracks the AppShell sidebar state from its DOM contract. ChatPage is rendered
- * below the shell rather than receiving that state as a prop, and wide native
- * layouts can dock the sidebar without changing the surface hit-test result.
- */
+/** Tracks the AppShell sidebar state from its DOM contract. */
 export function useAppShellSidebarOpen(): boolean {
   const read = () =>
     typeof document !== "undefined" &&
@@ -99,9 +99,26 @@ export function useAppShellSidebarOpen(): boolean {
 }
 
 /**
- * Drive the iOS shell's native server switcher overlay. Official server mode
- * follows the frontmost main surface; conversation-title mode keeps that top
- * row clear and shows the switcher only over the open sidebar.
+ * Whether the iOS shell's floating server-switcher pill should be hidden given
+ * the main surface's frontmost state.
+ *
+ * On shells that host the in-sidebar server picker (the bridge exposes
+ * `getServerPicker`), server selection lives in the navigation drawer — the
+ * pill must never float over the main surface, where it crowds the chat
+ * header's title and floating controls. Older shells lack the sidebar picker,
+ * so the pill stays their only selection affordance and follows `frontmost`.
+ */
+export function serverSwitcherHiddenForSurface(frontmost: boolean): boolean {
+  return supportsNativeServerPicker() || !frontmost;
+}
+
+/**
+ * Drive the iOS shell's native server switcher overlay. On shells with the
+ * in-sidebar server picker the overlay stays hidden over the main surface
+ * (selection lives in the drawer); on older shells it shows only while
+ * `surface` is the frontmost element on screen and `active` is true — hiding
+ * whenever the sidebar (or any other overlay) covers the main surface, and
+ * whenever the surface is unmounted.
  *
  * No-ops outside the iOS shell. Used by both the in-session main surface
  * (ChatPage) and the new-session landing screen (NewChatDialog).

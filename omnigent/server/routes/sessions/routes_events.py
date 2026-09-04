@@ -17,6 +17,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
     NewConversationItem,
@@ -114,13 +115,13 @@ from omnigent.server.routes._sessions.common import (
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _logger,
     _pushed_model_options_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
-    _session_todos_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -265,8 +266,6 @@ class _DeletionClaimLease:
                     claimed_at=int(time.time()),
                 )
             except Exception:
-                # A transient DB failure must not terminate renewal after one
-                # miss; later beats can still arrive before the stale window.
                 _logger.warning(
                     "Failed to renew deletion claim for session %s",
                     self._session_id,
@@ -312,6 +311,18 @@ class _DeletionClaimLease:
         """Outer-task completion fallback; stale recovery covers loop shutdown."""
         with contextlib.suppress(RuntimeError):
             self._ensure_release_task()
+
+# POST /events types that arrive per streamed chunk — the harness echoing its
+# own live output back. Their per-call audit row is pure noise (the content is
+# already on the SSE-event logger), so the envelope is suppressed for them.
+_TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
+    {
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+        _EXTERNAL_SESSION_USAGE_TYPE,
+    }
+)
 
 
 def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
@@ -604,6 +615,13 @@ def register_events_routes(
                 f"Allowed types: {sorted(_ALLOWED_EVENT_TYPES)}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Tag the audit envelope end-event with the event kind so a message,
+        # interrupt, approval, stop, … are distinguishable in the audit table.
+        # Transient per-chunk echoes suppress the row entirely (they are the
+        # firehose; the content is already on the SSE-event logger).
+        add_audit_attrs(event_type=body.type)
+        if body.type in _TRANSIENT_AUDIT_EVENT_TYPES:
+            mark_request_audit_suppressed()
         # For item types, validate the data payload shape against
         # the item-type's discriminator class. The control types
         # (interrupt, approval) bypass the item-persist path and have
@@ -723,6 +741,13 @@ def register_events_routes(
                 # deny sentinel on the session stream so the
                 # client/REPL sees feedback.
                 reason = _input_verdict.get("reason", "Denied by policy")
+                # Surface the input-policy block on this post_event's audit row
+                # so a "my message was blocked" case is queryable with its reason.
+                add_audit_attrs(
+                    policy_verdict=_input_verdict.get("verdict", "deny"),
+                    policy_phase="input",
+                    policy_reason=reason,
+                )
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -1298,22 +1323,16 @@ def register_events_routes(
             data = await _enrich_terminal_status_with_subagent_output(
                 body.data, status, session_id, conversation_store
             )
-            # Forward only the same bounded, typed display detail that the
-            # Server accepted. The Runner retains this across reconnects, so
-            # raw/nested/oversized task objects must not become resident there.
-            if bg_count is None:
-                data.pop("background_task_count", None)
-            else:
-                data["background_task_count"] = bg_count
-            if bg_tasks is None:
-                data.pop("background_tasks", None)
-            else:
-                data["background_tasks"] = [
-                    task.model_dump(exclude_none=True) for task in bg_tasks
-                ]
-            published_status = "idle" if status in {"completed", "stopped", "killed"} else status
-            if status in {"completed", "failed", "stopped", "killed"} and bg_count is None:
-                bg_count = 0
+            if conv.kind == "sub_agent":
+                durable_terminal_status = "completed" if status == "idle" else status
+                if status == "running":
+                    durable_terminal_status = ""
+                if durable_terminal_status in ("", "completed", "failed", "stopped", "killed"):
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: durable_terminal_status},
+                    )
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
             # last_task_error, not only the sub-agent parent-inbox path.
@@ -1338,9 +1357,12 @@ def register_events_routes(
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
+            public_status = (
+                "idle" if status in {"completed", "stopped", "killed"} else status
+            )
             _publish_status(
                 session_id,
-                published_status,
+                public_status,
                 status_error,
                 response_id=response_id,
                 background_task_count=bg_count,
@@ -1356,11 +1378,7 @@ def register_events_routes(
                         installation_id=_get_installation_id(),
                         session_id=session_id,
                         status=(
-                            "failed"
-                            if status == "failed"
-                            else "cancelled"
-                            if status in {"stopped", "killed"}
-                            else "completed"
+                            "completed" if status in {"idle", "completed"} else "failed"
                         ),
                         latency_ms=None,
                         model=None,
@@ -1532,7 +1550,7 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
-            await _handle_external_session_todos(session_id, body, conversation_store)
+            _handle_external_session_todos(session_id, body)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id = await _persist_external_subagent_start(
@@ -2279,13 +2297,19 @@ def register_events_routes(
             has a server-created worktree (``git_branch`` set), the
             host removes the worktree directory and deletes its branch
             (``git worktree remove --force`` then ``git branch -D``).
-            Ignored for sessions with no worktree. Best-effort: a
-            cleanup failure does not block the delete. Defaults to
-            ``False`` (worktree and branch left untouched). See
+            Ignored for sessions with no worktree. If the host
+            tunnel is down (typically ``runner_online: false``), the
+            delete is rejected with 409 so the caller can retry
+            without cleanup rather than receiving a misleading 404.
+            A host-reported git failure is still logged and does not
+            block the delete. Defaults to ``False`` (worktree and
+            branch left untouched). See
             designs/SESSION_GIT_WORKTREE.md.
         :returns: A :class:`ConversationDeleted` confirmation.
         :raises OmnigentError: 404 if no session or no access,
-            403 if insufficient permissions.
+            403 if insufficient permissions, 409 if
+            ``delete_branch=true`` and the host is offline so
+            worktree cleanup cannot run.
         """
         user_id = _require_user(request, auth_provider)
         if permission_store is not None and user_id is not None:
@@ -2335,7 +2359,9 @@ def register_events_routes(
         if conv is None:
             await delete_lease.release()
             raise _session_not_found()
-        await delete_lease.run(_best_effort_stop(session_id, conversation_store, runner_router))
+        await delete_lease.run(
+            _best_effort_stop(session_id, conversation_store, runner_router)
+        )
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -2369,17 +2395,15 @@ def register_events_routes(
             from omnigent.runtime import get_terminal_registry
 
             with contextlib.suppress(RuntimeError):
-                await delete_lease.run(get_terminal_registry().cleanup_conversation(session_id))
-        # Session file cleanup.
-        if file_store is not None and artifact_store is not None:
-            deleted_file_ids = await delete_lease.to_thread(
-                file_store.delete_all_for_session, session_id
-            )
-            for fid in deleted_file_ids:
-                await delete_lease.to_thread(artifact_store.delete, fid)
+                await delete_lease.run(
+                    get_terminal_registry().cleanup_conversation(session_id)
+                )
         # Opt-in git worktree cleanup: only when delete_branch=true and
         # the session has a server-created worktree. Runs after runner
-        # teardown; best-effort (designs/SESSION_GIT_WORKTREE.md).
+        # teardown but before the irreversible file cleanup below: an
+        # unreachable host fails the delete (409) with the session
+        # retained, so nothing irrecoverable may be destroyed first.
+        # Git errors on a reachable host stay best-effort.
         if (
             delete_branch
             and conv.git_branch is not None
@@ -2396,8 +2420,16 @@ def register_events_routes(
                     reason="session-delete",
                     conversation_store=conversation_store,
                     exclude_conversation_id=conv.id,
+                    fail_if_unavailable=True,
                 )
             )
+        # Session file cleanup.
+        if file_store is not None and artifact_store is not None:
+            deleted_file_ids = await delete_lease.to_thread(
+                file_store.delete_all_for_session, session_id
+            )
+            for fid in deleted_file_ids:
+                await delete_lease.to_thread(artifact_store.delete, fid)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
         deleted = await delete_lease.run(conversation_store.delete_conversation(session_id))
@@ -2417,9 +2449,6 @@ def register_events_routes(
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.
         _pushed_model_options_cache.pop(session_id, None)
-        # The durable todo snapshot is deleted with the conversation, so its
-        # process-local fast path must go too.
-        _session_todos_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.

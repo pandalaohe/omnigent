@@ -17,10 +17,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
-from omnigent.runner.background_titles.service import (
-    BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS,
-    FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
-)
+from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.stores.conversation_store import ConversationStore
 
 if TYPE_CHECKING:
@@ -100,15 +97,9 @@ class RunnerBackgroundTitleGenerator:
             "sub_agent_name": request.sub_agent_name,
         }
         custom = request.additional_instructions.strip() if request.additional_instructions else ""
-        custom_budget = (
-            BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS
-            - len(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
-            - 1
-        )
-        bounded_custom = custom[:custom_budget].rstrip()
         body["additional_instructions"] = (
-            f"{bounded_custom}\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
-            if bounded_custom
+            f"{custom}\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
+            if custom
             else FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
         )
         response = await routed.client.post(

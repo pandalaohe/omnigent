@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from omnigent.codex_native_app_server import (
     build_codex_native_server,
     discover_codex_model_options,
     framework_approved_tools,
+    trust_all_codex_hooks,
     trust_codex_router_hooks,
     trust_native_policy_hooks,
 )
@@ -318,6 +320,7 @@ class _FakeCodexClient:
 
     hooks: list[dict[str, Any]]
     flip_on_trust: bool = True
+    cwd: str = _CWD
     requests: list[_Req] = field(default_factory=list)
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -331,7 +334,7 @@ class _FakeCodexClient:
         """
         self.requests.append(_Req(method=method, params=params))
         if method == "hooks/list":
-            return {"result": {"data": [{"cwd": _CWD, "hooks": self.hooks}]}}
+            return {"result": {"data": [{"cwd": self.cwd, "hooks": self.hooks}]}}
         if method == "config/batchWrite":
             if self.flip_on_trust:
                 written = params["edits"][0]["value"]
@@ -936,8 +939,9 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
 
     rendered = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert rendered.startswith("[mcp_servers.omnigent]\n")
-    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
-    assert stat.S_IMODE((codex_home / "config.toml").stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE((codex_home / "config.toml").stat().st_mode) == 0o600
     parsed = tomllib.loads(rendered)
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
@@ -1247,8 +1251,9 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
         "credential-helper --token sk-sentinel-do-not-use",
     ]
     assert provider["wire_api"] == "responses"
-    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
-    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
 
 
 def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
@@ -1428,7 +1433,8 @@ def test_user_prompt_submit_carries_the_route_turn_hook(tmp_path: Path) -> None:
     commands = [h for entry in hooks["UserPromptSubmit"] for h in entry["hooks"]]
     routing = [h for h in commands if "route-turn" in h["command"]]
     assert len(routing) == 1
-    assert f"--bridge-dir {bridge_dir}" in routing[0]["command"]
+    assert "--bridge-dir" in routing[0]["command"]
+    assert str(bridge_dir) in routing[0]["command"]
     assert "--harness codex-native" in routing[0]["command"]
     assert routing[0]["timeout"] == HARNESS_HOOK_TIMEOUT_S
     # Trust is filtered by module, so route-turn must ride the policy one.
@@ -1965,7 +1971,8 @@ async def test_trust_step_covers_router_hooks_when_routing_armed(
         hooks=[
             _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
             _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
-        ]
+        ],
+        cwd=str(Path(_CWD)),
     )
 
     async def _fake_connect(self: Any) -> None:
@@ -1992,6 +1999,95 @@ async def test_trust_step_covers_router_hooks_when_routing_armed(
     for write in _batchwrite_calls(client):
         trusted.update(write.params["edits"][0]["value"])
     assert set(trusted) == {"policy", "gate"}
+
+
+async def test_trust_all_codex_hooks_trusts_user_hooks() -> None:
+    """
+    The runner-owned trust-all pass covers user hooks, not just Omnigent's.
+
+    Codex ignores ``--dangerously-bypass-hook-trust`` for the startup
+    review screen on a persistent ``resume``; persisting trust for the
+    merged user hooks is what keeps that screen from stranding a resumed
+    web session, so this pass must reach hooks the policy trust never does.
+    """
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("ours", _OUR_COMMAND, "untrusted", "sha256:ours"),
+            _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
+        ]
+    )
+
+    assert await trust_all_codex_hooks(client.request, cwd=_CWD) == []
+
+    writes = _batchwrite_calls(client)
+    assert len(writes) == 1
+    written = writes[0].params["edits"][0]["value"]
+    assert written == {
+        "ours": {"trusted_hash": "sha256:ours"},
+        "theirs": {"trusted_hash": "sha256:theirs"},
+    }
+
+
+async def test_trust_all_codex_hooks_reports_still_untrusted_without_raising() -> None:
+    """
+    A hash that never flips is returned, not raised.
+
+    The trust-all pass is a UX fix (suppress the review screen), not a
+    security gate, so a persistent failure only risks the screen
+    reappearing and must never block startup.
+    """
+    client = _FakeCodexClient(
+        hooks=[_hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs")],
+        flip_on_trust=False,
+    )
+
+    assert await trust_all_codex_hooks(client.request, cwd=_CWD) == ["theirs"]
+
+
+async def test_trust_step_trusts_user_hooks_only_when_trust_all_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``trust_all_hooks`` gates whether the startup step trusts user hooks.
+
+    Runner-owned sessions enable it so a resumed web session never faces
+    the interactive review screen; interactive CLI sessions leave it off so
+    a human at the terminal reviews their own new or changed hooks.
+    """
+
+    async def _fake_connect(self: Any) -> None:
+        return None
+
+    async def _fake_close(self: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient.connect", _fake_connect
+    )
+    monkeypatch.setattr("omnigent.codex_native_app_server.CodexAppServerClient.close", _fake_close)
+
+    for trust_all, expected in ((True, {"policy", "theirs"}), (False, {"policy"})):
+        client = _FakeCodexClient(
+            hooks=[
+                _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
+                _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
+            ],
+            cwd=str(Path(_CWD)),
+        )
+        monkeypatch.setattr(
+            "omnigent.codex_native_app_server.CodexAppServerClient.request",
+            lambda self, method, params, _c=client: _c.request(method, params),
+        )
+        server = _test_app_server(
+            tmp_path, tmp_path / "codex-home", tmp_path / "bridge", Path(_CWD)
+        )
+        server.trust_all_hooks = trust_all
+        await server._trust_policy_hooks()
+
+        trusted: dict[str, Any] = {}
+        for write in _batchwrite_calls(client):
+            trusted.update(write.params["edits"][0]["value"])
+        assert set(trusted) == expected
 
 
 async def test_policy_hook_command_runs_python_isolated() -> None:
@@ -2362,3 +2458,53 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
             _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-9-9")
             == "databricks-gpt-9-9"
         )
+
+
+def test_probe_codex_home_bridges_provider_tables_and_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The probe home carries the provider tables its overrides name.
+
+    A launch shape resolved off the user's ``config.toml`` pins only a
+    provider *name* (``-c model_provider="Databricks"``). Codex refuses to
+    load a config that names an undefined provider, exiting before it binds
+    the listener, so a probe home holding only a credential yields no
+    catalog at all. Minimal keeps the user's MCP/hook/plugin config out.
+    """
+    from omnigent import codex_native_app_server
+
+    source = tmp_path / ".codex"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "Databricks"\n'
+        "\n"
+        "[model_providers.Databricks]\n"
+        'base_url = "https://ws.example/serving-endpoints"\n'
+        "\n"
+        "[mcp_servers.slow]\n"
+        'command = "sleep"\n'
+    )
+    (source / ".credentials.json").write_text("{}")
+    (source / "hooks.json").write_text("{}")
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
+
+    config = (home / "config.toml").read_text()
+    assert "[model_providers.Databricks]" in config
+    assert "https://ws.example/serving-endpoints" in config
+    # The credential the account's catalog is gated on, in either spelling.
+    assert (home / ".credentials.json").is_symlink()
+    # Minimal: no MCPs to boot and no hooks to fire during a probe.
+    assert "mcp_servers" not in config
+    assert not (home / "hooks.json").exists()
+
+    # A persistent home must re-read an edited source config, not pin the
+    # tables copied on first use.
+    (source / "config.toml").write_text(
+        'model_provider = "Other"\n\n[model_providers.Other]\nbase_url = "https://two.example"\n'
+    )
+    home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
+    assert "https://two.example" in (home / "config.toml").read_text()

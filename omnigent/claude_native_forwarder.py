@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -439,6 +439,9 @@ class SubagentForwardState:
     subagents: dict[str, SubagentEntry]
     parent_byte_offset: int = 0
     parent_line_cursor: int = 0
+    pending_terminal_notifications: dict[str, tuple[str, str | None]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -594,6 +597,19 @@ class _ForwardDedupeState:
     # prevents the limiter from recovering.
     cost_retry_not_before: float = 0.0
     cost_retry_failures: int = 0
+    # The ``PreCompact`` ``seq`` to dismiss when the transcript phase sees a
+    # ``/compact`` refusal (``is_compact_noop``), else ``None``. The dismissal
+    # is DEFERRED until after the hook phase, because the ``PreCompact`` hook
+    # (which raises the spinner via ``in_progress``) is forwarded after
+    # transcript items in the same poll — dismissing first would clear nothing
+    # and then the hook would strand a fresh spinner. Scoped to the specific
+    # seq (not a bare flag) and cleared every poll: the prescan mints the
+    # token before the transcript phase and Claude writes ``PreCompact``
+    # before the refusal stdout, so the refused compaction's token is already
+    # pending when the refusal is seen. Keying to that seq stops a refusal
+    # whose ``PreCompact`` was missed from later hijacking an unrelated
+    # genuine compaction's token.
+    pending_compaction_dismiss_seq: int | None = None
 
 
 def _provider_usage_limits_should_post(
@@ -1032,6 +1048,23 @@ async def forward_claude_transcript_to_session(
                             # (the user-message reset only fires on the next turn).
                             response_id=state.current_response_id,
                         )
+                        # Deferred ``/compact``-refusal dismissal: runs AFTER
+                        # the hook phase so the ``failed`` post always follows
+                        # the ``PreCompact`` ``in_progress`` that raised the
+                        # spinner, even when both land in this same poll. Scoped
+                        # to the refused compaction's own seq and consumed here
+                        # (one-shot, cleared unconditionally) so a stale arm can
+                        # never dismiss a later genuine compaction's spinner or
+                        # discard its boundary token.
+                        if dedupe.pending_compaction_dismiss_seq is not None:
+                            dismiss_seq = dedupe.pending_compaction_dismiss_seq
+                            dedupe.pending_compaction_dismiss_seq = None
+                            await _maybe_dismiss_stranded_compaction_spinner(
+                                client,
+                                session_id=current_session_id,
+                                bridge_dir=bridge_dir,
+                                seq=dismiss_seq,
+                            )
                         subagent_state = await _forward_available_subagents(
                             client=client,
                             parent_session_id=current_session_id,
@@ -1147,10 +1180,23 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         return SubagentForwardState(subagents={})
     parent_byte_offset = raw.get("parent_byte_offset", 0)
     parent_line_cursor = raw.get("parent_line_cursor", 0)
+    pending_raw = raw.get("pending_terminal_notifications", {})
     if not isinstance(parent_byte_offset, int) or parent_byte_offset < 0:
         parent_byte_offset = 0
     if not isinstance(parent_line_cursor, int) or parent_line_cursor < 0:
         parent_line_cursor = 0
+    pending_terminal_notifications: dict[str, tuple[str, str | None]] = {}
+    if isinstance(pending_raw, dict):
+        for tool_use_id, row in pending_raw.items():
+            if not isinstance(tool_use_id, str) or not isinstance(row, dict):
+                continue
+            status = row.get("status")
+            output = row.get("output")
+            if status not in _SUBAGENT_TERMINAL_STATUSES:
+                continue
+            if output is not None and not isinstance(output, str):
+                output = None
+            pending_terminal_notifications[tool_use_id] = (status, output)
     entries: dict[str, SubagentEntry] = {}
     for subagent_id, row in subagents_raw.items():
         if not isinstance(subagent_id, str) or not isinstance(row, dict):
@@ -1204,6 +1250,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         subagents=entries,
         parent_byte_offset=parent_byte_offset,
         parent_line_cursor=parent_line_cursor,
+        pending_terminal_notifications=pending_terminal_notifications,
     )
 
 
@@ -1233,6 +1280,10 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
         },
         "parent_byte_offset": state.parent_byte_offset,
         "parent_line_cursor": state.parent_line_cursor,
+        "pending_terminal_notifications": {
+            tool_use_id: {"status": status, "output": output}
+            for tool_use_id, (status, output) in state.pending_terminal_notifications.items()
+        },
         "updated_at": time.time(),
     }
     _write_json_atomic(bridge_dir / _SUBAGENT_STATE_FILE, payload)
@@ -1575,26 +1626,35 @@ async def _forward_available_subagents(
         start_line=updated.parent_line_cursor,
         agent_name=agent_name,
     )
-    notifications_by_tool = {
-        notification.tool_use_id: notification
-        for notification in parent_result.task_notifications
-        if notification.tool_use_id is not None
-        and notification.status in _SUBAGENT_TERMINAL_STATUSES
-    }
-    if notifications_by_tool:
+    pending_notifications = dict(updated.pending_terminal_notifications)
+    for notification in parent_result.task_notifications:
+        if (
+            notification.tool_use_id is not None
+            and notification.status in _SUBAGENT_TERMINAL_STATUSES
+        ):
+            pending_notifications[notification.tool_use_id] = (
+                notification.status,
+                notification.result,
+            )
+    if pending_notifications:
         entries = dict(updated.subagents)
         for subagent_id, entry in entries.items():
             if entry.tool_use_id is None:
                 continue
-            notification = notifications_by_tool.get(entry.tool_use_id)
+            notification = pending_notifications.pop(entry.tool_use_id, None)
             if notification is None:
                 continue
+            terminal_status, terminal_output = notification
             entries[subagent_id] = replace(
                 entry,
-                terminal_status=notification.status,
-                terminal_output=notification.result,
+                terminal_status=terminal_status,
+                terminal_output=terminal_output,
             )
-        updated = replace(updated, subagents=entries)
+        updated = replace(
+            updated,
+            subagents=entries,
+            pending_terminal_notifications=pending_notifications,
+        )
     if (
         parent_result.byte_offset != updated.parent_byte_offset
         or parent_result.line_cursor != updated.parent_line_cursor
@@ -1778,10 +1838,9 @@ async def _forward_available_subagents(
                 last_activity_ts=now,
             )
 
-        # Structured parent notifications are authoritative. For older Claude
-        # runs that omit them, silence is only a fallback when the child JSONL
-        # itself ends in a real assistant answer. A trailing function call or
-        # result is never completion, however long it stays quiet.
+        # Structured parent notifications are authoritative. Transcript silence
+        # is not a completion signal: an assistant can emit text before another
+        # tool call, so settling from a quiet timer can deliver a false result.
         desired_status: str | None = None
         desired_output: str | None = None
         if new_entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES:
@@ -1791,14 +1850,6 @@ async def _forward_available_subagents(
             desired_status = None
         elif had_item:
             desired_status = "running"
-        elif (
-            new_entry.last_activity_ts is not None
-            and new_entry.quiet_terminal_output is not None
-            and now - new_entry.last_activity_ts > _SUBAGENT_TERMINAL_QUIESCENCE_S
-            and new_entry.last_status != "completed"
-        ):
-            desired_status = "completed"
-            desired_output = new_entry.quiet_terminal_output
         if desired_status is not None and desired_status != new_entry.last_status:
             retry_key = f"subagent_status:{entry.child_conversation_id}"
             if status_retry_tracker.retry_delay_s(retry_key) is None:
@@ -1811,17 +1862,39 @@ async def _forward_available_subagents(
                     )
                 except httpx.HTTPError as exc:
                     decision = status_retry_tracker.record_failure(retry_key, exc)
-                    _logger.warning(
-                        "Failed to forward claude-native sub-agent status; "
-                        "child=%s status=%s attempt=%s next_retry_s=%.3f "
-                        "http_status=%s",
-                        entry.child_conversation_id,
-                        desired_status,
-                        decision.attempts,
-                        decision.delay_s,
-                        _http_status_for_log(exc),
-                        exc_info=True,
-                    )
+                    if decision.exhausted:
+                        _logger.error(
+                            "Dropping claude-native sub-agent status after bounded "
+                            "delivery failures; child=%s status=%s attempts=%s "
+                            "http_status=%s",
+                            entry.child_conversation_id,
+                            desired_status,
+                            decision.attempts,
+                            _http_status_for_log(exc),
+                            exc_info=True,
+                        )
+                        append_dead_letter(
+                            bridge_dir,
+                            session_id=entry.child_conversation_id,
+                            event_type="external_session_status",
+                            payload={"status": desired_status, "output": desired_output},
+                            reason="terminal status delivery not confirmed after retries",
+                            delivered_ambiguous=False,
+                            http_status=_http_status_for_log(exc),
+                        )
+                        new_entry = replace(new_entry, last_status=desired_status)
+                    else:
+                        _logger.warning(
+                            "Failed to forward claude-native sub-agent status; "
+                            "child=%s status=%s attempt=%s next_retry_s=%.3f "
+                            "http_status=%s",
+                            entry.child_conversation_id,
+                            desired_status,
+                            decision.attempts,
+                            decision.delay_s,
+                            _http_status_for_log(exc),
+                            exc_info=True,
+                        )
                 else:
                     status_retry_tracker.clear(retry_key)
                     new_entry = replace(new_entry, last_status=desired_status)
@@ -3568,6 +3641,22 @@ async def _forward_available_items(
             )
             await _write_forward_state_async(bridge_dir, updated)
             continue
+        # ``/compact`` refusal ("Not enough messages to compact."). Claude
+        # fired ``PreCompact`` (raising the spinner) but declined to compact,
+        # so no completion signal follows and the spinner is stranded. Defer
+        # the dismissal (see ``pending_compaction_dismiss_seq``) — the raising
+        # ``PreCompact`` hook can land in the SAME poll and is forwarded AFTER
+        # this transcript phase, so dismissing now would clear nothing and
+        # leave a fresh spinner. Scope it to the refused compaction's OWN
+        # pending seq (already minted by the prescan, since Claude writes
+        # ``PreCompact`` before the refusal stdout) so it can never dismiss a
+        # later genuine compaction. If no token is pending the ``PreCompact``
+        # was missed and no spinner is up — nothing to dismiss. The item still
+        # forwards below as a ``slash_command`` bubble carrying the text.
+        if item.is_compact_noop:
+            refused = _read_compaction_state(bridge_dir).pending
+            if refused is not None:
+                dedupe.pending_compaction_dismiss_seq = refused.seq
         if skip_user_messages and item.item_type == "message" and item.data.get("role") == "user":
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)
@@ -4704,15 +4793,16 @@ async def _post_external_compaction_status(
     "Compacting conversation…" spinner while Claude runs the real
     compaction in the terminal. ``"in_progress"`` is sent from the
     ``PreCompact`` hook and ``"completed"`` from the post-compaction
-    ``SessionStart`` (``source == "compact"``) hook. The Omnigent server maps
+    ``SessionStart`` (``source == "compact"``) hook; ``"failed"`` dismisses a
+    stranded spinner when Claude declined to compact. The Omnigent server maps
     these to the ``response.compaction.in_progress`` /
-    ``response.compaction.completed`` SSE events the web client already
-    renders.
+    ``response.compaction.completed`` / ``response.compaction.failed`` SSE
+    events the web client already renders.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param status: Compaction status value, ``"in_progress"`` or
-        ``"completed"``.
+    :param status: Compaction status value, ``"in_progress"``,
+        ``"completed"``, or ``"failed"``.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
@@ -4989,7 +5079,17 @@ def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
         body = exc.response.json()
     except Exception:  # noqa: BLE001 — best-effort body parse
         return False
-    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    if error == "subagent_delivery_not_confirmed":
+        return True
+    if not isinstance(error, dict):
+        return False
+    if error.get("code") == "subagent_delivery_not_confirmed":
+        return True
+    message = error.get("message")
+    return isinstance(message, str) and "subagent_delivery_not_confirmed" in message
 
 
 def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
@@ -5367,6 +5467,97 @@ async def _note_transcript_summary_without_token(bridge_dir: Path) -> None:
         )
 
     await asyncio.to_thread(_mutate)
+
+
+async def _discard_pending_compaction(bridge_dir: Path, seq: int) -> bool:
+    """
+    Drop the in-flight ``PreCompact`` token for ``seq`` that will never complete.
+
+    Called when a ``/compact`` refusal ("Not enough messages to compact.")
+    is observed: Claude fired ``PreCompact`` (raising the spinner) but then
+    aborted, so neither completion signal will ever arrive. Clears the
+    pending token so a later, genuine compaction reconciles cleanly, and
+    closes any completion-ack window.
+
+    Scoped to ``seq``: only the token the refusal belongs to is dropped. A
+    later, genuine compaction (a higher seq) is left untouched, so a stale or
+    mis-paired refusal can never discard a live compaction's boundary token.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param seq: The refused compaction's ``PreCompact`` seq to drop.
+    :returns: ``True`` when the pending token for ``seq`` was cleared,
+        ``False`` when no such token is pending (so the caller skips the
+        dismissal post).
+    """
+
+    def _mutate() -> bool:
+        state = _read_compaction_state(bridge_dir)
+        if state.pending is None or state.pending.seq != seq:
+            return False
+        _write_compaction_state(
+            bridge_dir,
+            CompactionForwardState(
+                pending=None,
+                last_seq=state.last_seq,
+                persisted_seqs=state.persisted_seqs,
+                last_precompact_cursor=state.last_precompact_cursor,
+                expect_completion_ack=False,
+                expect_completion_ack_seq=0,
+            ),
+        )
+        return True
+
+    return await asyncio.to_thread(_mutate)
+
+
+async def _maybe_dismiss_stranded_compaction_spinner(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    seq: int,
+) -> None:
+    """
+    Dismiss the "Compacting…" spinner when Claude declines to compact.
+
+    Called after the hook phase for a ``/compact`` refusal
+    (``is_compact_noop``) whose own ``PreCompact`` seq is ``seq``. Claude
+    fired ``PreCompact`` first, so the forwarder already posted
+    ``external_compaction_status: in_progress`` and the web UI is showing
+    the spinner. No ``isCompactSummary`` record or ``SessionStart
+    source=compact`` hook follows a refusal, so without this the spinner is
+    stranded forever. Post ``failed`` (which the web UI maps to
+    ``response.compaction.failed`` → remove the loading block) and drop the
+    dangling ``PreCompact`` token. Best-effort — logged, not raised.
+
+    No-op when ``seq`` is no longer the pending token (the ``PreCompact`` was
+    missed so no spinner is up, or an unrelated compaction has since
+    superseded it) — that's the guard against dismissing a genuine
+    compaction's spinner or discarding its boundary token.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Claude bridge directory.
+    :param seq: The refused compaction's own ``PreCompact`` seq.
+    :returns: None.
+    """
+    if not await _discard_pending_compaction(bridge_dir, seq):
+        return
+    try:
+        await _post_external_compaction_status(
+            client,
+            session_id=session_id,
+            status="failed",
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to dismiss stranded compaction spinner after a /compact refusal; "
+            "session=%s bridge_dir=%s",
+            session_id,
+            bridge_dir,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
 
 
 async def _claim_standalone_completion(bridge_dir: Path) -> int | None:

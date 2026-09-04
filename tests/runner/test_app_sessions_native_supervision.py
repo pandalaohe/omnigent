@@ -1092,7 +1092,7 @@ def test_subagent_terminal_delivery_retry_uses_latest_undelivered_report() -> No
 
 
 @pytest.mark.parametrize("terminal_status", ["stopped", "killed"])
-def test_subagent_terminal_delivery_preserves_structured_terminal_status(
+async def test_subagent_terminal_delivery_preserves_structured_terminal_status(
     terminal_status: str,
 ) -> None:
     """Runner inbox delivery retains stopped/killed instead of flattening them."""
@@ -1118,7 +1118,7 @@ def test_subagent_terminal_delivery_preserves_structured_terminal_status(
             output=f"worker {terminal_status}",
         )
         delivered = session_inbox.get_nowait()
-        _cleanup_drained_subagent_work(delivered)
+        await _cleanup_drained_subagent_work(delivered, server_client=None)
         work_after_drain = runner_app.get_subagent_work(child_id)
     finally:
         runner_app.unregister_subagent_work(child_id)

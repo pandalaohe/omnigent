@@ -93,6 +93,9 @@ export function applyUiFontSize(px: number): void {
   root.style.setProperty("--mobile-ui-font-size", value);
 }
 
+/** Backward-compatible name used by the upstream desktop bootstrap. */
+export const applyDesktopUiFontSize = applyUiFontSize;
+
 // ---- Font family ---------------------------------------------------------
 
 const FONT_FAMILY_STORAGE_KEY = "omnigent:ui-font-family";

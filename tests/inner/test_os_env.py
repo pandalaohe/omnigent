@@ -388,13 +388,26 @@ def test_shell_command_does_not_see_omnigent_project_root(
     """
     project_entry = "/opt/venvs/proj/site-packages"
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(_project_root()), project_entry]))
+    if os.name == "nt":
+        # ``bash.exe`` may be the WSL launcher, which intentionally does not
+        # inherit arbitrary Windows variables unless WSLENV opts them in.
+        # Exercise the Windows-native helper boundary through COMSPEC here.
+        from omnigent.inner import os_env as os_env_mod
+
+        real_which = os_env_mod.shutil.which
+        monkeypatch.setattr(
+            os_env_mod.shutil,
+            "which",
+            lambda name: None if name in {"bash", "sh"} else real_which(name),
+        )
 
     os_env = create_os_environment(
         OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
     )
     assert os_env is not None
     try:
-        result = asyncio.run(os_env.shell("echo PP=$PYTHONPATH"))
+        command = "echo PP=%PYTHONPATH%" if os.name == "nt" else "echo PP=$PYTHONPATH"
+        result = asyncio.run(os_env.shell(command))
     finally:
         os_env.close()
 

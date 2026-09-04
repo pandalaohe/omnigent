@@ -33,6 +33,9 @@ export interface RememberScope {
   host?: string;
 }
 
+/** Persistence scopes advertised by Codex for MCP tool approvals. */
+export type CodexPersistMode = "session" | "always";
+
 /**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at
@@ -70,6 +73,8 @@ export interface Usage {
 export interface ErrorInfo {
   code: string;
   message: string;
+  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
+  level?: "error" | "info";
   /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */
   title?: string;
   /** One/two-sentence explanation of why it failed. Paired with `title`. */
@@ -557,6 +562,18 @@ export interface NativeReasoningEffortOption {
   description?: string;
 }
 
+/** Non-secret provenance for the configuration serving a model. */
+export interface ModelConfigurationSource {
+  /** Stable provider category, e.g. `subscription`, `databricks`, or `gateway`. */
+  kind: string;
+  /** Compact composer label, e.g. `Subscription` or `Workspace`. */
+  label: string;
+  /** Specific configured source, e.g. a provider name or Databricks profile. */
+  name?: string;
+  /** Non-secret endpoint host, when the provider has one. */
+  host?: string;
+}
+
 /** One runner-owned native model-picker row. */
 export interface NativeModelOption {
   /** Native picker id (a Claude alias or Codex model id). */
@@ -571,4 +588,6 @@ export interface NativeModelOption {
   supportedReasoningEfforts?: NativeReasoningEffortOption[];
   /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
+  /** Configuration that supplies this model; never includes credentials. */
+  source?: ModelConfigurationSource;
 }
