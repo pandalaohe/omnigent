@@ -43,11 +43,10 @@ export interface MentionBrowser {
   dismiss: () => void;
 }
 
-export interface MentionKeyboardEvent {
-  key: string;
-  shiftKey: boolean;
-  preventDefault: () => void;
-}
+export type MentionKeyboardEvent = Pick<
+  KeyboardEvent,
+  "code" | "key" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey" | "preventDefault"
+>;
 
 /**
  * Shared ``@``-file-mention controller for the in-session composer and the
@@ -131,12 +130,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const handleKeyDown = (e: MentionKeyboardEvent): boolean => {
     if (!mentionOpen) return false;
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
-    if (eventMatchesShortcutAction(e.nativeEvent, "nextSuggestion")) {
+    if (eventMatchesShortcutAction(e, "nextSuggestion")) {
       e.preventDefault();
       setMentionIndex((i) => (i + 1) % mentionEntries.length);
       return true;
     }
-    if (eventMatchesShortcutAction(e.nativeEvent, "previousSuggestion")) {
+    if (eventMatchesShortcutAction(e, "previousSuggestion")) {
       e.preventDefault();
       setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
       return true;
@@ -144,7 +143,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     // Enter: open a folder (drill in) or attach a file. Tab: attach the
     // highlighted row as a unit — whole folder or file — without drilling.
     if (
-      eventMatchesShortcutAction(e.nativeEvent, "applySuggestion") &&
+      eventMatchesShortcutAction(e, "applySuggestion") &&
       e.key === "Enter" &&
       !isMobile &&
       active
@@ -154,12 +153,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       else attachMention(active.path, false);
       return true;
     }
-    if (eventMatchesShortcutAction(e.nativeEvent, "applySuggestion") && active) {
+    if (eventMatchesShortcutAction(e, "applySuggestion") && active) {
       e.preventDefault();
       attachMention(active.path, active.type === "directory");
       return true;
     }
-    if (eventMatchesShortcutAction(e.nativeEvent, "dismissSuggestions")) {
+    if (eventMatchesShortcutAction(e, "dismissSuggestions")) {
       e.preventDefault();
       dismiss();
       return true;
