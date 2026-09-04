@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from sqlalchemy import event, text
 
+from omnigent.db.db_models import SqlConversationItem, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     CompactionData,
@@ -476,9 +477,7 @@ def test_deletion_claim_and_archive_lock_are_mutually_exclusive(
 ) -> None:
     conv = conversation_store.create_conversation()
     assert (
-        conversation_store.set_archive_lock(
-            conv.id, True, updated_at=1_000, stale_before=100
-        )
+        conversation_store.set_archive_lock(conv.id, True, updated_at=1_000, stale_before=100)
         == "updated"
     )
     assert (
@@ -488,9 +487,7 @@ def test_deletion_claim_and_archive_lock_are_mutually_exclusive(
         == "locked"
     )
     assert (
-        conversation_store.set_archive_lock(
-            conv.id, False, updated_at=1_002, stale_before=100
-        )
+        conversation_store.set_archive_lock(conv.id, False, updated_at=1_002, stale_before=100)
         == "updated"
     )
     assert (
@@ -500,35 +497,25 @@ def test_deletion_claim_and_archive_lock_are_mutually_exclusive(
         == "claimed"
     )
     assert (
-        conversation_store.set_archive_lock(
-            conv.id, True, updated_at=1_004, stale_before=100
-        )
+        conversation_store.set_archive_lock(conv.id, True, updated_at=1_004, stale_before=100)
         == "busy"
     )
     assert (
-        conversation_store.renew_conversation_deletion(
-            conv.id, "wrong-token", claimed_at=2_000
-        )
+        conversation_store.renew_conversation_deletion(conv.id, "wrong-token", claimed_at=2_000)
         is False
     )
     assert (
-        conversation_store.renew_conversation_deletion(
-            conv.id, "delete-a", claimed_at=2_000
-        )
+        conversation_store.renew_conversation_deletion(conv.id, "delete-a", claimed_at=2_000)
         is True
     )
     assert (
-        conversation_store.set_archive_lock(
-            conv.id, True, updated_at=2_001, stale_before=1_500
-        )
+        conversation_store.set_archive_lock(conv.id, True, updated_at=2_001, stale_before=1_500)
         == "busy"
     )
     assert conversation_store.release_conversation_deletion(conv.id, "wrong-token") is False
     assert conversation_store.release_conversation_deletion(conv.id, "delete-a") is True
     assert (
-        conversation_store.set_archive_lock(
-            conv.id, True, updated_at=1_005, stale_before=100
-        )
+        conversation_store.set_archive_lock(conv.id, True, updated_at=1_005, stale_before=100)
         == "updated"
     )
 
@@ -545,9 +532,7 @@ def test_stale_deletion_claim_recovers_in_a_new_store(db_uri: str) -> None:
 
     restarted = SqlAlchemyConversationStore(db_uri)
     assert (
-        restarted.set_archive_lock(
-            conv.id, True, updated_at=2_001, stale_before=2_000
-        )
+        restarted.set_archive_lock(conv.id, True, updated_at=2_001, stale_before=2_000)
         == "updated"
     )
     assert (
@@ -1458,7 +1443,7 @@ def test_list_conversations_search_snippet_on_content_match(
     """
     conv_content = conversation_store.create_conversation()
     conversation_store.update_conversation(conv_content.id, title="General chat")
-    conversation_store.append(
+    [persisted_match] = conversation_store.append(
         conv_content.id,
         [
             NewConversationItem(
@@ -1481,8 +1466,126 @@ def test_list_conversations_search_snippet_on_content_match(
     # Content match: snippet present and contains the query term.
     assert by_id[conv_content.id].search_snippet is not None
     assert "deployment" in by_id[conv_content.id].search_snippet.lower()
+    assert by_id[conv_content.id].search_item_id == persisted_match.id
+    assert by_id[conv_content.id].search_response_id == "resp_snip1"
+    assert by_id[conv_content.id].search_item_created_at == persisted_match.created_at
     # Title-only match: no snippet (the title already shows the hit).
     assert by_id[conv_title.id].search_snippet is None
+    assert by_id[conv_title.id].search_item_id is None
+
+
+def test_list_conversations_search_excludes_meta_messages(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Framework-owned meta context is not archive-library search material."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_meta",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "internal archive sentinel"}],
+                    is_meta=True,
+                ),
+            ),
+        ],
+    )
+
+    page = conversation_store.list_conversations(search_query="archive sentinel")
+    assert conv.id not in {row.id for row in page.data}
+
+
+@pytest.mark.parametrize(
+    "hidden_text,query",
+    [
+        (
+            "This session is being continued from a previous conversation: private recap",
+            "private recap",
+        ),
+        (
+            "<task-notification><task-id>agent-1</task-id>private result</task-notification>",
+            "private result",
+        ),
+    ],
+)
+def test_list_conversations_search_excludes_legacy_hidden_messages(
+    conversation_store: SqlAlchemyConversationStore,
+    hidden_text: str,
+    query: str,
+) -> None:
+    """Legacy hidden prompts remain absent even if an old row retained search_text."""
+    conv = conversation_store.create_conversation()
+    [persisted] = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_hidden",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": hidden_text}],
+                ),
+            ),
+        ],
+    )
+    # Simulate a pre-fix indexed row: current writes correctly store an empty
+    # search_text, while the read predicate must still hide historical rows.
+    with conversation_store._conv_session("test_legacy_hidden_search") as session:
+        row = session.get(
+            SqlConversationItem,
+            (current_workspace_id(), conv.id, persisted.id, persisted.created_at),
+        )
+        assert row is not None
+        row.search_text = hidden_text
+
+    page = conversation_store.list_conversations(search_query=query)
+    assert conv.id not in {row.id for row in page.data}
+
+
+@pytest.mark.parametrize(
+    "literal,matching_text",
+    [("%", "progress is 100% complete"), ("_", "literal_under_score")],
+)
+def test_list_conversations_search_treats_like_wildcards_literally(
+    conversation_store: SqlAlchemyConversationStore,
+    literal: str,
+    matching_text: str,
+) -> None:
+    matching = conversation_store.create_conversation()
+    conversation_store.append(
+        matching.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_literal",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": matching_text}],
+                ),
+            )
+        ],
+    )
+    unrelated = conversation_store.create_conversation()
+    conversation_store.append(
+        unrelated.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_plain",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "ordinary archive text"}],
+                ),
+            )
+        ],
+    )
+
+    ids = {row.id for row in conversation_store.list_conversations(search_query=literal).data}
+    assert matching.id in ids
+    assert unrelated.id not in ids
 
 
 def test_list_conversations_search_snippet_absent_without_query(

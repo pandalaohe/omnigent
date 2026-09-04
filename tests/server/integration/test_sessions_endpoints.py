@@ -3712,6 +3712,52 @@ async def test_list_session_items_big_page_survives_bounded_read_backend(
         _sa_event.remove(store._conv_engine, "before_execute", _choke_on_oversized_reads)
 
 
+async def test_get_session_items_window_centers_on_anchor(
+    client: httpx.AsyncClient,
+) -> None:
+    """Archive readers can fetch a bounded window around an exact item."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        initial_message="window anchor",
+    )
+    await _wait_for_idle(client, session["id"])
+
+    items_resp = await client.get(f"/v1/sessions/{session['id']}/items")
+    items = items_resp.json()["data"]
+    assert items
+    anchor_id = items[0]["id"]
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/items/window",
+        params={"anchor_id": anchor_id, "before": 1, "after": 1},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [item["id"] for item in body["data"]]
+    assert body["object"] == "session.items.window"
+    assert body["anchor_id"] == anchor_id
+    assert anchor_id in ids
+    assert len(ids) <= 3
+
+
+async def test_get_session_items_window_404_for_unknown_anchor(
+    client: httpx.AsyncClient,
+) -> None:
+    """A stale deep-link locator does not silently open the wrong message."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="known item")
+    await _wait_for_idle(client, session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/items/window",
+        params={"anchor_id": "msg_missing", "before": 1, "after": 1},
+    )
+    assert resp.status_code == 404
+
+
 # ── GET /v1/sessions/{id} snapshot fields ────────────────
 
 
@@ -4806,10 +4852,7 @@ async def test_post_external_structured_terminal_ignores_stale_assistant_opener(
     assert status_resp.status_code == 202, status_resp.text
     child_snapshot = await client.get(f"/v1/sessions/{child['id']}")
     assert child_snapshot.status_code == 200, child_snapshot.text
-    assert (
-        child_snapshot.json()["labels"]["omnigent.subagent.terminal_status"]
-        == terminal_status
-    )
+    assert child_snapshot.json()["labels"]["omnigent.subagent.terminal_status"] == terminal_status
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/events",

@@ -12,6 +12,7 @@ import {
   bindOnlyOnlineRunner,
   createSession,
   fetchSessionItemsPage,
+  fetchSessionItemsWindow,
   forkSession,
   getSession,
   getSessionSlim,
@@ -870,6 +871,35 @@ describe("fetchSessionItemsPage", () => {
     // (the pre-fix shape) would return the conversation's start instead.
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
       "/v1/sessions/conv_abc/items?limit=25&order=desc&after=msg_50",
+    );
+  });
+});
+
+describe("fetchSessionItemsWindow", () => {
+  it("requests and parses a bounded chronological window around an item", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "session.items.window",
+        data: [{ id: "msg_anchor", type: "message", role: "user", content: [] }],
+        anchor_id: "msg_anchor",
+        first_id: "msg_anchor",
+        last_id: "msg_anchor",
+        has_older: true,
+        has_newer: false,
+      }),
+    );
+
+    const window = await fetchSessionItemsWindow("conv with space", "msg/anchor", {
+      before: 12,
+      after: 8,
+    });
+
+    expect(window.items.map((item) => item.id)).toEqual(["msg_anchor"]);
+    expect(window.anchorId).toBe("msg_anchor");
+    expect(window.hasOlder).toBe(true);
+    expect(window.hasNewer).toBe(false);
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      "/v1/sessions/conv%20with%20space/items/window?anchor_id=msg%2Fanchor&before=12&after=8",
     );
   });
 });

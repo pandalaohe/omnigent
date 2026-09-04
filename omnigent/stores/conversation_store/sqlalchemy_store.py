@@ -53,6 +53,8 @@ from omnigent.db.enum_codecs import (
 )
 from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
+    CLAUDE_COMPACTION_SUMMARY_PREFIX,
+    CLAUDE_TASK_NOTIFICATION_MARKERS,
     _supports_fts5,
     build_search_snippet,
     delete_fts_by_conversation_ids,
@@ -603,11 +605,39 @@ def _fetch_labels_bulk(
     return out
 
 
-def _fetch_search_snippets(
+def _literal_like_pattern(value: str) -> str:
+    """Build a SQL LIKE pattern that treats the user's query as literal text."""
+    escaped = value.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _visible_search_match_predicate(pattern: str) -> Any:
+    """Match searchable user-visible rows, including pre-fix stored data."""
+    data = SqlConversationItem.data
+    legacy_task_notification = and_(
+        *(data.like(f"%{marker}%") for marker in CLAUDE_TASK_NOTIFICATION_MARKERS),
+    )
+    return and_(
+        SqlConversationItem.search_text.ilike(pattern, escape="\\"),
+        or_(
+            SqlConversationItem.type != encode_item_type("message"),
+            and_(
+                # ``append`` serializes with json.dumps' stable ``": "`` spacing.
+                # Future hidden messages persist an empty search_text; these
+                # gates keep older indexed rows from surfacing after an upgrade.
+                data.not_like('%"is_meta": true%'),
+                data.not_like(f'%"text": "{CLAUDE_COMPACTION_SUMMARY_PREFIX}%'),
+                ~legacy_task_notification,
+            ),
+        ),
+    )
+
+
+def _fetch_search_matches(
     session: Session,
     conversation_ids: list[str],
     query: str,
-) -> dict[str, str]:
+) -> dict[str, tuple[str, str, int, str]]:
     """
     Build a per-conversation preview excerpt of matching chat content.
 
@@ -627,13 +657,14 @@ def _fetch_search_snippets(
     :param conversation_ids: Conversation IDs to build snippets for,
         e.g. ``["conv_a", "conv_b"]``.
     :param query: The user's search string.
-    :returns: Mapping ``{conversation_id: snippet}``. Conversations whose
+    :returns: Mapping ``{conversation_id: (item_id, response_id,
+        created_at, snippet)}``. Conversations whose
         only match was the title (no item body match) are absent — the
         caller leaves their ``search_snippet`` as ``None``.
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
+    pattern = _literal_like_pattern(query)
     workspace_id = current_workspace_id()
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
@@ -645,7 +676,7 @@ def _fetch_search_snippets(
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+        _visible_search_match_predicate(pattern),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -663,6 +694,9 @@ def _fetch_search_snippets(
     rows = session.execute(
         select(
             SqlConversationItem.conversation_id,
+            SqlConversationItem.id,
+            SqlConversationItem.response_id,
+            SqlConversationItem.created_at,
             SqlConversationItem.search_text,
         ).join(
             earliest,
@@ -673,13 +707,13 @@ def _fetch_search_snippets(
             ),
         )
     ).all()
-    out: dict[str, str] = {}
-    for conv_id, search_text in rows:
+    out: dict[str, tuple[str, str, int, str]] = {}
+    for conv_id, item_id, response_id, created_at, search_text in rows:
         if not search_text:
             continue
         snippet = build_search_snippet(search_text, query)
         if snippet is not None:
-            out[conv_id] = snippet
+            out[conv_id] = (item_id, response_id, created_at, snippet)
     return out
 
 
@@ -2500,8 +2534,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             scope_batches = [None]
         else:
             scope_batches = [
-                permission_ids[index : index + 500]
-                for index in range(0, len(permission_ids), 500)
+                permission_ids[index : index + 500] for index in range(0, len(permission_ids), 500)
             ]
 
         projects: set[str] = set()
@@ -2779,16 +2812,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Workspace/CWD is metadata-owned. Resolve its matching ids here,
             # then OR them with title/content matches in the AP query below.
             with self._session("list_conversations") as meta_sess:
-                workspace_matching_ids = list(
-                    meta_sess.execute(
-                        select(SqlConversationMetadata.id).where(
-                            SqlConversationMetadata.workspace_id == current_workspace_id(),
-                            func.lower(SqlConversationMetadata.workspace).like(
-                                f"%{search_query.lower()}%"
-                            ),
-                        )
-                    ).scalars()
+                is_meta_postgres = (
+                    meta_sess.bind is not None and meta_sess.bind.dialect.name == "postgresql"
                 )
+                if is_meta_postgres:
+                    meta_sess.execute(
+                        text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
+                    )
+                workspace_stmt = select(SqlConversationMetadata.id).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    func.lower(SqlConversationMetadata.workspace).like(
+                        _literal_like_pattern(search_query), escape="\\"
+                    ),
+                )
+                if qualifying_ids is not None:
+                    workspace_stmt = workspace_stmt.where(
+                        SqlConversationMetadata.id.in_(qualifying_ids)
+                    )
+                workspace_matching_ids = list(meta_sess.execute(workspace_stmt).scalars())
 
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
@@ -2870,8 +2911,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:
-                pattern = f"%{search_query.lower()}%"
-                title_match = func.lower(SqlConversation.title).like(pattern)
+                pattern = _literal_like_pattern(search_query)
+                title_match = func.lower(SqlConversation.title).like(pattern, escape="\\")
                 # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
                 # form is uncorrelated, so the match set is built for the WHOLE
                 # workspace before the outer query discards every row the caller
@@ -2891,7 +2932,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                        _visible_search_match_predicate(pattern),
                     )
                     .exists()
                 )
@@ -3025,8 +3066,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             # match is often invisible in the title). Title-only matches keep
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
-            snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+            search_matches = (
+                _fetch_search_matches(session, row_ids, search_query) if search_query else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
@@ -3053,7 +3094,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             convs = []
         for conv in convs:
-            conv.search_snippet = snippets.get(conv.id)
+            match = search_matches.get(conv.id)
+            if match is None:
+                continue
+            (
+                conv.search_item_id,
+                conv.search_response_id,
+                conv.search_item_created_at,
+                conv.search_snippet,
+            ) = match
         return PagedList(
             data=convs,
             first_id=convs[0].id if convs else None,

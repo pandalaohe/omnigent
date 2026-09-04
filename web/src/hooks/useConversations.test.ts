@@ -348,7 +348,8 @@ describe("useArchivedConversations", () => {
     );
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    const url = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    const [requestUrl, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const url = new URL(requestUrl, "http://test");
     expect(url.searchParams.get("archived_only")).toBe("true");
     expect(url.searchParams.get("search_query")).toBe("Omnigent");
     expect(url.searchParams.get("project")).toBe("Core");
@@ -361,7 +362,42 @@ describe("useArchivedConversations", () => {
     expect(url.searchParams.get("archived_before")).toBe(
       String(Math.floor(now / 1000) - 90 * 86_400),
     );
+    expect(requestInit.signal).toBeInstanceOf(AbortSignal);
     nowSpy.mockRestore();
+  });
+
+  it("cancels an obsolete archive search when the query changes", async () => {
+    let firstSignal: AbortSignal | undefined;
+    fetchMock
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        firstSignal = init.signal as AbortSignal;
+        return new Promise<Response>((_resolve, reject) => {
+          firstSignal?.addEventListener("abort", () => reject(firstSignal?.reason), { once: true });
+        });
+      })
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const filters = (searchQuery: string) => ({
+      searchQuery,
+      dateField: "archived_at" as const,
+      sortField: "archived_at" as const,
+      agePreset: "any" as const,
+      order: "desc" as const,
+    });
+    const hook = renderHook(({ query }) => useArchivedConversations(filters(query)), {
+      wrapper,
+      initialProps: { query: "first" },
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    hook.rerender({ query: "second" });
+
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   });
 
   it("falls back once when an older Server rejects archived_at parameters", async () => {

@@ -73,6 +73,7 @@ import {
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
+import { ArchiveTranscriptViewer } from "@/components/archive/ArchiveTranscriptViewer";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import {
@@ -154,6 +155,7 @@ import {
 } from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
@@ -339,6 +341,8 @@ export function SettingsPage() {
     );
   }
 
+  if (section === "archived") return <ArchivedSection />;
+
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
@@ -349,7 +353,6 @@ export function SettingsPage() {
       {section === "context-usage" && <ContextUsageSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
-      {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
       {section === "updates" && isElectronShell() && <UpdatesSection />}
     </PageScroll>
@@ -2479,7 +2482,58 @@ function ImportSection() {
 }
 
 function ArchivedSection() {
+  const isMobileViewport = useIsMobileViewport();
+  const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
+  const { width, containerRef, handleProps } = useResizableColumn(420, 300, 720);
+
+  return (
+    <div
+      ref={(node) => {
+        containerRef.current = node;
+      }}
+      className="flex h-full min-h-0 overflow-hidden pt-[calc(var(--app-header-height,3.5rem)+env(safe-area-inset-top))]"
+      data-testid="archive-library"
+    >
+      <div
+        className={cn(
+          "min-h-0 shrink-0 overflow-y-auto px-5 pt-4 pb-10",
+          isMobileViewport && selectedConversation ? "hidden" : "w-full",
+        )}
+        style={isMobileViewport ? undefined : { width }}
+      >
+        <ArchivedListPane
+          selectedConversationId={selectedConversation?.id ?? null}
+          onSelectConversation={setSelectedConversation}
+        />
+      </div>
+      {!isMobileViewport && (
+        <div
+          {...handleProps}
+          aria-label="Resize archive session list"
+          className="group relative w-1 shrink-0 cursor-col-resize border-x border-transparent hover:bg-primary/10"
+        >
+          <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border group-hover:bg-primary/50" />
+        </div>
+      )}
+      {(!isMobileViewport || selectedConversation) && (
+        <ArchiveTranscriptViewer
+          conversation={selectedConversation}
+          onBack={isMobileViewport ? () => setSelectedConversation(null) : undefined}
+        />
+      )}
+    </div>
+  );
+}
+
+function ArchivedListPane({
+  selectedConversationId,
+  onSelectConversation,
+}: {
+  selectedConversationId: string | null;
+  onSelectConversation: (conversation: Conversation | null) => void;
+}) {
   const [view, setView] = useState<ArchivedViewPreferences>(readArchivedViewPreferences);
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState(view.searchQuery ?? "");
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
   const [pageCursors, setPageCursors] = useState<(string | undefined)[]>([undefined]);
   const paginationAnchorRef = useRef<HTMLElement>(null);
@@ -2488,8 +2542,30 @@ function ArchivedSection() {
   const projectsQuery = useProjects();
   const hostsQuery = useHosts({ includeSandbox: true });
   const pageNumber = pageCursors.length;
-  const listQuery = useArchivedConversations(view, pageCursors.at(-1));
+  useEffect(() => {
+    const timeout = window.setTimeout(
+      () => setDebouncedSearchQuery((view.searchQuery ?? "").trim()),
+      250,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [view.searchQuery]);
+  const queryView = useMemo(
+    () => ({ ...view, searchQuery: debouncedSearchQuery }),
+    [debouncedSearchQuery, view],
+  );
+  const listQuery = useArchivedConversations(queryView, pageCursors.at(-1));
   const archived = useMemo(() => listQuery.data?.data ?? [], [listQuery.data]);
+
+  useEffect(() => {
+    if (listQuery.isLoading) return;
+    if (archived.length === 0) {
+      if (selectedConversationId !== null) onSelectConversation(null);
+      return;
+    }
+    const selected = archived.find((conversation) => conversation.id === selectedConversationId);
+    if (!selected) onSelectConversation(archived[0]);
+    else if (selected !== null) onSelectConversation(selected);
+  }, [archived, listQuery.isLoading, onSelectConversation, selectedConversationId]);
 
   useEffect(() => {
     localStorage.setItem(ARCHIVED_VIEW_STORAGE_KEY, JSON.stringify(view));
@@ -2611,7 +2687,7 @@ function ArchivedSection() {
   const sortOrderLabel = view.order === "asc" ? "Oldest first" : "Newest first";
 
   return (
-    <section ref={paginationAnchorRef} className="scroll-mt-16">
+    <section ref={paginationAnchorRef} className="scroll-mt-16" aria-label="Archived sessions">
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <h1 className="mr-auto text-xl font-semibold">Archived sessions</h1>
         {archived.length > 0 &&
@@ -2652,8 +2728,8 @@ function ArchivedSection() {
             />
             <Input
               type="search"
-              aria-label="Search archived session title or CWD"
-              placeholder="Search title or CWD…"
+              aria-label="Search archived session title, CWD, or conversation content"
+              placeholder="Search title, CWD, or messages…"
               className="h-10 pl-9 text-base md:h-9 md:text-sm"
               value={view.searchQuery ?? ""}
               onChange={(event) => setFilter("searchQuery", event.target.value)}
@@ -2841,6 +2917,8 @@ function ArchivedSection() {
                       selectionMode={selectionMode}
                       isSelected={selectedIds.has(conv.id)}
                       onToggleSelected={toggleSelected}
+                      isActive={selectedConversationId === conv.id}
+                      onOpen={onSelectConversation}
                     />
                   ))}
                 </ul>
@@ -3057,10 +3135,8 @@ function ArchivedBulkActionBar({
 }
 
 /**
- * One archived-session row. Not clickable (archived sessions aren't a
- * navigation target here); the title + timestamp read as a record, and the
- * Delete / Unarchive controls reveal on hover (always visible on touch).
- * In selection mode, clicking the row toggles its checkbox.
+ * One archived-session row. Its primary control opens the read-only transcript;
+ * in selection mode the same control toggles its checkbox.
  * Unarchive navigates to the restored session once the PATCH lands.
  */
 function ArchivedRow({
@@ -3069,12 +3145,16 @@ function ArchivedRow({
   selectionMode,
   isSelected,
   onToggleSelected,
+  isActive,
+  onOpen,
 }: {
   conversation: Conversation;
   hostName?: string;
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (id: string) => void;
+  isActive: boolean;
+  onOpen: (conversation: Conversation) => void;
 }) {
   const navigate = useNavigate();
   const archive = useArchiveConversation();
@@ -3092,83 +3172,107 @@ function ArchivedRow({
   return (
     <li
       data-testid="archived-row"
+      data-active={isActive || undefined}
       className={cn(
-        "group relative flex items-center gap-2 rounded-md border border-transparent px-3 py-2 hover:border-border hover:bg-muted/60 max-md:flex-wrap max-md:border-border/60 max-md:bg-muted/20 max-md:py-3",
-        selectionMode && "cursor-pointer",
+        "group relative flex items-center gap-2 rounded-md border border-transparent hover:border-border hover:bg-muted/60 max-md:flex-wrap max-md:border-border/60 max-md:bg-muted/20",
+        isActive && !selectionMode && "border-primary/30 bg-primary/5",
         isSelected && "bg-muted",
       )}
-      onClick={selectionMode ? () => onToggleSelected(conversation.id) : undefined}
+      onClick={(event) => {
+        if (selectionMode && event.target === event.currentTarget) {
+          onToggleSelected(conversation.id);
+        }
+      }}
     >
-      {selectionMode && (
-        <span className="flex shrink-0 items-center">
-          {isSelected ? (
-            <SquareCheckIcon className="size-4 text-primary" />
-          ) : (
-            <SquareIcon className="size-4 text-muted-foreground" />
-          )}
-        </span>
-      )}
-      <div
-        className={cn(
-          "grid min-w-0 flex-1 gap-x-4 gap-y-2 lg:grid-cols-[minmax(0,1fr)_13.25rem] lg:items-center",
-          !selectionMode && "max-md:basis-full",
-        )}
+      <button
+        type="button"
+        data-testid="archived-open-session"
+        aria-pressed={selectionMode ? isSelected : undefined}
+        className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:py-3"
+        onClick={() => (selectionMode ? onToggleSelected(conversation.id) : onOpen(conversation))}
       >
-        <div className="min-w-0">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="truncate text-ui font-medium" title={label}>
-              {label}
-            </span>
-            {conversation.labels?.omni_project && (
-              <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-                {conversation.labels.omni_project}
-              </span>
+        {selectionMode && (
+          <span className="flex shrink-0 items-center">
+            {isSelected ? (
+              <SquareCheckIcon className="size-4 text-primary" />
+            ) : (
+              <SquareIcon className="size-4 text-muted-foreground" />
             )}
-          </div>
-          <div
-            className="truncate font-mono text-xs text-info/90"
-            title={conversation.workspace ?? "CWD not recorded"}
-          >
-            {conversation.workspace ?? "CWD not recorded"}
-          </div>
-          <div
-            className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground"
-            data-testid="archived-context"
-          >
-            <span className="truncate" title={resolvedHostName}>
-              {resolvedHostName}
-            </span>
-            <span className="shrink-0 text-border" aria-hidden="true">
-              •
-            </span>
-            <span className="truncate" title={resolvedAgentName}>
-              {resolvedAgentName}
-            </span>
-          </div>
-        </div>
-        <dl
-          className="grid grid-cols-[3.25rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs lg:border-l lg:pl-3"
-          data-testid="archived-time-column"
+          </span>
+        )}
+        <div
+          className={cn(
+            "grid min-w-0 flex-1 gap-x-4 gap-y-2 lg:grid-cols-[minmax(0,1fr)_13.25rem] lg:items-center",
+            !selectionMode && "max-md:basis-full",
+          )}
         >
-          <dt className="text-[10px] leading-4 tracking-wide text-info uppercase">Archived</dt>
-          <dd className="min-w-0 truncate leading-4 font-medium text-foreground">
-            <time
-              dateTime={new Date(archivedAtMs).toISOString()}
-              title={absoluteTime(archivedAtMs)}
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-ui font-medium" title={label}>
+                {label}
+              </span>
+              {conversation.labels?.omni_project && (
+                <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                  {conversation.labels.omni_project}
+                </span>
+              )}
+            </div>
+            {conversation.search_snippet && (
+              <p
+                className="mt-1 line-clamp-2 text-xs leading-4 text-foreground/75"
+                data-testid="archived-search-snippet"
+              >
+                {conversation.search_snippet}
+              </p>
+            )}
+            <div
+              className="truncate font-mono text-xs text-info/90"
+              title={conversation.workspace ?? "CWD not recorded"}
             >
-              {absoluteTime(archivedAtMs)}
-            </time>
-          </dd>
-          <dt className="text-[10px] leading-4 tracking-wide text-muted-foreground uppercase">
-            Created
-          </dt>
-          <dd className="min-w-0 truncate leading-4 text-muted-foreground">
-            <time dateTime={new Date(createdAtMs).toISOString()} title={absoluteTime(createdAtMs)}>
-              {absoluteTime(createdAtMs)}
-            </time>
-          </dd>
-        </dl>
-      </div>
+              {conversation.workspace ?? "CWD not recorded"}
+            </div>
+            <div
+              className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground"
+              data-testid="archived-context"
+            >
+              <span className="truncate" title={resolvedHostName}>
+                {resolvedHostName}
+              </span>
+              <span className="shrink-0 text-border" aria-hidden="true">
+                •
+              </span>
+              <span className="truncate" title={resolvedAgentName}>
+                {resolvedAgentName}
+              </span>
+            </div>
+          </div>
+          <dl
+            className="grid grid-cols-[3.25rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs lg:border-l lg:pl-3"
+            data-testid="archived-time-column"
+          >
+            <dt className="text-[10px] leading-4 tracking-wide text-info uppercase">Archived</dt>
+            <dd className="min-w-0 truncate leading-4 font-medium text-foreground">
+              <time
+                dateTime={new Date(archivedAtMs).toISOString()}
+                title={absoluteTime(archivedAtMs)}
+              >
+                {absoluteTime(archivedAtMs)}
+              </time>
+            </dd>
+            <dt className="text-[10px] leading-4 tracking-wide text-muted-foreground uppercase">
+              Created
+            </dt>
+            <dd className="min-w-0 truncate leading-4 text-muted-foreground">
+              <time
+                dateTime={new Date(createdAtMs).toISOString()}
+                title={absoluteTime(createdAtMs)}
+              >
+                {absoluteTime(createdAtMs)}
+              </time>
+            </dd>
+          </dl>
+        </div>
+      </button>
       {!selectionMode && (
         <div className="flex shrink-0 items-center gap-1 max-md:mr-14 max-md:ml-auto">
           <Tooltip>

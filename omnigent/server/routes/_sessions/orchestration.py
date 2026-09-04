@@ -331,6 +331,7 @@ from omnigent.server.schemas import (
     SessionListItem,
     SessionModelEvent,
     SessionResponse,
+    SessionSearchMatch,
     SessionStatusEvent,
     SessionUsageEvent,
     SkillSummary,
@@ -899,6 +900,19 @@ def _build_session_list_item(
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,
+        search_match=(
+            SessionSearchMatch(
+                item_id=conv.search_item_id,
+                response_id=conv.search_response_id,
+                created_at=conv.search_item_created_at,
+                snippet=conv.search_snippet,
+            )
+            if conv.search_item_id is not None
+            and conv.search_response_id is not None
+            and conv.search_item_created_at is not None
+            and conv.search_snippet is not None
+            else None
+        ),
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
     )

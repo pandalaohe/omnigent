@@ -699,11 +699,13 @@ count and notification titles are prefixed with the firing server's hostname.
 ## Deep links
 
 An `omnigent://<hostname>/c/<session_id>` URL opens that session on that
-server in the desktop app — the way a browser deep link opens a page:
+server in the desktop app. Archive Library references use the same server
+identity with an exact item locator:
 
 ```
 omnigent://localhost:8000/c/conv_abc              → http://localhost:8000/c/conv_abc
 omnigent://my-workspace.cloud.databricks.com/c/x → https://…/omnigent/c/x
+omnigent://example.com/archive/x?item=msg_1       → https://example.com/archive/x?item=msg_1
 ```
 
 The link names a server by **host** (with port if non-default) and carries no
@@ -711,8 +713,9 @@ The link names a server by **host** (with port if non-default) and carries no
 uses (`http` for loopback, `https` for a remote host), so a deep link and a
 pasted URL can never disagree. The Databricks workspace mount (`/omnigent`)
 is **not** in the link; it is server-determined and discovered the same way a
-pasted workspace URL is. v1 accepts only `/c/<session_id>`; other paths are
-ignored.
+pasted workspace URL is. The parser accepts `/c/<session_id>` and
+`/archive/<session_id>`; Archive links require one bounded `item` locator and
+may carry one `response` locator. Other paths and query parameters are rejected.
 
 **Window handling** (the careful part):
 

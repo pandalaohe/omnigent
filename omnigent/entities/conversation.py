@@ -224,6 +224,9 @@ class Conversation:
         if the title also matched), so the search UI can show *where* the
         session matched. Never persisted (not a DB column) and ``None`` on
         every non-search read path and title-only matches.
+    :param search_item_id: Stable item id for ``search_snippet``. Transient and
+        populated together with the snippet so readers can open the matching
+        part of a long transcript without walking every earlier page.
     """
 
     id: str
@@ -266,6 +269,9 @@ class Conversation:
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
+    search_item_id: str | None = None
+    search_response_id: str | None = None
+    search_item_created_at: int | None = None
 
 
 # ── Conversation item data types ───────────────────────

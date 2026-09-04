@@ -238,6 +238,13 @@ export interface Conversation {
    * matched. Absent on non-search fetches and title-only matches.
    */
   search_snippet?: string | null;
+  /** Stable locator for the first visible body match in a search response. */
+  search_match?: {
+    item_id: string;
+    response_id: string;
+    created_at: number;
+    snippet: string;
+  } | null;
   /**
    * For sub-agent sessions, the id of the direct parent session.
    * `null` / absent for top-level sessions. Included in
@@ -593,6 +600,7 @@ function archivedAgeBounds(
 async function fetchArchivedConversationsPage(
   filters: ArchivedConversationFilters,
   after?: string,
+  requestSignal?: AbortSignal,
 ): Promise<ConversationsPage> {
   const requestGeneration = getOmnigentHostGeneration();
   if (requestGeneration !== archivedAtCapabilityGeneration) {
@@ -631,7 +639,14 @@ async function fetchArchivedConversationsPage(
     return params;
   };
   let params = buildParams(archivedAtQuerySupported);
-  let res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  const timeoutSignal = filters.searchQuery
+    ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS)
+    : undefined;
+  const signal =
+    requestSignal && timeoutSignal
+      ? AbortSignal.any([requestSignal, timeoutSignal])
+      : (requestSignal ?? timeoutSignal);
+  let res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
   ensureCurrentConnection();
   if (res.status === 422 && archivedAtQuerySupported && usesArchivedAt) {
     // f7 and older reject archived_at before the UI can apply its display
@@ -639,7 +654,7 @@ async function fetchArchivedConversationsPage(
     // this host generation so pagination/refetches do not keep probing.
     archivedAtQuerySupported = false;
     params = buildParams(false);
-    res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
     ensureCurrentConnection();
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -656,10 +671,12 @@ export function resetArchivedQueryCompatibilityForTests(): void {
 export function useArchivedConversations(filters: ArchivedConversationFilters, after?: string) {
   return useQuery({
     queryKey: [...ARCHIVED_CONVERSATIONS_KEY, filters, after ?? null],
-    queryFn: () => fetchArchivedConversationsPage(filters, after),
+    queryFn: ({ signal }) => fetchArchivedConversationsPage(filters, after, signal),
     staleTime: 30_000,
     retry: (failureCount, error) =>
-      !(error instanceof DOMException && error.name === "AbortError") && failureCount < 3,
+      !isAbortTimeout(error) &&
+      !(error instanceof DOMException && error.name === "AbortError") &&
+      failureCount < 3,
   });
 }
 

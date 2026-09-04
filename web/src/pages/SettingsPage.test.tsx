@@ -152,6 +152,13 @@ vi.mock("@/hooks/useConversations", async () => {
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: mocks.hosts }),
 }));
+vi.mock("@/components/archive/ArchiveTranscriptViewer", () => ({
+  ArchiveTranscriptViewer: ({ conversation }: { conversation: Conversation | null }) => (
+    <div data-testid="archive-transcript-viewer">
+      {conversation ? `Transcript: ${conversation.title ?? conversation.id}` : "Select a session"}
+    </div>
+  ),
+}));
 // Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
 // native <select> so tests can drive both the color-theme dropdown and the
 // archived project filter. The real page puts data-testid on SelectTrigger,
@@ -1044,6 +1051,36 @@ describe("SettingsPage", () => {
     });
     // Unarchiving opens the restored session (the mock mutate runs onSuccess).
     expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
+  });
+
+  it("debounces archive content search before issuing a new list query", async () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Searchable" })];
+    renderPage("/settings/archived");
+    const input = screen.getByRole("searchbox", {
+      name: "Search archived session title, CWD, or conversation content",
+    });
+
+    fireEvent.change(input, { target: { value: "b" } });
+    fireEvent.change(input, { target: { value: "bounded" } });
+    expect(mocks.archivedFilters?.searchQuery).toBe("");
+
+    await waitFor(() => expect(mocks.archivedFilters?.searchQuery).toBe("bounded"), {
+      timeout: 1_000,
+    });
+  });
+
+  it("resizes the desktop archive list with the keyboard", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+    const library = screen.getByTestId("archive-library");
+    const list = library.firstElementChild as HTMLElement;
+    const separator = screen.getByRole("separator", { name: "Resize archive session list" });
+
+    expect(list).toHaveStyle({ width: "420px" });
+    expect(separator).toHaveAttribute("aria-valuenow", "420");
+    fireEvent.keyDown(separator, { key: "ArrowLeft" });
+    expect(list).toHaveStyle({ width: "396px" });
+    expect(separator).toHaveAttribute("aria-valuenow", "396");
   });
 
   it("keeps mobile archive filters collapsed until the Filters button is opened", () => {

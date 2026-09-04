@@ -1078,6 +1078,41 @@ export interface SessionItemsPage {
   hasMore: boolean;
 }
 
+export interface SessionItemsWindow {
+  items: ConversationItem[];
+  anchorId: string;
+  hasOlder: boolean;
+  hasNewer: boolean;
+}
+
+/** Fetch a bounded chronological transcript window centered on one item. */
+export async function fetchSessionItemsWindow(
+  sessionId: string,
+  anchorId: string,
+  { before = 30, after = 30 }: { before?: number; after?: number } = {},
+): Promise<SessionItemsWindow> {
+  const params = new URLSearchParams({
+    anchor_id: anchorId,
+    before: String(before),
+    after: String(after),
+  });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items/window?${params}`,
+  );
+  const payload = await readJsonOrThrow<{
+    data: ConversationItem[];
+    anchor_id: string;
+    has_older: boolean;
+    has_newer: boolean;
+  }>(res);
+  return {
+    items: payload.data,
+    anchorId: payload.anchor_id,
+    hasOlder: payload.has_older,
+    hasNewer: payload.has_newer,
+  };
+}
+
 /**
  * Fetch one page of a session's committed items, oldest-to-newest.
  *

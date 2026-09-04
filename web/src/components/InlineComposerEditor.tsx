@@ -45,6 +45,39 @@ const SlashTokenHighlight = Extension.create({
   },
 });
 
+/** Visually identifies portable Archive Library references pasted into a draft. */
+const OmnigentReferenceHighlight = Extension.create({
+  name: "omnigentReferenceHighlight",
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        key: new PluginKey("omnigentReferenceHighlight"),
+        props: {
+          decorations(state) {
+            const decorations: Decoration[] = [];
+            state.doc.descendants((node, position) => {
+              if (!node.isText || !node.text) return;
+              const pattern = /⟦Omnigent reference \| [^⟧]+⟧/g;
+              for (const match of node.text.matchAll(pattern)) {
+                const start = position + (match.index ?? 0);
+                decorations.push(
+                  Decoration.inline(start, start + match[0].length, {
+                    class:
+                      "rounded-md border border-primary/25 bg-primary/10 px-1 py-0.5 font-mono text-[0.78em] text-primary",
+                    "data-omnigent-reference": "true",
+                    title: "Portable Omnigent session reference",
+                  }),
+                );
+              }
+            });
+            return DecorationSet.create(state.doc, decorations);
+          },
+        },
+      }),
+    ];
+  },
+});
+
 function appendText(parts: ComposerDraftPart[], text: string): void {
   if (!text) return;
   const tail = parts.at(-1);
@@ -360,6 +393,7 @@ export const InlineComposerEditor = forwardRef<
       }),
       createAttachmentExtension(filesRef),
       SlashTokenHighlight,
+      OmnigentReferenceHighlight,
     ],
     [],
   );

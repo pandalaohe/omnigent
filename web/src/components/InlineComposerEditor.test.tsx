@@ -12,6 +12,23 @@ function image(name: string): File {
 describe("InlineComposerEditor", () => {
   afterEach(cleanup);
 
+  it("visually identifies a portable Omnigent archive reference without changing its text", () => {
+    const reference =
+      "⟦Omnigent reference | session=conv_a | target=item:msg_1 | agent=codex | host=win | title=Notes | link=omnigent://server/c/conv_a?item=msg_1⟧\n> useful excerpt";
+    const ref = createRef<InlineComposerEditorHandle>();
+    const { container } = render(
+      <InlineComposerEditor
+        ref={ref}
+        initialParts={[{ type: "text", text: reference }]}
+        onChange={() => undefined}
+        ariaLabel="Message"
+      />,
+    );
+
+    expect(container.querySelector("[data-omnigent-reference='true']")).toBeTruthy();
+    expect(ref.current?.getProjection()).toBe(reference);
+  });
+
   it("exposes the placeholder on the editable element", () => {
     const { getByPlaceholderText } = render(
       <InlineComposerEditor
