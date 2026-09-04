@@ -35,6 +35,7 @@ from omnigent.host.frames import (
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
+    pending_elicitations,
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -311,6 +312,7 @@ class _DeletionClaimLease:
         """Outer-task completion fallback; stale recovery covers loop shutdown."""
         with contextlib.suppress(RuntimeError):
             self._ensure_release_task()
+
 
 # POST /events types that arrive per streamed chunk — the harness echoing its
 # own live output back. Their per-call audit row is pure noise (the content is
@@ -1018,8 +1020,36 @@ def register_events_routes(
                 _interrupt_fenced_sessions.discard(session_id)
                 raise
             if not stop_delivered:
-                # No runner resolved: nothing else lifts the fence (same as interrupt).
+                # No runner resolved: the process is already gone, but its last
+                # running/waiting edge can remain cached and persisted forever.
+                # Settle that stale lifecycle state authoritatively before
+                # reporting success so the child leaves the parent's B rollup.
+                # This keeps the conversation and all items intact; Stop is a
+                # lifecycle transition, not deletion.
                 _interrupt_fenced_sessions.discard(session_id)
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                # A dead runner can also strand approval/question Futures.
+                # Resolve every tracked prompt as cancelled before the terminal
+                # status fan-out: this clears the child badge, flips live cards,
+                # and mirrors the resolution through all ancestor streams.
+                for pending in pending_elicitations.snapshot_for(session_id):
+                    elicitation_id = pending.get("elicitation_id")
+                    if isinstance(elicitation_id, str) and elicitation_id:
+                        await _resolve_elicitation(
+                            session_id,
+                            {"elicitation_id": elicitation_id, "action": "cancel"},
+                            runner_router,
+                            conversation_store,
+                        )
+                if stop_conv is not None and stop_conv.kind == "sub_agent":
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "stopped"},
+                    )
+                _publish_status(session_id, "idle", background_task_count=0)
             # Host-spawned sessions run on a dedicated runner the host
             # launched for this one session. Killing the pane (above) leaves
             # that runner connected, so GET /health keeps reporting
@@ -1030,7 +1060,10 @@ def register_events_routes(
             # command" banner a CLI-launched session reaches on exit. Read
             # host_id / runner_id from the owner-gated session row so we can
             # only ever stop the runner bound to this session.
-            stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if stop_delivered:
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
             if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
                 # Mark the tunnel drop as intentional BEFORE tearing it down so
                 # the relay's disconnect handler renders a quiet stopped state
@@ -1357,9 +1390,7 @@ def register_events_routes(
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
-            public_status = (
-                "idle" if status in {"completed", "stopped", "killed"} else status
-            )
+            public_status = "idle" if status in {"completed", "stopped", "killed"} else status
             _publish_status(
                 session_id,
                 public_status,
@@ -1377,9 +1408,7 @@ def register_events_routes(
                     _TelTurnEndEvent(
                         installation_id=_get_installation_id(),
                         session_id=session_id,
-                        status=(
-                            "completed" if status in {"idle", "completed"} else "failed"
-                        ),
+                        status=("completed" if status in {"idle", "completed"} else "failed"),
                         latency_ms=None,
                         model=None,
                         input_tokens=None,
@@ -2359,9 +2388,7 @@ def register_events_routes(
         if conv is None:
             await delete_lease.release()
             raise _session_not_found()
-        await delete_lease.run(
-            _best_effort_stop(session_id, conversation_store, runner_router)
-        )
+        await delete_lease.run(_best_effort_stop(session_id, conversation_store, runner_router))
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -2395,9 +2422,7 @@ def register_events_routes(
             from omnigent.runtime import get_terminal_registry
 
             with contextlib.suppress(RuntimeError):
-                await delete_lease.run(
-                    get_terminal_registry().cleanup_conversation(session_id)
-                )
+                await delete_lease.run(get_terminal_registry().cleanup_conversation(session_id))
         # Opt-in git worktree cleanup: only when delete_branch=true and
         # the session has a server-created worktree. Runs after runner
         # teardown but before the irreversible file cleanup below: an

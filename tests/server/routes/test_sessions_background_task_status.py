@@ -21,6 +21,7 @@ import types
 import pytest
 
 from omnigent.server.routes import sessions as _sessions_mod
+from omnigent.server.routes._sessions.helpers import _session_background_activity_count
 from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -111,6 +112,38 @@ def test_failure_clears_tally_and_wins_over_count() -> None:
     assert _SID not in _sessions_mod._session_background_task_count_cache
     # ``failed`` is authoritative for the list row, never masked by a tally.
     assert _session_status_with_child_rollup(_SID, []) == "failed"
+
+
+def test_background_badge_counts_only_live_child_states() -> None:
+    """Finished children leave B while running/waiting children remain."""
+    running_child = "conv_bg_running_child"
+    waiting_child = "conv_bg_waiting_child"
+    idle_child = "conv_bg_idle_child"
+    failed_child = "conv_bg_failed_child"
+    child_ids = [running_child, waiting_child, idle_child, failed_child]
+    _sessions_mod._session_status_cache.update(
+        {
+            _SID: "idle",
+            running_child: "running",
+            waiting_child: "waiting",
+            idle_child: "idle",
+            failed_child: "failed",
+        }
+    )
+    _sessions_mod._session_background_task_count_cache[_SID] = 1
+    try:
+        assert _session_background_activity_count(_SID, child_ids) == 3
+
+        _sessions_mod._session_status_cache[running_child] = "idle"
+        _sessions_mod._session_status_cache[waiting_child] = "failed"
+        assert _session_background_activity_count(_SID, child_ids) == 1
+
+        # A failed owner cannot have a trustworthy sticky shell tally.
+        _sessions_mod._session_status_cache[_SID] = "failed"
+        assert _session_background_activity_count(_SID, child_ids) == 0
+    finally:
+        for child_id in child_ids:
+            _sessions_mod._session_status_cache.pop(child_id, None)
 
 
 # ── background-task detail rides with the tally ─────────────────────────────

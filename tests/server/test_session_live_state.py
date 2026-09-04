@@ -367,15 +367,14 @@ def test_scheduled_run_completion_runs_in_callers_workspace_scope() -> None:
 
 
 @pytest.mark.asyncio
-async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
-    """A stale persisted pending count can't light a phantom inbox badge.
+async def test_liveness_pass_zeroes_runner_owned_activity_for_offline_runner() -> None:
+    """Stale runner-owned activity can't light phantom inbox or B badges.
 
     Nothing decrements the persisted ``pending_elicitation_count`` when a
     runner/host/replica crashes with prompts parked, so the row can outlive
-    the prompts it counts. The liveness pass (shared by ``GET /v1/sessions``
-    and the ``/v1/sessions/updates`` watched-items fetch) zeroes the count on
-    rows whose runner is offline — dead runner means dead prompts — while an
-    online runner's count passes through untouched.
+    the prompts it counts. The list-row liveness pass zeroes the count when
+    the runner is offline — dead runner means dead prompts and background
+    work — while an online runner's count passes through untouched.
     """
     from omnigent.server.routes.sessions import SessionLiveness, _apply_liveness_to_items
     from omnigent.server.schemas import SessionListItem
@@ -386,7 +385,7 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
             agent_id="ag_1",
             status="idle",
             foreground_status="idle",
-            background_activity_count=0,
+            background_activity_count=2,
             created_at=1,
             updated_at=1,
             pending_elicitations_count=3,
@@ -400,7 +399,9 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
 
     await _apply_liveness_to_items(items, lambda ids: {i: liveness[i] for i in ids})
 
-    assert [(i.runner_online, i.pending_elicitations_count) for i in items] == [
-        (False, 0),
-        (True, 3),
+    assert [
+        (i.runner_online, i.pending_elicitations_count, i.background_activity_count) for i in items
+    ] == [
+        (False, 0, 0),
+        (True, 3, 2),
     ]

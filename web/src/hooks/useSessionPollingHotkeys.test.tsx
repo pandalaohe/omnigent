@@ -79,7 +79,7 @@ describe("choosePolledConversation", () => {
     );
   });
 
-  it("still visits a B response before ordinary sessions in the secondary pass", () => {
+  it("keeps even an actionable B session behind an idle non-background session", () => {
     const candidates = [
       conversation("active"),
       conversation("plain-idle"),
@@ -89,7 +89,22 @@ describe("choosePolledConversation", () => {
       }),
     ];
     expect(choosePolledConversation(candidates, "active", () => false, true)?.id).toBe(
-      "background-response",
+      "plain-idle",
+    );
+  });
+
+  it("keeps a foreground-working session behind an idle non-background session", () => {
+    const candidates = [
+      conversation("active"),
+      conversation("foreground-working", 3, {
+        status: "running",
+        foreground_status: "running",
+      }),
+      conversation("plain-idle", 2),
+    ];
+
+    expect(choosePolledConversation(candidates, "active", () => false, true)?.id).toBe(
+      "plain-idle",
     );
   });
 
@@ -225,7 +240,10 @@ describe("useSessionPollingHotkeys", () => {
         background_activity_count: 1,
         viewer_last_seen: 10,
       }),
-      conversation("plain-idle", 30, { viewer_last_seen: 30 }),
+      conversation("background-idle", 30, {
+        background_activity_count: 1,
+        viewer_last_seen: 30,
+      }),
     ];
     renderHook(() =>
       useSessionPollingHotkeys({
@@ -238,6 +256,50 @@ describe("useSessionPollingHotkeys", () => {
     act(() => window.dispatchEvent(new Event(POLL_SESSIONS_ACTION_EVENT)));
 
     await waitFor(() => expect(navigate).toHaveBeenLastCalledWith("/c/background-result"));
+  });
+
+  it("visits every eligible session before restarting the priority pass", async () => {
+    const rows = [
+      conversation("plain-a"),
+      conversation("plain-b"),
+      conversation("background", 2, { background_activity_count: 1 }),
+    ];
+    const props = {
+      getConversations: async () => rows,
+      isUnread: () => false,
+      onArchive: vi.fn(),
+    };
+    const { rerender } = renderHook(
+      ({ activeId }) => useSessionPollingHotkeys({ ...props, activeId }),
+      { initialProps: { activeId: "plain-a" } },
+    );
+
+    act(() => window.dispatchEvent(new Event(POLL_SESSIONS_ACTION_EVENT)));
+    await waitFor(() => expect(navigate).toHaveBeenLastCalledWith("/c/plain-b"));
+
+    rerender({ activeId: "plain-b" });
+    act(() => window.dispatchEvent(new Event(POLL_SESSIONS_ACTION_EVENT)));
+    await waitFor(() => expect(navigate).toHaveBeenLastCalledWith("/c/background"));
+
+    rerender({ activeId: "background" });
+    act(() => window.dispatchEvent(new Event(POLL_SESSIONS_ACTION_EVENT)));
+    await waitFor(() => expect(navigate).toHaveBeenLastCalledWith("/c/plain-a"));
+  });
+
+  it("continues circularly after a non-first active session within the same priority", async () => {
+    const rows = [conversation("a"), conversation("b"), conversation("c"), conversation("d")];
+    renderHook(() =>
+      useSessionPollingHotkeys({
+        activeId: "c",
+        getConversations: async () => rows,
+        isUnread: () => false,
+        onArchive: vi.fn(),
+      }),
+    );
+
+    act(() => window.dispatchEvent(new Event(POLL_SESSIONS_ACTION_EVENT)));
+
+    await waitFor(() => expect(navigate).toHaveBeenLastCalledWith("/c/d"));
   });
 
   it("does not navigate from a poll that resolves after the active route changes", async () => {

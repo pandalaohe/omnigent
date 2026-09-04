@@ -17,6 +17,19 @@ import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSession
 import { useSession } from "@/hooks/useSession";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
+const { stopSessionMutate, stopSessionState } = vi.hoisted(() => {
+  const mutate = vi.fn();
+  return {
+    stopSessionMutate: mutate,
+    stopSessionState: {
+      mutate,
+      isPending: false,
+      isError: false,
+      error: null as Error | null,
+    },
+  };
+});
+
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
   // hook itself is replaced.
@@ -26,6 +39,10 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
+}));
+
+vi.mock("@/hooks/useConversations", () => ({
+  useStopSession: () => stopSessionState,
 }));
 
 // Stub the brand logos with plain SVGs so jsdom doesn't have to resolve
@@ -139,6 +156,10 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
+  stopSessionMutate.mockReset();
+  stopSessionState.isPending = false;
+  stopSessionState.isError = false;
+  stopSessionState.error = null;
   // Default: parent's status is idle. Tests override per-case.
   useSessionMock.mockReturnValue({
     session: {
@@ -483,6 +504,112 @@ describe("SubagentsPanel", () => {
     expect(rows[1]).toHaveAttribute("href", "/c/conv_child_b");
     // Status-word display (which states show a word vs. a bare dot) is owned
     // by the dedicated "shows the status word only for notable states" test.
+  });
+
+  it("lets the user stop a working sub-agent without deleting its history", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({
+          id: "conv_stuck",
+          title: "claude_code:stuck-worker",
+          tool: "claude_code",
+          session_name: "stuck-worker",
+          current_task_status: "in_progress",
+          busy: true,
+        }),
+        childInfo({
+          id: "conv_done",
+          title: "claude_code:finished-worker",
+          tool: "claude_code",
+          session_name: "finished-worker",
+          current_task_status: "completed",
+          busy: false,
+        }),
+      ],
+    });
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    expect(screen.getAllByTestId("stop-subagent")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Stop sub-agent stuck-worker" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Its conversation and history are kept.");
+
+    fireEvent.click(screen.getByTestId("stop-subagent-confirm"));
+    expect(stopSessionMutate).toHaveBeenCalledWith(
+      "conv_stuck",
+      expect.objectContaining({ onSuccess: expect.any(Function) }),
+    );
+  });
+
+  it("offers Stop while a sub-agent is launching or awaiting input", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "conv_launching", current_task_status: "launching" }),
+        childInfo({
+          id: "conv_awaiting",
+          busy: true,
+          pending_elicitations_count: 1,
+        }),
+      ],
+    });
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    expect(screen.getByRole("button", { name: /Stop sub-agent conv_launching/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Stop sub-agent conv_awaiting/ })).toBeVisible();
+  });
+
+  it("keeps a failed Stop visible and retryable", () => {
+    stopSessionState.isError = true;
+    stopSessionState.error = new Error("runner unreachable");
+    mockChildTree({
+      conv_root: [childInfo({ id: "conv_stuck", busy: true })],
+    });
+
+    renderPanel({ rootSessionId: "conv_root" });
+    fireEvent.click(screen.getByRole("button", { name: "Stop sub-agent conv_stuck" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/runner unreachable/);
+    fireEvent.click(screen.getByTestId("stop-subagent-confirm"));
+    expect(stopSessionMutate).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("does not offer the owner-only stop action to a read-only viewer", () => {
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_root",
+        agentId: "ag_root",
+        agentName: null,
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 1,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+    mockChildTree({
+      conv_root: [
+        childInfo({
+          id: "conv_shared_stuck",
+          title: "claude_code:shared-worker",
+          current_task_status: "in_progress",
+          busy: true,
+        }),
+      ],
+    });
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    expect(screen.queryByTestId("stop-subagent")).not.toBeInTheDocument();
   });
 
   it("uses spawned task titles as the primary child-row labels", () => {

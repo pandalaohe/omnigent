@@ -9245,43 +9245,112 @@ async def test_stop_session_surfaces_runner_failure_as_error(
     )
 
 
-async def test_stop_session_no_runner_lifts_stop_fence(
+async def test_stop_session_no_runner_settles_stale_child_and_parent_badge(
     client: httpx.AsyncClient,
+    db_uri: str,
 ) -> None:
     """
-    A stop with no runner bound anywhere still removes the turn fence.
+    A stop with no runner bound settles stale child activity and keeps history.
 
     When neither the session router nor the global fallback resolves a
     runner client, ``_stop_session_via_runner`` treats the stop as a
-    no-op success (the session is not running on any runner) and does
-    not raise. The fence installed just before the forward must not
-    outlive that no-op: nothing else would ever lift it, and the
-    interrupt branch already unfences in the same no-client situation.
+    success (the process is already absent) and does not raise. The server must
+    also replace a stale running/waiting edge with an intentional stopped
+    terminal state; otherwise the parent keeps its B badge forever. The fence
+    must be lifted and the child conversation/items must remain intact.
     """
-    from omnigent.runtime import set_runner_client
+    from omnigent.runtime import pending_elicitations, set_runner_client
+    from omnigent.server.routes._sessions.common import _SUBAGENT_TERMINAL_STATUS_LABEL_KEY
     from omnigent.server.routes.sessions import _interrupt_fenced_sessions
 
     # Pin the no-runner precondition: no global fallback client either.
     set_runner_client(None)
-    session_id: str | None = None
+    pending_elicitations.reset_for_tests()
+    from omnigent.server.routes import sessions as sessions_module
+
+    child_id: str | None = None
+    parent_id: str | None = None
     try:
         agent = await create_test_agent(client)
-        session = await _create_session(client, agent["id"])
-        session_id = session["id"]
+        parent = await _create_session(client, agent["id"], title="parent")
+        parent_id = parent["id"]
+        conv_store = SqlAlchemyConversationStore(db_uri)
+        child = conv_store.create_conversation(
+            kind="sub_agent",
+            title="worker:stale",
+            parent_conversation_id=parent["id"],
+            agent_id=agent["id"],
+        )
+        child_id = child.id
+        conv_store.append(
+            child_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_kept",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "Keep this history"}],
+                    ),
+                )
+            ],
+        )
+        sessions_module._session_status_cache[parent["id"]] = "idle"
+        sessions_module._session_status_cache[child_id] = "waiting"
+        pending_elicitations.record_publish(
+            child_id,
+            {
+                "type": "response.elicitation_request",
+                "elicitation_id": "elicit_stale_child",
+                "method": "elicitation/create",
+                "params": {"mode": "form", "message": "Allow the stuck task?"},
+            },
+        )
+
+        before_parent = await client.get("/v1/sessions")
+        before_parent_row = next(
+            row for row in before_parent.json()["data"] if row["id"] == parent["id"]
+        )
+        assert before_parent_row["background_activity_count"] == 1
+        assert pending_elicitations.count_for(child_id) == 1
+        before_parent_snapshot = (await client.get(f"/v1/sessions/{parent['id']}")).json()
+        assert len(before_parent_snapshot["pending_elicitations"]) == 1
+        before_items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
 
         resp = await client.post(
-            f"/v1/sessions/{session_id}/events",
+            f"/v1/sessions/{child_id}/events",
             json={"type": "stop_session", "data": {}},
         )
-        # No runner resolved = no-op success, not a RUNNER_UNAVAILABLE 503.
+        # No runner resolved = already-gone success, not RUNNER_UNAVAILABLE.
         assert resp.status_code == 202, resp.text
-        assert session_id not in _interrupt_fenced_sessions, (
+        assert child_id not in _interrupt_fenced_sessions, (
             "a no-runner stop_session must remove the fence it installed — "
             "nothing else would ever lift it"
         )
+        assert sessions_module._session_status_cache[child_id] == "idle"
+
+        after_parent = await client.get("/v1/sessions")
+        after_parent_row = next(
+            row for row in after_parent.json()["data"] if row["id"] == parent["id"]
+        )
+        assert after_parent_row["status"] == "idle"
+        assert after_parent_row["background_activity_count"] == 0
+        assert pending_elicitations.count_for(child_id) == 0
+
+        child_snapshot = (await client.get(f"/v1/sessions/{child_id}")).json()
+        assert child_snapshot["labels"][_SUBAGENT_TERMINAL_STATUS_LABEL_KEY] == "stopped"
+        assert child_snapshot["pending_elicitations"] == []
+        after_parent_snapshot = (await client.get(f"/v1/sessions/{parent['id']}")).json()
+        assert after_parent_snapshot["pending_elicitations"] == []
+        after_items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+        assert after_items == before_items
     finally:
-        if session_id is not None:
-            _interrupt_fenced_sessions.discard(session_id)
+        if child_id is not None:
+            _interrupt_fenced_sessions.discard(child_id)
+            sessions_module._session_status_cache.pop(child_id, None)
+        if parent_id is not None:
+            sessions_module._session_status_cache.pop(parent_id, None)
+        pending_elicitations.reset_for_tests()
 
 
 async def test_retry_session_reports_live_runner_noop_without_mutating_history(

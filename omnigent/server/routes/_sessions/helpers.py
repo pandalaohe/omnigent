@@ -1367,9 +1367,10 @@ async def _apply_liveness_to_items(
     Attach runner + host liveness to session-list items when a lookup is
     wired.
 
-    Both ``GET /v1/sessions`` and ``WS /v1/sessions/updates`` use this so
-    HTTP reconciliation preserves the same ``runner_online`` /
-    ``host_online`` fields that push frames patch into the web cache.
+    The ``WS /v1/sessions/updates`` watched-row builder uses this so pushed
+    reconciliation carries ``runner_online`` / ``host_online`` fields. The
+    paginated ``GET /v1/sessions`` path deliberately skips per-row liveness
+    queries and relies on the later watched-row stream for that enrichment.
 
     :param items: Session-list rows to annotate.
     :param liveness_lookup: Bulk liveness lookup from session id to a
@@ -1395,6 +1396,7 @@ async def _apply_liveness_to_items(
         # runner reconnects (see ``_on_runner_connect``'s pending resync).
         if not result.runner_online:
             item.pending_elicitations_count = 0
+            item.background_activity_count = 0
 
 
 def _targeted_elicitation_event(
@@ -9473,7 +9475,11 @@ def _child_session_summary_from_conversation(
     # Derive busy from the relay-fed cache; tasks table is gone.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
-    if cached_status is None:
+    if cached_status is None or cached_status == "idle":
+        # ``idle`` is the public session-status representation for every
+        # successful terminal edge. A durable child label refines that generic
+        # value so an intentional Stop renders as stopped (not completed) on
+        # live fan-out and subsequent snapshots.
         durable_status = labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
         if durable_status in ("completed", "failed", "stopped", "killed"):
             cached_status = durable_status

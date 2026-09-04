@@ -19,6 +19,7 @@ import type { ComponentType, SVGProps } from "react";
 import {
   BookOpenIcon,
   BotIcon,
+  CircleStopIcon,
   Code2Icon,
   CompassIcon,
   ChevronDownIcon,
@@ -47,10 +48,20 @@ import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { useStopSession } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -109,12 +120,18 @@ interface SubagentsPanelProps {
 }
 
 type ViewMode = "list" | "graph";
+interface StopTarget {
+  id: string;
+  label: string;
+}
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
+  const { session: rootSession } = useSession(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
+  const [stopTarget, setStopTarget] = useState<StopTarget | null>(null);
   const toggleCollapsedRow = (id: string) => {
     setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
   };
@@ -175,6 +192,8 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
+            canStopChildren={rootSession != null && isOwnerLevel(rootSession.permissionLevel)}
+            onRequestStop={(id, label) => setStopTarget({ id, label })}
           />
         ))}
       </ul>
@@ -183,7 +202,54 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       {addOpen && (
         <AddAgentDialog parentSessionId={rootSessionId} open={addOpen} onOpenChange={setAddOpen} />
       )}
+      {stopTarget && <SubagentStopDialog target={stopTarget} onClose={() => setStopTarget(null)} />}
     </div>
+  );
+}
+
+function SubagentStopDialog({ target, onClose }: { target: StopTarget; onClose: () => void }) {
+  const stopSession = useStopSession();
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !stopSession.isPending) onClose();
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Stop sub-agent?</DialogTitle>
+          <DialogDescription>
+            This stops <span className="font-medium">{target.label}</span>. Its conversation and
+            history are kept.
+          </DialogDescription>
+        </DialogHeader>
+        {stopSession.isError && (
+          <p className="text-ui text-destructive" role="alert">
+            Couldn't stop the sub-agent
+            {stopSession.error instanceof Error && stopSession.error.message
+              ? `: ${stopSession.error.message}`
+              : " — it may still be running"}
+            . Try again in a moment.
+          </p>
+        )}
+        <DialogFooter>
+          <Button type="button" variant="ghost" onClick={onClose} disabled={stopSession.isPending}>
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            data-testid="stop-subagent-confirm"
+            onClick={() => stopSession.mutate(target.id, { onSuccess: onClose })}
+            loading={stopSession.isPending}
+            componentId="subagents.stop"
+          >
+            Stop sub-agent
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -584,6 +650,8 @@ function SubagentRow({
   conversationId,
   collapsedRows,
   onToggleCollapsed,
+  canStopChildren,
+  onRequestStop,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
@@ -592,6 +660,8 @@ function SubagentRow({
   conversationId: string;
   collapsedRows: Record<string, boolean>;
   onToggleCollapsed: (id: string) => void;
+  canStopChildren: boolean;
+  onRequestStop: (id: string, label: string) => void;
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
@@ -608,6 +678,11 @@ function SubagentRow({
   const { children: grandchildren } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
   const hasGrandchildren = grandchildren.length > 0;
   const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
+  const canStop =
+    canStopChildren &&
+    (status.activity === "launching" ||
+      status.activity === "working" ||
+      status.activity === "awaiting");
   return (
     <>
       <li className="relative">
@@ -639,7 +714,8 @@ function SubagentRow({
           // under its parent, signaling where it sits in the tree.
           style={{ paddingLeft: rowPaddingLeft(depth) }}
           className={cn(
-            "flex w-full flex-col gap-0.5 py-2 pr-2.5 text-left hover:bg-accent/60",
+            "flex w-full flex-col gap-0.5 py-2 text-left hover:bg-accent/60",
+            canStop ? "pr-12" : "pr-2.5",
             isActive && "bg-accent",
             dim && "opacity-60 hover:opacity-100",
           )}
@@ -681,6 +757,20 @@ function SubagentRow({
             </p>
           )}
         </Link>
+        {canStop && (
+          <Button
+            type="button"
+            variant="destructive"
+            size="icon"
+            data-testid="stop-subagent"
+            aria-label={`Stop sub-agent ${primary}`}
+            title={`Stop sub-agent ${primary}`}
+            className="absolute top-1/2 right-1 z-10 -translate-y-1/2"
+            onClick={() => onRequestStop(child.id, primary)}
+          >
+            <CircleStopIcon className="size-4" />
+          </Button>
+        )}
       </li>
       {!collapsed &&
         grandchildren.map((grandchild) => (
@@ -691,6 +781,8 @@ function SubagentRow({
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={onToggleCollapsed}
+            canStopChildren={canStopChildren}
+            onRequestStop={onRequestStop}
           />
         ))}
     </>
