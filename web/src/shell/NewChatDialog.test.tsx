@@ -1195,7 +1195,7 @@ describe("NewChatLandingScreen", () => {
     const composer = screen.getByTestId("new-chat-landing-composer");
     expect(composer).toHaveClass(
       "border-border",
-      "has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+      "focus-within:shadow-[var(--composer-shadow-focus)]",
     );
     expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
     expect(composer.className).not.toContain("has-[textarea:focus]:border-");
@@ -3161,7 +3161,7 @@ describe("NewChatLandingScreen skills menu", () => {
       fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
 
       expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
-        "/rev",
+        "/rev\n",
       );
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
     } finally {
@@ -3547,7 +3547,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
 
       fireEvent.keyDown(input(), { key: "Enter" });
 
-      expect((input() as HTMLTextAreaElement).value).toBe("@README");
+      expect((input() as HTMLTextAreaElement).value).toBe("@README\n");
       expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
     } finally {

@@ -1863,3 +1863,16 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     """No stderr and an empty ``str(exc)`` still yields something actionable."""
     ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
+
+
+def test_ordered_prompt_blocks_preserve_text_image_text_order() -> None:
+    blocks = [
+        {"type": "input_text", "text": "before"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAB"},
+        {"type": "input_text", "text": "after"},
+    ]
+    assert AcpExecutor._ordered_prompt_blocks(blocks, image_supported=True) == [
+        {"type": "text", "text": "before"},
+        {"type": "image", "mimeType": "image/png", "data": "AAAB"},
+        {"type": "text", "text": "after"},
+    ]
