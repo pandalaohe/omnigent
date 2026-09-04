@@ -1,4 +1,4 @@
-"""Tests for the connections migration (ga1b2c3d4e5f).
+"""Tests for the connections migration and legacy custom-lineage repair.
 
 The single-head test is the guard: a stacked PR whose migration chains off a
 revision that isn't a real ancestor leaves the tree with two heads, and
@@ -34,7 +34,7 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["ga1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    assert heads == ["fc1b2c3d4e5"], f"expected a single head, got {heads!r}"
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
@@ -62,6 +62,22 @@ def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
 
     _downgrade(uri, engine, "za2b3c4d5e6f")
     assert "connections" not in sa.inspect(engine).get_table_names()
+
+    engine.dispose()
+    clear_engine_cache()
+
+
+def test_legacy_custom_stamp_repairs_missing_connections_table(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'legacy-connections.db'}"
+    engine = sa.create_engine(uri)
+
+    _upgrade(uri, engine, "fb1b2c3d4e5")
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP TABLE connections"))
+    assert "connections" not in sa.inspect(engine).get_table_names()
+
+    _upgrade(uri, engine, "head")
+    assert "connections" in sa.inspect(engine).get_table_names()
 
     engine.dispose()
     clear_engine_cache()
