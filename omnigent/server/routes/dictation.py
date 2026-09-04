@@ -61,7 +61,15 @@ from collections.abc import Callable
 from typing import Final
 
 import anyio
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketException
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+)
+from pydantic import BaseModel, Field
 from starlette import status
 
 from omnigent.debug_logging import debug_event
@@ -69,9 +77,12 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.dictation import (
     DictationEngine,
     DictationStreamHandle,
+    PunctuationRestorer,
     get_engine,
+    get_punctuation_restorer,
     max_streams,
 )
+from omnigent.server.routes._auth_helpers import require_user
 
 _logger = logging.getLogger(__name__)
 
@@ -81,12 +92,26 @@ _WS_CLOSE_INTERNAL_ERROR: Final[int] = 1011
 #: Minimum interval between partial-transcript pushes. Keeps the socket
 #: chatty enough for live text without a frame per audio chunk.
 _PARTIAL_INTERVAL_S: Final[float] = 0.15
+_MAX_PUNCTUATION_CHARS: Final[int] = 500
+
+
+class DictationPunctuationRequest(BaseModel):
+    """One completed transcript that needs punctuation restoration."""
+
+    text: str = Field(min_length=1, max_length=_MAX_PUNCTUATION_CHARS)
+
+
+class DictationPunctuationResponse(BaseModel):
+    """Display-ready transcript returned to the composer."""
+
+    text: str
 
 
 def create_dictation_router(
     *,
     auth_provider: AuthProvider | None = None,
     engine_provider: Callable[[], DictationEngine] | None = None,
+    punctuation_provider: Callable[[], PunctuationRestorer] | None = None,
 ) -> APIRouter:
     """Build the router carrying the dictation stream route.
 
@@ -99,12 +124,47 @@ def create_dictation_router(
     :param engine_provider: Engine factory override for tests. Defaults
         to :func:`omnigent.server.dictation.get_engine`, which resolves
         the configured engine and loads models on first use.
+    :param punctuation_provider: Final-text punctuation factory override
+        for tests. Defaults to the lazy process-wide restorer.
     :returns: An :class:`APIRouter` carrying the stream route.
     """
     router = APIRouter()
     resolve_engine = engine_provider or get_engine
+    resolve_punctuation = punctuation_provider or get_punctuation_restorer
     # Router-scoped so each app (and each test app) gets its own cap.
     slots = asyncio.Semaphore(max_streams())
+    punctuation_slots = asyncio.Semaphore(1)
+
+    @router.post(
+        "/dictation/punctuation",
+        response_model=DictationPunctuationResponse,
+        responses={
+            429: {"description": "Punctuation model busy"},
+            503: {"description": "Punctuation model unavailable"},
+        },
+    )
+    async def restore_dictation_punctuation(
+        request: Request,
+        body: DictationPunctuationRequest,
+    ) -> DictationPunctuationResponse:
+        """Restore Chinese/English punctuation in a completed transcript."""
+        require_user(request, auth_provider)
+        if punctuation_slots.locked():
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="dictation punctuation busy",
+            )
+        async with punctuation_slots:
+            try:
+                restorer = await asyncio.to_thread(resolve_punctuation)
+                restored = await asyncio.to_thread(restorer.restore, body.text)
+            except Exception as exc:
+                _logger.exception("dictation punctuation failed")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="dictation punctuation unavailable",
+                ) from exc
+        return DictationPunctuationResponse(text=restored)
 
     @router.websocket("/dictation/stream")
     async def dictation_stream(websocket: WebSocket) -> None:
