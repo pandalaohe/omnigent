@@ -5,6 +5,7 @@ import {
   KEYBOARD_SHORTCUTS_STORAGE_KEY,
   deleteShortcutPlatformOverride,
   eventMatchesShortcut,
+  eventMatchesShortcutAction,
   findShortcutConflicts,
   defaultShortcutBindings,
   readKeyboardShortcutPreferences,
@@ -92,6 +93,16 @@ describe("keyboardShortcutPreferences", () => {
         chord,
       ),
     ).toBe(false);
+  });
+
+  it("matches default primary shortcuts only on the selected platform", () => {
+    const commandN = new KeyboardEvent("keydown", { code: "KeyN", key: "n", metaKey: true });
+    const controlN = new KeyboardEvent("keydown", { code: "KeyN", key: "n", ctrlKey: true });
+
+    expect(eventMatchesShortcutAction(commandN, "newSession", "macos")).toBe(true);
+    expect(eventMatchesShortcutAction(controlN, "newSession", "macos")).toBe(false);
+    expect(eventMatchesShortcutAction(controlN, "newSession", "windows")).toBe(true);
+    expect(eventMatchesShortcutAction(commandN, "newSession", "windows")).toBe(false);
   });
 
   it("reports conflicts only within the same platform-effective bindings", () => {

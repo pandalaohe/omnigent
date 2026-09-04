@@ -523,11 +523,10 @@ export function eventMatchesShortcutAction(
   platform = currentShortcutPlatform(),
 ): boolean {
   if (shortcutRecordingActive) return false;
-  const acceptEitherPrimary = !hasCustomShortcutBindings(actionId);
   return (
     isShortcutActionEnabled(actionId) &&
     resolveShortcutBindings(actionId, platform).some((binding) =>
-      eventMatchesShortcut(event, binding, platform, acceptEitherPrimary),
+      eventMatchesShortcut(event, binding, platform),
     )
   );
 }
