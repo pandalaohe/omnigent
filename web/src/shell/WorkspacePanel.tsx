@@ -556,6 +556,9 @@ function RailTerminalView({
 interface WorkspacePanelProps {
   /** Active session id — panels read the workspace against it. */
   conversationId: string;
+  /** Project and Host from the active session seed the Archive Library filters. */
+  archiveInitialProject?: string | null;
+  archiveInitialHostId?: string | null;
   /** Current rail width (px), driven by the resize handle. */
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
@@ -668,6 +671,8 @@ interface WorkspacePanelProps {
  */
 export function WorkspacePanel({
   conversationId,
+  archiveInitialProject,
+  archiveInitialHostId,
   width,
   handleProps,
   inert,
@@ -990,7 +995,11 @@ export function WorkspacePanel({
             sort={filesPanelSort}
           />
         ) : rightRailTab === "archive" ? (
-          <ArchiveLibraryRail />
+          <ArchiveLibraryRail
+            activeConversationId={conversationId}
+            initialProject={archiveInitialProject}
+            initialHostId={archiveInitialHostId}
+          />
         ) : rightRailTab === "browser" && showBrowserTab ? (
           // Embedded browser (Electron only) — BrowserPane self-gates and
           // measures this rail slot to position the native view over it.

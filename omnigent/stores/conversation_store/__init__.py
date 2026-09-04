@@ -670,6 +670,8 @@ class ConversationStore(ABC):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
+        include_search_match: bool = True,
         host_id: str | None = None,
         created_after: int | None = None,
         created_before: int | None = None,

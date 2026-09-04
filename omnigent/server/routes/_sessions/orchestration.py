@@ -900,6 +900,7 @@ def _build_session_list_item(
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,
+        search_match_count=conv.search_match_count,
         search_match=(
             SessionSearchMatch(
                 item_id=conv.search_item_id,

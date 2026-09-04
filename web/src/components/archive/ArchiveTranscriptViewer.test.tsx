@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Conversation } from "@/hooks/useConversations";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { ArchiveTranscriptViewer } from "./ArchiveTranscriptViewer";
 
 const mocks = vi.hoisted(() => ({
@@ -55,7 +56,9 @@ function renderViewer(value: Conversation = conversation) {
   return render(
     <MemoryRouter>
       <QueryClientProvider client={queryClient}>
-        <ArchiveTranscriptViewer conversation={value} />
+        <TooltipProvider>
+          <ArchiveTranscriptViewer conversation={value} />
+        </TooltipProvider>
       </QueryClientProvider>
     </MemoryRouter>,
   );
@@ -115,6 +118,26 @@ describe("ArchiveTranscriptViewer", () => {
     expect(screen.getByText("Showing the matching conversation window")).toBeInTheDocument();
   });
 
+  it("loads earlier messages when the reader scrolls upward at the top", async () => {
+    mocks.fetchPage
+      .mockResolvedValueOnce({
+        items: [{ id: "msg_latest", text: "latest" }],
+        hasMore: true,
+      })
+      .mockResolvedValueOnce({
+        items: [{ id: "msg_earlier", text: "earlier" }],
+        hasMore: false,
+      });
+    renderViewer();
+
+    const transcript = await screen.findByTestId("archive-transcript");
+    await screen.findByText("Rendered message msg_latest");
+    fireEvent.wheel(transcript, { deltaY: -32 });
+
+    expect(await screen.findByText("Rendered message msg_earlier")).toBeInTheDocument();
+    expect(mocks.fetchPage).toHaveBeenCalledTimes(2);
+  });
+
   it("copies a selected passage with the containing item deep link", async () => {
     renderViewer();
 
@@ -150,7 +173,9 @@ describe("ArchiveTranscriptViewer", () => {
     rendered.rerender(
       <MemoryRouter>
         <QueryClientProvider client={new QueryClient()}>
-          <ArchiveTranscriptViewer conversation={{ ...conversation, id: "conv_second" }} />
+          <TooltipProvider>
+            <ArchiveTranscriptViewer conversation={{ ...conversation, id: "conv_second" }} />
+          </TooltipProvider>
         </QueryClientProvider>
       </MemoryRouter>,
     );

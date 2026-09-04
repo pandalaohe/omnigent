@@ -101,18 +101,25 @@ export interface UseConversationsOptions {
 }
 
 export type ArchivedDateField = "created_at" | "archived_at";
+export type ArchivedSearchScope = "title" | "content";
+export type ArchivedSortField = ArchivedDateField | "title";
 export type ArchivedAgePreset =
   "any" | "lt24h" | "lt7d" | "gt7d" | "gt30d" | "gt90d" | "gt180d" | "gt365d";
 
 export interface ArchivedConversationFilters {
   searchQuery?: string;
+  searchScope?: ArchivedSearchScope;
   project?: string;
   hostId?: string;
   agentName?: string;
   dateField: ArchivedDateField;
-  sortField: ArchivedDateField;
+  sortField: ArchivedSortField;
   agePreset: ArchivedAgePreset;
   order: "asc" | "desc";
+  createdAfter?: number;
+  createdBefore?: number;
+  archivedAfter?: number;
+  archivedBefore?: number;
 }
 
 export interface ArchivedSessionFacets {
@@ -238,6 +245,7 @@ export interface Conversation {
    * matched. Absent on non-search fetches and title-only matches.
    */
   search_snippet?: string | null;
+  search_match_count?: number;
   /** Stable locator for the first visible body match in a search response. */
   search_match?: {
     item_id: string;
@@ -614,7 +622,9 @@ async function fetchArchivedConversationsPage(
   };
   const usesArchivedAt =
     filters.sortField === "archived_at" ||
-    (filters.dateField === "archived_at" && filters.agePreset !== "any");
+    (filters.dateField === "archived_at" && filters.agePreset !== "any") ||
+    filters.archivedAfter !== undefined ||
+    filters.archivedBefore !== undefined;
   const buildParams = (supportsArchivedAt: boolean) => {
     const dateField =
       !supportsArchivedAt && filters.dateField === "archived_at"
@@ -633,9 +643,24 @@ async function fetchArchivedConversationsPage(
     });
     if (after) params.set("after", after);
     if (filters.searchQuery) params.set("search_query", filters.searchQuery);
+    if (filters.searchQuery && filters.searchScope) params.set("search_scope", filters.searchScope);
     if (filters.project) params.set("project", filters.project);
     if (filters.hostId) params.set("host_id", filters.hostId);
     if (filters.agentName) params.set("agent_name", filters.agentName);
+    if (filters.createdAfter !== undefined)
+      params.set("created_after", String(filters.createdAfter));
+    if (filters.createdBefore !== undefined)
+      params.set("created_before", String(filters.createdBefore));
+    if (filters.archivedAfter !== undefined)
+      params.set(
+        supportsArchivedAt ? "archived_after" : "updated_after",
+        String(filters.archivedAfter),
+      );
+    if (filters.archivedBefore !== undefined)
+      params.set(
+        supportsArchivedAt ? "archived_before" : "updated_before",
+        String(filters.archivedBefore),
+      );
     return params;
   };
   let params = buildParams(archivedAtQuerySupported);
@@ -1804,8 +1829,25 @@ export function useArchivedProjectNames() {
   });
 }
 
-export async function fetchArchivedSessionFacets(): Promise<ArchivedSessionFacets> {
-  const res = await authenticatedFetch("/v1/sessions/archived-facets");
+export async function fetchArchivedSessionFacets(
+  filters?: Partial<ArchivedConversationFilters>,
+): Promise<ArchivedSessionFacets> {
+  const params = new URLSearchParams();
+  if (filters?.searchQuery) params.set("search_query", filters.searchQuery);
+  if (filters?.searchQuery && filters.searchScope) params.set("search_scope", filters.searchScope);
+  if (filters?.project) params.set("project", filters.project);
+  if (filters?.hostId) params.set("host_id", filters.hostId);
+  if (filters?.agentName) params.set("agent_name", filters.agentName);
+  if (filters?.createdAfter !== undefined)
+    params.set("created_after", String(filters.createdAfter));
+  if (filters?.createdBefore !== undefined)
+    params.set("created_before", String(filters.createdBefore));
+  if (filters?.archivedAfter !== undefined)
+    params.set("archived_after", String(filters.archivedAfter));
+  if (filters?.archivedBefore !== undefined)
+    params.set("archived_before", String(filters.archivedBefore));
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await authenticatedFetch(`/v1/sessions/archived-facets${suffix}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const payload = (await res.json()) as {
     projects: string[];
@@ -1819,10 +1861,10 @@ export async function fetchArchivedSessionFacets(): Promise<ArchivedSessionFacet
   };
 }
 
-export function useArchivedSessionFacets() {
+export function useArchivedSessionFacets(filters?: Partial<ArchivedConversationFilters>) {
   return useQuery<ArchivedSessionFacets>({
-    queryKey: ARCHIVED_SESSION_FACETS_KEY,
-    queryFn: fetchArchivedSessionFacets,
+    queryKey: [...ARCHIVED_SESSION_FACETS_KEY, filters ?? null],
+    queryFn: () => fetchArchivedSessionFacets(filters),
     staleTime: 60_000,
   });
 }

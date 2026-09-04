@@ -18,7 +18,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  readLastExplicitRightRailTab,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
@@ -2520,7 +2523,7 @@ describe("Right workspace card visibility", () => {
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
   });
 
-  it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
+  it("keeps the card mounted with Agents and Archive for a minimal agent", async () => {
     // A no-os_env agent (available: false) with no shells
     // still has the unconditional Agents tab (the panel lists at least
     // the main agent), so the card mounts, the Agents tab is selected
@@ -2537,8 +2540,14 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
-    // The tab-fallback effect lands on Agents (the only available tab).
-    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /Archive/i })).toBeInTheDocument();
+    // The tab-fallback effect lands on Agents, the first available tab.
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
@@ -2660,6 +2669,31 @@ describe("Right workspace card visibility", () => {
 
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
+  });
+
+  it("uses the last explicitly clicked rail tab for a fresh session", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_explicit_a", permission_level: null },
+      { id: "conv_explicit_b", permission_level: null },
+    ]);
+
+    const first = renderShell("/c/conv_explicit_a");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Archive/i }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(readLastExplicitRightRailTab()).toBe("archive");
+    first.unmount();
+
+    renderShell("/c/conv_explicit_b");
+    expect(screen.getByRole("tab", { name: /Archive/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("restores the open file tabs per session (independent of the ?file= param)", () => {

@@ -28,6 +28,8 @@ export interface SessionWorkspaceState {
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
+const LAST_EXPLICIT_TAB_KEY = "omnigent:last-explicit-right-rail-tab";
+const INHERIT_LAST_TAB_KEY = "omnigent:new-session-inherit-right-rail-tab";
 // Cap stored sessions so the store can't grow without bound. The
 // least-recently-touched entries (front of the array) are pruned first once the
 // cap is exceeded.
@@ -43,6 +45,27 @@ function isValidWidth(value: unknown): value is number {
 
 function isRailTab(value: unknown): value is RightRailTab {
   return typeof value === "string" && (RAIL_TABS as readonly string[]).includes(value);
+}
+
+export function readLastExplicitRightRailTab(): RightRailTab {
+  if (typeof window === "undefined") return "files";
+  const value = window.localStorage.getItem(LAST_EXPLICIT_TAB_KEY);
+  return isRailTab(value) ? value : "files";
+}
+
+export function writeLastExplicitRightRailTab(tab: RightRailTab): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(LAST_EXPLICIT_TAB_KEY, tab);
+}
+
+export function readInheritLastRightRailTab(): boolean {
+  if (typeof window === "undefined") return true;
+  return window.localStorage.getItem(INHERIT_LAST_TAB_KEY) !== "0";
+}
+
+export function writeInheritLastRightRailTab(enabled: boolean): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(INHERIT_LAST_TAB_KEY, enabled ? "1" : "0");
 }
 
 /**

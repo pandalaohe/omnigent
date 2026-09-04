@@ -1474,6 +1474,58 @@ def test_list_conversations_search_snippet_on_content_match(
     assert by_id[conv_title.id].search_item_id is None
 
 
+def test_list_conversations_search_scope_and_match_count(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Title/content scope stays distinct and content results report every matching item."""
+    title_match = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_match.id, title="needle runbook")
+
+    content_match = conversation_store.create_conversation()
+    conversation_store.update_conversation(content_match.id, title="General notes")
+    conversation_store.append(
+        content_match.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index}",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"needle detail {index}"}],
+                ),
+            )
+            for index in range(2)
+        ],
+    )
+
+    title_page = conversation_store.list_conversations(
+        search_query="needle",
+        search_scope="title",
+    )
+    assert [row.id for row in title_page.data] == [title_match.id]
+    assert title_page.data[0].search_match_count == 0
+
+    content_page = conversation_store.list_conversations(
+        search_query="needle",
+        search_scope="content",
+    )
+    assert [row.id for row in content_page.data] == [content_match.id]
+    assert content_page.data[0].search_match_count == 2
+    assert content_page.data[0].search_item_id is not None
+
+
+def test_list_conversations_sorts_titles_case_insensitively(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Archive name sorting uses a stable, case-insensitive title key."""
+    for title in ("zulu", "Alpha", "bravo"):
+        conversation = conversation_store.create_conversation()
+        conversation_store.update_conversation(conversation.id, title=title)
+
+    page = conversation_store.list_conversations(sort_by="title", order="asc")
+    assert [row.title for row in page.data] == ["Alpha", "bravo", "zulu"]
+
+
 def test_list_conversations_search_excludes_meta_messages(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

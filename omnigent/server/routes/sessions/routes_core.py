@@ -904,20 +904,104 @@ def register_core_routes(
     async def list_archived_session_facets(
         request: Request,
         response: Response,
+        search_query: str | None = Query(default=None),
+        search_scope: str = Query(default="title", pattern="^(title|content)$"),
+        project: str | None = Query(default=None),
+        host_id: str | None = Query(default=None),
+        agent_name: str | None = Query(default=None),
+        created_after: int | None = Query(default=None, ge=0),
+        created_before: int | None = Query(default=None, ge=0),
+        archived_after: int | None = Query(default=None, ge=0),
+        archived_before: int | None = Query(default=None, ge=0),
     ) -> ArchivedSessionFacetsResponse:
-        """Return compact, distinct filter values for visible archived sessions."""
+        """Return linked filter values for the visible archived-session set.
+
+        The candidate query applies search and date bounds once, then the three
+        facet sets are computed while excluding each facet's own current value.
+        This keeps Project/Host/Agent switchable while removing combinations
+        that cannot produce a result.
+        """
         response.headers["Cache-Control"] = "no-store"
         user_id = _require_user(request, auth_provider)
-        facets = await asyncio.to_thread(
-            conversation_store.list_archived_facets,
-            accessible_by=user_id,
-        )
-        agent_names_by_id = await asyncio.to_thread(agent_store.get_names, facets.agent_ids)
+        normalized_query = search_query if search_query else None
+
+        def _load_candidates() -> list[Conversation]:
+            candidates: list[Conversation] = []
+            after: str | None = None
+            while True:
+                page = conversation_store.list_conversations(
+                    limit=1000,
+                    after=after,
+                    accessible_by=user_id,
+                    has_agent_id=True,
+                    kind="default",
+                    archived_only=True,
+                    order="desc",
+                    sort_by="archived_at",
+                    search_query=normalized_query,
+                    search_scope=search_scope,
+                    include_search_match=False,
+                    created_after=created_after,
+                    created_before=created_before,
+                    archived_after=archived_after,
+                    archived_before=archived_before,
+                )
+                candidates.extend(page.data)
+                if not page.has_more or not page.last_id or page.last_id == after:
+                    return candidates
+                after = page.last_id
+
+        candidates = await asyncio.to_thread(_load_candidates)
+        agent_ids = {candidate.agent_id for candidate in candidates if candidate.agent_id}
+        agent_names_by_id = await asyncio.to_thread(agent_store.get_names, list(agent_ids))
+        project_names_by_id: dict[str, str] = {}
+        if project_store is not None:
+            visible_projects = await asyncio.to_thread(project_store.list, user_id=user_id)
+            project_names_by_id = {candidate.id: candidate.name for candidate in visible_projects}
+
+        def _project_name(candidate: Conversation) -> str | None:
+            if candidate.project_id:
+                resolved = project_names_by_id.get(candidate.project_id)
+                if resolved:
+                    return resolved
+            legacy = candidate.labels.get(PROJECT_LABEL_KEY)
+            return legacy if legacy else None
+
+        def _agent_name(candidate: Conversation) -> str | None:
+            return agent_names_by_id.get(candidate.agent_id) if candidate.agent_id else None
+
+        def _matches(candidate: Conversation, *, skip: str) -> bool:
+            if skip != "project" and project is not None and _project_name(candidate) != project:
+                return False
+            if skip != "host" and host_id is not None and candidate.host_id != host_id:
+                return False
+            if skip != "agent" and agent_name is not None and _agent_name(candidate) != agent_name:
+                return False
+            return True
+
         return ArchivedSessionFacetsResponse(
-            projects=facets.projects,
-            host_ids=facets.host_ids,
+            projects=sorted(
+                {
+                    resolved
+                    for candidate in candidates
+                    if _matches(candidate, skip="project")
+                    if (resolved := _project_name(candidate))
+                }
+            ),
+            host_ids=sorted(
+                {
+                    candidate.host_id
+                    for candidate in candidates
+                    if _matches(candidate, skip="host") and candidate.host_id
+                }
+            ),
             agent_names=sorted(
-                {name for name in agent_names_by_id.values() if isinstance(name, str) and name}
+                {
+                    resolved
+                    for candidate in candidates
+                    if _matches(candidate, skip="agent")
+                    if (resolved := _agent_name(candidate))
+                }
             ),
         )
 
@@ -1089,9 +1173,10 @@ def register_core_routes(
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         sort_by: str = Query(
             default="created_at",
-            pattern="^(created_at|updated_at|archived_at)$",
+            pattern="^(created_at|updated_at|archived_at|title)$",
         ),
         search_query: str | None = Query(default=None),
+        search_scope: str = Query(default="all", pattern="^(all|title|content)$"),
         include_archived: bool = Query(default=False),
         archived_only: bool = Query(default=False),
         host_id: str | None = Query(default=None),
@@ -1127,14 +1212,16 @@ def register_core_routes(
             have distinct bundles. ``None`` disables the filter.
         :param order: Sort direction, ``"desc"`` (newest-first)
             or ``"asc"`` (oldest-first).
-        :param sort_by: Column to sort on, ``"created_at"``,
-            ``"updated_at"``, or ``"archived_at"``.
+        :param sort_by: Column to sort on: ``"created_at"``,
+            ``"updated_at"``, ``"archived_at"``, or ``"title"``.
         :param search_query: Case-insensitive substring filter on
             the session title or conversation content. ``None``
             or empty string disables the filter. A session
             matches if its title contains the query or any of
             its conversation items' text does. Powers the
             sidebar's session search.
+        :param search_scope: Limit search to ``"title"`` or ``"content"``;
+            ``"all"`` keeps the existing title/content/workspace behavior.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions
             are returned alongside active ones (the sidebar groups
@@ -1197,6 +1284,7 @@ def register_core_routes(
             order=order,
             sort_by=sort_by,
             search_query=normalized_query,
+            search_scope=search_scope,
             include_archived=include_archived,
             archived_only=archived_only,
             host_id=host_id,

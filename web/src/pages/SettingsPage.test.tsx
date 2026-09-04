@@ -154,7 +154,7 @@ vi.mock("@/hooks/useHosts", () => ({
 }));
 vi.mock("@/components/archive/ArchiveTranscriptViewer", () => ({
   ArchiveTranscriptViewer: ({ conversation }: { conversation: Conversation | null }) => (
-    <div data-testid="archive-transcript-viewer">
+    <div data-testid="archive-transcript" tabIndex={0}>
       {conversation ? `Transcript: ${conversation.title ?? conversation.id}` : "Select a session"}
     </div>
   ),
@@ -1053,11 +1053,23 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
   });
 
+  it("moves keyboard focus into the transcript when Return opens a row", async () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+    const row = screen.getByTestId("archived-open-session");
+
+    row.focus();
+    fireEvent.keyDown(row, { key: "Enter" });
+
+    await waitFor(() => expect(screen.getByTestId("archive-transcript")).toHaveFocus());
+  });
+
   it("debounces archive content search before issuing a new list query", async () => {
     mocks.conversations = [conv("conv_archived", { archived: true, title: "Searchable" })];
     renderPage("/settings/archived");
+    fireEvent.click(screen.getByRole("button", { name: "Content" }));
     const input = screen.getByRole("searchbox", {
-      name: "Search archived session title, CWD, or conversation content",
+      name: "Search archived conversation content",
     });
 
     fireEvent.change(input, { target: { value: "b" } });
@@ -1083,25 +1095,17 @@ describe("SettingsPage", () => {
     expect(separator).toHaveAttribute("aria-valuenow", "396");
   });
 
-  it("keeps mobile archive filters collapsed until the Filters button is opened", () => {
+  it("keeps the compact archive toolbar available on mobile", () => {
     const restoreViewport = useMobileViewport();
     mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
 
     try {
       renderPage("/settings/archived");
 
-      const toggle = screen.getByTestId("archived-filter-toggle");
-      expect(toggle).toHaveTextContent("Filters");
-      expect(toggle).toHaveAttribute("aria-expanded", "false");
-      expect(screen.queryByTestId("archived-filter-panel")).toBeNull();
-      expect(screen.getByRole("button", { name: /Change archive sorting/ })).toHaveTextContent(
-        "Archive date·Newest first",
-      );
+      expect(screen.getByRole("searchbox", { name: /Search archived session titles/ })).toBeVisible();
+      expect(screen.getByRole("combobox", { name: /by project/i })).toBeVisible();
+      expect(screen.getByRole("button", { name: /Archive sort/ })).toBeVisible();
       expect(screen.getByTestId("archived-row")).toBeInTheDocument();
-
-      fireEvent.click(toggle);
-      expect(toggle).toHaveAttribute("aria-expanded", "true");
-      expect(screen.getByTestId("archived-filter-panel")).toBeInTheDocument();
     } finally {
       cleanup();
       restoreViewport();
@@ -1142,20 +1146,20 @@ describe("SettingsPage", () => {
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
   });
 
-  it("hides the project filter when no archived session belongs to a project", () => {
+  it("keeps the fuzzy project filter available when no archived session has a project", () => {
     mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
     renderPage("/settings/archived");
 
-    expect(screen.getByTestId("archived-project-filter")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /by project/i })).toBeInTheDocument();
     expect(screen.getByTestId("archived-row")).toBeInTheDocument();
   });
 
-  it("shows the empty state (and no filter) when there are no archived sessions", () => {
+  it("shows the empty state while keeping the reusable filters available", () => {
     mocks.conversations = [conv("conv_active")];
     renderPage("/settings/archived");
 
     expect(screen.getByText("No archived sessions match.")).toBeInTheDocument();
-    expect(screen.getByTestId("archived-project-filter")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /by project/i })).toBeInTheDocument();
   });
 
   it("shows a project-scoped empty state when the picked project has no rows", () => {
@@ -1245,7 +1249,7 @@ describe("SettingsPage", () => {
     expect(screen.getByText("First page chat")).toBeInTheDocument();
   });
 
-  it("groups archived sessions under date headers", () => {
+  it("keeps archive dates inline instead of adding visual group headers", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     // Use local-time construction so bucket boundaries align with the
     // local-time arithmetic in dateGroupLabel regardless of the test runner's
@@ -1273,19 +1277,9 @@ describe("SettingsPage", () => {
       ];
       renderPage("/settings/archived");
 
-      expect(screen.getByText("Today")).toBeInTheDocument();
-      expect(screen.getByText("Yesterday")).toBeInTheDocument();
-      expect(screen.getByText("Previous 7 days")).toBeInTheDocument();
-      expect(screen.getByText("Previous 30 days")).toBeInTheDocument();
-      // Derive the expected label the same way the component does so the
-      // assertion is locale-independent.
-      const expectedOldLabel = oldDate.toLocaleDateString(undefined, {
-        month: "long",
-        year: "numeric",
-      });
-      expect(screen.getByText(expectedOldLabel)).toBeInTheDocument();
-
       expect(screen.getAllByTestId("archived-row")).toHaveLength(5);
+      expect(screen.queryByRole("heading", { name: "Today" })).toBeNull();
+      expect(screen.getAllByTestId("archived-row")[0].querySelectorAll("time")).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -1379,7 +1373,7 @@ describe("SettingsPage", () => {
     expect(screen.getByText("3 selected")).toBeInTheDocument();
   });
 
-  it("shows recorded CWD, Host, Agent, archive date, and create date", () => {
+  it("shows a compact title, project, host, agent, and archive date row", () => {
     mocks.hostIds = ["host-win"];
     mocks.agentNames = ["codex-native"];
     mocks.hosts = [{ host_id: "host-win", name: "Windows Workstation" }];
@@ -1390,39 +1384,32 @@ describe("SettingsPage", () => {
         host_id: "host-win",
         agent_name: "codex-native",
         workspace: "D:/AIProgram/Projects/Omnigent",
+        labels: { omni_project: "Omnigent" },
       }),
     ];
 
     renderPage("/settings/archived");
 
-    expect(screen.getByText("D:/AIProgram/Projects/Omnigent")).toBeInTheDocument();
-    expect(screen.getByText("Windows Workstation")).toBeInTheDocument();
-    expect(screen.getByText("codex-native")).toBeInTheDocument();
+    expect(screen.queryByText("D:/AIProgram/Projects/Omnigent")).toBeNull();
+    expect(screen.getByText("Omnigent")).toBeInTheDocument();
     const context = screen.getByTestId("archived-context");
     const row = screen.getByTestId("archived-row");
-    const timeColumn = screen.getByTestId("archived-time-column");
     expect(within(context).getByText("Windows Workstation")).toBeInTheDocument();
     expect(within(context).getByText("codex-native")).toBeInTheDocument();
-    expect(within(timeColumn).getByText("Archived")).toBeInTheDocument();
-    expect(within(timeColumn).getByText("Created")).toBeInTheDocument();
-    expect(timeColumn.querySelectorAll("time")).toHaveLength(2);
-    expect(row).toHaveClass("max-md:border-border/60", "max-md:bg-muted/20");
-    expect(timeColumn).not.toHaveClass("border-t", "border-dashed");
+    expect(row.querySelectorAll("time")).toHaveLength(1);
   });
 
   it("persists the compact archive view options", async () => {
     renderPage("/settings/archived");
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Age" }), {
-      target: { value: "gt90d" },
-    });
+    fireEvent.click(screen.getByRole("button", { name: "Content" }));
 
     await waitFor(() => {
       const stored = JSON.parse(
         localStorage.getItem("omnigent:archived-sessions-view-v1") ?? "{}",
       ) as Record<string, unknown>;
-      expect(stored.agePreset).toBe("gt90d");
-      expect(mocks.archivedFilters?.agePreset).toBe("gt90d");
+      expect(stored.searchScope).toBe("content");
+      expect(mocks.archivedFilters?.searchScope).toBe("content");
     });
   });
 

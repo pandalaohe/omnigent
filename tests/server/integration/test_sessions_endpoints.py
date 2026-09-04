@@ -2558,6 +2558,21 @@ async def test_archived_facets_returns_distinct_server_aggregates(
     assert "Active only" not in body["projects"]
     assert active["id"] not in response.text
 
+    linked = await client.get(
+        "/v1/sessions/archived-facets",
+        params={"project": "Core"},
+    )
+    assert linked.status_code == 200, linked.text
+    assert linked.json()["host_ids"] == [host.host_id]
+    assert linked.json()["agent_names"] == ["codex-native"]
+
+    agent_linked = await client.get(
+        "/v1/sessions/archived-facets",
+        params={"agent_name": "claude-native"},
+    )
+    assert agent_linked.status_code == 200, agent_linked.text
+    assert agent_linked.json()["projects"] == ["Agents"]
+
 
 async def test_archive_lock_blocks_delete_until_unlocked(
     client: httpx.AsyncClient,

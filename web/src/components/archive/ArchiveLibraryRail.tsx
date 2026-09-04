@@ -1,17 +1,14 @@
-import {
-  ArrowDownAZIcon,
-  ArrowUpAZIcon,
-  ChevronLeftIcon,
-  ChevronRightIcon,
-  SearchIcon,
-} from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import {
+  ArchiveLibraryToolbar,
+  type ArchiveLibraryViewState,
+  buildArchiveConversationFilters,
+} from "@/components/archive/ArchiveLibraryToolbar";
 import { ArchiveTranscriptViewer } from "@/components/archive/ArchiveTranscriptViewer";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
-  type ArchivedConversationFilters,
   type Conversation,
   useArchivedConversations,
   useArchivedSessionFacets,
@@ -32,7 +29,6 @@ function useVerticalSplit() {
   const containerRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
   const [ratio, setRatio] = useState(readSplit);
-
   const updateFromPointer = useCallback((clientY: number) => {
     const bounds = containerRef.current?.getBoundingClientRect();
     if (!bounds || bounds.height <= 0) return;
@@ -58,9 +54,7 @@ function useVerticalSplit() {
     };
   }, [updateFromPointer]);
 
-  useEffect(() => {
-    localStorage.setItem(SPLIT_STORAGE_KEY, String(ratio));
-  }, [ratio]);
+  useEffect(() => localStorage.setItem(SPLIT_STORAGE_KEY, String(ratio)), [ratio]);
 
   return {
     containerRef,
@@ -68,6 +62,7 @@ function useVerticalSplit() {
     handleProps: {
       role: "separator" as const,
       tabIndex: 0,
+      title: "Drag to resize the archive list and conversation; use arrow keys for small steps.",
       "aria-label": "Resize archive list and conversation",
       "aria-orientation": "horizontal" as const,
       "aria-valuemin": 24,
@@ -91,66 +86,137 @@ function useVerticalSplit() {
   };
 }
 
-const DEFAULT_FILTERS: ArchivedConversationFilters = {
-  searchQuery: "",
-  dateField: "archived_at",
-  sortField: "archived_at",
-  agePreset: "any",
-  order: "desc",
-};
+function initialView(project?: string | null, hostId?: string | null): ArchiveLibraryViewState {
+  return {
+    searchQuery: "",
+    searchScope: "title",
+    project: project || undefined,
+    hostId: hostId || undefined,
+    agentName: undefined,
+    createdRange: "",
+    archivedRange: "",
+    sortField: "archived_at",
+    order: "desc",
+  };
+}
 
-export function ArchiveLibraryRail() {
+function shortArchiveDate(conversation: Conversation): string {
+  const timestamp = conversation.archived_at ?? conversation.updated_at ?? conversation.created_at;
+  return new Date(timestamp * 1000).toLocaleDateString(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+  });
+}
+
+export function ArchiveLibraryRail({
+  activeConversationId,
+  initialProject,
+  initialHostId,
+}: {
+  activeConversationId?: string;
+  initialProject?: string | null;
+  initialHostId?: string | null;
+}) {
   const { containerRef, ratio, handleProps } = useVerticalSplit();
-  const [query, setQuery] = useState("");
+  const [view, setView] = useState(() => initialView(initialProject, initialHostId));
   const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [project, setProject] = useState("");
-  const [hostId, setHostId] = useState("");
-  const [agentName, setAgentName] = useState("");
-  const [order, setOrder] = useState<"asc" | "desc">("desc");
   const [selected, setSelected] = useState<Conversation | null>(null);
   const [pageAfter, setPageAfter] = useState<string | undefined>();
   const [pageHistory, setPageHistory] = useState<(string | undefined)[]>([]);
-  const facets = useArchivedSessionFacets();
+  const listRef = useRef<HTMLDivElement>(null);
+  const facetTouched = useRef({ project: false, hostId: false });
+  const activeIdRef = useRef(activeConversationId);
   const projects = useProjects();
   const hosts = useHosts({ includeSandbox: true });
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => setDebouncedQuery(query.trim()), 250);
+    const timeout = window.setTimeout(() => setDebouncedQuery(view.searchQuery.trim()), 250);
     return () => window.clearTimeout(timeout);
-  }, [query]);
+  }, [view.searchQuery]);
 
-  const filters = useMemo<ArchivedConversationFilters>(
-    () => ({
-      ...DEFAULT_FILTERS,
-      searchQuery: debouncedQuery,
-      project: project || undefined,
-      hostId: hostId || undefined,
-      agentName: agentName || undefined,
-      order,
-    }),
-    [agentName, debouncedQuery, hostId, order, project],
+  const filters = useMemo(
+    () => buildArchiveConversationFilters(view, debouncedQuery),
+    [debouncedQuery, view],
   );
-  useEffect(() => {
-    setPageAfter(undefined);
-    setPageHistory([]);
-  }, [filters]);
-
+  const facets = useArchivedSessionFacets(filters);
   const archivedQuery = useArchivedConversations(filters, pageAfter);
   const archived = useMemo(() => archivedQuery.data?.data ?? [], [archivedQuery.data]);
   const hostNames = useMemo(
     () => new Map((hosts.data ?? []).map((host) => [host.host_id, host.name])),
     [hosts.data],
   );
-  const projectNames = useMemo(
-    () =>
-      [
-        ...new Set([
-          ...(facets.data?.projects ?? []),
-          ...(projects.data ?? []).map((candidate) => candidate.name),
-        ]),
-      ].sort((a, b) => a.localeCompare(b)),
-    [facets.data, projects.data],
+  const projectNamesById = useMemo(
+    () => new Map((projects.data ?? []).map((project) => [project.id, project.name])),
+    [projects.data],
   );
+  const projectOptions = useMemo(
+    () => (facets.data?.projects ?? []).map((name) => ({ value: name, label: name })),
+    [facets.data],
+  );
+  const hostOptions = useMemo(
+    () =>
+      (facets.data?.hostIds ?? []).map((hostId) => ({
+        value: hostId,
+        label: hostNames.get(hostId) ?? hostId,
+        keywords: hostId,
+      })),
+    [facets.data, hostNames],
+  );
+  const agentOptions = useMemo(
+    () => (facets.data?.agentNames ?? []).map((name) => ({ value: name, label: name })),
+    [facets.data],
+  );
+
+  useEffect(() => {
+    if (activeIdRef.current !== activeConversationId) {
+      activeIdRef.current = activeConversationId;
+      facetTouched.current = { project: false, hostId: false };
+      setView((current) => ({
+        ...current,
+        project: initialProject || undefined,
+        hostId: initialHostId || undefined,
+      }));
+      return;
+    }
+    setView((current) => {
+      const project =
+        !facetTouched.current.project && initialProject ? initialProject : current.project;
+      const hostId = !facetTouched.current.hostId && initialHostId ? initialHostId : current.hostId;
+      return project === current.project && hostId === current.hostId
+        ? current
+        : { ...current, project, hostId };
+    });
+  }, [activeConversationId, initialHostId, initialProject]);
+
+  useEffect(() => {
+    if (!facets.data) return;
+    setView((current) => {
+      const next = { ...current };
+      let changed = false;
+      const normalize = (
+        key: "project" | "hostId" | "agentName",
+        options: { value: string }[],
+      ) => {
+        const selectedValue = next[key];
+        if (selectedValue && !options.some((option) => option.value === selectedValue)) {
+          next[key] = undefined;
+          changed = true;
+        } else if (!selectedValue && options.length === 1) {
+          next[key] = options[0].value;
+          changed = true;
+        }
+      };
+      normalize("project", projectOptions);
+      normalize("hostId", hostOptions);
+      normalize("agentName", agentOptions);
+      return changed ? next : current;
+    });
+  }, [agentOptions, facets.data, hostOptions, projectOptions]);
+
+  useEffect(() => {
+    setPageAfter(undefined);
+    setPageHistory([]);
+  }, [filters]);
 
   useEffect(() => {
     if (archivedQuery.isLoading) return;
@@ -158,116 +224,94 @@ export function ArchiveLibraryRail() {
     setSelected(current ?? archived[0] ?? null);
   }, [archived, archivedQuery.isLoading, selected?.id]);
 
-  return (
-    <div
-      ref={containerRef}
-      className="flex min-h-0 flex-1 flex-col"
-      data-testid="archive-library-rail"
-    >
-      <section
-        className="min-h-0 shrink-0 overflow-y-auto p-3"
-        style={{ height: `${ratio * 100}%` }}
-      >
-        <div className="mb-2 flex items-center gap-2">
-          <h2 className="text-sm font-semibold">Archive Library</h2>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            className="ml-auto"
-            aria-label={order === "desc" ? "Sort oldest first" : "Sort newest first"}
-            onClick={() => setOrder((current) => (current === "desc" ? "asc" : "desc"))}
-          >
-            {order === "desc" ? <ArrowDownAZIcon /> : <ArrowUpAZIcon />}
-          </Button>
-        </div>
-        <div className="relative">
-          <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            type="search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            aria-label="Search archived sessions and messages"
-            placeholder="Search sessions and messages…"
-            className="h-8 pl-8 text-sm"
-          />
-        </div>
-        <div className="mt-2 grid grid-cols-3 gap-1">
-          <select
-            aria-label="Filter archive by project"
-            value={project}
-            onChange={(event) => setProject(event.target.value)}
-            className="h-7 min-w-0 rounded-md border bg-background px-1 text-xs"
-          >
-            <option value="">All projects</option>
-            {projectNames.map((value) => (
-              <option key={value}>{value}</option>
-            ))}
-          </select>
-          <select
-            aria-label="Filter archive by host"
-            value={hostId}
-            onChange={(event) => setHostId(event.target.value)}
-            className="h-7 min-w-0 rounded-md border bg-background px-1 text-xs"
-          >
-            <option value="">All hosts</option>
-            {(facets.data?.hostIds ?? []).map((value) => (
-              <option key={value} value={value}>
-                {hostNames.get(value) ?? value}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="Filter archive by agent"
-            value={agentName}
-            onChange={(event) => setAgentName(event.target.value)}
-            className="h-7 min-w-0 rounded-md border bg-background px-1 text-xs"
-          >
-            <option value="">All agents</option>
-            {(facets.data?.agentNames ?? []).map((value) => (
-              <option key={value}>{value}</option>
-            ))}
-          </select>
-        </div>
+  const changeView = useCallback((patch: Partial<ArchiveLibraryViewState>) => {
+    if (Object.hasOwn(patch, "project")) {
+      facetTouched.current.project = true;
+    }
+    if (Object.hasOwn(patch, "hostId")) {
+      facetTouched.current.hostId = true;
+    }
+    setPageAfter(undefined);
+    setPageHistory([]);
+    setView((current) => ({ ...current, ...patch }));
+  }, []);
 
-        <div className="mt-2 flex flex-col gap-1" role="listbox" aria-label="Archived sessions">
+  return (
+    <div ref={containerRef} className="flex min-h-0 flex-1 flex-col" data-testid="archive-library-rail">
+      <section className="flex min-h-0 shrink-0 flex-col" style={{ height: `${ratio * 100}%` }}>
+        <ArchiveLibraryToolbar
+          value={view}
+          projectOptions={projectOptions}
+          hostOptions={hostOptions}
+          agentOptions={agentOptions}
+          onChange={changeView}
+        />
+        <div className="flex h-6 shrink-0 items-center justify-between border-b px-2 text-[10px] text-muted-foreground">
+          <span>{archived.length} sessions{view.searchScope === "content" && debouncedQuery ? " · content matches" : ""}</span>
+          <span>↑↓ select · Return open</span>
+        </div>
+        <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto p-1" role="listbox" aria-label="Archived sessions">
           {archivedQuery.isLoading ? (
             <p className="p-2 text-xs text-muted-foreground">Loading…</p>
           ) : archived.length === 0 ? (
             <p className="p-2 text-xs text-muted-foreground">No archived sessions match.</p>
           ) : (
-            archived.map((conversation) => (
-              <button
-                key={conversation.id}
-                type="button"
-                role="option"
-                aria-selected={selected?.id === conversation.id}
-                className={cn(
-                  "rounded-md border border-transparent px-2 py-1.5 text-left hover:bg-muted",
-                  selected?.id === conversation.id && "border-primary/30 bg-primary/5",
-                )}
-                onClick={() => setSelected(conversation)}
-              >
-                <span className="block truncate text-xs font-medium">
-                  {conversationDisplayLabel(conversation)}
-                </span>
-                <span className="block truncate text-[11px] text-muted-foreground">
-                  {hostNames.get(conversation.host_id ?? "") ??
-                    conversation.host_id ??
-                    "Unknown host"}
-                  {conversation.agent_name ? ` · ${conversation.agent_name}` : ""}
-                </span>
-                {conversation.search_snippet && (
-                  <span className="mt-0.5 line-clamp-2 block text-[11px] leading-4 text-foreground/70">
-                    {conversation.search_snippet}
+            archived.map((conversation, index) => {
+              const projectName =
+                (conversation.project_id ? projectNamesById.get(conversation.project_id) : undefined) ??
+                conversation.labels?.omni_project;
+              return (
+                <button
+                  key={conversation.id}
+                  type="button"
+                  role="option"
+                  aria-selected={selected?.id === conversation.id}
+                  className={cn(
+                    "block h-12 w-full rounded-md border border-transparent px-2 py-1.5 text-left hover:bg-muted",
+                    selected?.id === conversation.id && "border-primary/30 bg-primary/5",
+                  )}
+                  onClick={() => setSelected(conversation)}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                      event.preventDefault();
+                      const rows = listRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]');
+                      const next = event.key === "ArrowDown" ? index + 1 : index - 1;
+                      rows?.[Math.max(0, Math.min(archived.length - 1, next))]?.focus();
+                    }
+                    if (event.key === "Enter") {
+                      setSelected(conversation);
+                      window.setTimeout(
+                        () => document.querySelector<HTMLElement>('[data-testid="archive-transcript"]')?.focus(),
+                        0,
+                      );
+                    }
+                  }}
+                >
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                      {conversationDisplayLabel(conversation)}
+                    </span>
+                    {projectName && (
+                      <span className="max-w-24 shrink-0 truncate rounded bg-muted px-1 text-[9px] text-muted-foreground">
+                        {projectName}
+                      </span>
+                    )}
                   </span>
-                )}
-              </button>
-            ))
+                  <span className="mt-1 block truncate text-[10px] text-muted-foreground">
+                    {hostNames.get(conversation.host_id ?? "") ?? conversation.host_id ?? "Host not recorded"}
+                    {conversation.agent_name ? ` · ${conversation.agent_name}` : ""}
+                    {` · Archived ${shortArchiveDate(conversation)}`}
+                    {view.searchScope === "content" && conversation.search_match
+                      ? ` · ● ${conversation.search_match_count ?? 1} match${(conversation.search_match_count ?? 1) === 1 ? "" : "es"}`
+                      : ""}
+                  </span>
+                </button>
+              );
+            })
           )}
         </div>
         {(pageHistory.length > 0 || archivedQuery.data?.has_more) && (
-          <div className="mt-2 flex items-center justify-between gap-2 border-t pt-2">
+          <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-t px-2">
             <Button
               type="button"
               variant="ghost"
@@ -281,7 +325,7 @@ export function ArchiveLibraryRail() {
             >
               <ChevronLeftIcon /> Previous
             </Button>
-            <span className="text-[11px] text-muted-foreground">Page {pageHistory.length + 1}</span>
+            <span className="text-[10px] text-muted-foreground">Page {pageHistory.length + 1}</span>
             <Button
               type="button"
               variant="ghost"
@@ -299,14 +343,14 @@ export function ArchiveLibraryRail() {
           </div>
         )}
       </section>
-
       <div
         {...handleProps}
         className="group relative h-1 shrink-0 cursor-row-resize bg-border/80 outline-none focus-visible:bg-primary/50"
       >
         <span className="absolute top-1/2 left-1/2 h-1 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-border-strong group-hover:bg-primary/50" />
       </div>
-      <ArchiveTranscriptViewer conversation={selected} />
+      <ArchiveTranscriptViewer conversation={selected} returnFocusRef={listRef} />
+      <span className="sr-only" aria-live="polite">Archive defaults loaded for {activeConversationId ?? "the current session"}.</span>
     </div>
   );
 }

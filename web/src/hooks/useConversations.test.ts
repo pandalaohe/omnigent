@@ -316,6 +316,39 @@ describe("fetchArchivedSessionFacets", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/archived-facets");
   });
+
+  it("sends the current search, date, and linked facet constraints", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ projects: ["Core"], host_ids: ["host-win"], agent_names: ["codex"] }),
+    );
+
+    await fetchArchivedSessionFacets({
+      searchQuery: "handoff",
+      searchScope: "content",
+      project: "Core",
+      hostId: "host-win",
+      agentName: "codex",
+      dateField: "archived_at",
+      sortField: "archived_at",
+      agePreset: "any",
+      order: "desc",
+      createdAfter: 100,
+      createdBefore: 200,
+      archivedAfter: 300,
+      archivedBefore: 400,
+    });
+
+    const url = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    expect(url.searchParams.get("search_scope")).toBe("content");
+    expect(url.searchParams.get("search_query")).toBe("handoff");
+    expect(url.searchParams.get("project")).toBe("Core");
+    expect(url.searchParams.get("host_id")).toBe("host-win");
+    expect(url.searchParams.get("agent_name")).toBe("codex");
+    expect(url.searchParams.get("created_after")).toBe("100");
+    expect(url.searchParams.get("created_before")).toBe("200");
+    expect(url.searchParams.get("archived_after")).toBe("300");
+    expect(url.searchParams.get("archived_before")).toBe("400");
+  });
 });
 
 describe("useArchivedConversations", () => {
@@ -334,6 +367,7 @@ describe("useArchivedConversations", () => {
         useArchivedConversations(
           {
             searchQuery: "Omnigent",
+            searchScope: "content",
             project: "Core",
             hostId: "host-win",
             agentName: "codex-native",
@@ -352,6 +386,7 @@ describe("useArchivedConversations", () => {
     const url = new URL(requestUrl, "http://test");
     expect(url.searchParams.get("archived_only")).toBe("true");
     expect(url.searchParams.get("search_query")).toBe("Omnigent");
+    expect(url.searchParams.get("search_scope")).toBe("content");
     expect(url.searchParams.get("project")).toBe("Core");
     expect(url.searchParams.get("host_id")).toBe("host-win");
     expect(url.searchParams.get("agent_name")).toBe("codex-native");

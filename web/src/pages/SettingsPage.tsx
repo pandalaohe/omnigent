@@ -45,12 +45,9 @@ import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
   CheckIcon,
-  ChevronDownIcon,
-  ChevronsUpDownIcon,
   DownloadIcon,
   KeyRoundIcon,
   LockIcon,
-  ListFilterIcon,
   Loader2Icon,
   LaptopMinimalIcon,
   LogOutIcon,
@@ -61,7 +58,6 @@ import {
   PanelRightCloseIcon,
   PanelRightIcon,
   PlusIcon,
-  SearchIcon,
   SunIcon,
   SquareCheckIcon,
   SquareIcon,
@@ -73,6 +69,12 @@ import {
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
+import {
+  ArchiveLibraryToolbar,
+  buildArchiveConversationFilters,
+  type ArchiveFilterOption,
+  type ArchiveLibraryViewState,
+} from "@/components/archive/ArchiveLibraryToolbar";
 import { ArchiveTranscriptViewer } from "@/components/archive/ArchiveTranscriptViewer";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
@@ -83,14 +85,6 @@ import {
 } from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Command,
-  CommandEmpty,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -140,8 +134,6 @@ import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
   ARCHIVE_LOCK_LABEL_KEY,
-  type ArchivedAgePreset,
-  type ArchivedConversationFilters,
   type ArchivedDateField,
   useArchiveConversation,
   useArchiveLockConversation,
@@ -159,6 +151,10 @@ import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
+import {
+  readInheritLastRightRailTab,
+  writeInheritLastRightRailTab,
+} from "@/lib/sessionWorkspaceState";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
 import { isThemeMode, normalizeThemeMode, type ThemeMode } from "@/components/theme/themeMode";
@@ -2329,17 +2325,17 @@ function AccountSection() {
 
 const ARCHIVED_VIEW_STORAGE_KEY = "omnigent:archived-sessions-view-v1";
 
-interface ArchivedViewPreferences extends ArchivedConversationFilters {
-  project?: string;
-  hostId?: string;
-  agentName?: string;
-}
+type ArchivedViewPreferences = ArchiveLibraryViewState;
 
 const DEFAULT_ARCHIVED_VIEW: ArchivedViewPreferences = {
   searchQuery: "",
-  dateField: "archived_at",
+  searchScope: "title",
+  project: undefined,
+  hostId: undefined,
+  agentName: undefined,
+  createdRange: "",
+  archivedRange: "",
   sortField: "archived_at",
-  agePreset: "any",
   order: "desc",
 };
 
@@ -2352,8 +2348,13 @@ function readArchivedViewPreferences(): ArchivedViewPreferences {
     return {
       ...DEFAULT_ARCHIVED_VIEW,
       ...stored,
-      dateField: stored.dateField === "created_at" ? "created_at" : "archived_at",
-      sortField: stored.sortField === "created_at" ? "created_at" : "archived_at",
+      searchScope: stored.searchScope === "content" ? "content" : "title",
+      createdRange: typeof stored.createdRange === "string" ? stored.createdRange : "",
+      archivedRange: typeof stored.archivedRange === "string" ? stored.archivedRange : "",
+      sortField:
+        stored.sortField === "created_at" || stored.sortField === "title"
+          ? stored.sortField
+          : "archived_at",
       order: stored.order === "asc" ? "asc" : "desc",
     };
   } catch {
@@ -2375,101 +2376,6 @@ function archivedTimestamp(
   return conversation.archived_at ?? conversation.updated_at ?? conversation.created_at;
 }
 
-interface ArchiveFilterOption {
-  value: string;
-  label: string;
-  keywords?: string;
-}
-
-function ArchiveFilterCombobox({
-  label,
-  allLabel,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  allLabel: string;
-  value?: string;
-  options: ArchiveFilterOption[];
-  onChange: (value: string | undefined) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const current = options.find((option) => option.value === value);
-  return (
-    <div className="min-w-0">
-      <span className="mb-1 block text-xs text-muted-foreground">{label}</span>
-      <Popover open={open} onOpenChange={setOpen}>
-        <PopoverTrigger asChild>
-          <Button
-            type="button"
-            variant="outline"
-            role="combobox"
-            aria-label={`Filter archived sessions by ${label.toLowerCase()}`}
-            data-testid={`archived-${label.toLowerCase()}-filter`}
-            aria-expanded={open}
-            className="h-9 w-full justify-between px-3 font-normal"
-          >
-            <span className="truncate">{current?.label ?? allLabel}</span>
-            <ChevronsUpDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent align="start" className="w-(--radix-popover-trigger-width) p-0">
-          <Command>
-            <CommandInput placeholder={`Search ${label.toLowerCase()}…`} />
-            <CommandList>
-              <CommandEmpty>No match.</CommandEmpty>
-              <CommandItem
-                value={allLabel}
-                data-checked={value === undefined}
-                onSelect={() => {
-                  onChange(undefined);
-                  setOpen(false);
-                }}
-              >
-                {allLabel}
-              </CommandItem>
-              {options.map((option) => (
-                <CommandItem
-                  key={option.value}
-                  value={`${option.label} ${option.keywords ?? ""}`}
-                  data-checked={option.value === value}
-                  onSelect={() => {
-                    onChange(option.value);
-                    setOpen(false);
-                  }}
-                >
-                  <span className="truncate">{option.label}</span>
-                </CommandItem>
-              ))}
-            </CommandList>
-          </Command>
-        </PopoverContent>
-      </Popover>
-    </div>
-  );
-}
-
-function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
-  const date = new Date(timestampSec * 1000);
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-  const yesterday = new Date(startOfToday);
-  yesterday.setDate(yesterday.getDate() - 1);
-
-  const sevenDaysAgo = new Date(startOfToday);
-  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
-  const thirtyDaysAgo = new Date(startOfToday);
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-  if (date >= startOfToday) return "Today";
-  if (date >= yesterday) return "Yesterday";
-  if (date >= sevenDaysAgo) return "Previous 7 days";
-  if (date >= thirtyDaysAgo) return "Previous 30 days";
-  return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-}
-
 function ImportSection() {
   return (
     <Section
@@ -2485,6 +2391,7 @@ function ArchivedSection() {
   const isMobileViewport = useIsMobileViewport();
   const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
   const { width, containerRef, handleProps } = useResizableColumn(420, 300, 720);
+  const listFocusRef = useRef<HTMLDivElement>(null);
 
   return (
     <div
@@ -2495,8 +2402,9 @@ function ArchivedSection() {
       data-testid="archive-library"
     >
       <div
+        ref={listFocusRef}
         className={cn(
-          "min-h-0 shrink-0 overflow-y-auto px-5 pt-4 pb-10",
+          "min-h-0 shrink-0 overflow-x-hidden overflow-y-auto",
           isMobileViewport && selectedConversation ? "hidden" : "w-full",
         )}
         style={isMobileViewport ? undefined : { width }}
@@ -2510,6 +2418,7 @@ function ArchivedSection() {
         <div
           {...handleProps}
           aria-label="Resize archive session list"
+          title="Drag to resize the archive list and conversation."
           className="group relative w-1 shrink-0 cursor-col-resize border-x border-transparent hover:bg-primary/10"
         >
           <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border group-hover:bg-primary/50" />
@@ -2519,6 +2428,7 @@ function ArchivedSection() {
         <ArchiveTranscriptViewer
           conversation={selectedConversation}
           onBack={isMobileViewport ? () => setSelectedConversation(null) : undefined}
+          returnFocusRef={listFocusRef}
         />
       )}
     </div>
@@ -2534,11 +2444,9 @@ function ArchivedListPane({
 }) {
   const [view, setView] = useState<ArchivedViewPreferences>(readArchivedViewPreferences);
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState(view.searchQuery ?? "");
-  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
   const [pageCursors, setPageCursors] = useState<(string | undefined)[]>([undefined]);
+  const [inheritLastTab, setInheritLastTab] = useState(readInheritLastRightRailTab);
   const paginationAnchorRef = useRef<HTMLElement>(null);
-  const isMobileViewport = useIsMobileViewport();
-  const facetsQuery = useArchivedSessionFacets();
   const projectsQuery = useProjects();
   const hostsQuery = useHosts({ includeSandbox: true });
   const pageNumber = pageCursors.length;
@@ -2550,9 +2458,10 @@ function ArchivedListPane({
     return () => window.clearTimeout(timeout);
   }, [view.searchQuery]);
   const queryView = useMemo(
-    () => ({ ...view, searchQuery: debouncedSearchQuery }),
+    () => buildArchiveConversationFilters(view, debouncedSearchQuery),
     [debouncedSearchQuery, view],
   );
+  const facetsQuery = useArchivedSessionFacets(queryView);
   const listQuery = useArchivedConversations(queryView, pageCursors.at(-1));
   const archived = useMemo(() => listQuery.data?.data ?? [], [listQuery.data]);
 
@@ -2571,10 +2480,10 @@ function ArchivedListPane({
     localStorage.setItem(ARCHIVED_VIEW_STORAGE_KEY, JSON.stringify(view));
   }, [view]);
 
-  const setFilter = useCallback(
-    <K extends keyof ArchivedViewPreferences>(key: K, value: ArchivedViewPreferences[K]) => {
+  const updateView = useCallback(
+    (patch: Partial<ArchivedViewPreferences>) => {
       setPageCursors([undefined]);
-      setView((current) => ({ ...current, [key]: value }));
+      setView((current) => ({ ...current, ...patch }));
     },
     [],
   );
@@ -2584,14 +2493,8 @@ function ArchivedListPane({
     [hostsQuery.data],
   );
   const projectOptions = useMemo(() => {
-    const names = new Set([
-      ...(facetsQuery.data?.projects ?? []),
-      ...(projectsQuery.data ?? []).map((project) => project.name),
-    ]);
-    return [...names]
-      .sort((a, b) => a.localeCompare(b))
-      .map((name) => ({ value: name, label: name }));
-  }, [facetsQuery.data, projectsQuery.data]);
+    return (facetsQuery.data?.projects ?? []).map((name) => ({ value: name, label: name }));
+  }, [facetsQuery.data]);
   const hostOptions = useMemo(
     () =>
       (facetsQuery.data?.hostIds ?? []).map((hostId) => ({
@@ -2605,21 +2508,28 @@ function ArchivedListPane({
     () => (facetsQuery.data?.agentNames ?? []).map((name) => ({ value: name, label: name })),
     [facetsQuery.data],
   );
+  const projectNames = useMemo(
+    () => new Map((projectsQuery.data ?? []).map((project) => [project.id, project.name])),
+    [projectsQuery.data],
+  );
 
-  const groupedArchived = useMemo(() => {
-    const now = new Date();
-    const groups: { label: string; conversations: typeof archived }[] = [];
-    let currentLabel = "";
-    for (const conv of archived) {
-      const label = dateGroupLabel(archivedTimestamp(conv, view.sortField), now);
-      if (label !== currentLabel) {
-        currentLabel = label;
-        groups.push({ label, conversations: [] });
+  useEffect(() => {
+    if (!facetsQuery.data) return;
+    const normalize = (
+      key: "project" | "hostId" | "agentName",
+      options: ArchiveFilterOption[],
+    ) => {
+      const current = view[key];
+      if (current && !options.some((option) => option.value === current)) {
+        updateView({ [key]: undefined });
+      } else if (!current && options.length === 1) {
+        updateView({ [key]: options[0].value });
       }
-      groups[groups.length - 1].conversations.push(conv);
-    }
-    return groups;
-  }, [archived, view.sortField]);
+    };
+    normalize("project", projectOptions);
+    normalize("hostId", hostOptions);
+    normalize("agentName", agentOptions);
+  }, [agentOptions, facetsQuery.data, hostOptions, projectOptions, updateView, view]);
 
   // ── Bulk selection ──
   const [selectionMode, setSelectionMode] = useState(false);
@@ -2679,17 +2589,10 @@ function ArchivedListPane({
     paginationAnchorRef.current?.scrollIntoView({ block: "start" });
   }, [listQuery.data]);
 
-  const hasFilters = Boolean(
-    view.searchQuery || view.project || view.hostId || view.agentName || view.agePreset !== "any",
-  );
-  const showFilterPanel = !isMobileViewport || mobileFiltersOpen;
-  const sortFieldLabel = view.sortField === "created_at" ? "Create date" : "Archive date";
-  const sortOrderLabel = view.order === "asc" ? "Oldest first" : "Newest first";
-
   return (
     <section ref={paginationAnchorRef} className="scroll-mt-16" aria-label="Archived sessions">
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <h1 className="mr-auto text-xl font-semibold">Archived sessions</h1>
+      <div className="flex min-h-11 flex-wrap items-center gap-2 border-b px-2 py-1.5">
+        <h1 className="mr-auto text-sm font-semibold">Archived sessions</h1>
         {archived.length > 0 &&
           (selectionMode ? (
             <>
@@ -2719,215 +2622,65 @@ function ArchivedListPane({
           ))}
       </div>
 
-      <div className="mb-3">
-        <div className="flex min-w-0 gap-2">
-          <div className="relative min-w-0 flex-1">
-            <SearchIcon
-              className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
-              aria-hidden="true"
-            />
-            <Input
-              type="search"
-              aria-label="Search archived session title, CWD, or conversation content"
-              placeholder="Search title, CWD, or messages…"
-              className="h-10 pl-9 text-base md:h-9 md:text-sm"
-              value={view.searchQuery ?? ""}
-              onChange={(event) => setFilter("searchQuery", event.target.value)}
-            />
-          </div>
-          {isMobileViewport && (
-            <Button
-              type="button"
-              variant="outline"
-              className="h-10 shrink-0 gap-2 px-3"
-              aria-expanded={mobileFiltersOpen}
-              aria-controls="archived-filter-panel"
-              data-testid="archived-filter-toggle"
-              onClick={() => setMobileFiltersOpen((open) => !open)}
-            >
-              <ListFilterIcon className="size-4" />
-              Filters
-              <ChevronDownIcon
-                className={cn("size-3.5 transition-transform", mobileFiltersOpen && "rotate-180")}
-                aria-hidden="true"
-              />
-            </Button>
-          )}
-        </div>
+      <ArchiveLibraryToolbar
+        value={view}
+        projectOptions={projectOptions}
+        hostOptions={hostOptions}
+        agentOptions={agentOptions}
+        onChange={updateView}
+      />
 
-        {isMobileViewport && !mobileFiltersOpen && (
-          <button
-            type="button"
-            className="mt-1 flex min-h-9 w-full items-center gap-1.5 px-1 text-left text-xs text-muted-foreground"
-            aria-label={`Change archive sorting: ${sortFieldLabel}, ${sortOrderLabel}`}
-            onClick={() => setMobileFiltersOpen(true)}
-          >
-            <span>{sortFieldLabel}</span>
-            <span aria-hidden="true">·</span>
-            <span>{sortOrderLabel}</span>
-            <ChevronDownIcon className="ml-auto size-3.5" aria-hidden="true" />
-          </button>
-        )}
-
-        {showFilterPanel && (
-          <div
-            id="archived-filter-panel"
-            data-testid="archived-filter-panel"
-            className="mt-2 rounded-lg border bg-muted/20 p-3"
-          >
-            <div className="grid grid-cols-2 gap-2">
-              <ArchiveFilterCombobox
-                label="Project"
-                allLabel="All projects"
-                value={view.project}
-                options={projectOptions}
-                onChange={(value) => setFilter("project", value)}
-              />
-              <ArchiveFilterCombobox
-                label="Host"
-                allLabel="All hosts"
-                value={view.hostId}
-                options={hostOptions}
-                onChange={(value) => setFilter("hostId", value)}
-              />
-            </div>
-
-            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
-              <ArchiveFilterCombobox
-                label="Agent"
-                allLabel="All agents"
-                value={view.agentName}
-                options={agentOptions}
-                onChange={(value) => setFilter("agentName", value)}
-              />
-              <label className="min-w-0">
-                <span className="mb-1 block text-xs text-muted-foreground">Date</span>
-                <Select
-                  value={view.dateField}
-                  onValueChange={(value) => setFilter("dateField", value as ArchivedDateField)}
-                >
-                  <SelectTrigger className="h-9 w-full" aria-label="Archived date field">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="archived_at">Archive date</SelectItem>
-                    <SelectItem value="created_at">Create date</SelectItem>
-                  </SelectContent>
-                </Select>
-              </label>
-              <label className="min-w-0">
-                <span className="mb-1 block text-xs text-muted-foreground">Age</span>
-                <Select
-                  value={view.agePreset}
-                  onValueChange={(value) => setFilter("agePreset", value as ArchivedAgePreset)}
-                >
-                  <SelectTrigger className="h-9 w-full" aria-label="Archived session age">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="any">Any</SelectItem>
-                    <SelectItem value="lt24h">&lt;24h</SelectItem>
-                    <SelectItem value="lt7d">&lt;7d</SelectItem>
-                    <SelectItem value="gt7d">&gt;7d</SelectItem>
-                    <SelectItem value="gt30d">&gt;30d</SelectItem>
-                    <SelectItem value="gt90d">&gt;90d</SelectItem>
-                    <SelectItem value="gt180d">&gt;180d</SelectItem>
-                    <SelectItem value="gt365d">&gt;365d</SelectItem>
-                  </SelectContent>
-                </Select>
-              </label>
-            </div>
-
-            <div className="mt-2 grid grid-cols-2 items-end gap-2 border-t pt-2">
-              <label className="min-w-0">
-                <span className="mb-1 block text-xs text-muted-foreground">Sort by</span>
-                <Select
-                  value={view.sortField}
-                  onValueChange={(value) => setFilter("sortField", value as ArchivedDateField)}
-                >
-                  <SelectTrigger className="h-9 w-full" aria-label="Sort archived sessions by">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="archived_at">Archive date</SelectItem>
-                    <SelectItem value="created_at">Create date</SelectItem>
-                  </SelectContent>
-                </Select>
-              </label>
-              <label className="min-w-0">
-                <span className="mb-1 block text-xs text-muted-foreground">Order</span>
-                <Select
-                  value={view.order}
-                  onValueChange={(value) => setFilter("order", value as "asc" | "desc")}
-                >
-                  <SelectTrigger className="h-9 w-full" aria-label="Archived session sort order">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="desc">Newest first</SelectItem>
-                    <SelectItem value="asc">Oldest first</SelectItem>
-                  </SelectContent>
-                </Select>
-              </label>
-              {hasFilters && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="col-span-2 justify-self-end"
-                  onClick={() => {
-                    setPageCursors([undefined]);
-                    setView(DEFAULT_ARCHIVED_VIEW);
-                  }}
-                >
-                  Clear filters
-                </Button>
-              )}
-            </div>
-          </div>
-        )}
+      <div className="flex min-h-8 items-center gap-2 border-b px-2 text-[11px] text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate">
+          New sessions use the last right rail tab you explicitly selected
+        </span>
+        <Switch
+          checked={inheritLastTab}
+          aria-label="Use last explicitly selected right rail tab for new sessions"
+          onCheckedChange={(checked) => {
+            setInheritLastTab(checked);
+            writeInheritLastRightRailTab(checked);
+          }}
+        />
       </div>
 
       {selectionMode && (
-        <ArchivedBulkActionBar
-          selectedIds={selectedIds}
-          allArchived={archived}
-          onDeselectAll={deselectAll}
-        />
+        <div className="px-2 pt-2">
+          <ArchivedBulkActionBar
+            selectedIds={selectedIds}
+            allArchived={archived}
+            onDeselectAll={deselectAll}
+          />
+        </div>
       )}
 
       {listQuery.isLoading ? (
-        <p className="text-ui text-muted-foreground">Loading…</p>
+        <p className="px-3 py-4 text-ui text-muted-foreground">Loading…</p>
       ) : archived.length === 0 ? (
-        <p className="text-ui text-muted-foreground">No archived sessions match.</p>
+        <p className="px-3 py-4 text-ui text-muted-foreground">No archived sessions match.</p>
       ) : (
         <>
-          <div className="flex flex-col gap-4">
-            {groupedArchived.map((group) => (
-              <div key={group.label}>
-                <h3 className="mb-1 px-3 text-sm font-medium text-muted-foreground">
-                  {group.label}
-                </h3>
-                <ul className="flex flex-col gap-2 md:gap-0.5">
-                  {group.conversations.map((conv) => (
-                    <ArchivedRow
-                      key={conv.id}
-                      conversation={conv}
-                      hostName={hostNames.get(conv.host_id ?? "")}
-                      selectionMode={selectionMode}
-                      isSelected={selectedIds.has(conv.id)}
-                      onToggleSelected={toggleSelected}
-                      isActive={selectedConversationId === conv.id}
-                      onOpen={onSelectConversation}
-                    />
-                  ))}
-                </ul>
-              </div>
+          <ul className="flex flex-col p-1">
+            {archived.map((conv) => (
+              <ArchivedRow
+                key={conv.id}
+                conversation={conv}
+                projectName={
+                  (conv.project_id ? projectNames.get(conv.project_id) : undefined) ??
+                  conv.labels?.omni_project
+                }
+                hostName={hostNames.get(conv.host_id ?? "")}
+                selectionMode={selectionMode}
+                isSelected={selectedIds.has(conv.id)}
+                onToggleSelected={toggleSelected}
+                isActive={selectedConversationId === conv.id}
+                onOpen={onSelectConversation}
+              />
             ))}
-          </div>
+          </ul>
           {(pageNumber > 1 || listQuery.data?.has_more) && (
             <nav
-              className="mt-4 flex items-center justify-center gap-3"
+              className="flex items-center justify-center gap-3 border-t p-2"
               aria-label="Archived session pages"
             >
               <Button
@@ -3141,6 +2894,7 @@ function ArchivedBulkActionBar({
  */
 function ArchivedRow({
   conversation,
+  projectName,
   hostName,
   selectionMode,
   isSelected,
@@ -3149,6 +2903,7 @@ function ArchivedRow({
   onOpen,
 }: {
   conversation: Conversation;
+  projectName?: string;
   hostName?: string;
   selectionMode: boolean;
   isSelected: boolean;
@@ -3165,9 +2920,9 @@ function ArchivedRow({
   const locked = isArchiveLocked(conversation);
   const busy = archive.isPending || archiveLock.isPending || del.isPending;
   const archivedAtMs = archivedTimestamp(conversation) * 1000;
-  const createdAtMs = conversation.created_at * 1000;
   const resolvedHostName = hostName ?? conversation.host_id ?? "Host not recorded";
   const resolvedAgentName = conversation.agent_name ?? "Agent not recorded";
+  const matchCount = conversation.search_match_count ?? (conversation.search_match ? 1 : 0);
 
   return (
     <li
@@ -3187,9 +2942,33 @@ function ArchivedRow({
       <button
         type="button"
         data-testid="archived-open-session"
+        aria-selected={isActive && !selectionMode}
         aria-pressed={selectionMode ? isSelected : undefined}
-        className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:py-3"
+        className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2.5 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
         onClick={() => (selectionMode ? onToggleSelected(conversation.id) : onOpen(conversation))}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !selectionMode) {
+            event.preventDefault();
+            onOpen(conversation);
+            window.setTimeout(
+              () =>
+                document
+                  .querySelector<HTMLElement>('[data-testid="archive-transcript"]')
+                  ?.focus(),
+              0,
+            );
+            return;
+          }
+          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+          event.preventDefault();
+          const rows = [
+            ...(event.currentTarget.closest("ul")?.querySelectorAll<HTMLButtonElement>(
+              '[data-testid="archived-open-session"]',
+            ) ?? []),
+          ];
+          const index = rows.indexOf(event.currentTarget);
+          rows[index + (event.key === "ArrowDown" ? 1 : -1)]?.focus();
+        }}
       >
         {selectionMode && (
           <span className="flex shrink-0 items-center">
@@ -3200,77 +2979,43 @@ function ArchivedRow({
             )}
           </span>
         )}
-        <div
-          className={cn(
-            "grid min-w-0 flex-1 gap-x-4 gap-y-2 lg:grid-cols-[minmax(0,1fr)_13.25rem] lg:items-center",
-            !selectionMode && "max-md:basis-full",
-          )}
-        >
-          <div className="min-w-0">
-            <div className="flex min-w-0 items-center gap-2">
-              <span className="truncate text-ui font-medium" title={label}>
-                {label}
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate text-sm font-medium" title={label}>
+              {label}
+            </span>
+            {projectName && (
+              <span className="max-w-28 shrink-0 truncate rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                {projectName}
               </span>
-              {conversation.labels?.omni_project && (
-                <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-                  {conversation.labels.omni_project}
-                </span>
-              )}
-            </div>
-            {conversation.search_snippet && (
-              <p
-                className="mt-1 line-clamp-2 text-xs leading-4 text-foreground/75"
-                data-testid="archived-search-snippet"
-              >
-                {conversation.search_snippet}
-              </p>
             )}
-            <div
-              className="truncate font-mono text-xs text-info/90"
-              title={conversation.workspace ?? "CWD not recorded"}
-            >
-              {conversation.workspace ?? "CWD not recorded"}
-            </div>
-            <div
-              className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground"
-              data-testid="archived-context"
-            >
-              <span className="truncate" title={resolvedHostName}>
-                {resolvedHostName}
-              </span>
-              <span className="shrink-0 text-border" aria-hidden="true">
-                •
-              </span>
-              <span className="truncate" title={resolvedAgentName}>
-                {resolvedAgentName}
-              </span>
-            </div>
           </div>
-          <dl
-            className="grid grid-cols-[3.25rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs lg:border-l lg:pl-3"
-            data-testid="archived-time-column"
+          <div
+            className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-[11px] text-muted-foreground"
+            data-testid="archived-context"
           >
-            <dt className="text-[10px] leading-4 tracking-wide text-info uppercase">Archived</dt>
-            <dd className="min-w-0 truncate leading-4 font-medium text-foreground">
-              <time
-                dateTime={new Date(archivedAtMs).toISOString()}
-                title={absoluteTime(archivedAtMs)}
-              >
-                {absoluteTime(archivedAtMs)}
-              </time>
-            </dd>
-            <dt className="text-[10px] leading-4 tracking-wide text-muted-foreground uppercase">
-              Created
-            </dt>
-            <dd className="min-w-0 truncate leading-4 text-muted-foreground">
-              <time
-                dateTime={new Date(createdAtMs).toISOString()}
-                title={absoluteTime(createdAtMs)}
-              >
-                {absoluteTime(createdAtMs)}
-              </time>
-            </dd>
-          </dl>
+            <span className="truncate" title={resolvedHostName}>
+              {resolvedHostName}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="truncate" title={resolvedAgentName}>
+              {resolvedAgentName}
+            </span>
+            <span aria-hidden="true">·</span>
+            <time
+              className="shrink-0"
+              dateTime={new Date(archivedAtMs).toISOString()}
+              title={`Archived ${absoluteTime(archivedAtMs)}`}
+            >
+              {new Date(archivedAtMs).toLocaleDateString(undefined, {
+                month: "short",
+                day: "numeric",
+              })}
+            </time>
+            {conversation.search_match && (
+              <span className="shrink-0 text-info">· {matchCount} content match</span>
+            )}
+          </div>
         </div>
       </button>
       {!selectionMode && (

@@ -1,6 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   useArchivedConversations,
@@ -26,6 +28,14 @@ const useArchivedMock = vi.mocked(useArchivedConversations);
 const useFacetsMock = vi.mocked(useArchivedSessionFacets);
 const useHostsMock = vi.mocked(useHosts);
 const useProjectsMock = vi.mocked(useProjects);
+
+function renderRail(props: ComponentProps<typeof ArchiveLibraryRail> = {}) {
+  return render(
+    <TooltipProvider>
+      <ArchiveLibraryRail {...props} />
+    </TooltipProvider>,
+  );
+}
 
 function archiveConversation(id: string, title: string): Conversation {
   return {
@@ -78,7 +88,7 @@ describe("ArchiveLibraryRail", () => {
   });
 
   it("pages through a large archive and can return to the prior page", async () => {
-    render(<ArchiveLibraryRail />);
+    renderRail();
 
     expect(await screen.findByRole("option", { name: /First archive page/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Next/ }));
@@ -93,13 +103,36 @@ describe("ArchiveLibraryRail", () => {
     expect(screen.getByText("Page 1")).toBeInTheDocument();
   });
 
-  it("includes first-class projects that are absent from legacy archive facets", () => {
+  it("fuzzy-selects a viable first-class project from linked facets", () => {
+    useFacetsMock.mockReturnValue({
+      data: { projects: ["First class project"], hostIds: [], agentNames: [] },
+    } as unknown as ReturnType<typeof useArchivedSessionFacets>);
     useProjectsMock.mockReturnValue({
       data: [{ id: "project-1", name: "First class project" }],
     } as unknown as ReturnType<typeof useProjects>);
 
-    render(<ArchiveLibraryRail />);
+    renderRail();
 
-    expect(screen.getByRole("option", { name: "First class project" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("combobox", { name: /by project/i }));
+    const input = screen.getByPlaceholderText("Search project…");
+    fireEvent.change(input, { target: { value: "first class" } });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("combobox", { name: /by project/i })).toHaveTextContent(
+      "First class project",
+    );
+  });
+
+  it("seeds project and host filters from the active session", async () => {
+    useFacetsMock.mockReturnValue({
+      data: { projects: ["Omnigent"], hostIds: ["host-win"], agentNames: [] },
+    } as unknown as ReturnType<typeof useArchivedSessionFacets>);
+
+    renderRail({ initialProject: "Omnigent", initialHostId: "host-win" });
+
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: /by project/i })).toHaveTextContent("Omnigent");
+      expect(screen.getByRole("combobox", { name: /by host/i })).toHaveTextContent("Windows");
+    });
   });
 });

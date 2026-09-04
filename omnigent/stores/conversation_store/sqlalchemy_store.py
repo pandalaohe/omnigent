@@ -637,7 +637,7 @@ def _fetch_search_matches(
     session: Session,
     conversation_ids: list[str],
     query: str,
-) -> dict[str, tuple[str, str, int, str]]:
+) -> dict[str, tuple[str, str, int, str, int]]:
     """
     Build a per-conversation preview excerpt of matching chat content.
 
@@ -684,6 +684,7 @@ def _fetch_search_matches(
         select(
             SqlConversationItem.conversation_id.label("cid"),
             func.min(SqlConversationItem.position).label("pos"),
+            func.count().label("match_count"),
         )
         .where(match_pred)
         .group_by(SqlConversationItem.conversation_id)
@@ -698,6 +699,7 @@ def _fetch_search_matches(
             SqlConversationItem.response_id,
             SqlConversationItem.created_at,
             SqlConversationItem.search_text,
+            earliest.c.match_count,
         ).join(
             earliest,
             and_(
@@ -707,13 +709,13 @@ def _fetch_search_matches(
             ),
         )
     ).all()
-    out: dict[str, tuple[str, str, int, str]] = {}
-    for conv_id, item_id, response_id, created_at, search_text in rows:
+    out: dict[str, tuple[str, str, int, str, int]] = {}
+    for conv_id, item_id, response_id, created_at, search_text, match_count in rows:
         if not search_text:
             continue
         snippet = build_search_snippet(search_text, query)
         if snippet is not None:
-            out[conv_id] = (item_id, response_id, created_at, snippet)
+            out[conv_id] = (item_id, response_id, created_at, snippet, int(match_count))
     return out
 
 
@@ -2654,6 +2656,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
+        include_search_match: bool = True,
         host_id: str | None = None,
         created_after: int | None = None,
         created_before: int | None = None,
@@ -2699,10 +2703,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"``
-            ``"updated_at"``, or ``"archived_at"``.
+        :param sort_by: Column to sort on: ``"created_at"``,
+            ``"updated_at"``, ``"archived_at"``, or ``"title"``.
         :param search_query: Case-insensitive substring filter on
-            the session title OR conversation item content.
+            the session title or conversation item content.
             ``None`` or empty string disables the filter;
             otherwise matches conversations where
             ``LOWER(title) LIKE %query%`` or any
@@ -2710,6 +2714,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
             Postgres without extra extensions.
+        :param search_scope: Search ``"title"``, ``"content"``, or ``"all"``
+            supported text fields. ``"all"`` also includes workspace metadata.
+        :param include_search_match: Populate the first matching item, snippet,
+            and match count. Facet scans disable this extra result query.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2737,6 +2745,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
+        if search_scope not in {"all", "title", "content"}:
+            raise ValueError(f"invalid search_scope: {search_scope!r}")
         sort_col = self._resolve_sort_column(sort_by)
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
@@ -2808,7 +2818,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         intersection &= candidate
                     qualifying_ids = list(intersection)
 
-        if search_query:
+        if search_query and search_scope == "all":
             # Workspace/CWD is metadata-owned. Resolve its matching ids here,
             # then OR them with title/content matches in the AP query below.
             with self._session("list_conversations") as meta_sess:
@@ -2838,7 +2848,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
             # by a client disconnect, so this is the only server-side bound.
             is_postgres = session.bind is not None and session.bind.dialect.name == "postgresql"
-            if search_query and is_postgres:
+            if search_query and search_scope != "title" and is_postgres:
                 # Postgres SET does not accept a bind parameter, so the value is
                 # inlined. Safe from injection: it is an int module constant, not
                 # caller input — coerced through int() to keep it that way.
@@ -2936,8 +2946,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .exists()
                 )
-                workspace_match = SqlConversation.id.in_(workspace_matching_ids or [])
-                stmt = stmt.where(or_(title_match, content_match, workspace_match))
+                if search_scope == "title":
+                    stmt = stmt.where(title_match)
+                elif search_scope == "content":
+                    stmt = stmt.where(content_match)
+                else:
+                    workspace_match = SqlConversation.id.in_(workspace_matching_ids or [])
+                    stmt = stmt.where(or_(title_match, content_match, workspace_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -3067,7 +3082,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             search_matches = (
-                _fetch_search_matches(session, row_ids, search_query) if search_query else {}
+                _fetch_search_matches(session, row_ids, search_query)
+                if search_query and search_scope != "title" and include_search_match
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
@@ -3102,6 +3119,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conv.search_response_id,
                 conv.search_item_created_at,
                 conv.search_snippet,
+                conv.search_match_count,
             ) = match
         return PagedList(
             data=convs,
@@ -3111,12 +3129,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
 
     @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+    def _resolve_sort_column(sort_by: str) -> ColumnElement[Any]:
         """
         Map a ``sort_by`` string to the corresponding
         :class:`SqlConversation` column.
 
-        :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"archived_at"``.
+        :param sort_by: ``"created_at"``, ``"updated_at"``, ``"archived_at"``,
+            or ``"title"``.
         :returns: The mapped column attribute.
         :raises ValueError: If ``sort_by`` is not a valid column
             name.
@@ -3125,17 +3144,18 @@ class SqlAlchemyConversationStore(ConversationStore):
             "created_at": SqlConversation.created_at,
             "updated_at": SqlConversation.updated_at,
             "archived_at": SqlConversation.archived_at,
+            "title": func.lower(func.coalesce(SqlConversation.title, "")),
         }
         col = allowed.get(sort_by)
         if col is None:
             raise ValueError(f"invalid sort_by: {sort_by!r}")
-        return col
+        return cast(ColumnElement[Any], col)
 
     @staticmethod
     def _apply_cursor(
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
-        sort_col: QueryableAttribute[int],
+        sort_col: ColumnElement[Any],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,
@@ -3149,7 +3169,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param stmt: The current SELECT statement to augment.
         :param cursor_id: The conversation ID acting as the page cursor,
             e.g. ``"conv_abc123"``.
-        :param sort_col: Primary sort column (``created_at`` or ``updated_at``).
+        :param sort_col: Primary sort expression.
         :param is_desc: ``True`` for descending, ``False`` for ascending.
         :param tiebreaker_col: Secondary sort column; must match the
             secondary ORDER BY column. See ``_tiebreaker_col`` in

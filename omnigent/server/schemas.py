@@ -2714,6 +2714,7 @@ class SessionListItem(BaseModel):
     viewer_unread: bool = False
     search_snippet: str | None = None
     search_match: SessionSearchMatch | None = None
+    search_match_count: int = Field(default=0, ge=0)
     parent_session_id: str | None = None
     # First-class project this session is filed under, or ``None`` when
     # unfiled. Lets the sidebar group sessions by project without a follow-up

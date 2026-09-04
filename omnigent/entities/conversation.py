@@ -272,6 +272,7 @@ class Conversation:
     search_item_id: str | None = None
     search_response_id: str | None = None
     search_item_created_at: int | None = None
+    search_match_count: int = 0
 
 
 # ── Conversation item data types ───────────────────────

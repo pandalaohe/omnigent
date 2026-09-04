@@ -1,8 +1,9 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { ArrowLeftIcon, CheckIcon, CopyIcon, ExternalLinkIcon, LinkIcon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactElement, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles, type Bubble } from "@/lib/renderItems";
@@ -21,11 +22,21 @@ interface ArchiveTranscriptViewerProps {
   conversation: Conversation | null;
   onBack?: () => void;
   className?: string;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 interface SelectedQuote {
   text: string;
   target: SessionLinkTarget;
+}
+
+function ExplainedAction({ content, children }: { content: string; children: ReactElement }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{children}</TooltipTrigger>
+      <TooltipContent className="max-w-72">{content}</TooltipContent>
+    </Tooltip>
+  );
 }
 
 function bubbleKey(bubble: Bubble): string {
@@ -89,12 +100,15 @@ export function ArchiveTranscriptViewer({
   conversation,
   onBack,
   className,
+  returnFocusRef,
 }: ArchiveTranscriptViewerProps) {
   const navigate = useNavigate();
   const rebasePath = useRebasePath();
   const transcriptRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [selectedQuote, setSelectedQuote] = useState<SelectedQuote | null>(null);
+  const pendingScrollAnchor = useRef<{ itemId: string; top: number } | null>(null);
+  const touchStartY = useRef<number | null>(null);
   const requestedFocusItemId = conversation?.search_match?.item_id ?? null;
   const [showMatchWindow, setShowMatchWindow] = useState(requestedFocusItemId !== null);
   const focusItemId = showMatchWindow ? requestedFocusItemId : null;
@@ -142,6 +156,34 @@ export function ArchiveTranscriptViewer({
   const bubbles = useMemo(() => buildBubbles(itemsToBlocks(items), null), [items]);
   const loading = focusItemId !== null ? focusedQuery.isLoading : historyQuery.isLoading;
   const error = focusItemId !== null ? focusedQuery.error : historyQuery.error;
+
+  const loadEarlier = useCallback(() => {
+    if (
+      focusItemId !== null ||
+      !historyQuery.hasNextPage ||
+      historyQuery.isFetchingNextPage ||
+      !transcriptRef.current
+    ) {
+      return;
+    }
+    const first = transcriptRef.current.querySelector<HTMLElement>("[data-archive-item]");
+    const itemId = first?.dataset.archiveItem?.split(" ")[0];
+    if (first && itemId) {
+      pendingScrollAnchor.current = { itemId, top: first.getBoundingClientRect().top };
+    }
+    void historyQuery.fetchNextPage();
+  }, [focusItemId, historyQuery]);
+
+  useEffect(() => {
+    const anchor = pendingScrollAnchor.current;
+    const scroller = transcriptRef.current;
+    if (!anchor || !scroller || historyQuery.isFetchingNextPage) return;
+    const element = [...scroller.querySelectorAll<HTMLElement>("[data-archive-item]")].find(
+      (candidate) => candidate.dataset.archiveItem?.split(" ").includes(anchor.itemId),
+    );
+    if (element) scroller.scrollTop += element.getBoundingClientRect().top - anchor.top;
+    pendingScrollAnchor.current = null;
+  }, [bubbles.length, historyQuery.isFetchingNextPage]);
 
   useEffect(() => {
     if (!focusItemId || items.length === 0) return;
@@ -196,33 +238,39 @@ export function ArchiveTranscriptViewer({
             {conversation.agent_name ?? "Agent not recorded"} · {conversation.id}
           </p>
         </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Copy session ID"
-          onClick={() => copy(conversation.id, "session-id")}
-        >
-          {copied === "session-id" ? <CheckIcon /> : <CopyIcon />}
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Copy session link"
-          onClick={() => copy(sessionLink, "session-link")}
-        >
-          {copied === "session-link" ? <CheckIcon /> : <LinkIcon />}
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Open full session"
-          onClick={() => navigate(`/c/${conversation.id}`)}
-        >
-          <ExternalLinkIcon />
-        </Button>
+        <ExplainedAction content="Copy the exact Session ID for API calls, logs, and cross-device lookup.">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Copy session ID"
+            onClick={() => copy(conversation.id, "session-id")}
+          >
+            {copied === "session-id" ? <CheckIcon /> : <CopyIcon />}
+          </Button>
+        </ExplainedAction>
+        <ExplainedAction content="Copy a portable Omnigent deep link that opens this archived session on any connected device that can reach its Server.">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Copy session link"
+            onClick={() => copy(sessionLink, "session-link")}
+          >
+            {copied === "session-link" ? <CheckIcon /> : <LinkIcon />}
+          </Button>
+        </ExplainedAction>
+        <ExplainedAction content="Open the complete session page without restoring or changing its archived state.">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Open full session"
+            onClick={() => navigate(`/c/${conversation.id}`)}
+          >
+            <ExternalLinkIcon />
+          </Button>
+        </ExplainedAction>
       </header>
 
       {selectedQuote && (
@@ -230,32 +278,60 @@ export function ArchiveTranscriptViewer({
           <p className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
             “{selectedQuote.text}”
           </p>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() =>
-              copy(
-                citation(
-                  selectedQuote.text,
-                  conversation,
-                  getSessionDeepLink(conversation.id, rebasePath, selectedQuote.target),
-                  selectedQuote.target,
-                ),
-                "selection",
-              )
-            }
-          >
-            {copied === "selection" ? <CheckIcon /> : <CopyIcon />}
-            Copy citation
-          </Button>
+          <ExplainedAction content="Copy the selected words together with source metadata and a deep link, ready to paste into another session as directed context.">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                copy(
+                  citation(
+                    selectedQuote.text,
+                    conversation,
+                    getSessionDeepLink(conversation.id, rebasePath, selectedQuote.target),
+                    selectedQuote.target,
+                  ),
+                  "selection",
+                )
+              }
+            >
+              {copied === "selection" ? <CheckIcon /> : <CopyIcon />}
+              Copy citation
+            </Button>
+          </ExplainedAction>
         </div>
       )}
 
       <div
         ref={transcriptRef}
         data-testid="archive-transcript"
+        tabIndex={0}
         className="min-h-0 flex-1 overflow-y-auto px-3 py-4"
+        onKeyDown={(event) => {
+          if (event.key !== "Escape") return;
+          const active = returnFocusRef?.current?.querySelector<HTMLElement>(
+            '[aria-selected="true"], [data-active="true"] [data-testid="archived-open-session"]',
+          );
+          active?.focus();
+        }}
+        onWheel={(event) => {
+          if (event.currentTarget.scrollTop <= 1 && event.deltaY < 0) loadEarlier();
+        }}
+        onTouchStart={(event) => {
+          touchStartY.current = event.touches[0]?.clientY ?? null;
+        }}
+        onTouchMove={(event) => {
+          const y = event.touches[0]?.clientY;
+          if (
+            y !== undefined &&
+            touchStartY.current !== null &&
+            event.currentTarget.scrollTop <= 1 &&
+            y - touchStartY.current > 36
+          ) {
+            touchStartY.current = y;
+            loadEarlier();
+          }
+        }}
         onMouseUp={() => {
           const selection = window.getSelection();
           const text = selection?.toString().trim() ?? "";
@@ -295,7 +371,7 @@ export function ArchiveTranscriptViewer({
                 variant="ghost"
                 size="sm"
                 disabled={historyQuery.isFetchingNextPage}
-                onClick={() => void historyQuery.fetchNextPage()}
+                onClick={loadEarlier}
               >
                 {historyQuery.isFetchingNextPage ? "Loading…" : "Load earlier conversation"}
               </Button>
@@ -338,31 +414,35 @@ export function ArchiveTranscriptViewer({
                   />
                   {text && (
                     <div className="flex justify-end gap-1 pt-1 opacity-60 transition-opacity md:opacity-0 md:group-hover/archive:opacity-100 md:group-focus-within/archive:opacity-100">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="xs"
-                        aria-label="Copy message citation"
-                        onClick={() =>
-                          copy(
-                            citation(text, conversation, link, target),
-                            `citation:${bubbleKey(bubble)}`,
-                          )
-                        }
-                      >
-                        {copied === `citation:${bubbleKey(bubble)}` ? <CheckIcon /> : <CopyIcon />}
-                        Citation
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="xs"
-                        aria-label="Copy message link"
-                        onClick={() => copy(link, `link:${bubbleKey(bubble)}`)}
-                      >
-                        {copied === `link:${bubbleKey(bubble)}` ? <CheckIcon /> : <LinkIcon />}
-                        Link
-                      </Button>
+                      <ExplainedAction content="Citation copies this message or response text, its source metadata, and its directed deep link so another session can ingest it as context.">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="xs"
+                          aria-label="Copy message citation"
+                          onClick={() =>
+                            copy(
+                              citation(text, conversation, link, target),
+                              `citation:${bubbleKey(bubble)}`,
+                            )
+                          }
+                        >
+                          {copied === `citation:${bubbleKey(bubble)}` ? <CheckIcon /> : <CopyIcon />}
+                          Citation
+                        </Button>
+                      </ExplainedAction>
+                      <ExplainedAction content="Link copies only the deep link to this exact message or response; it does not include the message text.">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="xs"
+                          aria-label="Copy message link"
+                          onClick={() => copy(link, `link:${bubbleKey(bubble)}`)}
+                        >
+                          {copied === `link:${bubbleKey(bubble)}` ? <CheckIcon /> : <LinkIcon />}
+                          Link
+                        </Button>
+                      </ExplainedAction>
                     </div>
                   )}
                 </article>

@@ -36,7 +36,13 @@ import {
   dataUrlToFile,
   type DesignModeElement,
 } from "@/lib/designModePrompt";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  readInheritLastRightRailTab,
+  readLastExplicitRightRailTab,
+  readSessionWorkspaceState,
+  writeLastExplicitRightRailTab,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 import {
   readDefaultWorkspacePanelOpen,
   writeDefaultWorkspacePanelOpen,
@@ -223,9 +229,12 @@ export function AppShell() {
   // (rail open/width/tab/open files) used throughout this component.
   const { conversationId } = useParams<{ conversationId: string }>();
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
-  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
-    conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
-  );
+  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() => {
+    if (!conversationId) return "files";
+    const persistedTab = readSessionWorkspaceState(conversationId).rightRailTab;
+    if (persistedTab) return persistedTab;
+    return readInheritLastRightRailTab() ? readLastExplicitRightRailTab() : "files";
+  });
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on any other tab the FileViewer
   // is unmounted, so the 720 floor would just waste horizontal space. Both
@@ -1002,7 +1011,9 @@ export function AppShell() {
     // itself). ``nextTab`` stays null when there's no persisted tab and no file
     // to surface, so the tab-fallback effect can still land on the first
     // *available* tab — forcing "files" here would shadow it.
-    let nextTab: RightRailTab | null = persisted.rightRailTab ?? null;
+    let nextTab: RightRailTab | null =
+      persisted.rightRailTab ??
+      (readInheritLastRightRailTab() ? readLastExplicitRightRailTab() : null);
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
@@ -1034,6 +1045,12 @@ export function AppShell() {
     // pull the rail to Files unless it's already on a files scope.
     if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
       nextTab = "files";
+    }
+    if (nextTab !== null && !railTabsAvailable[nextTab]) {
+      nextTab =
+        (["files", "changes", "github", "subagents", "archive", "browser"] as const).find(
+          (tab) => railTabsAvailable[tab],
+        ) ?? null;
     }
     if (nextTab !== null) setRightRailTab(nextTab);
 
@@ -1445,6 +1462,7 @@ export function AppShell() {
   // open file to reveal the picked tab's scope list.
   function handleRightRailTabChange(next: RightRailTab) {
     setRightRailTab(next);
+    writeLastExplicitRightRailTab(next);
     if (selectedFilePath !== null) {
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);
@@ -2034,6 +2052,8 @@ export function AppShell() {
                 {conversationId && workspacePanelVisible && (
                   <WorkspacePanel
                     conversationId={conversationId}
+                    archiveInitialProject={headerProjectName}
+                    archiveInitialHostId={livenessRow?.host_id}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}
                     handleProps={inlinePanelHandleProps}
