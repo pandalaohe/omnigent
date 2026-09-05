@@ -3143,11 +3143,14 @@ def _parse_external_conversation_item(
             "external_conversation_item data.response_id must be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
-    # NOTE: external conversation items are persisted with a random
-    # primary key like any other item — there is no server-side dedup.
-    # Producers (the claude-native / codex-native forwarders) are
-    # responsible for not re-posting records they have already sent;
-    # they no longer emit a ``source_id`` dedup key to the server.
+    source_id = body.data.get("source_id")
+    if source_id is not None and (
+        not isinstance(source_id, str) or not source_id or len(source_id) > 1024
+    ):
+        raise OmnigentError(
+            "external item source_id must be a non-empty string up to 1024 characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
@@ -3162,6 +3165,7 @@ def _parse_external_conversation_item(
         type=item_type,
         response_id=response_id.strip(),
         data=data,
+        idempotency_key=f"external:{source_id}" if source_id is not None else None,
     )
 
 
@@ -3410,12 +3414,16 @@ def _publish_session_created(
     session_stream.publish(parent_id, event.model_dump())
 
 
+_NATIVE_REGISTRATION_ID_LABEL_KEY = "omnigent.native_registration_id"
+_MAX_NATIVE_REGISTRATION_ID_LEN = 128
+
+
 async def _persist_external_subagent_start(
     parent_id: str,
     parent_conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
-) -> str:
+) -> tuple[str, bool]:
     """
     Mint a child :class:`Conversation` row for a claude-native
     sub-agent and emit the parent's ``session.created`` SSE event.
@@ -3445,10 +3453,13 @@ async def _persist_external_subagent_start(
         ``subagent_id`` (Claude-side id, e.g. ``"a5c7eff..."``),
         ``agent_type`` (e.g. ``"Explore"``), ``description``
         (free-form, used in the title), and optional ``tool_use_id``
-        (e.g. ``"toolu_..."``) for newer forwarders.
+        (e.g. ``"toolu_..."``) and ``registration_id`` (the creating
+        forwarder's bounded retry token) for newer forwarders.
     :param conversation_store: Store used to read existing children
         (for idempotency) and create the new row.
-    :returns: The child conversation id, e.g. ``"conv_child456"``.
+    :returns: The child conversation id and whether it predates the current
+        registration attempt. A retry carrying the same ``registration_id``
+        as the creator returns ``False`` so its first completion remains live.
     :raises OmnigentError: 400 if the payload is missing any of
         the required keys; 400 if the parent has no ``agent_id``
         (claude-native parents always carry one, so this would be
@@ -3458,6 +3469,7 @@ async def _persist_external_subagent_start(
     agent_type = body.data.get("agent_type")
     description = body.data.get("description")
     tool_use_id = body.data.get("tool_use_id")
+    registration_id = body.data.get("registration_id")
     if not isinstance(subagent_id, str) or not subagent_id:
         raise OmnigentError(
             "external_subagent_start requires non-empty data.subagent_id",
@@ -3478,6 +3490,18 @@ async def _persist_external_subagent_start(
             "external_subagent_start data.tool_use_id must be a non-empty string when present",
             code=ErrorCode.INVALID_INPUT,
         )
+    if registration_id is not None:
+        if (
+            not isinstance(registration_id, str)
+            or not registration_id.strip()
+            or len(registration_id) > _MAX_NATIVE_REGISTRATION_ID_LEN
+        ):
+            raise OmnigentError(
+                "external_subagent_start data.registration_id must be a non-empty string "
+                f"up to {_MAX_NATIVE_REGISTRATION_ID_LEN} characters when present",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        registration_id = registration_id.strip()
     if parent_conv.agent_id is None:
         # claude-native parents are always created with an agent_id
         # by ``omnigent claude`` (the synthetic Claude bundle).
@@ -3502,7 +3526,11 @@ async def _persist_external_subagent_start(
         subagent_id,
     )
     if existing is not None:
-        return existing.id
+        same_registration = (
+            registration_id is not None
+            and existing.labels.get(_NATIVE_REGISTRATION_ID_LABEL_KEY) == registration_id
+        )
+        return existing.id, not same_registration
 
     # Title format mirrors omnigent-spawned children
     # (``"{tool}:{session_name}"``) so the rail's split-on-colon
@@ -3525,6 +3553,8 @@ async def _persist_external_subagent_start(
     }
     if isinstance(tool_use_id, str):
         labels[_CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY] = tool_use_id
+    if isinstance(registration_id, str):
+        labels[_NATIVE_REGISTRATION_ID_LABEL_KEY] = registration_id
 
     try:
         child = await asyncio.to_thread(
@@ -3554,17 +3584,34 @@ async def _persist_external_subagent_start(
         )
         if adopted is None:
             raise
-        await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
+        adopted_registration_id = adopted.labels.get(_NATIVE_REGISTRATION_ID_LABEL_KEY)
+        same_registration = (
+            registration_id is not None and adopted_registration_id == registration_id
+        )
+        # The collision can still be healed as an existing historical child,
+        # but the title alone does not prove this request created the row.
+        # Preserve a missing or different stored owner token so a later retry
+        # cannot reclassify old work as current merely by supplying a new id.
+        adopted_labels = (
+            labels
+            if same_registration
+            else {
+                key: value
+                for key, value in labels.items()
+                if key != _NATIVE_REGISTRATION_ID_LABEL_KEY
+            }
+        )
+        await asyncio.to_thread(conversation_store.set_labels, adopted.id, adopted_labels)
         # The POST that created this orphan died before reaching the
         # ``session.created`` publish below, so live clients (the web
         # Subagents rail) have never heard about the child — emit it now.
         # In the concurrent-race case the winner also published; a
         # duplicate event is a harmless extra cache invalidation.
         _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
-        return adopted.id
+        return adopted.id, not same_registration
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     _publish_session_created(parent_id, child.id, parent_conv.agent_id)
-    return child.id
+    return child.id, False
 
 
 def _antigravity_subagent_title(role: str, cascade_id: str) -> str:

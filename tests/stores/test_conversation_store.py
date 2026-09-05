@@ -570,6 +570,172 @@ def test_only_one_store_worker_can_claim_deletion(db_uri: str) -> None:
 # ── Append & list items ──────────────────────────────
 
 
+def test_native_replay_keeps_item_identity_and_history_order(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_claude_original",
+        data=MessageData(
+            role="user", content=[{"type": "input_text", "text": "historical instruction"}]
+        ),
+        idempotency_key="external:source-uuid:0:message",
+    )
+    first = conversation_store.append(conv.id, [item])[0]
+    replay = conversation_store.append(conv.id, [item, item])
+    assert [row.id for row in replay] == [first.id, first.id]
+    assert [row.created_at for row in replay] == [first.created_at, first.created_at]
+    assert len(conversation_store.list_items(conv.id).data) == 1
+    other = conversation_store.create_conversation()
+    assert conversation_store.append(other.id, [item])[0].id != first.id
+
+
+def test_native_replay_recognizes_legacy_child_without_merging_new_turn(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_claude_original",
+        data=MessageData(
+            role="user", content=[{"type": "input_text", "text": "historical instruction"}]
+        ),
+    )
+    # The same real instruction can occur twice; cold batching also changes
+    # response IDs. Match in order, preserving both distinct stored rows.
+    originals = conversation_store.append(conv.id, [item, item])
+    after = None
+    for index, original in enumerate(originals):
+        replay = item.model_copy(
+            update={
+                "idempotency_key": f"external:old-source-{index}",
+                "response_id": "different-cold-batch",
+                "native_recovery": True,
+                "recovery_after": after,
+            }
+        )
+        found = conversation_store.append(conv.id, [replay])[0]
+        assert found.id == original.id and found.replayed
+        after = found.id
+    assert len(conversation_store.list_items(conv.id).data) == 2
+    # An offline, not-yet-uploaded historical suffix is inserted once.
+    suffix = item.model_copy(
+        update={
+            "idempotency_key": "external:suffix",
+            "native_recovery": True,
+            "recovery_after": after,
+        }
+    )
+    first = conversation_store.append(conv.id, [suffix])[0]
+    assert conversation_store.append(conv.id, [suffix])[0].id == first.id
+    assert len(conversation_store.list_items(conv.id).data) == 3
+
+
+def test_native_recovery_conflict_does_not_search_ahead_or_append(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.stores.conversation_store import NativeReplayConflictError
+
+    conv = conversation_store.create_conversation()
+
+    def message(text: str) -> NewConversationItem:
+        return NewConversationItem(
+            type="message",
+            response_id="old",
+            data=MessageData(
+                role="user",
+                content=[{"type": "input_text", "text": text}],
+            ),
+        )
+
+    a, b = conversation_store.append(conv.id, [message("A"), message("B")])
+    replay = message("B").model_copy(
+        update={
+            "native_recovery": True,
+            "idempotency_key": "external:b",
+        }
+    )
+    with pytest.raises(NativeReplayConflictError, match="prefix differs"):
+        conversation_store.append(conv.id, [replay])
+    assert [row.id for row in conversation_store.list_items(conv.id).data] == [a.id, b.id]
+    with pytest.raises(NativeReplayConflictError, match="cursor is missing"):
+        conversation_store.append(
+            conv.id, [replay.model_copy(update={"recovery_after": "missing"})]
+        )
+
+
+def test_native_source_conflict_preserves_original(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.stores.conversation_store import NativeReplayConflictError
+
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="old",
+        idempotency_key="source",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "first"}]),
+    )
+    original = conversation_store.append(conv.id, [item])[0]
+    changed = item.model_copy(
+        update={
+            "data": MessageData(role="user", content=[{"type": "input_text", "text": "different"}])
+        }
+    )
+    with pytest.raises(NativeReplayConflictError, match="source identity"):
+        conversation_store.append(conv.id, [changed])
+    assert conversation_store.list_items(conv.id).data[0].id == original.id
+
+
+def test_native_source_replay_preserves_server_restored_uploads(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.stores.conversation_store import NativeReplayConflictError
+
+    conv = conversation_store.create_conversation()
+    stored = NewConversationItem(
+        type="message",
+        response_id="old",
+        idempotency_key="source",
+        data=MessageData(
+            role="user",
+            content=[
+                {"type": "input_text", "text": "look"},
+                {"type": "input_image", "file_id": "upload-a"},
+                {"type": "input_text", "text": "here"},
+            ],
+        ),
+    )
+    original = conversation_store.append(conv.id, [stored])[0]
+    replay = stored.model_copy(
+        update={
+            "data": MessageData(
+                role="user",
+                content=[{"type": "input_text", "text": "look\n[Attached: /tmp/a.png]\nhere"}],
+            )
+        }
+    )
+    assert conversation_store.append(conv.id, [replay])[0].id == original.id
+    assert (
+        conversation_store.append(conv.id, [replay.model_copy(update={"native_recovery": True})])[
+            0
+        ].id
+        == original.id
+    )
+    # Legacy history without a source anchor cannot prove attachment identity.
+    with pytest.raises(NativeReplayConflictError, match="prefix differs"):
+        conversation_store.append(
+            conv.id,
+            [
+                replay.model_copy(
+                    update={"idempotency_key": "unknown-source", "native_recovery": True}
+                )
+            ],
+        )
+    assert conversation_store.list_items(conv.id).data[0].data == stored.data
+
+
 def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     items = conversation_store.append(

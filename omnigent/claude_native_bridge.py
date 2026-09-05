@@ -475,6 +475,7 @@ class ClaudeTaskNotification:
     tool_use_id: str | None = None
     status: str | None = None
     result: str | None = None
+    replayed: bool = False
 
 
 @dataclass(frozen=True)
@@ -2479,7 +2480,7 @@ def read_transcript_items_since_with_position(
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
-        task_notifications=tuple(task_notifications),
+        task_notifications=_dedupe_task_notifications(task_notifications),
         goal_state_observed=goal_state_observed,
         latest_goal_state=latest_goal_state,
     )
@@ -2494,6 +2495,7 @@ def read_transcript_items_from_offset(
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
     include_sidechains: bool = False,
+    end_offset: int | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items appended after a byte offset.
@@ -2522,12 +2524,16 @@ def read_transcript_items_from_offset(
         leave the sub-agent's child Omnigent conversation empty. The
         default ``False`` keeps the parent-transcript path
         unchanged.
+    :param end_offset: Optional frozen byte boundary. Only complete records
+        ending at or before this offset are consumed, even if the file grows
+        while it is being read.
     :returns: Parsed items plus updated line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
         transcript_path,
         byte_offset=byte_offset,
         start_line=start_line,
+        end_offset=end_offset,
     )
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
@@ -2584,7 +2590,7 @@ def read_transcript_items_from_offset(
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
-        task_notifications=tuple(task_notifications),
+        task_notifications=_dedupe_task_notifications(task_notifications),
         goal_state_observed=goal_state_observed,
         latest_goal_state=latest_goal_state,
     )
@@ -3076,6 +3082,7 @@ def _read_complete_jsonl_records(
     byte_offset: int,
     start_line: int,
     emit_after_line: int | None = None,
+    end_offset: int | None = None,
 ) -> _JsonlReadResult:
     """
     Read complete newline-terminated records from a JSONL file.
@@ -3092,12 +3099,16 @@ def _read_complete_jsonl_records(
     :param emit_after_line: When provided, complete records at or
         before this line number are counted for cursor migration but
         not decoded or stored.
+    :param end_offset: Optional frozen upper byte boundary. Records crossing
+        the boundary are treated as a trailing partial record.
     :returns: Complete records plus updated line and byte cursors.
     """
     if byte_offset < 0:
         raise ValueError(f"byte_offset must be non-negative, got {byte_offset}")
     if start_line < 0:
         raise ValueError(f"start_line must be non-negative, got {start_line}")
+    if end_offset is not None and end_offset < 0:
+        raise ValueError(f"end_offset must be non-negative, got {end_offset}")
     records: list[_JsonlRecord] = []
     cursor = start_line
     position = byte_offset
@@ -3105,15 +3116,16 @@ def _read_complete_jsonl_records(
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             file_size = handle.tell()
+            read_end = file_size if end_offset is None else min(file_size, end_offset)
             if byte_offset > file_size:
                 handle.seek(0)
                 cursor = 0
                 position = 0
             else:
                 handle.seek(byte_offset)
-            while True:
+            while position < read_end:
                 record_start = position
-                raw = handle.readline()
+                raw = handle.readline(read_end - position)
                 if not raw:
                     break
                 if not raw.endswith(b"\n"):
@@ -6278,24 +6290,125 @@ def _task_notification_from_text(text: str) -> ClaudeTaskNotification | None:
     )
 
 
-def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotification]:
-    """Extract task notifications without retaining their private path fields."""
+def _omnigent_task_notification(raw: object) -> ClaudeTaskNotification | None:
+    """Parse one terminal notification preserved by an Omnigent transcript rebuild."""
+    if not isinstance(raw, dict):
+        return None
+    tool_use_id = raw.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+        return None
+    status = raw.get("status")
+    if status not in _TERMINAL_BACKGROUND_TASK_STATUSES:
+        return None
+    result = raw.get("result")
+    if result is not None and not isinstance(result, str):
+        return None
+    return ClaudeTaskNotification(
+        task_id=tool_use_id,
+        tool_use_id=tool_use_id,
+        status=status,
+        result=result,
+        replayed=True,
+    )
+
+
+def _omnigent_tool_result_metadata(entry: _JsonObject) -> _JsonObject:
+    """Read lifecycle fields retained by Omnigent's transcript serializer."""
+    raw = entry.get("omnigentToolResult")
+    if not isinstance(raw, dict) or raw.get("tool_name") not in {"Agent", "Task"}:
+        return {}
+    status = raw.get("tool_status")
+    if not isinstance(status, str) or not status:
+        return {}
+    data: _JsonObject = {"tool_status": status}
+    for key in ("is_async", "is_error"):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if not isinstance(value, bool):
+            return {}
+        data[key] = value
+    return data
+
+
+def _omnigent_tool_result_notification(entry: _JsonObject) -> ClaudeTaskNotification | None:
+    """Convert one rebuilt Agent/Task result into its terminal lifecycle edge."""
+    metadata = _omnigent_tool_result_metadata(entry)
+    status = metadata.get("tool_status")
+    if not isinstance(status, str) or status not in _TERMINAL_BACKGROUND_TASK_STATUSES:
+        return None
     message = entry.get("message")
     if not isinstance(message, dict) or message.get("role") != "user":
-        return []
+        return None
     content = message.get("content")
-    texts: list[str] = []
-    if isinstance(content, str):
-        texts.append(content)
-    elif isinstance(content, list):
-        texts.extend(
-            text
-            for block in content
-            if isinstance(block, dict)
-            and block.get("type") == "text"
-            and isinstance((text := block.get("text")), str)
+    if not isinstance(content, list):
+        return None
+    tool_results = [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+    if len(tool_results) != 1:
+        return None
+    block = tool_results[0]
+    tool_use_id = block.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+        return None
+    return ClaudeTaskNotification(
+        task_id=tool_use_id,
+        tool_use_id=tool_use_id,
+        status=status,
+        result=_tool_result_output(entry, block),
+        replayed=True,
+    )
+
+
+def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotification]:
+    """Extract task notifications without retaining their private path fields."""
+    notifications: list[ClaudeTaskNotification] = []
+    message = entry.get("message")
+    if isinstance(message, dict) and message.get("role") == "user":
+        content = message.get("content")
+        texts: list[str] = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(
+                text
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance((text := block.get("text")), str)
+            )
+        notifications.extend(
+            parsed for text in texts if (parsed := _task_notification_from_text(text))
         )
-    return [parsed for text in texts if (parsed := _task_notification_from_text(text))]
+
+    preserved = entry.get("omnigentTaskNotifications")
+    if isinstance(preserved, list):
+        notifications.extend(
+            parsed for raw in preserved if (parsed := _omnigent_task_notification(raw))
+        )
+    rebuilt = _omnigent_tool_result_notification(entry)
+    if rebuilt is not None:
+        notifications.append(rebuilt)
+    return notifications
+
+
+def _dedupe_task_notifications(
+    notifications: list[ClaudeTaskNotification],
+) -> tuple[ClaudeTaskNotification, ...]:
+    """Collapse replayed terminal evidence keyed by its stable tool-use id."""
+    deduped: list[ClaudeTaskNotification] = []
+    seen_tool_use_ids: set[str] = set()
+    for notification in notifications:
+        tool_use_id = notification.tool_use_id
+        if tool_use_id is not None:
+            if tool_use_id in seen_tool_use_ids:
+                continue
+            seen_tool_use_ids.add(tool_use_id)
+        deduped.append(notification)
+    return tuple(deduped)
 
 
 def _task_notification_item_data(notification: ClaudeTaskNotification) -> _JsonObject:
@@ -6965,6 +7078,7 @@ def _tool_result_metadata(entry: _JsonObject, block: _JsonObject) -> _JsonObject
     block_error = block.get("is_error")
     if isinstance(block_error, bool):
         data["is_error"] = block_error
+    data.update(_omnigent_tool_result_metadata(entry))
     return data
 
 

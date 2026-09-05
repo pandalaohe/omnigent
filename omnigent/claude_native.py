@@ -5106,7 +5106,30 @@ def _claude_transcript_records_from_session_items(
     records: list[_JsonObject] = []
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
+    tool_names_by_call_id: dict[str, str] = {}
+    terminal_tasks: dict[str, _JsonObject] = {}
     for index, item in enumerate(items):
+        call_id = item.get("call_id")
+        if item.get("type") == "function_call" and isinstance(call_id, str):
+            name = item.get("name")
+            if isinstance(name, str):
+                tool_names_by_call_id[call_id] = name
+                terminal_tasks.pop(call_id, None)
+        elif (
+            item.get("type") == "function_call_output"
+            and isinstance(call_id, str)
+            and tool_names_by_call_id.get(call_id) in ("Agent", "Task")
+        ):
+            task_status = item.get("tool_status")
+            if task_status in ("completed", "failed", "stopped", "killed"):
+                result = item.get("output")
+                terminal_tasks[call_id] = {
+                    "tool_use_id": call_id,
+                    "status": task_status,
+                    "result": result if isinstance(result, str) else None,
+                }
+            elif isinstance(task_status, str) and task_status:
+                terminal_tasks.pop(call_id, None)
         # Compaction items carry the post-compaction context. Replace
         # all prior records with the compacted messages so the
         # reconstructed transcript reflects the compacted state.
@@ -5182,6 +5205,7 @@ def _claude_transcript_records_from_session_items(
             parent_uuid=tool_parent_by_call_id.get(str(item.get("call_id"))) or parent_uuid,
             cwd=cwd,
             bridge_dir=bridge_dir,
+            tool_name=tool_names_by_call_id.get(str(item.get("call_id"))),
         )
         if record is None:
             continue
@@ -5191,6 +5215,11 @@ def _claude_transcript_records_from_session_items(
             if isinstance(call_id, str) and call_id:
                 tool_parent_by_call_id[call_id] = record_uuid
         parent_uuid = record_uuid
+    if records and terminal_tasks:
+        # Compaction drops earlier model context, but must not erase the
+        # lifecycle evidence used to settle rediscovered native children.
+        # Keep this local metadata outside Claude's message/tool payloads.
+        records[-1]["omnigentTaskNotifications"] = list(terminal_tasks.values())
     return records
 
 
@@ -5203,6 +5232,7 @@ def _claude_transcript_record_from_session_item(
     cwd: Path,
     bridge_dir: Path,
     allow_native_message_content: bool = False,
+    tool_name: str | None = None,
 ) -> _JsonObject | None:
     """
     Convert one Omnigent item into one Claude transcript record.
@@ -5228,6 +5258,7 @@ def _claude_transcript_record_from_session_item(
         attachment blocks.
     :param allow_native_message_content: Accept Claude-native string and
         content-block shapes when API-block conversion finds no content.
+    :param tool_name: Name of the correlated call, when known from history.
     :returns: Claude transcript record, or ``None`` for unsupported or
         empty Omnigent items.
     """
@@ -5315,6 +5346,16 @@ def _claude_transcript_record_from_session_item(
         extra["toolUseResult"] = _tool_use_result_for_content(
             output, content_blocks, rehydrated.dropped_oversized_image
         )
+        lifecycle: _JsonObject = {}
+        if isinstance(item.get("tool_status"), str):
+            lifecycle["tool_status"] = item["tool_status"]
+        for key in ("is_async", "is_error"):
+            if isinstance(item.get(key), bool):
+                lifecycle[key] = item[key]
+        if lifecycle:
+            if tool_name is not None:
+                lifecycle["tool_name"] = tool_name
+            extra["omnigentToolResult"] = lifecycle
     else:
         return None
     return {

@@ -4249,7 +4249,7 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
     )
 
     try:
-        item_id = await _persist_external_conversation_item(
+        item_id, replayed = await _persist_external_conversation_item(
             "823dbd1aab969b5a813fac59bb977a77",
             conv,
             body,
@@ -4257,6 +4257,7 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
         )
 
         assert item_id == "item_2"
+        assert replayed is False
         assert pending_inputs.snapshot_for("823dbd1aab969b5a813fac59bb977a77") == []
         assert [item.type for item in store.appended_items] == ["message", "error", "message"]
         skipped_user, skipped_error, matched_user = store.appended_items

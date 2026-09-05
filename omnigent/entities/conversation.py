@@ -822,6 +822,12 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
+    # Internal store key for a vendor transcript record. Ordinary messages
+    # retain random IDs; native forwarders supply their stable source identity.
+    idempotency_key: str | None = Field(default=None, exclude=True)
+    # Ordered cold-transcript recovery; None is the beginning of history.
+    native_recovery: bool = Field(default=False, exclude=True)
+    recovery_after: str | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -858,6 +864,46 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    replayed: bool = Field(default=False, exclude=True)
+
+    def matches_native_replay(self, incoming: NewConversationItem, *, exact_source: bool) -> bool:
+        """Compare vendor data, allowing stored uploads only with a known source ID."""
+        if self.type != incoming.type:
+            return False
+        if self.data == incoming.data:
+            return True
+        old, new = self.data, incoming.data
+        if not (
+            exact_source
+            and isinstance(old, MessageData)
+            and isinstance(new, MessageData)
+            and old.role == new.role == "user"
+            and old.model_dump(exclude={"content"}) == new.model_dump(exclude={"content"})
+        ):
+            return False
+        file_types = {"input_image", "input_file"}
+        if not any(block.get("type") in file_types for block in old.content) or any(
+            block.get("type") in file_types for block in new.content
+        ):
+            return False
+
+        def mirrored_text(content: list[dict[str, Any]], *, strip_markers: bool) -> str:
+            text = "\n".join(
+                str(block.get("text", ""))
+                for block in content
+                if block.get("type") in {"input_text", "output_text", "text"}
+            )
+            if strip_markers:
+                text = "\n".join(
+                    line
+                    for line in text.splitlines()
+                    if not _ATTACHMENT_MARKER_RE.fullmatch(line.strip())
+                )
+            return " ".join(text.split())
+
+        return mirrored_text(old.content, strip_markers=False) == mirrored_text(
+            new.content, strip_markers=True
+        )
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:

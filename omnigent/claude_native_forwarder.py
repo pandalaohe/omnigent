@@ -10,6 +10,7 @@ import logging
 import os
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -62,6 +63,7 @@ _HOOKS_FILE = "hooks.jsonl"
 # a handful over its lifetime, so a small bound is ample while still
 # surviving a cursor rewind that re-reads an already-persisted summary.
 _MAX_PERSISTED_COMPACTION_SEQS = 16
+_SUBAGENT_RECOVERY_BATCH_ITEMS = 64
 
 # Cap on the in-memory ``(message_id, index)`` dedupe ring for streamed
 # deltas. The byte offset already prevents re-reading on the normal
@@ -402,6 +404,17 @@ class SubagentEntry:
     :param terminal_status: Correlated structured status from the parent Task
         notification, retained until the Server acknowledges delivery.
     :param terminal_output: Result carried by the correlated Task notification.
+    :param terminal_replayed: Whether the terminal notification was restored
+        from Omnigent's cold-resume metadata rather than emitted live by Claude.
+    :param recovery_watermark: Frozen complete-record EOF for a child already
+        known by the Server. While set, the prefix is reconciled as history and
+        cannot produce live activity.
+    :param parent_recovery_watermark: Frozen parent transcript boundary for
+        this existing child's terminal notification only.
+    :param recovery_after: Server item id acknowledged immediately before the
+        next historical item.
+    :param recovery_seen_source_ids: Historical item source ids already
+        acknowledged within the frozen prefix.
     """
 
     subagent_id: str
@@ -414,6 +427,11 @@ class SubagentEntry:
     quiet_terminal_output: str | None = None
     terminal_status: str | None = None
     terminal_output: str | None = None
+    terminal_replayed: bool = False
+    recovery_watermark: int | None = None
+    parent_recovery_watermark: int | None = None
+    recovery_after: str | None = None
+    recovery_seen_source_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -439,7 +457,10 @@ class SubagentForwardState:
     subagents: dict[str, SubagentEntry]
     parent_byte_offset: int = 0
     parent_line_cursor: int = 0
-    pending_terminal_notifications: dict[str, tuple[str, str | None]] = field(default_factory=dict)
+    pending_registration_watermarks: dict[str, tuple[int, int, str]] = field(default_factory=dict)
+    pending_terminal_notifications: dict[str, tuple[str, str | None, bool]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -1180,23 +1201,48 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         return SubagentForwardState(subagents={})
     parent_byte_offset = raw.get("parent_byte_offset", 0)
     parent_line_cursor = raw.get("parent_line_cursor", 0)
+    pending_registration_raw = raw.get("pending_registration_watermarks", {})
     pending_raw = raw.get("pending_terminal_notifications", {})
     if not isinstance(parent_byte_offset, int) or parent_byte_offset < 0:
         parent_byte_offset = 0
     if not isinstance(parent_line_cursor, int) or parent_line_cursor < 0:
         parent_line_cursor = 0
-    pending_terminal_notifications: dict[str, tuple[str, str | None]] = {}
+    pending_registration_watermarks: dict[str, tuple[int, int, str]] = {}
+    if isinstance(pending_registration_raw, dict):
+        for subagent_id, row in pending_registration_raw.items():
+            if not isinstance(subagent_id, str) or not isinstance(row, dict):
+                continue
+            child_watermark = row.get("child_watermark")
+            parent_watermark = row.get("parent_watermark")
+            registration_id = row.get("registration_id")
+            if (
+                isinstance(child_watermark, int)
+                and child_watermark >= 0
+                and isinstance(parent_watermark, int)
+                and parent_watermark >= 0
+            ):
+                pending_registration_watermarks[subagent_id] = (
+                    child_watermark,
+                    parent_watermark,
+                    registration_id
+                    if isinstance(registration_id, str) and registration_id
+                    else uuid.uuid4().hex,
+                )
+    pending_terminal_notifications: dict[str, tuple[str, str | None, bool]] = {}
     if isinstance(pending_raw, dict):
         for tool_use_id, row in pending_raw.items():
             if not isinstance(tool_use_id, str) or not isinstance(row, dict):
                 continue
             status = row.get("status")
             output = row.get("output")
-            if status not in _SUBAGENT_TERMINAL_STATUSES:
+            replayed = row.get("replayed", False)
+            if not isinstance(status, str) or status not in _SUBAGENT_TERMINAL_STATUSES:
                 continue
             if output is not None and not isinstance(output, str):
                 output = None
-            pending_terminal_notifications[tool_use_id] = (status, output)
+            if not isinstance(replayed, bool):
+                replayed = False
+            pending_terminal_notifications[tool_use_id] = (status, output, replayed)
     entries: dict[str, SubagentEntry] = {}
     for subagent_id, row in subagents_raw.items():
         if not isinstance(subagent_id, str) or not isinstance(row, dict):
@@ -1210,6 +1256,11 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         quiet_terminal_output = row.get("quiet_terminal_output")
         terminal_status = row.get("terminal_status")
         terminal_output = row.get("terminal_output")
+        terminal_replayed = row.get("terminal_replayed", False)
+        recovery_watermark = row.get("recovery_watermark")
+        entry_parent_recovery_watermark = row.get("parent_recovery_watermark")
+        recovery_after = row.get("recovery_after")
+        recovery_seen_source_ids = row.get("recovery_seen_source_ids", [])
         # Empty string is a valid parked sentinel written by
         # ``_forward_available_subagents`` after the start POST exhausts
         # its permanent-failure budget. Preserving it across restarts is
@@ -1234,6 +1285,21 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             terminal_status = None
         if terminal_output is not None and not isinstance(terminal_output, str):
             terminal_output = None
+        if not isinstance(terminal_replayed, bool):
+            terminal_replayed = False
+        if not isinstance(recovery_watermark, int) or recovery_watermark < byte_offset:
+            recovery_watermark = None
+        if (
+            not isinstance(entry_parent_recovery_watermark, int)
+            or entry_parent_recovery_watermark < parent_byte_offset
+        ):
+            entry_parent_recovery_watermark = None
+        if recovery_after is not None and not isinstance(recovery_after, str):
+            recovery_after = None
+        if not isinstance(recovery_seen_source_ids, list) or not all(
+            isinstance(source_id, str) for source_id in recovery_seen_source_ids
+        ):
+            recovery_seen_source_ids = []
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
             child_conversation_id=child_id,
@@ -1245,11 +1311,17 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             quiet_terminal_output=quiet_terminal_output,
             terminal_status=terminal_status,
             terminal_output=terminal_output,
+            terminal_replayed=terminal_replayed,
+            recovery_watermark=recovery_watermark,
+            parent_recovery_watermark=entry_parent_recovery_watermark,
+            recovery_after=recovery_after,
+            recovery_seen_source_ids=tuple(recovery_seen_source_ids),
         )
     return SubagentForwardState(
         subagents=entries,
         parent_byte_offset=parent_byte_offset,
         parent_line_cursor=parent_line_cursor,
+        pending_registration_watermarks=pending_registration_watermarks,
         pending_terminal_notifications=pending_terminal_notifications,
     )
 
@@ -1275,14 +1347,31 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "quiet_terminal_output": entry.quiet_terminal_output,
                 "terminal_status": entry.terminal_status,
                 "terminal_output": entry.terminal_output,
+                "terminal_replayed": entry.terminal_replayed,
+                "recovery_watermark": entry.recovery_watermark,
+                "parent_recovery_watermark": entry.parent_recovery_watermark,
+                "recovery_after": entry.recovery_after,
+                "recovery_seen_source_ids": list(entry.recovery_seen_source_ids),
             }
             for entry in state.subagents.values()
         },
         "parent_byte_offset": state.parent_byte_offset,
         "parent_line_cursor": state.parent_line_cursor,
+        "pending_registration_watermarks": {
+            subagent_id: {
+                "child_watermark": child_watermark,
+                "parent_watermark": parent_watermark,
+                "registration_id": registration_id,
+            }
+            for subagent_id, (child_watermark, parent_watermark, registration_id) in (
+                state.pending_registration_watermarks.items()
+            )
+        },
         "pending_terminal_notifications": {
-            tool_use_id: {"status": status, "output": output}
-            for tool_use_id, (status, output) in state.pending_terminal_notifications.items()
+            tool_use_id: {"status": status, "output": output, "replayed": replayed}
+            for tool_use_id, (status, output, replayed) in (
+                state.pending_terminal_notifications.items()
+            )
         },
         "updated_at": time.time(),
     }
@@ -1340,6 +1429,14 @@ def _parse_json_response(resp: httpx.Response, *, context: str) -> dict[str, obj
     return {str(key): value for key, value in payload.items()}
 
 
+@dataclass(frozen=True)
+class _ExternalSubagentStartResult:
+    """Server identity result for one native child registration."""
+
+    child_session_id: str
+    existing: bool
+
+
 async def _post_external_subagent_start(
     client: httpx.AsyncClient,
     *,
@@ -1348,10 +1445,10 @@ async def _post_external_subagent_start(
     agent_type: str,
     description: str,
     tool_use_id: str,
-) -> str:
+    registration_id: str,
+) -> _ExternalSubagentStartResult:
     """
-    POST ``external_subagent_start`` to the Omnigent server and return the
-    minted child Conversation id.
+    POST ``external_subagent_start`` and return the child identity boundary.
 
     :param client: Omnigent HTTP client.
     :param parent_session_id: Parent (claude-native) conversation id,
@@ -1365,7 +1462,10 @@ async def _post_external_subagent_start(
         e.g. ``"Investigate web UI session data flow"``.
     :param tool_use_id: Parent transcript's ``Task`` tool-use block
         id this sub-agent was spawned from, e.g. ``"toolu_..."``.
-    :returns: The Omnigent child conversation id, e.g. ``"conv_child456"``.
+    :param registration_id: Durable idempotency id reused across retries of
+        this one Host-side registration attempt.
+    :returns: Child conversation id plus whether it already existed. A Server
+        that omits ``existing`` is treated conservatively as pre-existing.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     :raises KeyError: If the server response is missing
         ``child_session_id`` — indicates a server/forwarder version
@@ -1381,6 +1481,7 @@ async def _post_external_subagent_start(
                 "agent_type": agent_type,
                 "description": description,
                 "tool_use_id": tool_use_id,
+                "registration_id": registration_id,
             },
         },
     )
@@ -1389,7 +1490,11 @@ async def _post_external_subagent_start(
     child_session_id = body.get("child_session_id")
     if not isinstance(child_session_id, str) or not child_session_id:
         raise KeyError("child_session_id")
-    return child_session_id
+    existing = body.get("existing")
+    return _ExternalSubagentStartResult(
+        child_session_id=child_session_id,
+        existing=existing if isinstance(existing, bool) else True,
+    )
 
 
 def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
@@ -1426,6 +1531,61 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
         "description": description,
         "toolUseId": tool_use_id,
     }
+
+
+def _freeze_complete_transcript_offset(
+    transcript_path: Path,
+    *,
+    agent_name: str,
+    include_sidechains: bool,
+) -> int:
+    """Return the complete-record EOF frozen at function entry."""
+    try:
+        raw_end = transcript_path.stat().st_size
+    except OSError:
+        raw_end = 0
+    return read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name=agent_name,
+        include_sidechains=include_sidechains,
+        end_offset=raw_end,
+    ).byte_offset
+
+
+async def _post_external_recovery_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    item: ClaudeTranscriptItem,
+    recovery_after: str | None,
+) -> str:
+    """Reconcile one frozen historical item and return its Server item id."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": item.item_type,
+                "item_data": item.data,
+                "response_id": item.response_id,
+                "source_id": item.source_id,
+                "recovery_after": recovery_after,
+            },
+        },
+    )
+    resp.raise_for_status()
+    body = _parse_json_response(resp, context="sub-agent history recovery")
+    item_id = body.get("item_id")
+    if (
+        not isinstance(item_id, str)
+        or not item_id
+        or body.get("replayed") is not True
+        or body.get("recovery") is not True
+    ):
+        raise RuntimeError("sub-agent history recovery response did not confirm the chain")
+    return item_id
 
 
 def _subagent_quiet_terminal_output(item: ClaudeTranscriptItem) -> str | None:
@@ -1517,14 +1677,45 @@ async def _forward_available_subagents(
         if meta is None:
             # File may be mid-write; try again on the next tick.
             continue
+        registration_watermarks = updated.pending_registration_watermarks.get(subagent_id)
+        if registration_watermarks is None:
+            child_watermark, parent_watermark = await asyncio.gather(
+                asyncio.to_thread(
+                    _freeze_complete_transcript_offset,
+                    subagents_dir / f"agent-{subagent_id}.jsonl",
+                    agent_name=agent_name,
+                    include_sidechains=True,
+                ),
+                asyncio.to_thread(
+                    _freeze_complete_transcript_offset,
+                    transcript_path,
+                    agent_name=agent_name,
+                    include_sidechains=False,
+                ),
+            )
+            registration_watermarks = (
+                child_watermark,
+                parent_watermark,
+                uuid.uuid4().hex,
+            )
+            updated = replace(
+                updated,
+                pending_registration_watermarks={
+                    **updated.pending_registration_watermarks,
+                    subagent_id: registration_watermarks,
+                },
+            )
+            await _write_subagent_forward_state_async(bridge_dir, updated)
+        _child_watermark, _parent_watermark, registration_id = registration_watermarks
         try:
-            child_id = await _post_external_subagent_start(
+            start_result = await _post_external_subagent_start(
                 client,
                 parent_session_id=parent_session_id,
                 subagent_id=subagent_id,
                 agent_type=meta["agentType"],
                 description=meta["description"],
                 tool_use_id=meta["toolUseId"],
+                registration_id=registration_id,
             )
         except httpx.HTTPError as exc:
             decision = start_retry_tracker.record_failure(retry_key, exc)
@@ -1548,6 +1739,7 @@ async def _forward_available_subagents(
                         "agent_type": meta["agentType"],
                         "description": meta["description"],
                         "tool_use_id": meta["toolUseId"],
+                        "registration_id": registration_id,
                     },
                     reason="permanent HTTP failure after retries",
                     # Claude only dead-letters permanent 4xx (it retries
@@ -1569,6 +1761,11 @@ async def _forward_available_subagents(
                             tool_use_id=meta["toolUseId"],
                         ),
                     },
+                    pending_registration_watermarks={
+                        key: value
+                        for key, value in updated.pending_registration_watermarks.items()
+                        if key != subagent_id
+                    },
                 )
                 await _write_subagent_forward_state_async(bridge_dir, updated)
                 continue
@@ -1587,16 +1784,26 @@ async def _forward_available_subagents(
             )
             continue
         start_retry_tracker.clear(retry_key)
+        child_watermark, parent_watermark, _registration_id = registration_watermarks
+        pending_registration_watermarks = dict(updated.pending_registration_watermarks)
+        pending_registration_watermarks.pop(subagent_id, None)
         updated = replace(
             updated,
             subagents={
                 **updated.subagents,
                 subagent_id: SubagentEntry(
                     subagent_id=subagent_id,
-                    child_conversation_id=child_id,
+                    child_conversation_id=start_result.child_session_id,
                     tool_use_id=meta["toolUseId"],
+                    recovery_watermark=(child_watermark if start_result.existing else None),
+                    parent_recovery_watermark=(
+                        parent_watermark
+                        if start_result.existing and parent_watermark > updated.parent_byte_offset
+                        else None
+                    ),
                 ),
             },
+            pending_registration_watermarks=pending_registration_watermarks,
         )
         await _write_subagent_forward_state_async(bridge_dir, updated)
 
@@ -1619,22 +1826,53 @@ async def _forward_available_subagents(
     # Tail them with an independent durable cursor: the ordinary transcript
     # cursor may already have advanced when terminal delivery is retried after a
     # disconnect/restart. Re-reading from zero once upgrades legacy state safely.
-    parent_result = await asyncio.to_thread(
-        read_transcript_items_from_offset,
-        transcript_path,
-        updated.parent_byte_offset,
-        start_line=updated.parent_line_cursor,
-        agent_name=agent_name,
+    parent_result: TranscriptReadResult | None = None
+    recovery_boundaries = sorted(
+        {
+            entry.parent_recovery_watermark
+            for entry in updated.subagents.values()
+            if entry.parent_recovery_watermark is not None
+            and entry.parent_recovery_watermark > updated.parent_byte_offset
+        }
     )
+    parent_recovery = recovery_boundaries[0] if recovery_boundaries else None
+    # Do not consume the parent baseline while a child registration outcome is
+    # unknown: an eventual ``existing=true`` must still be able to mark old XML
+    # terminal notifications as replayed.
+    if not updated.pending_registration_watermarks:
+        parent_result = await asyncio.to_thread(
+            read_transcript_items_from_offset,
+            transcript_path,
+            updated.parent_byte_offset,
+            start_line=updated.parent_line_cursor,
+            agent_name=agent_name,
+            end_offset=parent_recovery,
+        )
     pending_notifications = dict(updated.pending_terminal_notifications)
-    for notification in parent_result.task_notifications:
+    for notification in () if parent_result is None else parent_result.task_notifications:
         if (
             notification.tool_use_id is not None
+            and isinstance(notification.status, str)
             and notification.status in _SUBAGENT_TERMINAL_STATUSES
         ):
+            matching_entry = next(
+                (
+                    entry
+                    for entry in updated.subagents.values()
+                    if entry.tool_use_id == notification.tool_use_id
+                ),
+                None,
+            )
+            replayed_for_child = (
+                parent_recovery is not None
+                and matching_entry is not None
+                and matching_entry.parent_recovery_watermark is not None
+                and matching_entry.parent_recovery_watermark >= parent_recovery
+            )
             pending_notifications[notification.tool_use_id] = (
                 notification.status,
                 notification.result,
+                notification.replayed or replayed_for_child,
             )
     if pending_notifications:
         entries = dict(updated.subagents)
@@ -1644,25 +1882,36 @@ async def _forward_available_subagents(
             notification = pending_notifications.pop(entry.tool_use_id, None)
             if notification is None:
                 continue
-            terminal_status, terminal_output = notification
+            terminal_status, terminal_output, terminal_replayed = notification
             entries[subagent_id] = replace(
                 entry,
                 terminal_status=terminal_status,
                 terminal_output=terminal_output,
+                terminal_replayed=terminal_replayed,
             )
         updated = replace(
             updated,
             subagents=entries,
             pending_terminal_notifications=pending_notifications,
         )
-    if (
+    if parent_result is not None and (
         parent_result.byte_offset != updated.parent_byte_offset
         or parent_result.line_cursor != updated.parent_line_cursor
+        or parent_recovery is not None
     ):
         updated = replace(
             updated,
             parent_byte_offset=parent_result.byte_offset,
             parent_line_cursor=parent_result.line_cursor,
+            subagents={
+                subagent_id: (
+                    replace(entry, parent_recovery_watermark=None)
+                    if entry.parent_recovery_watermark is not None
+                    and entry.parent_recovery_watermark <= parent_result.byte_offset
+                    else entry
+                )
+                for subagent_id, entry in updated.subagents.items()
+            },
         )
     if updated != parent_state_before_scan:
         await _write_subagent_forward_state_async(bridge_dir, updated)
@@ -1676,6 +1925,90 @@ async def _forward_available_subagents(
         jsonl_path = subagents_dir / f"agent-{subagent_id}.jsonl"
         if not jsonl_path.exists():
             continue
+        if entry.recovery_watermark is not None:
+            recovery_watermark = entry.recovery_watermark
+            recovery_result = await asyncio.to_thread(
+                read_transcript_items_from_offset,
+                jsonl_path,
+                0,
+                start_line=0,
+                agent_name=agent_name,
+                current_response_id=None,
+                include_sidechains=True,
+                end_offset=recovery_watermark,
+            )
+            recovery_seen = set(entry.recovery_seen_source_ids)
+            unmatched = [
+                item for item in recovery_result.items if item.source_id not in recovery_seen
+            ]
+            recovery_blocked = False
+            for item in unmatched[:_SUBAGENT_RECOVERY_BATCH_ITEMS]:
+                retry_key = f"subagent_recovery:{entry.child_conversation_id}:{item.source_id}"
+                if item_retry_tracker.retry_delay_s(retry_key) is not None:
+                    recovery_blocked = True
+                    break
+                try:
+                    recovery_item_id = await _post_external_recovery_item(
+                        client,
+                        session_id=entry.child_conversation_id,
+                        item=item,
+                        recovery_after=entry.recovery_after,
+                    )
+                except httpx.HTTPError as exc:
+                    decision = item_retry_tracker.record_failure(retry_key, exc)
+                    _logger.warning(
+                        "Claude sub-agent history reconciliation held; child=%s "
+                        "source_id=%s attempt=%s http_status=%s",
+                        entry.child_conversation_id,
+                        item.source_id,
+                        decision.attempts,
+                        _http_status_for_log(exc),
+                        exc_info=True,
+                    )
+                    recovery_blocked = True
+                    break
+                except RuntimeError:
+                    _logger.warning(
+                        "Claude sub-agent history reconciliation was not confirmed; "
+                        "child=%s source_id=%s",
+                        entry.child_conversation_id,
+                        item.source_id,
+                        exc_info=True,
+                    )
+                    recovery_blocked = True
+                    break
+                item_retry_tracker.clear(retry_key)
+                recovery_seen.add(item.source_id)
+                entry = replace(
+                    entry,
+                    recovery_after=recovery_item_id,
+                    recovery_seen_source_ids=(*entry.recovery_seen_source_ids, item.source_id),
+                )
+                updated = replace(
+                    updated,
+                    subagents={**updated.subagents, subagent_id: entry},
+                )
+                await _write_subagent_forward_state_async(bridge_dir, updated)
+            recovery_complete = not recovery_blocked and all(
+                item.source_id in recovery_seen for item in recovery_result.items
+            )
+            if not recovery_complete:
+                continue
+            entry = replace(
+                entry,
+                byte_offset=recovery_watermark,
+                seen_source_ids=_bounded_seen_source_ids(
+                    [*entry.seen_source_ids, *entry.recovery_seen_source_ids]
+                ),
+                recovery_watermark=None,
+                recovery_after=None,
+                recovery_seen_source_ids=(),
+            )
+            updated = replace(
+                updated,
+                subagents={**updated.subagents, subagent_id: entry},
+            )
+            await _write_subagent_forward_state_async(bridge_dir, updated)
         # Reuse the parent-transcript parser, but pass
         # ``include_sidechains=True`` — every record in a sub-agent's
         # own ``agent-<id>.jsonl`` carries ``isSidechain: true``
@@ -1707,7 +2040,7 @@ async def _forward_available_subagents(
                 items_failed = True
                 break
             try:
-                await _post_external_conversation_item(
+                is_new_item = await _post_external_conversation_item(
                     client,
                     session_id=entry.child_conversation_id,
                     item=item,
@@ -1805,13 +2138,13 @@ async def _forward_available_subagents(
                 items_failed = True
                 break
             item_retry_tracker.clear(retry_key)
-            had_item = True
+            had_item = had_item or is_new_item
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
             new_entry = replace(
                 new_entry,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                last_activity_ts=now,
+                last_activity_ts=now if is_new_item else new_entry.last_activity_ts,
                 quiet_terminal_output=_subagent_quiet_terminal_output(item),
             )
             updated = replace(updated, subagents={**updated.subagents, subagent_id: new_entry})
@@ -1843,9 +2176,11 @@ async def _forward_available_subagents(
         # tool call, so settling from a quiet timer can deliver a false result.
         desired_status: str | None = None
         desired_output: str | None = None
+        desired_replayed = False
         if new_entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES:
             desired_status = new_entry.terminal_status
             desired_output = new_entry.terminal_output
+            desired_replayed = new_entry.terminal_replayed
         elif new_entry.last_status in _SUBAGENT_TERMINAL_STATUSES:
             desired_status = None
         elif had_item:
@@ -1859,6 +2194,7 @@ async def _forward_available_subagents(
                         session_id=entry.child_conversation_id,
                         status=desired_status,
                         output=desired_output,
+                        replayed=desired_replayed,
                     )
                 except httpx.HTTPError as exc:
                     decision = status_retry_tracker.record_failure(retry_key, exc)
@@ -1877,7 +2213,11 @@ async def _forward_available_subagents(
                             bridge_dir,
                             session_id=entry.child_conversation_id,
                             event_type="external_session_status",
-                            payload={"status": desired_status, "output": desired_output},
+                            payload={
+                                "status": desired_status,
+                                "output": desired_output,
+                                **({"replayed": True} if desired_replayed else {}),
+                            },
                             reason="terminal status delivery not confirmed after retries",
                             delivered_ambiguous=False,
                             http_status=_http_status_for_log(exc),
@@ -4270,7 +4610,7 @@ async def _post_external_conversation_item(
     *,
     session_id: str,
     item: ClaudeTranscriptItem,
-) -> None:
+) -> bool:
     """
     Post one mirrored transcript item to the Sessions API.
 
@@ -4302,10 +4642,17 @@ async def _post_external_conversation_item(
                     "item_type": item.item_type,
                     "item_data": item.data,
                     "response_id": item.response_id,
+                    "source_id": item.source_id,
                 },
             },
         )
         resp.raise_for_status()
+        # Historical import is not evidence of a running native child.
+        # Older servers omit the flag and keep their prior behavior.
+        if not resp.content:
+            return True
+        body = _parse_json_response(resp, context="external conversation item")
+        return body.get("replayed") is not True
 
 
 async def _post_external_output_text_delta(

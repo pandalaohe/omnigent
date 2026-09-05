@@ -287,6 +287,10 @@ def runner_seen_is_fresh(last_seen: int | None, now: int | None = None) -> bool:
     return last_seen >= ref - RUNNER_LIVENESS_TTL_S
 
 
+class NativeReplayConflictError(Exception):
+    """A native transcript does not match the next persisted historical item."""
+
+
 class ConversationNotFoundError(Exception):
     """
     Raised when a required conversation row is missing.
@@ -634,6 +638,11 @@ class ConversationStore(ABC):
         :returns: Mapping ``{conversation_id: [ConversationItem, ...]}``.
             Input ids with no matching messages map to an empty list.
         """
+        ...
+
+    @abstractmethod
+    def find_idempotent_item(self, conversation_id: str, key: str) -> ConversationItem | None:
+        """Find a prior append with this conversation-scoped source key."""
         ...
 
     @abstractmethod

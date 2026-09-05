@@ -1347,11 +1347,173 @@ async def test_external_subagent_start_is_idempotent_on_subagent_id(
     first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
     second = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
     assert first.json()["child_session_id"] == second.json()["child_session_id"]
+    assert first.json()["existing"] is False
+    assert second.json()["existing"] is True
 
     children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
     # Pin "exactly one" rather than ">= 1" — a duplicate would slip
     # past >= without a failure here.
     assert len(children) == 1
+
+
+async def test_external_subagent_start_distinguishes_same_registration_retry(
+    client: httpx.AsyncClient,
+) -> None:
+    """Only a retry from the creating registration remains live, not historical."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    payload = {
+        "type": "external_subagent_start",
+        "data": {
+            "subagent_id": "registration-owned-child",
+            "agent_type": "Explore",
+            "description": "Trace registration ownership",
+            "tool_use_id": "toolu_registration_owned",
+            "registration_id": "registration-attempt-one",
+        },
+    }
+
+    first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    same_retry = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    different_retry = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            **payload,
+            "data": {**payload["data"], "registration_id": "registration-attempt-two"},
+        },
+    )
+
+    assert first.status_code == 202, first.text
+    assert same_retry.status_code == 202, same_retry.text
+    assert different_retry.status_code == 202, different_retry.text
+    assert {
+        first.json()["child_session_id"],
+        same_retry.json()["child_session_id"],
+        different_retry.json()["child_session_id"],
+    } == {first.json()["child_session_id"]}
+    assert first.json()["existing"] is False
+    assert same_retry.json()["existing"] is False
+    assert different_retry.json()["existing"] is True
+    child = (await client.get(f"/v1/sessions/{first.json()['child_session_id']}")).json()
+    assert child["labels"]["omnigent.native_registration_id"] == "registration-attempt-one"
+
+
+@pytest.mark.parametrize("registration_id", ["", "x" * 129, 42])
+async def test_external_subagent_start_rejects_invalid_registration_id(
+    client: httpx.AsyncClient,
+    registration_id: object,
+) -> None:
+    """Registration ownership accepts only a bounded non-empty string."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "invalid-registration",
+                "agent_type": "Explore",
+                "description": "Reject invalid registration",
+                "registration_id": registration_id,
+            },
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "registration_id" in response.text
+
+
+async def test_external_subagent_start_title_collision_preserves_registration_owner(
+    client: httpx.AsyncClient,
+) -> None:
+    """A registration-marked title collision cannot be relabeled by another owner."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    seeded = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "Explore:registration-collision",
+            "labels": {"omnigent.native_registration_id": "registration-owner-one"},
+        },
+    )
+    assert seeded.status_code == 201, seeded.text
+
+    retry = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "registration-collision",
+                "agent_type": "Explore",
+                "description": "Do not steal this row",
+                "registration_id": "registration-owner-two",
+            },
+        },
+    )
+
+    assert retry.status_code == 202, retry.text
+    assert retry.json()["child_session_id"] == seeded.json()["id"]
+    assert retry.json()["existing"] is True
+    child = (await client.get(f"/v1/sessions/{seeded.json()['id']}")).json()
+    assert child["labels"]["omnigent.native_registration_id"] == "registration-owner-one"
+    assert child["labels"]["omnigent.claude_native.subagent_id"] == "registration-collision"
+
+
+async def test_external_subagent_start_adopts_title_collision_for_same_registration(
+    client: httpx.AsyncClient,
+) -> None:
+    """A creator retry may heal its own registration-marked partial child."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    seeded = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "Explore:same-registration-collision",
+            "labels": {"omnigent.native_registration_id": "registration-owner"},
+        },
+    )
+    assert seeded.status_code == 201, seeded.text
+
+    retry = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "same-registration-collision",
+                "agent_type": "Explore",
+                "description": "Heal my partial row",
+                "registration_id": "registration-owner",
+            },
+        },
+    )
+
+    assert retry.status_code == 202, retry.text
+    assert retry.json()["child_session_id"] == seeded.json()["id"]
+    assert retry.json()["existing"] is False
+    child = (await client.get(f"/v1/sessions/{seeded.json()['id']}")).json()
+    assert child["labels"]["omnigent.claude_native.subagent_id"] == ("same-registration-collision")
+    assert child["labels"]["omnigent.native_registration_id"] == "registration-owner"
 
 
 async def test_external_subagent_start_adopts_unlabeled_title_collision(
@@ -1839,6 +2001,444 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
     assert resp.status_code == 500, resp.text
     # Our controlled message, not the generic "An internal error occurred."
     assert "malformed skill resolution" in resp.json()["error"]["message"]
+
+
+async def test_external_item_replay_preserves_history_and_does_not_broadcast(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    body = {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "historical instruction"}],
+            },
+            "response_id": "resp_claude_original",
+            "source_id": "native-user-uuid:0:message",
+        },
+    }
+    first, concurrent = await asyncio.gather(
+        client.post(f"/v1/sessions/{session['id']}/events", json=body),
+        client.post(f"/v1/sessions/{session['id']}/events", json=body),
+    )
+    assert first.status_code == 202, first.text
+    assert concurrent.status_code == 202, concurrent.text
+    assert sorted([first.json()["replayed"], concurrent.json()["replayed"]]) == [False, True]
+    assert first.json()["item_id"] == concurrent.json()["item_id"]
+    published.clear()
+    replay = await client.post(f"/v1/sessions/{session['id']}/events", json=body)
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["replayed"] is True
+    assert replay.json()["item_id"] == first.json()["item_id"]
+    assert published == []
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert len([item for item in items if item.get("response_id") == "resp_claude_original"]) == 1
+
+
+async def _create_claude_native_child(
+    client: httpx.AsyncClient,
+    *,
+    subagent_id: str,
+) -> tuple[dict[str, Any], str]:
+    """Create a claude-native parent and register one native child."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    child = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": subagent_id,
+                "agent_type": "Explore",
+                "description": "Recover historical transcript",
+                "tool_use_id": f"toolu_{subagent_id}",
+            },
+        },
+    )
+    assert child.status_code == 202, child.text
+    return parent, child.json()["child_session_id"]
+
+
+async def test_external_item_recovery_matches_legacy_prefix_ignoring_response_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """Cold recovery matches the next typed item, not its unstable batch id."""
+    _, child_id = await _create_claude_native_child(client, subagent_id="legacy-prefix")
+    legacy = {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "message",
+            "item_data": {
+                "role": "assistant",
+                "agent": "claude-native-ui",
+                "content": [{"type": "output_text", "text": "historical result"}],
+            },
+            "response_id": "resp_old_batch",
+        },
+    }
+    seeded = await client.post(f"/v1/sessions/{child_id}/events", json=legacy)
+    assert seeded.status_code == 202, seeded.text
+
+    recovered = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                **legacy["data"],
+                "response_id": "resp_new_cold_batch",
+                "source_id": "legacy-prefix:0:message",
+                "recovery_after": None,
+            },
+        },
+    )
+
+    assert recovered.status_code == 202, recovered.text
+    assert recovered.json() == {
+        "queued": False,
+        "item_id": seeded.json()["item_id"],
+        "replayed": True,
+        "recovery": True,
+    }
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert len(items) == 1
+    assert items[0]["response_id"] == "resp_old_batch"
+
+
+async def test_external_item_recovery_keeps_consecutive_duplicate_items_distinct(
+    client: httpx.AsyncClient,
+) -> None:
+    """The ordered cursor maps identical neighbors one-to-one without set dedup."""
+    _, child_id = await _create_claude_native_child(client, subagent_id="duplicate-prefix")
+    item_data = {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "same legitimate update"}],
+    }
+    seeded_ids: list[str] = []
+    for response_id in ("resp_old_first", "resp_old_second"):
+        seeded = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": item_data,
+                    "response_id": response_id,
+                },
+            },
+        )
+        assert seeded.status_code == 202, seeded.text
+        seeded_ids.append(seeded.json()["item_id"])
+    assert seeded_ids[0] != seeded_ids[1]
+
+    cursor: str | None = None
+    recovered_ids: list[str] = []
+    for index in range(2):
+        recovered = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": item_data,
+                    "response_id": f"resp_cold_batch_{index}",
+                    "source_id": f"duplicate-prefix:{index}:message",
+                    "recovery_after": cursor,
+                },
+            },
+        )
+        assert recovered.status_code == 202, recovered.text
+        assert recovered.json()["replayed"] is True
+        assert recovered.json()["recovery"] is True
+        cursor = recovered.json()["item_id"]
+        recovered_ids.append(cursor)
+
+    assert recovered_ids == seeded_ids
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert len(items) == 2
+
+
+async def test_external_item_recovery_conflict_does_not_append(
+    client: httpx.AsyncClient,
+) -> None:
+    """A changed historical prefix is a 409 and leaves history untouched."""
+    _, child_id = await _create_claude_native_child(client, subagent_id="changed-prefix")
+    seeded = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "stored history"}],
+                },
+                "response_id": "resp_stored",
+            },
+        },
+    )
+    assert seeded.status_code == 202, seeded.text
+
+    conflict = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "different local history"}],
+                },
+                "response_id": "resp_cold",
+                "source_id": "changed-prefix:0:message",
+                "recovery_after": None,
+            },
+        },
+    )
+
+    assert conflict.status_code == 409, conflict.text
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert len(items) == 1
+    assert items[0]["id"] == seeded.json()["item_id"]
+
+
+async def test_external_item_recovery_appends_historical_suffix_silently(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An offline suffix persists without draining fresh input or emitting SSE."""
+    from omnigent.runtime import pending_inputs
+
+    _, child_id = await _create_claude_native_child(client, subagent_id="offline-suffix")
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, event: published.append((sid, event)),
+    )
+    pending_inputs.reset_for_tests()
+    try:
+        pending_inputs.record(
+            child_id,
+            [{"type": "input_text", "text": "historical local input"}],
+        )
+        before = pending_inputs.snapshot_for(child_id)
+        recovered = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "historical local input"}],
+                    },
+                    "response_id": "resp_offline_suffix",
+                    "source_id": "offline-suffix:0:message",
+                    "recovery_after": None,
+                },
+            },
+        )
+
+        assert recovered.status_code == 202, recovered.text
+        assert recovered.json()["replayed"] is True
+        assert recovered.json()["recovery"] is True
+        assert pending_inputs.snapshot_for(child_id) == before
+        assert published == []
+        items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+        assert len(items) == 1
+        assert items[0]["response_id"] == "resp_offline_suffix"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+async def test_replayed_native_child_terminal_status_updates_without_waking_parent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    """Recovered terminal evidence restores child state without Runner delivery."""
+    _, child_id = await _create_claude_native_child(
+        client,
+        subagent_id=f"replayed-{terminal_status}",
+    )
+    forward = AsyncMock(return_value=None)
+    recover_via_parent = AsyncMock(return_value=None)
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        forward,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._recover_subagent_status_forward_via_parent",
+        recover_via_parent,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, event: published.append((sid, event)),
+    )
+
+    for _ in range(2):
+        response = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": terminal_status,
+                    "output": f"historical {terminal_status} result",
+                    "replayed": True,
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert response.json() == {"queued": False}
+
+    child = await client.get(f"/v1/sessions/{child_id}")
+    assert child.status_code == 200, child.text
+    assert child.json()["labels"]["omnigent.subagent.terminal_status"] == terminal_status
+    public_status = "idle" if terminal_status == "completed" else "failed"
+    status_events = [
+        event
+        for sid, event in published
+        if sid == child_id and event.get("type") == "session.status"
+    ]
+    assert [event["status"] for event in status_events] == [public_status, public_status]
+    forward.assert_not_awaited()
+    recover_via_parent.assert_not_awaited()
+
+
+async def test_replayed_completed_recovers_native_child_from_sticky_failed_state(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Historical completion replaces stale failure cache and durable error labels."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    _, child_id = await _create_claude_native_child(
+        client,
+        subagent_id="failed-then-completed-replay",
+    )
+    forward = AsyncMock(return_value=None)
+    recover_via_parent = AsyncMock(return_value=None)
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        forward,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._recover_subagent_status_forward_via_parent",
+        recover_via_parent,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, event: published.append((sid, event)),
+    )
+
+    failed = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "output": "stale failure from the interrupted host",
+                "replayed": True,
+            },
+        },
+    )
+    assert failed.status_code == 202, failed.text
+    failed_snapshot = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert failed_snapshot["status"] == "failed"
+    assert failed_snapshot["last_task_error"] == {
+        "code": "codex_turn_error",
+        "message": "stale failure from the interrupted host",
+    }
+
+    published.clear()
+    completed = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "completed",
+                "output": "historical result completed before reconnect",
+                "replayed": True,
+            },
+        },
+    )
+    assert completed.status_code == 202, completed.text
+
+    child_snapshot = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert child_snapshot["status"] == "idle"
+    assert child_snapshot["last_task_error"] is None
+    assert child_snapshot["labels"]["omnigent.subagent.terminal_status"] == "completed"
+    durable_store = SqlAlchemyConversationStore(db_uri)
+    deadline = asyncio.get_running_loop().time() + 2.0
+    stored = durable_store.get_conversation(child_id)
+    while stored is not None and stored.live_status != "idle":
+        assert asyncio.get_running_loop().time() < deadline, (
+            f"live_status did not persist idle before deadline: {stored.live_status!r}"
+        )
+        await asyncio.sleep(0.01)
+        stored = durable_store.get_conversation(child_id)
+    assert stored is not None
+    assert stored.live_status == "idle"
+    assert stored.labels["omnigent.last_task_error_code"] == ""
+    assert stored.labels["omnigent.last_task_error_message"] == ""
+    status_events = [
+        event
+        for sid, event in published
+        if sid == child_id and event.get("type") == "session.status"
+    ]
+    assert [event["status"] for event in status_events] == ["idle"]
+    assert sessions_module._session_status_cache[child_id] == "idle"
+    forward.assert_not_awaited()
+    recover_via_parent.assert_not_awaited()
+
+
+async def test_replayed_terminal_status_rejects_non_native_and_nonterminal_targets(
+    client: httpx.AsyncClient,
+) -> None:
+    """Historical status recovery is limited to terminal native-child edges."""
+    agent = await create_test_agent(client)
+    ordinary = await _create_session(client, agent["id"])
+    _, native_child_id = await _create_claude_native_child(
+        client,
+        subagent_id="reject-running-replay",
+    )
+
+    non_native = await client.post(
+        f"/v1/sessions/{ordinary['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "completed", "replayed": True},
+        },
+    )
+    nonterminal = await client.post(
+        f"/v1/sessions/{native_child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "running", "replayed": True},
+        },
+    )
+
+    assert non_native.status_code == 400, non_native.text
+    assert nonterminal.status_code == 400, nonterminal.text
 
 
 async def test_external_meta_user_message_persists_without_live_input_event(

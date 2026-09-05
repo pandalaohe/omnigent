@@ -8649,6 +8649,65 @@ def test_claude_transcript_tool_use_result_is_json_parseable(
         assert content == output
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_cold_resume_preserves_agent_completion_after_compaction(
+    tmp_path: Path, compact: bool
+) -> None:
+    items: list[dict[str, Any]] = [
+        {"type": "function_call", "call_id": "task-1", "name": "Agent", "arguments": "{}"},
+        {
+            "type": "function_call_output",
+            "call_id": "task-1",
+            "output": "historical result",
+            "tool_status": "completed",
+            "is_async": True,
+        },
+        {"type": "function_call", "call_id": "read-1", "name": "Read", "arguments": "{}"},
+        {
+            "type": "function_call_output",
+            "call_id": "read-1",
+            "output": "file content",
+            "tool_status": "completed",
+        },
+    ]
+    if compact:
+        items.append(
+            {
+                "type": "compaction",
+                "summary": "summary",
+                "token_count": 10,
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "summary"}],
+                    }
+                ],
+            }
+        )
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv",
+        external_session_id="native",
+        cwd=tmp_path,
+        bridge_dir=tmp_path,
+    )
+    assert records[-1]["omnigentTaskNotifications"] == [
+        {
+            "tool_use_id": "task-1",
+            "status": "completed",
+            "result": "historical result",
+        }
+    ]
+    if not compact:
+        assert json.loads(records[1]["toolUseResult"]) == "historical result"
+        assert records[1]["omnigentToolResult"] == {
+            "tool_name": "Agent",
+            "tool_status": "completed",
+            "is_async": True,
+        }
+
+
 def test_json_safe_tool_use_result_wraps_non_json() -> None:
     """Non-JSON strings become a JSON string literal; JSON passes through."""
     # A leading '<' is not valid JSON, so it is wrapped.

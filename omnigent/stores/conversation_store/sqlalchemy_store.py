@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any, Protocol, cast
@@ -99,6 +100,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     DeletionClaimResult,
+    NativeReplayConflictError,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -2292,6 +2294,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         return strip_nul_bytes(extract_search_text(item))
 
+    @staticmethod
+    def _idempotent_item_id(conversation_id: str, key: str) -> str:
+        return hashlib.sha256(json.dumps([conversation_id, key]).encode()).hexdigest()[:32]
+
+    def find_idempotent_item(self, conversation_id: str, key: str) -> ConversationItem | None:
+        item_id = self._idempotent_item_id(conversation_id, key)
+        with self._conv_session("find_idempotent_item") as session:
+            row = session.execute(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == item_id,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            session.expunge(row)
+        return _to_item(row, self._decode_item_data_batch([row.data])[0])
+
     def append(
         self,
         conversation_id: str,
@@ -2313,6 +2334,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         now = now_epoch()
         persisted: list[ConversationItem] = []
+        if any(item.native_recovery for item in items) and len(items) != 1:
+            raise NativeReplayConflictError("Historical recovery requires one ordered item")
 
         # Encode every item payload up front, in one batch, BEFORE opening the
         # write transaction. The transform depends only on item data, not on any
@@ -2332,10 +2355,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
-            # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if conv_row is not None:
-                conv_row.updated_at = now
 
             # Allocate item positions from the conversation's maintained
             # next_position counter instead of running a MAX(position) aggregate
@@ -2368,10 +2388,89 @@ class SqlAlchemyConversationStore(ConversationStore):
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
             for item, data in zip(items, encoded_data, strict=True):
+                item_id = (
+                    self._idempotent_item_id(conversation_id, item.idempotency_key)
+                    if item.idempotency_key is not None
+                    else generate_item_id(item.type)
+                )
+                if item.native_recovery:
+                    # Match the NEXT historical item under the same lock used
+                    # for appends. Batch-derived response IDs are not stable
+                    # across a cold read. Never search ahead by message text.
+                    after_position = -1
+                    if item.recovery_after is not None:
+                        try:
+                            uuid_to_bytes(item.recovery_after)
+                        except ValueError as exc:
+                            raise NativeReplayConflictError(
+                                "Historical recovery cursor is missing"
+                            ) from exc
+                        after_position = session.execute(
+                            select(SqlConversationItem.position).where(
+                                SqlConversationItem.workspace_id == workspace_id,
+                                SqlConversationItem.conversation_id == conversation_id,
+                                SqlConversationItem.id == item.recovery_after,
+                            )
+                        ).scalar_one_or_none()
+                        if after_position is None:
+                            raise NativeReplayConflictError(
+                                "Historical recovery cursor is missing"
+                            )
+                    historical = session.execute(
+                        select(SqlConversationItem)
+                        .where(
+                            SqlConversationItem.workspace_id == workspace_id,
+                            SqlConversationItem.conversation_id == conversation_id,
+                            SqlConversationItem.position > after_position,
+                        )
+                        .order_by(SqlConversationItem.position)
+                        .limit(1)
+                    ).scalar_one_or_none()
+                    if historical is not None:
+                        existing = _to_item(
+                            historical, self._decode_item_data_batch([historical.data])[0]
+                        )
+                        if not existing.matches_native_replay(
+                            item, exact_source=historical.id == item_id
+                        ):
+                            raise NativeReplayConflictError("Historical transcript prefix differs")
+                        source_row = session.execute(
+                            select(SqlConversationItem.id).where(
+                                SqlConversationItem.workspace_id == workspace_id,
+                                SqlConversationItem.conversation_id == conversation_id,
+                                SqlConversationItem.id == item_id,
+                            )
+                        ).scalar_one_or_none()
+                        if source_row is not None and source_row != historical.id:
+                            raise NativeReplayConflictError("Transcript source is out of order")
+                        persisted.append(existing.model_copy(update={"replayed": True}))
+                        continue
+                if item.idempotency_key is not None:
+                    # The conversation lock also serializes concurrent retries.
+                    # Replays retain their original ID and timestamp and must
+                    # not move the conversation to the top of the session list.
+                    existing = next((old for old in persisted if old.id == item_id), None)
+                    if existing is None:
+                        row = session.execute(
+                            select(SqlConversationItem).where(
+                                SqlConversationItem.workspace_id == workspace_id,
+                                SqlConversationItem.conversation_id == conversation_id,
+                                SqlConversationItem.id == item_id,
+                            )
+                        ).scalar_one_or_none()
+                        if row is not None:
+                            decoded = self._decode_item_data_batch([row.data])[0]
+                            existing = _to_item(row, decoded)
+                    if existing is not None:
+                        if not existing.matches_native_replay(item, exact_source=True):
+                            raise NativeReplayConflictError("Transcript source identity changed")
+                        if item.native_recovery:
+                            raise NativeReplayConflictError("Transcript source is out of order")
+                        persisted.append(existing.model_copy(update={"replayed": True}))
+                        continue
                 position = next_pos
                 next_pos += 1
                 search = self._item_search_text(item)
-                item_id = generate_item_id(item.type)
                 values: dict[str, object] = {
                     "workspace_id": workspace_id,
                     "id": item_id,
@@ -2412,6 +2511,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             # dominates append latency against a remote managed Postgres.
             if row_values:
                 session.execute(insert(SqlConversationItem), row_values)
+                if conv_row is not None and not items[0].native_recovery:
+                    conv_row.updated_at = now
             insert_fts_bulk(session, fts_rows)
 
             # Persist the advanced counter so the next append reads it instead

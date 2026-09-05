@@ -13,6 +13,7 @@ import json
 import math
 import secrets
 import time
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, cast
 
@@ -352,6 +353,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    NativeReplayConflictError,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -2317,6 +2319,11 @@ async def _persist_external_codex_subagent_start(
     )
 
 
+_external_item_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -2324,7 +2331,26 @@ async def _persist_external_conversation_item(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-) -> str:
+) -> tuple[str, bool]:
+    """Serialize mirrored input consumption with replay detection for a session."""
+    lock = _external_item_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _external_item_locks[session_id] = lock
+    async with lock:
+        return await _persist_external_conversation_item_locked(
+            session_id, conv, body, conversation_store, created_by, background_title_coordinator
+        )
+
+
+async def _persist_external_conversation_item_locked(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+) -> tuple[str, bool]:
     """
     Persist and broadcast a conversation item produced outside AP.
 
@@ -2343,9 +2369,42 @@ async def _persist_external_conversation_item(
         directly in the native terminal (no pending-input entry exists
         for those). ``None`` in single-user / unauthenticated mode —
         no label is stamped in that case.
-    :returns: Store-assigned conversation item id.
+    :returns: Store-assigned item id and whether this was a replay.
     """
     item = _parse_external_conversation_item(body)
+    if "recovery_after" in body.data:
+        after = body.data["recovery_after"]
+        if (
+            conv.kind != "sub_agent"
+            or conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
+            or item.idempotency_key is None
+            or (after is not None and (not isinstance(after, str) or not after))
+        ):
+            raise OmnigentError(
+                "Invalid native child recovery cursor", code=ErrorCode.INVALID_INPUT
+            )
+        historical = item.model_copy(update={"native_recovery": True, "recovery_after": after})
+        try:
+            persisted = (
+                await asyncio.to_thread(conversation_store.append, session_id, [historical])
+            )[0]
+        except NativeReplayConflictError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        # Hydration is not new input or work: no pending-input consumption,
+        # title generation, unread event, elicitation, or Runner delivery.
+        return persisted.id, True
+    if item.idempotency_key is not None:
+        existing = await asyncio.to_thread(
+            conversation_store.find_idempotent_item,
+            session_id,
+            item.idempotency_key,
+        )
+        if existing is not None:
+            if not existing.matches_native_replay(item, exact_source=True):
+                raise OmnigentError("Transcript source identity changed", code=ErrorCode.CONFLICT)
+            # A forwarder restart may replay old user messages. Do not consume
+            # a new pending input, seed a title, or broadcast them as new work.
+            return existing.id, True
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -2399,16 +2458,21 @@ async def _persist_external_conversation_item(
         conversation=conv,
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    try:
+        persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    except NativeReplayConflictError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+    persisted = persisted_items[0]
+    if persisted.replayed:
+        return persisted.id, True
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()
-    persisted = persisted_items[0]
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
-    return persisted.id
+    return persisted.id, False
 
 
 async def _persist_skipped_kiro_pending_input(

@@ -21,7 +21,7 @@ from typing import Any, TextIO
 
 import pytest
 
-from omnigent import claude_native_bridge, native_cost_popup
+from omnigent import claude_native, claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _build_tools,
@@ -1061,6 +1061,7 @@ def test_read_transcript_items_from_offset_parses_correlated_task_notification(
     assert notification.tool_use_id == "toolu_worker_1"
     assert notification.status == "completed"
     assert notification.result == "Final verified report."
+    assert notification.replayed is False
     assert [item.item_type for item in result.items] == ["function_call_output"]
     assert result.items[0].data == {
         "call_id": "toolu_worker_1",
@@ -1120,6 +1121,299 @@ def test_read_transcript_items_since_preserves_async_tool_result_metadata(
         # looser entry-level metadata.
         "is_error": False,
     }
+
+
+@pytest.mark.parametrize("reader", ["line", "offset"])
+@pytest.mark.parametrize(
+    ("status", "is_error"),
+    [("completed", False), ("failed", True)],
+)
+def test_transcript_readers_restore_local_agent_terminal_metadata(
+    tmp_path: Path,
+    reader: str,
+    status: str,
+    is_error: bool,
+) -> None:
+    """A rebuilt Agent result restores one authoritative terminal edge."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": f"rebuilt-agent-{status}",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_agent_1",
+                            "content": "Final agent output",
+                            "is_error": is_error,
+                        }
+                    ],
+                },
+                "toolUseResult": json.dumps("Final agent output"),
+                "omnigentToolResult": {
+                    "tool_name": "Agent",
+                    "tool_status": status,
+                    "is_async": False,
+                    "is_error": is_error,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    if reader == "line":
+        result = claude_native_bridge.read_transcript_items_since_with_position(
+            transcript_path,
+            0,
+            agent_name="claude-native-ui",
+        )
+    else:
+        result = read_transcript_items_from_offset(
+            transcript_path,
+            0,
+            start_line=0,
+            agent_name="claude-native-ui",
+        )
+
+    assert result.task_notifications == (
+        claude_native_bridge.ClaudeTaskNotification(
+            task_id="toolu_agent_1",
+            tool_use_id="toolu_agent_1",
+            status=status,
+            result="Final agent output",
+            replayed=True,
+        ),
+    )
+    assert [item.data for item in result.items] == [
+        {
+            "call_id": "toolu_agent_1",
+            "output": "Final agent output",
+            "tool_status": status,
+            "is_async": False,
+            "is_error": is_error,
+        }
+    ]
+
+
+def test_transcript_reader_restores_compacted_agent_notifications_once(tmp_path: Path) -> None:
+    """Compaction-carried terminal records survive without duplicate edges."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "rebuilt-agent-terminal-index",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_agent_1",
+                            "content": "Final agent output",
+                        }
+                    ],
+                },
+                "omnigentToolResult": {
+                    "tool_name": "Task",
+                    "tool_status": "completed",
+                    "is_async": True,
+                    "is_error": False,
+                },
+                "omnigentTaskNotifications": [
+                    {
+                        "tool_use_id": "toolu_agent_1",
+                        "status": "completed",
+                        "result": "Final agent output",
+                    },
+                    {
+                        "tool_use_id": "toolu_compacted_2",
+                        "status": "failed",
+                        "result": None,
+                    },
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [
+        (item.tool_use_id, item.status, item.result) for item in result.task_notifications
+    ] == [
+        ("toolu_agent_1", "completed", "Final agent output"),
+        ("toolu_compacted_2", "failed", None),
+    ]
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_session_serializer_agent_terminal_round_trips_once(
+    tmp_path: Path,
+    compact: bool,
+) -> None:
+    """Cold-resume records settle Agent once and never promote a Read result."""
+    items: list[dict[str, Any]] = [
+        {"type": "function_call", "call_id": "task-1", "name": "Agent", "arguments": "{}"},
+        {
+            "type": "function_call_output",
+            "call_id": "task-1",
+            "output": "historical result",
+            "tool_status": "completed",
+            "is_async": True,
+        },
+        {"type": "function_call", "call_id": "read-1", "name": "Read", "arguments": "{}"},
+        {
+            "type": "function_call_output",
+            "call_id": "read-1",
+            "output": "file content",
+            "tool_status": "completed",
+        },
+    ]
+    if compact:
+        items.append(
+            {
+                "type": "compaction",
+                "summary": "summary",
+                "token_count": 10,
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "summary"}],
+                    }
+                ],
+            }
+        )
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv",
+        external_session_id="native",
+        cwd=tmp_path,
+        bridge_dir=tmp_path,
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+
+    assert result.task_notifications == (
+        claude_native_bridge.ClaudeTaskNotification(
+            task_id="task-1",
+            tool_use_id="task-1",
+            status="completed",
+            result="historical result",
+            replayed=True,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_agent_async",
+                        "content": "Agent started",
+                    }
+                ],
+            },
+            "omnigentToolResult": {
+                "tool_name": "Agent",
+                "tool_status": "async_launched",
+                "is_async": True,
+                "is_error": False,
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read_1",
+                        "content": "File contents",
+                    }
+                ],
+            },
+            "omnigentToolResult": {
+                "tool_name": "Read",
+                "tool_status": "completed",
+                "is_async": False,
+                "is_error": False,
+            },
+        },
+        {
+            "type": "summary",
+            "omnigentTaskNotifications": [
+                {
+                    "tool_use_id": "toolu_agent_running",
+                    "status": "running",
+                    "result": "still running",
+                },
+                {"tool_use_id": " ", "status": "completed", "result": "invalid id"},
+                {"tool_use_id": "toolu_agent_bad", "status": "failed", "result": 7},
+            ],
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_agent_bad_bool",
+                        "content": "Agent finished",
+                    }
+                ],
+            },
+            "omnigentToolResult": {
+                "tool_name": "Agent",
+                "tool_status": "completed",
+                "is_async": "yes",
+            },
+        },
+    ],
+)
+def test_transcript_reader_rejects_nonterminal_or_nonagent_local_metadata(
+    tmp_path: Path,
+    entry: dict[str, Any],
+) -> None:
+    """Local lifecycle fields cannot promote live or ordinary tools to terminal."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+
+    assert result.task_notifications == ()
 
 
 def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:

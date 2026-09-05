@@ -124,6 +124,7 @@ from omnigent.server.routes._sessions.common import (
     _pushed_model_options_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
+    _session_status_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -1256,7 +1257,7 @@ def register_events_routes(
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
-            item_id = await _persist_external_conversation_item(
+            item_id, replayed = await _persist_external_conversation_item(
                 session_id,
                 conv,
                 body,
@@ -1264,7 +1265,12 @@ def register_events_routes(
                 created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
             )
-            return {"queued": False, "item_id": item_id}
+            return {
+                "queued": False,
+                "item_id": item_id,
+                "replayed": replayed,
+                **({"recovery": True} if "recovery_after" in body.data else {}),
+            }
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
             _publish_external_output_text_delta(session_id, body)
             return {"queued": False}
@@ -1308,6 +1314,19 @@ def register_events_routes(
                 raise OmnigentError(
                     f"external_session_status requires data.status in "
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            replayed = body.data.get("replayed", False)
+            if not isinstance(replayed, bool) or (
+                replayed
+                and (
+                    conv.kind != "sub_agent"
+                    or conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
+                    or status not in {"completed", "failed", "stopped", "killed"}
+                )
+            ):
+                raise OmnigentError(
+                    "Historical status recovery requires a native child terminal status",
                     code=ErrorCode.INVALID_INPUT,
                 )
             response_id = body.data.get("response_id")
@@ -1387,13 +1406,26 @@ def register_events_routes(
                     ),
                     message=output.strip(),
                 )
+            public_status = "idle" if status in {"completed", "stopped", "killed"} else status
             if status_error is not None:
                 await _persist_session_status_error_labels(
                     session_id, status_error, conversation_store
                 )
-            elif status == "running":
+            elif status == "running" or (replayed and public_status == "idle"):
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
-            public_status = "idle" if status in {"completed", "stopped", "killed"} else status
+            if (
+                replayed
+                and public_status == "idle"
+                and _session_status_cache.get(session_id) == "failed"
+            ):
+                # The global failed→idle guard protects a real StopFailure
+                # from the PTY watcher's trailing quiescence edge. Historical
+                # native-child terminal evidence is authoritative instead: it
+                # describes the same already-ended child after reconnect, so
+                # release only that stale cache entry before publishing the
+                # recovered terminal state. The replay was validated above and
+                # returns before Runner delivery, so this cannot wake work.
+                _session_status_cache.pop(session_id, None)
             _publish_status(
                 session_id,
                 public_status,
@@ -1406,6 +1438,11 @@ def register_events_routes(
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
             # No latency or token deltas are available on this path.
+            if replayed:
+                # Restore the display and durable terminal label only. A
+                # replay must not re-register work, enqueue a result, or wake
+                # the parent in a freshly started Runner.
+                return {"queued": False}
             if status in {"idle", "completed", "failed", "stopped", "killed"}:
                 _tel_emit(
                     _TelTurnEndEvent(
@@ -1588,7 +1625,7 @@ def register_events_routes(
             await _persist_external_goal_state(session_id, conv, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
-            child_id = await _persist_external_subagent_start(
+            child_id, existing_child = await _persist_external_subagent_start(
                 session_id,
                 conv,
                 body,
@@ -1597,7 +1634,7 @@ def register_events_routes(
             # Returned to the claude-native forwarder so it can address
             # subsequent ``external_conversation_item`` /
             # ``external_session_status`` events to the child id.
-            return {"queued": False, "child_session_id": child_id}
+            return {"queued": False, "child_session_id": child_id, "existing": existing_child}
         if body.type == _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE:
             child_id = await _persist_external_antigravity_subagent_start(
                 session_id,

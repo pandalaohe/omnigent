@@ -179,6 +179,7 @@ async def post_external_session_status(
     background_task_count: int | None = None,
     background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
+    replayed: bool = False,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -209,6 +210,9 @@ async def post_external_session_status(
         timer) rather than as static completed cards. ``None`` (the default)
         preserves the bare, turn-agnostic status edges (e.g. the sub-agent
         quiescence badge) that don't map to a turn.
+    :param replayed: Whether this terminal edge was restored from historical
+        cold-resume metadata. Only ``True`` is serialized; live/default edges
+        omit the field for backward compatibility.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -220,6 +224,8 @@ async def post_external_session_status(
         data["background_tasks"] = background_tasks
     if response_id is not None:
         data["response_id"] = response_id
+    if replayed:
+        data["replayed"] = True
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},
