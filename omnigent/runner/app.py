@@ -416,9 +416,7 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 
 _NO_BODY_STATUS_CODES = {204, 304}
-_SUBAGENT_TERMINAL_STATUSES = frozenset(
-    {"completed", "failed", "cancelled", "stopped", "killed"}
-)
+_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "stopped", "killed"})
 # Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
 # that has produced NO edge at all (no running/waiting/terminal status, no
 # in-flight response) within this window never started — fail it loudly
@@ -3079,10 +3077,16 @@ def create_runner_app(
         session_id: str,
         status: str,
         blocked_on: str | None = None,
+        background_task_count: int | None = None,
+        background_tasks: list[dict[str, object]] | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if background_task_count is not None:
+            event["background_task_count"] = background_task_count
+        if background_tasks is not None:
+            event["background_tasks"] = background_tasks
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -8607,7 +8611,35 @@ def create_runner_app(
                 "stopped",
                 "killed",
             ):
-                resource_registry.note_external_session_status(conversation_id, status)
+                raw_count = data.get("background_task_count")
+                bg_count = (
+                    raw_count
+                    if isinstance(raw_count, int)
+                    and not isinstance(raw_count, bool)
+                    and raw_count >= 0
+                    else None
+                )
+                raw_tasks = data.get("background_tasks")
+                bg_tasks = (
+                    [
+                        {
+                            key: value
+                            for key, value in task.items()
+                            if key in {"id", "type", "status", "command", "description"}
+                            and isinstance(value, str)
+                        }
+                        for task in raw_tasks[:100]
+                        if isinstance(task, dict)
+                    ]
+                    if isinstance(raw_tasks, list)
+                    else None
+                )
+                resource_registry.note_external_session_status(
+                    conversation_id,
+                    status,
+                    background_task_count=bg_count,
+                    background_tasks=bg_tasks,
+                )
                 _fan_out_child_delta_to_parent(
                     conversation_id,
                     {"type": "session.status", "status": status},
