@@ -9,6 +9,7 @@ import {
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { ArchiveDateRangePicker } from "@/components/archive/ArchiveDateRangePicker";
 import {
   Command,
   CommandEmpty,
@@ -21,9 +22,11 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type {
   ArchivedConversationFilters,
+  ArchivedDateField,
   ArchivedSearchScope,
   ArchivedSortField,
 } from "@/hooks/useConversations";
+import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { cn } from "@/lib/utils";
 
 export interface ArchiveLibraryViewState {
@@ -32,8 +35,8 @@ export interface ArchiveLibraryViewState {
   project?: string;
   hostId?: string;
   agentName?: string;
-  createdRange: string;
-  archivedRange: string;
+  dateField: ArchivedDateField;
+  dateRange: string;
   sortField: ArchivedSortField;
   order: "asc" | "desc";
 }
@@ -53,51 +56,25 @@ interface ArchiveLibraryToolbarProps {
   className?: string;
 }
 
-const DATE_RANGE_PATTERN = /^\d{6}-\d{6}$/;
-
 export function parseArchiveDateRange(value: string): { after: number; before: number } | null {
-  if (!DATE_RANGE_PATTERN.test(value)) return null;
-  const parse = (part: string) => {
-    const year = 2000 + Number.parseInt(part.slice(0, 2), 10);
-    const month = Number.parseInt(part.slice(2, 4), 10) - 1;
-    const day = Number.parseInt(part.slice(4, 6), 10);
-    const date = new Date(year, month, day);
-    if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day) {
-      return null;
-    }
-    return date;
-  };
-  const start = parse(value.slice(0, 6));
-  const end = parse(value.slice(7));
-  if (!start || !end || start > end) return null;
-  const endExclusive = new Date(end);
-  endExclusive.setDate(endExclusive.getDate() + 1);
-  return {
-    after: Math.floor(start.getTime() / 1000),
-    before: Math.floor(endExclusive.getTime() / 1000),
-  };
+  return archiveDateRangeBounds(value);
 }
 
 export function buildArchiveConversationFilters(
   value: ArchiveLibraryViewState,
   searchQuery: string,
 ): ArchivedConversationFilters {
-  const created = parseArchiveDateRange(value.createdRange);
-  const archived = parseArchiveDateRange(value.archivedRange);
   return {
     searchQuery,
     searchScope: value.searchScope,
     project: value.project,
     hostId: value.hostId,
     agentName: value.agentName,
-    dateField: "archived_at",
+    dateField: value.dateField,
+    dateRange: value.dateRange,
     sortField: value.sortField,
     agePreset: "any",
     order: value.order,
-    createdAfter: created?.after,
-    createdBefore: created?.before,
-    archivedAfter: archived?.after,
-    archivedBefore: archived?.before,
   };
 }
 
@@ -156,7 +133,9 @@ function FilterCombobox({
                 setOpen(false);
               }}
             >
-              <CheckIcon className={cn("size-3.5", value === undefined ? "opacity-100" : "opacity-0")} />
+              <CheckIcon
+                className={cn("size-3.5", value === undefined ? "opacity-100" : "opacity-0")}
+              />
               {allLabel}
             </CommandItem>
             {options.map((option) => (
@@ -195,15 +174,8 @@ export function ArchiveLibraryToolbar({
   className,
 }: ArchiveLibraryToolbarProps) {
   const hasFilters = Boolean(
-    value.searchQuery ||
-      value.project ||
-      value.hostId ||
-      value.agentName ||
-      value.createdRange ||
-      value.archivedRange,
+    value.searchQuery || value.project || value.hostId || value.agentName || value.dateRange,
   );
-  const createdValid = !value.createdRange || parseArchiveDateRange(value.createdRange) !== null;
-  const archivedValid = !value.archivedRange || parseArchiveDateRange(value.archivedRange) !== null;
 
   return (
     <div className={cn("space-y-1.5 border-b p-2", className)}>
@@ -219,7 +191,9 @@ export function ArchiveLibraryToolbar({
                 ? "Search archived session titles"
                 : "Search archived conversation content"
             }
-            placeholder={value.searchScope === "title" ? "Search session titles…" : "Search messages…"}
+            placeholder={
+              value.searchScope === "title" ? "Search session titles…" : "Search messages…"
+            }
             className="h-8 pl-8 text-xs"
           />
         </div>
@@ -285,7 +259,10 @@ export function ArchiveLibraryToolbar({
                 }
               >
                 <CheckIcon
-                  className={cn("size-3.5", value.sortField === field ? "opacity-100" : "opacity-0")}
+                  className={cn(
+                    "size-3.5",
+                    value.sortField === field ? "opacity-100" : "opacity-0",
+                  )}
                 />
                 {label}
               </Button>
@@ -340,48 +317,48 @@ export function ArchiveLibraryToolbar({
                     type="button"
                     variant="outline"
                     size="icon-sm"
-                    className={cn(
-                      "size-8",
-                      (value.createdRange || value.archivedRange) &&
-                        "border-primary/40 bg-primary/5",
-                    )}
-                    aria-label="Filter archive by created and archived date ranges"
+                    className={cn("size-8", value.dateRange && "border-primary/40 bg-primary/5")}
+                    aria-label="Filter archive by date"
                   >
                     <CalendarRangeIcon className="size-3.5" />
                   </Button>
                 </PopoverTrigger>
               </span>
             </TooltipTrigger>
-            <TooltipContent>
-              Limit by Created and Archived ranges using YYMMDD-YYMMDD; the end date is inclusive.
-            </TooltipContent>
+            <TooltipContent>Filter by Created, Active, or Archived date.</TooltipContent>
           </Tooltip>
-          <PopoverContent align="end" className="w-72 space-y-2 p-3">
-            <p className="text-xs font-medium">Date ranges</p>
-            {(
-              [
-                ["createdRange", "Created"],
-                ["archivedRange", "Archived"],
-              ] as const
-            ).map(([key, label]) => {
-              const valid = key === "createdRange" ? createdValid : archivedValid;
-              return (
-                <label key={key} className="grid grid-cols-[4.5rem_1fr] items-center gap-2 text-xs">
-                  <span className="text-muted-foreground">{label}</span>
-                  <Input
-                    value={value[key]}
-                    onChange={(event) => onChange({ [key]: event.target.value })}
-                    placeholder="YYMMDD-YYMMDD"
-                    maxLength={13}
-                    aria-invalid={!valid}
-                    className="h-8 font-mono text-xs"
-                  />
-                </label>
-              );
-            })}
-            <p className="text-[11px] text-muted-foreground">
-              Example: 260901-260904. Leave a field empty for no limit.
-            </p>
+          <PopoverContent align="end" className="w-[20rem] space-y-3 p-3">
+            <div
+              role="group"
+              aria-label="Archive date dimension"
+              className="grid grid-cols-3 rounded-md border bg-muted/20 p-0.5"
+            >
+              {(
+                [
+                  ["created_at", "Created"],
+                  ["active_at", "Active"],
+                  ["archived_at", "Archived"],
+                ] as const
+              ).map(([field, label]) => (
+                <button
+                  key={field}
+                  type="button"
+                  aria-pressed={value.dateField === field}
+                  className={cn(
+                    "h-7 rounded px-2 text-xs text-muted-foreground",
+                    value.dateField === field && "bg-background text-foreground shadow-sm",
+                  )}
+                  onClick={() => onChange({ dateField: field })}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <ArchiveDateRangePicker
+              value={value.dateRange}
+              onValueChange={(dateRange) => onChange({ dateRange })}
+              inlineCalendar
+            />
           </PopoverContent>
         </Popover>
         {hasFilters && (
@@ -399,15 +376,14 @@ export function ArchiveLibraryToolbar({
                     project: undefined,
                     hostId: undefined,
                     agentName: undefined,
-                    createdRange: "",
-                    archivedRange: "",
+                    dateRange: "",
                   })
                 }
               >
                 <RotateCcwIcon className="size-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Clear search, Project, Host, Agent, and both date ranges.</TooltipContent>
+            <TooltipContent>Clear archive search and filters.</TooltipContent>
           </Tooltip>
         )}
       </div>

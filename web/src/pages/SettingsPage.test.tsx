@@ -1102,10 +1102,18 @@ describe("SettingsPage", () => {
     try {
       renderPage("/settings/archived");
 
-      expect(screen.getByRole("searchbox", { name: /Search archived session titles/ })).toBeVisible();
+      expect(
+        screen.getByRole("searchbox", { name: /Search archived session titles/ }),
+      ).toBeVisible();
       expect(screen.getByRole("combobox", { name: /by project/i })).toBeVisible();
       expect(screen.getByRole("button", { name: /Archive sort/ })).toBeVisible();
       expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+      expect(screen.queryByTestId("archive-transcript")).toBeNull();
+      expect(screen.getByTestId("archive-list-pane")).not.toHaveClass("hidden");
+
+      fireEvent.click(screen.getByTestId("archived-open-session"));
+      expect(screen.getByTestId("archive-transcript")).toHaveTextContent("Transcript: Old chat");
+      expect(screen.getByTestId("archive-list-pane")).toHaveClass("hidden");
     } finally {
       cleanup();
       restoreViewport();

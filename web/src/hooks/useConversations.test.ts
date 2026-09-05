@@ -329,7 +329,8 @@ describe("fetchArchivedSessionFacets", () => {
       project: "Core",
       hostId: "host-win",
       agentName: "codex",
-      dateField: "archived_at",
+      dateField: "active_at",
+      dateRange: "20260902",
       sortField: "archived_at",
       agePreset: "any",
       order: "desc",
@@ -349,10 +350,42 @@ describe("fetchArchivedSessionFacets", () => {
     expect(url.searchParams.get("created_before")).toBe("200");
     expect(url.searchParams.get("archived_after")).toBe("300");
     expect(url.searchParams.get("archived_before")).toBe("400");
+    expect(url.searchParams.get("active_after")).not.toBeNull();
+    expect(Number(url.searchParams.get("active_before"))).toBeGreaterThan(
+      Number(url.searchParams.get("active_after")),
+    );
   });
 });
 
 describe("useArchivedConversations", () => {
+  it("maps the selected Active calendar day to active interval bounds", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    renderHook(
+      () =>
+        useArchivedConversations({
+          dateField: "active_at",
+          dateRange: "20260902",
+          sortField: "archived_at",
+          agePreset: "any",
+          order: "desc",
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const url = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    expect(url.searchParams.get("active_after")).not.toBeNull();
+    expect(Number(url.searchParams.get("active_before"))).toBeGreaterThan(
+      Number(url.searchParams.get("active_after")),
+    );
+  });
+
   it("pushes archive filters, age bounds, and sort to the server", async () => {
     const now = 2_000_000_000_000;
     const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);

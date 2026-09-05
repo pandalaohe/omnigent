@@ -1087,6 +1087,25 @@ export interface SessionItemsWindow {
   hasNewer: boolean;
 }
 
+export interface SessionItemSearchResult {
+  items: ConversationItem[];
+  hasMore: boolean;
+}
+
+/** Search the full persisted transcript without hydrating every item. */
+export async function searchSessionItems(
+  sessionId: string,
+  searchQuery: string,
+  limit = 1000,
+): Promise<SessionItemSearchResult> {
+  const params = new URLSearchParams({ search_query: searchQuery, limit: String(limit) });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items/search?${params}`,
+  );
+  const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
+  return { items: page.data, hasMore: page.has_more };
+}
+
 /** Fetch a bounded chronological transcript window centered on one item. */
 export async function fetchSessionItemsWindow(
   sessionId: string,

@@ -3,6 +3,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -97,7 +98,7 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 const { showToastMock } = vi.hoisted(() => ({ showToastMock: vi.fn() }));
 vi.mock("@/components/ui/toast", () => ({ showToast: showToastMock }));
 vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/customAgentsApi")>()),
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
   useCustomAgents: vi.fn(() => ({ data: [], isPending: false, error: null })),
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({

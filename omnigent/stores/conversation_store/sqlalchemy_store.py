@@ -2766,6 +2766,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         created_before: int | None = None,
         updated_after: int | None = None,
         updated_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
         archived_after: int | None = None,
         archived_before: int | None = None,
         accessible_by: str | None = None,
@@ -2987,6 +2989,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.updated_at >= updated_after)
             if updated_before is not None:
                 stmt = stmt.where(SqlConversation.updated_at < updated_before)
+            # Active is the interval from session creation through its newest
+            # committed item. Metadata-only updates do not extend it.
+            if active_before is not None:
+                stmt = stmt.where(SqlConversation.created_at < active_before)
+            if active_after is not None:
+                active_item_exists = (
+                    select(SqlConversationItem.id)
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == SqlConversation.id,
+                        SqlConversationItem.created_at >= active_after,
+                    )
+                    .correlate(SqlConversation)
+                    .exists()
+                )
+                stmt = stmt.where(
+                    (SqlConversation.created_at >= active_after) | active_item_exists
+                )
             if archived_after is not None:
                 stmt = stmt.where(SqlConversation.archived_at >= archived_after)
             if archived_before is not None:

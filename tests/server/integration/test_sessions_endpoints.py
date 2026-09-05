@@ -3097,6 +3097,27 @@ async def test_patch_session_archive_hides_from_default_list(
     assert filtered.status_code == 200
     assert sid in {row["id"] for row in filtered.json()["data"]}
 
+    active_overlap = await client.get(
+        "/v1/sessions",
+        params={
+            "archived_only": "true",
+            "active_after": str(session["created_at"]),
+            "active_before": str(session["created_at"] + 1),
+        },
+    )
+    assert active_overlap.status_code == 200
+    assert sid in {row["id"] for row in active_overlap.json()["data"]}
+
+    active_before_creation = await client.get(
+        "/v1/sessions",
+        params={
+            "archived_only": "true",
+            "active_before": str(session["created_at"]),
+        },
+    )
+    assert active_before_creation.status_code == 200
+    assert sid not in {row["id"] for row in active_before_creation.json()["data"]}
+
     invalid_mixed_sort = await client.get(
         "/v1/sessions",
         params={"include_archived": "true", "sort_by": "archived_at"},
@@ -4246,6 +4267,30 @@ async def test_list_session_items_404_for_nonexistent(
     """Items endpoint returns 404 for a session that doesn't exist."""
     resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/items")
     assert resp.status_code == 404
+
+
+async def test_search_session_items_is_scoped_to_full_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """Archive readers search persisted items without loading transcript pages."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        initial_message="needle unique archive phrase",
+    )
+    await _wait_for_idle(client, session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/items/search",
+        params={"search_query": "needle"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data"]
+    assert any(item.get("role") == "user" for item in body["data"])
+    assert body["first_id"] == body["data"][0]["id"]
 
 
 async def test_list_session_items_big_page_survives_bounded_read_backend(

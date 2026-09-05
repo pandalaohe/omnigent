@@ -217,6 +217,42 @@ def register_items_routes(
                 _subagent_reconcile_locks.pop(session_id, None)
 
     @router.get(
+        "/sessions/{session_id}/items/search",
+        response_model=None,
+        responses={200: {"model": PaginatedList}},
+    )
+    async def search_session_items(
+        request: Request,
+        session_id: str,
+        search_query: str = Query(min_length=1, max_length=500),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> PaginatedList:
+        """Search committed items inside one authorized session."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+
+        matches = await asyncio.to_thread(
+            conversation_store.search,
+            search_query,
+            conversation_id=session_id,
+            limit=limit + 1,
+        )
+        has_more = len(matches) > limit
+        visible = sorted(matches[:limit], key=lambda item: (item.created_at, item.id))
+        return PaginatedList(
+            data=[item.to_api_dict() for item in visible],
+            first_id=visible[0].id if visible else None,
+            last_id=visible[-1].id if visible else None,
+            has_more=has_more,
+        )
+
+    @router.get(
         "/sessions/{session_id}/items/window",
         response_model=SessionItemsWindow,
     )

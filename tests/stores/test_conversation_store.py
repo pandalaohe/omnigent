@@ -2137,6 +2137,45 @@ def test_archive_manager_filters_archived_host_cwd_and_dates(
     }
 
 
+def test_active_interval_ends_at_last_committed_item_not_later_metadata_edit(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Active-date overlap follows chat activity, never mutable updated_at."""
+    clock = {"now": 100}
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        lambda: clock["now"],
+    )
+    conv = conversation_store.create_conversation(title="active interval")
+    clock["now"] = 200
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_active",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "finished work"}],
+                    agent="test-agent",
+                ),
+            )
+        ],
+    )
+    clock["now"] = 400
+    conversation_store.update_conversation(conv.id, title="renamed after completion")
+
+    overlapping = conversation_store.list_conversations(active_after=150, active_before=250)
+    after_chat_finished = conversation_store.list_conversations(
+        active_after=250,
+        active_before=450,
+    )
+
+    assert conv.id in {row.id for row in overlapping.data}
+    assert conv.id not in {row.id for row in after_chat_finished.data}
+
+
 def test_archived_facets_are_aggregated_without_loading_conversation_rows(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,

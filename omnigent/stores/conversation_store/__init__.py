@@ -713,6 +713,8 @@ class ConversationStore(ABC):
         created_before: int | None = None,
         updated_after: int | None = None,
         updated_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
         archived_after: int | None = None,
         archived_before: int | None = None,
         accessible_by: str | None = None,
@@ -797,6 +799,11 @@ class ConversationStore(ABC):
             contains the query OR any of its items' search text
             does. Powers the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
+        :param active_after: Keep conversations whose activity interval ends
+            on or after this timestamp. Activity starts at session creation
+            and ends at the newest committed conversation item.
+        :param active_before: Keep conversations whose activity interval starts
+            before this exclusive timestamp.
         :param accessible_by: When set, filter to sessions the
             user has access to via ``session_permissions``. Uses
             a UNION subquery: sessions the user has a direct

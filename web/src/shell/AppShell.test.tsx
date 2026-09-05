@@ -1856,7 +1856,7 @@ describe("Workspace rail maximize", () => {
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
-  it("pins the sidebar open on /settings so the Back row is reachable", () => {
+  it("pins the sidebar open on desktop /settings so the Back row is reachable", () => {
     // The settings nav replaces the session list INSIDE the sidebar, and its
     // Back row is the only way off the page. Collapsed, that row is clipped and
     // inert — the user is stranded with no visible exit. Entering /settings must
@@ -1865,6 +1865,33 @@ describe("Workspace rail maximize", () => {
     renderShell("/settings");
 
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("starts with the settings drawer closed on mobile so section content is reachable", () => {
+    const realMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as typeof window.matchMedia;
+
+    try {
+      mockConversations([]);
+      renderShell("/settings");
+
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    } finally {
+      window.matchMedia = realMatchMedia;
+    }
   });
 
   it("refuses to collapse the sidebar while on /settings", () => {

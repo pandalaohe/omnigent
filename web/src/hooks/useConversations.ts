@@ -25,6 +25,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { getOmnigentHostGeneration } from "@/lib/host";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
@@ -100,9 +101,9 @@ export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
 }
 
-export type ArchivedDateField = "created_at" | "archived_at";
+export type ArchivedDateField = "created_at" | "active_at" | "archived_at";
 export type ArchivedSearchScope = "title" | "content";
-export type ArchivedSortField = ArchivedDateField | "title";
+export type ArchivedSortField = "created_at" | "archived_at" | "title";
 export type ArchivedAgePreset =
   "any" | "lt24h" | "lt7d" | "gt7d" | "gt30d" | "gt90d" | "gt180d" | "gt365d";
 
@@ -115,11 +116,15 @@ export interface ArchivedConversationFilters {
   dateField: ArchivedDateField;
   sortField: ArchivedSortField;
   agePreset: ArchivedAgePreset;
+  /** Local calendar day or inclusive range: YYYYMMDD[-YYYYMMDD]. */
+  dateRange?: string;
   order: "asc" | "desc";
   createdAfter?: number;
   createdBefore?: number;
   archivedAfter?: number;
   archivedBefore?: number;
+  activeAfter?: number;
+  activeBefore?: number;
 }
 
 export interface ArchivedSessionFacets {
@@ -610,6 +615,19 @@ function archivedAgeBounds(
   };
 }
 
+function archivedCalendarBounds(
+  field: ArchivedDateField | "updated_at",
+  value: string | undefined,
+): Record<string, string> {
+  const bounds = archiveDateRangeBounds(value ?? "");
+  if (!bounds) return {};
+  const prefix = field.replace("_at", "");
+  return {
+    [`${prefix}_after`]: String(bounds.after),
+    [`${prefix}_before`]: String(bounds.before),
+  };
+}
+
 async function fetchArchivedConversationsPage(
   filters: ArchivedConversationFilters,
   after?: string,
@@ -627,7 +645,8 @@ async function fetchArchivedConversationsPage(
   };
   const usesArchivedAt =
     filters.sortField === "archived_at" ||
-    (filters.dateField === "archived_at" && filters.agePreset !== "any") ||
+    (filters.dateField === "archived_at" &&
+      (filters.agePreset !== "any" || Boolean(filters.dateRange))) ||
     filters.archivedAfter !== undefined ||
     filters.archivedBefore !== undefined;
   const buildParams = (supportsArchivedAt: boolean) => {
@@ -645,6 +664,7 @@ async function fetchArchivedConversationsPage(
       order: filters.order,
       sort_by: sortField,
       ...archivedAgeBounds(dateField, filters.agePreset),
+      ...archivedCalendarBounds(dateField, filters.dateRange),
     });
     if (after) params.set("after", after);
     if (filters.searchQuery) params.set("search_query", filters.searchQuery);
@@ -666,6 +686,9 @@ async function fetchArchivedConversationsPage(
         supportsArchivedAt ? "archived_before" : "updated_before",
         String(filters.archivedBefore),
       );
+    if (filters.activeAfter !== undefined) params.set("active_after", String(filters.activeAfter));
+    if (filters.activeBefore !== undefined)
+      params.set("active_before", String(filters.activeBefore));
     return params;
   };
   let params = buildParams(archivedAtQuerySupported);
@@ -1838,6 +1861,11 @@ export async function fetchArchivedSessionFacets(
   filters?: Partial<ArchivedConversationFilters>,
 ): Promise<ArchivedSessionFacets> {
   const params = new URLSearchParams();
+  const calendarBounds = archivedCalendarBounds(
+    filters?.dateField ?? "archived_at",
+    filters?.dateRange,
+  );
+  for (const [key, value] of Object.entries(calendarBounds)) params.set(key, value);
   if (filters?.searchQuery) params.set("search_query", filters.searchQuery);
   if (filters?.searchQuery && filters.searchScope) params.set("search_scope", filters.searchScope);
   if (filters?.project) params.set("project", filters.project);
@@ -1851,6 +1879,9 @@ export async function fetchArchivedSessionFacets(
     params.set("archived_after", String(filters.archivedAfter));
   if (filters?.archivedBefore !== undefined)
     params.set("archived_before", String(filters.archivedBefore));
+  if (filters?.activeAfter !== undefined) params.set("active_after", String(filters.activeAfter));
+  if (filters?.activeBefore !== undefined)
+    params.set("active_before", String(filters.activeBefore));
   const suffix = params.size > 0 ? `?${params.toString()}` : "";
   const res = await authenticatedFetch(`/v1/sessions/archived-facets${suffix}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);

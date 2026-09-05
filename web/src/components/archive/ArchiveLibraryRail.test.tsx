@@ -5,9 +5,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
+  useArchiveConversation,
   useArchivedConversations,
   useArchivedSessionFacets,
   useProjects,
+  useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
 import { ArchiveLibraryRail } from "./ArchiveLibraryRail";
@@ -16,8 +18,11 @@ vi.mock("@/hooks/useConversations", () => ({
   useArchivedConversations: vi.fn(),
   useArchivedSessionFacets: vi.fn(),
   useProjects: vi.fn(),
+  useArchiveConversation: vi.fn(),
+  useStopAndDeleteConversation: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn(() => false) }));
 vi.mock("@/components/archive/ArchiveTranscriptViewer", () => ({
   ArchiveTranscriptViewer: ({ conversation: selected }: { conversation: Conversation | null }) => (
     <div data-testid="transcript-stub">{selected?.title ?? "none"}</div>
@@ -28,6 +33,8 @@ const useArchivedMock = vi.mocked(useArchivedConversations);
 const useFacetsMock = vi.mocked(useArchivedSessionFacets);
 const useHostsMock = vi.mocked(useHosts);
 const useProjectsMock = vi.mocked(useProjects);
+const useArchiveMock = vi.mocked(useArchiveConversation);
+const useDeleteMock = vi.mocked(useStopAndDeleteConversation);
 
 function renderRail(props: ComponentProps<typeof ArchiveLibraryRail> = {}) {
   return render(
@@ -55,6 +62,14 @@ function archiveConversation(id: string, title: string): Conversation {
 describe("ArchiveLibraryRail", () => {
   beforeEach(() => {
     localStorage.clear();
+    useArchiveMock.mockReturnValue({
+      mutate: vi.fn(),
+      isPending: false,
+    } as unknown as ReturnType<typeof useArchiveConversation>);
+    useDeleteMock.mockReturnValue({
+      mutate: vi.fn(),
+      isPending: false,
+    } as unknown as ReturnType<typeof useStopAndDeleteConversation>);
     useFacetsMock.mockReturnValue({
       data: { projects: [], hostIds: [], agentNames: [] },
     } as unknown as ReturnType<typeof useArchivedSessionFacets>);
@@ -134,5 +149,13 @@ describe("ArchiveLibraryRail", () => {
       expect(screen.getByRole("combobox", { name: /by project/i })).toHaveTextContent("Omnigent");
       expect(screen.getByRole("combobox", { name: /by host/i })).toHaveTextContent("Windows");
     });
+  });
+
+  it("keeps row actions available without a visible keyboard instruction", async () => {
+    renderRail();
+
+    expect(await screen.findByRole("button", { name: "Unarchive session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete archived session" })).toBeInTheDocument();
+    expect(screen.queryByText(/Return open/)).toBeNull();
   });
 });

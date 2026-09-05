@@ -150,7 +150,6 @@ import { useHosts } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
-import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import {
   readInheritLastRightRailTab,
@@ -2335,24 +2334,37 @@ const DEFAULT_ARCHIVED_VIEW: ArchivedViewPreferences = {
   project: undefined,
   hostId: undefined,
   agentName: undefined,
-  createdRange: "",
-  archivedRange: "",
+  dateField: "archived_at",
+  dateRange: "",
   sortField: "archived_at",
   order: "desc",
 };
 
 function readArchivedViewPreferences(): ArchivedViewPreferences {
   try {
-    const stored = JSON.parse(
-      localStorage.getItem(ARCHIVED_VIEW_STORAGE_KEY) ?? "null",
-    ) as Partial<ArchivedViewPreferences> | null;
+    const stored = JSON.parse(localStorage.getItem(ARCHIVED_VIEW_STORAGE_KEY) ?? "null") as
+      | (Partial<ArchivedViewPreferences> & {
+          createdRange?: string;
+          archivedRange?: string;
+        })
+      | null;
     if (!stored) return DEFAULT_ARCHIVED_VIEW;
+    const dateField =
+      stored.dateField === "created_at" || stored.dateField === "active_at"
+        ? stored.dateField
+        : "archived_at";
+    const legacyRange =
+      typeof stored.archivedRange === "string" && stored.archivedRange
+        ? stored.archivedRange
+        : typeof stored.createdRange === "string"
+          ? stored.createdRange
+          : "";
     return {
       ...DEFAULT_ARCHIVED_VIEW,
       ...stored,
       searchScope: stored.searchScope === "content" ? "content" : "title",
-      createdRange: typeof stored.createdRange === "string" ? stored.createdRange : "",
-      archivedRange: typeof stored.archivedRange === "string" ? stored.archivedRange : "",
+      dateField,
+      dateRange: typeof stored.dateRange === "string" ? stored.dateRange : legacyRange,
       sortField:
         stored.sortField === "created_at" || stored.sortField === "title"
           ? stored.sortField
@@ -2405,6 +2417,7 @@ function ArchivedSection() {
     >
       <div
         ref={listFocusRef}
+        data-testid="archive-list-pane"
         className={cn(
           "min-h-0 shrink-0 overflow-x-hidden overflow-y-auto",
           isMobileViewport && selectedConversation ? "hidden" : "w-full",
@@ -2413,6 +2426,7 @@ function ArchivedSection() {
       >
         <ArchivedListPane
           selectedConversationId={selectedConversation?.id ?? null}
+          autoSelectFirst={!isMobileViewport}
           onSelectConversation={setSelectedConversation}
         />
       </div>
@@ -2439,9 +2453,11 @@ function ArchivedSection() {
 
 function ArchivedListPane({
   selectedConversationId,
+  autoSelectFirst,
   onSelectConversation,
 }: {
   selectedConversationId: string | null;
+  autoSelectFirst: boolean;
   onSelectConversation: (conversation: Conversation | null) => void;
 }) {
   const [view, setView] = useState<ArchivedViewPreferences>(readArchivedViewPreferences);
@@ -2473,22 +2489,28 @@ function ArchivedListPane({
       if (selectedConversationId !== null) onSelectConversation(null);
       return;
     }
+    if (selectedConversationId === null) {
+      if (autoSelectFirst) onSelectConversation(archived[0]);
+      return;
+    }
     const selected = archived.find((conversation) => conversation.id === selectedConversationId);
-    if (!selected) onSelectConversation(archived[0]);
-    else if (selected !== null) onSelectConversation(selected);
-  }, [archived, listQuery.isLoading, onSelectConversation, selectedConversationId]);
+    onSelectConversation(selected ?? null);
+  }, [
+    archived,
+    autoSelectFirst,
+    listQuery.isLoading,
+    onSelectConversation,
+    selectedConversationId,
+  ]);
 
   useEffect(() => {
     localStorage.setItem(ARCHIVED_VIEW_STORAGE_KEY, JSON.stringify(view));
   }, [view]);
 
-  const updateView = useCallback(
-    (patch: Partial<ArchivedViewPreferences>) => {
-      setPageCursors([undefined]);
-      setView((current) => ({ ...current, ...patch }));
-    },
-    [],
-  );
+  const updateView = useCallback((patch: Partial<ArchivedViewPreferences>) => {
+    setPageCursors([undefined]);
+    setView((current) => ({ ...current, ...patch }));
+  }, []);
 
   const hostNames = useMemo(
     () => new Map((hostsQuery.data ?? []).map((host) => [host.host_id, host.name])),
@@ -2517,10 +2539,7 @@ function ArchivedListPane({
 
   useEffect(() => {
     if (!facetsQuery.data) return;
-    const normalize = (
-      key: "project" | "hostId" | "agentName",
-      options: ArchiveFilterOption[],
-    ) => {
+    const normalize = (key: "project" | "hostId" | "agentName", options: ArchiveFilterOption[]) => {
       const current = view[key];
       if (current && !options.some((option) => option.value === current)) {
         updateView({ [key]: undefined });
@@ -2954,9 +2973,7 @@ function ArchivedRow({
             onOpen(conversation);
             window.setTimeout(
               () =>
-                document
-                  .querySelector<HTMLElement>('[data-testid="archive-transcript"]')
-                  ?.focus(),
+                document.querySelector<HTMLElement>('[data-testid="archive-transcript"]')?.focus(),
               0,
             );
             return;
@@ -2964,9 +2981,9 @@ function ArchivedRow({
           if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
           event.preventDefault();
           const rows = [
-            ...(event.currentTarget.closest("ul")?.querySelectorAll<HTMLButtonElement>(
-              '[data-testid="archived-open-session"]',
-            ) ?? []),
+            ...(event.currentTarget
+              .closest("ul")
+              ?.querySelectorAll<HTMLButtonElement>('[data-testid="archived-open-session"]') ?? []),
           ];
           const index = rows.indexOf(event.currentTarget);
           rows[index + (event.key === "ArrowDown" ? 1 : -1)]?.focus();
@@ -3007,9 +3024,9 @@ function ArchivedRow({
             <time
               className="shrink-0"
               dateTime={new Date(archivedAtMs).toISOString()}
-              title={`Archived ${absoluteTime(archivedAtMs)}`}
+              title={`Archived ${new Date(archivedAtMs).toLocaleString("en-US")}`}
             >
-              {new Date(archivedAtMs).toLocaleDateString(undefined, {
+              {new Date(archivedAtMs).toLocaleDateString("en-US", {
                 month: "short",
                 day: "numeric",
               })}
