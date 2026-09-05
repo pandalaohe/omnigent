@@ -98,13 +98,16 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         "version": USER_PREFERENCE_VERSION,
         "settings": deepcopy(settings),
     }
-    serialized = json.dumps(
-        copied,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    try:
+        serialized = json.dumps(
+            copied,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise UserPreferencesValidationError("preferences strings must be valid UTF-8") from exc
     if len(serialized) > USER_PREFERENCES_MAX_BYTES:
         raise UserPreferencesValidationError("preferences exceed the 64 KiB limit")
     return copied

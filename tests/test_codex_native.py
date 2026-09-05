@@ -71,6 +71,11 @@ def test_normalized_codex_goal_state(status: str, expected: str | None) -> None:
     assert state == expected
 
 
+@pytest.mark.parametrize("goal", [{}, {"status": []}, {"status": "future"}, False])
+def test_normalized_codex_goal_state_ignores_unknown(goal: object) -> None:
+    assert codex_native_forwarder._normalized_codex_goal_state(goal) == (False, None)
+
+
 def test_forwarder_posts_goal_notifications_and_dedupes(tmp_path: Path) -> None:
     posted: list[dict[str, Any]] = []
     forwarder_state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_123")
@@ -85,6 +90,7 @@ def test_forwarder_posts_goal_notifications_and_dedupes(tmp_path: Path) -> None:
             transport=httpx.MockTransport(handler),
         ) as client:
             for event in [
+                {"method": "thread/goal/updated", "params": {"threadId": "thread_123"}},
                 {
                     "method": "thread/goal/updated",
                     "params": {"threadId": "thread_123", "goal": {"status": "active"}},
@@ -7883,6 +7889,7 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
 
         :returns: None.
         """
+        assert _kwargs["headers"] == {}
         order.append("attach")
 
     monkeypatch.setattr(chat_mod, "_remote_headers", lambda *_args, **_kwargs: {})

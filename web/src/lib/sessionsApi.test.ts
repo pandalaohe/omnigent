@@ -96,6 +96,9 @@ describe("createSession", () => {
       hostResumable: false,
       status: "idle",
       createdAt: 1704067200,
+      updatedAt: 1704067200,
+      archivedAt: null,
+      archived: false,
       title: null,
       items: [],
       queuedItems: undefined,
@@ -687,6 +690,9 @@ describe("getSession", () => {
         agent_id: "agent_xyz",
         status: "idle",
         created_at: 1704067200,
+        updated_at: 1704067300,
+        archived_at: 1704067250,
+        archived: true,
         items: [],
       }),
     );
@@ -702,6 +708,9 @@ describe("getSession", () => {
     );
     expect(session.agentId).toBe("agent_xyz");
     expect(session.items).toEqual([]);
+    expect(session.updatedAt).toBe(1704067300);
+    expect(session.archivedAt).toBe(1704067250);
+    expect(session.archived).toBe(true);
   });
 
   it("getSessionSlim can request a runner-backed state refresh", async () => {

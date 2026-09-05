@@ -94,6 +94,7 @@ export const ARCHIVED_PAGE_SIZE = 20;
 
 let archivedAtCapabilityGeneration = -1;
 let archivedAtQuerySupported = true;
+let archivedAtCapabilityConfirmed = false;
 
 export const ARCHIVE_LOCK_LABEL_KEY = "omnigent.archive_locked";
 
@@ -688,6 +689,7 @@ async function fetchArchivedConversationsPage(
   if (requestGeneration !== archivedAtCapabilityGeneration) {
     archivedAtCapabilityGeneration = requestGeneration;
     archivedAtQuerySupported = true;
+    archivedAtCapabilityConfirmed = false;
   }
   const ensureCurrentConnection = () => {
     if (getOmnigentHostGeneration() !== requestGeneration) {
@@ -700,16 +702,20 @@ async function fetchArchivedConversationsPage(
       (filters.agePreset !== "any" || Boolean(filters.dateRange))) ||
     filters.archivedAfter !== undefined ||
     filters.archivedBefore !== undefined;
+  const usesArchiveExtensions = usesArchivedAt || filters.sortField === "title";
   const buildParams = (supportsArchivedAt: boolean) => {
     const dateField =
       !supportsArchivedAt && filters.dateField === "archived_at"
         ? ("updated_at" as const)
         : filters.dateField;
     const sortField =
-      !supportsArchivedAt && filters.sortField === "archived_at"
+      !supportsArchivedAt && (filters.sortField === "archived_at" || filters.sortField === "title")
         ? ("updated_at" as const)
         : filters.sortField;
     const params = new URLSearchParams({
+      // This is the pre-existing Server contract. Keep it on every request so
+      // an older Server that ignores archived_only cannot return active rows.
+      visibility: "archived",
       archived_only: "true",
       limit: String(ARCHIVED_PAGE_SIZE),
       order: filters.order,
@@ -742,7 +748,6 @@ async function fetchArchivedConversationsPage(
       params.set("active_before", String(filters.activeBefore));
     return params;
   };
-  let params = buildParams(archivedAtQuerySupported);
   const timeoutSignal = filters.searchQuery
     ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS)
     : undefined;
@@ -750,25 +755,53 @@ async function fetchArchivedConversationsPage(
     requestSignal && timeoutSignal
       ? AbortSignal.any([requestSignal, timeoutSignal])
       : (requestSignal ?? timeoutSignal);
+  const needsArchivedAtPreflight =
+    !archivedAtCapabilityConfirmed && usesArchivedAt && filters.sortField !== "archived_at";
+  if (needsArchivedAtPreflight) {
+    const probe = new URLSearchParams({
+      visibility: "archived",
+      archived_only: "true",
+      sort_by: "archived_at",
+      limit: "1",
+    });
+    const probeResponse = await authenticatedFetch(`/v1/sessions?${probe.toString()}`, { signal });
+    ensureCurrentConnection();
+    if (probeResponse.status === 422) {
+      archivedAtQuerySupported = false;
+    } else if (!probeResponse.ok) {
+      throw new Error(`${probeResponse.status} ${probeResponse.statusText}`);
+    }
+    archivedAtCapabilityConfirmed = true;
+  }
+
+  let params = buildParams(archivedAtQuerySupported);
   let res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
   ensureCurrentConnection();
-  if (res.status === 422 && archivedAtQuerySupported && usesArchivedAt) {
+  if (res.status === 422 && archivedAtQuerySupported && usesArchiveExtensions) {
     // f7 and older reject archived_at before the UI can apply its display
     // fallback. Retry once against updated_at and remember the capability for
     // this host generation so pagination/refetches do not keep probing.
     archivedAtQuerySupported = false;
+    archivedAtCapabilityConfirmed = true;
     params = buildParams(false);
     res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
     ensureCurrentConnection();
+  } else if (res.ok && usesArchiveExtensions) {
+    archivedAtCapabilityConfirmed = true;
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return withoutDeletingSessions((await res.json()) as ConversationsPage);
+  const page = (await res.json()) as ConversationsPage;
+  return withoutDeletingSessions({
+    ...page,
+    data: page.data.filter((conversation) => conversation.archived === true),
+  });
 }
 
 /** Test-only reset for the per-Server archived_at capability cache. */
 export function resetArchivedQueryCompatibilityForTests(): void {
   archivedAtCapabilityGeneration = -1;
   archivedAtQuerySupported = true;
+  archivedAtCapabilityConfirmed = false;
 }
 
 /** Server-filtered, archive-only list used by Settings → Archived sessions. */
@@ -1910,6 +1943,7 @@ export function useArchivedProjectNames() {
 
 export async function fetchArchivedSessionFacets(
   filters?: Partial<ArchivedConversationFilters>,
+  signal?: AbortSignal,
 ): Promise<ArchivedSessionFacets> {
   const params = new URLSearchParams();
   const calendarBounds = archivedCalendarBounds(
@@ -1934,7 +1968,7 @@ export async function fetchArchivedSessionFacets(
   if (filters?.activeBefore !== undefined)
     params.set("active_before", String(filters.activeBefore));
   const suffix = params.size > 0 ? `?${params.toString()}` : "";
-  const res = await authenticatedFetch(`/v1/sessions/archived-facets${suffix}`);
+  const res = await authenticatedFetch(`/v1/sessions/archived-facets${suffix}`, { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const payload = (await res.json()) as {
     projects: string[];
@@ -1951,7 +1985,7 @@ export async function fetchArchivedSessionFacets(
 export function useArchivedSessionFacets(filters?: Partial<ArchivedConversationFilters>) {
   return useQuery<ArchivedSessionFacets>({
     queryKey: [...ARCHIVED_SESSION_FACETS_KEY, filters ?? null],
-    queryFn: () => fetchArchivedSessionFacets(filters),
+    queryFn: ({ signal }) => fetchArchivedSessionFacets(filters, signal),
     staleTime: 60_000,
   });
 }

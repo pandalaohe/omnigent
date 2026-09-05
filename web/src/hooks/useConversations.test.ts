@@ -307,7 +307,8 @@ describe("fetchArchivedSessionFacets", () => {
       }),
     );
 
-    const facets = await fetchArchivedSessionFacets();
+    const signal = new AbortController().signal;
+    const facets = await fetchArchivedSessionFacets(undefined, signal);
 
     expect(facets).toEqual({
       projects: ["Alpha", "Beta"],
@@ -316,6 +317,7 @@ describe("fetchArchivedSessionFacets", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/archived-facets");
+    expect((fetchMock.mock.calls[0][1] as RequestInit).signal).toBe(signal);
   });
 
   it("sends the current search, date, and linked facet constraints", async () => {
@@ -359,9 +361,13 @@ describe("fetchArchivedSessionFacets", () => {
 
 describe("useArchivedConversations", () => {
   it("maps the selected Active calendar day to active interval bounds", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
-    );
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
@@ -415,10 +421,13 @@ describe("useArchivedConversations", () => {
       { wrapper },
     );
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    const [requestUrl, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const probe = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    expect(probe.searchParams.get("sort_by")).toBe("archived_at");
+    const [requestUrl, requestInit] = fetchMock.mock.calls[1] as [string, RequestInit];
     const url = new URL(requestUrl, "http://test");
     expect(url.searchParams.get("archived_only")).toBe("true");
+    expect(url.searchParams.get("visibility")).toBe("archived");
     expect(url.searchParams.get("search_query")).toBe("Omnigent");
     expect(url.searchParams.get("search_scope")).toBe("content");
     expect(url.searchParams.get("project")).toBe("Core");
@@ -503,6 +512,73 @@ describe("useArchivedConversations", () => {
     expect(cachedLegacy.searchParams.get("sort_by")).toBe("updated_at");
     expect(cachedLegacy.searchParams.has("updated_before")).toBe(true);
     second.unmount();
+  });
+
+  it("preflights archived dates and keeps old-Server membership archive-only", async () => {
+    const active = conversation({ id: "active", archived: false });
+    const archived = conversation({ id: "archived", archived: true });
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 422 }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [active, archived],
+          first_id: "active",
+          last_id: "archived",
+          has_more: false,
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const rendered = renderHook(
+      () =>
+        useArchivedConversations({
+          dateField: "archived_at",
+          sortField: "created_at",
+          agePreset: "gt30d",
+          order: "desc",
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const probe = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    const legacy = new URL(fetchMock.mock.calls[1][0] as string, "http://test");
+    expect(probe.searchParams.get("sort_by")).toBe("archived_at");
+    expect(legacy.searchParams.get("visibility")).toBe("archived");
+    expect(legacy.searchParams.get("sort_by")).toBe("created_at");
+    expect(legacy.searchParams.has("updated_before")).toBe(true);
+    expect(rendered.result.current.data?.data.map((row) => row.id)).toEqual(["archived"]);
+  });
+
+  it("falls title sorting back to updated_at on an older Server", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 422 }))
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const rendered = renderHook(
+      () =>
+        useArchivedConversations({
+          dateField: "created_at",
+          sortField: "title",
+          agePreset: "any",
+          order: "asc",
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const legacy = new URL(fetchMock.mock.calls[1][0] as string, "http://test");
+    expect(legacy.searchParams.get("sort_by")).toBe("updated_at");
+    expect(legacy.searchParams.get("visibility")).toBe("archived");
   });
 
   it("ignores a delayed compatibility response from the previous Server", async () => {

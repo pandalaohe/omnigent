@@ -7,12 +7,12 @@ from pathlib import Path
 
 import sqlalchemy as sa
 from alembic import command
+from alembic.script import ScriptDirectory
 
 from omnigent.db.compression import decode
 from omnigent.db.utils import _build_alembic_config, _create_engine, _get_current_db_revision
 
 _PREVIOUS = "f9a1b2c3d4e5"
-_HEAD = "fb1b2c3d4e5"
 _LABEL_KEY = "omnigent.last_provider_usage_limits"
 
 
@@ -80,7 +80,9 @@ def test_upgrade_recovers_one_character_clipped_provider_snapshot(tmp_path: Path
         config.attributes["connection"] = connection
         command.upgrade(config, "head")
 
-    assert _get_current_db_revision(engine) == _HEAD
+    assert (
+        _get_current_db_revision(engine) == ScriptDirectory.from_config(config).get_current_head()
+    )
     with engine.connect() as connection:
         raw = connection.execute(
             sa.text(

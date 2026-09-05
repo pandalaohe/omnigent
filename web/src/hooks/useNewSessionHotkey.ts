@@ -2,6 +2,7 @@ import { useEffect } from "react";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
+import { useNewSessionTarget } from "@/hooks/useNewSessionTarget";
 import {
   eventMatchesShortcutAction,
   hasCustomShortcutBindings,
@@ -23,6 +24,7 @@ export function isNewSessionHotkey(e: globalThis.KeyboardEvent, isMac = isMacPla
 /** Navigate to the same new-session route used by the command palette. */
 export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): void {
   const navigate = useNavigate();
+  const { route } = useNewSessionTarget();
 
   useEffect(() => {
     if (!enabled) return;
@@ -30,9 +32,9 @@ export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): vo
       if (e.repeat || !isNewSessionHotkey(e, isMac)) return;
       e.preventDefault();
       e.stopPropagation();
-      navigate("/");
+      navigate(route);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [enabled, isMac, navigate]);
+  }, [enabled, isMac, navigate, route]);
 }

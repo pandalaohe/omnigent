@@ -145,6 +145,25 @@ def test_final_punctuation_does_not_rewrite_live_partials() -> None:
     assert engine._beautify_final("你好") == "你好。"
 
 
+def test_final_punctuation_failure_does_not_log_transcript(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model failure falls back without copying dictated text into logs."""
+    private_text = "do not record this transcript"
+
+    class FailingRestorer:
+        def restore(self, text: str) -> str:
+            raise RuntimeError(f"failed while processing {text}")
+
+    engine = object.__new__(dictation.SherpaDictationEngine)
+    engine._punct = None
+    engine._final_punctuation = FailingRestorer()
+
+    with caplog.at_level("WARNING"):
+        assert engine._beautify_final(private_text) == private_text
+    assert private_text not in caplog.text
+
+
 def test_pick_model_file_prefers_int8(tmp_path: Path) -> None:
     """int8 quantizations win over float exports of the same stem."""
     (tmp_path / "encoder.onnx").touch()

@@ -696,8 +696,10 @@ async def _archive_stop(
         tunnels, or ``None`` when host support is not wired.
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
+    from omnigent.server.native_subagent_watchdog import disarm_native_subagent_watchdogs
     from omnigent.server.routes import sessions as _facade
 
+    disarm_native_subagent_watchdogs(session_id)
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)

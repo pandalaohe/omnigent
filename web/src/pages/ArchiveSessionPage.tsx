@@ -48,7 +48,8 @@ export function ArchiveSessionPage() {
     object: "conversation",
     title: session.title,
     created_at: session.createdAt,
-    updated_at: session.createdAt,
+    updated_at: session.updatedAt ?? session.createdAt,
+    archived_at: session.archivedAt ?? null,
     labels: session.labels ?? {},
     permission_level: session.permissionLevel ?? null,
     runner_id: session.runnerId,
@@ -56,7 +57,7 @@ export function ArchiveSessionPage() {
     workspace: session.workspace,
     agent_id: session.agentId,
     agent_name: session.agentName,
-    archived: true,
+    archived: session.archived ?? true,
     ...(itemId
       ? {
           search_match: {
@@ -70,7 +71,7 @@ export function ArchiveSessionPage() {
   };
 
   return (
-    <main className="flex h-full min-h-0 pt-[calc(var(--app-header-height,3.5rem)+env(safe-area-inset-top))]">
+    <main className="flex h-full min-h-0 min-w-0 overflow-hidden pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]">
       <ArchiveTranscriptViewer conversation={conversation} onBack={() => navigate(-1)} />
     </main>
   );

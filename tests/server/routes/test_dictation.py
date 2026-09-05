@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -155,19 +156,24 @@ def test_punctuation_route_requires_identity() -> None:
     assert exc_info.value.code == ErrorCode.UNAUTHORIZED
 
 
-def test_punctuation_route_maps_model_failure_to_service_unavailable() -> None:
+def test_punctuation_route_maps_model_failure_to_service_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Model failures return a fixed 503 without exposing transcript text."""
 
+    private_text = "私密转写内容"
+
     def unavailable() -> _FakePunctuationRestorer:
-        raise RuntimeError("model failed")
+        raise RuntimeError(f"model failed while processing {private_text}")
 
     app = _fake_app(punctuation_provider=unavailable)
-    with TestClient(app) as tc:
-        resp = tc.post("/v1/dictation/punctuation", json={"text": "私密转写内容"})
+    with caplog.at_level(logging.ERROR), TestClient(app) as tc:
+        resp = tc.post("/v1/dictation/punctuation", json={"text": private_text})
 
     assert resp.status_code == 503
     assert resp.json() == {"detail": "dictation punctuation unavailable"}
-    assert "私密转写内容" not in resp.text
+    assert private_text not in resp.text
+    assert private_text not in caplog.text
 
 
 def test_stream_partial_final_stop_flow() -> None:

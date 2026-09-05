@@ -251,9 +251,6 @@ export function ArchiveLibraryRail({
         if (selectedValue && !options.some((option) => option.value === selectedValue)) {
           next[key] = undefined;
           changed = true;
-        } else if (!selectedValue && options.length === 1) {
-          next[key] = options[0].value;
-          changed = true;
         }
       };
       normalize("project", projectOptions);

@@ -599,6 +599,7 @@ def create_hosts_router(
         now = now_epoch()
         result: list[dict[str, Any]] = []
         for host in hosts:
+            live_connection = host_registry.get(host.host_id)
             # Status comes from the DB, not host_registry. The registry
             # is per-replica; if a host is connected to replica B and
             # this request lands on replica A, A's registry won't know
@@ -622,6 +623,12 @@ def create_hosts_router(
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
                     "default_workspace": host.default_workspace,
+                    # Root enumeration is a Host capability. Missing hello
+                    # metadata (older Host or another replica) fails closed so
+                    # the picker retains its home/path flow.
+                    "filesystem_roots": bool(
+                        live_connection and live_connection.hello.filesystem_roots
+                    ),
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
@@ -667,6 +674,10 @@ def create_hosts_router(
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
             "default_workspace": host.default_workspace,
+            "filesystem_roots": bool(
+                (live_connection := host_registry.get(host.host_id))
+                and live_connection.hello.filesystem_roots
+            ),
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
@@ -687,24 +698,21 @@ def create_hosts_router(
 
         value = body.default_workspace
         if value is not None:
-            value = value.strip()
-            if not value:
+            if value == "":
                 value = None
             elif len(value) > 2048 or "\x00" in value:
                 raise HTTPException(status_code=400, detail="invalid default workspace")
-            elif not (
-                value.startswith(("/", "\\\\"))
-                or (
-                    len(value) >= 3
-                    and value[0].isalpha()
-                    and value[1] == ":"
-                    and value[2] in "\\/"
-                )
-            ):
+            elif not (value.startswith("/") or _is_windows_absolute_path(value)):
                 raise HTTPException(status_code=400, detail="default workspace must be absolute")
 
-        updated = await asyncio.to_thread(host_store.set_default_workspace, host_id, value)
-        assert updated is not None
+        updated = await asyncio.to_thread(
+            host_store.set_default_workspace,
+            host_id,
+            value,
+            expected_user_id=host.user_id,
+        )
+        if updated is None:
+            raise HTTPException(status_code=409, detail="host ownership changed while updating")
         return {
             "host_id": updated.host_id,
             "default_workspace": updated.default_workspace,

@@ -225,6 +225,7 @@ import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
+import { readLastCreatedWorkspace, writeLastCreatedWorkspace } from "@/lib/lastCreatedWorkspace";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
@@ -235,7 +236,7 @@ import {
 } from "@/hooks/useNativeServerSwitcher";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
-import type { Conversation } from "@/hooks/useConversations";
+import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
@@ -279,6 +280,7 @@ import {
   customAgentForPicker,
   useCustomAgents,
 } from "@/lib/customAgentsApi";
+import { writeNewSessionTarget } from "@/lib/newSessionTarget";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
@@ -481,16 +483,16 @@ export function ConnectHostInstructions({
  * has typed something usable.
  *
  * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` is absolute for the target host.
+ * @returns true when ``workspace.trimStart()`` is absolute for the target host.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return isAbsoluteHostPath(workspace.trim());
+  return isAbsoluteHostPath(workspace.trimStart());
 }
 
 /**
  * Normalize a host filesystem path for equality comparison.
  *
- * Trims whitespace and strips trailing slashes so ``"/repo/"`` and
+ * Trims leading whitespace and strips trailing slashes so ``"/repo/"`` and
  * ``"/repo"`` compare equal, preserving the root ``"/"``. Blank/whitespace
  * input returns ``null`` (no path), never the root. Lexical only — no ``..``
  * or symlink resolution — which suffices because the server stores canonical
@@ -500,7 +502,7 @@ export function isValidWorkspace(workspace: string): boolean {
  * @returns The normalized path, e.g. ``"/Users/me/repo"``; ``null`` for blank.
  */
 export function normalizeWorkspacePath(path: string): string | null {
-  const trimmed = path.trim();
+  const trimmed = path.trimStart();
   if (trimmed === "") return null;
   if (/^[A-Za-z]:[\\/]+$/.test(trimmed)) {
     return `${trimmed.slice(0, 2)}\\`;
@@ -2770,6 +2772,10 @@ export function NewChatLandingScreen() {
   }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
+  const lastCreatedWorkspace = useMemo(
+    () => readLastCreatedWorkspace(selectedHostId),
+    [selectedHostId],
+  );
   const { addRecentHarness } = useRecentHarnesses();
 
   const allHosts = hosts ?? [];
@@ -2960,10 +2966,8 @@ export function NewChatLandingScreen() {
   // the working-directory field is pre-filled and the user can send in one
   // click. Derived from the same home listing the picker uses (entries carry
   // absolute paths); only fetched when there's no recent to fall back to.
-  const hostDefaultWorkspace =
-    hosts?.find((host) => host.host_id === selectedHostId)?.default_workspace ?? null;
   const needsHomeFallback =
-    selectedHostId !== null && recent.length === 0 && hostDefaultWorkspace === null;
+    selectedHostId !== null && lastCreatedWorkspace === null && recent.length === 0;
   const { data: homeListing, isPlaceholderData: homeListingIsPlaceholder } = useHostFilesystem(
     selectedHostId,
     needsHomeFallback ? "" : null,
@@ -2997,8 +3001,8 @@ export function NewChatLandingScreen() {
   // else the derived home. Exposed as a memo so we can probe its repo for
   // worktrees before committing to it (see the fork-fresh redirect below).
   const autoSeedCandidate = useMemo(
-    () => hostDefaultWorkspace ?? recent[0] ?? derivedHome ?? null,
-    [hostDefaultWorkspace, recent, derivedHome],
+    () => lastCreatedWorkspace ?? recent[0] ?? derivedHome ?? null,
+    [lastCreatedWorkspace, recent, derivedHome],
   );
   // "Fork fresh from default": when the project defines a default base branch,
   // a fresh new-chat must NOT silently continue in the last-used worktree — it
@@ -3081,7 +3085,7 @@ export function NewChatLandingScreen() {
     if (didForkFresh && seededWorkspace && branchName === "" && prefilledBranch === "") {
       // Preempt the opt-in-worktree effect so it can't also seed a branch, then
       // name one here to fork fresh off the project default. Store the ref in
-      // the raw representation that effect compares against (workspaceTrimmed).
+      // the raw representation that effect compares against (workspaceValue).
       worktreeSeededForRef.current = candidate;
       // Not tracked as a retractable auto-seed: this fork-fresh branch is driven
       // by the project's base_branch (to fork off it), independent of the
@@ -3643,7 +3647,7 @@ export function NewChatLandingScreen() {
     setPickedHarness(null);
     _setCostControlMode(null);
   }, [info, smartRoutingEnabled, pickedHarness]);
-  const workspaceTrimmed = workspace.trim();
+  const workspaceValue = workspace.trimStart();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
@@ -3674,10 +3678,10 @@ export function NewChatLandingScreen() {
   // Existing git worktrees of the picked directory's repo, for the
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
-  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceValue !== "";
   const { data: hostWorktrees, isPlaceholderData: hostWorktreesArePlaceholder } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
-    worktreesEnabled ? workspaceTrimmed : null,
+    worktreesEnabled ? workspaceValue : null,
   );
   // Linked worktrees (exclude the main work tree — "starting in the main
   // repo" is just picking that directory, not selecting a worktree).
@@ -3689,10 +3693,10 @@ export function NewChatLandingScreen() {
   // the user navigated the picker straight into a worktree folder, or clicked
   // one in the list below.
   const activeWorktree = useMemo(() => {
-    const target = normalizeWorkspacePath(workspaceTrimmed);
+    const target = normalizeWorkspacePath(workspaceValue);
     if (target === null) return null;
     return linkedWorktrees.find((w) => normalizeWorkspacePath(w.path) === target) ?? null;
-  }, [linkedWorktrees, workspaceTrimmed]);
+  }, [linkedWorktrees, workspaceValue]);
   // When the workspace lands on an existing worktree, prefill the branch
   // field with its branch and remember it as the prefill. Leaving the
   // worktree clears the prefill (but not a name the user typed themselves).
@@ -3812,13 +3816,13 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
     if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
-    if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
+    if (sandboxSelected || selectedHostId === null || workspaceValue === "") return;
     if (branchName !== "" || prefilledBranch !== "") return;
-    if (worktreeSeededForRef.current === workspaceTrimmed) return;
+    if (worktreeSeededForRef.current === workspaceValue) return;
     // Need the git-ness probe for the CURRENT workspace resolved (not the
     // anti-flicker placeholder from a previous path).
     if (hostWorktreesArePlaceholder || hostWorktrees === undefined) return;
-    worktreeSeededForRef.current = workspaceTrimmed;
+    worktreeSeededForRef.current = workspaceValue;
     if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
     prefillConfig,
@@ -3826,7 +3830,7 @@ export function NewChatLandingScreen() {
     projectParam,
     sandboxSelected,
     selectedHostId,
-    workspaceTrimmed,
+    workspaceValue,
     branchName,
     prefilledBranch,
     hostWorktrees,
@@ -3921,7 +3925,7 @@ export function NewChatLandingScreen() {
   const mentionEnabled =
     isNativeTerminalAgent && !sandboxSelected && !!selectedHostId && workspaceValid;
   const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
-  const workspaceRoot = workspaceTrimmed.replace(/\/+$/, "");
+  const workspaceRoot = workspaceValue.replace(/\/+$/, "");
   // Absolute dir to list = workspace root + the drilled sub-path.
   const mentionAbsDir =
     mentionEnabled && mention
@@ -4019,7 +4023,7 @@ export function NewChatLandingScreen() {
               : null;
 
   // Chip display labels.
-  const workspaceLabel = workspaceTrimmed ? basename(workspaceTrimmed) : "Working directory";
+  const workspaceLabel = workspaceValue ? basename(workspaceValue) : "Working directory";
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
     sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
@@ -4393,6 +4397,7 @@ export function NewChatLandingScreen() {
       // move). A label-only folder (no first-class row yet) keeps the legacy
       // label + post-create move, which creates the project row on demand.
       const createProjectId = selectedProject !== "" ? configProjectId : null;
+      let rememberedProjectId = createProjectId;
       // Server-side default-fill: a slot still holding its untouched project-
       // config seed (per the source refs) is OMITTED so the server fills it
       // from the config. Any user interaction — even re-picking the exact
@@ -4408,7 +4413,7 @@ export function NewChatLandingScreen() {
         createProjectId !== null &&
         workspaceFromConfigRef.current &&
         prefillConfig?.workspace != null &&
-        workspaceTrimmed === prefillConfig.workspace;
+        workspaceValue === prefillConfig.workspace;
       // When filing into a project by LABEL, stamp its legacy `omni_project`
       // label at create so the session is BORN FILED. The sidebar dual-reads
       // project membership from this label OR the first-class `project_id` the
@@ -4439,7 +4444,7 @@ export function NewChatLandingScreen() {
           ? await customAgentBundle(customTemplate.id)
           : await buildAgentBundle(pendingAgent!);
         const metadata: Record<string, unknown> = {};
-        if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
+        if (workspaceValue && !workspaceFromProjectConfig) metadata.workspace = workspaceValue;
         if (createProjectId !== null) metadata.project_id = createProjectId;
         metadata.labels = {
           ...(createLabels ?? {}),
@@ -4457,7 +4462,7 @@ export function NewChatLandingScreen() {
         markSessionCreated(data.id, sandboxSelected ? "sandbox" : "computer");
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
-        if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
+        if (!sandboxSelected && selectedHostId && workspaceValue) {
           // Create a new worktree, bind an existing one (records the branch
           // for the sidebar + delete flow without creating anything), or
           // neither — mirrored on the `git` block.
@@ -4466,7 +4471,7 @@ export function NewChatLandingScreen() {
             : startInExistingWorktree
               ? { branchName: trimmedBranch, existingWorktree: true }
               : undefined;
-          await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
+          await launchRunner(selectedHostId, data.id, workspaceValue, gitOpts);
         }
         // Clear pending agent after successful creation.
         setPendingAgent(null);
@@ -4526,7 +4531,7 @@ export function NewChatLandingScreen() {
                   host_id: selectedHostId,
                   // Config-seeded workspace on a `project_id` create: omitted
                   // so the server default-fills it (see agent_id above).
-                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
+                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceValue }),
                   // Create a new worktree, or bind an existing one
                   // (`existing_worktree` records the branch for the sidebar +
                   // delete flow without creating anything), or neither. Always
@@ -4685,7 +4690,8 @@ export function NewChatLandingScreen() {
           // File via first-class project_id; the helper resolves the picked
           // name to a project id, creating an empty project on demand when the
           // name is new or label-only.
-          await moveConversationToProject(data.id, selectedProject);
+          const moved = await moveConversationToProject(data.id, selectedProject);
+          rememberedProjectId = moved.project_id ?? rememberedProjectId;
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -4698,8 +4704,44 @@ export function NewChatLandingScreen() {
           // still shows it under the project.
         }
       }
+      if (selectedProject) {
+        // Keep the project-list cache ahead of the persisted target write. A
+        // label-only project may have been promoted by the move above, while an
+        // invalidation still exposes the old list for one render; without this
+        // small overlay the target reconciler could misread that gap as delete.
+        queryClient.setQueryData<ProjectSummary[]>(["projects"], (current = []) => {
+          const project = {
+            id: rememberedProjectId,
+            name: selectedProject,
+          };
+          const withoutMatch = current.filter(
+            (candidate) =>
+              !(
+                (rememberedProjectId !== null && candidate.id === rememberedProjectId) ||
+                candidate.name === selectedProject
+              ),
+          );
+          return [...withoutMatch, project];
+        });
+      }
+      // A successful create becomes the remembered destination for every
+      // global new-session entry point. First-class projects retain their id;
+      // a legacy name-only folder is promoted when the Sidebar next observes
+      // the project row created by the move above.
+      writeNewSessionTarget(
+        selectedProject
+          ? {
+              kind: "project",
+              projectId: rememberedProjectId,
+              projectName: selectedProject,
+            }
+          : { kind: "none" },
+      );
       // Sandbox creates have no user-picked workspace to remember.
-      if (!sandboxSelected) addRecent(workspaceTrimmed);
+      if (!sandboxSelected) {
+        writeLastCreatedWorkspace(selectedHostId, workspaceValue);
+        addRecent(workspaceValue);
+      }
       // Remember the launched harness so the picker promotes it out of "More"
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
@@ -5617,9 +5659,7 @@ export function NewChatLandingScreen() {
                     {selectedHostId ? (
                       <HostWorkspacePicker
                         hostId={selectedHostId}
-                        initialPath={
-                          isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
-                        }
+                        initialPath={isNavigablePath(workspaceValue) ? workspaceValue : undefined}
                         onNavigate={(path) => {
                           // Browsing is an explicit choice: the create sends
                           // the workspace even if it matches the config seed.
@@ -5747,7 +5787,7 @@ export function NewChatLandingScreen() {
                               {filteredWorktrees.map((w) => {
                                 const selected =
                                   normalizeWorkspacePath(w.path) ===
-                                  normalizeWorkspacePath(workspaceTrimmed);
+                                  normalizeWorkspacePath(workspaceValue);
                                 return (
                                   <li key={w.path}>
                                     <button

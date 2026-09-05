@@ -209,6 +209,33 @@ describe("ArchiveTranscriptViewer", () => {
     expect(screen.getByText("2/3")).toBeInTheDocument();
   });
 
+  it("keeps the final turn selected when it is too short to reach the reading line", async () => {
+    mocks.fetchPage.mockResolvedValueOnce({
+      items: [
+        { id: "turn_one", text: "first turn" },
+        { id: "turn_two", text: "second turn" },
+        { id: "turn_three", text: "short final turn" },
+      ],
+      hasMore: false,
+    });
+    renderViewer();
+    await screen.findByText("Rendered message turn_three");
+    const scroller = screen.getByTestId("archive-transcript");
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1200 },
+      clientHeight: { configurable: true, value: 600 },
+      scrollTop: { configurable: true, value: 600 },
+    });
+    const turns = [...scroller.querySelectorAll<HTMLElement>("[data-archive-turn]")];
+    for (const [index, turn] of turns.entries()) {
+      vi.spyOn(turn, "getBoundingClientRect").mockReturnValue({
+        top: [-500, -100, 200][index],
+      } as DOMRect);
+    }
+    fireEvent.scroll(scroller);
+    expect(screen.getByText("3/3")).toBeInTheDocument();
+  });
+
   it("copies a selected passage with the containing item deep link", async () => {
     renderViewer();
 

@@ -1095,6 +1095,65 @@ describe("SettingsPage", () => {
     expect(separator).toHaveAttribute("aria-valuenow", "396");
   });
 
+  it("renders the Archive Library outside the narrow shared settings scroller", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+
+    renderPage("/settings/archived");
+
+    const library = screen.getByTestId("archive-library");
+    expect(library).toHaveClass("h-full", "min-w-0");
+    expect(library.closest(".max-w-3xl")).toBeNull();
+  });
+
+  it("keeps All selected when one named facet coexists with unfiled rows", async () => {
+    mocks.projectNames = ["Alpha"];
+    mocks.conversations = [
+      conv("filed", { archived: true, labels: { omni_project: "Alpha" } }),
+      conv("unfiled", { archived: true }),
+    ];
+
+    renderPage("/settings/archived");
+
+    await waitFor(() => expect(screen.getAllByTestId("archived-row")).toHaveLength(2));
+    expect(mocks.archivedFilters?.project).toBeUndefined();
+    expect(screen.getByRole("combobox", { name: /by project/i })).toHaveTextContent("All projects");
+  });
+
+  it("retains expiration cleanup while skipping locked and shared sessions", () => {
+    const now = 2_000_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    localStorage.setItem("omnigent:archived-retention-days", "7");
+    const archivedAt = Math.floor(now / 1000) - 8 * 86_400;
+    mocks.conversations = [
+      conv("expired", {
+        archived: true,
+        owner: "alice",
+        updated_at: Math.floor(now / 1000),
+        labels: { "omnigent.archived_at": String(archivedAt) },
+      }),
+      conv("locked-expired", {
+        archived: true,
+        owner: "alice",
+        archived_at: archivedAt,
+        labels: { "omnigent.archive_locked": "1" },
+      }),
+      conv("shared-expired", {
+        archived: true,
+        owner: "bob",
+        archived_at: archivedAt,
+      }),
+    ];
+
+    renderPage("/settings/archived");
+
+    expect(screen.getAllByText("Expired")).toHaveLength(3);
+    expect(screen.getByText("3 expired on this page")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("delete-expired"));
+    fireEvent.click(screen.getByRole("button", { name: "Delete 1 session" }));
+    expect(mocks.bulkDeleteMutate).toHaveBeenCalledWith({ ids: ["expired"] });
+    nowSpy.mockRestore();
+  });
+
   it("keeps the compact archive toolbar available on mobile", () => {
     const restoreViewport = useMobileViewport();
     mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];

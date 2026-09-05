@@ -1,6 +1,20 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$InstructionPath
+    [string]$InstructionPath,
+    [Parameter(Mandatory = $true)]
+    [string]$ResultPath,
+    [Parameter(Mandatory = $true)]
+    [string]$LogPath,
+    [Parameter(Mandatory = $true)]
+    [string]$LockPath,
+    [Parameter(Mandatory = $true)]
+    [string]$WrapperPath,
+    [Parameter(Mandatory = $true)]
+    [string]$OldCommit,
+    [Parameter(Mandatory = $true)]
+    [string]$TargetCommit,
+    [Parameter(Mandatory = $true)]
+    [string]$HostId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,38 +106,56 @@ function Test-HostReconnected {
     return $false
 }
 
-$instruction = Get-Content -LiteralPath $InstructionPath -Raw | ConvertFrom-Json
-$resultPath = [string]$instruction.result_path
-$logPath = [string]$instruction.log_path
-$lockPath = [string]$instruction.lock_path
 $result = [ordered]@{
     schema_version = 1
-    status = 'running'
-    old_commit = [string]$instruction.old_commit
-    target_commit = [string]$instruction.target_commit
+    status = 'starting'
+    old_commit = $OldCommit
+    target_commit = $TargetCommit
     helper_pid = $PID
     error = $null
     updated_at = [DateTimeOffset]::UtcNow.ToString('o')
 }
-Write-JsonAtomic $resultPath $result
-Add-UpdateLog $logPath "Waiting for CLI process $($instruction.parent_pid) to exit."
+$exitCode = 0
+$instruction = $null
 
 try {
+    $instruction = Get-Content -LiteralPath $InstructionPath -Raw | ConvertFrom-Json
+    if ([int]$instruction.schema_version -ne 1) {
+        throw "Unsupported custom Host update instruction schema '$($instruction.schema_version)'."
+    }
+    $expected = [ordered]@{
+        result_path = $ResultPath
+        log_path = $LogPath
+        lock_path = $LockPath
+        wrapper_path = $WrapperPath
+        old_commit = $OldCommit
+        target_commit = $TargetCommit
+        host_id = $HostId
+    }
+    foreach ($entry in $expected.GetEnumerator()) {
+        if ([string]$instruction.($entry.Key) -ne [string]$entry.Value) {
+            throw "Custom Host update instruction field '$($entry.Key)' does not match the launcher."
+        }
+    }
+
+    $result.status = 'running'
+    Write-JsonAtomic $ResultPath $result
+    Add-UpdateLog $LogPath "Waiting for CLI process $($instruction.parent_pid) to exit."
     Wait-Process -Id ([int]$instruction.parent_pid) -Timeout 120 -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
 
     Write-JsonAtomic ([string]$instruction.rollback_path) ([ordered]@{
         schema_version = 1
-        commit_sha = [string]$instruction.old_commit
+        commit_sha = $OldCommit
     })
 
     $installArguments = @($instruction.install_argv | ForEach-Object { [string]$_ })
-    Add-UpdateLog $logPath "Running custom Host installer."
+    Add-UpdateLog $LogPath "Running custom Host installer."
     $install = Invoke-CapturedProcess $installArguments @{
         OMNIGENT_SKIP_WEB_UI = 'true'
     }
-    if ($install.Stdout) { Add-UpdateLog $logPath $install.Stdout.Trim() }
-    if ($install.Stderr) { Add-UpdateLog $logPath $install.Stderr.Trim() }
+    if ($install.Stdout) { Add-UpdateLog $LogPath $install.Stdout.Trim() }
+    if ($install.Stderr) { Add-UpdateLog $LogPath $install.Stderr.Trim() }
     if ($install.ExitCode -ne 0) {
         throw "Installer exited with status $($install.ExitCode). Recovery: $($instruction.recovery_command)"
     }
@@ -131,11 +163,11 @@ try {
     $probeArguments = @($instruction.probe_argv | ForEach-Object { [string]$_ })
     $probe = Invoke-CapturedProcess $probeArguments
     $installedCommit = $probe.Stdout.Trim().ToLowerInvariant()
-    if ($probe.ExitCode -ne 0 -or $installedCommit -ne [string]$instruction.target_commit) {
-        throw "Installed commit '$installedCommit' did not match '$($instruction.target_commit)'."
+    if ($probe.ExitCode -ne 0 -or $installedCommit -ne $TargetCommit) {
+        throw "Installed commit '$installedCommit' did not match '$TargetCommit'."
     }
 
-    Restart-HostSupervisor ([string]$instruction.wrapper_path)
+    Restart-HostSupervisor $WrapperPath
     $reconnected = $false
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
@@ -150,22 +182,40 @@ try {
     }
 
     $result.status = 'complete'
-    Add-UpdateLog $logPath "Custom Host update completed and reconnected."
+    Add-UpdateLog $LogPath "Custom Host update completed and reconnected."
 }
 catch {
+    $exitCode = 1
     $result.status = 'failed'
     $result.error = $_.Exception.Message
-    Add-UpdateLog $logPath "FAILED: $($result.error)"
     try {
-        Restart-HostSupervisor ([string]$instruction.wrapper_path)
+        Add-UpdateLog $LogPath "FAILED: $($result.error)"
+    }
+    catch {
+        [Console]::Error.WriteLine("Failed to write custom Host update log: $($_.Exception.Message)")
+    }
+    try {
+        Restart-HostSupervisor $WrapperPath
     }
     catch {
         $result.error = "$($result.error) Additionally failed to restart Host: $($_.Exception.Message)"
-        Add-UpdateLog $logPath "RESTART FAILED: $($_.Exception.Message)"
+        try {
+            Add-UpdateLog $LogPath "RESTART FAILED: $($_.Exception.Message)"
+        }
+        catch {
+            [Console]::Error.WriteLine("Failed to write custom Host restart error: $($_.Exception.Message)")
+        }
     }
 }
 finally {
     $result.updated_at = [DateTimeOffset]::UtcNow.ToString('o')
-    Write-JsonAtomic $resultPath $result
-    Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+    try {
+        Write-JsonAtomic $ResultPath $result
+    }
+    catch {
+        [Console]::Error.WriteLine("Failed to write custom Host update result: $($_.Exception.Message)")
+    }
+    Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue
 }
+
+exit $exitCode

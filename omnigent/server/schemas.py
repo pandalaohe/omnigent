@@ -106,6 +106,14 @@ class UserPreferenceNamespacePatchRequest(BaseModel):
     value: JsonValue | None
 
 
+class CurrentUserResponse(BaseModel):
+    """Authenticated identity and optional synchronized preferences."""
+
+    user_id: str | None
+    is_admin: bool
+    preferences: UserPreferencesEnvelope | None = None
+
+
 # ── Agents ──────────────────────────────────────────────────────
 
 
@@ -879,6 +887,8 @@ class ChildSessionSummary(BaseModel):
     current_task_status: str | None = None
     busy: bool = False
     activity_unverified: bool = False
+    # Connectivity observation only; does not change task status, busy or B.
+    native_activity_unverified: bool = False
     labels: dict[str, str] = Field(default_factory=dict)
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None

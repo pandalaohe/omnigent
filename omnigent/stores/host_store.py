@@ -754,17 +754,34 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
-    def set_default_workspace(self, host_id: str, default_workspace: str | None) -> Host | None:
-        """Persist the directory a host's workspace picker should open first."""
+    def set_default_workspace(
+        self,
+        host_id: str,
+        default_workspace: str | None,
+        *,
+        expected_user_id: str,
+    ) -> Host | None:
+        """Persist a Host preference only while the expected owner still owns it."""
         with self._session("set_host_default_workspace") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.user_id == expected_user_id,
+                    )
+                    .values(default_workspace=default_workspace)
+                ),
+            )
+            if result.rowcount != 1:
+                return None
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
                 )
-            ).scalar_one_or_none()
-            if row is None:
-                return None
-            row.default_workspace = default_workspace
+            ).scalar_one()
             # updated_at is the host liveness heartbeat. A preference write
             # must not make a stale `status=online` row look live again.
             return _row_to_host(row)

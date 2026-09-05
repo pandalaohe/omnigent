@@ -28,6 +28,7 @@ def validate_session_todos(value: object) -> list[dict[str, Any]]:
         if (
             not isinstance(todo, dict)
             or not isinstance(todo.get("content"), str)
+            or not isinstance(todo.get("status"), str)
             or todo.get("status") not in _VALID_STATUSES
             or not isinstance(todo.get("activeForm"), str)
         ):
@@ -50,9 +51,7 @@ def validate_session_todos(value: object) -> list[dict[str, Any]]:
         json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     )
     if serialized_size > _MAX_SERIALIZED_BYTES:
-        raise ValueError(
-            f"session todos cannot exceed {_MAX_SERIALIZED_BYTES} serialized bytes"
-        )
+        raise ValueError(f"session todos cannot exceed {_MAX_SERIALIZED_BYTES} serialized bytes")
     return normalized
 
 

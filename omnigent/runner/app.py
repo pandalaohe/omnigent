@@ -1850,26 +1850,38 @@ async def _fetch_latest_assistant_text(
     server_client: httpx.AsyncClient, session_id: str
 ) -> str | None:
     """
-    Return the newest assistant message text of a session, reading newest first.
+    Return the newest assistant message text from the latest turn.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param session_id: Session to read, e.g. ``"conv_child456"``.
-    :returns: Joined text blocks of the newest assistant message (empty when
-        that message carries no text, matching live delivery), or ``None``
-        when the transcript holds no assistant message.
+    Reading newest first stops at the first non-meta user message or tool item:
+    crossing that boundary would reuse an assistant answer from an older turn.
+    Meta messages do not start a turn and are skipped.
+
+    :returns: Joined text blocks of the latest turn's newest assistant message
+        (empty when that message carries no text, matching live delivery), or
+        ``None`` when the latest turn has no assistant message.
     :raises _SubagentRecoveryReadError: When a page read fails.
     """
     params: dict[str, str] = {"limit": "100", "order": "desc"}
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
-            if item.get("type") != "message" or item.get("role") != "assistant":
+            item_type = item.get("type")
+            if item_type == "message" and item.get("is_meta") is True:
                 continue
-            return "\n".join(
-                block["text"]
-                for block in item.get("content", [])
-                if block.get("type") in {"output_text", "text"} and block.get("text")
-            )
+            if item_type == "message":
+                if item.get("role") == "assistant":
+                    return "\n".join(
+                        block["text"]
+                        for block in item.get("content", [])
+                        if block.get("type") in {"output_text", "text"} and block.get("text")
+                    )
+                if item.get("role") == "user":
+                    return None
+                continue
+            if item_type in {"function_call", "function_call_output"}:
+                return None
         if not page.get("has_more") or not page.get("last_id"):
             return None
         params["after"] = page["last_id"]

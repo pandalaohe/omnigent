@@ -46,6 +46,7 @@ import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
   CheckIcon,
+  ClockIcon,
   DownloadIcon,
   KeyRoundIcon,
   LockIcon,
@@ -215,6 +216,11 @@ import {
   writeSubmitWithModEnter,
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import {
+  archivedAtSeconds,
+  readRetentionDays,
+  writeRetentionDays,
+} from "@/lib/retentionPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
@@ -2385,9 +2391,25 @@ function archivedTimestamp(
   field: ArchivedDateField = "archived_at",
 ): number {
   if (field === "created_at") return conversation.created_at;
-  // Older Servers do not expose archived_at. updated_at is retained only as
-  // a compatibility fallback; current Servers provide the stable timestamp.
-  return conversation.archived_at ?? conversation.updated_at ?? conversation.created_at;
+  return conversation.archived_at ?? archivedAtSeconds(conversation);
+}
+
+const RETENTION_OPTIONS: { label: string; value: string; days: number | null }[] = [
+  { label: "Never", value: "never", days: null },
+  { label: "After 7 days", value: "7", days: 7 },
+  { label: "After 30 days", value: "30", days: 30 },
+  { label: "After 60 days", value: "60", days: 60 },
+  { label: "After 90 days", value: "90", days: 90 },
+];
+
+function retentionDaysToSelectValue(days: number | null): string {
+  return days === null ? "never" : String(days);
+}
+
+function selectValueToRetentionDays(value: string): number | null {
+  if (value === "never") return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 function ImportSection() {
@@ -2405,14 +2427,36 @@ function ArchivedSection() {
   const isMobileViewport = useIsMobileViewport();
   const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
   const { width, containerRef, handleProps } = useResizableColumn(420, 300, 720);
+  const [containerWidth, setContainerWidth] = useState<number | null>(null);
   const listFocusRef = useRef<HTMLDivElement>(null);
+  const singlePane = isMobileViewport || (containerWidth !== null && containerWidth < 680);
+  const listWidth =
+    containerWidth === null ? width : Math.min(width, Math.max(300, containerWidth - 320));
+
+  useEffect(() => {
+    const node = containerRef.current;
+    if (!node) return;
+    const update = () => {
+      const measured = node.getBoundingClientRect().width;
+      if (measured > 0) setContainerWidth(measured);
+    };
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [containerRef]);
+
+  useEffect(() => {
+    if (singlePane) setSelectedConversation(null);
+  }, [singlePane]);
 
   return (
     <div
       ref={(node) => {
         containerRef.current = node;
       }}
-      className="flex h-full min-h-0 overflow-hidden pt-[calc(var(--app-header-height,3.5rem)+env(safe-area-inset-top))]"
+      className="flex h-full min-h-0 min-w-0 overflow-hidden pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]"
       data-testid="archive-library"
     >
       <div
@@ -2420,17 +2464,17 @@ function ArchivedSection() {
         data-testid="archive-list-pane"
         className={cn(
           "min-h-0 shrink-0 overflow-x-hidden overflow-y-auto",
-          isMobileViewport && selectedConversation ? "hidden" : "w-full",
+          singlePane && selectedConversation ? "hidden" : singlePane && "w-full",
         )}
-        style={isMobileViewport ? undefined : { width }}
+        style={singlePane ? undefined : { width: listWidth }}
       >
         <ArchivedListPane
           selectedConversationId={selectedConversation?.id ?? null}
-          autoSelectFirst={!isMobileViewport}
+          autoSelectFirst={!singlePane}
           onSelectConversation={setSelectedConversation}
         />
       </div>
-      {!isMobileViewport && (
+      {!singlePane && (
         <div
           {...handleProps}
           aria-label="Resize archive session list"
@@ -2440,10 +2484,10 @@ function ArchivedSection() {
           <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border group-hover:bg-primary/50" />
         </div>
       )}
-      {(!isMobileViewport || selectedConversation) && (
+      {(!singlePane || selectedConversation) && (
         <ArchiveTranscriptViewer
           conversation={selectedConversation}
-          onBack={isMobileViewport ? () => setSelectedConversation(null) : undefined}
+          onBack={singlePane ? () => setSelectedConversation(null) : undefined}
           returnFocusRef={listFocusRef}
         />
       )}
@@ -2464,6 +2508,10 @@ function ArchivedListPane({
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState(view.searchQuery ?? "");
   const [pageCursors, setPageCursors] = useState<(string | undefined)[]>([undefined]);
   const [inheritLastTab, setInheritLastTab] = useState(readInheritLastRightRailTab);
+  const [retentionDays, setRetentionDays] = useState<number | null>(readRetentionDays);
+  const [deleteExpiredOpen, setDeleteExpiredOpen] = useState(false);
+  const bulkDelete = useBulkDeleteConversations();
+  const viewerId = useViewerId();
   const paginationAnchorRef = useRef<HTMLElement>(null);
   const projectsQuery = useProjects();
   const hostsQuery = useHosts({ includeSandbox: true });
@@ -2482,6 +2530,25 @@ function ArchivedListPane({
   const facetsQuery = useArchivedSessionFacets(queryView);
   const listQuery = useArchivedConversations(queryView, pageCursors.at(-1));
   const archived = useMemo(() => listQuery.data?.data ?? [], [listQuery.data]);
+  const retentionCutoff = useMemo(
+    () => (retentionDays === null ? null : Math.floor(Date.now() / 1000) - retentionDays * 86_400),
+    [retentionDays],
+  );
+  const expiredSessions = useMemo(
+    () =>
+      retentionCutoff === null
+        ? []
+        : archived.filter((conversation) => archivedTimestamp(conversation) < retentionCutoff),
+    [archived, retentionCutoff],
+  );
+  const deletableExpiredSessions = useMemo(
+    () =>
+      expiredSessions.filter((conversation) => {
+        const owner = conversation.owner ?? null;
+        return (owner === null || owner === viewerId) && !isArchiveLocked(conversation);
+      }),
+    [expiredSessions, viewerId],
+  );
 
   useEffect(() => {
     if (listQuery.isLoading) return;
@@ -2543,8 +2610,6 @@ function ArchivedListPane({
       const current = view[key];
       if (current && !options.some((option) => option.value === current)) {
         updateView({ [key]: undefined });
-      } else if (!current && options.length === 1) {
-        updateView({ [key]: options[0].value });
       }
     };
     normalize("project", projectOptions);
@@ -2651,6 +2716,99 @@ function ArchivedListPane({
         onChange={updateView}
       />
 
+      <div className="flex min-h-10 flex-wrap items-center gap-2 border-b px-2 py-1.5 text-xs text-muted-foreground">
+        <label htmlFor="archived-retention">Mark as expired after</label>
+        <Select
+          value={retentionDaysToSelectValue(retentionDays)}
+          onValueChange={(value) => {
+            const days = selectValueToRetentionDays(value);
+            setRetentionDays(days);
+            writeRetentionDays(days);
+          }}
+        >
+          <SelectTrigger
+            id="archived-retention"
+            aria-label="Mark archived sessions as expired after"
+            data-testid="archived-retention"
+            className="h-8 w-32 text-xs"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent position="popper" align="start">
+            {RETENTION_OPTIONS.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {expiredSessions.length > 0 && (
+          <span className="ml-auto flex items-center gap-1 text-destructive">
+            <ClockIcon className="size-3.5" />
+            {expiredSessions.length} expired on this page
+          </span>
+        )}
+        {deletableExpiredSessions.length > 0 && (
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            data-testid="delete-expired"
+            disabled={bulkDelete.isPending}
+            onClick={() => setDeleteExpiredOpen(true)}
+          >
+            Delete expired
+          </Button>
+        )}
+      </div>
+
+      <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete expired sessions?</DialogTitle>
+            <DialogDescription>
+              {deletableExpiredSessions.length === 1
+                ? "1 owned archived session"
+                : deletableExpiredSessions.length + " owned archived sessions"}{" "}
+              older than {retentionDays} days on this page will be permanently deleted. Locked and
+              shared sessions are skipped. This cannot be undone.
+              {listQuery.data?.has_more && (
+                <span className="mt-2 block text-sm">
+                  More matching archived sessions exist on later pages; review those pages
+                  separately.
+                </span>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setDeleteExpiredOpen(false)}
+              disabled={bulkDelete.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={bulkDelete.isPending}
+              onClick={() => {
+                bulkDelete.mutate({
+                  ids: deletableExpiredSessions.map((conversation) => conversation.id),
+                });
+                setDeleteExpiredOpen(false);
+              }}
+            >
+              Delete{" "}
+              {deletableExpiredSessions.length === 1
+                ? "1 session"
+                : deletableExpiredSessions.length + " sessions"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <div className="flex min-h-8 items-center gap-2 border-b px-2 text-[11px] text-muted-foreground">
         <span className="min-w-0 flex-1 truncate">
           New sessions use the last right rail tab you explicitly selected
@@ -2691,6 +2849,7 @@ function ArchivedListPane({
                   conv.labels?.omni_project
                 }
                 hostName={hostNames.get(conv.host_id ?? "")}
+                cutoff={retentionCutoff}
                 selectionMode={selectionMode}
                 isSelected={selectedIds.has(conv.id)}
                 onToggleSelected={toggleSelected}
@@ -2917,6 +3076,7 @@ function ArchivedRow({
   conversation,
   projectName,
   hostName,
+  cutoff,
   selectionMode,
   isSelected,
   onToggleSelected,
@@ -2926,6 +3086,7 @@ function ArchivedRow({
   conversation: Conversation;
   projectName?: string;
   hostName?: string;
+  cutoff: number | null;
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (id: string) => void;
@@ -2941,6 +3102,7 @@ function ArchivedRow({
   const locked = isArchiveLocked(conversation);
   const busy = archive.isPending || archiveLock.isPending || del.isPending;
   const archivedAtMs = archivedTimestamp(conversation) * 1000;
+  const isExpired = cutoff !== null && archivedAtMs < cutoff * 1000;
   const resolvedHostName = hostName ?? conversation.host_id ?? "Host not recorded";
   const resolvedAgentName = conversation.agent_name ?? "Agent not recorded";
   const matchCount = conversation.search_match_count ?? (conversation.search_match ? 1 : 0);
@@ -3006,6 +3168,11 @@ function ArchivedRow({
             {projectName && (
               <span className="max-w-28 shrink-0 truncate rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
                 {projectName}
+              </span>
+            )}
+            {isExpired && (
+              <span className="shrink-0 rounded bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
+                Expired
               </span>
             )}
           </div>

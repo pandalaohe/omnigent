@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { createRef } from "react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { InlineComposerEditor, type InlineComposerEditorHandle } from "./InlineComposerEditor";
 import type { ComposerDraftPart } from "@/lib/composerContent";
@@ -9,8 +9,51 @@ function image(name: string): File {
   return new File([name], name, { type: "image/png" });
 }
 
+const originalResizeObserver = globalThis.ResizeObserver;
+
 describe("InlineComposerEditor", () => {
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    globalThis.ResizeObserver = originalResizeObserver;
+    vi.restoreAllMocks();
+  });
+
+  it("reports intrinsic editor height changes without repeating unchanged measurements", () => {
+    let resize: ResizeObserverCallback | null = null;
+    globalThis.ResizeObserver = class {
+      constructor(callback: ResizeObserverCallback) {
+        resize = callback;
+      }
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    };
+    const onHeightChange = vi.fn();
+    const { getByRole } = render(
+      <InlineComposerEditor
+        initialParts={[]}
+        onChange={() => {}}
+        onHeightChange={onHeightChange}
+        ariaLabel="Message"
+      />,
+    );
+    const editor = getByRole("textbox", { name: "Message" });
+    vi.spyOn(editor, "getBoundingClientRect").mockReturnValue({
+      width: 320,
+      height: 48,
+      top: 0,
+      right: 320,
+      bottom: 48,
+      left: 0,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    act(() => resize?.([], {} as ResizeObserver));
+    expect(onHeightChange).toHaveBeenCalledTimes(1);
+    act(() => resize?.([], {} as ResizeObserver));
+    expect(onHeightChange).toHaveBeenCalledTimes(1);
+  });
 
   it("visually identifies a portable Omnigent archive reference without changing its text", () => {
     const reference =

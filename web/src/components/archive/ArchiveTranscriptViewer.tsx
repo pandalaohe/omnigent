@@ -240,9 +240,14 @@ export function ArchiveTranscriptViewer({
   const updateAtBottom = useCallback(() => {
     const scroller = transcriptRef.current;
     if (!scroller) return;
-    setAtBottom(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 8);
+    const reachedBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 8;
+    setAtBottom(reachedBottom);
     const turnElements = [...scroller.querySelectorAll<HTMLElement>("[data-archive-turn]")];
     if (turnElements.length === 0) return;
+    if (reachedBottom && scroller.scrollHeight > scroller.clientHeight + 8) {
+      setActiveTurnIndex(Number(turnElements.at(-1)?.dataset.archiveTurn ?? 0));
+      return;
+    }
     const readingLine =
       scroller.getBoundingClientRect().top + Math.min(120, scroller.clientHeight / 4);
     let current = 0;
@@ -340,7 +345,7 @@ export function ArchiveTranscriptViewer({
 
   if (conversation === null) {
     return (
-      <div className={cn("flex min-h-0 flex-1 items-center justify-center p-6", className)}>
+      <div className={cn("flex min-h-0 min-w-0 flex-1 items-center justify-center p-6", className)}>
         <p className="max-w-xs text-center text-sm text-muted-foreground">
           Select an archived session to read its conversation.
         </p>
@@ -355,16 +360,16 @@ export function ArchiveTranscriptViewer({
   };
 
   return (
-    <section className={cn("flex min-h-0 flex-1 flex-col bg-background", className)}>
+    <section
+      className={cn(
+        "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background",
+        className,
+      )}
+      data-testid="archive-transcript-viewer"
+    >
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
         {onBack && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            className="md:hidden"
-            onClick={onBack}
-          >
+          <Button type="button" variant="ghost" size="icon-sm" onClick={onBack}>
             <ArrowLeftIcon className="size-4" />
             <span className="sr-only">Back to archive list</span>
           </Button>
@@ -421,7 +426,7 @@ export function ArchiveTranscriptViewer({
             onChange={(event) => setSessionSearch(event.target.value)}
             aria-label="Search this archived session"
             placeholder="Search this session…"
-            className="h-8 pl-8 text-sm"
+            className="h-8 pl-8 text-base md:text-sm"
           />
         </div>
         {debouncedSessionSearch && (
@@ -491,7 +496,7 @@ export function ArchiveTranscriptViewer({
         </div>
       )}
 
-      <div className="relative min-h-0 flex-1">
+      <div className="relative min-h-0 min-w-0 flex-1">
         {debouncedSessionSearch && markerIndexes.length > 1 ? (
           <nav
             className="absolute top-3 bottom-3 left-1 z-10 hidden w-4 flex-col justify-center gap-0.5 md:flex"
@@ -523,7 +528,7 @@ export function ArchiveTranscriptViewer({
         )}
         {!debouncedSessionSearch && turnBubbleIndexes.length > 1 && (
           <nav
-            className="absolute bottom-3 left-3 z-20 flex items-center rounded-full border border-border bg-secondary/95 shadow-md backdrop-blur md:hidden"
+            className="absolute bottom-[calc(0.75rem+env(safe-area-inset-bottom))] left-3 z-20 flex items-center rounded-full border border-border bg-secondary/95 shadow-md backdrop-blur md:hidden"
             aria-label="Conversation turn controls"
           >
             <Button
@@ -560,7 +565,7 @@ export function ArchiveTranscriptViewer({
           data-testid="archive-transcript"
           tabIndex={0}
           className={cn(
-            "h-full min-h-0 overflow-y-auto px-3 py-4",
+            "h-full min-h-0 min-w-0 overflow-x-hidden overflow-y-auto px-3 pt-4 pb-[calc(4rem+env(safe-area-inset-bottom))] md:pb-4",
             ((debouncedSessionSearch && markerIndexes.length > 1) ||
               (!debouncedSessionSearch && turnBubbleIndexes.length > 1)) &&
               "md:pl-7",
@@ -623,7 +628,7 @@ export function ArchiveTranscriptViewer({
           ) : bubbles.length === 0 ? (
             <p className="text-sm text-muted-foreground">This session has no visible messages.</p>
           ) : (
-            <div className="mx-auto flex w-full max-w-3xl flex-col gap-3">
+            <div className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-3">
               {focusItemId === null && historyQuery.hasNextPage && (
                 <Button
                   type="button"
@@ -668,7 +673,7 @@ export function ArchiveTranscriptViewer({
                       turnIndex !== undefined ? turns[turnIndex]?.itemId : undefined
                     }
                     className={cn(
-                      "group/archive relative rounded-lg px-2 py-1 ring-offset-background",
+                      "group/archive relative min-w-0 rounded-lg px-2 py-1 ring-offset-background",
                       active && "bg-primary/10 ring-2 ring-primary/50",
                     )}
                   >
@@ -728,7 +733,7 @@ export function ArchiveTranscriptViewer({
                 type="button"
                 variant="secondary"
                 size="icon-sm"
-                className="absolute right-3 bottom-3 z-20 rounded-full shadow-md max-md:size-11"
+                className="absolute right-3 bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-20 rounded-full shadow-md max-md:size-11 md:bottom-3"
                 aria-label="Jump to end of session"
                 onClick={jumpToBottom}
               >

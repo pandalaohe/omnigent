@@ -500,8 +500,10 @@ class SherpaDictationEngine:
         if self._final_punctuation is not None:
             try:
                 return self._final_punctuation.restore(text)
-            except Exception:  # noqa: BLE001 - never fail a take over punctuation
-                _logger.warning("final dictation punctuation failed", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - never fail a take over punctuation
+                # Model exceptions may include their input; log only the class
+                # so dictated text never enters server logs.
+                _logger.warning("final dictation punctuation failed (%s)", type(exc).__name__)
         return self._beautify(text)
 
     def create_stream(self) -> _SherpaStream:

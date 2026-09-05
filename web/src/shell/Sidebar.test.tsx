@@ -17,6 +17,7 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { writeSessionNavigationPreferences } from "@/lib/sessionNavigationPreferences";
+import { NEW_SESSION_TARGET_STORAGE_KEY } from "@/lib/newSessionTarget";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
 import type { ExtensionCatalogItem } from "@/extensions/types";
@@ -1799,6 +1800,163 @@ describe("Sidebar visibility filter (server-side mine/shared split)", () => {
 // "Sessions" list into a folder under the "Projects" group (rendered between
 // Pinned and Sessions). The project list comes from useProjects() (mocked here).
 describe("Sidebar project sections", () => {
+  it("preserves the selected project when opening settings", () => {
+    mockConversations([]);
+    projectsMock.push("Alpha");
+    localStorage.setItem(
+      NEW_SESSION_TARGET_STORAGE_KEY,
+      JSON.stringify({
+        kind: "project",
+        projectId: "p_Alpha",
+        projectName: "Alpha",
+      }),
+    );
+    renderSidebar(true, "/settings/appearance");
+    expect(JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null")).toEqual({
+      kind: "project",
+      projectId: "p_Alpha",
+      projectName: "Alpha",
+    });
+  });
+  it("keeps a newly selected project from being overwritten by the old composer URL", async () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([]);
+    renderSidebar(true, "/?project=Alpha");
+
+    const alpha = screen.getByRole("button", { name: "Use Alpha for new sessions" });
+    const beta = screen.getByRole("button", { name: "Use Beta for new sessions" });
+    expect(alpha).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(beta);
+
+    await waitFor(() => expect(beta).toHaveAttribute("aria-pressed", "true"));
+    expect(alpha).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("new-chat-button")).toHaveAttribute("href", "/?project=Beta");
+    expect(JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null")).toEqual({
+      kind: "project",
+      projectId: "p_Beta",
+      projectName: "Beta",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Use No Project for new sessions" }));
+    await waitFor(() => expect(screen.getByTestId("new-chat-button")).toHaveAttribute("href", "/"));
+    expect(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY)).toBeNull();
+  });
+
+  it("keeps an empty persisted project selected while viewing another session", () => {
+    projectsMock.push("Empty Project");
+    mockConversations([conv("conv_unfiled", "Claude Code")]);
+    localStorage.setItem(
+      NEW_SESSION_TARGET_STORAGE_KEY,
+      JSON.stringify({
+        kind: "project",
+        projectId: "p_Empty Project",
+        projectName: "Empty Project",
+      }),
+    );
+
+    renderSidebar(true, "/c/conv_unfiled");
+
+    expect(
+      screen.getByRole("button", { name: "Use Empty Project for new sessions" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("new-chat-button")).toHaveAttribute(
+      "href",
+      "/?project=Empty%20Project",
+    );
+  });
+
+  it("treats an explicit project composer route as the global target", async () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([]);
+    localStorage.setItem(
+      NEW_SESSION_TARGET_STORAGE_KEY,
+      JSON.stringify({ kind: "project", projectId: "p_Beta", projectName: "Beta" }),
+    );
+
+    renderSidebar(true, "/?project=Alpha");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-button")).toHaveAttribute("href", "/?project=Alpha"),
+    );
+    expect(screen.getByRole("button", { name: "Use Alpha for new sessions" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null")).toEqual({
+      kind: "project",
+      projectId: "p_Alpha",
+      projectName: "Alpha",
+    });
+  });
+
+  it("selects Project and No Project independently from expand/collapse", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_unfiled", "Claude Code", { workspace: "D:\\AIProgram\\Codex\\core" }),
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const projectTarget = screen.getByRole("button", {
+      name: "Use Customer X for new sessions",
+    });
+    const projectToggle = screen.getByRole("button", { name: /^Customer X/ });
+    const noProjectTarget = screen.getByRole("button", {
+      name: "Use No Project for new sessions",
+    });
+
+    expect(projectTarget).toHaveAttribute("aria-pressed", "false");
+    expect(noProjectTarget).toHaveAttribute("aria-pressed", "true");
+    expect(projectToggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(projectTarget);
+
+    expect(projectTarget).toHaveAttribute("aria-pressed", "true");
+    expect(noProjectTarget).toHaveAttribute("aria-pressed", "false");
+    expect(projectToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("conv_filed")).toBeNull();
+    expect(screen.getByTestId("new-chat-button")).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(screen.getByTestId("new-session-target-label")).toHaveTextContent("Customer X");
+
+    fireEvent.click(projectToggle);
+    expect(projectToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("conv_filed")).toBeInTheDocument();
+
+    fireEvent.click(noProjectTarget);
+    expect(noProjectTarget).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("new-chat-button")).toHaveAttribute("href", "/");
+    expect(screen.getByTestId("new-session-target-label")).toHaveTextContent("No Project");
+  });
+
+  it("shows an unfiled session CWD as a bounded inspection control", () => {
+    const workspace = "D:\\AIProgram\\Projects\\A very long workspace folder\\repo";
+    mockConversations([conv("conv_unfiled", "Claude Code", { workspace })]);
+    renderSidebar();
+
+    const detail = screen.getByTestId("session-workspace-detail");
+    expect(detail).toHaveAccessibleName(`Working directory: ${workspace}`);
+    expect(detail).toHaveClass("min-w-0", "max-w-[calc(100%-6rem)]");
+    fireEvent.click(detail);
+    expect(detail).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Working directory")).toBeInTheDocument();
+    expect(screen.getByTestId("session-workspace-path")).toHaveTextContent(workspace);
+    expect(screen.getByText(workspace)).toBeInTheDocument();
+  });
+
+  it("does not repeat the CWD for sessions already grouped in a project", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        workspace: "D:\\AIProgram\\Projects\\CustomerX",
+      }),
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    expect(screen.queryByTestId("session-workspace-detail")).toBeNull();
+  });
+
   it("groups sessions by their project label, separate from Sessions", () => {
     projectsMock.push("Customer X");
     mockConversations([
@@ -2137,13 +2295,7 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("keeps New session in the project menu when the pencil requires hover", async () => {
-    // The pencil is a redundant shortcut for the kebab's always-present "New
-    // session" item, so without a fine hover pointer it is genuinely absent
-    // (display:none via `hidden`), NOT sr-only — an sr-only pencil would stay
-    // focusable and announce a duplicate "New session" alongside the kebab's
-    // item. On hover+fine it is display-flex, revealed on hover/focus by the
-    // overlay's opacity. The kebab (not this pencil) carries the touch a11y path.
+  it("keeps direct and labeled project new-session paths visible on touch", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2151,19 +2303,15 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
-    // Genuinely absent on touch — not merely clipped — so it leaves the a11y
-    // tree and tab order, unlike the kebab.
-    // Separate assertions: toHaveClass with multiple classes only fails when
-    // ALL are present, so a partial regression (e.g. adding just `sr-only`)
-    // would slip past a combined negation while clipping the pencil invisible
-    // on hover+fine.
+    expect(pencil).toHaveAttribute("aria-label", "New session in Customer X");
+    expect(pencil.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(pencil).not.toHaveClass("hidden");
     expect(pencil).not.toHaveClass("sr-only");
-    expect(pencil).not.toHaveClass("focus-visible:not-sr-only");
 
-    // The menu remains a touch/long-press fallback even when the hover shortcut
-    // is eligible, because a touchscreen tap cannot reveal that shortcut first.
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
+    const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
+    expect(kebab).not.toHaveClass("hidden");
+    expect(kebab).not.toHaveClass("sr-only");
+    fireEvent.pointerDown(kebab, {
       button: 0,
       ctrlKey: false,
     });
@@ -2178,96 +2326,30 @@ describe("Sidebar project sections", () => {
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
-  it("keeps the project kebab off the row but reachable without a fine hover pointer", () => {
-    // jsdom can't evaluate @media, so the capability contract is asserted via
-    // classes; the recorded demo is the behavioral guardrail. The base classes
-    // stand for every pointer lacking fine hover — a 390px phone and an 810px
-    // unfolded foldable alike (coarse, hover:none) — where the kebab is
-    // sr-only: absent from the row, zero layout, yet in the a11y tree.
+  it("keeps collapsed markers clear of the visible touch action column", () => {
     projectsMock.push("Customer X");
     mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
-    ]);
-    renderSidebar();
-
-    const kebab = screen.getByTestId("project-actions");
-    // sr-only at rest; revealed only where a fine hover pointer exists, at ANY
-    // width — no md gate that would drop it on a narrow hover desktop.
-    expect(kebab).toHaveClass(
-      "sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:flex",
-    );
-    // Never display:none — that would strip it from the a11y tree and tab order
-    // on touch, where the long-press contextmenu isn't reliably dispatched.
-    expect(kebab).not.toHaveClass("hidden");
-    // Keyboard focus un-clips it (`:focus-visible` isn't raised by a touch tap),
-    // so a sighted keyboard/switch user on a touchscreen laptop gets a visible
-    // focus ring instead of one clipped off-screen.
-    expect(kebab).toHaveClass("focus-visible:not-sr-only");
-    // No un-capability-gated display utility at md would re-expose it on a wide
-    // touch screen (the reported foldable bug) — broader than the one literal.
-    for (const cls of kebab.classList) {
-      expect(cls).not.toMatch(
-        /^md:(flex|inline-flex|block|inline-block|inline|grid|inline-grid|table|contents|flow-root)$/,
-      );
-    }
-  });
-
-  it("gives the touch kebab the sr-only (not display:none) class contract", () => {
-    // The touch/coarse case (390px and 810px). No CSS is loaded in jsdom, so a
-    // display:none button is equally findable/focusable here — the meaningful
-    // guard is the class contract: sr-only (kept in the a11y tree, unlike
-    // `hidden`) plus focus-visible:not-sr-only (a focused control becomes
-    // visible). The demo is the behavioral guardrail for the effective render.
-    projectsMock.push("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
-    ]);
-    renderSidebar();
-
-    const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
-    expect(kebab).toHaveClass("sr-only", "focus-visible:not-sr-only");
-    expect(kebab).not.toHaveClass("hidden");
-  });
-
-  it("reveals the folder kebab on hover at every width, narrow hover desktops included", () => {
-    // The regression case: a fine-pointer, hover-capable desktop narrower than
-    // md (~500px window) and a wide 1280px desktop share one gate. The reveal
-    // keys off the pointer capability alone (no md), so hover brings the kebab
-    // back at any width instead of stranding a mouse-only user in a narrow
-    // window. jsdom can't evaluate @media; the demo shows the effective reveal.
-    projectsMock.push("Customer X");
-    mockConversations([
-      conv("conv_running", "Claude Code", {
+      conv("conv_filed", "Claude Code", {
         labels: { omni_project: "Customer X" },
         status: "running",
       }),
     ]);
     renderSidebar();
 
+    const marker = screen.getByTestId("session-state-badge").parentElement!;
+    expect(marker).toHaveClass("mr-14");
+
     const kebab = screen.getByTestId("project-actions");
     const revealWrapper = kebab.closest("div[class*=transition-opacity]")!;
-    // Opacity reveal is capability-gated with NO md: hidden at rest, shown on
-    // hover, at every width for a fine hover pointer.
     expect(revealWrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
     );
-    for (const cls of revealWrapper.classList) {
-      expect(cls).not.toMatch(/:md:opacity-0$/);
-    }
-    // A collapsed folder (marker shown) protects that marker from the kebab's
-    // at-rest hit target with the same capability-only (no md) gate, so a
-    // narrow hover desktop doesn't let an invisible control swallow the tap.
     const outerBox = kebab.closest("div[class*=absolute]")!;
     expect(outerBox).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto",
     );
-    for (const cls of outerBox.classList) {
-      expect(cls).not.toMatch(/:md:pointer-events-none$/);
-    }
   });
 });
 
@@ -2288,7 +2370,11 @@ describe("Sidebar collapsed project marker", () => {
     // marker surfaces on the project header.
     const header = screen.getByRole("button", { name: /^Customer X/ });
     expect(header).toHaveAttribute("aria-expanded", "false");
-    expect(within(header).getByText("Needs response")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("button", { name: "Use Customer X for new sessions" })).getByText(
+        "Needs response",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("keeps foreground and B markers distinct on a collapsed project", () => {
@@ -2305,7 +2391,7 @@ describe("Sidebar collapsed project marker", () => {
     mockConversations([row]);
     renderSidebar();
 
-    const header = screen.getByRole("button", { name: /^Customer B/ });
+    const header = screen.getByRole("button", { name: "Use Customer B for new sessions" });
     expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
       "unseen",
@@ -2361,30 +2447,17 @@ describe("Sidebar collapsed project marker", () => {
     // Fixed centered box so the dot centers on the same vertical line as the
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
-    // Hover-only controls never reserve a rest column, keeping the marker at
-    // the rows' right edge.
-    expect(slot).toHaveClass("-mr-1");
-    expect(slot).not.toHaveClass("mr-14");
-    expect(slot).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
-    // The hover-driven fades track the fine-hover reveal (hover only exists on
-    // fine), so they stay pointer-gated with no md.
+    // Touch keeps two controls visible, so the marker reserves that column;
+    // fine-hover desktop returns it to the row badge edge at rest.
+    expect(slot).toHaveClass("mr-14");
+    expect(slot).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
     expect(slot).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
     );
-    // The focus-within fade tracks the pointer-UNgated focus-visible reveal, so
-    // it is ungated too: a coarse-pointer tablet + keyboard can focus the kebab,
-    // and the spinner must clear there as well or the revealed kebab overlaps
-    // it. Asserted separately below (it must NOT carry the pointer/hover gate).
-    expect(slot).toHaveClass("group-has-[[data-header-controls]:focus-within]/header:opacity-0");
-    expect(slot).not.toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+    expect(slot).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
-    // No width-gated fade survives for a hover-only action — that mismatch is
-    // the narrow-hover overlap regression.
-    for (const cls of slot.classList) {
-      expect(cls).not.toMatch(/:md:group-(hover|has-).*opacity-0$/);
-    }
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the

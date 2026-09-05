@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ntpath
 import re
 import secrets
 from typing import Any
@@ -207,24 +208,30 @@ def _is_subpath_of(canonical_workspace: str, canonical_boundary: str) -> bool:
     :returns: ``True`` when the workspace is the boundary or
         nested under it.
     """
-    # host.stat realpath on Windows uses backslashes. Only then treat
-    # ``\`` as a separator and ignore drive-letter case. On POSIX a
-    # backslash is a legal filename character, so ``/allowed\escape``
-    # must not look like a child of ``/allowed``.
     if _is_windows_absolute_path(canonical_workspace) or _is_windows_absolute_path(
         canonical_boundary
     ):
-        workspace = canonical_workspace.replace("\\", "/").lower()
-        boundary = canonical_boundary.replace("\\", "/").lower()
-    else:
-        workspace = canonical_workspace
-        boundary = canonical_boundary
-    if workspace == boundary:
+        workspace = ntpath.normcase(ntpath.normpath(canonical_workspace))
+        boundary = ntpath.normcase(ntpath.normpath(canonical_boundary))
+        workspace_drive, workspace_tail = ntpath.splitdrive(workspace)
+        boundary_drive, boundary_tail = ntpath.splitdrive(boundary)
+        if workspace_drive != boundary_drive:
+            return False
+        if boundary_tail in ("", "\\"):
+            return True
+        try:
+            return ntpath.commonpath([workspace_tail, boundary_tail]) == boundary_tail
+        except ValueError:
+            return False
+
+    if canonical_workspace == canonical_boundary:
         return True
     # Add a trailing separator so ``/a/foo`` is not treated as a
     # subpath of ``/a/fo`` (prefix collision).
-    boundary_with_sep = boundary if boundary.endswith("/") else boundary + "/"
-    return workspace.startswith(boundary_with_sep)
+    boundary_with_sep = (
+        canonical_boundary if canonical_boundary.endswith("/") else canonical_boundary + "/"
+    )
+    return canonical_workspace.startswith(boundary_with_sep)
 
 
 async def validate_workspace(

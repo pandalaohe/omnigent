@@ -4,6 +4,8 @@ This module hosts the server-side speech-to-text surface behind the
 composer mic button (``designs/server-dictation.md``):
 
 - ``WS /v1/dictation/stream`` — one connection per dictation take.
+- ``POST /v1/dictation/punctuation`` — restore punctuation in one completed
+  browser-speech transcript on the main server only.
 
 Availability is advertised as ``dictation_available`` on ``GET /v1/info``
 (the web UI's boot-time capability probe); there is no separate probe
@@ -112,6 +114,7 @@ def create_dictation_router(
     auth_provider: AuthProvider | None = None,
     engine_provider: Callable[[], DictationEngine] | None = None,
     punctuation_provider: Callable[[], PunctuationRestorer] | None = None,
+    include_punctuation: bool = True,
 ) -> APIRouter:
     """Build the router carrying the dictation stream route.
 
@@ -126,6 +129,8 @@ def create_dictation_router(
         the configured engine and loads models on first use.
     :param punctuation_provider: Final-text punctuation factory override
         for tests. Defaults to the lazy process-wide restorer.
+    :param include_punctuation: Whether to mount the browser-facing HTTP
+        punctuation route. The standalone audio worker disables it.
     :returns: An :class:`APIRouter` carrying the stream route.
     """
     router = APIRouter()
@@ -135,14 +140,6 @@ def create_dictation_router(
     slots = asyncio.Semaphore(max_streams())
     punctuation_slots = asyncio.Semaphore(1)
 
-    @router.post(
-        "/dictation/punctuation",
-        response_model=DictationPunctuationResponse,
-        responses={
-            429: {"description": "Punctuation model busy"},
-            503: {"description": "Punctuation model unavailable"},
-        },
-    )
     async def restore_dictation_punctuation(
         request: Request,
         body: DictationPunctuationRequest,
@@ -159,12 +156,26 @@ def create_dictation_router(
                 restorer = await asyncio.to_thread(resolve_punctuation)
                 restored = await asyncio.to_thread(restorer.restore, body.text)
             except Exception as exc:
-                _logger.exception("dictation punctuation failed")
+                # Model exceptions are not trusted to omit their input. Keep
+                # transcript text out of logs while retaining the error class.
+                _logger.error("dictation punctuation failed (%s)", type(exc).__name__)
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="dictation punctuation unavailable",
                 ) from exc
         return DictationPunctuationResponse(text=restored)
+
+    if include_punctuation:
+        router.add_api_route(
+            "/dictation/punctuation",
+            restore_dictation_punctuation,
+            methods=["POST"],
+            response_model=DictationPunctuationResponse,
+            responses={
+                429: {"description": "Punctuation model busy"},
+                503: {"description": "Punctuation model unavailable"},
+            },
+        )
 
     @router.websocket("/dictation/stream")
     async def dictation_stream(websocket: WebSocket) -> None:

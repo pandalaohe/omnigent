@@ -2782,8 +2782,9 @@ async def _persist_external_goal_state(
 ) -> None:
     """Persist a provider-neutral Goal marker from a native harness."""
     raw_state = body.data.get("state")
-    if raw_state is not None and (
-        not isinstance(raw_state, str) or raw_state not in _EXTERNAL_GOAL_STATE_VALUES
+    if "state" not in body.data or (
+        raw_state is not None
+        and (not isinstance(raw_state, str) or raw_state not in _EXTERNAL_GOAL_STATE_VALUES)
     ):
         raise OmnigentError(
             "external_goal_state requires data.state to be active, paused, or null",
@@ -4820,7 +4821,11 @@ def _invalidate_runner_backed_snapshot_state(
         the session (agent switch); ``False`` keeps it serving while the
         session has no runner.
     """
+    from omnigent.server.native_subagent_watchdog import disarm_native_subagent_watchdogs
     from omnigent.server.smart_routing import invalidate_runner_catalog
+
+    if cancel_inflight:
+        disarm_native_subagent_watchdogs(session_id, retire=False)
 
     # Only worth marking when there is something to keep serving: a session
     # with no cached skills already re-fetches on the next read, and marking
@@ -9785,6 +9790,8 @@ def _child_session_summary_from_conversation(
             last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    from omnigent.server.native_subagent_watchdog import native_subagent_activity_unverified
+
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -9802,6 +9809,11 @@ def _child_session_summary_from_conversation(
         current_task_status=current_task_status,
         busy=busy,
         activity_unverified=activity_unverified,
+        native_activity_unverified=(
+            busy
+            and not conv.archived
+            and native_subagent_activity_unverified(parent_session_id, conv.id)
+        ),
         labels=labels,
         last_task_error=last_task_error,
         last_message_preview=last_message_preview,

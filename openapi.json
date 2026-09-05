@@ -262,6 +262,7 @@
           "command": {
             "anyOf": [
               {
+                "maxLength": 8192,
                 "type": "string"
               },
               {
@@ -274,6 +275,7 @@
           "description": {
             "anyOf": [
               {
+                "maxLength": 2048,
                 "type": "string"
               },
               {
@@ -286,6 +288,7 @@
           "id": {
             "anyOf": [
               {
+                "maxLength": 256,
                 "type": "string"
               },
               {
@@ -298,6 +301,7 @@
           "status": {
             "anyOf": [
               {
+                "maxLength": 128,
                 "type": "string"
               },
               {
@@ -310,6 +314,7 @@
           "type": {
             "anyOf": [
               {
+                "maxLength": 128,
                 "type": "string"
               },
               {
@@ -678,6 +683,11 @@
             ],
             "description": "Error details from the child's most recent failed run, e.g. `{\"code\": \"required_terminal_exited\", \"message\": \"...\"}`. `None` when the child has no durable failure detail. This is the typed projection of runner-owned failure labels; clients should not parse those labels directly.",
             "title": "Last Task Error"
+          },
+          "native_activity_unverified": {
+            "default": false,
+            "title": "Native Activity Unverified",
+            "type": "boolean"
           },
           "object": {
             "default": "child_session",
@@ -1520,6 +1530,42 @@
           "response"
         ],
         "title": "CreatedEvent",
+        "type": "object"
+      },
+      "CurrentUserResponse": {
+        "description": "Authenticated identity and optional synchronized preferences.",
+        "properties": {
+          "is_admin": {
+            "title": "Is Admin",
+            "type": "boolean"
+          },
+          "preferences": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserPreferencesEnvelope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "required": [
+          "user_id",
+          "is_admin"
+        ],
+        "title": "CurrentUserResponse",
         "type": "object"
       },
       "CustomAgentPatch": {
@@ -10766,7 +10812,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentUserResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -10782,6 +10830,41 @@
       "put": {
         "description": "Initialize the caller's full preference envelope exactly once.",
         "operationId": "initialize_user_preferences_v1_me_preferences_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "settings": {
+                    "additionalProperties": {},
+                    "propertyNames": {
+                      "enum": [
+                        "agent_badges",
+                        "context_indicator",
+                        "keyboard_shortcuts",
+                        "mobile_assistant",
+                        "session_navigation",
+                        "usage_context"
+                      ]
+                    },
+                    "type": "object"
+                  },
+                  "version": {
+                    "const": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "settings"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -10792,6 +10875,27 @@
               }
             },
             "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
           }
         },
         "summary": "Initialize User Preferences"
@@ -10820,6 +10924,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "value": {}
+                },
+                "required": [
+                  "value"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -10831,15 +10952,26 @@
             },
             "description": "Successful Response"
           },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
           "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
           }
         },
         "summary": "Patch User Preferences Namespace"

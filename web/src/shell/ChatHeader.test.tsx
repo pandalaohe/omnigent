@@ -729,10 +729,10 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Mark as unread",
       "Add to project",
       "Files",
-      "Archive Library",
+      "Archived sessions",
       "Changes",
       "Agents1",
-      "Archive",
+      "Archive this session",
       "Delete",
     ]);
   });
@@ -772,7 +772,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
       button: 0,
     });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Archive Library" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archived sessions" }));
     expect(onOpenArchive).toHaveBeenCalledOnce();
   });
 

@@ -210,6 +210,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.last_auto_compact_token_limit",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.goal_state",
         "omnigent.last_provider_usage_limits",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
@@ -871,6 +872,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def search_visible_items_literal(
+        self,
+        conversation_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> list[ConversationItem]:
+        """Search one transcript by literal user-visible text."""
+        ...
+
+    @abstractmethod
     def update_conversation(
         self,
         conversation_id: str,
@@ -1138,17 +1149,20 @@ class ConversationStore(ABC):
     def list_archived_facets(
         self,
         accessible_by: str | None = None,
+        *,
+        search_query: str | None = None,
+        search_scope: str = "title",
+        project: str | None = None,
+        host_id: str | None = None,
+        agent_name: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
     ) -> ArchivedConversationFacets:
-        """Return distinct Project, Host, and Agent ids for archived sessions.
-
-        Implementations aggregate in the database and return only facet values;
-        they must not materialize full conversation entities or page through the
-        public session-list contract.
-
-        :param accessible_by: When set, restrict to sessions visible to this user.
-            ``None`` disables the permission filter for auth-disabled servers.
-        :returns: Alphabetically sorted distinct facet values.
-        """
+        """Aggregate linked Archive facet values in the storage layer."""
         ...
 
     @abstractmethod

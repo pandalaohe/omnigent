@@ -3072,9 +3072,11 @@ async def test_create_session_codex_auto_create_guard_skips_rotation_targets(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("binding_token", [None, "native-forwarder-binding-test"])
 async def test_auto_create_claude_terminal_registers_permission_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    binding_token: str | None,
 ) -> None:
     """
     Host-spawned terminal launch wires the PermissionRequest hook.
@@ -3090,6 +3092,15 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     SessionStart/Stop/.../PreCompact + statusLine but no
     PermissionRequest).
     """
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    if binding_token is None:
+        monkeypatch.delenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, binding_token)
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -3194,6 +3205,9 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
+    assert forwarder_kwargs["headers"].get(RUNNER_TUNNEL_TOKEN_HEADER) == binding_token
+    # The runner binding is for its in-process forwarder, not the vendor hook.
+    assert RUNNER_TUNNEL_TOKEN_HEADER not in config["ap_auth_headers"]
 
 
 # ── What a plain claude-native launch must NOT carry ─────────────────

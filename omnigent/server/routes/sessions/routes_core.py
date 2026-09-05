@@ -928,88 +928,26 @@ def register_core_routes(
         """
         response.headers["Cache-Control"] = "no-store"
         user_id = _require_user(request, auth_provider)
-        normalized_query = search_query if search_query else None
-
-        def _load_candidates() -> list[Conversation]:
-            candidates: list[Conversation] = []
-            after: str | None = None
-            while True:
-                page = conversation_store.list_conversations(
-                    limit=1000,
-                    after=after,
-                    accessible_by=user_id,
-                    has_agent_id=True,
-                    kind="default",
-                    archived_only=True,
-                    order="desc",
-                    sort_by="archived_at",
-                    search_query=normalized_query,
-                    search_scope=search_scope,
-                    include_search_match=False,
-                    created_after=created_after,
-                    created_before=created_before,
-                    active_after=active_after,
-                    active_before=active_before,
-                    archived_after=archived_after,
-                    archived_before=archived_before,
-                )
-                candidates.extend(page.data)
-                if not page.has_more or not page.last_id or page.last_id == after:
-                    return candidates
-                after = page.last_id
-
-        candidates = await asyncio.to_thread(_load_candidates)
-        agent_ids = {candidate.agent_id for candidate in candidates if candidate.agent_id}
-        agent_names_by_id = await asyncio.to_thread(agent_store.get_names, list(agent_ids))
-        project_names_by_id: dict[str, str] = {}
-        if project_store is not None:
-            visible_projects = await asyncio.to_thread(project_store.list, user_id=user_id)
-            project_names_by_id = {candidate.id: candidate.name for candidate in visible_projects}
-
-        def _project_name(candidate: Conversation) -> str | None:
-            if candidate.project_id:
-                resolved = project_names_by_id.get(candidate.project_id)
-                if resolved:
-                    return resolved
-            legacy = candidate.labels.get(PROJECT_LABEL_KEY)
-            return legacy if legacy else None
-
-        def _agent_name(candidate: Conversation) -> str | None:
-            return agent_names_by_id.get(candidate.agent_id) if candidate.agent_id else None
-
-        def _matches(candidate: Conversation, *, skip: str) -> bool:
-            if skip != "project" and project is not None and _project_name(candidate) != project:
-                return False
-            if skip != "host" and host_id is not None and candidate.host_id != host_id:
-                return False
-            if skip != "agent" and agent_name is not None and _agent_name(candidate) != agent_name:
-                return False
-            return True
-
+        facets = await asyncio.to_thread(
+            conversation_store.list_archived_facets,
+            user_id,
+            search_query=search_query if search_query else None,
+            search_scope=search_scope,
+            project=project,
+            host_id=host_id,
+            agent_name=agent_name,
+            created_after=created_after,
+            created_before=created_before,
+            active_after=active_after,
+            active_before=active_before,
+            archived_after=archived_after,
+            archived_before=archived_before,
+        )
+        agent_names_by_id = await asyncio.to_thread(agent_store.get_names, facets.agent_ids)
         return ArchivedSessionFacetsResponse(
-            projects=sorted(
-                {
-                    resolved
-                    for candidate in candidates
-                    if _matches(candidate, skip="project")
-                    if (resolved := _project_name(candidate))
-                }
-            ),
-            host_ids=sorted(
-                {
-                    candidate.host_id
-                    for candidate in candidates
-                    if _matches(candidate, skip="host") and candidate.host_id
-                }
-            ),
-            agent_names=sorted(
-                {
-                    resolved
-                    for candidate in candidates
-                    if _matches(candidate, skip="agent")
-                    if (resolved := _agent_name(candidate))
-                }
-            ),
+            projects=facets.projects,
+            host_ids=facets.host_ids,
+            agent_names=sorted(set(agent_names_by_id.values())),
         )
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────

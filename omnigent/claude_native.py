@@ -3348,10 +3348,15 @@ def _run_with_local_server(
             warn=lambda message: click.echo(message, err=True),
         )
         startup_profiler.mark("opening terminal attach")
+        from omnigent.runner.identity import with_runner_binding_token
+
         asyncio.run(
             _attach_with_transcript_forwarder(
                 base_url=base_url,
-                headers={},
+                headers=with_runner_binding_token(
+                    {},
+                    getattr(server_handle, "runner_binding_token", None),
+                ),
                 prepared=prepared,
                 agent_name=_AGENT_NAME,
                 attach_url=_attach_url(base_url, prepared.session_id, prepared.terminal_id),

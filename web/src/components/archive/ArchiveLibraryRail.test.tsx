@@ -138,6 +138,24 @@ describe("ArchiveLibraryRail", () => {
     );
   });
 
+  it("does not auto-select a sole named facet that may coexist with null rows", async () => {
+    useFacetsMock.mockReturnValue({
+      data: { projects: ["Only named project"], hostIds: ["host-win"], agentNames: ["codex"] },
+    } as unknown as ReturnType<typeof useArchivedSessionFacets>);
+
+    renderRail();
+
+    await waitFor(() => {
+      const filters = useArchivedMock.mock.calls.at(-1)?.[0];
+      expect(filters?.project).toBeUndefined();
+      expect(filters?.hostId).toBeUndefined();
+      expect(filters?.agentName).toBeUndefined();
+    });
+    expect(screen.getByRole("combobox", { name: /by project/i })).toHaveTextContent("All projects");
+    expect(screen.getByRole("combobox", { name: /by host/i })).toHaveTextContent("All hosts");
+    expect(screen.getByRole("combobox", { name: /by agent/i })).toHaveTextContent("All agents");
+  });
+
   it("seeds project and host filters from the active session", async () => {
     useFacetsMock.mockReturnValue({
       data: { projects: ["Omnigent"], hostIds: ["host-win"], agentNames: [] },

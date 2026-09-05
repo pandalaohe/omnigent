@@ -1489,6 +1489,49 @@ def test_search_treats_fts_operators_and_quotes_as_literal_text(
     assert conversation_store.search("release NOT missing", conversation_id=conv.id) == []
 
 
+@pytest.mark.parametrize(
+    "query,matching_text",
+    [
+        ("ploy", "deployment completed"),
+        ("%", "progress reached 100%"),
+        ("_", "literal_under_score"),
+        ('"quoted"', 'a "quoted" phrase'),
+    ],
+)
+def test_visible_item_search_uses_literal_substrings(
+    conversation_store: SqlAlchemyConversationStore,
+    query: str,
+    matching_text: str,
+) -> None:
+    conv = conversation_store.create_conversation()
+    [matching, unrelated] = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_matching",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": matching_text}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_unrelated",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "ordinary transcript text"}],
+                ),
+            ),
+        ],
+    )
+
+    results = conversation_store.search_visible_items_literal(conv.id, query, limit=10)
+
+    assert [item.id for item in results] == [matching.id]
+    assert unrelated.id not in {item.id for item in results}
+
+
 def test_search_scoped_to_conversation(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -4495,6 +4538,7 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.last_provider_usage_limits": '{"source":"claude"}',
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
+            "omnigent.goal_state": "active",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },
@@ -5131,6 +5175,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         conv_id,
         {
             instance_label: "1",
+            "omnigent.goal_state": "active",
             "omnigent.last_provider_usage_limits": '{"source":"claude"}',
             "omnigent:agent-template-id": "ca_old",
             "unrelated": "preserved",
@@ -5214,6 +5259,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     assert updated.labels[WRAPPER_LABEL_KEY] == CODEX_NATIVE_WRAPPER_VALUE
     assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
     assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "52adb39f0c5ea92b5563da5327dac08f"
+    assert "omnigent.goal_state" not in updated.labels
     assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
     assert "omnigent.last_provider_usage_limits" not in updated.labels
     assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
@@ -6526,3 +6572,52 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+def test_visible_item_search_filters_legacy_hidden_rows_before_limit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Internal rows cannot consume the bounded visible result window."""
+    conv = conversation_store.create_conversation()
+    persisted = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_hidden",
+                data=MessageData(
+                    role="user",
+                    is_meta=True,
+                    content=[{"type": "input_text", "text": "needle hidden"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_visible_one",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "needle visible one"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_visible_two",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "needle visible two"}],
+                    agent="test-agent",
+                ),
+            ),
+        ],
+    )
+    with conversation_store._conv_session("seed_legacy_hidden_archive_search") as session:
+        hidden = session.get(
+            SqlConversationItem,
+            (current_workspace_id(), conv.id, persisted[0].id, persisted[0].created_at),
+        )
+        assert hidden is not None
+        hidden.search_text = "needle hidden"
+
+    results = conversation_store.search_visible_items_literal(conv.id, "needle", limit=2)
+
+    assert [item.id for item in results] == [persisted[1].id, persisted[2].id]

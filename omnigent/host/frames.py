@@ -122,6 +122,7 @@ class HostHelloFrame:
     telemetry_opt_out: bool = False
     installation_id: str | None = None
     codex_rate_limits: _JsonObject | None = None
+    filesystem_roots: bool = False
 
 
 @dataclass
@@ -1061,6 +1062,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
                 "codex_rate_limits": frame.codex_rate_limits,
+                "filesystem_roots": frame.filesystem_roots,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1582,6 +1584,9 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
         codex_rate_limits=validate_codex_rate_limits_snapshot(msg.get("codex_rate_limits")),
+        filesystem_roots=(
+            _required_bool(msg, "filesystem_roots") if "filesystem_roots" in msg else False
+        ),
     )
 
 

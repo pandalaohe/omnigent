@@ -2323,6 +2323,49 @@ async def test_replayed_native_child_terminal_status_updates_without_waking_pare
     recover_via_parent.assert_not_awaited()
 
 
+@pytest.mark.parametrize("active_status", ["running", "waiting"])
+async def test_native_child_activity_clears_stale_durable_terminal_status(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    active_status: str,
+) -> None:
+    """A new active edge cannot leave the previous turn terminal on restart."""
+    _, child_id = await _create_claude_native_child(
+        client,
+        subagent_id=f"terminal-then-{active_status}",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        AsyncMock(return_value=None),
+    )
+
+    terminal = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "completed",
+                "output": "previous turn result",
+                "replayed": True,
+            },
+        },
+    )
+    assert terminal.status_code == 202, terminal.text
+    terminal_child = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert terminal_child["labels"]["omnigent.subagent.terminal_status"] == "completed"
+
+    active = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": active_status},
+        },
+    )
+    assert active.status_code == 202, active.text
+    child = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert child["labels"].get("omnigent.subagent.terminal_status") in {None, ""}
+
+
 async def test_replayed_completed_recovers_native_child_from_sticky_failed_state(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -12270,11 +12313,14 @@ async def test_external_goal_state_updates_and_clears_session_list_marker(
     assert "goal_state" not in next(row for row in rows if row["id"] == session["id"])
 
 
-async def test_external_goal_state_rejects_unknown_value(client: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize("data", [{"state": "complete"}, {"state": []}, {}])
+async def test_external_goal_state_rejects_unknown_value(
+    client: httpx.AsyncClient, data: dict[str, Any]
+) -> None:
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     response = await client.post(
         f"/v1/sessions/{session['id']}/events",
-        json={"type": "external_goal_state", "data": {"state": "complete"}},
+        json={"type": "external_goal_state", "data": data},
     )
     assert response.status_code == 400, response.text

@@ -6212,6 +6212,8 @@ function applyChildSessionUpdated(
   if (child.busy !== undefined) patch.busy = child.busy === true;
   if (child.activity_unverified !== undefined)
     patch.activity_unverified = child.activity_unverified === true;
+  if (child.native_activity_unverified !== undefined)
+    patch.native_activity_unverified = child.native_activity_unverified === true;
   if (child.last_message_preview !== undefined)
     patch.last_message_preview = strOrNull(child.last_message_preview);
   if (child.pending_elicitations_count !== undefined)

@@ -238,13 +238,13 @@ def register_items_routes(
                 raise _session_not_found()
 
         matches = await asyncio.to_thread(
-            conversation_store.search,
+            conversation_store.search_visible_items_literal,
+            session_id,
             search_query,
-            conversation_id=session_id,
             limit=limit + 1,
         )
         has_more = len(matches) > limit
-        visible = sorted(matches[:limit], key=lambda item: (item.created_at, item.id))
+        visible = matches[:limit]
         return PaginatedList(
             data=[item.to_api_dict() for item in visible],
             first_id=visible[0].id if visible else None,

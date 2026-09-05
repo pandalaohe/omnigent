@@ -1,3 +1,4 @@
+import { readLastCreatedWorkspace, writeLastCreatedWorkspace } from "@/lib/lastCreatedWorkspace";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
@@ -298,6 +299,47 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it("prefers the last successful create directory over general recent activity", async () => {
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify({ host_1: ["/Users/corey/switched-host-location"] }),
+    );
+    writeLastCreatedWorkspace("host_1", "/Users/corey/created-session-location");
+
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "created-session-location",
+      ),
+    );
+  });
+
+  it("preserves a legal trailing-space directory in the create and its host default", async () => {
+    const exactWorkspace = "/Users/corey/projects/legal-trailing-space ";
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [exactWorkspace] }));
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "legal-trailing-space",
+      ),
+    );
+    typeMessage("inspect the exact directory");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { workspace: string };
+    expect(body.workspace).toBe(exactWorkspace);
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+    expect(readLastCreatedWorkspace("host_1")).toBe(exactWorkspace);
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

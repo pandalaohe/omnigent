@@ -1793,6 +1793,7 @@ def test_remote_daemon_run_attaches_without_cli_forwarder(
         "forwarder; the runner already owns the forwarder and a second "
         "tailer duplicates every web chat message"
     )
+    assert captured_attach["headers"] == {"Authorization": "Bearer tok"}
 
 
 @pytest.mark.asyncio

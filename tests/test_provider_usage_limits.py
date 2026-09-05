@@ -24,7 +24,7 @@ def test_provider_usage_limits_accepts_bounded_windows() -> None:
     assert validate_provider_usage_limits_snapshot(snapshot) == snapshot
 
 
-@pytest.mark.parametrize("used_percent", [-1, 101, True, "5"])
+@pytest.mark.parametrize("used_percent", [-1, 101, True, "5", float("nan"), float("inf"), 10**400])
 def test_provider_usage_limits_rejects_invalid_percent(used_percent: object) -> None:
     with pytest.raises(ValueError, match="window values"):
         validate_provider_usage_limits_snapshot(

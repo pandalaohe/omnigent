@@ -2058,6 +2058,18 @@ async def _resolve_pi_resume_session(
     return None
 
 
+def _native_forwarder_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Authenticate trusted in-process forwarders with the current runner.
+
+    Keep this copy separate from hook configuration and terminal environment:
+    harness subprocesses must not inherit the runner control-plane token.
+    """
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import with_runner_binding_token
+
+    return with_runner_binding_token(headers, _runner_tunnel_binding_token_from_env())
+
+
 async def _auto_create_pi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -3803,7 +3815,7 @@ async def _auto_create_kimi_terminal(
     _forwarder_task = asyncio.create_task(
         supervise_kimi_forwarder(
             base_url=server_url,
-            headers=_runner_headers,
+            headers=_native_forwarder_headers(_runner_headers),
             session_id=session_id,
             bridge_dir=bridge_dir,
             kimi_home=bridge_dir / "kimi-code-home",
@@ -4760,7 +4772,7 @@ async def _codex_discover_thread_and_forward(
 
         await supervise_forwarder(
             base_url=server_url,
-            headers=headers,
+            headers=_native_forwarder_headers(headers),
             session_id=session_id,
             bridge_dir=bridge_dir,
             app_server_url=codex_ws_url,
@@ -4825,7 +4837,7 @@ async def _codex_forward_known_thread(
     try:
         await supervise_forwarder(
             base_url=server_url,
-            headers=headers,
+            headers=_native_forwarder_headers(headers),
             session_id=session_id,
             bridge_dir=bridge_dir,
             app_server_url=codex_ws_url,
@@ -7329,7 +7341,7 @@ async def _auto_create_claude_terminal(
         try:
             await supervise_forwarder(
                 base_url=server_url,
-                headers=_runner_headers,
+                headers=_native_forwarder_headers(_runner_headers),
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 agent_name="claude-native-ui",

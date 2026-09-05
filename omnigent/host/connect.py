@@ -3845,6 +3845,7 @@ class HostProcess:
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
             codex_rate_limits=self._codex_rate_limits,
+            filesystem_roots=True,
         )
         try:
             encoded_hello = encode_host_frame(hello)

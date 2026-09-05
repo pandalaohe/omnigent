@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 BACKGROUND_TITLE_MAX_PROMPT_CHARS = 4_000
-BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS = 4_000
 BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 32
 CUSTOM_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 64
 BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS = 60.0
@@ -56,17 +55,6 @@ _BACKGROUND_TITLE_MODELS: dict[str, str] = {
 def background_title_model(harness: str) -> str | None:
     """Return the economy-tier title model for a canonical harness, if registered."""
     return _BACKGROUND_TITLE_MODELS.get(harness)
-
-
-def _operator_title_instructions(additional_instructions: str | None) -> str:
-    """Remove the framework language suffix sent for older Runner versions."""
-    custom = additional_instructions.strip() if additional_instructions else ""
-    if custom == FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION:
-        return ""
-    suffix = f"\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
-    if custom.endswith(suffix):
-        return custom[: -len(suffix)].rstrip()
-    return custom
 
 
 def _operator_title_instructions(additional_instructions: str | None) -> str:

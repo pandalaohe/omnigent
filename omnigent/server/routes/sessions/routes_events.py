@@ -32,6 +32,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
+from omnigent.native_subagent_snapshot import parse_native_subagent_snapshot
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -62,6 +63,10 @@ from omnigent.server.background_session_titles import (
     schedule_background_child_task_summary,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.native_subagent_watchdog import (
+    NativeSubagentWatchdog,
+    disarm_native_subagent_watchdogs,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -97,6 +102,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
     _EXTERNAL_MODEL_OPTIONS_TYPE,
+    _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
@@ -210,6 +216,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _wait_for_host_bound_runner_client,
     ensure_runner_connected,
 )
+from omnigent.server.routes._sessions.subagent_reconciliation import _read_native_subagent_probe
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ConversationDeleted,
@@ -328,6 +335,7 @@ class _DeletionClaimLease:
 # already on the SSE-event logger), so the envelope is suppressed for them.
 _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
     {
+        _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
         _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
@@ -480,6 +488,32 @@ def register_events_routes(
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
+    async def _verify_native_inventory(parent_id: str, binding: str) -> bool:
+        # Only GET existing Host evidence. This does not ensure a runner,
+        # resume a native thread, inject input or settle any child task.
+        parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+        if (
+            parent is None
+            or parent.archived
+            or parent.runner_id != binding
+            or parent_id in _intentional_stop_sessions
+        ):
+            return False
+        client = await _get_runner_client(parent_id, runner_router, conversation=parent)
+        if client is not None:
+            await _read_native_subagent_probe(client, parent_id)
+        return True
+
+    def _native_inventory_changed(children: frozenset[str]) -> None:
+        for child_id in children:
+            _publish_child_status_to_parent(child_id, _session_status_cache.get(child_id, "idle"))
+
+    native_watchdog = NativeSubagentWatchdog(
+        verify=_verify_native_inventory,
+        changed=_native_inventory_changed,
+    )
+    router.add_event_handler("shutdown", native_watchdog.close)
+
     def _has_runner_created_by_authority(request: Request, conv: Any) -> bool:
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token:
@@ -619,7 +653,7 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
-        if in_flight is not None:
+        if in_flight is not None and body.type != _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.
             in_flight.enter_context(_mark_dispatch_in_flight(session_id))
@@ -684,6 +718,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
+            _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
@@ -1057,6 +1092,8 @@ def register_events_routes(
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
                 raise
+            native_watchdog.disarm(session_id, retire=True)
+            stop_conv = None
             if not stop_delivered:
                 # No runner resolved: the process is already gone, but its last
                 # running/waiting edge can remain cached and persisted forever.
@@ -1342,6 +1379,55 @@ def register_events_routes(
                 )
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
+        if body.type == _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE:
+            token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+            # Unlike the legacy attribution helper, a registered token from
+            # another runner never grants authority over this parent's children.
+            if not token or not conv.runner_id or token_bound_runner_id(token) != conv.runner_id:
+                raise OmnigentError(
+                    "Snapshot requires the current bound runner", code=ErrorCode.FORBIDDEN
+                )
+            if not _is_native_terminal_session(conv):
+                raise OmnigentError(
+                    "Snapshot requires a native parent", code=ErrorCode.INVALID_INPUT
+                )
+            if conv.archived or session_id in _intentional_stop_sessions:
+                native_watchdog.disarm(session_id)
+                return {"queued": False}
+            try:
+                snapshot = parse_native_subagent_snapshot(body.data)
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            children = await asyncio.to_thread(
+                conversation_store.get_conversations,
+                list(snapshot.children),
+            )
+            if set(children) != set(snapshot.children) or any(
+                child.parent_conversation_id != session_id
+                or child.labels.get("omnigent.wrapper")
+                not in {
+                    "claude-code-native-ui-subagent",
+                    "codex-native-ui-subagent",
+                }
+                for child in children.values()
+            ):
+                raise OmnigentError(
+                    "Snapshot contains a foreign child", code=ErrorCode.INVALID_INPUT
+                )
+            current_parent = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if (
+                current_parent is None
+                or current_parent.archived
+                or current_parent.runner_id != conv.runner_id
+                or session_id in _intentional_stop_sessions
+            ):
+                return {"queued": False}
+            # Inventory can never publish status, clear B/Goal/approvals, or
+            # enqueue a result. Existing terminal events/CAS own that authority.
+            native_watchdog.heartbeat(session_id, conv.runner_id, snapshot)
+            return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
             status = body.data.get("status")
             if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
@@ -1480,7 +1566,7 @@ def register_events_routes(
                 ]
             if conv.kind == "sub_agent":
                 durable_terminal_status = "completed" if status == "idle" else status
-                if status == "running":
+                if status in {"running", "waiting"}:
                     durable_terminal_status = ""
                 if durable_terminal_status in ("", "completed", "failed", "stopped", "killed"):
                     await asyncio.to_thread(
@@ -2600,6 +2686,7 @@ def register_events_routes(
                 await delete_lease.to_thread(artifact_store.delete, fid)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
+        disarm_native_subagent_watchdogs(session_id)
         deleted = await delete_lease.run(conversation_store.delete_conversation(session_id))
         if not deleted:
             raise _session_not_found()

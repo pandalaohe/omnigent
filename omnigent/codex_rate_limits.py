@@ -31,7 +31,10 @@ def _number(value: object) -> float | None:
     """Return a finite JSON number while rejecting booleans."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
     return number if math.isfinite(number) else None
 
 
@@ -143,7 +146,7 @@ def validate_codex_rate_limits_snapshot(snapshot: object) -> _JsonObject | None:
             if not isinstance(raw_window, dict):
                 raise ValueError("invalid codex rate-limit window")
             kind = raw_window.get("kind")
-            if kind not in {"primary", "secondary"}:
+            if not isinstance(kind, str) or kind not in {"primary", "secondary"}:
                 raise ValueError("invalid codex rate-limit window kind")
             normalized = _window(
                 {

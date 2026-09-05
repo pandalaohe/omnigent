@@ -2065,9 +2065,11 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("binding_token", [None, "native-forwarder-binding-test"])
 async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    binding_token: str | None,
 ) -> None:
     """
     Snapshot ``terminal_launch_args`` reach the launched kimi argv.
@@ -2085,7 +2087,16 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     from omnigent import kimi_native_bridge as kimi_bridge_mod
     from omnigent.runner import app as runner_app_mod
     from omnigent.runner.app import _auto_create_kimi_terminal
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
     from omnigent.runner.resource_registry import KIMI_NATIVE_TERMINAL_ROLE
+
+    if binding_token is None:
+        monkeypatch.delenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, binding_token)
 
     session_id = "92c6f9222c7ac0f45ba2736b57b51f88"
     workspace = tmp_path / "workspace"
@@ -2101,7 +2112,10 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
         lambda session_home, **_kwargs: {"KIMI_CODE_HOME": str(session_home)},
     )
 
+    forwarder_kwargs: dict[str, Any] = {}
+
     async def _sleeping_forwarder(**_kwargs: Any) -> None:
+        forwarder_kwargs.update(_kwargs)
         await asyncio.Event().wait()
 
     monkeypatch.setattr(kimi_fwd_mod, "supervise_kimi_forwarder", _sleeping_forwarder)
@@ -2159,6 +2173,7 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     # Bare ``kimi`` plus the persisted pass-through args, verbatim.
     assert spec.command == "/fake/bin/kimi"
     assert spec.args == ["--yolo"]
+    assert forwarder_kwargs["headers"].get(RUNNER_TUNNEL_TOKEN_HEADER) == binding_token
 
 
 @pytest.mark.asyncio
@@ -3208,9 +3223,11 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("binding_token", [None, "native-forwarder-binding-test"])
 async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    binding_token: str | None,
 ) -> None:
     """
     The fresh-session bridge state must carry the session workspace as ``cwd``.
@@ -3226,6 +3243,15 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
         _AUTO_CODEX_APP_SERVERS,
         _codex_discover_thread_and_forward,
     )
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    if binding_token is None:
+        monkeypatch.delenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, binding_token)
 
     thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
     workspace = tmp_path / "selected-workspace"
@@ -3233,8 +3259,11 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     async def _fake_wait(*_args: object, **_kwargs: object) -> str:
         return thread_id
 
+    forwarder_kwargs: dict[str, Any] = {}
+
     async def _fake_supervise(**_kwargs: object) -> None:
-        return None
+        forwarder_kwargs.update(_kwargs)
+        return
 
     class _Client:
         async def close(self) -> None:
@@ -3268,6 +3297,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     assert state is not None
     assert state.thread_id == thread_id
     assert state.cwd == str(workspace)
+    assert forwarder_kwargs["headers"].get(RUNNER_TUNNEL_TOKEN_HEADER) == binding_token
 
 
 @pytest.mark.asyncio

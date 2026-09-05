@@ -109,6 +109,14 @@ export function childStatus(child: ChildSessionInfo): AgentStatus {
       details: "No current Host activity was found after reconnect",
     };
   }
+  if (child.native_activity_unverified && child.busy && !child.last_task_error) {
+    return {
+      activity: "unverified",
+      label: "Activity unverified",
+      details:
+        "Native status updates are unavailable. The task may still be running; reconnect the Host or recheck its status.",
+    };
+  }
   // ``busy`` is the authoritative live flag (queued or in_progress);
   // ``current_task_status`` may be "launching", "completed", "failed",
   // "cancelled", or null when no task has run yet.

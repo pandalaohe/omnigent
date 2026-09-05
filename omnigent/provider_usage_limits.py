@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 _MAX_WINDOWS = 8
@@ -43,6 +44,7 @@ def validate_provider_usage_limits_snapshot(snapshot: object) -> dict[str, Any] 
             or not isinstance(used_percent, (int, float))
             or used_percent < 0
             or used_percent > 100
+            or not math.isfinite(used_percent)
         ):
             raise ValueError("invalid provider usage-limit window values")
         normalized: dict[str, Any] = {

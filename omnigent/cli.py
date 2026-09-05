@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from importlib import import_module, resources
 from pathlib import Path
@@ -667,6 +667,7 @@ _CUSTOM_HOST_VCS_URL = "git+https://github.com/pandalaohe/omnigent.git"
 _CUSTOM_HOST_CHANNEL = "local/host-custom"
 _CUSTOM_HOST_CHANNEL_URL = f"{_CUSTOM_HOST_VCS_URL}@{_CUSTOM_HOST_CHANNEL}"
 _CUSTOM_HOST_RECONNECT_TIMEOUT_S = 60.0
+_CUSTOM_HOST_HELPER_START_TIMEOUT_S = 10.0
 # When reusing an existing daemon, how long to let a live-but-offline daemon
 # (re)establish its server tunnel before treating it as a zombie and
 # respawning. Covers the daemon's reconnect backoff after a transient drop.
@@ -4129,6 +4130,7 @@ def server(
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
 
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
@@ -4143,6 +4145,7 @@ def server(
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
+    user_preferences_store = SqlAlchemyUserPreferencesStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -4312,6 +4315,7 @@ def server(
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,
+        user_preferences_store=user_preferences_store,
         policy_modules=cfg.get("policy_modules"),
         debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
         admins=config_str_list(cfg.get("admins")),
@@ -8838,6 +8842,47 @@ def _read_custom_host_update_result() -> dict[str, object] | None:
     return raw if isinstance(raw, dict) else None
 
 
+@contextlib.contextmanager
+def _custom_host_update_launch_guard() -> Iterator[None]:
+    """Serialize the entire Windows update launch before stopping its Host.
+
+    The guard file is permanent: deleting it would let two callers lock
+    different file identities. The OS releases the lock if a launcher exits.
+    Once the launcher returns, the existing live-helper receipt owns exclusion.
+    """
+    root = _custom_host_update_paths()["root"]
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / "custom-host-launch.guard").open("a+b") as guard:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(guard.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise click.ClickException(
+                    "A custom Host update is already being started."
+                ) from exc
+            try:
+                yield
+            finally:
+                guard.seek(0)
+                msvcrt.locking(guard.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            # Exercise the same ownership boundary in Linux release tests.
+            import fcntl
+
+            try:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise click.ClickException(
+                    "A custom Host update is already being started."
+                ) from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+
+
 def _ensure_no_running_custom_host_helper() -> None:
     """Refuse overlapping Windows helpers and clear only a stale lock."""
     lock_path = _custom_host_update_paths()["lock"]
@@ -8845,9 +8890,14 @@ def _ensure_no_running_custom_host_helper() -> None:
         return
     result = _read_custom_host_update_result()
     helper_pid = result.get("helper_pid") if result is not None else None
-    if isinstance(helper_pid, int) and _pid_alive(helper_pid):
+    launcher_pid = result.get("launcher_pid") if result is not None else None
+    live_pid = next(
+        (pid for pid in (helper_pid, launcher_pid) if isinstance(pid, int) and _pid_alive(pid)),
+        None,
+    )
+    if live_pid is not None:
         raise click.ClickException(
-            f"A custom Host update is already running (helper pid {helper_pid})."
+            f"A custom Host update is already running (process pid {live_pid})."
         )
     lock_path.unlink(missing_ok=True)
 
@@ -8896,6 +8946,7 @@ def _launch_windows_custom_host_update(
             "Windows custom update requires PowerShell 7 and the installed omni "
             "executable on PATH."
         )
+    process: subprocess.Popen[bytes] | None = None
     try:
         _copy_windows_custom_host_helper(paths["helper"])
         paths["log"].write_text("", encoding="utf-8")
@@ -8923,41 +8974,98 @@ def _launch_windows_custom_host_update(
             "lock_path": str(paths["lock"]),
         }
         atomic_write_json(paths["instruction"], instruction)
-        creationflags = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
-        process = subprocess.Popen(
-            [
-                pwsh,
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(paths["helper"]),
-                "-InstructionPath",
-                str(paths["instruction"]),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            creationflags=creationflags,
-        )
         atomic_write_json(
             paths["result"],
             {
                 "schema_version": 1,
-                "status": "running",
+                "status": "starting",
                 "old_commit": old_commit,
                 "target_commit": target_commit,
-                "helper_pid": process.pid,
+                "launcher_pid": os.getpid(),
+                "helper_pid": None,
                 "error": None,
             },
         )
-        return process.pid, paths["result"], paths["log"]
-    except Exception:
+        # DETACHED_PROCESS can make pwsh exit before evaluating -File. A hidden
+        # process group plus the readiness handshake survives the launcher exit.
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
+        with paths["log"].open("ab", buffering=0) as helper_output:
+            process = subprocess.Popen(
+                [
+                    pwsh,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(paths["helper"]),
+                    "-InstructionPath",
+                    str(paths["instruction"]),
+                    "-ResultPath",
+                    str(paths["result"]),
+                    "-LogPath",
+                    str(paths["log"]),
+                    "-LockPath",
+                    str(paths["lock"]),
+                    "-WrapperPath",
+                    str(wrapper),
+                    "-OldCommit",
+                    old_commit,
+                    "-TargetCommit",
+                    target_commit,
+                    "-HostId",
+                    host_id,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=helper_output,
+                stderr=helper_output,
+                close_fds=True,
+                creationflags=creationflags,
+            )
+        deadline = time.monotonic() + _CUSTOM_HOST_HELPER_START_TIMEOUT_S
+        while time.monotonic() < deadline:
+            result = _read_custom_host_update_result()
+            if result is not None and result.get("helper_pid") == process.pid:
+                if result.get("status") in {"running", "complete"}:
+                    return process.pid, paths["result"], paths["log"]
+                if result.get("status") == "failed":
+                    error = result.get("error")
+                    raise click.ClickException(
+                        "Windows custom Host update helper failed during startup"
+                        + (f": {error}" if isinstance(error, str) and error else ".")
+                    )
+            return_code = process.poll()
+            if return_code is not None:
+                raise click.ClickException(
+                    "Windows custom Host update helper exited before reporting readiness "
+                    f"(status {return_code}). Check {paths['log']}."
+                )
+            time.sleep(0.05)
+        raise click.ClickException(
+            "Windows custom Host update helper did not report readiness within "
+            f"{_CUSTOM_HOST_HELPER_START_TIMEOUT_S:.0f}s. Check {paths['log']}."
+        )
+    except Exception as exc:
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.terminate()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+        result = _read_custom_host_update_result()
+        if result is None or result.get("status") != "failed":
+            with contextlib.suppress(Exception):
+                atomic_write_json(
+                    paths["result"],
+                    {
+                        "schema_version": 1,
+                        "status": "failed",
+                        "old_commit": old_commit,
+                        "target_commit": target_commit,
+                        "helper_pid": process.pid if process is not None else None,
+                        "error": str(exc),
+                    },
+                )
         paths["lock"].unlink(missing_ok=True)
         raise
 
@@ -9228,6 +9336,25 @@ def host_update_custom(
     rollback: bool,
 ) -> None:
     """Update this managed Host from our fork-only custom channel."""
+    # Hold exclusion across preflight, draining, supervisor stop, and receipt
+    # handoff. Locking only inside the final helper launch is too late: another
+    # caller could stop/restart the Host while the first installer is running.
+    guard = (
+        _custom_host_update_launch_guard()
+        if IS_WINDOWS and not check_only and not dry_run
+        else contextlib.nullcontext()
+    )
+    with guard:
+        _host_update_custom_impl(check_only, dry_run, force, rollback)
+
+
+def _host_update_custom_impl(
+    check_only: bool,
+    dry_run: bool,
+    force: bool,
+    rollback: bool,
+) -> None:
+    """Run update checks and the guarded installation workflow."""
     if check_only and rollback:
         raise click.UsageError("--check and --rollback cannot be used together.")
     if _find_repo_root() is not None:
@@ -9277,6 +9404,9 @@ def host_update_custom(
                 "Check network/git access."
             )
 
+    # Resolve the moving channel once, then install that exact revision on
+    # every platform. A push during uv/pipx installation must not change it.
+    target_url = f"{_CUSTOM_HOST_VCS_URL}@{target_sha}"
     suggestion = _build_upgrade_suggestion(info, target_vcs_url=target_url)
     if not suggestion.runnable:
         raise click.ClickException(

@@ -288,8 +288,8 @@ export interface WorkspacePickerProps {
   onClose?: () => void;
   /**
    * Absolute path to open the picker at on mount, e.g.
-   * ``"/Users/corey/projects"``. ``undefined`` starts at ``defaultPath``
-   * when present, otherwise at the Host's home directory. Read only at
+   * ``"/Users/corey/projects"``. ``undefined`` starts at the Host's home
+   * directory. Read only at
    * mount time; later changes are ignored (navigate via the picker UI instead).
    */
   initialPath?: string;
@@ -310,12 +310,14 @@ export interface WorkspacePickerProps {
    * meaningful anchor.
    */
   workspacePath?: string;
-  /** Host-level starting folder currently persisted for new sessions. */
+  /** Host-level folder pinned as a picker shortcut. */
   defaultPath?: string | null;
   /** Human-readable Host name used to make the pin action's scope explicit. */
   defaultPathHostName?: string;
-  /** Set or clear the host-level starting folder. */
+  /** Set or clear the host-level pinned folder. */
   onDefaultPathChange?: (path: string | null) => void | Promise<void>;
+  /** Whether this Host advertises platform-root enumeration support. */
+  supportsFilesystemRoots?: boolean;
 }
 
 export type HostWorkspacePickerProps = Omit<
@@ -342,6 +344,7 @@ export function HostWorkspacePicker(props: HostWorkspacePickerProps) {
       {...props}
       defaultPath={host?.default_workspace}
       defaultPathHostName={host?.name ?? props.hostId ?? undefined}
+      supportsFilesystemRoots={host?.filesystem_roots === true}
       onDefaultPathChange={
         props.hostId === null
           ? undefined
@@ -370,8 +373,8 @@ export function HostWorkspacePicker(props: HostWorkspacePickerProps) {
  * @param onClose Fired when the ✕ button is clicked.
  * @param onNavigate Fired with the current directory on every navigation,
  *   for a live-updating picker with no "Select" button.
- * @param initialPath Absolute path to open at on mount; defaults to
- *   the Host's pinned starting folder, then its home directory.
+ * @param initialPath Absolute path to open at on mount; defaults to the
+ *   Host's home directory. The pinned folder remains an explicit shortcut.
  * @param occupancyForPath Returns how many other live agents occupy a given
  *   absolute directory; drives the conflict banner. Omit to disable it.
  */
@@ -386,10 +389,11 @@ export function WorkspacePicker({
   defaultPath,
   defaultPathHostName,
   onDefaultPathChange,
+  supportsFilesystemRoots = false,
 }: WorkspacePickerProps) {
   // "" means home — the server forwards ~ to list_dir. initialPath
   // seeds the start dir (read once at mount).
-  const [path, setPath] = useState<string>(initialPath ?? defaultPath ?? "");
+  const [path, setPath] = useState<string>(initialPath ?? "");
   const [showRoots, setShowRoots] = useState(false);
   // The editable path value; diverges from `path` while typing and
   // snaps back on commit (Enter / blur).
@@ -421,7 +425,7 @@ export function WorkspacePicker({
   useEffect(() => {
     if (prevHostId.current === hostId) return;
     prevHostId.current = hostId;
-    setPath(defaultPath ?? "");
+    setPath("");
     setShowRoots(false);
     setPathInput("");
     setResolvedHome(null);
@@ -430,10 +434,10 @@ export function WorkspacePicker({
     setCreateError(null);
     setDefaultError(null);
     setSearchQuery("");
-  }, [hostId, defaultPath]);
+  }, [hostId]);
 
   const directoryQuery = useHostFilesystem(hostId, showRoots ? null : path);
-  const rootsQuery = useHostFilesystemRoots(hostId, showRoots);
+  const rootsQuery = useHostFilesystemRoots(hostId, supportsFilesystemRoots && showRoots);
   const { data, isLoading, error, isPlaceholderData } = showRoots ? rootsQuery : directoryQuery;
 
   // Resolve the host's home dir independently of where the picker is
@@ -618,7 +622,7 @@ export function WorkspacePicker({
     try {
       await onDefaultPathChange(currentAbsolute === defaultPath ? null : currentAbsolute);
     } catch (err) {
-      setDefaultError(err instanceof Error ? err.message : "Failed to save the default folder");
+      setDefaultError(err instanceof Error ? err.message : "Failed to save the pinned folder");
     }
   }
 
@@ -631,17 +635,24 @@ export function WorkspacePicker({
         <PickerIconButton
           label="Up one level"
           icon={<ArrowUpIcon className="size-4" />}
-          onClick={() => (parent !== null ? navigateTo(parent) : navigateToRoots())}
-          disabled={showRoots || currentAbsolute === ""}
+          onClick={() => {
+            if (parent !== null) navigateTo(parent);
+            else if (supportsFilesystemRoots) navigateToRoots();
+          }}
+          disabled={
+            showRoots || currentAbsolute === "" || (parent === null && !supportsFilesystemRoots)
+          }
           testId="workspace-picker-up"
         />
-        <PickerIconButton
-          label="Computer roots"
-          icon={<HardDriveIcon className="size-4" />}
-          onClick={navigateToRoots}
-          disabled={showRoots}
-          testId="workspace-picker-roots"
-        />
+        {supportsFilesystemRoots && (
+          <PickerIconButton
+            label="Computer roots"
+            icon={<HardDriveIcon className="size-4" />}
+            onClick={navigateToRoots}
+            disabled={showRoots}
+            testId="workspace-picker-roots"
+          />
+        )}
         {workspacePath !== undefined && (
           <PickerIconButton
             label="Workspace root"
@@ -657,6 +668,14 @@ export function WorkspacePicker({
           onClick={() => navigateTo("")}
           testId="workspace-picker-home"
         />
+        {defaultPath && (
+          <PickerIconButton
+            label={`Open pinned folder: ${defaultPath}`}
+            icon={<PinIcon className="size-4" />}
+            onClick={() => navigateTo(defaultPath)}
+            testId="workspace-picker-open-pinned"
+          />
+        )}
         <div className="flex-1" />
         <PickerIconButton
           label={showHidden ? "Hide hidden files" : "Show hidden files"}
@@ -729,8 +748,8 @@ export function WorkspacePicker({
           <PickerIconButton
             label={
               currentAbsolute !== "" && currentAbsolute === defaultPath
-                ? `Clear default starting folder for ${defaultPathHostName ?? "this Host"}`
-                : `Use this folder as the default starting folder for ${defaultPathHostName ?? "this Host"}`
+                ? `Unpin this folder for ${defaultPathHostName ?? "this Host"}. Pinning only provides quick access; new sessions remember the last working folder.`
+                : `Pin this folder for quick access on ${defaultPathHostName ?? "this Host"}. New sessions remember the last working folder.`
             }
             icon={
               <PinIcon

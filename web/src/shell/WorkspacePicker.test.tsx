@@ -97,7 +97,10 @@ describe("HostWorkspacePicker shared preference wiring", () => {
     expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue(
       "D:\\AIProgram\\Projects",
     );
-    expect(pin).toHaveAttribute("aria-label", "Clear default starting folder for Windows desktop");
+    expect(pin).toHaveAttribute(
+      "aria-label",
+      "Unpin this folder for Windows desktop. Pinning only provides quick access; new sessions remember the last working folder.",
+    );
     fireEvent.click(pin);
     await waitFor(() => expect(setHostDefaultWorkspaceMock).toHaveBeenCalledWith("win_host", null));
   });
@@ -341,7 +344,7 @@ describe("WorkspacePicker path bar", () => {
       }),
     );
 
-    render(<WorkspacePicker hostId="host_1" />);
+    render(<WorkspacePicker hostId="host_1" supportsFilesystemRoots />);
     const input = screen.getByTestId("workspace-picker-path-input") as HTMLInputElement;
     fireEvent.click(screen.getByTestId("workspace-picker-entry-projects"));
     expect(input.value).toBe("/Users/serena.ruan/projects");
@@ -396,16 +399,45 @@ describe("WorkspacePicker filesystem roots", () => {
       }),
     );
 
-    render(<WorkspacePicker hostId="host_1" />);
+    render(<WorkspacePicker hostId="host_1" supportsFilesystemRoots />);
     fireEvent.click(screen.getByTestId("workspace-picker-roots"));
     fireEvent.click(screen.getByTestId("workspace-picker-entry-D:\\"));
 
     expect(useHostFilesystemMock).toHaveBeenCalledWith("host_1", "D:\\");
   });
+
+  it("keeps root browsing hidden for an older Host", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
+    );
+
+    render(<WorkspacePicker hostId="old_host" />);
+
+    expect(screen.queryByTestId("workspace-picker-roots")).not.toBeInTheDocument();
+    expect(useHostFilesystemRootsMock).toHaveBeenCalledWith("old_host", false);
+  });
 });
 
-describe("WorkspacePicker default starting folder", () => {
-  it("opens each Host at its own pinned folder", () => {
+describe("WorkspacePicker pinned folder", () => {
+  it("opens the pinned shortcut without changing the selected working folder", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false }),
+    );
+    const onSelect = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/work/current"
+        defaultPath="/work/pinned"
+        onSelect={onSelect}
+      />,
+    );
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("host_1", "/work/current");
+    fireEvent.click(screen.getByTestId("workspace-picker-open-pinned"));
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("host_1", "/work/pinned");
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+  it("keeps pinned folders as shortcuts when the Host changes", () => {
     useHostFilesystemMock.mockReturnValue(
       result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
     );
@@ -413,13 +445,17 @@ describe("WorkspacePicker default starting folder", () => {
     const { rerender } = render(
       <WorkspacePicker hostId="mac_host" defaultPath="/Users/me/Projects" />,
     );
-    expect(useHostFilesystemMock).toHaveBeenCalledWith("mac_host", "/Users/me/Projects");
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("mac_host", "");
 
     rerender(<WorkspacePicker hostId="windows_host" defaultPath={"D:\\AIProgram\\Projects"} />);
-    expect(useHostFilesystemMock).toHaveBeenCalledWith("windows_host", "D:\\AIProgram\\Projects");
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("windows_host", "");
+    expect(screen.getByTestId("workspace-picker-open-pinned")).toHaveAttribute(
+      "aria-label",
+      "Open pinned folder: D:\\AIProgram\\Projects",
+    );
   });
 
-  it("pins the current Windows directory for future sessions", () => {
+  it("pins the current Windows directory for quick access", () => {
     const onDefaultPathChange = vi.fn();
     useHostFilesystemMock.mockReturnValue(
       result({
@@ -440,7 +476,7 @@ describe("WorkspacePicker default starting folder", () => {
     );
     expect(screen.getByTestId("workspace-picker-default")).toHaveAttribute(
       "aria-label",
-      "Use this folder as the default starting folder for Windows desktop",
+      "Pin this folder for quick access on Windows desktop. New sessions remember the last working folder.",
     );
     fireEvent.click(screen.getByTestId("workspace-picker-default"));
 

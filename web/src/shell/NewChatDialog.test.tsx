@@ -48,6 +48,7 @@ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { NEW_SESSION_TARGET_STORAGE_KEY } from "@/lib/newSessionTarget";
 import {
   connectArcaHost,
   controlHost,
@@ -362,7 +363,7 @@ describe("normalizeWorkspacePath", () => {
     ["/Users/me/repo/", "/Users/me/repo"],
     ["/Users/me/repo///", "/Users/me/repo"],
     // Surrounding whitespace (pasted paths) trimmed before comparison.
-    ["  /a/b  ", "/a/b"],
+    ["  /a/b  ", "/a/b  "],
     // Root is preserved, not collapsed away.
     ["/", "/"],
     ["///", "/"],
@@ -1698,7 +1699,7 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("prefers the Host default over the browser's recent path", async () => {
+  it("uses the last working folder even when the Host has a pinned folder", async () => {
     mockHosts([
       {
         ...host("online"),
@@ -1707,13 +1708,11 @@ describe("NewChatLandingScreen", () => {
     ]);
     renderLanding();
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
-        "Projects",
-      ),
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
   });
 
-  it("opens the footer CWD picker with the selected Host's default-folder control", async () => {
+  it("opens the footer CWD picker at the last working folder with a quick-access pin", async () => {
     mockHosts([
       {
         ...host("online"),
@@ -1723,15 +1722,13 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
-        "Projects",
-      ),
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
 
     expect(screen.getByTestId("workspace-picker-default")).toHaveAttribute(
       "aria-label",
-      "Clear default starting folder for machine-1",
+      "Pin this folder for quick access on machine-1. New sessions remember the last working folder.",
     );
   });
 
@@ -2721,6 +2718,10 @@ describe("NewChatLandingScreen", () => {
         resolveCreate = resolve;
       }),
     );
+    localStorage.setItem(
+      NEW_SESSION_TARGET_STORAGE_KEY,
+      JSON.stringify({ kind: "project", projectId: "p_old", projectName: "Old" }),
+    );
     renderLanding({ managed_sandboxes_enabled: true });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
@@ -2752,6 +2753,7 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     // The resolved create navigates without surfacing an error.
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
+    await waitFor(() => expect(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY)).toBeNull());
   });
 
   it("shows the default hero heading in the normal new-session flow (no project)", async () => {
@@ -2772,7 +2774,10 @@ describe("NewChatLandingScreen", () => {
         ok: true,
         json: async () => ({ object: "list", data: [{ id: "p_docs", name: "docs" }] }),
       } as Response)
-      .mockResolvedValue({ ok: true, json: async () => ({ id: "conv_new" }) } as Response);
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new", project_id: "p_docs" }),
+      } as Response);
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     // A `?project=` landing (e.g. via the sidebar's per-project pencil) names the
     // project in the hero heading rather than a tray chip.
@@ -2806,6 +2811,11 @@ describe("NewChatLandingScreen", () => {
       project_id: string;
     };
     expect(patchBody.project_id).toBe("p_docs");
+    expect(JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null")).toEqual({
+      kind: "project",
+      projectId: "p_docs",
+      projectName: "docs",
+    });
 
     // The target folder fetches its own paginated list (useProjectSessions),
     // so filing the new session must invalidate it — otherwise the row only

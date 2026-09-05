@@ -2199,7 +2199,7 @@ export function AppShell() {
               {conversationId && (
                 <MobilePanelDrawer
                   open={archivePanelOpen}
-                  title="Archive"
+                  title="Archived sessions"
                   onClose={() => setArchivePanelOpen(false)}
                   testId="archive-panel-drawer"
                 >

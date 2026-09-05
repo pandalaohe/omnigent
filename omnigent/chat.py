@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -229,6 +229,9 @@ class LocalServer:
     log_path: Path
     runner_id: str | None = None
     runner_proc: subprocess.Popen[bytes] | None = None
+    # The local CLI owns this token because it minted the sibling runner.
+    # Keep it in memory only and omit it from diagnostic representations.
+    runner_binding_token: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -3761,6 +3764,7 @@ def _start_local_server(
         log_path=log_path,
         runner_id=runner_id,
         runner_proc=runner.proc,
+        runner_binding_token=binding_token,
     )
 
 

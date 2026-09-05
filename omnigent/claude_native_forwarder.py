@@ -51,6 +51,7 @@ from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import sync_raw_status_context
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.model_metadata import concrete_reported_model
+from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 _FORWARDER_STATE_FILE = "transcript_forwarder.json"
@@ -923,7 +924,10 @@ async def forward_claude_transcript_to_session(
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        NativeSubagentSnapshotPublisher(client, observation_timeout_s=35.0) as snapshots,
+    ):
         while True:
             try:
                 async with asyncio.timeout(_FORWARD_LOOP_STALL_DEADLINE_S):
@@ -957,6 +961,7 @@ async def forward_claude_transcript_to_session(
                             new_session_id=rotation,
                             agent_name=agent_name,
                         )
+                        snapshots.update(session_id, {}, retired=True)
                         session_id = rotation
                         state = None
                         hook_state = None
@@ -993,6 +998,7 @@ async def forward_claude_transcript_to_session(
                         state=hook_state,
                     )
                     if rotation is not None:
+                        snapshots.update(session_id, {}, retired=True)
                         session_id = rotation
                         state = None
                         hook_state = None
@@ -1135,6 +1141,10 @@ async def forward_claude_transcript_to_session(
                             item_retry_tracker=subagent_item_retries,
                             status_retry_tracker=subagent_status_retries,
                         )
+                        snapshots.update(
+                            current_session_id,
+                            _native_subagent_snapshot(subagent_state),
+                        )
                         # Reconcile + POST cumulative cost AFTER sub-agents are
                         # forwarded so the estimate sees this poll's sub-agent
                         # transcript growth. This is what lets the parent's
@@ -1194,6 +1204,22 @@ async def forward_claude_transcript_to_session(
                     extra={"session_id": session_id},
                 )
             await asyncio.sleep(poll_interval_s)
+
+
+def _native_subagent_snapshot(state: SubagentForwardState) -> dict[str, str]:
+    """Inventory only: preserve historical uncertainty and structured outcomes."""
+    return {
+        entry.child_conversation_id: (
+            entry.terminal_status
+            or (
+                "activity_unverified"
+                if entry.activity_unverified
+                else entry.last_status or "activity_unverified"
+            )
+        )
+        for entry in state.subagents.values()
+        if entry.child_conversation_id
+    }
 
 
 def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
@@ -1689,13 +1715,14 @@ def _structured_terminal_evidence(
     """
     evidence: dict[str, tuple[str, str | None]] = {}
     for notification in result.task_notifications:
+        status = notification.status
         if (
             notification.tool_use_id is not None
-            and notification.status is not None
-            and notification.status in _SUBAGENT_TERMINAL_STATUSES
+            and isinstance(status, str)
+            and status in _SUBAGENT_TERMINAL_STATUSES
         ):
             evidence[notification.tool_use_id] = (
-                notification.status,
+                status,
                 notification.result,
             )
 
@@ -2088,10 +2115,11 @@ async def _forward_available_subagents(
         )
     pending_notifications = dict(updated.pending_terminal_notifications)
     for notification in () if parent_result is None else parent_result.task_notifications:
+        status = notification.status
         if (
             notification.tool_use_id is not None
-            and isinstance(notification.status, str)
-            and notification.status in _SUBAGENT_TERMINAL_STATUSES
+            and isinstance(status, str)
+            and status in _SUBAGENT_TERMINAL_STATUSES
         ):
             matching_entry = next(
                 (
@@ -2108,7 +2136,7 @@ async def _forward_available_subagents(
                 and matching_entry.parent_recovery_watermark >= parent_recovery
             )
             pending_notifications[notification.tool_use_id] = (
-                notification.status,
+                status,
                 notification.result,
                 notification.replayed or replayed_for_child,
             )

@@ -4,7 +4,15 @@ import { NodeSelection, Plugin, PluginKey, TextSelection } from "@tiptap/pm/stat
 import { Decoration, DecorationSet, type EditorView } from "@tiptap/pm/view";
 import { EditorContent, useEditor } from "@tiptap/react";
 import TiptapStarterKit from "@tiptap/starter-kit";
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, type RefObject } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type RefObject,
+} from "react";
 
 import {
   COMPOSER_ATTACHMENT_PLACEHOLDER,
@@ -322,6 +330,7 @@ interface InlineComposerEditorProps {
   onCompositionStart?: () => void;
   onCompositionEnd?: () => void;
   onKeyDown?: (event: KeyboardEvent, selection: { start: number; end: number }) => boolean;
+  onHeightChange?: () => void;
   ariaLabel: string;
   testId?: string;
   autoFocus?: boolean;
@@ -344,6 +353,7 @@ export const InlineComposerEditor = forwardRef<
     onCompositionStart,
     onCompositionEnd,
     onKeyDown,
+    onHeightChange,
     ariaLabel,
     testId,
     autoFocus = false,
@@ -361,11 +371,13 @@ export const InlineComposerEditor = forwardRef<
   const onFocusRef = useRef(onFocus);
   const onBlurRef = useRef(onBlur);
   const onKeyDownRef = useRef(onKeyDown);
+  const onHeightChangeRef = useRef(onHeightChange);
   onChangeRef.current = onChange;
   onRejectedFilesRef.current = onRejectedFiles;
   onFocusRef.current = onFocus;
   onBlurRef.current = onBlur;
   onKeyDownRef.current = onKeyDown;
+  onHeightChangeRef.current = onHeightChange;
 
   const register = (file: File): string => {
     const id = `composer-file-${nextIdRef.current++}`;
@@ -472,6 +484,22 @@ export const InlineComposerEditor = forwardRef<
   useEffect(() => {
     if (autoFocus) editor?.view.focus();
   }, [editor, autoFocus]);
+
+  // Report intrinsic contenteditable growth before paint so the transcript
+  // owner can preserve its existing bottom lock across browser engines.
+  useLayoutEffect(() => {
+    if (!editor || typeof ResizeObserver === "undefined") return;
+    const dom = editor.view.dom;
+    let height = dom.getBoundingClientRect().height;
+    const observer = new ResizeObserver(() => {
+      const nextHeight = dom.getBoundingClientRect().height;
+      if (nextHeight === height) return;
+      height = nextHeight;
+      onHeightChangeRef.current?.();
+    });
+    observer.observe(dom);
+    return () => observer.disconnect();
+  }, [editor]);
 
   // Keep the small textarea-compatible DOM surface the surrounding composer
   // hooks use for caret-aware dictation, mentions, and existing integrations.

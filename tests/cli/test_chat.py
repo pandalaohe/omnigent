@@ -456,7 +456,8 @@ def test_start_local_server_spawns_runner_as_sibling(
         env: dict[str, str],
         stdout: object,
         stderr: object,
-        start_new_session: bool,
+        start_new_session: bool = True,
+        **_spawn_kwargs: object,
     ) -> _Proc:
         """Record the server subprocess command."""
         assert start_new_session is True
@@ -513,6 +514,8 @@ def test_start_local_server_spawns_runner_as_sibling(
         == server_popen_calls[0].env["OMNIGENT_RUNNER_TUNNEL_TOKEN"]
     )
     assert runner_calls[0]["isolate_session"] is True
+    assert server.runner_binding_token == runner_calls[0]["tunnel_token"]
+    assert server.runner_binding_token not in repr(server)
 
     # LocalServer exposes both runner_id and runner_proc.
     assert server.runner_id is not None

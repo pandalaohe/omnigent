@@ -14,7 +14,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
@@ -80,6 +80,7 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.custom_agents import create_custom_agents_router
@@ -108,11 +109,13 @@ from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.schemas import (
+    CurrentUserResponse,
     UserPreferenceNamespace,
     UserPreferenceNamespacePatchRequest,
     UserPreferencesEnvelope,
 )
 from omnigent.server.user_preferences_store import (
+    USER_PREFERENCE_NAMESPACES,
     USER_PREFERENCES_MAX_BYTES,
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
@@ -2544,7 +2547,11 @@ def create_app(
             headers={"X-Content-Type-Options": "nosniff"},
         )
 
-    @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
+    @app.get(
+        "/v1/me",
+        response_model=CurrentUserResponse,
+        response_model_exclude_unset=True,
+    )
     async def me(request: Request, http_response: Response) -> dict[str, Any] | JSONResponse:
         """Return the current user's identity.
 
@@ -2603,9 +2610,8 @@ def create_app(
             "user_id": user_id,
             "is_admin": is_admin,
         }
-        # Keep create_app consumers that have not adopted the store byte-for-byte
-        # compatible. The normal CLI always wires the store, where ``null`` is
-        # the explicit first-device migration signal for the web client.
+        # Preserve the response contract for create_app consumers that have not
+        # adopted preferences persistence.
         if user_preferences_store is not None:
             response["preferences"] = preferences
         return response
@@ -2618,25 +2624,17 @@ def create_app(
             )
         return user_preferences_store
 
-    async def _preferences_owner(request: Request) -> tuple[str, bool]:
+    def _preferences_owner(request: Request) -> tuple[str, bool]:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         from omnigent.server.auth import UnifiedAuthProvider
 
         accounts_mode = (
             isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
         )
-        if accounts_mode:
-            account = (
-                None
-                if account_store is None
-                else await asyncio.to_thread(account_store.get_user, owner)
-            )
-            if account is None:
-                raise StarletteHTTPException(status_code=401, detail="Account no longer exists")
-            # A deleted account must not be recreated between the existence
-            # check and the write by a still-valid cookie.
-            return owner, False
-        return owner, True
+        # Accounts are created only by the account lifecycle. The store checks
+        # the user row inside its write transaction, so a stale cookie cannot
+        # recreate an account deleted concurrently with this request.
+        return owner, not accounts_mode
 
     _preferences_http_max_bytes = USER_PREFERENCES_MAX_BYTES + 4096
 
@@ -2668,8 +2666,39 @@ def create_app(
             ) from exc
 
     _preference_write_hits: dict[str, list[float]] = {}
+    _preference_last_rate_cleanup = 0.0
+
+    _preferences_envelope_request_schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["version", "settings"],
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "settings": {
+                "type": "object",
+                "propertyNames": {"enum": sorted(USER_PREFERENCE_NAMESPACES)},
+                "additionalProperties": {},
+            },
+        },
+    }
+    _preferences_patch_request_schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["value"],
+        "properties": {"value": {}},
+    }
+    _preferences_error_responses: dict[int | str, dict[str, Any]] = {
+        400: {"description": "Invalid Content-Length header"},
+        401: {"description": "Authentication required or account deleted"},
+        413: {"description": "Request body exceeds the preferences limit"},
+        415: {"description": "Request body is not application/json"},
+        422: {"description": "Invalid preferences payload or namespace"},
+        429: {"description": "Per-user write rate exceeded"},
+        503: {"description": "Preferences persistence is unavailable"},
+    }
 
     def _check_preference_write_rate(owner: str) -> None:
+        nonlocal _preference_last_rate_cleanup
         now = time.monotonic()
         cutoff = now - 60.0
         hits = [hit for hit in _preference_write_hits.get(owner, ()) if hit > cutoff]
@@ -2681,27 +2710,44 @@ def create_app(
                 headers={"Retry-After": "60"},
             )
         if owner not in _preference_write_hits and len(_preference_write_hits) >= 10_000:
-            for key in list(_preference_write_hits):
-                live = [hit for hit in _preference_write_hits[key] if hit > cutoff]
-                if live:
-                    _preference_write_hits[key] = live
-                else:
+            # Throttle the full-map cleanup so rotating new identities cannot
+            # turn a bounded-memory guard into repeated O(n) work.
+            if now - _preference_last_rate_cleanup >= 1.0:
+                _preference_last_rate_cleanup = now
+                expired = [
+                    key
+                    for key, key_hits in _preference_write_hits.items()
+                    if not key_hits or key_hits[-1] <= cutoff
+                ]
+                for key in expired:
                     _preference_write_hits.pop(key, None)
             if len(_preference_write_hits) >= 10_000:
-                return
+                raise StarletteHTTPException(
+                    status_code=429,
+                    detail="Too many preference updates",
+                    headers={"Retry-After": "60"},
+                )
         hits.append(now)
         _preference_write_hits[owner] = hits
 
     @app.put(
         "/v1/me/preferences",
         response_model=UserPreferencesEnvelope,
+        dependencies=[Depends(require_json_content_type)],
+        responses=_preferences_error_responses,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": _preferences_envelope_request_schema}},
+            }
+        },
     )
     async def initialize_user_preferences(
         request: Request,
     ) -> UserPreferencesEnvelope:
         """Initialize the caller's full preference envelope exactly once."""
         store = _preferences_store()
-        owner, create_if_missing = await _preferences_owner(request)
+        owner, create_if_missing = _preferences_owner(request)
         _check_preference_write_rate(owner)
         body = await _read_preferences_body(request, UserPreferencesEnvelope)
         assert isinstance(body, UserPreferencesEnvelope)
@@ -2724,6 +2770,14 @@ def create_app(
     @app.patch(
         "/v1/me/preferences/{namespace}",
         response_model=UserPreferencesEnvelope,
+        dependencies=[Depends(require_json_content_type)],
+        responses=_preferences_error_responses,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": _preferences_patch_request_schema}},
+            }
+        },
     )
     async def patch_user_preferences_namespace(
         namespace: UserPreferenceNamespace,
@@ -2731,7 +2785,7 @@ def create_app(
     ) -> UserPreferencesEnvelope:
         """Atomically merge or remove one namespace for the current user."""
         store = _preferences_store()
-        owner, create_if_missing = await _preferences_owner(request)
+        owner, create_if_missing = _preferences_owner(request)
         _check_preference_write_rate(owner)
         body = await _read_preferences_body(request, UserPreferenceNamespacePatchRequest)
         assert isinstance(body, UserPreferenceNamespacePatchRequest)

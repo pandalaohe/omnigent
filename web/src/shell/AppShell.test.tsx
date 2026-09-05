@@ -3346,6 +3346,35 @@ describe("Mobile session menu", () => {
     return trigger;
   }
 
+  it("opens archived sessions as a full-screen drawer from the mobile menu", () => {
+    const realMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as typeof window.matchMedia;
+    try {
+      mockConversations([{ id: "conv_abc", permission_level: null }]);
+      renderShell("/c/conv_abc");
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Session actions" }), {
+        button: 0,
+      });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Archived sessions" }));
+      const drawer = screen.getByTestId("archive-panel-drawer");
+      expect(drawer).toHaveAttribute("data-state", "open");
+      expect(drawer).toHaveClass("mobile-panel-drawer");
+      expect(within(drawer).getByText("Archived sessions")).toBeInTheDocument();
+      expect(within(drawer).getByTestId("archive-library-rail")).toBeInTheDocument();
+    } finally {
+      window.matchMedia = realMatchMedia;
+    }
+  });
+
   it("lists the native session's menu entries (Terminals folds into the pill)", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },

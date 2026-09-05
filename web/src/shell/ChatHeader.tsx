@@ -284,7 +284,7 @@ export function ChatHeader({
           className="gap-2.5 px-2.5 py-2 text-ui"
         >
           <ArchiveIcon className="size-4" />
-          Archive Library
+          Archived sessions
         </DropdownMenuItem>
         {showFilesPanel && (
           <DropdownMenuItem

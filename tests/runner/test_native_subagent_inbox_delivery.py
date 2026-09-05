@@ -600,6 +600,38 @@ async def test_runner_restart_recovers_text_less_final_turn_as_no_output(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        {"type": "message", "role": "user", "content": []},
+        {"type": "function_call", "name": "shell", "call_id": "call_next"},
+        {"type": "function_call_output", "call_id": "call_next", "output": "done"},
+    ],
+    ids=["user-message", "tool-call", "tool-result"],
+)
+async def test_runner_restart_does_not_reuse_assistant_text_before_latest_turn_boundary(
+    _clean_subagent_registry: None,
+    boundary: dict[str, Any],
+) -> None:
+    """A newer user/tool item keeps recovery from delivering an old answer."""
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    child_items = [
+        {"type": "message", "role": "user", "content": [], "is_meta": True},
+        boundary,
+        _CHILD_RESULT_ITEM,
+    ]
+    app = create_runner_app(
+        server_client=_RecoveryServerClient([_child_summary()], child_items=child_items),  # type: ignore[arg-type]
+    )
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["status"] == "completed"
+    assert payload["output"] == "[System: sub-agent completed with no output]"
+
+
+@pytest.mark.asyncio
 async def test_runner_restart_recovers_failed_child_error(
     _clean_subagent_registry: None,
 ) -> None:

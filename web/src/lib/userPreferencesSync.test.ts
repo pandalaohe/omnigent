@@ -20,7 +20,35 @@ describe("user preference synchronization", () => {
     const fetcher = vi.fn();
     await initializeUserPreferencesSync(undefined, fetcher);
     expect(localStorage.getItem("omnigent:context-indicator-mode")).toBe("compact");
+    expect(localStorage.getItem("omnigent:user-preferences-owner")).toBe("__default__:__local__");
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("does not seed a new Server from an older Server's local preferences", async () => {
+    localStorage.setItem("omnigent:context-indicator-mode", "compact");
+    await initializeUserPreferencesSync(undefined, vi.fn(), "alice", "server-a");
+    const serverB = vi.fn().mockResolvedValue(Response.json({ version: 1, settings: {} }));
+
+    await initializeUserPreferencesSync(null, serverB, "alice", "server-b");
+
+    expect(serverB).toHaveBeenCalledWith(
+      "/v1/me/preferences",
+      expect.objectContaining({ body: JSON.stringify({ version: 1, settings: {} }) }),
+    );
+    expect(localStorage.getItem("omnigent:context-indicator-mode")).toBeNull();
+    expect(localStorage.getItem("omnigent:user-preferences-owner")).toBe("server-b:alice");
+  });
+
+  it("downgrades an unrecognized preferences envelope to device-only behavior", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn();
+    await initializeUserPreferencesSync({ version: 2, settings: {} }, fetcher, "alice", "server-a");
+
+    queueUserPreferencePatch("context_indicator", "compact");
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(localStorage.getItem("omnigent:user-preferences-owner")).toBe("server-a:alice");
   });
 
   it("collects and hydrates the Agent badge namespace", async () => {
@@ -77,11 +105,11 @@ describe("user preference synchronization", () => {
         body: JSON.stringify(collectLocalUserPreferences()),
       }),
     );
-    expect(localStorage.getItem("omnigent:user-preferences-owner")).toBe("alice");
+    expect(localStorage.getItem("omnigent:user-preferences-owner")).toBe("__default__:alice");
   });
 
   it("does not seed a new account from another user's local cache", async () => {
-    localStorage.setItem("omnigent:user-preferences-owner", "alice");
+    localStorage.setItem("omnigent:user-preferences-owner", "__default__:alice");
     localStorage.setItem("omnigent:context-indicator-mode", "compact");
     const fetcher = vi.fn().mockResolvedValue(Response.json({ version: 1, settings: {} }));
     await initializeUserPreferencesSync(null, fetcher, "bob");
@@ -92,7 +120,24 @@ describe("user preference synchronization", () => {
       }),
     );
     expect(localStorage.getItem("omnigent:context-indicator-mode")).toBeNull();
-    expect(localStorage.getItem("omnigent:user-preferences-owner")).toBe("bob");
+    expect(localStorage.getItem("omnigent:user-preferences-owner")).toBe("__default__:bob");
+  });
+
+  it("clears another scope's local values even when initialization fails", async () => {
+    localStorage.setItem("omnigent:user-preferences-owner", "server-a:alice");
+    localStorage.setItem("omnigent:context-indicator-mode", "compact");
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 503 }));
+
+    await initializeUserPreferencesSync(null, fetcher, "alice", "server-b");
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "/v1/me/preferences",
+      expect.objectContaining({
+        body: JSON.stringify({ version: 1, settings: {} }),
+      }),
+    );
+    expect(localStorage.getItem("omnigent:context-indicator-mode")).toBeNull();
+    expect(localStorage.getItem("omnigent:user-preferences-owner")).toBe("server-b:alice");
   });
 
   it("hydrates the persisted winner after a racing first-device initialization", async () => {
@@ -149,6 +194,59 @@ describe("user preference synchronization", () => {
     });
   });
 
+  it("ignores device-only assistant placement received from the Server", async () => {
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: {
+          mobile_assistant: {
+            version: 2,
+            enabled: true,
+            buttons: [],
+            dock: { edge: "left", offset: 0.25 },
+            position: { x: 0.1, y: 0.2 },
+          },
+        },
+      },
+      vi.fn(),
+    );
+
+    expect(JSON.parse(localStorage.getItem("omnigent:mobile-assistant-preferences")!)).toEqual({
+      version: 2,
+      enabled: true,
+      buttons: [],
+    });
+    expect(localStorage.getItem("omnigent:mobile-assistant-device-state")).toBeNull();
+  });
+
+  it("keeps the latest local assistant placement across later hydration", async () => {
+    localStorage.setItem(
+      "omnigent:mobile-assistant-preferences",
+      JSON.stringify({ version: 2, enabled: true, buttons: [], position: { x: 0.2, y: 0.8 } }),
+    );
+    const serverEnvelope = {
+      version: 1 as const,
+      settings: { mobile_assistant: { version: 2, enabled: false, buttons: [] } },
+    };
+    await initializeUserPreferencesSync(serverEnvelope, vi.fn(), "alice");
+    localStorage.setItem(
+      "omnigent:mobile-assistant-preferences",
+      JSON.stringify({ version: 2, enabled: false, buttons: [], position: { x: 0.6, y: 0.4 } }),
+    );
+
+    await initializeUserPreferencesSync(serverEnvelope, vi.fn(), "alice");
+
+    expect(JSON.parse(localStorage.getItem("omnigent:mobile-assistant-preferences")!)).toEqual({
+      version: 2,
+      enabled: false,
+      buttons: [],
+      position: { x: 0.6, y: 0.4 },
+    });
+    expect(JSON.parse(localStorage.getItem("omnigent:mobile-assistant-device-state")!)).toEqual({
+      position: { x: 0.6, y: 0.4 },
+    });
+  });
+
   it("debounces independent namespace patches", async () => {
     vi.useFakeTimers();
     const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
@@ -164,6 +262,46 @@ describe("user preference synchronization", () => {
         body: JSON.stringify({ value: { version: 1, showCodexRateLimits: true } }),
       }),
     );
+  });
+
+  it("serializes overlapping patches so the latest value is persisted last", async () => {
+    vi.useFakeTimers();
+    let resolveFirst!: (response: Response) => void;
+    let resolveSecond!: (response: Response) => void;
+    const fetcher = vi
+      .fn()
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveFirst = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveSecond = resolve;
+        }),
+      );
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    localStorage.setItem("omnigent:context-indicator-mode", "compact");
+    queueUserPreferencePatch("context_indicator", "compact");
+    await vi.advanceTimersByTimeAsync(251);
+
+    localStorage.removeItem("omnigent:context-indicator-mode");
+    queueUserPreferencePatch("context_indicator", null);
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    resolveFirst(new Response(null, { status: 200 }));
+    await vi.runOnlyPendingTimersAsync();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.map((call) => (call[1] as RequestInit).body)).toEqual([
+      JSON.stringify({ value: "compact" }),
+      JSON.stringify({ value: null }),
+    ]);
+    expect(localStorage.getItem("omnigent:user-preferences-dirty")).not.toBeNull();
+
+    resolveSecond(new Response(null, { status: 200 }));
+    await Promise.resolve();
+    expect(localStorage.getItem("omnigent:user-preferences-dirty")).toBeNull();
   });
 
   it("retries an unacknowledged patch and clears its durable dirty marker", async () => {

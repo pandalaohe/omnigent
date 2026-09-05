@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 import tarfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -11,9 +12,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+import omnigent.runtime.agent_cache as agent_cache_module
 from omnigent.errors import OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 # Minimal valid config.yaml for a spec_version=1 agent
@@ -146,6 +147,38 @@ def test_concurrent_cache_miss_extracts_once(
 
     assert extract_calls == 1
     assert first_loaded.spec is second_loaded.spec
+
+
+def test_failed_cache_miss_does_not_leave_partial_workdir(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed extraction is cleaned before a later load retries."""
+    loc = "agent-partial/abc123"
+    _store_bundle(artifact_store, loc)
+    original_load_spec = agent_cache_module.load_spec
+    failed_once = False
+
+    def fail_first_load(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal failed_once
+        dest = kwargs.get("dest")
+        if not failed_once and isinstance(dest, Path):
+            failed_once = True
+            dest.mkdir(parents=True)
+            (dest / "config.yaml").write_text("partial")
+            raise ValueError("injected extraction failure")
+        return original_load_spec(*args, **kwargs)
+
+    monkeypatch.setattr("omnigent.runtime.agent_cache.load_spec", fail_first_load)
+
+    with pytest.raises(ValueError, match="injected extraction failure"):
+        agent_cache.load("agent-partial", loc)
+
+    workdir = agent_cache._cache_dir / "agent-partial"
+    assert not workdir.exists()
+    assert not list(workdir.parent.glob(".agent-partial-staging-*"))
+    assert agent_cache.load("agent-partial", loc).workdir.is_dir()
 
 
 def test_load_disk_cache_hit(
@@ -399,52 +432,151 @@ def test_replace_swaps_spec(
     assert loaded_again.spec is loaded_v2.spec
 
 
-def test_concurrent_load_waits_for_replace_disk_swap(
+def test_load_waits_for_replace_disk_swap(
     agent_cache: AgentCache,
     artifact_store: LocalArtifactStore,
-    cache_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cache hit cannot pair the new spec with the old workdir."""
+    """A memory hit cannot return while replace() is swapping its workdir."""
     loc_v1 = "agent-replace-race/v1"
     _store_bundle(artifact_store, loc_v1)
     agent_cache.load("agent-replace-race", loc_v1)
+
+    other_agent_id = "agent-unrelated"
+    other_loc = f"{other_agent_id}/v1"
+    _store_bundle(artifact_store, other_loc)
+    agent_cache.load(other_agent_id, other_loc)
 
     new_config = yaml.dump(
         {
             "spec_version": 1,
             "name": "test-agent",
-            "description": "replacement",
+            "description": "updated agent",
             "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
         }
     )
     new_bytes = _make_bundle_bytes({"config.yaml": new_config})
-    rename_started = threading.Event()
-    release_rename = threading.Event()
+
+    disk_swap_started = threading.Event()
+    release_disk_swap = threading.Event()
+    load_started = threading.Event()
+    load_finished = threading.Event()
     original_rename = Path.rename
 
-    def blocked_rename(path: Path, target: Path) -> Path:
-        if path == cache_dir / "agent-replace-race_staging":
-            rename_started.set()
-            assert release_rename.wait(timeout=5)
-        return original_rename(path, target)
+    def blocked_rename(source: Path, target: Path) -> Path:
+        if "-staging-" in source.name:
+            disk_swap_started.set()
+            assert release_disk_swap.wait(timeout=5)
+        return original_rename(source, target)
+
+    def load_during_replace():  # type: ignore[no-untyped-def]
+        load_started.set()
+        loaded = agent_cache.load("agent-replace-race", "agent-replace-race/v2")
+        load_finished.set()
+        return loaded
 
     monkeypatch.setattr(Path, "rename", blocked_rename)
-    with ThreadPoolExecutor(max_workers=2) as executor:
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
         replacing = executor.submit(
             agent_cache.replace,
             "agent-replace-race",
             "agent-replace-race/v2",
             new_bytes,
         )
-        assert rename_started.wait(timeout=5)
-        loading = executor.submit(agent_cache.load, "agent-replace-race", loc_v1)
-        assert not loading.done(), "load must wait until the disk swap is complete"
-        release_rename.set()
+        assert disk_swap_started.wait(timeout=5)
+        loading = executor.submit(load_during_replace)
+        assert load_started.wait(timeout=5)
+        assert not load_finished.wait(timeout=0.1)
+
+        unrelated = executor.submit(agent_cache.load, other_agent_id, other_loc)
+        assert unrelated.result(timeout=1).spec.name == "test-agent"
+        release_disk_swap.set()
+
         replaced = replacing.result(timeout=5)
         loaded = loading.result(timeout=5)
 
-    assert replaced.spec.description == "replacement"
     assert loaded.spec is replaced.spec
-    assert loaded.workdir == cache_dir / "agent-replace-race"
-    assert load_spec(loaded.workdir).description == "replacement"
+    assert loaded.workdir.is_dir()
+    assert agent_cache._mutation_locks == {}
+
+
+def test_replace_failure_restores_previous_cache(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed staging rename preserves both the old spec and workdir."""
+    loc_v1 = "agent-replace-failure/v1"
+    _store_bundle(artifact_store, loc_v1)
+    loaded_v1 = agent_cache.load("agent-replace-failure", loc_v1)
+
+    new_config = yaml.dump(
+        {
+            "spec_version": 1,
+            "name": "replacement-agent",
+            "description": "must not be published",
+            "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        }
+    )
+    original_rename = Path.rename
+
+    def fail_staging_rename(source: Path, target: Path) -> Path:
+        if "-staging-" in source.name:
+            raise OSError("injected staging rename failure")
+        return original_rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", fail_staging_rename)
+
+    with pytest.raises(OSError, match="injected staging rename failure"):
+        agent_cache.replace(
+            "agent-replace-failure",
+            "agent-replace-failure/v2",
+            _make_bundle_bytes({"config.yaml": new_config}),
+        )
+
+    loaded_after_failure = agent_cache.load("agent-replace-failure", loc_v1)
+    assert loaded_after_failure.spec is loaded_v1.spec
+    assert loaded_after_failure.workdir.is_dir()
+    assert not list(loaded_after_failure.workdir.parent.glob(".agent-replace-failure-*-*"))
+    assert agent_cache._mutation_locks == {}
+
+
+def test_load_waits_for_concurrent_evict(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reload cannot inspect an agent while eviction removes its workdir."""
+    loc = "agent-evict-race/v1"
+    _store_bundle(artifact_store, loc)
+    agent_cache.load("agent-evict-race", loc)
+
+    evict_started = threading.Event()
+    release_evict = threading.Event()
+    load_finished = threading.Event()
+    original_rmtree = shutil.rmtree
+
+    def blocked_rmtree(path: str | Path, *args: object, **kwargs: object) -> None:
+        evict_started.set()
+        assert release_evict.wait(timeout=5)
+        original_rmtree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("omnigent.runtime.agent_cache.shutil.rmtree", blocked_rmtree)
+
+    def reload_after_evict():  # type: ignore[no-untyped-def]
+        loaded = agent_cache.load("agent-evict-race", loc)
+        load_finished.set()
+        return loaded
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        evicting = executor.submit(agent_cache.evict, "agent-evict-race")
+        assert evict_started.wait(timeout=5)
+        loading = executor.submit(reload_after_evict)
+        assert not load_finished.wait(timeout=0.1)
+        release_evict.set()
+        evicting.result(timeout=5)
+        loaded = loading.result(timeout=5)
+
+    assert loaded.workdir.is_dir()
+    assert agent_cache._mutation_locks == {}

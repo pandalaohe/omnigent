@@ -79,7 +79,7 @@ def test_normalize_supports_legacy_single_bucket_and_omits_missing_month() -> No
     assert len(snapshot["limits"][0]["windows"]) == 2
 
 
-@pytest.mark.parametrize("used_percent", [-1, 101, True, "5"])
+@pytest.mark.parametrize("used_percent", [-1, 101, True, "5", float("nan"), 10**400])
 def test_normalize_rejects_invalid_percentages(used_percent: object) -> None:
     assert (
         normalize_codex_rate_limits_response(
@@ -113,6 +113,28 @@ def test_wire_validator_rejects_extra_or_malformed_values() -> None:
                             {
                                 "kind": "primary",
                                 "used_percent": 500,
+                                "window_duration_mins": 300,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize("kind", [[], {}, None, True])
+def test_wire_validator_rejects_non_string_window_kind(kind: object) -> None:
+    with pytest.raises(ValueError, match="window kind"):
+        validate_codex_rate_limits_snapshot(
+            {
+                "captured_at": 1,
+                "limits": [
+                    {
+                        "limit_id": "codex",
+                        "windows": [
+                            {
+                                "kind": kind,
+                                "used_percent": 5,
                                 "window_duration_mins": 300,
                             }
                         ],

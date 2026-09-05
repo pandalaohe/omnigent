@@ -30,6 +30,8 @@ export interface Host {
   gateway_inference?: Record<string, boolean> | null;
   /** Host-native directory opened first for new sessions on this machine. */
   default_workspace?: string | null;
+  /** Whether the connected Host can enumerate platform filesystem roots. */
+  filesystem_roots?: boolean;
 }
 
 export interface CodexRateLimitWindow {

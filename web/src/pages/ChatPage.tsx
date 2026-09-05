@@ -1648,6 +1648,29 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // shrink in this same task — otherwise the pin reads a stale scrollHeight
   // and the browser paints the spacer's later RO settle as a visible shift.
   const spacerMeasureRef = useRef<(() => void) | null>(null);
+  const pinnedToBottomRef = useRef(false);
+  useEffect(() => {
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const update = () => {
+      pinnedToBottomRef.current =
+        scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 1;
+    };
+    update();
+    scrollEl.addEventListener("scroll", update, { passive: true });
+    return () => scrollEl.removeEventListener("scroll", update);
+  }, [scroller]);
+
+  const pinScrollOnComposerGrowth = useCallback(() => {
+    spacerMeasureRef.current?.();
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const lockState = scroller?.state;
+    if (!lockState?.isAtBottom || lockState.escapedFromLock) return;
+    // Do not pull a reader who intentionally scrolled away back to the bottom.
+    if (!pinnedToBottomRef.current) return;
+    scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
+  }, [scroller]);
   // Persistent terminal surfaces for terminal-first sessions. Each is
   // mounted from the moment its terminal is reachable — not just when the
   // view is open — and kept mounted as a visibility-toggled overlay, so
@@ -1794,6 +1817,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
+            onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
           />
 
           {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
@@ -1958,6 +1982,8 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
+  /** Preserve a locked transcript before composer growth shrinks its viewport. */
+  onViewportShrinkPinScroll?: () => void;
 }
 
 /**
@@ -2640,6 +2666,7 @@ function ComposerImpl({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
+  onViewportShrinkPinScroll,
 }: ComposerProps) {
   const [composerParts, setComposerParts] = useState<ComposerDraftPart[]>([]);
   const composerPartsRef = useRef(composerParts);
@@ -3603,6 +3630,7 @@ function ComposerImpl({
         <InlineComposerEditor
           ref={inlineEditorRef}
           initialParts={composerParts}
+          onHeightChange={onViewportShrinkPinScroll}
           onChange={(nextParts) => {
             composerPartsRef.current = nextParts;
             setComposerParts(nextParts);
