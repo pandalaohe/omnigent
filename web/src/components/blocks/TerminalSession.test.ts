@@ -12,6 +12,7 @@ import {
   terminalSoftKeyPayload,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
+  TOUCH_DRAG_THRESHOLD_PX,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
   decodeTerminalClipboardBase64,
@@ -23,6 +24,7 @@ import {
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
+  touchDragPayload,
   type ConnectionState,
   wheelReportPayload,
   type WheelMouseState,
@@ -429,6 +431,94 @@ describe("wheelReportPayload", () => {
   });
 });
 
+describe("touchDragPayload", () => {
+  const screen: WheelScreenMetrics = {
+    left: 0,
+    top: 0,
+    cellWidth: 8,
+    cellHeight: 16,
+    cols: 80,
+    rows: 24,
+  };
+  const tracked: WheelMouseState = { mouseTrackingMode: "vt200", sgrEncoding: true };
+
+  function movement(over: Partial<Parameters<typeof touchDragPayload>[0]> = {}) {
+    return {
+      totalX: 0,
+      totalY: TOUCH_DRAG_THRESHOLD_PX + 1,
+      deltaY: -16,
+      clientX: 100,
+      clientY: 100,
+      ...over,
+    };
+  }
+
+  it("waits for a deliberate drag before claiming the gesture", () => {
+    expect(
+      touchDragPayload(
+        movement({ totalY: TOUCH_DRAG_THRESHOLD_PX - 1, deltaY: -7 }),
+        "pending",
+        tracked,
+        screen,
+        0,
+      ),
+    ).toEqual({ axis: "pending", consume: false, data: "", scrollLines: 0, partial: 0 });
+  });
+
+  it("keeps a horizontal drag available to browser navigation", () => {
+    expect(
+      touchDragPayload(movement({ totalX: 30, totalY: 5 }), "pending", tracked, screen, 0.5),
+    ).toEqual({ axis: "horizontal", consume: false, data: "", scrollLines: 0, partial: 0 });
+  });
+
+  it("turns a downward finger drag into TUI wheel-up reports", () => {
+    const result = touchDragPayload(
+      movement({ totalY: 32, deltaY: -32 }),
+      "pending",
+      tracked,
+      screen,
+      0,
+    );
+
+    expect(result.axis).toBe("vertical");
+    expect(result.consume).toBe(true);
+    expect(result.data).toBe("\x1b[<64;13;7M\x1b[<64;13;7M");
+    expect(result.scrollLines).toBe(0);
+  });
+
+  it("scrolls xterm history locally when the foreground program is not tracking the mouse", () => {
+    const result = touchDragPayload(
+      movement({ totalY: 24, deltaY: -24 }),
+      "pending",
+      { mouseTrackingMode: "none", sgrEncoding: false },
+      screen,
+      0,
+    );
+
+    expect(result).toEqual({
+      axis: "vertical",
+      consume: true,
+      data: "",
+      scrollLines: -1,
+      partial: -0.5,
+    });
+  });
+
+  it("does not send SGR bytes to a program using an incompatible mouse encoding", () => {
+    const result = touchDragPayload(
+      movement(),
+      "pending",
+      { mouseTrackingMode: "drag", sgrEncoding: false },
+      screen,
+      0,
+    );
+
+    expect(result.consume).toBe(false);
+    expect(result.data).toBe("");
+    expect(result.scrollLines).toBe(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // TerminalSession class — wired up against a fake WebSocket + ResizeObserver.
 // The real xterm Terminal runs (it already does in jsdom for loadWebglRenderer
@@ -527,6 +617,36 @@ describe("TerminalSession", () => {
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
 
+  function testTouch(identifier: number, clientX: number, clientY: number): Touch {
+    return { identifier, clientX, clientY } as Touch;
+  }
+
+  function testTouchList(touches: Touch[]): TouchList {
+    const list = {
+      length: touches.length,
+      item: (index: number) => touches[index] ?? null,
+    } as TouchList & Record<number, Touch>;
+    touches.forEach((touch, index) => {
+      list[index] = touch;
+    });
+    return list;
+  }
+
+  function dispatchTouch(
+    target: Element,
+    type: "touchstart" | "touchmove" | "touchend" | "touchcancel",
+    touches: Touch[],
+    changedTouches = touches,
+  ): Event {
+    const event = new Event(type, { bubbles: true, cancelable: true });
+    Object.defineProperties(event, {
+      touches: { value: testTouchList(touches) },
+      changedTouches: { value: testTouchList(changedTouches) },
+    });
+    target.dispatchEvent(event);
+    return event;
+  }
+
   it("reports 'connected' and sends an initial resize on socket open", () => {
     // WHY: the open handler must push a resize frame before the user sees the
     // default 80x24, then surface kind:"connected" to React. readyState is
@@ -554,6 +674,89 @@ describe("TerminalSession", () => {
     expect(onInput).toHaveBeenCalledOnce();
     expect(socket.sent).toHaveLength(1);
     expect(new TextDecoder().decode(socket.sent[0] as Uint8Array)).toBe("\u001b[A");
+    session.dispose();
+  });
+
+  it("turns a vertical finger drag into local xterm scrollback", () => {
+    const { session, container } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const screen = {
+      left: 0,
+      top: 0,
+      cellWidth: 8,
+      cellHeight: 16,
+      cols: 80,
+      rows: 24,
+    };
+    vi.spyOn(
+      session as unknown as { screenMetrics: () => WheelScreenMetrics | null },
+      "screenMetrics",
+    ).mockReturnValue(screen);
+    const scrollSpy = vi.spyOn(term, "scrollLines");
+
+    expect(term.element?.style.touchAction).toBe("pan-x pinch-zoom");
+    dispatchTouch(container, "touchstart", [testTouch(1, 100, 100)]);
+    const move = dispatchTouch(container, "touchmove", [testTouch(1, 102, 132)]);
+
+    expect(move.defaultPrevented).toBe(true);
+    expect(scrollSpy).toHaveBeenCalledWith(-2);
+    session.dispose();
+  });
+
+  it("sends a tracked TUI finger drag through xterm's websocket input path", async () => {
+    const onInput = vi.fn();
+    const { session, container, socket } = makeSession(undefined, onInput);
+    const term = (session as unknown as { term: Terminal }).term;
+    vi.spyOn(
+      session as unknown as { screenMetrics: () => WheelScreenMetrics | null },
+      "screenMetrics",
+    ).mockReturnValue({
+      left: 0,
+      top: 0,
+      cellWidth: 8,
+      cellHeight: 16,
+      cols: 80,
+      rows: 24,
+    });
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?1002h\x1b[?1006h", resolve);
+    });
+    socket.open();
+    socket.sent = [];
+
+    dispatchTouch(container, "touchstart", [testTouch(4, 100, 100)]);
+    const move = dispatchTouch(container, "touchmove", [testTouch(4, 100, 132)]);
+
+    expect(move.defaultPrevented).toBe(true);
+    expect(onInput).toHaveBeenCalledOnce();
+    expect(socket.sent).toHaveLength(1);
+    expect(new TextDecoder().decode(socket.sent[0] as Uint8Array)).toBe(
+      "\x1b[<64;13;9M\x1b[<64;13;9M",
+    );
+    session.dispose();
+  });
+
+  it("leaves a horizontal finger drag unclaimed", () => {
+    const { session, container } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    vi.spyOn(
+      session as unknown as { screenMetrics: () => WheelScreenMetrics | null },
+      "screenMetrics",
+    ).mockReturnValue({
+      left: 0,
+      top: 0,
+      cellWidth: 8,
+      cellHeight: 16,
+      cols: 80,
+      rows: 24,
+    });
+    const scrollSpy = vi.spyOn(term, "scrollLines");
+
+    dispatchTouch(container, "touchstart", [testTouch(2, 100, 100)]);
+    const move = dispatchTouch(container, "touchmove", [testTouch(2, 132, 104)]);
+
+    expect(move.defaultPrevented).toBe(false);
+    expect(scrollSpy).not.toHaveBeenCalled();
     session.dispose();
   });
 

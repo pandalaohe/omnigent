@@ -111,6 +111,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _logger,
     _managed_launch_tasks,
     _session_todos_cache,
@@ -1342,6 +1343,17 @@ def register_core_routes(
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
+        child_rows = (
+            await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
+            if all_child_ids
+            else {}
+        )
+        activity_unverified_child_ids = {
+            child_id
+            for child_id, child in child_rows.items()
+            if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+        }
         items: list[SessionListItem] = [
             _build_session_list_item(
                 conv,
@@ -1353,6 +1365,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                activity_unverified_child_ids=activity_unverified_child_ids,
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -1472,6 +1485,17 @@ def register_core_routes(
             _comments_fingerprints_for(conv_ids),
         )
         pending_counts = pending_elicitations.counts_for(conv_ids)
+        all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
+        child_rows = (
+            await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
+            if all_child_ids
+            else {}
+        )
+        activity_unverified_child_ids = {
+            child_id
+            for child_id, child in child_rows.items()
+            if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+        }
         items = [
             _build_session_list_item(
                 conv,
@@ -1483,6 +1507,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                activity_unverified_child_ids=activity_unverified_child_ids,
             )
             for conv in convs
         ]

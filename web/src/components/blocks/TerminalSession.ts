@@ -384,6 +384,9 @@ export type TerminalClipboardListener = (text: string) => void;
  */
 export const WHEEL_REPORTS_MAX_PER_EVENT = 50;
 
+/** Distance before a finger drag is claimed as terminal scrolling. */
+export const TOUCH_DRAG_THRESHOLD_PX = 8;
+
 /**
  * Mouse state consulted by {@link wheelReportPayload}. ``mouseTrackingMode``
  * comes from the public ``term.modes``; ``sgrEncoding`` is whether the pane
@@ -406,6 +409,29 @@ export interface WheelScreenMetrics {
   cellHeight: number;
   cols: number;
   rows: number;
+}
+
+/** Axis ownership retained for one touch gesture. */
+export type TerminalTouchDragAxis = "pending" | "vertical" | "horizontal";
+
+/** Finger movement needed to translate one touchmove event. */
+export interface TerminalTouchDragMovement {
+  /** Movement from the gesture origin, used once to choose an axis. */
+  totalX: number;
+  totalY: number;
+  /** Scroll delta since the previous event (previous Y minus current Y). */
+  deltaY: number;
+  clientX: number;
+  clientY: number;
+}
+
+/** Result of translating one finger-drag step. */
+export interface TerminalTouchDragResult {
+  axis: TerminalTouchDragAxis;
+  consume: boolean;
+  data: string;
+  scrollLines: number;
+  partial: number;
 }
 
 /**
@@ -496,6 +522,80 @@ export function wheelReportPayload(
 }
 
 /**
+ * Translate a one-finger drag into either TUI mouse-wheel reports or local
+ * xterm scrollback movement.
+ *
+ * Browsers do not emit wheel events for touchscreen drags, and xterm 6's DOM
+ * viewport has no touch bridge. A vertical drag therefore needs an explicit
+ * owner. When the foreground program requested SGR mouse tracking (Claude
+ * Code and similar alternate-screen TUIs), this emits the same reports as the
+ * wheel path. With tracking off, it asks the caller to scroll xterm's local
+ * history. Horizontal gestures stay unclaimed so browser navigation remains
+ * available.
+ */
+export function touchDragPayload(
+  movement: TerminalTouchDragMovement,
+  axis: TerminalTouchDragAxis,
+  mouse: WheelMouseState,
+  screen: WheelScreenMetrics | null,
+  partial: number,
+): TerminalTouchDragResult {
+  let nextAxis = axis;
+  if (nextAxis === "pending") {
+    const distance = Math.max(Math.abs(movement.totalX), Math.abs(movement.totalY));
+    if (distance < TOUCH_DRAG_THRESHOLD_PX) {
+      return { axis: "pending", consume: false, data: "", scrollLines: 0, partial };
+    }
+    nextAxis = Math.abs(movement.totalY) > Math.abs(movement.totalX) ? "vertical" : "horizontal";
+  }
+  if (nextAxis === "horizontal") {
+    return { axis: nextAxis, consume: false, data: "", scrollLines: 0, partial: 0 };
+  }
+  if (movement.deltaY === 0 || screen === null) {
+    return { axis: nextAxis, consume: false, data: "", scrollLines: 0, partial };
+  }
+
+  if (mouse.mouseTrackingMode !== "none") {
+    if (!mouse.sgrEncoding) {
+      return { axis: nextAxis, consume: false, data: "", scrollLines: 0, partial };
+    }
+    const wheel = wheelReportPayload(
+      {
+        deltaY: movement.deltaY,
+        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+        shiftKey: false,
+        clientX: movement.clientX,
+        clientY: movement.clientY,
+      },
+      mouse,
+      screen,
+      partial,
+    );
+    return {
+      axis: nextAxis,
+      consume: wheel.consume,
+      data: wheel.data,
+      scrollLines: 0,
+      partial: wheel.partial,
+    };
+  }
+
+  const total = partial + movement.deltaY / screen.cellHeight;
+  const whole = Math.trunc(total);
+  const capped = Math.max(
+    -WHEEL_REPORTS_MAX_PER_EVENT,
+    Math.min(WHEEL_REPORTS_MAX_PER_EVENT, whole),
+  );
+  return {
+    axis: nextAxis,
+    consume: true,
+    data: "",
+    scrollLines: capped,
+    partial: capped === whole ? total - whole : 0,
+  };
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -540,6 +640,15 @@ export class TerminalSession {
   private lastSentSize: { cols: number; rows: number } | null = null;
   /** Fractional wheel lines carried across events (see {@link wheelReportPayload}). */
   private wheelPartialLines = 0;
+  /** Active one-finger scroll gesture, or ``null`` between gestures. */
+  private touchDrag: {
+    identifier: number;
+    startX: number;
+    startY: number;
+    lastY: number;
+    axis: TerminalTouchDragAxis;
+    partial: number;
+  } | null = null;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -635,6 +744,86 @@ export class TerminalSession {
       (e) => applyTerminalCopy(e, this.term.getSelection()),
       { capture: true, signal },
     );
+
+    // xterm 6 does not translate touchscreen drags into either scrollback or
+    // mouse-wheel reports. Reserve vertical one-finger panning for the
+    // terminal while leaving horizontal navigation and pinch zoom to the
+    // browser; the active listeners below perform the actual scrolling.
+    if (this.term.element) this.term.element.style.touchAction = "pan-x pinch-zoom";
+    container.addEventListener(
+      "touchstart",
+      (event) => {
+        if (event.touches.length !== 1) {
+          this.touchDrag = null;
+          return;
+        }
+        const touch = event.touches.item(0);
+        if (!touch) return;
+        this.touchDrag = {
+          identifier: touch.identifier,
+          startX: touch.clientX,
+          startY: touch.clientY,
+          lastY: touch.clientY,
+          axis: "pending",
+          partial: 0,
+        };
+      },
+      { passive: true, signal },
+    );
+    container.addEventListener(
+      "touchmove",
+      (event) => {
+        const drag = this.touchDrag;
+        if (!drag || event.touches.length !== 1) return;
+        let touch: Touch | null = null;
+        for (let index = 0; index < event.touches.length; index += 1) {
+          const candidate = event.touches.item(index);
+          if (candidate?.identifier === drag.identifier) {
+            touch = candidate;
+            break;
+          }
+        }
+        if (!touch) return;
+        const result = touchDragPayload(
+          {
+            totalX: touch.clientX - drag.startX,
+            totalY: touch.clientY - drag.startY,
+            // Finger content follows the gesture: dragging down requests
+            // older rows (negative terminal scroll), hence the inversion.
+            deltaY: drag.lastY - touch.clientY,
+            clientX: touch.clientX,
+            clientY: touch.clientY,
+          },
+          drag.axis,
+          {
+            mouseTrackingMode: this.term.modes.mouseTrackingMode,
+            sgrEncoding: this.sgrMouseEncodingActive(),
+          },
+          this.screenMetrics(),
+          drag.partial,
+        );
+        drag.axis = result.axis;
+        drag.lastY = touch.clientY;
+        drag.partial = result.partial;
+        if (!result.consume) return;
+        event.preventDefault();
+        if (result.data) this.term.input(result.data, true);
+        if (result.scrollLines) this.term.scrollLines(result.scrollLines);
+      },
+      { passive: false, signal },
+    );
+    const finishTouchDrag = (event: TouchEvent) => {
+      const drag = this.touchDrag;
+      if (!drag) return;
+      for (let index = 0; index < event.changedTouches.length; index += 1) {
+        if (event.changedTouches.item(index)?.identifier === drag.identifier) {
+          this.touchDrag = null;
+          return;
+        }
+      }
+    };
+    container.addEventListener("touchend", finishTouchDrag, { passive: true, signal });
+    container.addEventListener("touchcancel", finishTouchDrag, { passive: true, signal });
 
     this.ws.addEventListener(
       "open",

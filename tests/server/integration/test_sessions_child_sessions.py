@@ -127,6 +127,149 @@ async def test_child_sessions_404_for_nonexistent_session(
     assert resp.status_code == 404
 
 
+async def test_replayed_unverified_native_child_is_not_busy_and_live_activity_restores_it(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A legacy running snapshot is quarantined until a new live edge arrives."""
+    parent = await _create_parent_session(client, "unverified-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:legacy",
+        agent_id=parent["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    )
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "activity_unverified", "replayed": True},
+            },
+        )
+        assert response.status_code == 202, response.text
+        rows = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+        row = next(value for value in rows if value["id"] == child.id)
+        assert row["busy"] is False
+        assert row["current_task_status"] is None
+        assert row["activity_unverified"] is True
+
+        snapshot = (await client.get(f"/v1/sessions/{child.id}")).json()
+        assert snapshot["status"] == "idle"
+
+        sessions_module._session_status_cache[child.id] = "running"
+        parent_row = next(
+            row
+            for row in (await client.get("/v1/sessions")).json()["data"]
+            if row["id"] == parent["id"]
+        )
+        assert parent_row["background_activity_count"] == 0
+        assert parent_row["status"] == "idle"
+
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert response.status_code == 202, response.text
+        assert sessions_module._session_status_cache[child.id] == "activity_unverified"
+
+        # A Server restart drops the process-local cache. The durable label
+        # must still keep this row out of busy/B and out of the false Done state.
+        sessions_module._session_status_cache.pop(child.id, None)
+        rows = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+        row = next(value for value in rows if value["id"] == child.id)
+        assert row["busy"] is False
+        assert row["current_task_status"] is None
+        assert row["activity_unverified"] is True
+
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={"type": "external_session_status", "data": {"status": "running"}},
+        )
+        assert response.status_code == 202, response.text
+        rows = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+        row = next(value for value in rows if value["id"] == child.id)
+        assert row["busy"] is True
+        assert row["activity_unverified"] is False
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+async def test_activity_unverified_rejects_live_and_non_claude_native_sessions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Only a replayed Claude-native child may invalidate historical activity."""
+    parent = await _create_parent_session(client, "unverified-validation-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:legacy",
+    )
+    conv_store.set_labels(
+        child.id,
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    )
+    live = await client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_status", "data": {"status": "activity_unverified"}},
+    )
+    wrong_session = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "activity_unverified", "replayed": True},
+        },
+    )
+    assert live.status_code == 400
+    assert wrong_session.status_code == 400
+
+
+async def test_activity_unverified_does_not_override_durable_terminal_status(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An unknown replay cannot downgrade stronger structured completion evidence."""
+    parent = await _create_parent_session(client, "unverified-terminal-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:completed",
+    )
+    conv_store.set_labels(
+        child.id,
+        {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.subagent.terminal_status": "completed",
+        },
+    )
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "activity_unverified", "replayed": True},
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert sessions_module._session_status_cache[child.id] == "idle"
+        rows = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+        row = next(value for value in rows if value["id"] == child.id)
+        assert row["current_task_status"] == "completed"
+        assert row["activity_unverified"] is False
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
 # ── Empty ────────────────────────────────────────────────
 
 

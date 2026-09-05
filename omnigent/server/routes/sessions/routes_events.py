@@ -117,6 +117,7 @@ from omnigent.server.routes._sessions.common import (
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
@@ -159,6 +160,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_policy_deny_sentinel,
     _persist_session_status_error_labels,
     _prune_session_read_state,
+    _publish_child_status_to_parent,
     _publish_compaction_completed,
     _publish_compaction_failed,
     _publish_compaction_in_progress,
@@ -1317,12 +1319,23 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             replayed = body.data.get("replayed", False)
-            if not isinstance(replayed, bool) or (
+            if (
+                not isinstance(replayed, bool)
+                or (status == "activity_unverified" and replayed is not True)
+                or (
                 replayed
                 and (
                     conv.kind != "sub_agent"
                     or conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
-                    or status not in {"completed", "failed", "stopped", "killed"}
+                    or status
+                    not in {
+                        "completed",
+                        "failed",
+                        "stopped",
+                        "killed",
+                        "activity_unverified",
+                    }
+                )
                 )
             ):
                 raise OmnigentError(
@@ -1334,6 +1347,49 @@ def register_events_routes(
                 raise OmnigentError(
                     "external_session_status data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
+                )
+            if status == "activity_unverified":
+                durable_terminal = conv.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+                if durable_terminal in {"completed", "failed", "stopped", "killed"}:
+                    public_terminal = "failed" if durable_terminal == "failed" else "idle"
+                    previous_status = _session_status_cache.get(session_id)
+                    _session_status_cache[session_id] = public_terminal
+                    if previous_status != public_terminal:
+                        _publish_child_status_to_parent(session_id, public_terminal)
+                    return {"queued": False}
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    session_id,
+                    {
+                        _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: "true",
+                        _SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "",
+                    },
+                )
+                previous_status = _session_status_cache.get(session_id)
+                _session_status_cache[session_id] = status
+                if previous_status != status:
+                    _publish_child_status_to_parent(session_id, status)
+                return {"queued": False}
+            if (
+                status in {"idle", "waiting"}
+                and conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+            ):
+                # PTY quiescence after reconnect is not proof that an old
+                # native child completed. Keep the explicit unknown state
+                # until new activity or a structured terminal edge arrives.
+                _session_status_cache[session_id] = "activity_unverified"
+                return {"queued": False}
+            if (
+                conv.kind == "sub_agent"
+                and conv.labels.get("omnigent.wrapper")
+                == "claude-code-native-ui-subagent"
+                and conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+                and status in {"running", "completed", "failed", "stopped", "killed"}
+            ):
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    session_id,
+                    {_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: ""},
                 )
             # ``None`` (field absent) = no information; leave the sticky
             # tally untouched (the PTY-activity ``idle`` carries none). An

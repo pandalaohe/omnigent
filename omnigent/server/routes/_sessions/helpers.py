@@ -194,6 +194,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _SLASH_COMMAND_TYPE,
     _STOP_RUNNER_RESULT_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _TURN_ACTOR_LABEL,
     _UI_ADDED_AGENT_TITLE_PREFIX,
@@ -1229,6 +1230,7 @@ def _session_status_with_child_rollup(
     conversation_id: str,
     child_session_ids: list[str],
     db_status: str | None = None,
+    activity_unverified_child_ids: set[str] | None = None,
 ) -> Literal["idle", "running", "failed"]:
     """
     Map a session's cached status plus direct child activity to list status.
@@ -1257,7 +1259,8 @@ def _session_status_with_child_rollup(
     # the next ``Stop`` hook, so a spinner keyed off it can outlive the shells.
     # The in-chat indicator still reports them from the count.
     if any(
-        _session_status_cache.get(child_id) in ("running", "waiting")
+        child_id not in (activity_unverified_child_ids or set())
+        and _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
     ):
         return "running"
@@ -1268,6 +1271,7 @@ def _session_background_activity_count(
     conversation_id: str,
     child_session_ids: list[str],
     db_status: str | None = None,
+    activity_unverified_child_ids: set[str] | None = None,
 ) -> int:
     """Count live work that does not own the parent session's prompt."""
     own_status = _session_status_from_cache(conversation_id, db_status)
@@ -1277,7 +1281,8 @@ def _session_background_activity_count(
         else _session_background_task_count_cache.get(conversation_id, 0)
     )
     child_count = sum(
-        _session_status_cache.get(child_id) in ("running", "waiting")
+        child_id not in (activity_unverified_child_ids or set())
+        and _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
     )
     return shell_count + child_count
@@ -9568,6 +9573,12 @@ def _child_session_summary_from_conversation(
         busy = True
     else:
         busy = False
+    activity_unverified = (
+        cached_status == "activity_unverified"
+        or labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+    )
+    if activity_unverified:
+        busy = False
     last_task_error = _last_task_error_from_labels(labels)
     current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
     if last_task_error is not None:
@@ -9599,6 +9610,7 @@ def _child_session_summary_from_conversation(
         current_task_id=None,
         current_task_status=current_task_status,
         busy=busy,
+        activity_unverified=activity_unverified,
         labels=labels,
         last_task_error=last_task_error,
         last_message_preview=last_message_preview,

@@ -12,7 +12,15 @@ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 // runner dropped its tunnel or exited; the task did NOT genuinely fail, so
 // it renders a quiet, non-destructive grey dot rather than the red "Failed".
 export type AgentActivity =
-  "launching" | "working" | "awaiting" | "done" | "failed" | "disconnected" | "idle" | "other";
+  | "launching"
+  | "working"
+  | "awaiting"
+  | "unverified"
+  | "done"
+  | "failed"
+  | "disconnected"
+  | "idle"
+  | "other";
 
 export interface AgentStatus {
   activity: AgentActivity;
@@ -60,6 +68,7 @@ const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> =
   // neutral --muted-foreground (not the shared amber --warning) so the "Needs
   // response" badge keeps its amber and the dot stays notable.
   disconnected: "bg-muted-foreground",
+  unverified: "bg-muted-foreground",
   idle: "bg-session-active/55",
   launching: "bg-session-active/70",
   // Exception: the verbatim "other status" fallthrough stays neutral grey.
@@ -92,6 +101,13 @@ export function childStatus(child: ChildSessionInfo): AgentStatus {
   // "Working" pill — exactly the signal the user needs to act on.
   if (child.pending_elicitations_count > 0) {
     return { activity: "awaiting", label: "Needs response" };
+  }
+  if (child.activity_unverified) {
+    return {
+      activity: "unverified",
+      label: "Activity unverified",
+      details: "No current Host activity was found after reconnect",
+    };
   }
   // ``busy`` is the authoritative live flag (queued or in_progress);
   // ``current_task_status`` may be "launching", "completed", "failed",

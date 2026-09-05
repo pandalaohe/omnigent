@@ -167,6 +167,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S,
     _RUNNER_SESSION_INIT_TIMEOUT_S,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
@@ -802,6 +803,7 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    activity_unverified_child_ids: set[str] | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -854,14 +856,33 @@ def _build_session_list_item(
     # dots straight from the list (no separate fetch). Built per-user here —
     # `user_id` is the requesting caller, never broadcast to other viewers.
     viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
+    own_activity_unverified = (
+        conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+    )
     return SessionListItem(
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
-        status=_session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
-        foreground_status=_session_status_from_cache(conv.id, conv.live_status),
+        status=(
+            "idle"
+            if own_activity_unverified
+            else _session_status_with_child_rollup(
+                conv.id,
+                child_session_ids,
+                conv.live_status,
+                activity_unverified_child_ids,
+            )
+        ),
+        foreground_status=(
+            "idle"
+            if own_activity_unverified
+            else _session_status_from_cache(conv.id, conv.live_status)
+        ),
         background_activity_count=_session_background_activity_count(
-            conv.id, child_session_ids, conv.live_status
+            conv.id,
+            child_session_ids,
+            conv.live_status,
+            activity_unverified_child_ids,
         ),
         goal_state=(
             cast(Literal["active", "paused"], conv.labels[_GOAL_STATE_LABEL_KEY])
@@ -9773,8 +9794,15 @@ async def _get_session_snapshot(
     # Native runners inject a prompt and return before the CLI turn ends.
     # Their generic GET status can therefore be idle while the persisted
     # status-file/hook signal is still running. Preserve that signal on restart.
-    status = _session_status_from_cache(session_id, conv.live_status)
-    if status == "idle":
+    activity_unverified = (
+        conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+    )
+    if activity_unverified:
+        _session_status_cache[session_id] = "activity_unverified"
+        status = "idle"
+    else:
+        status = _session_status_from_cache(session_id, conv.live_status)
+    if status == "idle" and not activity_unverified:
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a
         # freshly bound session (the relay's GET /stream is still in its

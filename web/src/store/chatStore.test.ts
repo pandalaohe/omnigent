@@ -6172,6 +6172,34 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(cached?.[0].current_task_status).toBe("completed");
     });
 
+    it("keeps the activity-unverified marker live until verified work resumes", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          task_summary: null,
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: null,
+          busy: false,
+          activity_unverified: true,
+          last_message_preview: null,
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: { id: "conv_child1", busy: true, activity_unverified: false },
+      });
+      const row = client.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_parent"),
+      )?.[0];
+      expect(row?.busy).toBe(true);
+      expect(row?.activity_unverified).toBe(false);
+    });
+
     it("merges a PARTIAL status delta without clobbering the preview", () => {
       // Runner status deltas omit last_message_preview; the merge must
       // keep the snapshot's preview rather than nulling it.

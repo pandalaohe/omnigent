@@ -299,6 +299,7 @@ const QUIET_STATE: Record<AgentActivity, boolean> = {
   // idle/done/working dot states. The colored dot is enough to flag the
   // liveness loss without adding label text to the row.
   disconnected: true,
+  unverified: false,
   other: false,
   done: true,
   idle: true,
@@ -315,6 +316,7 @@ const SETTLED_STATE: Record<AgentActivity, boolean> = {
   // Not dimmed — a disconnected runner is something the user may want to
   // notice and act on (retry/reconnect), so it stays full-strength.
   disconnected: false,
+  unverified: false,
   other: false,
   done: true,
   idle: true,

@@ -28,6 +28,7 @@ const ACTIVITY_TINT: Record<AgentActivity, { border: string; bg: string }> = {
   failed: { border: "border-destructive", bg: "bg-destructive/5" },
   launching: { border: "border-muted-foreground/40", bg: "bg-muted/30" },
   disconnected: { border: "border-muted-foreground/30", bg: "bg-card" },
+  unverified: { border: "border-muted-foreground/30", bg: "bg-muted/20" },
   done: { border: "border-muted-foreground/30", bg: "bg-card" },
   idle: { border: "border-muted-foreground/30", bg: "bg-card" },
   other: { border: "border-muted-foreground/30", bg: "bg-card" },
