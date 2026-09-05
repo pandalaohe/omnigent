@@ -50,6 +50,7 @@ from omnigent.claude_native_bridge import (
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import sync_raw_status_context
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.model_metadata import concrete_reported_model
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 _FORWARDER_STATE_FILE = "transcript_forwarder.json"
@@ -5567,6 +5568,7 @@ async def _post_model_change_if_new(
         fresh observation," and a previously-observed-but-unposted model
         is still reconciled (retried) here.
     """
+    model = concrete_reported_model(model)
     if model is not None:
         dedupe.observed_model = model
     if dedupe.observed_model is None or dedupe.observed_model == dedupe.posted_model:

@@ -93,6 +93,8 @@ export type OmnigentAnalyticsEvent =
     };
 
 export interface OmnigentHostConfig {
+  /** Stable server/workspace identity used to scope browser-local extension storage. */
+  serverIdentity?: string;
   /**
    * Stable identity of the selected Omnigent Server, normally its canonical
    * base URL. Embedded/native hosts that can switch Servers must keep this
@@ -176,6 +178,14 @@ let hostConfig: OmnigentHostConfig = {};
 let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
 let embedScopeRoot: HTMLElement | null = null;
+
+export function getOmnigentServerIdentity(): string | null {
+  if (hostConfig.serverIdentity?.trim()) return hostConfig.serverIdentity.trim();
+  // Standalone has one same-origin server. Embedded hosts can proxy many
+  // backends behind one origin and must provide an explicit stable identity.
+  if (hostConfig.fetcher) return null;
+  return typeof window === "undefined" ? "server" : window.location.origin;
+}
 
 export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // Guard: never clobber an already-installed fetcher with an empty config.

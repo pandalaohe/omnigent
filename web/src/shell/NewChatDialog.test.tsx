@@ -889,6 +889,10 @@ async function readCreateBody(): Promise<{ raw: string; body: Record<string, unk
 
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    const customAgents = screen.queryByTestId("new-chat-landing-custom-agents");
+    fireEvent.click(customAgents ?? screen.getByTestId("new-chat-landing-harness-more"));
+  }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
@@ -3981,7 +3985,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   }
 
-  it("lists Custom agents directly on mobile", () => {
+  it("drills into Custom agents on mobile", () => {
     // A custom (non-builtin) agent lands in the Custom agents group.
     mockAgents([
       {
@@ -4003,9 +4007,11 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     ]);
     renderLanding();
     openPicker();
-    expect(screen.getByTestId("new-chat-landing-agent-ag_custom")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(screen.getByTestId("new-chat-landing-agent-ag_custom")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-page-back")).toBeTruthy();
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_custom"));
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
       "My Custom Agent",

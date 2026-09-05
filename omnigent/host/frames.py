@@ -77,6 +77,7 @@ class HostFrameKind(str, Enum):
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
     IMPORT_LOCAL = "host.import_local"
+    IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_DONE = "host.import_local_done"
 
@@ -921,6 +922,20 @@ class HostImportLocalFrame:
 
 
 @dataclass
+class HostImportLocalByIdFrame:
+    """Server → host: read one known local transcript without listing.
+
+    :param request_id: Unique id for correlating the result.
+    :param source: Harness namespace containing the session.
+    :param session_id: Exact harness-native session id to load.
+    """
+
+    request_id: str
+    source: str
+    session_id: str
+
+
+@dataclass
 class HostImportLocalSessionFrame:
     """Host → server: one normalized local session, streamed as it's read.
 
@@ -991,6 +1006,7 @@ HostFrame = (
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
     | HostImportLocalFrame
+    | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
     | HostImportLocalDoneFrame
 )
@@ -1372,6 +1388,15 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "limit": frame.limit,
             }
         )
+    if isinstance(frame, HostImportLocalByIdFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_BY_ID.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "session_id": frame.session_id,
+            }
+        )
     if isinstance(frame, HostImportLocalSessionFrame):
         s = frame.session
         return _encode_payload(
@@ -1532,6 +1557,8 @@ def _decode_known_host_frame(
             return _decode_model_options_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
+        case HostFrameKind.IMPORT_LOCAL_BY_ID:
+            return _decode_import_local_by_id(msg)
         case HostFrameKind.IMPORT_LOCAL_SESSION:
             return _decode_import_local_session(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
@@ -2065,6 +2092,15 @@ def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
         request_id=_required_str(msg, "request_id"),
         source=_required_str(msg, "source"),
         limit=_required_int(msg, "limit"),
+    )
+
+
+def _decode_import_local_by_id(msg: _JsonObject) -> HostImportLocalByIdFrame:
+    """Decode a host.import_local_by_id frame."""
+    return HostImportLocalByIdFrame(
+        request_id=_required_str(msg, "request_id"),
+        source=_required_str(msg, "source"),
+        session_id=_required_str(msg, "session_id"),
     )
 
 

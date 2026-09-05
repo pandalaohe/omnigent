@@ -183,6 +183,8 @@ from omnigent.server.schemas import (
     PaginatedList,
     ProjectSessionCreateRequest,
     ReadStatePutRequest,
+    ResetSessionModelOverrideRequest,
+    ResetSessionModelOverrideResponse,
     SessionAgentChangedEvent,
     SessionCreateRequest,
     SessionForkRequest,
@@ -1196,6 +1198,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -1245,6 +1248,12 @@ def register_core_routes(
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
+        :param visibility: Ownership/archive filter for the sidebar tabs.
+            ``"mine"`` returns only sessions the caller owns (owner-level
+            grant). ``"shared"`` returns only sessions accessible but not
+            owned. ``"archived"`` returns only archived sessions.
+            ``"all"`` (default) returns all accessible non-archived
+            sessions, matching the legacy behaviour.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -1261,19 +1270,64 @@ def register_core_routes(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
-        if sort_by == "archived_at" and not archived_only:
+        # Map the visibility filter to store-level ACL params.
+        # "mine": only sessions the caller owns — no accessible_by needed
+        #   because owner-level implies access.
+        # "shared": sessions accessible but not owned — shared_only=True
+        #   computes the set difference (accessible − owned).
+        # "all": all accessible sessions (legacy default). A project folder
+        #   additionally gates on owned_by so a shared session with a
+        #   like-named project stays out of the viewer's own folder.
+        # mine/shared require an identity anchor (owned_by / accessible_by).
+        # Passing None into the store's shared_only path raises ValueError.
+        # "archived" carries no ownership semantics — preserve it in no-auth.
+        effective_visibility = visibility
+        if user_id is None and visibility in ("mine", "shared"):
+            effective_visibility = "all"
+        if effective_visibility == "mine":
+            accessible_by_param: str | None = None
+            owned_by_param: str | None = user_id
+            shared_only_param = False
+            include_archived_param = False
+            archived_only_param = False
+        elif effective_visibility == "shared":
+            accessible_by_param = user_id
+            owned_by_param = None
+            shared_only_param = True
+            include_archived_param = False
+            archived_only_param = False
+        elif effective_visibility == "archived":
+            accessible_by_param = user_id
+            owned_by_param = None
+            shared_only_param = False
+            # archived_only=True implies include_archived=True — the store
+            # filters to archived=True regardless of include_archived.
+            include_archived_param = True
+            archived_only_param = True
+        else:  # "all"
+            accessible_by_param = user_id
+            # A specific project folder ("My sessions"-only) must show only the
+            # viewer's own sessions — a session shared with them but filed under a
+            # like-named project belongs on "Shared with me", not in this folder.
+            # Passing owned_by here also scopes the dual-read's first-class half:
+            # the store resolves the project NAME to the caller's own project id.
+            # The flat list (project=None) and Unfiled (project="") stay unscoped so
+            # shared sessions still surface for the "Shared with me" tab.
+            owned_by_param = user_id if project else None
+            shared_only_param = False
+            include_archived_param = include_archived
+            archived_only_param = False
+        # Keep the legacy archive parameters used by Archive Library while
+        # accepting upstream's visibility tabs. An explicit archive-only query
+        # wins over the default "all" visibility.
+        if archived_only:
+            include_archived_param = True
+            archived_only_param = True
+        if sort_by == "archived_at" and not archived_only_param:
             raise OmnigentError(
-                "sort_by='archived_at' requires archived_only=true",
+                "sort_by='archived_at' requires an archived-only view",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # A specific project folder ("My sessions"-only) must show only the
-        # viewer's own sessions — a session shared with them but filed under a
-        # like-named project belongs on "Shared with me", not in this folder.
-        # Passing owned_by here also scopes the dual-read's first-class half:
-        # the store resolves the project NAME to the caller's own project id.
-        # The flat list (project=None) and Unfiled (project="") stay unscoped so
-        # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -1281,8 +1335,9 @@ def register_core_routes(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
-            accessible_by=user_id,
-            owned_by=owned_by,
+            accessible_by=accessible_by_param,
+            owned_by=owned_by_param,
+            shared_only=shared_only_param,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API
             # spells that ``kind=any`` to keep the param required-ish
@@ -1292,8 +1347,8 @@ def register_core_routes(
             sort_by=sort_by,
             search_query=normalized_query,
             search_scope=search_scope,
-            include_archived=include_archived,
-            archived_only=archived_only,
+            include_archived=include_archived_param,
+            archived_only=archived_only_param,
             host_id=host_id,
             created_after=created_after,
             created_before=created_before,
@@ -1322,7 +1377,9 @@ def register_core_routes(
         # The tasks table has been removed — status comes exclusively from
         # the relay-fed ``_session_status_cache``.
         unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
-        agent_template_ids = await asyncio.to_thread(agent_store.get_template_ids, unique_agent_ids)
+        agent_template_ids = await asyncio.to_thread(
+            agent_store.get_template_ids, unique_agent_ids
+        )
         perms_by_conv: dict[str, list[SessionPermission]]
         if permission_store is not None:
             perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
@@ -1485,7 +1542,9 @@ def register_core_routes(
         if not convs:
             return []
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
-        agent_template_ids = await asyncio.to_thread(agent_store.get_template_ids, unique_agent_ids)
+        agent_template_ids = await asyncio.to_thread(
+            agent_store.get_template_ids, unique_agent_ids
+        )
         conv_ids = [c.id for c in convs]
         agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
             asyncio.to_thread(agent_store.get_names, unique_agent_ids),
@@ -1896,6 +1955,38 @@ def register_core_routes(
         if updated is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
+
+    @router.post(
+        "/sessions/{session_id}/model-override/reset",
+        response_model=ResetSessionModelOverrideResponse,
+    )
+    async def reset_session_model_override(
+        request: Request,
+        session_id: str,
+        body: ResetSessionModelOverrideRequest,
+    ) -> ResetSessionModelOverrideResponse:
+        """Retire a rejected pick after fallback without replacing a newer selection."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or conv.agent_id is None:
+            raise _session_not_found()
+        try:
+            validate_model_override(body.expected_model_override)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid expected_model_override: {exc}", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        # The terminal already launched its fallback. This only retires metadata;
+        # forwarding another model change could undo a concurrent live selection.
+        reset = await asyncio.to_thread(
+            conversation_store.clear_model_override_if_matches,
+            session_id,
+            body.expected_model_override,
+        )
+        return ResetSessionModelOverrideResponse(reset=reset)
 
     @router.patch(
         "/sessions/{session_id}",

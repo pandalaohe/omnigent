@@ -99,6 +99,16 @@ export const ARCHIVE_LOCK_LABEL_KEY = "omnigent.archive_locked";
 
 export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
+  // When false, the query is disabled (no fetch fires). Lets callers mount
+  // the hook unconditionally while suppressing the request until it's needed.
+  enabled?: boolean;
+  /**
+   * Which result fields trigger a consumer re-render (passed to the infinite
+   * query). Lets a consumer that holds the whole query object avoid re-rendering
+   * on the live-updates merge's per-frame result-object churn. Omit to notify on
+   * any observed field.
+   */
+  notifyOnChangeProps?: readonly (keyof ReturnType<typeof useInfiniteQuery>)[];
 }
 
 export type ArchivedDateField = "created_at" | "active_at" | "archived_at";
@@ -390,8 +400,18 @@ function withRecentlyCreated(
   project: string | undefined,
   includeArchived: boolean,
   queryClient: QueryClient,
+  visibility?: "mine" | "shared" | "archived",
 ): ConversationsPage {
-  if (after !== undefined || searchQuery || project || recentlyCreatedSessions.size === 0) {
+  // Recently-created sessions are always owned (active, not archived), so skip
+  // injection for "shared" and "archived" filters where they would not belong.
+  if (
+    after !== undefined ||
+    searchQuery ||
+    project ||
+    visibility === "shared" ||
+    visibility === "archived" ||
+    recentlyCreatedSessions.size === 0
+  ) {
     return page;
   }
   const present = new Set(page.data.map((c) => c.id));
@@ -460,12 +480,14 @@ async function fetchConversationsPage({
   searchQuery,
   includeArchived,
   project,
+  visibility,
   queryClient,
 }: {
   after?: string;
   searchQuery: string;
   includeArchived: boolean;
   project?: string;
+  visibility?: "mine" | "shared" | "archived";
   queryClient: QueryClient;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
@@ -487,6 +509,10 @@ async function fetchConversationsPage({
   // query key (which drops `project`) and the cache-membership check. This
   // list never requests the server's "unfiled" (`project=`) slice.
   if (project) params.set("project", project);
+  // Server-side ownership filter for the sidebar's My/Shared split. Omitting
+  // the param keeps the legacy "all accessible" behaviour (no regression for
+  // callers that don't pass visibility).
+  if (visibility) params.set("visibility", visibility);
   // Bound search fetches with a client-side deadline (see
   // SEARCH_FETCH_TIMEOUT_MS): a search whose server-side index is missing can
   // hang, and the palette shows "Searching…" for the whole in-flight window.
@@ -506,7 +532,15 @@ async function fetchConversationsPage({
   // can't seed a stale value; a hostless row clears any prior mapping.
   for (const row of page.data) setSessionHost(row.id, row.host_id);
   return withoutDeletingSessions(
-    withRecentlyCreated(page, after, searchQuery, project, includeArchived, queryClient),
+    withRecentlyCreated(
+      page,
+      after,
+      searchQuery,
+      project,
+      includeArchived,
+      queryClient,
+      visibility,
+    ),
   );
 }
 
@@ -539,6 +573,7 @@ export function useConversations(
   includeArchived = false,
   options: UseConversationsOptions = {},
   project?: string,
+  visibility?: "mine" | "shared" | "archived",
 ) {
   // Live updates arrive over the `WS /v1/sessions/updates` push stream
   // (SessionUpdatesProvider), which patches this cache in place as watched
@@ -552,11 +587,14 @@ export function useConversations(
   return useInfiniteQuery({
     // Keep the base three-element key for the unfiltered callers (byte-for-byte
     // unchanged, so the sidebar / rename / push-delta paths are untouched); only
-    // append `project` for a concrete name. A falsy project (`undefined` or `""`)
-    // is "all projects" and shares the base key — there is no distinct "" variant.
-    queryKey: project
-      ? ["conversations", searchQuery, includeArchived, project]
-      : ["conversations", searchQuery, includeArchived],
+    // append `project` for a concrete name; append `visibility` only when set so
+    // the "mine"/"shared" tab queries get their own cache entries without
+    // disturbing the existing all-sessions key used by every other caller.
+    queryKey: visibility
+      ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
+      : project
+        ? ["conversations", searchQuery, includeArchived, project]
+        : ["conversations", searchQuery, includeArchived],
     queryFn: async ({ pageParam }) => {
       const fetchPage = () =>
         fetchConversationsPage({
@@ -564,11 +602,14 @@ export function useConversations(
           searchQuery,
           includeArchived,
           project,
+          visibility,
           queryClient,
         });
       // Time the first full-list load per app session; skip pagination
-      // (pageParam set) and every later fetch (poll / reconcile / invalidation).
-      if (initialListLoadTimed || pageParam !== undefined) return fetchPage();
+      // (pageParam set), every later fetch (poll / reconcile / invalidation),
+      // and tab-scoped visibility queries (the CUJ measures the full-list only).
+      if (initialListLoadTimed || pageParam !== undefined || visibility !== undefined)
+        return fetchPage();
       initialListLoadTimed = true;
       const interaction = startTimedInteraction("list_sessions");
       try {
@@ -598,6 +639,16 @@ export function useConversations(
         ? CONNECTED_STREAM_REFETCH_INTERVAL_MS
         : false
       : DISCONNECTED_STREAM_REFETCH_INTERVAL_MS,
+    // Lets callers mount the hook unconditionally while suppressing the fetch
+    // until it's actually needed (e.g. the sidebar's tab-scoped query is
+    // disabled when the user is not on the "mine" or "shared" tab).
+    enabled: options.enabled ?? true,
+    // Coalesce the live-updates object churn for consumers that opt in (see
+    // UseConversationsOptions.notifyOnChangeProps). Mutable copy — the query
+    // options type wants a mutable array.
+    ...(options.notifyOnChangeProps
+      ? { notifyOnChangeProps: [...options.notifyOnChangeProps] }
+      : {}),
   });
 }
 

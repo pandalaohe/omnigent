@@ -2,6 +2,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ToastModule from "@/components/ui/toast";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -19,6 +20,7 @@ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { moveConversationToProject, useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { showToast } from "@/components/ui/toast";
+import { customAgentBundle, useCustomAgents } from "@/lib/customAgentsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
@@ -46,6 +48,11 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  useCustomAgents: vi.fn(),
+  customAgentBundle: vi.fn(),
+}));
 vi.mock("@/components/ui/toast", async (importOriginal) => ({
   ...(await importOriginal<typeof ToastModule>()),
   showToast: vi.fn(),
@@ -253,6 +260,10 @@ beforeEach(() => {
   vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
   vi.mocked(launchRunner).mockReset();
   vi.mocked(launchRunner).mockResolvedValue(undefined as never);
+  vi.mocked(useCustomAgents).mockReturnValue({ data: [] } as unknown as ReturnType<
+    typeof useCustomAgents
+  >);
+  vi.mocked(customAgentBundle).mockResolvedValue(new File(["x"], "bundle.tar.gz"));
   searchParams = new URLSearchParams("project=Alpha");
   resetLandingDraft();
   localStorage.clear();
@@ -424,8 +435,25 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
-    // Commit a pending custom agent (via the stubbed dialog), then submit.
-    fireEvent.click(screen.getByTestId("test-create-pending"));
+    // Select a persisted custom Agent; the current management flow downloads
+    // its bundle instead of creating an ephemeral pending Agent in this form.
+    vi.mocked(useCustomAgents).mockReturnValue({
+      data: [
+        {
+          id: "ca_template",
+          name: "Template Agent",
+          description: null,
+          harness: null,
+          model: null,
+          version: 1,
+          created_at: 1,
+          updated_at: null,
+        },
+      ],
+    } as unknown as ReturnType<typeof useCustomAgents>);
+    cleanup();
+    renderLanding();
+    selectAgent("ca_template");
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "hello" },
     });
@@ -434,9 +462,13 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     await waitFor(() => expect(navigateMock).toHaveBeenCalled());
 
     // Atomic filing rides in the metadata part; the config-seeded workspace
-    // is omitted (server default-fill) and no born-filed label is stamped.
+    // is omitted (server default-fill), and the durable Agent template id is
+    // stamped so later edits can trace sessions back to their source Agent.
     const [, metadata] = vi.mocked(createBundledSession).mock.calls[0];
-    expect(metadata).toEqual({ project_id: "proj_alpha" });
+    expect(metadata).toEqual({
+      project_id: "proj_alpha",
+      labels: { "omnigent:agent-template-id": "ca_template" },
+    });
     // The runner still launches with the explicit client-side workspace.
     expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();

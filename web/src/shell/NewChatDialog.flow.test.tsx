@@ -233,7 +233,8 @@ function openWorktree(): void {
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const customAgents = screen.queryByTestId("new-chat-landing-custom-agents");
+    fireEvent.click(customAgents ?? screen.getByTestId("new-chat-landing-harness-more"));
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
@@ -1825,8 +1826,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Pick the non-default agent from the selection-only menu.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_two"));
+    selectAgent("ag_two");
     // The explicit pick persists immediately — no session has to be created
     // for the preference to stick.
     expect(localStorage.getItem("omnigent:last-agent-id")).toBe("ag_two");

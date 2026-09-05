@@ -2553,15 +2553,15 @@ async def test_external_user_message_folds_pending_image_into_durable_item(
 
         items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
         user_msg = next(item for item in items if item["type"] == "message")
-        # The image block was folded back in, ahead of the transcript text
-        # — so reloading history shows the image, not just the caption.
+        # The complete ordered pending content is restored, so reloading
+        # history shows the image without retaining the native CLI's
+        # materialized attachment marker as duplicate user text.
         assert user_msg["content"][0] == {
             "type": "input_image",
             "file_id": "b08c893483887826e2b9f67165106700",
             "filename": "diagram.png",
         }
-        expected_text = "[Attached: /tmp/diagram.png]\n\nexplain this diagram"
-        assert user_msg["content"][1]["text"] == expected_text
+        assert user_msg["content"][1]["text"] == "explain this diagram"
         # The pending entry was drained — it won't double-render on rebind.
         assert pending_inputs.snapshot_for(session["id"]) == []
     finally:
@@ -2682,13 +2682,16 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
         # The marker stays text-only, so the UI still classifies it as a
         # system marker instead of rendering it as user text beside an image.
         assert marker["content"] == [{"type": "input_text", "text": interrupt_text}]
-        # The upload landed on the message that actually queued it.
-        assert steered["content"][0] == {
-            "type": "input_image",
-            "file_id": "file_shot1",
-            "filename": "shot.png",
-        }
-        assert steered["content"][1]["text"] == "[Attached: /tmp/uploads/shot.png]"
+        # The upload landed on the message that actually queued it. Because
+        # the original composer entry was image-only, the durable message is
+        # image-only too; the transcript's materialized marker is not copied.
+        assert steered["content"] == [
+            {
+                "type": "input_image",
+                "file_id": "file_shot1",
+                "filename": "shot.png",
+            }
+        ]
         # The real message drained the entry (the marker must not have).
         assert pending_inputs.snapshot_for(session["id"]) == []
         assert pid
@@ -2702,10 +2705,10 @@ async def test_external_interrupt_lookalike_still_drains_pending_input(
     """
     The interrupt-record exemption must not swallow real user messages.
 
-    A user can type a message that merely resembles the marker. Over-matching
-    would skip the drain for it, stranding the pending entry and dropping the
-    upload it carries — the same class of bug from the other direction. The
-    regex is anchored, so a bracketed question is a normal message.
+    A user can type a message that merely resembles the marker. The regex is
+    anchored, so a bracketed question is a normal message. Since that text
+    clearly does not match the attachment-only pending entry, the safety guard
+    must leave the upload queued instead of assigning it to unrelated input.
     """
     from omnigent.runtime import pending_inputs
 
@@ -2737,12 +2740,10 @@ async def test_external_interrupt_lookalike_still_drains_pending_input(
 
         items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
         user_msg = next(item for item in items if item["type"] == "message")
-        assert user_msg["content"][0] == {
-            "type": "input_image",
-            "file_id": "file_shot2",
-            "filename": "shot.png",
-        }
-        assert pending_inputs.snapshot_for(session["id"]) == []
+        assert user_msg["content"] == [
+            {"type": "input_text", "text": "[Request interrupted by user?]"}
+        ]
+        assert len(pending_inputs.snapshot_for(session["id"])) == 1
     finally:
         pending_inputs.reset_for_tests()
 
@@ -3484,6 +3485,114 @@ async def test_create_session_without_terminal_launch_args_is_null(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     assert session["terminal_launch_args"] is None
+
+
+_CODEX_BYPASS_ARGS = ["--dangerously-bypass-approvals-and-sandbox"]
+
+
+async def test_create_session_derives_explicit_yolo_from_agent_spec(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A body-less JSON create honors the agent spec's explicit ``yolo: true``.
+
+    A custom codex-native agent that declares ``executor.config.yolo:
+    true`` opted into full bypass in its own trusted, server-stored
+    bundle. With no ``terminal_launch_args`` in the create body the
+    session must persist the codex bypass flag, matching the named-worker
+    path — otherwise codex launches at its default approval stance and an
+    unattended orchestrator parks on approval prompts despite the opt-in.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-self-resolved",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    assert snap.json()["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+
+async def test_create_session_undeclared_codex_spec_keeps_launch_args_null(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    No spec opt-in → no derived args: the headless default must not leak.
+
+    codex-native named WORKERS default to full bypass because nobody can
+    answer a headless prompt, but a top-level session is interactive — a
+    human can answer the ApprovalCard. A codex-native spec that never
+    mentions ``yolo`` must keep ``terminal_launch_args`` NULL rather than
+    silently launching every custom codex agent with approvals and
+    sandbox bypassed.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-plain-self-resolved",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["terminal_launch_args"] is None
+
+
+async def test_create_session_body_launch_args_override_spec_yolo(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Explicit body args keep precedence over the spec's opt-in.
+
+    The web permission-mode selector posts concrete args at create time;
+    the spec seam only fills the gap when the body carries none.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-body-override",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--sandbox", "read-only"],
+    )
+    assert session["terminal_launch_args"] == ["--sandbox", "read-only"]
+
+
+async def test_bundle_create_derives_explicit_yolo_launch_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The multipart bundle create (``omnigent run <dir>``) honors ``yolo: true``.
+
+    ``create_test_agent`` creates its owning session via the multipart
+    bundle path with no metadata launch args, so the owning session's row
+    must carry the spec-derived codex bypass flag — the exact journey the
+    reporter hit with a custom top-level codex-native bundle.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-bundle",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+
+async def test_bundle_create_undeclared_codex_spec_keeps_launch_args_null(
+    client: httpx.AsyncClient,
+) -> None:
+    """A bundle that never mentions ``yolo`` gets no default bypass on upload."""
+    agent = await create_test_agent(
+        client,
+        name="codex-plain-bundle",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["terminal_launch_args"] is None
 
 
 async def test_create_session_rejects_oversized_terminal_launch_args(
@@ -8105,6 +8214,52 @@ async def test_post_external_model_change_publishes_session_model(
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["llm_model"] == "claude-opus-4-8[1m]"
     assert snapshot["model_override"] is None
+
+
+@pytest.mark.parametrize("sentinel", ["<synthetic>", " <synthetic> "])
+async def test_external_synthetic_model_preserves_report(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    response = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_model_change", "data": {"model": "gateway-claude-model"}},
+    )
+    assert response.status_code == 202
+    published: list[object] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda *args: published.append(args),
+    )
+    response = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_model_change", "data": {"model": sentinel}},
+    )
+    assert response.status_code == 202
+    assert published == []
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snapshot["llm_model"] == "gateway-claude-model"
+    assert snapshot["model_override"] is None
+
+
+@pytest.mark.parametrize("sentinel", ["<synthetic>", " <synthetic> "])
+async def test_snapshot_ignores_legacy_synthetic_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    sentinel: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    original = (await client.get(f"/v1/sessions/{sid}")).json()
+    SqlAlchemyConversationStore(db_uri).update_conversation(sid, reported_model=sentinel)
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snapshot["llm_model"] == original["llm_model"]
+    assert snapshot["llm_model"] != sentinel
 
 
 async def test_post_external_model_change_dedupes_when_unchanged(

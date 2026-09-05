@@ -126,6 +126,7 @@ from omnigent.server.routes._sessions.common import (
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
+    _session_todos_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -194,6 +195,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session,
+    _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
     _persist_external_antigravity_subagent_start,
@@ -500,6 +502,27 @@ def register_events_routes(
         body: SessionEventInput,
     ) -> dict[str, bool | str]:
         """
+        Route entry for :func:`_post_event_impl`.
+
+        A message counts as in flight for the whole request — including any
+        runner launch it triggers — so the session list reports a booting
+        session as running instead of idle.
+        """
+        with contextlib.ExitStack() as in_flight:
+            return await _post_event_impl(
+                request,
+                session_id,
+                body,
+                in_flight=in_flight if body.type == "message" else None,
+            )
+
+    async def _post_event_impl(
+        request: Request,
+        session_id: str,
+        body: SessionEventInput,
+        in_flight: contextlib.ExitStack | None = None,
+    ) -> dict[str, bool | str]:
+        """
         Submit a session event (input message, tool output,
         approval, or interrupt).
 
@@ -575,6 +598,9 @@ def register_events_routes(
 
         :param session_id: Session/conversation identifier.
         :param body: The validated :class:`SessionEventInput`.
+        :param in_flight: When given, the session is marked as having a
+            dispatch in flight once the caller is authorized, for the rest
+            of the request.
         :returns: ``{"queued": True, "item_id": "..."}`` for
             item-typed events, where ``item_id`` is the persisted
             conversation item id also emitted by
@@ -591,6 +617,10 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        if in_flight is not None:
+            # Marked only after authorization, so an unauthorized caller
+            # cannot flip a session to "running" even transiently.
+            in_flight.enter_context(_mark_dispatch_in_flight(session_id))
         created_by = _attribution_user(user_id)
         body_created_by = _attribution_user(body.created_by)
         if body_created_by is not None:
@@ -1323,19 +1353,19 @@ def register_events_routes(
                 not isinstance(replayed, bool)
                 or (status == "activity_unverified" and replayed is not True)
                 or (
-                replayed
-                and (
-                    conv.kind != "sub_agent"
-                    or conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
-                    or status
-                    not in {
-                        "completed",
-                        "failed",
-                        "stopped",
-                        "killed",
-                        "activity_unverified",
-                    }
-                )
+                    replayed
+                    and (
+                        conv.kind != "sub_agent"
+                        or conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
+                        or status
+                        not in {
+                            "completed",
+                            "failed",
+                            "stopped",
+                            "killed",
+                            "activity_unverified",
+                        }
+                    )
                 )
             ):
                 raise OmnigentError(
@@ -1381,8 +1411,7 @@ def register_events_routes(
                 return {"queued": False}
             if (
                 conv.kind == "sub_agent"
-                and conv.labels.get("omnigent.wrapper")
-                == "claude-code-native-ui-subagent"
+                and conv.labels.get("omnigent.wrapper") == "claude-code-native-ui-subagent"
                 and conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
                 and status in {"running", "completed", "failed", "stopped", "killed"}
             ):
@@ -1434,6 +1463,19 @@ def register_events_routes(
             data = await _enrich_terminal_status_with_subagent_output(
                 body.data, status, session_id, conversation_store
             )
+            # Forward only the same bounded, typed display detail that the
+            # Server accepted. The Runner retains this across reconnects, so
+            # raw/nested/oversized task objects must not become resident there.
+            if bg_count is None:
+                data.pop("background_task_count", None)
+            else:
+                data["background_task_count"] = bg_count
+            if bg_tasks is None:
+                data.pop("background_tasks", None)
+            else:
+                data["background_tasks"] = [
+                    task.model_dump(exclude_none=True) for task in bg_tasks
+                ]
             if conv.kind == "sub_agent":
                 durable_terminal_status = "completed" if status == "idle" else status
                 if status == "running":
@@ -1675,7 +1717,7 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
-            _handle_external_session_todos(session_id, body)
+            await _handle_external_session_todos(session_id, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_GOAL_STATE_TYPE:
             await _persist_external_goal_state(session_id, conv, body, conversation_store)
@@ -2573,6 +2615,9 @@ def register_events_routes(
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.
         _pushed_model_options_cache.pop(session_id, None)
+        # The durable todo snapshot is deleted with the conversation, so its
+        # process-local fast path must go too.
+        _session_todos_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.
@@ -2597,7 +2642,7 @@ def register_events_routes(
             bound_host = await delete_lease.to_thread(
                 host_store_for_managed.get_host, conv.host_id
             )
-            if bound_host is not None and bound_host.sandbox_id is not None:
+            if bound_host is not None and bound_host.sandbox_provider is not None:
                 from omnigent.server.managed_hosts import terminate_managed_host
 
                 await delete_lease.run(

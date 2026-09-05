@@ -52,6 +52,12 @@ import {
 } from "@/components/chat/chatBubbleParts";
 
 export interface TranscriptProps {
+  /**
+   * Deferred conversation id — keys the `<Conversation>` subtree so it
+   * remounts at transition priority rather than blocking the interaction frame.
+   * Passed from ChatPage as `useDeferredValue(urlConvId)`.
+   */
+  conversationKey: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -75,6 +81,8 @@ export interface TranscriptProps {
   conversationId: string | null;
   scrollToBottomOnSessionOpen: boolean;
   openedConversationIdRef: { current: string | null };
+  /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
+  spacerMeasureRef: React.RefObject<(() => void) | null>;
 }
 
 /**
@@ -86,6 +94,7 @@ export interface TranscriptProps {
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
+  conversationKey,
   setConversationEl,
   containerEl,
   scroller,
@@ -101,6 +110,7 @@ function TranscriptImpl({
   conversationId,
   scrollToBottomOnSessionOpen,
   openedConversationIdRef,
+  spacerMeasureRef,
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
@@ -142,11 +152,6 @@ function TranscriptImpl({
     subagentRoutingOverride,
     sessionStatus,
   ]);
-
-  // Keys the transcript so a warm switch (no hydration remount) still re-runs
-  // its mount-only scroll-to-bottom and anchor capture. Store id, not the URL
-  // prop, which leads the mirrored blocks by a commit.
-  const activeConversationId = useChatStore((s) => s.conversationId);
 
   // Single nav instance shared by hotkey + buttons. System-message bubbles are
   // excluded — the hotkey is for navigating real user turns, not markers.
@@ -231,7 +236,7 @@ function TranscriptImpl({
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
-          key={activeConversationId ?? "landing"}
+          key={conversationKey ?? "landing"}
           className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}
         >
           <ConversationContent
@@ -312,6 +317,7 @@ function TranscriptImpl({
             <LatestTurnSpacer
               scrollElement={scroller?.el ?? null}
               topGapPx={hasTasks ? 16 : undefined}
+              measureRef={spacerMeasureRef}
             />
           </ConversationContent>
           <ConversationScrollButton />

@@ -1,4 +1,5 @@
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -42,6 +43,10 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  useCustomAgents: vi.fn(() => ({ data: [] })),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),

@@ -1174,7 +1174,7 @@ export function AgentHarnessPicker({
   // Back row), instead of opening a hover flyout. `mobilePage` is the open
   // group (null = the main list); inert on desktop.
   const isMobile = useIsMobileViewport();
-  const [mobilePage, setMobilePage] = useState<"more" | null>(null);
+  const [mobilePage, setMobilePage] = useState<"more" | "custom" | null>(null);
   // Reset to the main list whenever the menu closes so it never reopens on a
   // stale drill-in page.
   useEffect(() => {
@@ -1288,11 +1288,13 @@ export function AgentHarnessPicker({
   // Which mobile drill-in page is showing (gated so a group that vanished — e.g.
   // list refresh — can't strand the menu on an empty page).
   const showMore = isMobile && mobilePage === "more" && moreHarnessEntries.length > 0;
+  const showCustom = isMobile && mobilePage === "custom" && hasCustomGroup;
   // If the open page's group disappears (or the viewport grows to desktop),
   // fall back to the main list so a reopened menu never lands on an empty page.
   useEffect(() => {
     if (mobilePage === "more" && !showMore) setMobilePage(null);
-  }, [mobilePage, showMore]);
+    if (mobilePage === "custom" && !showCustom) setMobilePage(null);
+  }, [mobilePage, showMore, showCustom]);
 
   return (
     <DropdownMenu
@@ -1369,6 +1371,23 @@ export function AgentHarnessPicker({
             <DropdownMenuSeparator />
             {moreHarnessEntries.map(renderEntry)}
           </div>
+        ) : showCustom ? (
+          // Mobile drill-in page for custom agents.
+          <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+            <DropdownMenuItem
+              data-testid="new-chat-landing-page-back"
+              onSelect={(e) => {
+                e.preventDefault();
+                setMobilePage(null);
+              }}
+              className="items-center font-medium"
+            >
+              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
+              <span className="truncate">Custom agents</span>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            {customAgentsBody}
+          </div>
         ) : (
           <>
             {/* Smart Routing sits in its own unlabeled group above the
@@ -1436,8 +1455,31 @@ export function AgentHarnessPicker({
             {hasCustomGroup && (
               <>
                 <DropdownMenuSeparator />
-                <PickerSectionHeader>Custom agents</PickerSectionHeader>
-                {customAgentsBody}
+                {isMobile ? (
+                  <DropdownMenuItem
+                    data-testid="new-chat-landing-custom-agents"
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      setMobilePage("custom");
+                    }}
+                    className="items-center"
+                  >
+                    <span className="flex-1">Custom agents</span>
+                    <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
+                  </DropdownMenuItem>
+                ) : (
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger
+                      data-testid="new-chat-landing-custom-agents"
+                      className="cursor-pointer items-center"
+                    >
+                      <span className="flex-1">Custom agents</span>
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto">
+                      {customAgentsBody}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                )}
               </>
             )}
           </>

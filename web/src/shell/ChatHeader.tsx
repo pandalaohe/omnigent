@@ -130,6 +130,11 @@ interface ChatHeaderProps {
    */
   projectName: string | null;
   /**
+   * The filed project's chosen emoji icon (a unicode grapheme), or ``null``
+   * for the default folder glyph. Shown as the breadcrumb's leading segment.
+   */
+  projectIcon?: string | null;
+  /**
    * Route the title links to (the parent session, when inside a sub-agent),
    * making the title a way back out. ``undefined`` renders it as plain text.
    */
@@ -205,6 +210,7 @@ export function ChatHeader({
   actionConversation = null,
   conversationTitle,
   projectName,
+  projectIcon,
   titleLinkTo,
   boundAgent,
   wrapperLabel,
@@ -373,7 +379,11 @@ export function ChatHeader({
   // folder icon in the breadcrumb.
   const projectTag =
     !isMobile && actionConversation && !isChildSession ? (
-      <HeaderProjectTag conversationId={actionConversation.id} projectName={projectName} />
+      <HeaderProjectTag
+        conversationId={actionConversation.id}
+        projectName={projectName}
+        projectIcon={projectIcon}
+      />
     ) : null;
   // Click-to-rename on the breadcrumb title, same gating as the folder tag:
   // desktop, owner-managed top-level row. A sub-agent's title stays a
@@ -462,6 +472,7 @@ export function ChatHeader({
           <ConversationBreadcrumb
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
+            projectIcon={projectIcon}
             projectTag={projectTag ?? undefined}
             titleSlot={titleSlot ?? undefined}
             titleLinkTo={titleLinkTo}

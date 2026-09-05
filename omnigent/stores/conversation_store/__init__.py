@@ -719,6 +719,7 @@ class ConversationStore(ABC):
         archived_before: int | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
+        shared_only: bool = False,
         include_archived: bool = False,
         archived_only: bool = False,
         project: str | None = None,
@@ -941,6 +942,22 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def clear_model_override_if_matches(
+        self,
+        conversation_id: str,
+        expected_model_override: str,
+    ) -> bool:
+        """Clear a model selection only while the stored settings still match.
+
+        :param conversation_id: Conversation to update.
+        :param expected_model_override: Model selection that must still be stored.
+        :returns: ``True`` when cleared; ``False`` when missing, mismatched,
+            or any session override changed concurrently. Other settings and
+            metadata remain unchanged.
         """
         ...
 

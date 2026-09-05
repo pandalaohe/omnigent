@@ -9,6 +9,7 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
+    LargeBinary,
     Select,
     and_,
     asc,
@@ -2772,6 +2773,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         archived_before: int | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
+        shared_only: bool = False,
         include_archived: bool = False,
         archived_only: bool = False,
         project: str | None = None,
@@ -2845,6 +2847,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             (an ``owner``-level grant) — stricter than ``accessible_by``,
             which also matches sessions merely shared with them. Powers
             the per-project folder fetch. ``None`` disables the filter.
+        :param shared_only: When ``True``, restrict to sessions the user
+            can access but does NOT own — i.e. sessions shared with them
+            by another user. Requires ``accessible_by`` to be set.
+            ``False`` (default) disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -2871,7 +2877,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         # are filtered directly on the AP query below. The only filters that
         # still require an Omnigent-side prefetch are the permission scopes.
         needs_meta_filter = (
-            (accessible_by is not None) or (owned_by is not None) or (host_id is not None)
+            (accessible_by is not None)
+            or (owned_by is not None)
+            or (host_id is not None)
+            or shared_only
         )
 
         qualifying_ids: list[str] | None = None
@@ -2884,28 +2893,40 @@ class SqlAlchemyConversationStore(ConversationStore):
             with self._session("list_conversations") as meta_sess:
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
-                if accessible_by is not None:
+                if accessible_by is not None or shared_only:
+                    if shared_only and accessible_by is None:
+                        raise ValueError("shared_only=True requires accessible_by to be set")
+                    acl_user = accessible_by
                     accessible_set = set(
                         meta_sess.execute(
                             select(SqlSessionPermission.conversation_id).where(
                                 SqlSessionPermission.workspace_id == current_workspace_id(),
-                                SqlSessionPermission.user_id == accessible_by,
+                                SqlSessionPermission.user_id == acl_user,
                             )
                         ).scalars()
                     )
-                if owned_by is not None:
+                if owned_by is not None or shared_only:
+                    # shared_only needs the owned set to subtract from the
+                    # accessible set; use accessible_by as the user anchor when
+                    # owned_by isn't explicitly set (they refer to the same user).
+                    owner_user = owned_by if owned_by is not None else accessible_by
                     owned_set = set(
                         meta_sess.execute(
                             select(SqlSessionPermission.conversation_id).where(
                                 SqlSessionPermission.workspace_id == current_workspace_id(),
-                                SqlSessionPermission.user_id == owned_by,
+                                SqlSessionPermission.user_id == owner_user,
                                 SqlSessionPermission.level >= LEVEL_OWNER,
                             )
                         ).scalars()
                     )
-                qualifying_sets = [
-                    candidate for candidate in (accessible_set, owned_set) if candidate is not None
-                ]
+                if shared_only:
+                    qualifying_sets = [(accessible_set or set()) - (owned_set or set())]
+                else:
+                    qualifying_sets = [
+                        candidate
+                        for candidate in (accessible_set, owned_set)
+                        if candidate is not None
+                    ]
                 if host_id is not None:
                     qualifying_sets.append(
                         set(
@@ -3483,6 +3504,46 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             meta = self._get_meta(conversation_id)
         return _to_conversation(row, meta, labels)
+
+    def clear_model_override_if_matches(
+        self,
+        conversation_id: str,
+        expected_model_override: str,
+    ) -> bool:
+        """Clear only a matching model selection with an atomic settings compare-and-swap."""
+        workspace_id = current_workspace_id()
+        with self._conv_session("clear_model_override_if_matches") as session:
+            original = session.scalar(
+                select(SqlConversation.session_overrides).where(
+                    SqlConversation.workspace_id == workspace_id,
+                    SqlConversation.id == conversation_id,
+                )
+            )
+            overrides: dict[str, Any] = json.loads(original) if original else {}
+            if overrides.get("model_override") != expected_model_override:
+                return False
+            del overrides["model_override"]
+            encoded = json.dumps(overrides, separators=(",", ":")) if overrides else None
+            unchanged = SqlConversation.session_overrides == original
+            if self._conv_engine.dialect.name == "mysql":
+                # MySQL text collations can equate distinct, case-only model selections.
+                unchanged = SqlConversation.session_overrides.cast(LargeBinary) == (
+                    original.encode("utf-8") if original is not None else None
+                )
+            # Comparing the whole blob preserves concurrent updates to sibling settings too.
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == workspace_id,
+                        SqlConversation.id == conversation_id,
+                        unchanged,
+                    )
+                    .values(session_overrides=encoded, updated_at=now_epoch())
+                ),
+            )
+            return result.rowcount == 1
 
     def rename_conversation_if_title_matches(
         self,
