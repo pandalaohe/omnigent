@@ -9706,7 +9706,10 @@ async def _get_session_snapshot(
             ),
         )
 
-    status = _session_status_from_cache(session_id)
+    # Native runners inject a prompt and return before the CLI turn ends.
+    # Their generic GET status can therefore be idle while the persisted
+    # status-file/hook signal is still running. Preserve that signal on restart.
+    status = _session_status_from_cache(session_id, conv.live_status)
     if status == "idle":
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a

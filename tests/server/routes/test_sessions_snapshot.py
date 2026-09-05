@@ -596,6 +596,36 @@ async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("durable_status", ["running", "waiting", "failed"])
+async def test_snapshot_preserves_durable_status_after_server_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    durable_status: str,
+) -> None:
+    """A cold cache must not replace a persisted native turn with placeholder idle."""
+    _sessions_mod._session_status_cache.clear()
+    sid = "cef2fb55a9d4841cff0b30b2826d91f1"
+
+    class IdleRunner:
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            assert url != f"/v1/sessions/{sid}", "must preserve the durable live state"
+            raise ConnectionError("optional metadata unavailable")
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: IdleRunner())
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=sid,
+        live_status=durable_status,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+    )
+    store = _ConversationStore([], conversations={sid: conv})
+    snapshot = await _get_session_snapshot(store, sid)
+    assert snapshot.status == ("failed" if durable_status == "failed" else "running")
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_queries_runner_on_cache_miss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
