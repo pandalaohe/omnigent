@@ -3866,12 +3866,6 @@ function ConversationRow({
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
-        !selectionMode &&
-          goalState === "active" &&
-          "ring-1 ring-inset ring-status-green/70 bg-status-green/5 hover:bg-status-green/10 dark:bg-status-green/10 dark:hover:bg-status-green/15",
-        !selectionMode &&
-          goalState === "paused" &&
-          "ring-1 ring-inset ring-status-yellow/70 bg-status-yellow/5 hover:bg-status-yellow/10 dark:bg-status-yellow/10 dark:hover:bg-status-yellow/15",
       )}
       data-goal-state={goalState ?? undefined}
       onClick={(e) => {

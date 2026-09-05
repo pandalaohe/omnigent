@@ -12,7 +12,7 @@ export interface SessionNavigationPreferences {
   pollingActiveWindowHours: number | null;
   /** Keep sessions carrying the B marker behind non-background poll targets. */
   deprioritizeBackgroundSessions: boolean;
-  /** Show unofficial Goal outlines and G markers in the session list. */
+  /** Show the unofficial current-session Goal frame and sidebar G markers. */
   showGoalSessionMarkers: boolean;
   /** Open a selected session at its newest transcript content. */
   scrollToBottomOnSessionOpen: boolean;

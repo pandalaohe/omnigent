@@ -189,7 +189,7 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 }
 
 export function AppShell() {
-  const { nativeMobileHeaderMode } = useSessionNavigationPreferences();
+  const { nativeMobileHeaderMode, showGoalSessionMarkers } = useSessionNavigationPreferences();
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -445,6 +445,7 @@ export function AppShell() {
       conversationsData?.pages.flatMap((p) => p.data).find((c) => c.id === conversationId) ?? null
     );
   }, [conversationId, conversationsData]);
+  const goalFrameState = showGoalSessionMarkers ? (activeConv?.goal_state ?? null) : null;
   // Single-conversation snapshot (shared cache with chatStore.bindStream).
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
@@ -2091,6 +2092,19 @@ export function AppShell() {
                     liveness={liveness}
                     onShellCreateStart={markShellCreateStarted}
                     onShellCreateFailed={clearShellCreatePending}
+                  />
+                )}
+                {(goalFrameState === "active" || goalFrameState === "paused") && (
+                  <div
+                    aria-hidden="true"
+                    data-testid="session-goal-frame"
+                    data-goal-state={goalFrameState}
+                    className={cn(
+                      "pointer-events-none absolute inset-y-0 left-0 z-50 ring-2 ring-inset",
+                      goalFrameState === "active" && "ring-status-green/80",
+                      goalFrameState === "paused" && "ring-status-yellow/80",
+                    )}
+                    style={{ right: "var(--workspace-panel-offset)" }}
                   />
                 )}
               </div>

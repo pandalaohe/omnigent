@@ -509,7 +509,7 @@ describe("Sidebar session list", () => {
     expect(within(renderedRow).getByTestId("background-activity-badge")).toBeInTheDocument();
   });
 
-  it("shows green active and yellow paused Goal rows with a G badge", () => {
+  it("shows active and paused Goal rows with a G badge but no row frame", () => {
     mockConversations([
       conv("conv_goal_active", "Codex", { title: "Active goal", goal_state: "active" }),
       conv("conv_goal_paused", "Claude Code", { title: "Paused goal", goal_state: "paused" }),
@@ -519,14 +519,14 @@ describe("Sidebar session list", () => {
 
     const active = screen.getByText("Active goal").closest("a")!;
     expect(active).toHaveAttribute("data-goal-state", "active");
-    expect(active).toHaveClass("ring-status-green/70");
+    expect(active).not.toHaveClass("ring-status-green/70");
     expect(within(active.closest("li")!).getByTestId("goal-activity-badge")).toHaveAccessibleName(
       "Goal active",
     );
 
     const paused = screen.getByText("Paused goal").closest("a")!;
     expect(paused).toHaveAttribute("data-goal-state", "paused");
-    expect(paused).toHaveClass("ring-status-yellow/70");
+    expect(paused).not.toHaveClass("ring-status-yellow/70");
     expect(within(paused.closest("li")!).getByTestId("goal-activity-badge")).toHaveAccessibleName(
       "Goal paused",
     );

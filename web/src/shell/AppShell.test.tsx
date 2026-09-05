@@ -23,6 +23,10 @@ import {
   writeSessionWorkspaceState,
 } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import {
+  readSessionNavigationPreferences,
+  writeSessionNavigationPreferences,
+} from "@/lib/sessionNavigationPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -464,6 +468,7 @@ function mockConversations(
     runner_id?: string | null;
     workspace?: string | null;
     created_at?: number;
+    goal_state?: "active" | "paused" | null;
   }[],
 ) {
   useConvMock.mockReturnValue({
@@ -481,6 +486,7 @@ function mockConversations(
             host_id: c.host_id ?? null,
             runner_id: c.runner_id ?? null,
             workspace: c.workspace ?? null,
+            goal_state: c.goal_state ?? null,
           })),
           first_id: null,
           last_id: null,
@@ -564,6 +570,42 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+describe("Goal session frame", () => {
+  it("frames the complete active chat column and leaves the workspace outside", () => {
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: "active" }]);
+    renderShell("/c/conv_goal");
+
+    const frame = screen.getByTestId("session-goal-frame");
+    expect(frame).toHaveAttribute("data-goal-state", "active");
+    expect(frame).toHaveClass("inset-y-0", "left-0", "ring-status-green/80");
+    expect(frame).toHaveStyle({ right: "var(--workspace-panel-offset)" });
+  });
+
+  it("uses yellow for a paused Goal", () => {
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: "paused" }]);
+    renderShell("/c/conv_goal");
+
+    const frame = screen.getByTestId("session-goal-frame");
+    expect(frame).toHaveAttribute("data-goal-state", "paused");
+    expect(frame).toHaveClass("ring-status-yellow/80");
+  });
+
+  it("removes the frame after completion and when the preference is off", () => {
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: null }]);
+    const completed = renderShell("/c/conv_goal");
+    expect(screen.queryByTestId("session-goal-frame")).toBeNull();
+    completed.unmount();
+
+    writeSessionNavigationPreferences({
+      ...readSessionNavigationPreferences(),
+      showGoalSessionMarkers: false,
+    });
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: "active" }]);
+    renderShell("/c/conv_goal");
+    expect(screen.queryByTestId("session-goal-frame")).toBeNull();
+  });
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
@@ -2543,10 +2585,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Archive/i })).toBeInTheDocument();
     // The tab-fallback effect lands on Agents, the first available tab.
     await waitFor(() =>
-      expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      ),
+      expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true"),
     );
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
@@ -2690,10 +2729,7 @@ describe("Right workspace card visibility", () => {
     first.unmount();
 
     renderShell("/c/conv_explicit_b");
-    expect(screen.getByRole("tab", { name: /Archive/i })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(screen.getByRole("tab", { name: /Archive/i })).toHaveAttribute("aria-selected", "true");
   });
 
   it("restores the open file tabs per session (independent of the ?file= param)", () => {
