@@ -101,6 +101,8 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     DeletionClaimResult,
     NativeReplayConflictError,
+    NativeSubagentReconcileFingerprint,
+    NativeSubagentReconcileWriteResult,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -3611,6 +3613,171 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(live_status=encode_session_live_status(status))
             )
+
+    def get_native_subagent_reconcile_fingerprint(
+        self,
+        conversation_id: str,
+        label_keys: tuple[str, ...],
+    ) -> NativeSubagentReconcileFingerprint | None:
+        """Return the state a native sub-agent terminal probe must freeze."""
+        conv = self.get_conversation(conversation_id)
+        if conv is None:
+            return None
+        latest = self.list_items(conversation_id, limit=1, order="desc")
+        with self._conv_session("native_subagent_reconcile_label_fingerprint") as session:
+            rows = session.execute(
+                select(
+                    SqlConversationLabel.key,
+                    SqlConversationLabel.value,
+                    SqlConversationLabel.updated_at,
+                ).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(label_keys),
+                )
+            ).all()
+        present = {key: (value, updated_at) for key, value, updated_at in rows}
+        return NativeSubagentReconcileFingerprint(
+            conversation_id=conversation_id,
+            parent_conversation_id=conv.parent_conversation_id,
+            runner_id=conv.runner_id,
+            host_id=conv.host_id,
+            external_session_id=conv.external_session_id,
+            live_status=conv.live_status,
+            latest_item_id=latest.data[0].id if latest.data else None,
+            label_states=tuple(
+                (key, present[key][0], present[key][1]) if key in present else (key, None, None)
+                for key in label_keys
+            ),
+        )
+
+    def reconcile_native_subagent_status(
+        self,
+        expected: NativeSubagentReconcileFingerprint,
+        *,
+        live_status: str,
+        label_updates: dict[str, str],
+    ) -> NativeSubagentReconcileWriteResult:
+        """Conditionally persist a native child terminal state in one transaction."""
+        # Conversation hierarchy/items/labels may be configured on a separate
+        # Agent Platform database. There is no distributed transaction across
+        # those engines, so refuse the repair instead of exposing a TOCTOU gap.
+        if self._engine is not self._conv_engine:
+            return "unsupported"
+
+        workspace_id = current_workspace_id()
+        with self._conv_session_immediate("reconcile_native_subagent_status") as session:
+            # append() takes this same lock before allocating a new item. This
+            # makes the latest-item comparison and the repair linearizable.
+            self._lock_conversation(session, expected.conversation_id)
+            conv_row = session.get(
+                SqlConversation,
+                (workspace_id, expected.conversation_id),
+            )
+            if (
+                conv_row is None
+                or conv_row.parent_conversation_id != expected.parent_conversation_id
+            ):
+                return "stale"
+
+            meta_query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == workspace_id,
+                SqlConversationMetadata.id == expected.conversation_id,
+            )
+            if self._meta_supports_for_update:
+                meta_query = meta_query.with_for_update()
+            meta = session.scalars(meta_query).first()
+            current_live_status = (
+                decode_session_live_status(meta.live_status)
+                if meta is not None and meta.live_status is not None
+                else None
+            )
+            if meta is None or current_live_status != expected.live_status:
+                return "stale"
+            if (
+                meta.runner_id != expected.runner_id
+                or meta.host_id != expected.host_id
+                or meta.external_session_id != expected.external_session_id
+            ):
+                return "stale"
+
+            latest_item_id = session.execute(
+                select(SqlConversationItem.id)
+                .where(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == expected.conversation_id,
+                )
+                .order_by(SqlConversationItem.position.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest_item_id != expected.latest_item_id:
+                return "stale"
+
+            label_keys = tuple(key for key, _value, _stamp in expected.label_states)
+            label_query = select(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == workspace_id,
+                SqlConversationLabel.conversation_id == expected.conversation_id,
+                SqlConversationLabel.key.in_(label_keys),
+            )
+            if self._supports_for_update:
+                label_query = label_query.with_for_update()
+            current_rows = session.scalars(label_query).all()
+            current_labels = {row.key: (row.value, row.updated_at) for row in current_rows}
+            current_label_states = tuple(
+                (key, current_labels[key][0], current_labels[key][1])
+                if key in current_labels
+                else (key, None, None)
+                for key in label_keys
+            )
+            if current_label_states != expected.label_states:
+                return "stale"
+
+            stamp = now_epoch()
+            missing_updates = {
+                key: value for key, value in label_updates.items() if key not in current_labels
+            }
+            if missing_updates:
+                dialect = session.bind.dialect.name if session.bind is not None else ""
+                if dialect not in ("sqlite", "postgresql"):
+                    return "unsupported"
+                rows = [
+                    {
+                        "conversation_id": expected.conversation_id,
+                        "key": key,
+                        "value": value[:LABEL_VALUE_MAX_LEN],
+                        "updated_at": stamp,
+                    }
+                    for key, value in missing_updates.items()
+                ]
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as guarded_insert
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as guarded_insert
+
+                insert_result = session.execute(
+                    guarded_insert(SqlConversationLabel)
+                    .values(rows)
+                    .on_conflict_do_nothing(
+                        index_elements=["workspace_id", "conversation_id", "key"]
+                    )
+                )
+                # Existing label rows are protected by SELECT FOR UPDATE.
+                # Missing rows need an insert-if-absent reservation: if a
+                # concurrent status writer won any key, abort the entire CAS
+                # rather than overwriting that newer edge via UPSERT below.
+                if getattr(insert_result, "rowcount", -1) != len(rows):
+                    session.rollback()
+                    return "stale"
+
+            meta.live_status = encode_session_live_status(live_status)
+            if label_updates:
+                _upsert_labels(
+                    session,
+                    expected.conversation_id,
+                    label_updates,
+                    stamp,
+                )
+            return "corrected"
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """

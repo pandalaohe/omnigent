@@ -77,6 +77,7 @@ import {
   type AgentStatus,
 } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
+import { ReconcileSubagentsButton } from "./ReconcileSubagentsButton";
 
 // Session-scoped URL params that the file viewer / Files panel write
 // for one session and AppShell's restore effect re-reads on the next.
@@ -135,6 +136,17 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   const toggleCollapsedRow = (id: string) => {
     setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
   };
+  const recheckButton =
+    rootSession != null &&
+    isOwnerLevel(rootSession.permissionLevel) &&
+    rootSession.labels?.[WRAPPER_LABEL_KEY] === "claude-code-native-ui" &&
+    children.length > 0 ? (
+      <ReconcileSubagentsButton
+        key={rootSessionId}
+        rootSessionId={rootSessionId}
+        childIds={children.map((child) => child.id)}
+      />
+    ) : null;
 
   // Loading/error states only surface when there's no cached data to
   // show alongside the "main" row.
@@ -156,7 +168,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   if (viewMode === "graph") {
     return (
       <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <ViewModeToggle
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+          recheckButton={recheckButton}
+        />
         <Suspense
           fallback={
             <div className="flex h-full flex-1 items-center justify-center text-sm text-muted-foreground">
@@ -172,7 +188,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+      <ViewModeToggle
+        viewMode={viewMode}
+        onViewModeChange={setViewMode}
+        recheckButton={recheckButton}
+      />
       <button
         type="button"
         data-testid="add-agent-button"
@@ -256,12 +276,15 @@ function SubagentStopDialog({ target, onClose }: { target: StopTarget; onClose: 
 function ViewModeToggle({
   viewMode,
   onViewModeChange,
+  recheckButton,
 }: {
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
+  recheckButton: React.ReactNode;
 }) {
   return (
     <div className="flex shrink-0 items-center justify-end gap-0.5 border-b px-2 py-1">
+      {recheckButton}
       <Button
         variant={viewMode === "list" ? "secondary" : "ghost"}
         size="icon-xs"

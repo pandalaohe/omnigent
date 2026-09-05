@@ -21,6 +21,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
 )
@@ -32,11 +33,17 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
     get_server_runner_router,
     set_server_runner_router,
 )
+from omnigent.server.routes._sessions.helpers import _get_runner_client
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
+)
+from omnigent.server.routes._sessions.subagent_reconciliation import (
+    reconcile_native_subagents,
 )
 from omnigent.server.schemas import (
     ChildSessionList,
@@ -45,6 +52,8 @@ from omnigent.server.schemas import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+_subagent_reconcile_locks: dict[str, asyncio.Lock] = {}
 
 
 def register_items_routes(
@@ -112,6 +121,100 @@ def register_items_routes(
             last_id=page.last_id,
             has_more=page.has_more,
         )
+
+    @router.post(
+        "/sessions/{session_id}/child_sessions/reconcile",
+        response_model=None,
+    )
+    async def reconcile_child_sessions(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, object]:
+        """Verify and repair stale direct native sub-agent status metadata.
+
+        The action is owner-only and intentionally accepts no child ids. It
+        freezes every direct child, asks the already-bound runner for a
+        read-only parent-transcript verdict, then applies each reliable
+        terminal result through a store compare-and-set. It never launches or
+        resumes a runner and never writes conversation items or parent inboxes.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+        parent = access.conversation
+        if parent is None:
+            parent = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if parent is None:
+            raise _session_not_found()
+        if (
+            parent.parent_conversation_id is not None
+            or parent.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+        ):
+            raise OmnigentError(
+                "Sub-agent status reconciliation is available only on a root Claude Code session.",
+                code=ErrorCode.CONFLICT,
+            )
+
+        page = await asyncio.to_thread(
+            conversation_store.list_conversations,
+            limit=1000,
+            kind="sub_agent",
+            parent_conversation_id=session_id,
+            order="desc",
+            sort_by="created_at",
+            include_archived=False,
+        )
+        if page.has_more:
+            raise OmnigentError(
+                "This session has more than 1000 direct children; no state was changed.",
+                code=ErrorCode.CONFLICT,
+            )
+        # Re-check ownership on every selected child. Child authorization
+        # normally delegates to this parent, but retaining the per-resource
+        # check keeps a malformed hierarchy from broadening this mutation.
+        for child in page.data:
+            await _require_access_and_level(
+                user_id,
+                child.id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+            )
+
+        lock = _subagent_reconcile_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            raise OmnigentError(
+                "Sub-agent status is already being checked for this session.",
+                code=ErrorCode.CONFLICT,
+            )
+        try:
+            async with lock:
+                runner_client = await _get_runner_client(
+                    session_id,
+                    get_server_runner_router(),
+                    conversation=parent,
+                )
+                if runner_client is None:
+                    raise OmnigentError(
+                        "The Host is offline or has no active runner for this session; reconnect it and try again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                return await reconcile_native_subagents(
+                    parent_session_id=session_id,
+                    parent=parent,
+                    children=page.data,
+                    conversation_store=conversation_store,
+                    runner_client=runner_client,
+                )
+        finally:
+            if not lock.locked() and _subagent_reconcile_locks.get(session_id) is lock:
+                _subagent_reconcile_locks.pop(session_id, None)
 
     @router.get(
         "/sessions/{session_id}/items/window",

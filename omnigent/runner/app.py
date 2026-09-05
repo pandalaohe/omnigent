@@ -4318,6 +4318,82 @@ def create_runner_app(
             },
         )
 
+    @app.get("/v1/sessions/{session_id}/native_subagent_status")
+    async def get_native_subagent_status(session_id: str) -> JSONResponse:
+        """Return read-only Host evidence for this Claude-native parent's children."""
+        if process_manager is None:
+            return JSONResponse(
+                status_code=501,
+                content={
+                    "error": "not_implemented",
+                    "detail": "Native sub-agent status needs a HarnessProcessManager.",
+                },
+            )
+        if not process_manager.has_session(session_id):
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "not_found",
+                    "detail": f"No session '{session_id}' on this runner.",
+                },
+            )
+        harness = _session_harness_name(session_id)
+        if harness is not None and harness != "claude-native":
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "not_found",
+                    "detail": f"Session '{session_id}' is not a Claude-native parent.",
+                },
+            )
+
+        from omnigent.claude_native_status_probe import (
+            NativeSubagentProbeError,
+            probe_native_subagent_status,
+        )
+
+        envelope = _fresh_session_init_envelope(session_id)
+        labels = envelope.snapshot.labels if envelope is not None else None
+        bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            server_client=server_client,
+            session_id=session_id,
+            session_labels=labels,
+        )
+        try:
+            result = await asyncio.to_thread(
+                probe_native_subagent_status,
+                parent_session_id=session_id,
+                bridge_id=bridge_id,
+            )
+        except NativeSubagentProbeError as exc:
+            return JSONResponse(
+                status_code=exc.http_status,
+                content={"error": exc.code, "detail": exc.detail},
+            )
+        terminal_registry_for_probe = resource_registry.terminal_registry
+        for child in result["children"]:
+            if child["status"] != "terminal":
+                continue
+            child_id = child["server_session_id"]
+            has_independent_terminal = (
+                terminal_registry_for_probe is not None
+                and terminal_registry_for_probe.get(child_id, "claude", "main") is not None
+            )
+            if (
+                process_manager.has_session(child_id)
+                or process_manager.has_active_turn(child_id)
+                or child_id in _active_turns
+                or _native_pane_status.get(child_id) in {"running", "waiting"}
+                or has_independent_terminal
+            ):
+                # The parent evidence proves the original Task/Agent dispatch
+                # ended. It cannot terminalize a child the user later resumed
+                # as its own conversation/runtime.
+                child["status"] = "unverified"
+                child["terminal_status"] = None
+                child["reason"] = "independent_child_runtime_present"
+        return JSONResponse(status_code=200, content=result)
+
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
         turn_task = _active_turns.pop(session_id, None)
@@ -8612,7 +8688,7 @@ def create_runner_app(
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
-            if status in (
+            if isinstance(data, dict) and status in (
                 "running",
                 "waiting",
                 "idle",
@@ -8630,7 +8706,7 @@ def create_runner_app(
                     else None
                 )
                 raw_tasks = data.get("background_tasks")
-                bg_tasks = (
+                bg_tasks: list[dict[str, object]] | None = (
                     [
                         {
                             key: value

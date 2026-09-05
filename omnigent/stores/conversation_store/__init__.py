@@ -92,6 +92,33 @@ DELETION_CLAIM_HEARTBEAT_INTERVAL_S = 60
 
 DeletionClaimResult = Literal["claimed", "locked", "busy", "not_found"]
 ArchiveLockWriteResult = Literal["updated", "busy", "not_found"]
+NativeSubagentReconcileWriteResult = Literal["corrected", "stale", "unsupported"]
+
+
+@dataclass(frozen=True)
+class NativeSubagentReconcileFingerprint:
+    """Frozen server state used to guard one native sub-agent repair.
+
+    The reconciliation endpoint obtains external terminal evidence from the
+    already-running native runner. That round trip must not be allowed to
+    overwrite a newer relay edge, transcript item, or failure detail that
+    arrived while it was in flight. The store therefore compares this full
+    fingerprint again inside the same transaction that applies the repair.
+
+    ``label_states`` carries ``(key, value, updated_at)`` triples. Missing
+    labels are represented by ``(key, None, None)`` so an insertion during the
+    probe is observable too.
+    """
+
+    conversation_id: str
+    parent_conversation_id: str | None
+    runner_id: str | None
+    host_id: str | None
+    external_session_id: str | None
+    live_status: str | None
+    latest_item_id: str | None
+    label_states: tuple[tuple[str, str | None, int | None], ...]
+
 
 # Reserved label-key PREFIX that records whether a session is "pinned" in the
 # sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
@@ -1414,6 +1441,38 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        """
+        ...
+
+    @abstractmethod
+    def get_native_subagent_reconcile_fingerprint(
+        self,
+        conversation_id: str,
+        label_keys: tuple[str, ...],
+    ) -> NativeSubagentReconcileFingerprint | None:
+        """Freeze the state needed for a read-only native child probe.
+
+        :param conversation_id: Direct child conversation to inspect.
+        :param label_keys: Identity, terminal, unverified, and failure-label
+            keys whose values and write timestamps must remain unchanged.
+        :returns: A fingerprint, or ``None`` when the child does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def reconcile_native_subagent_status(
+        self,
+        expected: NativeSubagentReconcileFingerprint,
+        *,
+        live_status: str,
+        label_updates: dict[str, str],
+    ) -> NativeSubagentReconcileWriteResult:
+        """Apply a terminal repair only while *expected* still matches.
+
+        The comparison and writes are one transaction. Implementations that
+        split conversations/labels and Omnigent metadata across independent
+        databases must return ``"unsupported"`` instead of weakening the
+        compare-and-set guarantee.
         """
         ...
 

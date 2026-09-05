@@ -36,6 +36,7 @@ from omnigent.claude_native_bridge import (
     read_claude_session_id,
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
+    read_latest_transcript_goal_state,
     read_message_deltas_from_offset,
     read_permission_mode,
     read_transcript_items_from_offset,
@@ -596,6 +597,12 @@ class _ForwardDedupeState:
     posted_title: str | None = None
     posted_goal_state: str | None = None
     posted_goal_state_known: bool = False
+    observed_goal_state: str | None = None
+    observed_goal_state_known: bool = False
+    observed_goal_byte_offset: int = -1
+    goal_recovery_path: Path | None = None
+    goal_recovery_file_id: tuple[int, int] | None = None
+    goal_recovery_max_size: int = -1
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
     # Kept to suppress duplicate posts when S hasn't advanced.
@@ -1025,6 +1032,7 @@ async def forward_claude_transcript_to_session(
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
                     transcript_path = read_transcript_path(bridge_dir)
                     if transcript_path is not None:
+                        previous_state = state
                         state = await _ensure_state_for_transcript(
                             bridge_dir=bridge_dir,
                             state=state,
@@ -1032,6 +1040,11 @@ async def forward_claude_transcript_to_session(
                             start_at_end=start_at_end,
                             session_id=current_session_id,
                             start_at_offset=start_at_offset,
+                        )
+                        await _recover_goal_state_from_transcript(
+                            transcript_path=transcript_path,
+                            dedupe=dedupe,
+                            force=(previous_state is not None and previous_state != state),
                         )
                         # Read deltas first for the lowest-latency preview. The
                         # runtime reconciler handles either delta/item order.
@@ -1677,6 +1690,7 @@ def _structured_terminal_evidence(
     for notification in result.task_notifications:
         if (
             notification.tool_use_id is not None
+            and notification.status is not None
             and notification.status in _SUBAGENT_TERMINAL_STATUSES
         ):
             evidence[notification.tool_use_id] = (
@@ -2152,7 +2166,9 @@ async def _forward_available_subagents(
                 desired_status = (
                     entry.terminal_status
                     if entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES
-                    else "activity_unverified" if entry.activity_unverified else None
+                    else "activity_unverified"
+                    if entry.activity_unverified
+                    else None
                 )
                 if desired_status is not None:
                     retry_key = f"subagent_status:{entry.child_conversation_id}"
@@ -4292,6 +4308,17 @@ async def _forward_available_items(
     result = await asyncio.to_thread(
         _read_transcript_items_for_state, state, agent_name, dedupe.settled_response_id
     )
+    if result.goal_state_observed and result.byte_offset >= dedupe.observed_goal_byte_offset:
+        dedupe.observed_goal_state = result.latest_goal_state
+        dedupe.observed_goal_state_known = True
+        dedupe.observed_goal_byte_offset = result.byte_offset
+    await _post_observed_goal_state_if_needed(
+        client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        dedupe=dedupe,
+        retry_tracker=retry_tracker,
+    )
     items = result.items
     if not items:
         if result.line_cursor == state.line_cursor and result.byte_offset == (
@@ -4626,17 +4653,102 @@ async def _forward_available_items(
         dedupe=dedupe,
         title=result.latest_custom_title,
     )
-    if result.goal_state_observed and (
-        not dedupe.posted_goal_state_known or result.latest_goal_state != dedupe.posted_goal_state
+    return updated
+
+
+async def _recover_goal_state_from_transcript(
+    *,
+    transcript_path: Path,
+    dedupe: _ForwardDedupeState,
+    force: bool = False,
+) -> None:
+    """Recover Goal metadata once for a transcript generation.
+
+    Reattach cursors intentionally skip old message records. Goal state is
+    session metadata, so it is recovered independently without moving that
+    cursor or replaying any conversation item.
+    """
+    try:
+        file_stat = await asyncio.to_thread(transcript_path.stat)
+    except OSError:
+        return
+    file_id = (file_stat.st_dev, file_stat.st_ino)
+    same_file = (
+        dedupe.goal_recovery_path == transcript_path and dedupe.goal_recovery_file_id == file_id
+    )
+    shrank = same_file and file_stat.st_size < dedupe.goal_recovery_max_size
+    if not force and same_file and not shrank:
+        dedupe.goal_recovery_max_size = max(dedupe.goal_recovery_max_size, file_stat.st_size)
+        return
+    # Offsets and pending posts belong to one file generation. Absence of a
+    # Goal record in its replacement is not an instruction to clear the Goal.
+    dedupe.observed_goal_state = None
+    dedupe.observed_goal_state_known = False
+    dedupe.observed_goal_byte_offset = -1
+    dedupe.posted_goal_state_known = False
+    try:
+        snapshot = await asyncio.to_thread(read_latest_transcript_goal_state, transcript_path)
+        scanned_stat = await asyncio.to_thread(transcript_path.stat)
+    except OSError:
+        return
+    scanned_file_id = (scanned_stat.st_dev, scanned_stat.st_ino)
+    if scanned_file_id != file_id or scanned_stat.st_size < file_stat.st_size:
+        return
+    dedupe.goal_recovery_path = transcript_path
+    dedupe.goal_recovery_file_id = file_id
+    dedupe.goal_recovery_max_size = scanned_stat.st_size
+    if not snapshot.goal_state_observed:
+        return
+    dedupe.observed_goal_state = snapshot.latest_goal_state
+    dedupe.observed_goal_state_known = True
+    dedupe.observed_goal_byte_offset = snapshot.byte_offset
+    # A new transcript generation may be reconnecting to a Server whose
+    # provider-neutral label was not restored. Re-assert the recovered value.
+    dedupe.posted_goal_state_known = False
+
+
+async def _post_observed_goal_state_if_needed(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    dedupe: _ForwardDedupeState,
+    retry_tracker: _PostRetryTracker,
+) -> None:
+    """Post the latest observed Goal state, retaining it across HTTP failures."""
+    if not dedupe.observed_goal_state_known or (
+        dedupe.posted_goal_state_known and dedupe.posted_goal_state == dedupe.observed_goal_state
     ):
+        return
+    retry_key = (
+        f"goal:{dedupe.observed_goal_byte_offset}:"
+        f"{dedupe.observed_goal_state if dedupe.observed_goal_state is not None else 'none'}"
+    )
+    if retry_tracker.retry_delay_s(retry_key) is not None:
+        return
+    try:
         await _post_external_goal_state(
             client,
             session_id=session_id,
-            state=result.latest_goal_state,
+            state=dedupe.observed_goal_state,
         )
-        dedupe.posted_goal_state = result.latest_goal_state
-        dedupe.posted_goal_state_known = True
-    return updated
+    except httpx.HTTPError as exc:
+        decision = retry_tracker.record_failure(retry_key, exc)
+        _logger.warning(
+            "Failed to forward Claude Goal state; session=%s bridge_dir=%s "
+            "attempt=%s next_retry_s=%.3f http_status=%s",
+            session_id,
+            bridge_dir,
+            decision.attempts,
+            decision.delay_s,
+            _http_status_for_log(exc),
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    retry_tracker.clear(retry_key)
+    dedupe.posted_goal_state = dedupe.observed_goal_state
+    dedupe.posted_goal_state_known = True
 
 
 def _read_hook_events_for_state(
