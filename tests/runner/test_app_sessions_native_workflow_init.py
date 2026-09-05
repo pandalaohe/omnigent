@@ -2276,6 +2276,39 @@ async def test_get_session_status_running() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native_status", ["running", "waiting", "idle", "failed"])
+async def test_get_session_preserves_native_turn_status(native_status: str) -> None:
+    """Native CLI turns outlive their short-lived prompt-injection task."""
+    app, _pm, _hc = _build_lifecycle_app()
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        # Exercise the installed poller publisher, including its five-argument contract.
+        app.state.session_resource_registry._session_status_publisher(
+            session_id, native_status, None, 0, []
+        )
+        response = await client.get(f"/v1/sessions/{session_id}")
+        assert response.status_code == 200
+        assert response.json()["status"] == native_status
+        # A hook update reaches the runner through /events, not the poller.
+        # GET and an idempotent rebind must both keep that newer state.
+        changed = "waiting" if native_status != "waiting" else "running"
+        await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "external_session_status", "data": {"status": changed}},
+        )
+        assert (await client.get(f"/v1/sessions/{session_id}")).json()["status"] == changed
+        rebound = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert rebound.json()["status"] == changed
+
+
+@pytest.mark.asyncio
 async def test_get_session_unknown() -> None:
     """``GET /v1/sessions/{id}`` returns 404 for unknown session."""
     app, _pm, _hc = _build_lifecycle_app()

@@ -4151,7 +4151,13 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
-        status = "running" if session_id in _active_turns else "idle"
+        status = (
+            "running"
+            if session_id in _active_turns
+            else _native_pane_status.get(session_id, "idle")
+        )
+        if status in {"completed", "stopped", "killed"}:
+            status = "idle"
         return JSONResponse(
             status_code=201,
             content={
@@ -4269,7 +4275,11 @@ def create_runner_app(
                 },
             )
         has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
-        status = "running" if has_turn else "idle"
+        # Native prompt injection returns before the CLI finishes its turn.
+        # Serve the same observed status that the live stream publishes.
+        status = "running" if has_turn else _native_pane_status.get(session_id, "idle")
+        if status in {"completed", "stopped", "killed"}:
+            status = "idle"
         agent_id = _session_agent_ids.get(session_id)
         if agent_id is None:
             return JSONResponse(
@@ -8640,6 +8650,9 @@ def create_runner_app(
                     background_task_count=bg_count,
                     background_tasks=bg_tasks,
                 )
+                # These edges are already published by the server; retain them
+                # for GET/rebind without emitting a second completion edge.
+                _native_pane_status[conversation_id] = status
                 _fan_out_child_delta_to_parent(
                     conversation_id,
                     {"type": "session.status", "status": status},
