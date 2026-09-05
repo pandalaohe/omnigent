@@ -169,6 +169,8 @@ export interface Conversation {
   workspace?: string | null;
   /** Durable identifier of the bound agent, e.g. ``"ag_abc123"``. */
   agent_id?: string;
+  /** Stable source template identity, retained across runtime clones. */
+  agent_template_id?: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
   agent_name?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
@@ -437,6 +439,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     host_id: wire.host_id ?? null,
     workspace: wire.workspace ?? null,
     agent_id: wire.agent_id,
+    agent_template_id: wire.agent_template_id ?? undefined,
     agent_name: wire.agent_name ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
     status: wire.status ?? "idle",

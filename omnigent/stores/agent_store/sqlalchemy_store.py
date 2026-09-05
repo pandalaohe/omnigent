@@ -9,9 +9,11 @@ from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    InvalidUuidError,
     SqlAgent,
     SqlConversation,
     current_workspace_id,
+    uuid_to_bytes,
 )
 from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import (
@@ -275,6 +277,44 @@ class SqlAlchemyAgentStore(AgentStore):
                 )
             ).all()
             return {row.id: row.name for row in rows}
+
+    def get_template_ids(self, agent_ids: builtins.list[str]) -> dict[str, str]:
+        """Batch identity lookup; no per-session database queries or name guessing."""
+        if not agent_ids:
+            return {}
+        with self._session("select_agent_template_ids") as session:
+            rows = session.execute(
+                select(SqlAgent.id, SqlAgent.kind, SqlAgent.bundle_location).where(
+                    SqlAgent.workspace_id == current_workspace_id(), SqlAgent.id.in_(agent_ids)
+                )
+            ).all()
+            result = {row.id: row.id for row in rows if row.kind == encode_agent_kind("template")}
+            origins: dict[str, str] = {}
+            for row in rows:
+                if row.kind == encode_agent_kind("template"):
+                    continue
+                try:
+                    origins[row.id] = uuid_to_bytes(row.bundle_location.split("/", 1)[0]).hex()
+                except InvalidUuidError:
+                    continue
+            if origins:
+                templates = set(
+                    session.scalars(
+                        select(SqlAgent.id).where(
+                            SqlAgent.workspace_id == current_workspace_id(),
+                            SqlAgent.kind == encode_agent_kind("template"),
+                            SqlAgent.id.in_(set(origins.values())),
+                        )
+                    )
+                )
+                result.update(
+                    {
+                        agent_id: origin
+                        for agent_id, origin in origins.items()
+                        if origin in templates
+                    }
+                )
+            return result
 
     def update(
         self,

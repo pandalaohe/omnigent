@@ -4384,12 +4384,13 @@ def test_fork_conversation_copies_labels(
         bundle_location="f1afc45b190c3da9cec1acf12aa3600f/fakehash",
     )
     source = conversation_store.create_conversation(agent_id="f1afc45b190c3da9cec1acf12aa3600f")
-    conversation_store.set_labels(source.id, {"sensitivity": "high", "dept": "eng"})
+    source_labels = {"sensitivity": "high", "dept": "eng", "omnigent:agent-template-id": "ca_test"}
+    conversation_store.set_labels(source.id, source_labels)
 
     fork = conversation_store.fork_conversation(source.id)
     # Both labels must be copied — a mismatch means the store's fork
     # skipped the label-copy step or only copied partial keys.
-    assert fork.labels == {"sensitivity": "high", "dept": "eng"}, (
+    assert fork.labels == source_labels, (
         "Fork should inherit all labels from the source conversation"
     )
 
@@ -5069,6 +5070,8 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         {
             instance_label: "1",
             "omnigent.last_provider_usage_limits": '{"source":"claude"}',
+            "omnigent:agent-template-id": "ca_old",
+            "unrelated": "preserved",
             # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
             # switch (a new agent/harness context) drops it rather than
             # silently re-arming bypass without a fresh typed confirmation.
@@ -5126,6 +5129,8 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     # New agent bound; old session-scoped agent deleted (unique session_id
     # index would otherwise be violated by leaving both).
     assert updated.agent_id == "9d2c8d5e342b7da390dc38351c49fb72"
+    assert "omnigent:agent-template-id" not in updated.labels
+    assert updated.labels["unrelated"] == "preserved"
     assert agent_store.get("af75a9579488e3520ba6842699e43323") is None, (
         "old session-scoped agent must be deleted on switch"
     )

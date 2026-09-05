@@ -27,6 +27,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "session_navigation",
         "context_indicator",
         "usage_context",
+        "agent_badges",
     }
 )
 

@@ -22,6 +22,7 @@ export const BUILTIN_AGENTS = new Set([
   "goose-native-ui", // Goose
   "qwen-native-ui", // Qwen Code
   "kimi-native-ui", // Kimi
+  "codex-sdk",
   "polly",
   "debby",
 ]);
@@ -69,6 +70,7 @@ export const AGENT_DISPLAY_ORDER = [
   "Antigravity",
   "Qwen Code",
   "Kimi",
+  "Codex SDK",
   "Polly",
   "Debby",
 ];

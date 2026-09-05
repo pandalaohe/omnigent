@@ -80,6 +80,7 @@ UserPreferenceNamespace = Literal[
     "session_navigation",
     "context_indicator",
     "usage_context",
+    "agent_badges",
 ]
 
 
@@ -2136,6 +2137,7 @@ class SessionResponse(BaseModel):
 
     id: str
     agent_id: str
+    agent_template_id: str | None = None
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
@@ -2688,6 +2690,7 @@ class SessionListItem(BaseModel):
 
     id: str
     agent_id: str
+    agent_template_id: str | None = None
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     foreground_status: Literal["idle", "running", "failed"]

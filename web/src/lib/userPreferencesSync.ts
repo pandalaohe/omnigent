@@ -3,7 +3,8 @@ export type UserPreferenceNamespace =
   | "mobile_assistant"
   | "session_navigation"
   | "context_indicator"
-  | "usage_context";
+  | "usage_context"
+  | "agent_badges";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -33,6 +34,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     usage_context: {
       storageKey: "omnigent:usage-context-preferences",
       eventName: "omnigent:usage-context-preferences-changed",
+    },
+    agent_badges: {
+      storageKey: "omnigent:agent-badge-preferences",
+      eventName: "omnigent:agent-badge-preferences-changed",
     },
   };
 

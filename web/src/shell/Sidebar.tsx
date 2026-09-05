@@ -1,3 +1,5 @@
+import { AgentBadge } from "@/components/AgentBadge";
+import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
 import {
   type ComponentType,
   type CSSProperties,
@@ -3904,6 +3906,14 @@ function ConversationRow({
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
       <div className="flex w-full items-center gap-1.5">
+        <AgentBadge
+          agentId={
+            conversation.labels[AGENT_TEMPLATE_LABEL] ??
+            conversation.agent_template_id ??
+            conversation.agent_id ??
+            null
+          }
+        />
         <span
           className={cn(
             "relative min-w-0 truncate",

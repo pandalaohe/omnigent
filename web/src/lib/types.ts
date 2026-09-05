@@ -264,6 +264,7 @@ export interface BackgroundTaskInfo {
 export interface Session {
   id: string;
   agentId: string;
+  agentTemplateId?: string | null;
   /**
    * Human-readable name of the bound agent, e.g. ``"research-agent"``.
    * Populated from ``SessionResponse.agent_name`` on the wire. ``null``

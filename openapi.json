@@ -568,6 +568,11 @@
       "ChildSessionSummary": {
         "description": "Summary of a sub-agent (child) session under a parent session.\n\nPowers `GET /v1/sessions/{id}/child_sessions`. Lets the web /\nREPL debug surface enumerate sub-agent calls spawned from a\nparent session without parsing parent `function_call_output`\nJSON handles (the legacy TUI Ctrl+O path). The endpoint is the\ncanonical \"historical truth\" source; the existing transient\n`session.created` SSE event handles live incremental updates.\n\nFields are derived from the child `Conversation` plus its\nlatest `Task` (newest by `created_at`).",
         "properties": {
+          "activity_unverified": {
+            "default": false,
+            "title": "Activity Unverified",
+            "type": "boolean"
+          },
           "agent_id": {
             "anyOf": [
               {
@@ -1066,6 +1071,21 @@
             "description": "The model used to generate the summary, e.g. `\"openai/gpt-4o\"`.",
             "title": "Model"
           },
+          "snapshot_source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "transcript",
+                  "hook_fallback"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Source"
+          },
           "summary": {
             "description": "The LLM-generated summary text covering all conversation items up through `last_item_id`, e.g. `\"User asked to analyze a dataset. Agent loaded data.csv and computed statistics.\"`.",
             "title": "Summary",
@@ -1500,6 +1520,63 @@
           "response"
         ],
         "title": "CreatedEvent",
+        "type": "object"
+      },
+      "CustomAgentPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 8192,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "maxLength": 262144,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "title": "CustomAgentPatch",
         "type": "object"
       },
       "DailyCost": {
@@ -5567,6 +5644,17 @@
             "description": "Human-readable name of the bound agent, e.g. `\"research-agent\"`. `None` when the agent row cannot be found.",
             "title": "Agent Name"
           },
+          "agent_template_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Template Id"
+          },
           "archived": {
             "default": false,
             "description": "Whether the session is archived. Archived sessions are returned by `GET /v1/sessions` only when the request passes `include_archived=true`; the sidebar groups them into a dedicated \"Archived\" section. `False` for normal sessions.",
@@ -6413,6 +6501,17 @@
             ],
             "description": "Human-readable name of the bound agent, e.g. `\"research-agent\"`. Loaded from the agent row at snapshot-build time. `None` when the agent row cannot be found (deleted or orphaned session).",
             "title": "Agent Name"
+          },
+          "agent_template_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Template Id"
           },
           "archived": {
             "default": false,
@@ -8768,7 +8867,8 @@
                 "mobile_assistant",
                 "session_navigation",
                 "context_indicator",
-                "usage_context"
+                "usage_context",
+                "agent_badges"
               ]
             },
             "title": "Settings",
@@ -9128,6 +9228,253 @@
           }
         },
         "summary": "Branding Logo"
+      }
+    },
+    "/v1/custom-agents": {
+      "get": {
+        "operationId": "list_custom_agents_v1_custom_agents_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Custom Agents V1 Custom Agents Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Custom Agents",
+        "tags": [
+          "custom-agents"
+        ]
+      },
+      "post": {
+        "operationId": "create_custom_agent_v1_custom_agents_post",
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Custom Agent V1 Custom Agents Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Custom Agent",
+        "tags": [
+          "custom-agents"
+        ]
+      }
+    },
+    "/v1/custom-agents/{agent_id}": {
+      "delete": {
+        "operationId": "delete_custom_agent_v1_custom_agents__agent_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Custom Agent",
+        "tags": [
+          "custom-agents"
+        ]
+      },
+      "get": {
+        "operationId": "get_custom_agent_v1_custom_agents__agent_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Custom Agent V1 Custom Agents  Agent Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Custom Agent",
+        "tags": [
+          "custom-agents"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_custom_agent_v1_custom_agents__agent_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomAgentPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Patch Custom Agent V1 Custom Agents  Agent Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Custom Agent",
+        "tags": [
+          "custom-agents"
+        ]
+      }
+    },
+    "/v1/custom-agents/{agent_id}/contents": {
+      "get": {
+        "operationId": "get_custom_agent_contents_v1_custom_agents__agent_id__contents_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/gzip": {},
+              "application/x-tar": {}
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Custom Agent Contents",
+        "tags": [
+          "custom-agents"
+        ]
       }
     },
     "/v1/dictation/punctuation": {
@@ -10422,7 +10769,8 @@
                 "mobile_assistant",
                 "session_navigation",
                 "context_indicator",
-                "usage_context"
+                "usage_context",
+                "agent_badges"
               ],
               "title": "Namespace",
               "type": "string"
@@ -12312,6 +12660,47 @@
           }
         },
         "summary": "List Child Sessions",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/child_sessions/reconcile": {
+      "post": {
+        "description": "Verify and repair stale direct native sub-agent status metadata.\n\nThe action is owner-only and intentionally accepts no child ids. It\nfreezes every direct child, asks the already-bound runner for a\nread-only parent-transcript verdict, then applies each reliable\nterminal result through a store compare-and-set. It never launches or\nresumes a runner and never writes conversation items or parent inboxes.",
+        "operationId": "reconcile_child_sessions_v1_sessions__session_id__child_sessions_reconcile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconcile Child Sessions",
         "tags": [
           "sessions"
         ]

@@ -1413,6 +1413,25 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
     )
 
     assert seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
+    assert seed_stores.agent_store.get_by_name("codex-sdk") is not None
+
+
+def test_codex_sdk_seed_is_distinct_and_uses_host_defaults(seed_stores: _SeedStores) -> None:
+    from omnigent.db.utils import builtin_agent_id
+
+    for _ in range(2):
+        server_app._ensure_default_codex_sdk_agent(
+            seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+        )
+    agent = seed_stores.agent_store.get_by_name("codex-sdk")
+    assert agent is not None
+    assert agent.id == builtin_agent_id("codex-sdk")
+    assert agent.id != builtin_agent_id("codex-native-ui")
+    assert agent.version == 1
+    loaded = seed_stores.agent_cache.load(agent.id, agent.bundle_location)
+    assert loaded.spec.executor.harness_kind == "codex"
+    assert loaded.spec.executor.model is None
+    assert loaded.spec.executor.auth is None
 
 
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:

@@ -146,6 +146,27 @@ async def test_preferences_api_initializes_merges_and_returns_from_me(
             "showMobileTitle": True,
         }
 
+        patched = await client.patch(
+            "/v1/me/preferences/agent_badges",
+            headers=headers,
+            json={
+                "value": {
+                    "version": 1,
+                    "enabled": False,
+                    "entries": {
+                        "agent-a": {
+                            "label": "A",
+                            "borderColor": "#123456",
+                            "textColor": "#abcdef",
+                        }
+                    },
+                }
+            },
+        )
+        assert patched.status_code == 200
+        assert patched.json()["settings"]["agent_badges"]["enabled"] is False
+        assert "agent-a" in patched.json()["settings"]["agent_badges"]["entries"]
+
         synced_me = await client.get("/v1/me", headers=headers)
         assert synced_me.json()["preferences"] == patched.json()
 

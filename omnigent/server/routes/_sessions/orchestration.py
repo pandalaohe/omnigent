@@ -804,6 +804,7 @@ def _build_session_list_item(
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
     activity_unverified_child_ids: set[str] | None = None,
+    agent_template_ids: Mapping[str, str] | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -863,6 +864,7 @@ def _build_session_list_item(
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
+        agent_template_id=(agent_template_ids or {}).get(conv.agent_id),
         status=(
             "idle"
             if own_activity_unverified
@@ -1149,6 +1151,13 @@ def _build_session_response(
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
+        agent_template_id=(
+            getattr(agent_store, "get_template_ids", lambda _ids: {})([conv.agent_id]).get(
+                conv.agent_id
+            )
+            if agent_store is not None and conv.agent_id is not None
+            else None
+        ),
         agent_name=agent_name,
         status=status,
         background_task_count=background_task_count,

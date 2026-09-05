@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "./contextIndicatorPreferences";
+import { AGENT_BADGE_STORAGE_KEY } from "./agentBadgePreferences";
 import { KEYBOARD_SHORTCUTS_STORAGE_KEY } from "./keyboardShortcutPreferences";
 import { MOBILE_ASSISTANT_STORAGE_KEY } from "./mobileAssistantPreferences";
 import {
@@ -33,12 +34,14 @@ describe("custom control portability", () => {
     localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, "mobile");
     localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, "navigation");
     localStorage.setItem(CONTEXT_INDICATOR_STORAGE_KEY, "compact");
+    localStorage.setItem(AGENT_BADGE_STORAGE_KEY, "badges");
 
     expect(collectSettings()?.settings).toMatchObject({
       [KEYBOARD_SHORTCUTS_STORAGE_KEY]: "keyboard",
       [MOBILE_ASSISTANT_STORAGE_KEY]: "mobile",
       [SESSION_NAVIGATION_STORAGE_KEY]: "navigation",
       [CONTEXT_INDICATOR_STORAGE_KEY]: "compact",
+      [AGENT_BADGE_STORAGE_KEY]: "badges",
     });
 
     applyImportedSettings({ version: 1, settings: {} });
@@ -46,6 +49,7 @@ describe("custom control portability", () => {
     expect(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY)).toBeNull();
     expect(localStorage.getItem(SESSION_NAVIGATION_STORAGE_KEY)).toBeNull();
     expect(localStorage.getItem(CONTEXT_INDICATOR_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(AGENT_BADGE_STORAGE_KEY)).toBeNull();
   });
 
   it("notifies same-tab session navigation consumers after import", () => {

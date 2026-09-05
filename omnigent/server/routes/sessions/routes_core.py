@@ -1314,6 +1314,7 @@ def register_core_routes(
         # The tasks table has been removed — status comes exclusively from
         # the relay-fed ``_session_status_cache``.
         unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
+        agent_template_ids = await asyncio.to_thread(agent_store.get_template_ids, unique_agent_ids)
         perms_by_conv: dict[str, list[SessionPermission]]
         if permission_store is not None:
             perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
@@ -1358,6 +1359,7 @@ def register_core_routes(
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                agent_template_ids=agent_template_ids,
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
@@ -1475,6 +1477,7 @@ def register_core_routes(
         if not convs:
             return []
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
+        agent_template_ids = await asyncio.to_thread(agent_store.get_template_ids, unique_agent_ids)
         conv_ids = [c.id for c in convs]
         agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
             asyncio.to_thread(agent_store.get_names, unique_agent_ids),
@@ -1500,6 +1503,7 @@ def register_core_routes(
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                agent_template_ids=agent_template_ids,
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
@@ -2734,6 +2738,7 @@ def register_core_routes(
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.add("omnigent:agent-template-id")
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always

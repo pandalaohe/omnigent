@@ -1,5 +1,6 @@
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -75,6 +76,10 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  useCustomAgents: vi.fn(() => ({ data: [], isPending: false, error: null })),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({
@@ -1819,10 +1824,8 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick the non-default agent (Radix opens on pointerdown). "second_agent"
-    // is a custom agent, so it lives in the "Custom agents" submenu.
+    // Pick the non-default agent from the selection-only menu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_two"));
     // The explicit pick persists immediately — no session has to be created
     // for the preference to stick.

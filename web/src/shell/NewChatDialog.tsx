@@ -272,7 +272,13 @@ import {
 } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
-import { CreateAgentDialog } from "./CreateAgentDialog";
+import { AgentBadge } from "@/components/AgentBadge";
+import {
+  AGENT_TEMPLATE_LABEL,
+  customAgentBundle,
+  customAgentForPicker,
+  useCustomAgents,
+} from "@/lib/customAgentsApi";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
@@ -1092,9 +1098,7 @@ export function AgentHarnessPicker({
   pendingAgent,
   pendingAgentId,
   onSelectPending,
-  onCreateCustomAgent,
   sandboxSelected,
-  allowCreateCustomAgent = true,
   onOpenChange,
   dropdownModal = true,
   contentClassName,
@@ -1116,7 +1120,7 @@ export function AgentHarnessPicker({
   pendingAgent: AgentBundleInput | null;
   pendingAgentId: string;
   onSelectPending: () => void;
-  onCreateCustomAgent: () => void;
+  onCreateCustomAgent?: () => void;
   sandboxSelected: boolean;
   /** Whether to offer the "Create custom agent" action. Defaults true; an
    *  embedder that only picks an existing agent (e.g. project settings) can
@@ -1170,7 +1174,7 @@ export function AgentHarnessPicker({
   // Back row), instead of opening a hover flyout. `mobilePage` is the open
   // group (null = the main list); inert on desktop.
   const isMobile = useIsMobileViewport();
-  const [mobilePage, setMobilePage] = useState<"more" | "custom" | null>(null);
+  const [mobilePage, setMobilePage] = useState<"more" | null>(null);
   // Reset to the main list whenever the menu closes so it never reopens on a
   // stale drill-in page.
   useEffect(() => {
@@ -1216,9 +1220,11 @@ export function AgentHarnessPicker({
         key={agent.id}
         data-testid={`new-chat-landing-agent-${agent.id}`}
         data-active={active ? "true" : undefined}
+        disabled={sandboxSelected && agent.id.startsWith("ca_")}
         onSelect={() => onSelectAgent(agent)}
         className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
       >
+        <AgentBadge agentId={agent.id} />
         {renderRowInner(agent, true)}
         {renderBadge(agent)}
       </DropdownMenuItem>
@@ -1259,30 +1265,7 @@ export function AgentHarnessPicker({
     [agentEntries],
   );
 
-  // Existing custom / pending agents fold into a "Custom agents" submenu so a
-  // long roster doesn't crowd the recommended picks. When there are none, the
-  // submenu would hold only the create action — which is a poor place to
-  // discover it — so we surface "Create custom agent" as a top-level row
-  // instead (see below). The submenu therefore renders only when there is at
-  // least one custom / pending agent to group.
-  const hasCustomAgents = customEntries.length > 0 || pendingAgent != null;
-  // "Create custom agent" is reachable on any non-sandbox target (a managed
-  // sandbox has no create path for an uploaded bundle), unless the embedder
-  // opts out (it has no create flow to route the action to).
-  const canCreateAgent = !sandboxSelected && allowCreateCustomAgent;
-  const createAgentItem = canCreateAgent ? (
-    <DropdownMenuItem
-      data-testid="new-chat-landing-create-agent"
-      onSelect={onCreateCustomAgent}
-      className="text-muted-foreground"
-    >
-      <PlusIcon className="size-3.5" />
-      Create custom agent
-    </DropdownMenuItem>
-  ) : null;
-  const hasCustomGroup = hasCustomAgents;
-  // Shared body for the custom-agents submenu (desktop flyout + mobile page):
-  // the custom agents, the pending upload, and the create action.
+  const hasCustomGroup = customEntries.length > 0 || pendingAgent != null;
   const customAgentsBody = (
     <>
       {customEntries.map(renderEntry)}
@@ -1300,24 +1283,16 @@ export function AgentHarnessPicker({
           </div>
         </DropdownMenuItem>
       )}
-      {canCreateAgent && (
-        <>
-          <DropdownMenuSeparator />
-          {createAgentItem}
-        </>
-      )}
     </>
   );
   // Which mobile drill-in page is showing (gated so a group that vanished — e.g.
   // list refresh — can't strand the menu on an empty page).
   const showMore = isMobile && mobilePage === "more" && moreHarnessEntries.length > 0;
-  const showCustom = isMobile && mobilePage === "custom" && hasCustomGroup;
   // If the open page's group disappears (or the viewport grows to desktop),
   // fall back to the main list so a reopened menu never lands on an empty page.
   useEffect(() => {
     if (mobilePage === "more" && !showMore) setMobilePage(null);
-    if (mobilePage === "custom" && !showCustom) setMobilePage(null);
-  }, [mobilePage, showMore, showCustom]);
+  }, [mobilePage, showMore]);
 
   return (
     <DropdownMenu
@@ -1353,6 +1328,7 @@ export function AgentHarnessPicker({
             triggerClassName,
           )}
         >
+          <AgentBadge agentId={autoHarnessActive ? null : effectiveAgentId} />
           <span
             className={cn("max-w-[12rem] truncate text-ui text-foreground", triggerLabelClassName)}
           >
@@ -1392,23 +1368,6 @@ export function AgentHarnessPicker({
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             {moreHarnessEntries.map(renderEntry)}
-          </div>
-        ) : showCustom ? (
-          // Mobile drill-in page for custom agents.
-          <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
-            <DropdownMenuItem
-              data-testid="new-chat-landing-page-back"
-              onSelect={(e) => {
-                e.preventDefault();
-                setMobilePage(null);
-              }}
-              className="items-center font-medium"
-            >
-              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
-              <span className="truncate">Custom agents</span>
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            {customAgentsBody}
           </div>
         ) : (
           <>
@@ -1468,45 +1427,19 @@ export function AgentHarnessPicker({
                 <DropdownMenuSeparator />
               </>
             )}
-            {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
-            <PickerSectionHeader>Agents</PickerSectionHeader>
-            {bundleEntries.map(renderEntry)}
-            {/* Existing custom agents fold into a "Custom agents" submenu (with
-            the pending upload and the create action). With no custom agents the
-            submenu would hold only "Create custom agent", so we surface that as
-            a top-level row instead — otherwise creation is invisible on a fresh
-            server. A managed sandbox has no create path, so neither appears. */}
-            {hasCustomGroup &&
-              (isMobile ? (
-                // Touch: drill into a "Custom agents" page in place (with Back).
-                <DropdownMenuItem
-                  data-testid="new-chat-landing-custom-agents"
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    setMobilePage("custom");
-                  }}
-                  className="items-center"
-                >
-                  <span className="flex-1">Custom agents</span>
-                  <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
-                </DropdownMenuItem>
-              ) : (
-                // Desktop: hover flyout submenu.
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger
-                    data-testid="new-chat-landing-custom-agents"
-                    className="cursor-pointer items-center"
-                  >
-                    <span className="flex-1">Custom agents</span>
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto">
-                    {customAgentsBody}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-              ))}
-            {/* No custom agents to group: surface the create action directly so
-            it stays discoverable instead of hiding behind an empty submenu. */}
-            {!hasCustomGroup && createAgentItem}
+            {bundleEntries.length > 0 && (
+              <>
+                <PickerSectionHeader>Built-in agents</PickerSectionHeader>
+                {bundleEntries.map(renderEntry)}
+              </>
+            )}
+            {hasCustomGroup && (
+              <>
+                <DropdownMenuSeparator />
+                <PickerSectionHeader>Custom agents</PickerSectionHeader>
+                {customAgentsBody}
+              </>
+            )}
           </>
         )}
       </DropdownMenuContent>
@@ -2294,9 +2227,11 @@ export function NewChatLandingScreen() {
   // Pin the configured project agent into discovery so the recency-bounded
   // session scan (or its same-name dedup) can't drop or id-swap it out of
   // the picker — the config must seed the agent the project actually pinned.
-  const { data: agents } = useAvailableAgents({
+  const { data: serverAgents } = useAvailableAgents({
     pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
   });
+  const customCatalog = useCustomAgents();
+  const agents = serverAgents;
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
   const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
@@ -2310,7 +2245,16 @@ export function NewChatLandingScreen() {
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
 
-  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
+  const agentList = useMemo(
+    () =>
+      selectableSessionAgents([
+        ...(agents ?? []).filter(
+          (agent) => !agent.templateId || agent.id === prefillConfig?.agentId,
+        ),
+        ...(customCatalog.data ?? []).map(customAgentForPicker),
+      ]),
+    [agents, customCatalog.data, prefillConfig?.agentId],
+  );
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -2332,7 +2276,6 @@ export function NewChatLandingScreen() {
   // here and the picker switches to a virtual "pending" agent entry. On
   // form submit, handleCreate detects the pending bundle, builds the
   // tar.gz, and uses multipart POST instead of the normal JSON path.
-  const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [pendingAgent, setPendingAgent] = useState<AgentBundleInput | null>(null);
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
@@ -3137,7 +3080,7 @@ export function NewChatLandingScreen() {
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
         ? pickedAgentId
-        : configuredAgentUnavailable
+        : configuredAgentUnavailable || pickedAgentId?.startsWith("ca_")
           ? null
           : (agentList[0]?.id ?? null);
   const selectedAgent = useMemo(
@@ -3197,14 +3140,16 @@ export function NewChatLandingScreen() {
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
   // lives only in the modal, so an agent with just that still needs the gear.
+  // Private catalog sessions launch the saved bundle configuration.
   const selectedAgentHasKnobs =
-    supportsPermissionMode ||
-    supportsApprovalMode ||
-    supportsCursorMode ||
-    supportsAgySkipPermissions ||
-    supportsModelPicker ||
-    smartRoutingEligible ||
-    (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
+    !effectiveAgentId?.startsWith("ca_") &&
+    (supportsPermissionMode ||
+      supportsApprovalMode ||
+      supportsCursorMode ||
+      supportsAgySkipPermissions ||
+      supportsModelPicker ||
+      smartRoutingEligible ||
+      (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll));
   // Label/value pairs summarizing the selected agent's current run-config, for
   // the gear icon's hover tooltip. Mirrors the modal's per-capability rows so a
   // user can read the active settings without opening it. "Default" = an unset
@@ -4009,6 +3954,7 @@ export function NewChatLandingScreen() {
   const canSubmit =
     (message.trim().length > 0 || files.length > 0) &&
     selectedAgent != null &&
+    !(sandboxSelected && effectiveAgentId?.startsWith("ca_")) &&
     (sandboxSelected ? sandboxRepoValid : !!selectedHostId && workspaceValid) &&
     !creating;
 
@@ -4024,9 +3970,11 @@ export function NewChatLandingScreen() {
         ? "Please choose a host and working directory"
         : configuredAgentUnavailable && selectedAgent == null
           ? "This project's configured agent is unavailable — pick an agent to continue"
-          : message.trim().length === 0 && files.length === 0
-            ? "Enter a message to get started"
-            : null;
+          : sandboxSelected && effectiveAgentId?.startsWith("ca_")
+            ? "Custom agents require a connected computer"
+            : message.trim().length === 0 && files.length === 0
+              ? "Enter a message to get started"
+              : null;
 
   // Chip display labels.
   const workspaceLabel = workspaceTrimmed ? basename(workspaceTrimmed) : "Working directory";
@@ -4394,7 +4342,7 @@ export function NewChatLandingScreen() {
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
       // survives reload.
       const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
+        !effectiveAgentId?.startsWith("ca_") && agentSupportsApprovalMode && bypassSandbox
           ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
           : nativeLabels;
       // First-class project filing: a project-driven visit whose `?project=`
@@ -4427,33 +4375,34 @@ export function NewChatLandingScreen() {
       // "Sessions" section while the search-indexed session list catches up to
       // the move. A `project_id` create needs no label: the row is born with
       // first-class membership (and a label would go stale on project rename).
+      const inheritedLabels = selectedAgent?.templateId
+        ? { ...(baseLabels ?? {}), [AGENT_TEMPLATE_LABEL]: selectedAgent.templateId }
+        : baseLabels;
       const createLabels =
         selectedProject && createProjectId === null
-          ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
-          : baseLabels;
+          ? { ...(inheritedLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
+          : inheritedLabels;
 
       let data: { id: string };
 
-      if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
+      const customTemplate = customCatalog.data?.find((entry) => entry.id === effectiveAgentId);
+      if ((effectiveAgentId === PENDING_AGENT_ID && pendingAgent) || customTemplate) {
+        if (sandboxSelected) throw new Error("Custom agents require a connected computer.");
         // Custom agent path: build bundle client-side and use multipart POST.
         // The multipart create only stores the agent + session rows — it does
         // NOT launch a runner on the host. We must follow up with launchRunner
         // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
         // same way the fork-resume path does.
-        const bundle = await buildAgentBundle(pendingAgent);
+        const bundle = customTemplate
+          ? await customAgentBundle(customTemplate.id)
+          : await buildAgentBundle(pendingAgent!);
         const metadata: Record<string, unknown> = {};
-        // A config-seeded workspace is omitted on a `project_id` create so the
-        // server default-fills it (same field semantics as the JSON path).
         if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
-        if (createProjectId !== null) {
-          // Atomic filing: the server sets first-class `project_id` at create.
-          metadata.project_id = createProjectId;
-        } else if (selectedProject) {
-          // Born-filed: stamp the project's `omni_project` label so a bundled
-          // session groups under its project from its first sidebar appearance,
-          // same as the JSON path (see `createLabels`).
-          metadata.labels = { [PROJECT_LABEL_KEY]: selectedProject };
-        }
+        if (createProjectId !== null) metadata.project_id = createProjectId;
+        metadata.labels = {
+          ...(createLabels ?? {}),
+          ...(customTemplate ? { [AGENT_TEMPLATE_LABEL]: customTemplate.id } : {}),
+        };
         const bundled = await createBundledSession(
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
@@ -4652,7 +4601,7 @@ export function NewChatLandingScreen() {
       // storage eagerly so an immediate Send cannot observe stale state; this
       // successful-create snapshot also covers restored drafts and every
       // harness-specific creation path.
-      if (!smartRoutingHarnessSelected) {
+      if (!smartRoutingHarnessSelected && !customTemplate) {
         const launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
           supportsPermissionMode: agentSupportsPermissionMode,
@@ -5097,7 +5046,6 @@ export function NewChatLandingScreen() {
                     pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                     pendingAgentId={PENDING_AGENT_ID}
                     onSelectPending={handleSelectPending}
-                    onCreateCustomAgent={() => setCreateAgentOpen(true)}
                     sandboxSelected={sandboxSelected}
                     triggerTooltip={
                       smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
@@ -5967,16 +5915,6 @@ export function NewChatLandingScreen() {
       />
 
       {/* Create custom agent dialog — opened from the agent picker dropdown. */}
-      <CreateAgentDialog
-        open={createAgentOpen}
-        onOpenChange={setCreateAgentOpen}
-        onCreate={(input) => {
-          setPendingAgent(input);
-          agentFromConfigRef.current = false;
-          setPickedAgentId(PENDING_AGENT_ID);
-          setPickedHarness(null);
-        }}
-      />
     </div>
   );
 }

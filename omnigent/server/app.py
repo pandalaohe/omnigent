@@ -61,6 +61,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -76,6 +77,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
+from omnigent.server.routes.custom_agents import create_custom_agents_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.extension_assets import create_extension_assets_router
@@ -262,6 +264,7 @@ WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_CODEX_SDK_AGENT_NAME = "codex-sdk"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 
@@ -312,6 +315,7 @@ def _error_audit_extra(
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
+_CODEX_SDK_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "codex-sdk.yaml"
 
 
 class _FastAPICallNext(Protocol):
@@ -674,6 +678,7 @@ def _ensure_default_agents(
     """
     _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
+    _ensure_default_codex_sdk_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -945,6 +950,30 @@ def _ensure_default_acp_agents(
         )
 
 
+def _build_codex_sdk_bundle() -> bytes:
+    """Package the SDK configuration under the standard config.yaml entry."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = Path(tmpdir)
+        (bundle_dir / "config.yaml").write_bytes(_CODEX_SDK_BUNDLE_SOURCE.read_bytes())
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_codex_sdk_agent(
+    agent_store: AgentStore, artifact_store: ArtifactStore, agent_cache: Any
+) -> None:
+    if not _CODEX_SDK_BUNDLE_SOURCE.is_file():
+        return
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_CODEX_SDK_AGENT_NAME,
+        bundle_bytes=_build_codex_sdk_bundle(),
+    )
+
+
 def _build_debby_bundle() -> bytes:
     """
     Build a gzipped tarball of the ``examples/debby`` agent bundle.
@@ -1076,6 +1105,7 @@ def create_app(
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
+    custom_agents_store: CustomAgentsStore | None = None,
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
     debug_router_modules: list[str] | None = None,
@@ -2750,6 +2780,24 @@ def create_app(
         prefix="/v1",
         tags=["usage"],
     )
+    # The private library never inserts tenant bundles into trusted templates.
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    if custom_agents_store is None and isinstance(agent_store, SqlAlchemyAgentStore):
+        custom_agents_store = CustomAgentsStore(agent_store.storage_location)
+    if custom_agents_store is not None:
+        app.include_router(
+            create_custom_agents_router(
+                custom_agents_store,
+                artifact_store,
+                agent_store,
+                conversation_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["custom-agents"],
+        )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
     # built-in (session_id IS NULL) agents for the new-session picker.

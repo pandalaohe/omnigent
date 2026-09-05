@@ -115,6 +115,10 @@ class AgentStore(ABC):
         """
         ...
 
+    def get_template_ids(self, agent_ids: builtins.list[str]) -> dict[str, str]:  # noqa: ARG002
+        """Optional authoritative template origins for display, absent on legacy stores."""
+        return {}
+
     @abstractmethod
     def update(
         self,

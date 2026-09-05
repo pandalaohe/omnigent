@@ -23,6 +23,31 @@ describe("user preference synchronization", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("collects and hydrates the Agent badge namespace", async () => {
+    const badgePreferences = {
+      version: 1,
+      enabled: false,
+      entries: {
+        "agent-a": { label: "A", borderColor: "#123456", textColor: "#abcdef" },
+      },
+    };
+    localStorage.setItem("omnigent:agent-badge-preferences", JSON.stringify(badgePreferences));
+    expect(collectLocalUserPreferences().settings.agent_badges).toEqual(badgePreferences);
+
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: { agent_badges: { ...badgePreferences, enabled: true } },
+      },
+      vi.fn(),
+    );
+
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-badge-preferences") ?? "null")).toEqual({
+      ...badgePreferences,
+      enabled: true,
+    });
+  });
+
   it("cancels queued sync when switching to an older Server", async () => {
     vi.useFakeTimers();
     const currentServer = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));

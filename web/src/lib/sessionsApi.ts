@@ -106,6 +106,7 @@ interface ModelUsageWire {
 interface SessionResponseWire {
   id: string;
   agent_id: string;
+  agent_template_id?: string | null;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
   agent_name?: string | null;
   runner_id?: string | null;
@@ -312,6 +313,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   return {
     id: wire.id,
     agentId: wire.agent_id,
+    ...(wire.agent_template_id !== undefined ? { agentTemplateId: wire.agent_template_id } : {}),
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,

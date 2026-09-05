@@ -1,3 +1,4 @@
+import { writeAgentBadgePreferences } from "@/lib/agentBadgePreferences";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
@@ -298,6 +299,32 @@ function seedPins(ids: string[]) {
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
+  it("shows the source builtin badge on a cloned runtime and keeps the global off switch", () => {
+    writeAgentBadgePreferences({
+      version: 1,
+      enabled: true,
+      entries: { seeded: { label: "研", borderColor: "#a78bfa", textColor: "#e9d5ff" } },
+    });
+    mockConversations([
+      conv("clone", "codex-sdk", {
+        title: "Cloned session",
+        agent_id: "random-runtime",
+        agent_template_id: "seeded",
+      }),
+    ]);
+    renderSidebar();
+    const row = screen.getByText("Cloned session").closest("li")!;
+    expect(within(row).getByTestId("agent-badge")).toHaveTextContent("研");
+    act(() =>
+      writeAgentBadgePreferences({
+        version: 1,
+        enabled: false,
+        entries: { seeded: { label: "研", borderColor: "#a78bfa", textColor: "#e9d5ff" } },
+      }),
+    );
+    expect(within(row).queryByTestId("agent-badge")).toBeNull();
+  });
+
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
     renderSidebar();

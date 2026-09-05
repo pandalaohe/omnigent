@@ -10,6 +10,7 @@ import type { Session } from "@/lib/types";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
+  fetchConversationById,
   deleteConversation,
   fetchArchivedSessionFacets,
   renameConversation,
@@ -2534,5 +2535,20 @@ describe("useDeleteProject", () => {
       succeeded: ["conv_a"],
       total: 2,
     });
+  });
+});
+
+it("keeps authoritative template identity when backfilling a pinned clone", async () => {
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({
+      id: "pinned-clone",
+      agent_id: "runtime-id",
+      agent_template_id: "builtin-id",
+      created_at: 1,
+    }),
+  );
+  expect(await fetchConversationById("pinned-clone")).toMatchObject({
+    agent_id: "runtime-id",
+    agent_template_id: "builtin-id",
   });
 });

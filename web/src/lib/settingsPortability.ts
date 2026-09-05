@@ -8,6 +8,7 @@
 
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "./contextIndicatorPreferences";
+import { AGENT_BADGE_STORAGE_KEY } from "./agentBadgePreferences";
 import { KEYBOARD_SHORTCUTS_STORAGE_KEY } from "./keyboardShortcutPreferences";
 import { MOBILE_ASSISTANT_STORAGE_KEY } from "./mobileAssistantPreferences";
 import { SESSION_NAVIGATION_STORAGE_KEY } from "./sessionNavigationPreferences";
@@ -35,6 +36,7 @@ const EXPORTABLE_KEYS = [
   MOBILE_ASSISTANT_STORAGE_KEY,
   SESSION_NAVIGATION_STORAGE_KEY,
   USAGE_CONTEXT_STORAGE_KEY,
+  AGENT_BADGE_STORAGE_KEY,
   "web-theme",
 ] as const;
 
