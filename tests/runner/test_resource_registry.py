@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -640,6 +641,52 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
     del callbacks
+
+
+@pytest.mark.asyncio
+async def test_delayed_stop_rechecks_unchanged_busy_status_file(tmp_path: Path) -> None:
+    """A late Stop must not hide the next turn until Claude rewrites its file."""
+    from omnigent.claude_native_status_file import SessionStatusPoller
+
+    session_id = "conv_late_stop"
+    _, statuses, _, fake_pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id
+    )
+    status_path = tmp_path / "sessions" / "123.json"
+    status_path.parent.mkdir()
+    record = {"pid": 123, "sessionId": "claude-test", "kind": "interactive", "status": "busy"}
+    status_path.write_text(json.dumps(record), encoding="utf-8")
+    poller = SessionStatusPoller(
+        on_status=fake_pollers[0]._on_status,
+        pane_pid_getter=lambda: 123,
+        session_id_getter=lambda: "claude-test",
+        config_dir=tmp_path,
+    )
+    registry._status_pollers[session_id] = poller
+    poller.tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    original_mtime = status_path.stat().st_mtime_ns
+
+    # Forwarder receives the previous turn's Stop after the next turn is busy.
+    registry.note_external_session_status(session_id, "idle")
+    poller.tick()
+    await asyncio.sleep(0)
+    assert status_path.stat().st_mtime_ns == original_mtime
+    assert statuses == ["running", "running"]
+    poller.tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+
+    # Real completion still settles, and repeated polls remain silent.
+    status_path.write_text(json.dumps({**record, "status": "idle"}), encoding="utf-8")
+    os.utime(status_path, ns=(original_mtime + 1_000_000_000, original_mtime + 1_000_000_000))
+    poller.tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running", "idle"]
+    poller.tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running", "idle"]
 
 
 @pytest.mark.asyncio

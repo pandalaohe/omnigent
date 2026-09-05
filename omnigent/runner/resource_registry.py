@@ -632,6 +632,16 @@ class SessionResourceRegistry:
                     else None,
                 )
         self._sync_status_edge(session_id, status)
+        if status == "idle":
+            # Hook delivery and file polling run independently. A delayed Stop
+            # can arrive after the next turn already wrote busy; resetting only
+            # the registry edge leaves the poller's unchanged-mtime gate silent.
+            # Recheck the authoritative current file on its next normal tick.
+            # Explicit failure/termination must not be reset by a stale file.
+            with self._lock:
+                poller = self._status_pollers.get(session_id)
+            if poller is not None:
+                poller.resync()
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
