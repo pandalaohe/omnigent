@@ -3836,6 +3836,14 @@ def _background_task_delivery_status(
 # Cap the per-shell detail a single edge can carry, mirroring the forwarder's
 # own cap so a malformed payload can't bloat the status event server-side.
 _MAX_FORWARDED_BACKGROUND_TASKS = 100
+_MAX_FORWARDED_BACKGROUND_TASK_BYTES = 256 * 1024
+_BACKGROUND_TASK_FIELD_BYTE_LIMITS = {
+    "id": 256,
+    "type": 128,
+    "status": 128,
+    "description": 2048,
+    "command": 8192,
+}
 
 
 def _parse_background_tasks(raw: object) -> list[BackgroundTaskInfo] | None:
@@ -3854,13 +3862,33 @@ def _parse_background_tasks(raw: object) -> list[BackgroundTaskInfo] | None:
     if not isinstance(raw, list):
         return None
     parsed: list[BackgroundTaskInfo] = []
+    accepted_bytes = 0
     for entry in raw[:_MAX_FORWARDED_BACKGROUND_TASKS]:
         if not isinstance(entry, dict):
             continue
+        entry_bytes = 0
+        oversized = False
+        for field, byte_limit in _BACKGROUND_TASK_FIELD_BYTE_LIMITS.items():
+            value = entry.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, str) or len(value) > byte_limit:
+                oversized = True
+                break
+            value_bytes = len(value.encode("utf-8"))
+            if value_bytes > byte_limit:
+                oversized = True
+                break
+            entry_bytes += value_bytes
+        if oversized:
+            continue
+        if accepted_bytes + entry_bytes > _MAX_FORWARDED_BACKGROUND_TASK_BYTES:
+            break
         try:
             parsed.append(BackgroundTaskInfo.model_validate(entry))
         except ValidationError:
             continue
+        accepted_bytes += entry_bytes
     return parsed or None
 
 

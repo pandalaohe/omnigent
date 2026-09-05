@@ -21,7 +21,11 @@ import types
 import pytest
 
 from omnigent.server.routes import sessions as _sessions_mod
-from omnigent.server.routes._sessions.helpers import _session_background_activity_count
+from omnigent.server.routes._sessions.helpers import (
+    _MAX_FORWARDED_BACKGROUND_TASK_BYTES,
+    _parse_background_tasks,
+    _session_background_activity_count,
+)
 from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -156,6 +160,19 @@ def test_background_tasks_detail_stored_with_positive_count() -> None:
     _publish_status(_SID, "idle", background_task_count=2, background_tasks=tasks)
     assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
     assert _sessions_mod._session_background_tasks_cache.get(_SID) == tasks
+
+
+def test_background_task_parser_caps_fields_and_total_payload_bytes() -> None:
+    oversized = {"status": "running", "command": "x" * 8193}
+    bounded = [{"status": "running", "command": "x" * 8192} for _ in range(100)]
+
+    parsed = _parse_background_tasks([oversized, *bounded])
+
+    assert parsed is not None
+    assert all(task.command != oversized["command"] for task in parsed)
+    assert sum(len((task.command or "").encode("utf-8")) for task in parsed) <= (
+        _MAX_FORWARDED_BACKGROUND_TASK_BYTES
+    )
 
 
 def test_background_tasks_detail_empty_when_count_only() -> None:

@@ -123,6 +123,8 @@ from omnigent.server.routes._sessions.common import (
     _interrupt_fenced_sessions,
     _logger,
     _pushed_model_options_cache,
+    _session_background_task_count_cache,
+    _session_background_tasks_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -2618,6 +2620,11 @@ def register_events_routes(
         # The durable todo snapshot is deleted with the conversation, so its
         # process-local fast path must go too.
         _session_todos_cache.pop(session_id, None)
+        # Background detail and the last live status are also retained across
+        # reloads while a session exists. Deletion makes those entries dead.
+        _session_background_task_count_cache.pop(session_id, None)
+        _session_background_tasks_cache.pop(session_id, None)
+        _session_status_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.

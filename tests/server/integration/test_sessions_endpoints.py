@@ -37,6 +37,7 @@ from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
+from omnigent.server.schemas import BackgroundTaskInfo
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -3237,10 +3238,10 @@ async def test_archive_lock_blocks_delete_until_unlocked(
     assert deleted.status_code == 200, deleted.text
 
 
-async def test_delete_session_evicts_todos_cache(
+async def test_delete_session_evicts_session_runtime_caches(
     client: httpx.AsyncClient,
 ) -> None:
-    """Deleting a session must not retain its durable-plan fast-path entry."""
+    """Deleting a session must not retain unreachable runtime state."""
     from omnigent.server.routes import sessions as sessions_module
 
     agent = await create_test_agent(client)
@@ -3249,11 +3250,19 @@ async def test_delete_session_evicts_todos_cache(
     sessions_module._session_todos_cache[sid] = [
         {"content": "Old plan", "status": "pending", "activeForm": "Planning"}
     ]
+    sessions_module._session_background_task_count_cache[sid] = 1
+    sessions_module._session_background_tasks_cache[sid] = [
+        BackgroundTaskInfo(status="running", description="Old shell")
+    ]
+    sessions_module._session_status_cache[sid] = "running"
 
     deleted = await client.delete(f"/v1/sessions/{sid}")
 
     assert deleted.status_code == 200, deleted.text
     assert sid not in sessions_module._session_todos_cache
+    assert sid not in sessions_module._session_background_task_count_cache
+    assert sid not in sessions_module._session_background_tasks_cache
+    assert sid not in sessions_module._session_status_cache
 
 
 async def test_in_flight_todos_update_cannot_repopulate_deleted_session_cache(

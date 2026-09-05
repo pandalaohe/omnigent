@@ -2002,6 +2002,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # tsvector indexing is a future optimization (tracked in GAPS.md).
             use_fts = _supports_fts5(self._conv_engine.dialect.name)
             if use_fts:
+                # MATCH parses operators and quotes. Archive search is literal
+                # user text, so quote the whole value and escape inner quotes.
+                query = '"' + query.replace('"', '""') + '"'
                 if conversation_id is not None:
                     stmt = text(
                         "SELECT item_id FROM conversation_items_fts "

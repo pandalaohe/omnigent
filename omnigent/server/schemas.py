@@ -1877,11 +1877,11 @@ class BackgroundTaskInfo(BaseModel):
     :param command: Command the shell is running, e.g. ``"sleep 120"``.
     """
 
-    id: str | None = None
-    type: str | None = None
-    status: str | None = None
-    description: str | None = None
-    command: str | None = None
+    id: str | None = Field(default=None, max_length=256)
+    type: str | None = Field(default=None, max_length=128)
+    status: str | None = Field(default=None, max_length=128)
+    description: str | None = Field(default=None, max_length=2048)
+    command: str | None = Field(default=None, max_length=8192)
 
 
 class SessionResponse(BaseModel):

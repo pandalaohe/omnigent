@@ -1466,6 +1466,29 @@ def test_search(conversation_store: SqlAlchemyConversationStore) -> None:
     assert conversation_store.search("nonexistent") == []
 
 
+def test_search_treats_fts_operators_and_quotes_as_literal_text(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Archive text input never becomes SQLite FTS query syntax."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_literal_search",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": 'release OR "rollback marker"'}],
+                ),
+            )
+        ],
+    )
+
+    assert len(conversation_store.search('release OR "rollback', conversation_id=conv.id)) == 1
+    assert conversation_store.search("release NOT missing", conversation_id=conv.id) == []
+
+
 def test_search_scoped_to_conversation(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

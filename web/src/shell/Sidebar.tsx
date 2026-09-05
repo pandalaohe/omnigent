@@ -4517,6 +4517,11 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "project_id",
   "owner",
   "pending_elicitations_count",
+  "goal_state",
+  "foreground_status",
+  "background_activity_count",
+  "agent_id",
+  "agent_template_id",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {

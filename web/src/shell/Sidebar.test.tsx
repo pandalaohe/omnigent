@@ -604,6 +604,68 @@ describe("Sidebar session list", () => {
     expect(within(completed).queryByTestId("goal-activity-badge")).toBeNull();
   });
 
+  it("rerenders memoized rows when live Goal and activity fields change", () => {
+    const initial = [
+      conv("conv_goal_live", "Codex", { title: "Goal live", goal_state: null }),
+      conv("conv_background_live", "Claude Code", {
+        title: "Background live",
+        background_activity_count: 0,
+      }),
+      conv("conv_foreground_live", "Claude Code", {
+        title: "Foreground live",
+        status: "running",
+        foreground_status: "idle",
+      }),
+    ];
+    mockConversations(initial);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <ExtensionCatalogProvider extensions={[]}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={vi.fn()} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </ExtensionCatalogProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree());
+
+    expect(
+      within(screen.getByText("Goal live").closest("li")!).queryByTestId("goal-activity-badge"),
+    ).toBeNull();
+    expect(
+      within(screen.getByText("Background live").closest("li")!).queryByTestId(
+        "background-activity-badge",
+      ),
+    ).toBeNull();
+    expect(
+      within(screen.getByText("Foreground live").closest("li")!).queryByTestId(
+        "session-state-badge",
+      ),
+    ).toBeNull();
+
+    mockConversations([
+      { ...initial[0], goal_state: "active" },
+      { ...initial[1], background_activity_count: 1 },
+      { ...initial[2], foreground_status: "running" },
+    ]);
+    rerender(tree());
+
+    expect(
+      within(screen.getByText("Goal live").closest("li")!).getByTestId("goal-activity-badge"),
+    ).toHaveAccessibleName("Goal active");
+    expect(
+      within(screen.getByText("Background live").closest("li")!).getByTestId(
+        "background-activity-badge",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Foreground live").closest("li")!).getByTestId("session-state-badge"),
+    ).toHaveAttribute("data-state", "running");
+  });
+
   it("hides the unread marker while a Goal is active, but keeps it when paused", () => {
     const active = conv("conv_goal_active_unread", "Codex", {
       title: "Active unread goal",
