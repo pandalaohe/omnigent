@@ -92,16 +92,35 @@ export function SessionNavigationSettings() {
       </div>
       <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
         <div className="min-w-0 flex-1">
-          <span className="text-sm font-medium text-foreground">Background sessions</span>
-          <p
-            className="mt-1 text-sm text-muted-foreground"
-            title="Sessions showing B remain available, but Poll visits actionable and unread non-background sessions first."
-          >
-            Keep sessions showing B in the second polling pass.
+          <span className="text-sm font-medium text-foreground">Goal markers</span>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Show unofficial Goal outlines and G badges in the session list.
           </p>
         </div>
         <Switch
-          aria-label="Deprioritize background sessions while polling"
+          aria-label="Show Goal markers in the session list"
+          checked={preferences.showGoalSessionMarkers}
+          onCheckedChange={(enabled) =>
+            writeSessionNavigationPreferences({
+              ...preferences,
+              showGoalSessionMarkers: enabled,
+            })
+          }
+          className="shrink-0"
+        />
+      </div>
+      <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
+        <div className="min-w-0 flex-1">
+          <span className="text-sm font-medium text-foreground">Background and Goal sessions</span>
+          <p
+            className="mt-1 text-sm text-muted-foreground"
+            title="Sessions showing B or G remain available, but Poll visits other sessions first."
+          >
+            Keep sessions showing B or G in the second polling pass.
+          </p>
+        </div>
+        <Switch
+          aria-label="Deprioritize background and Goal sessions while polling"
           checked={preferences.deprioritizeBackgroundSessions}
           onCheckedChange={(enabled) =>
             writeSessionNavigationPreferences({

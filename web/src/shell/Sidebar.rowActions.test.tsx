@@ -1109,8 +1109,9 @@ describe("mark all as read", () => {
     expect(screen.getAllByText("(unread)")).toHaveLength(2);
 
     const mobileAction = screen.getByTestId("mark-all-sessions-read-mobile");
-    expect(mobileAction).toHaveTextContent("Mark all read");
-    expect(mobileAction).toHaveClass("md:hidden", "h-9", "rounded-full");
+    expect(mobileAction).toHaveAccessibleName("Mark all sessions as read");
+    expect(mobileAction).toHaveTextContent("");
+    expect(mobileAction).toHaveClass("md:hidden", "size-9", "rounded-full", "p-0");
     expect(screen.getByTestId("mark-all-sessions-read")).toHaveClass("max-md:hidden");
 
     fireEvent.click(mobileAction);

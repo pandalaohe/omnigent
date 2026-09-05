@@ -2691,6 +2691,7 @@ class SessionListItem(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     foreground_status: Literal["idle", "running", "failed"]
     background_activity_count: int = Field(ge=0)
+    goal_state: Literal["active", "paused"] | None = None
     created_at: int
     updated_at: int
     archived_at: int | None = None

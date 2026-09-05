@@ -527,7 +527,7 @@ export function AppShell() {
     breadcrumbConv?.title ||
     (isChildSession ? parentSession?.title : activeSession?.title) ||
     (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ||
-    (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
+    (conversationId ? UNTITLED_CONVERSATION_LABEL : null);
   const headerProjectName =
     (breadcrumbConv?.project_id != null
       ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)?.name

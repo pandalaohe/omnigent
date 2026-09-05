@@ -15,6 +15,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+import { writeSessionNavigationPreferences } from "@/lib/sessionNavigationPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
@@ -506,6 +507,96 @@ describe("Sidebar session list", () => {
       "unseen",
     );
     expect(within(renderedRow).getByTestId("background-activity-badge")).toBeInTheDocument();
+  });
+
+  it("shows green active and yellow paused Goal rows with a G badge", () => {
+    mockConversations([
+      conv("conv_goal_active", "Codex", { title: "Active goal", goal_state: "active" }),
+      conv("conv_goal_paused", "Claude Code", { title: "Paused goal", goal_state: "paused" }),
+      conv("conv_goal_done", "Codex", { title: "Completed goal", goal_state: null }),
+    ]);
+    renderSidebar();
+
+    const active = screen.getByText("Active goal").closest("a")!;
+    expect(active).toHaveAttribute("data-goal-state", "active");
+    expect(active).toHaveClass("ring-status-green/70");
+    expect(within(active.closest("li")!).getByTestId("goal-activity-badge")).toHaveAccessibleName(
+      "Goal active",
+    );
+
+    const paused = screen.getByText("Paused goal").closest("a")!;
+    expect(paused).toHaveAttribute("data-goal-state", "paused");
+    expect(paused).toHaveClass("ring-status-yellow/70");
+    expect(within(paused.closest("li")!).getByTestId("goal-activity-badge")).toHaveAccessibleName(
+      "Goal paused",
+    );
+
+    const completed = screen.getByText("Completed goal").closest("li")!;
+    expect(within(completed).queryByTestId("goal-activity-badge")).toBeNull();
+  });
+
+  it("hides the unread marker while a Goal is active, but keeps it when paused", () => {
+    const active = conv("conv_goal_active_unread", "Codex", {
+      title: "Active unread goal",
+      goal_state: "active",
+      status: "idle",
+      updated_at: 20,
+      viewer_last_seen: 10,
+    });
+    const paused = conv("conv_goal_paused_unread", "Claude Code", {
+      title: "Paused unread goal",
+      goal_state: "paused",
+      status: "idle",
+      updated_at: 20,
+      viewer_last_seen: 10,
+    });
+    seedReadState([active, paused]);
+    mockConversations([active, paused]);
+    renderSidebar();
+
+    const activeRow = screen.getByText("Active unread goal").closest("li")!;
+    expect(within(activeRow).queryByText("(unread)")).toBeNull();
+    expect(within(activeRow).queryByTestId("session-state-badge")).toBeNull();
+    expect(within(activeRow).getByTestId("goal-activity-badge")).toHaveAccessibleName(
+      "Goal active",
+    );
+
+    const pausedRow = screen.getByText("Paused unread goal").closest("li")!;
+    expect(within(pausedRow).getByText("(unread)")).toBeInTheDocument();
+    expect(within(pausedRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "unseen",
+    );
+  });
+
+  it("lets B and G coexist and hides Goal styling with the preference", () => {
+    const row = conv("conv_bg_goal", "Codex", {
+      title: "Background goal",
+      background_activity_count: 2,
+      goal_state: "active",
+    });
+    mockConversations([row]);
+    renderSidebar();
+
+    const rendered = screen.getByText("Background goal").closest("li")!;
+    expect(within(rendered).getByTestId("background-activity-badge")).toBeInTheDocument();
+    expect(within(rendered).getByTestId("goal-activity-badge")).toBeInTheDocument();
+
+    writeSessionNavigationPreferences({
+      pollingActiveWindowHours: null,
+      deprioritizeBackgroundSessions: true,
+      showGoalSessionMarkers: false,
+      scrollToBottomOnSessionOpen: true,
+      nativeMobileHeaderMode: "server",
+    });
+    return waitFor(() => {
+      const hidden = screen.getByText("Background goal").closest("li")!;
+      expect(within(hidden).getByTestId("background-activity-badge")).toBeInTheDocument();
+      expect(within(hidden).queryByTestId("goal-activity-badge")).toBeNull();
+      expect(screen.getByText("Background goal").closest("a")).not.toHaveAttribute(
+        "data-goal-state",
+      );
+    });
   });
 
   it("offers the four display filters and defaults to My sessions", () => {

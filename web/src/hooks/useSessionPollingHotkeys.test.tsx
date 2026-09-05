@@ -60,6 +60,22 @@ describe("choosePolledConversation", () => {
     expect(choosePolledConversation([conversation("only")], "only", () => true)).toBeNull();
   });
 
+  it("keeps Goal sessions in the same secondary polling pass as B sessions", () => {
+    const candidates = [
+      conversation("active"),
+      conversation("goal-active", 3, { goal_state: "active" }),
+      conversation("goal-paused", 2, { goal_state: "paused" }),
+      conversation("plain-idle", 1),
+    ];
+
+    expect(choosePolledConversation(candidates, "active", () => false, true)?.id).toBe(
+      "plain-idle",
+    );
+    expect(choosePolledConversation(candidates.slice(0, 3), "active", () => false, true)?.id).toBe(
+      "goal-active",
+    );
+  });
+
   it("keeps every B session behind actionable and unread non-background targets", () => {
     const candidates = [
       conversation("active"),
@@ -167,6 +183,7 @@ describe("useSessionPollingHotkeys", () => {
       deprioritizeBackgroundSessions: true,
       scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
+      showGoalSessionMarkers: true,
     });
     const rows = [
       conversation("active", nowSeconds - 10 * 60 * 60),
@@ -197,6 +214,7 @@ describe("useSessionPollingHotkeys", () => {
       deprioritizeBackgroundSessions: true,
       scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
+      showGoalSessionMarkers: true,
     });
     renderHook(() =>
       useSessionPollingHotkeys({

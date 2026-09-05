@@ -23,16 +23,29 @@ describe("SessionNavigationSettings", () => {
     );
   });
 
-  it("deprioritizes B sessions by default and lets the user disable it", async () => {
+  it("deprioritizes B and G sessions by default and lets the user disable it", async () => {
     render(<SessionNavigationSettings />);
     const toggle = screen.getByRole("switch", {
-      name: "Deprioritize background sessions while polling",
+      name: "Deprioritize background and Goal sessions while polling",
     });
     expect(toggle).toBeChecked();
 
     fireEvent.click(toggle);
     await waitFor(() =>
       expect(readSessionNavigationPreferences().deprioritizeBackgroundSessions).toBe(false),
+    );
+  });
+
+  it("shows Goal markers by default and lets the user hide them", async () => {
+    render(<SessionNavigationSettings />);
+    const toggle = screen.getByRole("switch", {
+      name: "Show Goal markers in the session list",
+    });
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(readSessionNavigationPreferences().showGoalSessionMarkers).toBe(false),
     );
   });
 

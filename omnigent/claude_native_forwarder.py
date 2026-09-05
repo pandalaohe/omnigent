@@ -439,9 +439,7 @@ class SubagentForwardState:
     subagents: dict[str, SubagentEntry]
     parent_byte_offset: int = 0
     parent_line_cursor: int = 0
-    pending_terminal_notifications: dict[str, tuple[str, str | None]] = field(
-        default_factory=dict
-    )
+    pending_terminal_notifications: dict[str, tuple[str, str | None]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -566,6 +564,8 @@ class _ForwardDedupeState:
     posted_model: str | None = None
     observed_title: str | None = None
     posted_title: str | None = None
+    posted_goal_state: str | None = None
+    posted_goal_state_known: bool = False
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
     # Kept to suppress duplicate posts when S hasn't advanced.
@@ -3905,6 +3905,16 @@ async def _forward_available_items(
         dedupe=dedupe,
         title=result.latest_custom_title,
     )
+    if result.goal_state_observed and (
+        not dedupe.posted_goal_state_known or result.latest_goal_state != dedupe.posted_goal_state
+    ):
+        await _post_external_goal_state(
+            client,
+            session_id=session_id,
+            state=result.latest_goal_state,
+        )
+        dedupe.posted_goal_state = result.latest_goal_state
+        dedupe.posted_goal_state_known = True
     return updated
 
 
@@ -5041,6 +5051,20 @@ async def _post_external_session_todos(
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_todos", "data": {"todos": todos}},
+    )
+    resp.raise_for_status()
+
+
+async def _post_external_goal_state(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    state: str | None,
+) -> None:
+    """Post Claude's structured Goal state to the provider-neutral marker."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_goal_state", "data": {"state": state}},
     )
     resp.raise_for_status()
 

@@ -178,6 +178,8 @@ export interface Conversation {
   foreground_status?: "idle" | "running" | "failed";
   /** Active direct sub-agents plus background shells owned by this session. */
   background_activity_count?: number;
+  /** Provider-neutral Goal marker reported by Codex or Claude. */
+  goal_state?: "active" | "paused" | null;
   /**
    * Whether the session's runner is reachable, matching `GET /health`.
    * `GET /v1/sessions` and the `WS /v1/sessions/updates` stream include

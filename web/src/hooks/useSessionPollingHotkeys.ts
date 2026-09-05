@@ -31,8 +31,9 @@ function pollingPriority(
   }
 
   const background = (conversation.background_activity_count ?? 0) > 0;
+  const goal = conversation.goal_state === "active" || conversation.goal_state === "paused";
   const foregroundWorking = getConversationForegroundStatus(conversation) === "running";
-  if (!background && !foregroundWorking) {
+  if (!background && !goal && !foregroundWorking) {
     if (actionable) return 0;
     return unread ? 1 : 2;
   }

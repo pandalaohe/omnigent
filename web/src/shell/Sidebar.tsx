@@ -35,6 +35,7 @@ import {
   Loader2Icon,
   MailIcon,
   MailOpenIcon,
+  MessageCircleCheckIcon,
   MessageCircleDashedIcon,
   Maximize2Icon,
   Minimize2Icon,
@@ -143,9 +144,14 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
-import { BackgroundActivityBadge, SessionStateBadge } from "@/components/SessionStateBadge";
+import {
+  BackgroundActivityBadge,
+  GoalActivityBadge,
+  SessionStateBadge,
+} from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
@@ -514,6 +520,7 @@ export function Sidebar({
 }: SidebarProps) {
   const branding = useBranding();
   const serverInfo = useServerInfo();
+  const { showGoalSessionMarkers } = useSessionNavigationPreferences();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
@@ -613,12 +620,13 @@ export function Sidebar({
   useUnseenTick();
   const unreadConversations = loadedRows.filter(
     (conversation) =>
-      isExplicitlyUnread(conversation.id) ||
-      isConversationUnseen(
-        conversation.id,
-        conversation.updated_at,
-        getConversationForegroundStatus(conversation),
-      ),
+      !(showGoalSessionMarkers && conversation.goal_state === "active") &&
+      (isExplicitlyUnread(conversation.id) ||
+        isConversationUnseen(
+          conversation.id,
+          conversation.updated_at,
+          getConversationForegroundStatus(conversation),
+        )),
   );
   const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
   // Plus unseen file comments — the badge counts everything the Inbox
@@ -878,14 +886,13 @@ export function Sidebar({
                 <Button
                   type="button"
                   variant="ghost"
-                  size="sm"
+                  size="icon"
                   aria-label="Mark all sessions as read"
                   data-testid="mark-all-sessions-read-mobile"
-                  className="sidebar-glass-chip h-9 shrink-0 gap-1.5 rounded-full px-3 text-xs font-medium text-foreground md:hidden"
+                  className="sidebar-glass-chip size-9 shrink-0 rounded-full p-0 text-primary md:hidden"
                   onClick={() => markConversationsSeen(unreadConversations)}
                 >
-                  <MailOpenIcon className="size-4 shrink-0 text-primary" />
-                  <span>Mark all read</span>
+                  <MessageCircleCheckIcon className="size-4" />
                 </Button>
               )}
               {/* Brand mark doubles as the "home" affordance: clicking it
@@ -1486,6 +1493,7 @@ function ConversationList({
 }: ConversationListProps) {
   // Viewer id for the owner-based My/Shared split below.
   const viewerId = useViewerId();
+  const { showGoalSessionMarkers } = useSessionNavigationPreferences();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
   // owner so ordinary rows do not each create their own polling observer.
   const { data: hosts = [] } = useHosts({ includeSandbox: true });
@@ -2171,7 +2179,7 @@ function ConversationList({
                       active={newSessionProjectName === group.name}
                       // Best-effort marker from the globally-loaded window: a
                       // collapsed folder hasn't fetched its own sessions yet.
-                      marker={projectMarkerState(group.conversations)}
+                      marker={projectMarkerState(group.conversations, showGoalSessionMarkers)}
                       onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                       pinnedConversationIds={pinnedConversationIds}
                       activeOverride={activeOverride}
@@ -2407,7 +2415,10 @@ interface ProjectMarkerState {
   backgroundActivityCount: number;
 }
 
-function projectMarkerState(conversations: Conversation[]): ProjectMarkerState {
+function projectMarkerState(
+  conversations: Conversation[],
+  showGoalSessionMarkers: boolean,
+): ProjectMarkerState {
   let awaiting = 0;
   let unseen = false;
   let running = false;
@@ -2418,7 +2429,10 @@ function projectMarkerState(conversations: Conversation[]): ProjectMarkerState {
     const pending = c.pending_elicitations_count ?? 0;
     if (pending > 0) {
       awaiting += pending;
-    } else if (isConversationUnseen(c.id, c.updated_at, foregroundStatus)) {
+    } else if (
+      !(showGoalSessionMarkers && c.goal_state === "active") &&
+      isConversationUnseen(c.id, c.updated_at, foregroundStatus)
+    ) {
       unseen = true;
     } else if (foregroundStatus === "running") {
       running = true;
@@ -2879,6 +2893,7 @@ function ConversationSection({
       can expand that (possibly brand-new) project folder. */
   onProjectAssigned?: (projectName: string) => void;
 }) {
+  const { showGoalSessionMarkers } = useSessionNavigationPreferences();
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const protectsCollapsedBadge = isCollapsed && marker != null;
@@ -2987,6 +3002,7 @@ function ConversationSection({
                   isSelected={selectedIds.has(conv.id)}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={onProjectAssigned}
+                  showGoalSessionMarkers={showGoalSessionMarkers}
                 />
               ))}
             </ul>
@@ -3446,6 +3462,7 @@ function ConversationRow({
   isSelected,
   onToggleSelected,
   onProjectAssigned,
+  showGoalSessionMarkers,
 }: {
   conversation: Conversation;
   isPinned: boolean;
@@ -3455,6 +3472,7 @@ function ConversationRow({
   isSelected: boolean;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  showGoalSessionMarkers: boolean;
 }) {
   const hostsById = useContext(HostsByIdContext);
   // `useParams` reads from the active matched route. On `/`, the param is
@@ -3598,15 +3616,17 @@ function ConversationRow({
   // invisible until the turn finishes (then the dot lights like any unseen
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
-  const hasUnseenMessages =
+  const goalState = showGoalSessionMarkers ? (conversation.goal_state ?? null) : null;
+  const isLogicallyUnread =
     isConversationUnseen(
       conversation.id,
       conversation.updated_at,
       getConversationForegroundStatus(conversation),
     ) &&
     (!isActive || isExplicitlyUnread(conversation.id));
+  const hasUnseenMessages = isLogicallyUnread && goalState !== "active";
   // "Mark as unread" is offered on any row not already showing the dot.
-  const canMarkUnread = !hasUnseenMessages;
+  const canMarkUnread = !isLogicallyUnread;
   // Badge precedence: a pending approval ("Needs response") outranks the
   // unread dot — a session that's both unread and awaiting input should
   // surface the actionable approval tag. The row still renders bold (the
@@ -3630,11 +3650,17 @@ function ConversationRow({
         : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
   const backgroundActivityCount = Math.max(0, conversation.background_activity_count ?? 0);
   const hasBackgroundActivity = backgroundActivityCount > 0;
+  const hasGoalMarker = goalState === "active" || goalState === "paused";
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
-  const showDraftIndicator = hasDraft && !isActive && !hasBackgroundActivity;
-  const hasTrailingIndicator = sessionState !== null || hasBackgroundActivity || showDraftIndicator;
+  const showDraftIndicator = hasDraft && !isActive && !hasBackgroundActivity && !hasGoalMarker;
+  const hasTrailingIndicator =
+    sessionState !== null || hasBackgroundActivity || hasGoalMarker || showDraftIndicator;
+  const compactMarkerCount =
+    (sessionState !== null && sessionState.kind !== "awaiting" ? 1 : 0) +
+    (hasBackgroundActivity ? 1 : 0) +
+    (hasGoalMarker ? 1 : 0);
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -3818,14 +3844,18 @@ function ConversationRow({
         // rest, before hover reveals the controls.
         !selectionMode &&
           (sessionState?.kind === "awaiting"
-            ? hasBackgroundActivity
-              ? "pr-[8.75rem]"
-              : "pr-29"
-            : sessionState !== null && hasBackgroundActivity
-              ? "pr-11"
-              : hasTrailingIndicator
-                ? "pr-8"
-                : "pr-2"),
+            ? hasBackgroundActivity && hasGoalMarker
+              ? "pr-[10.25rem]"
+              : hasBackgroundActivity || hasGoalMarker
+                ? "pr-[8.75rem]"
+                : "pr-29"
+            : compactMarkerCount >= 3
+              ? "pr-17"
+              : compactMarkerCount === 2
+                ? "pr-12"
+                : hasTrailingIndicator
+                  ? "pr-8"
+                  : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -3836,7 +3866,14 @@ function ConversationRow({
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
+        !selectionMode &&
+          goalState === "active" &&
+          "ring-1 ring-inset ring-status-green/70 bg-status-green/5 hover:bg-status-green/10 dark:bg-status-green/10 dark:hover:bg-status-green/15",
+        !selectionMode &&
+          goalState === "paused" &&
+          "ring-1 ring-inset ring-status-yellow/70 bg-status-yellow/5 hover:bg-status-yellow/10 dark:bg-status-yellow/10 dark:hover:bg-status-yellow/15",
       )}
+      data-goal-state={goalState ?? undefined}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
         // Swallow the click that trails a drag so it doesn't navigate.
@@ -3989,10 +4026,14 @@ function ConversationRow({
             // marker (running/starting/unseen dot, or the draft pencil) sits in
             // the fixed centered box so it lines up under the kebab.
             isDotMarker(sessionState) &&
-              (sessionState !== null && hasBackgroundActivity
-                ? "w-11 justify-center gap-1"
-                : SESSION_STATE_DOT_SLOT_CLASS),
-            sessionState?.kind === "awaiting" && hasBackgroundActivity && "gap-1",
+              (compactMarkerCount >= 3
+                ? "w-16 justify-center gap-1"
+                : compactMarkerCount === 2
+                  ? "w-11 justify-center gap-1"
+                  : SESSION_STATE_DOT_SLOT_CLASS),
+            sessionState?.kind === "awaiting" &&
+              (hasBackgroundActivity || hasGoalMarker) &&
+              "gap-1",
           )}
         >
           {sessionState !== null ? (
@@ -4008,6 +4049,7 @@ function ConversationRow({
             </span>
           ) : null}
           {hasBackgroundActivity && <BackgroundActivityBadge count={backgroundActivityCount} />}
+          {hasGoalMarker && <GoalActivityBadge state={goalState} />}
         </span>
       ) : null}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex

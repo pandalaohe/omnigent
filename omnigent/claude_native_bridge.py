@@ -515,6 +515,20 @@ class TranscriptReadResult:
     latest_model: str | None = None
     latest_custom_title: str | None = None
     task_notifications: tuple[ClaudeTaskNotification, ...] = ()
+    goal_state_observed: bool = False
+    latest_goal_state: str | None = None
+
+
+def _goal_state_from_transcript_entry(entry: _JsonObject) -> tuple[bool, str | None]:
+    """Read Claude Code's structured ``active_goal`` transcript event."""
+    if entry.get("type") != "active_goal" or "value" not in entry:
+        return False, None
+    value = entry.get("value")
+    if value is None:
+        return True, None
+    if isinstance(value, dict):
+        return True, "active"
+    return False, None
 
 
 @dataclass(frozen=True)
@@ -2424,6 +2438,8 @@ def read_transcript_items_since_with_position(
     latest_model: str | None = None
     latest_custom_title: str | None = None
     task_notifications: list[ClaudeTaskNotification] = []
+    goal_state_observed = False
+    latest_goal_state: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2434,6 +2450,10 @@ def read_transcript_items_since_with_position(
         if not isinstance(entry, dict):
             continue
         task_notifications.extend(_task_notifications_from_entry(entry))
+        observed_goal, goal_state = _goal_state_from_transcript_entry(entry)
+        if observed_goal:
+            goal_state_observed = True
+            latest_goal_state = goal_state
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2466,6 +2486,8 @@ def read_transcript_items_since_with_position(
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
         task_notifications=tuple(task_notifications),
+        goal_state_observed=goal_state_observed,
+        latest_goal_state=latest_goal_state,
     )
 
 
@@ -2520,6 +2542,8 @@ def read_transcript_items_from_offset(
     latest_model: str | None = None
     latest_custom_title: str | None = None
     task_notifications: list[ClaudeTaskNotification] = []
+    goal_state_observed = False
+    latest_goal_state: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2530,6 +2554,10 @@ def read_transcript_items_from_offset(
         if not isinstance(entry, dict):
             continue
         task_notifications.extend(_task_notifications_from_entry(entry))
+        observed_goal, goal_state = _goal_state_from_transcript_entry(entry)
+        if observed_goal:
+            goal_state_observed = True
+            latest_goal_state = goal_state
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2563,6 +2591,8 @@ def read_transcript_items_from_offset(
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
         task_notifications=tuple(task_notifications),
+        goal_state_observed=goal_state_observed,
+        latest_goal_state=latest_goal_state,
     )
 
 
@@ -2934,8 +2964,7 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                         payload.get("transcript_path") if isinstance(payload, dict) else None
                     )
                     if isinstance(transcript_path, str) and "subagents" in (
-                        part.casefold()
-                        for part in transcript_path.replace("\\", "/").split("/")
+                        part.casefold() for part in transcript_path.replace("\\", "/").split("/")
                     ):
                         continue
                     return True

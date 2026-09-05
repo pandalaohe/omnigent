@@ -154,6 +154,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _FENCE_EXEMPT_EVENT_TYPES,
+    _GOAL_STATE_LABEL_KEY,
     _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
     _LAST_CONTEXT_TOKENS_LABEL_KEY,
     _LAST_CONTEXT_WINDOW_LABEL_KEY,
@@ -859,6 +860,11 @@ def _build_session_list_item(
         foreground_status=_session_status_from_cache(conv.id, conv.live_status),
         background_activity_count=_session_background_activity_count(
             conv.id, child_session_ids, conv.live_status
+        ),
+        goal_state=(
+            cast(Literal["active", "paused"], conv.labels[_GOAL_STATE_LABEL_KEY])
+            if conv.labels.get(_GOAL_STATE_LABEL_KEY) in {"active", "paused"}
+            else None
         ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,

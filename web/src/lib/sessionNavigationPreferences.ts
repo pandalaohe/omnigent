@@ -12,6 +12,8 @@ export interface SessionNavigationPreferences {
   pollingActiveWindowHours: number | null;
   /** Keep sessions carrying the B marker behind non-background poll targets. */
   deprioritizeBackgroundSessions: boolean;
+  /** Show unofficial Goal outlines and G markers in the session list. */
+  showGoalSessionMarkers: boolean;
   /** Open a selected session at its newest transcript content. */
   scrollToBottomOnSessionOpen: boolean;
   /** Native iOS defaults to its official top-of-screen Server switcher. */
@@ -21,6 +23,7 @@ export interface SessionNavigationPreferences {
 const DEFAULT_PREFERENCES: SessionNavigationPreferences = {
   pollingActiveWindowHours: null,
   deprioritizeBackgroundSessions: true,
+  showGoalSessionMarkers: true,
   scrollToBottomOnSessionOpen: true,
   nativeMobileHeaderMode: "server",
 };
@@ -39,6 +42,7 @@ function normalizePreferences(value: unknown): SessionNavigationPreferences {
   return {
     pollingActiveWindowHours: normalizePollingWindow(candidate.pollingActiveWindowHours),
     deprioritizeBackgroundSessions: candidate.deprioritizeBackgroundSessions !== false,
+    showGoalSessionMarkers: candidate.showGoalSessionMarkers !== false,
     scrollToBottomOnSessionOpen: candidate.scrollToBottomOnSessionOpen !== false,
     nativeMobileHeaderMode:
       candidate.nativeMobileHeaderMode === "conversation-title" ? "conversation-title" : "server",
@@ -62,6 +66,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
     if (
       normalized.pollingActiveWindowHours === null &&
       normalized.deprioritizeBackgroundSessions &&
+      normalized.showGoalSessionMarkers &&
       normalized.scrollToBottomOnSessionOpen &&
       normalized.nativeMobileHeaderMode === "server"
     ) {
@@ -77,6 +82,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
     "session_navigation",
     normalized.pollingActiveWindowHours === null &&
       normalized.deprioritizeBackgroundSessions &&
+      normalized.showGoalSessionMarkers &&
       normalized.scrollToBottomOnSessionOpen &&
       normalized.nativeMobileHeaderMode === "server"
       ? null
