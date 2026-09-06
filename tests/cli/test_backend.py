@@ -11,6 +11,7 @@ wiring that routes ``--server`` through them.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import io
 import json
 import logging
@@ -708,6 +709,27 @@ def test_daemon_host_online_survives_modules_replaced_by_self_update(
 
     assert cli._daemon_host_online(record) is True
     assert observed_path == ["/v1/hosts/host%2Fabc"]
+
+
+def test_target_bridge_import_survives_stale_metadata_from_self_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The newly installed bridge must import inside the still-old updater process."""
+    current_metadata = importlib.import_module("omnigent.model_metadata")
+    current_parser = current_metadata.concrete_reported_model
+    stale_metadata = ModuleType("omnigent.model_metadata")
+    package = importlib.import_module("omnigent")
+    importlib.import_module("omnigent.claude_native_bridge")
+    monkeypatch.setitem(sys.modules, "omnigent.model_metadata", stale_metadata)
+    monkeypatch.setattr(package, "model_metadata", stale_metadata, raising=False)
+    monkeypatch.delitem(sys.modules, "omnigent.claude_native_bridge")
+    monkeypatch.delattr(package, "claude_native_bridge")
+
+    bridge = importlib.import_module("omnigent.claude_native_bridge")
+
+    assert bridge._model_metadata is stale_metadata
+    for value in (None, 123, "", "   ", "<synthetic>", " <synthetic> ", "model", " model "):
+        assert bridge._concrete_transcript_model(value) == current_parser(value)
 
 
 def test_daemon_host_online_false_when_offline(

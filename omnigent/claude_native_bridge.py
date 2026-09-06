@@ -53,13 +53,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib import request
 
+from omnigent import model_metadata as _model_metadata
 from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
-from omnigent.model_metadata import concrete_reported_model
 
 if TYPE_CHECKING:
     import httpx
@@ -5649,6 +5649,21 @@ def _write_jsonrpc(
             print(raw, flush=True)
 
 
+def _concrete_transcript_model(value: object) -> str | None:
+    """Normalize a model report across an in-place package replacement."""
+    parser = getattr(_model_metadata, "concrete_reported_model", None)
+    if callable(parser):
+        return cast(Callable[[object], str | None], parser)(value)
+
+    # A Unix self-update replaces package files while the invoking CLI still
+    # holds the previous model_metadata module in memory. Keep the newly
+    # installed bridge importable until that old process finishes reconnecting.
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    return model if model and model != "<synthetic>" else None
+
+
 def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     """
     Return ``message.model`` from an assistant transcript record.
@@ -5665,7 +5680,7 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     message = entry.get("message")
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
-    return concrete_reported_model(message.get("model"))
+    return _concrete_transcript_model(message.get("model"))
 
 
 def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:
