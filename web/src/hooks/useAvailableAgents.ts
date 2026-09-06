@@ -163,7 +163,13 @@ export function useSessionAgents(enabled = true) {
     if (!enabled || !mine.data) return undefined;
     const agents = new Map<string, AvailableAgent>();
     for (const row of mine.data.pages.flatMap((page) => page.data).slice(0, 30)) {
-      if (!row.agent_id || !row.agent_name || agents.has(row.agent_id)) continue;
+      if (!row.agent_id || !row.agent_name) continue;
+      const existing = agents.get(row.agent_id);
+      if (existing) {
+        if (!existing.templateId && row.labels?.["omnigent:agent-template-id"])
+          existing.templateId = row.labels["omnigent:agent-template-id"];
+        continue;
+      }
       agents.set(row.agent_id, {
         id: row.agent_id,
         name: row.agent_name,

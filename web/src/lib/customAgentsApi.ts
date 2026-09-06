@@ -42,7 +42,9 @@ export async function listCustomAgents(): Promise<CustomAgent[]> {
       await authenticatedFetch(`/v1/custom-agents?limit=100&offset=${result.length}`),
     );
     const page = (await response.json()) as { data: CustomAgent[]; has_more: boolean };
-    if (!Array.isArray(page.data)) throw new Error("Invalid custom Agent catalog");
+    if (!Array.isArray(page.data) || typeof page.has_more !== "boolean") {
+      throw new Error("Invalid custom Agent catalog");
+    }
     result.push(...page.data);
     hasMore = page.has_more && page.data.length > 0;
   }

@@ -69,7 +69,10 @@ afterEach(() => {
 
 /** Build owned sessions around the agent metadata under test. */
 function sessionResponse(
-  body: { data?: { id: string; name: string; created_at?: number }[]; [key: string]: unknown },
+  body: {
+    data?: { id: string; name: string; created_at?: number; labels?: Record<string, string> }[];
+    [key: string]: unknown;
+  },
   init?: { ok?: boolean; status?: number },
 ): Response {
   return mockResponse(
@@ -79,6 +82,7 @@ function sessionResponse(
         id: `session_${index}`,
         agent_id: agent.id,
         agent_name: agent.name,
+        labels: agent.labels,
         created_at: agent.created_at ?? 1,
         updated_at: 1000 - index,
         permission_level: 4,
@@ -509,7 +513,11 @@ describe("useAvailableAgents", () => {
           // load (harness/description filled on hover via prefetchAvailableAgentDetails).
           { id: "ag_doc", name: "doc-writer" },
           // Same custom agent on an older session — deduped by id.
-          { id: "ag_doc", name: "doc-writer" },
+          {
+            id: "ag_doc",
+            name: "doc-writer",
+            labels: { "omnigent:agent-template-id": "ca_doc_writer" },
+          },
           // Orphaned row (agent deleted) — skipped.
         ],
         has_more: false,
@@ -547,6 +555,7 @@ describe("useAvailableAgents", () => {
         skills: [],
         sessionId: expect.any(String),
         created_at: 1,
+        templateId: "ca_doc_writer",
       },
     ]);
     // No enrich fetches on initial load — enrichment is deferred to hover.
