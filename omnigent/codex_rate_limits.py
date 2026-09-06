@@ -24,7 +24,9 @@ CODEX_RATE_LIMITS_REFRESH_INTERVAL_S = 300.0
 CODEX_RATE_LIMITS_HARD_TTL_S = 3600
 _CODEX_RATE_LIMITS_PROBE_TIMEOUT_S = 12.0
 _CODEX_RATE_LIMITS_MAX_BUCKETS = 16
+_CODEX_RATE_LIMITS_MAX_TEXT_LENGTH = 128
 _CODEX_RATE_LIMITS_MAX_WINDOW_MINS = 5 * 525_600
+_JSON_SAFE_POSITIVE_INT_MAX = (1 << 53) - 1
 
 
 def _number(value: object) -> float | None:
@@ -56,7 +58,11 @@ def _window(raw: object, *, kind: str) -> _JsonObject | None:
         "used_percent": used_percent,
         "window_duration_mins": duration,
     }
-    if isinstance(resets_at, int) and not isinstance(resets_at, bool) and resets_at > 0:
+    if (
+        isinstance(resets_at, int)
+        and not isinstance(resets_at, bool)
+        and 0 < resets_at <= _JSON_SAFE_POSITIVE_INT_MAX
+    ):
         window["resets_at"] = resets_at
     return window
 
@@ -81,15 +87,23 @@ def normalize_codex_rate_limits_response(
     rows: list[tuple[str, dict[str, Any]]] = []
     by_limit_id = result.get("rateLimitsByLimitId")
     if isinstance(by_limit_id, dict):
-        for raw_limit_id, raw_bucket in list(by_limit_id.items())[:_CODEX_RATE_LIMITS_MAX_BUCKETS]:
-            if isinstance(raw_limit_id, str) and raw_limit_id and isinstance(raw_bucket, dict):
-                rows.append((raw_limit_id, raw_bucket))
+        for raw_limit_id, raw_bucket in by_limit_id.items():
+            limit_id = raw_limit_id.strip() if isinstance(raw_limit_id, str) else ""
+            if (
+                limit_id
+                and len(limit_id) <= _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH
+                and isinstance(raw_bucket, dict)
+            ):
+                rows.append((limit_id, raw_bucket))
+                if len(rows) >= _CODEX_RATE_LIMITS_MAX_BUCKETS:
+                    break
     if not rows:
         raw_bucket = result.get("rateLimits")
         if isinstance(raw_bucket, dict):
             raw_limit_id = raw_bucket.get("limitId")
-            limit_id = raw_limit_id if isinstance(raw_limit_id, str) and raw_limit_id else "codex"
-            rows.append((limit_id, raw_bucket))
+            limit_id = raw_limit_id.strip() if isinstance(raw_limit_id, str) else "codex"
+            if limit_id and len(limit_id) <= _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH:
+                rows.append((limit_id, raw_bucket))
 
     limits: list[_JsonObject] = []
     for limit_id, raw_bucket in rows:
@@ -103,15 +117,21 @@ def normalize_codex_rate_limits_response(
         bucket: _JsonObject = {"limit_id": limit_id, "windows": windows}
         raw_name = raw_bucket.get("limitName")
         if isinstance(raw_name, str) and raw_name.strip():
-            bucket["limit_name"] = raw_name.strip()[:128]
+            bucket["limit_name"] = raw_name.strip()[:_CODEX_RATE_LIMITS_MAX_TEXT_LENGTH]
         limits.append(bucket)
 
     if not limits:
         return None
-    return {
+    snapshot = {
         "captured_at": int(time.time()) if captured_at is None else captured_at,
         "limits": limits,
     }
+    try:
+        return validate_codex_rate_limits_snapshot(snapshot)
+    except ValueError:
+        # Collection is advisory: an invalid optional timestamp or a future
+        # app-server shape must disappear rather than poison the Host cache.
+        return None
 
 
 def validate_codex_rate_limits_snapshot(snapshot: object) -> _JsonObject | None:
@@ -125,7 +145,7 @@ def validate_codex_rate_limits_snapshot(snapshot: object) -> _JsonObject | None:
     if (
         isinstance(captured_at, bool)
         or not isinstance(captured_at, int)
-        or captured_at <= 0
+        or not 0 < captured_at <= _JSON_SAFE_POSITIVE_INT_MAX
         or not isinstance(raw_limits, list)
         or not 0 < len(raw_limits) <= _CODEX_RATE_LIMITS_MAX_BUCKETS
     ):
@@ -137,7 +157,12 @@ def validate_codex_rate_limits_snapshot(snapshot: object) -> _JsonObject | None:
             raise ValueError("invalid codex rate-limit bucket")
         limit_id = raw_bucket.get("limit_id")
         raw_windows = raw_bucket.get("windows")
-        if not isinstance(limit_id, str) or not limit_id or len(limit_id) > 128:
+        if (
+            not isinstance(limit_id, str)
+            or not limit_id
+            or limit_id != limit_id.strip()
+            or len(limit_id) > _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH
+        ):
             raise ValueError("invalid codex rate-limit id")
         if not isinstance(raw_windows, list) or not 0 < len(raw_windows) <= 2:
             raise ValueError("invalid codex rate-limit windows")
@@ -148,11 +173,18 @@ def validate_codex_rate_limits_snapshot(snapshot: object) -> _JsonObject | None:
             kind = raw_window.get("kind")
             if not isinstance(kind, str) or kind not in {"primary", "secondary"}:
                 raise ValueError("invalid codex rate-limit window kind")
+            resets_at = raw_window.get("resets_at")
+            if resets_at is not None and (
+                isinstance(resets_at, bool)
+                or not isinstance(resets_at, int)
+                or not 0 < resets_at <= _JSON_SAFE_POSITIVE_INT_MAX
+            ):
+                raise ValueError("invalid codex rate-limit reset timestamp")
             normalized = _window(
                 {
                     "usedPercent": raw_window.get("used_percent"),
                     "windowDurationMins": raw_window.get("window_duration_mins"),
-                    "resetsAt": raw_window.get("resets_at"),
+                    "resetsAt": resets_at,
                 },
                 kind=str(kind),
             )
@@ -162,7 +194,12 @@ def validate_codex_rate_limits_snapshot(snapshot: object) -> _JsonObject | None:
         bucket: _JsonObject = {"limit_id": limit_id, "windows": windows}
         limit_name = raw_bucket.get("limit_name")
         if limit_name is not None:
-            if not isinstance(limit_name, str) or not limit_name or len(limit_name) > 128:
+            if (
+                not isinstance(limit_name, str)
+                or not limit_name
+                or limit_name != limit_name.strip()
+                or len(limit_name) > _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH
+            ):
                 raise ValueError("invalid codex rate-limit name")
             bucket["limit_name"] = limit_name
         limits.append(bucket)

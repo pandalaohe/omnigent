@@ -3973,7 +3973,7 @@ class HostProcess:
                 snapshot = await read_codex_rate_limits_snapshot()
             except asyncio.CancelledError:
                 raise
-            except (OSError, RuntimeError, TimeoutError, ValueError):
+            except Exception:  # noqa: BLE001 - optional telemetry must not stop refreshing
                 # Subscription auth is optional and app-server is versioned.
                 # Retain the last good snapshot; never let this advisory probe
                 # endanger Host liveness or print credential-bearing output.

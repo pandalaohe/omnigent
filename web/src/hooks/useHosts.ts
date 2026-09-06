@@ -52,6 +52,97 @@ export interface CodexRateLimitsSnapshot {
   limits: CodexRateLimitBucket[];
 }
 
+const MAX_CODEX_RATE_LIMIT_BUCKETS = 16;
+const MAX_CODEX_RATE_LIMIT_WINDOWS = 2;
+const MAX_CODEX_RATE_LIMIT_TEXT_LENGTH = 128;
+const MAX_CODEX_RATE_LIMIT_WINDOW_MINS = 5 * 525_600;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSafePositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+/** Rebuild a bounded snapshot from untrusted REST JSON, or hide it. */
+export function parseCodexRateLimitsSnapshot(value: unknown): CodexRateLimitsSnapshot | null {
+  if (!isRecord(value) || !isSafePositiveInteger(value.captured_at)) return null;
+  if (
+    !Array.isArray(value.limits) ||
+    value.limits.length < 1 ||
+    value.limits.length > MAX_CODEX_RATE_LIMIT_BUCKETS
+  ) {
+    return null;
+  }
+
+  const limits: CodexRateLimitBucket[] = [];
+  for (const rawBucket of value.limits) {
+    if (!isRecord(rawBucket)) return null;
+    const { limit_id: limitId, limit_name: limitName } = rawBucket;
+    if (
+      typeof limitId !== "string" ||
+      limitId.length < 1 ||
+      limitId.length > MAX_CODEX_RATE_LIMIT_TEXT_LENGTH ||
+      limitId.trim() !== limitId
+    ) {
+      return null;
+    }
+    if (
+      limitName !== undefined &&
+      (typeof limitName !== "string" ||
+        limitName.length < 1 ||
+        limitName.length > MAX_CODEX_RATE_LIMIT_TEXT_LENGTH ||
+        limitName.trim() !== limitName)
+    ) {
+      return null;
+    }
+    if (
+      !Array.isArray(rawBucket.windows) ||
+      rawBucket.windows.length < 1 ||
+      rawBucket.windows.length > MAX_CODEX_RATE_LIMIT_WINDOWS
+    ) {
+      return null;
+    }
+
+    const windows: CodexRateLimitWindow[] = [];
+    for (const rawWindow of rawBucket.windows) {
+      if (!isRecord(rawWindow)) return null;
+      const { kind, used_percent: usedPercent, window_duration_mins: duration } = rawWindow;
+      if (kind !== "primary" && kind !== "secondary") return null;
+      if (
+        typeof usedPercent !== "number" ||
+        !Number.isFinite(usedPercent) ||
+        usedPercent < 0 ||
+        usedPercent > 100
+      ) {
+        return null;
+      }
+      if (
+        !Number.isInteger(duration) ||
+        (duration as number) < 1 ||
+        (duration as number) > MAX_CODEX_RATE_LIMIT_WINDOW_MINS
+      ) {
+        return null;
+      }
+      const resetsAt = rawWindow.resets_at;
+      if (resetsAt !== undefined && !isSafePositiveInteger(resetsAt)) return null;
+      windows.push({
+        kind,
+        used_percent: usedPercent,
+        window_duration_mins: duration as number,
+        ...(resetsAt !== undefined ? { resets_at: resetsAt } : {}),
+      });
+    }
+    limits.push({
+      limit_id: limitId,
+      ...(limitName !== undefined ? { limit_name: limitName } : {}),
+      windows,
+    });
+  }
+  return { captured_at: value.captured_at, limits };
+}
+
 interface HostsResponse {
   hosts: Host[];
 }
@@ -114,8 +205,12 @@ async function fetchCodexRateLimits(hostId: string): Promise<CodexRateLimitsSnap
   // an unrelated chat-page error.
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as { rate_limits?: CodexRateLimitsSnapshot | null };
-  return body.rate_limits ?? null;
+  try {
+    const body: unknown = await res.json();
+    return isRecord(body) ? parseCodexRateLimitsSnapshot(body.rate_limits) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Sanitized Codex subscription quota windows reported by one connected Host. */

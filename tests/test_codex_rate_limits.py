@@ -99,6 +99,63 @@ def test_normalize_rejects_invalid_percentages(used_percent: object) -> None:
     )
 
 
+def test_normalize_filters_unbounded_ids_and_reset_timestamps() -> None:
+    snapshot = normalize_codex_rate_limits_response(
+        {
+            "result": {
+                "rateLimitsByLimitId": {
+                    "x" * 129: {"primary": {"usedPercent": 1, "windowDurationMins": 300}},
+                    " codex ": {
+                        "primary": {
+                            "usedPercent": 5,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1 << 80,
+                        }
+                    },
+                }
+            }
+        },
+        captured_at=1,
+    )
+
+    assert snapshot == {
+        "captured_at": 1,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 5.0,
+                        "window_duration_mins": 300,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_normalize_rejects_oversized_legacy_id_and_capture_time() -> None:
+    oversized_id_response = {
+        "result": {
+            "rateLimits": {
+                "limitId": "x" * 129,
+                "primary": {"usedPercent": 5, "windowDurationMins": 300},
+            }
+        }
+    }
+    valid_response = {
+        "result": {
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 5, "windowDurationMins": 300},
+            }
+        }
+    }
+    assert normalize_codex_rate_limits_response(oversized_id_response, captured_at=1) is None
+    assert normalize_codex_rate_limits_response(valid_response, captured_at=1 << 80) is None
+
+
 def test_wire_validator_rejects_extra_or_malformed_values() -> None:
     with pytest.raises(ValueError, match="snapshot"):
         validate_codex_rate_limits_snapshot({"captured_at": 1, "limits": []})
@@ -113,6 +170,43 @@ def test_wire_validator_rejects_extra_or_malformed_values() -> None:
                             {
                                 "kind": "primary",
                                 "used_percent": 500,
+                                "window_duration_mins": 300,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    with pytest.raises(ValueError, match="reset timestamp"):
+        validate_codex_rate_limits_snapshot(
+            {
+                "captured_at": 1,
+                "limits": [
+                    {
+                        "limit_id": "codex",
+                        "windows": [
+                            {
+                                "kind": "primary",
+                                "used_percent": 5,
+                                "window_duration_mins": 300,
+                                "resets_at": 1 << 80,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    with pytest.raises(ValueError, match="snapshot"):
+        validate_codex_rate_limits_snapshot(
+            {
+                "captured_at": 1 << 80,
+                "limits": [
+                    {
+                        "limit_id": "codex",
+                        "windows": [
+                            {
+                                "kind": "primary",
+                                "used_percent": 5,
                                 "window_duration_mins": 300,
                             }
                         ],

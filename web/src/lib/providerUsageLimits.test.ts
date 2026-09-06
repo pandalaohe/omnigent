@@ -48,7 +48,78 @@ describe("provider usage limits", () => {
       },
       "gpt-5.6",
     );
-    expect(formatProviderUsageLimits(snapshot, 1_900_000_010)?.text).toBe("5h:11% w:6%");
+    expect(formatProviderUsageLimits(snapshot, 1_900_000_010)).toMatchObject({
+      text: "5h:11% w:6%",
+      ariaLabel: "Codex usage: 5 hour 11% used, weekly 6% used",
+    });
+  });
+
+  it("prefers the most specific Codex model bucket", () => {
+    const snapshot = providerUsageLimitsFromCodex(
+      {
+        captured_at: 1_900_000_000,
+        limits: [
+          {
+            limit_id: "codex",
+            limit_name: "Codex",
+            windows: [{ kind: "primary", used_percent: 11, window_duration_mins: 300 }],
+          },
+          {
+            limit_id: "codex-spark",
+            limit_name: "Codex Spark",
+            windows: [{ kind: "primary", used_percent: 32, window_duration_mins: 300 }],
+          },
+        ],
+      },
+      "gpt-5.3-codex-spark",
+    );
+
+    expect(formatProviderUsageLimits(snapshot, 1_900_000_010)?.text).toBe("5h:32%");
+  });
+
+  it("falls back to a case-insensitive canonical bucket with displayable windows", () => {
+    const snapshot = providerUsageLimitsFromCodex(
+      {
+        captured_at: 1_900_000_000,
+        limits: [
+          {
+            limit_id: "special",
+            limit_name: "Model One",
+            windows: [{ kind: "primary", used_percent: 32, window_duration_mins: 60 }],
+          },
+          {
+            limit_id: "CoDeX",
+            windows: [{ kind: "primary", used_percent: 8, window_duration_mins: 300 }],
+          },
+        ],
+      },
+      "model-one",
+    );
+
+    expect(formatProviderUsageLimits(snapshot, 1_900_000_010)?.text).toBe("5h:8%");
+  });
+
+  it("hides malformed or unmatched Codex buckets instead of throwing or guessing", () => {
+    expect(() =>
+      providerUsageLimitsFromCodex(
+        { captured_at: 1_900_000_000, limits: [null] } as never,
+        "model-one",
+      ),
+    ).not.toThrow();
+    expect(
+      providerUsageLimitsFromCodex(
+        {
+          captured_at: 1_900_000_000,
+          limits: [
+            {
+              limit_id: "unrelated",
+              windows: [{ kind: "primary", used_percent: 9, window_duration_mins: 300 }],
+            },
+          ],
+        },
+        "model-one",
+      ),
+    ).toBeNull();
   });
 
   it("stops presenting a cached reading as current after one hour", () => {

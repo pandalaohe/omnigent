@@ -2608,7 +2608,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         as ``"online"``; ``False`` if the host id is unknown, the server
         is unreachable, or the host reports offline.
     """
-    from omnigent.claude_native_bridge import url_component
+    from urllib.parse import quote
 
     host_id = record.host_id or _load_existing_host_id()
     if host_id is None:
@@ -2619,7 +2619,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
     result = _host_http_json(
         base_url=base_url,
         method="GET",
-        path=f"/v1/hosts/{url_component(host_id)}",
+        path=f"/v1/hosts/{quote(host_id, safe='')}",
         timeout_s=timeout_s,
         host_id=host_id,
     )

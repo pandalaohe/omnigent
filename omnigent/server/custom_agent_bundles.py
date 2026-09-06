@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import re
 import tarfile
 import tempfile
 import uuid
@@ -17,6 +18,22 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.spec import extract_safe
 
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024
+_MANAGED_INSTRUCTIONS_PATH = re.compile(r"catalog-instructions-[0-9a-f]{32}\.md")
+
+
+def _managed_instructions_path(raw: str) -> str | None:
+    """Return our existing generated instructions member, when present."""
+    node = yaml.compose(raw)
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    for key, value in node.value:
+        if (
+            key.value == "instructions"
+            and isinstance(value, yaml.ScalarNode)
+            and _MANAGED_INSTRUCTIONS_PATH.fullmatch(value.value)
+        ):
+            return value.value
+    return None
 
 
 def _patch_yaml_fields(raw: str, fields: dict[str, Any]) -> str:
@@ -114,9 +131,10 @@ def patch_bundle(bundle: bytes, changes: dict[str, Any]) -> bytes:
         replacements: dict[str, bytes] = {}
         fields = dict(changes)
         if "instructions" in fields:
-            # Use a fresh explicit file: an inline value matching an existing
-            # filename would otherwise silently load that file as instructions.
-            path = f"catalog-instructions-{uuid.uuid4().hex}.md"
+            # Use a generated file so inline text matching a bundle filename is
+            # never loaded as that file. Reuse our prior path to avoid growing
+            # the archive on every edit.
+            path = _managed_instructions_path(raw) or f"catalog-instructions-{uuid.uuid4().hex}.md"
             replacements[path] = (fields["instructions"] or "").encode("utf-8")
             fields["instructions"] = path
         replacements[config.name] = _patch_yaml_fields(raw, fields).encode("utf-8")
@@ -138,6 +156,8 @@ def patch_bundle(bundle: bytes, changes: dict[str, Any]) -> bytes:
             if normalized in replacements and member.isfile():
                 data = replacements.pop(normalized)
                 info = copy.copy(member)
+                info.pax_headers = dict(info.pax_headers)
+                info.pax_headers.pop("size", None)
                 info.size = len(data)
                 target.addfile(info, io.BytesIO(data))
             else:

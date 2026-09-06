@@ -427,6 +427,21 @@ def test_codex_rate_limits_frame_rejects_unbounded_payload() -> None:
         )
 
 
+def test_host_hello_drops_invalid_optional_codex_rate_limits() -> None:
+    """Malformed advisory telemetry must not reject an otherwise valid hello."""
+    hello = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="laptop",
+        codex_rate_limits={"captured_at": 1, "limits": []},
+    )
+
+    decoded = decode_host_frame(encode_host_frame(hello))
+
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.codex_rate_limits is None
+
+
 def test_hello_frame_gateway_inference_round_trip() -> None:
     original = HostHelloFrame(
         version="0.1.0",

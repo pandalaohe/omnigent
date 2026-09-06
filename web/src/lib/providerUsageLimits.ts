@@ -1,4 +1,8 @@
-import type { CodexRateLimitsSnapshot } from "@/hooks/useHosts";
+import type {
+  CodexRateLimitBucket,
+  CodexRateLimitWindow,
+  CodexRateLimitsSnapshot,
+} from "@/hooks/useHosts";
 
 export interface ProviderUsageWindow {
   label: string;
@@ -150,8 +154,56 @@ const CODEX_WINDOW_TARGETS = [
   { label: "m", ariaLabel: "monthly", minutes: 43_200 },
 ] as const;
 const HARD_TTL_SECONDS = 3600;
-function normalizedLimitName(value: string | null | undefined): string {
-  return (value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+function normalizedLimitName(value: unknown): string {
+  return typeof value === "string" ? value.toLowerCase().replace(/[^a-z0-9]+/g, "") : "";
+}
+
+function isCodexRateLimitBucket(value: unknown): value is CodexRateLimitBucket {
+  if (!value || typeof value !== "object") return false;
+  const bucket = value as Partial<CodexRateLimitBucket>;
+  return (
+    typeof bucket.limit_id === "string" &&
+    (bucket.limit_name === undefined || typeof bucket.limit_name === "string") &&
+    Array.isArray(bucket.windows)
+  );
+}
+
+function isCodexRateLimitWindow(value: unknown): value is CodexRateLimitWindow {
+  if (!value || typeof value !== "object") return false;
+  const window = value as Partial<CodexRateLimitWindow>;
+  return (
+    (window.kind === "primary" || window.kind === "secondary") &&
+    typeof window.used_percent === "number" &&
+    Number.isFinite(window.used_percent) &&
+    window.used_percent >= 0 &&
+    window.used_percent <= 100 &&
+    typeof window.window_duration_mins === "number" &&
+    Number.isInteger(window.window_duration_mins) &&
+    window.window_duration_mins > 0
+  );
+}
+
+function codexDisplayWindows(bucket: CodexRateLimitBucket): ProviderUsageWindow[] {
+  const available = bucket.windows.filter(isCodexRateLimitWindow);
+  return CODEX_WINDOW_TARGETS.flatMap((target) => {
+    const window = available.find(
+      (candidate) =>
+        Math.abs(candidate.window_duration_mins - target.minutes) <= target.minutes * 0.05,
+    );
+    if (!window) return [];
+    const resetsAt = window.resets_at;
+    return [
+      {
+        label: target.label,
+        ariaLabel: target.ariaLabel,
+        usedPercent: Math.round(window.used_percent),
+        durationMinutes: window.window_duration_mins,
+        ...(typeof resetsAt === "number" && Number.isSafeInteger(resetsAt) && resetsAt > 0
+          ? { resetsAt }
+          : {}),
+      },
+    ];
+  });
 }
 
 /** Adapt Codex's account/bucket RPC into the same shape used by other harnesses. */
@@ -160,44 +212,37 @@ export function providerUsageLimitsFromCodex(
   model: string | null | undefined,
 ): ProviderUsageLimitsSnapshot | null {
   if (!snapshot || !Array.isArray(snapshot.limits) || snapshot.limits.length === 0) return null;
+  const buckets = snapshot.limits.filter(isCodexRateLimitBucket);
   const normalizedModel = normalizedLimitName(model);
-  const modelBucket = normalizedModel
-    ? snapshot.limits.find((bucket) => {
-        const name = normalizedLimitName(bucket.limit_name);
-        return (
-          name.length > 0 && (name.includes(normalizedModel) || normalizedModel.includes(name))
-        );
-      })
-    : undefined;
-  const bucket =
-    modelBucket ??
-    snapshot.limits.find((candidate) => candidate.limit_id.toLowerCase() === "codex") ??
-    snapshot.limits[0];
-  if (!bucket || !Array.isArray(bucket.windows)) return null;
+  const modelBuckets = normalizedModel
+    ? buckets
+        .filter((bucket) => {
+          const name = normalizedLimitName(bucket.limit_name);
+          return (
+            name.length > 0 && (name.includes(normalizedModel) || normalizedModel.includes(name))
+          );
+        })
+        .sort(
+          (left, right) =>
+            normalizedLimitName(right.limit_name).length -
+            normalizedLimitName(left.limit_name).length,
+        )
+    : [];
+  const canonical = buckets.find((candidate) => candidate.limit_id.toLowerCase() === "codex");
+  const candidates = [...modelBuckets];
+  if (canonical && !candidates.includes(canonical)) candidates.push(canonical);
 
-  const windows = CODEX_WINDOW_TARGETS.flatMap((target) => {
-    const window = bucket.windows.find(
-      (candidate) =>
-        Number.isFinite(candidate.window_duration_mins) &&
-        Math.abs(candidate.window_duration_mins - target.minutes) <= target.minutes * 0.05,
-    );
-    if (!window || !Number.isFinite(window.used_percent) || window.used_percent < 0) return [];
-    return [
-      {
-        label: target.label,
-        ariaLabel: target.ariaLabel,
-        usedPercent: Math.round(Math.min(window.used_percent, 100)),
-        durationMinutes: window.window_duration_mins,
-        ...(window.resets_at !== undefined ? { resetsAt: window.resets_at } : {}),
-      },
-    ];
-  });
-  return {
-    provider: "Codex",
-    scope: bucket.limit_name ?? bucket.limit_id,
-    capturedAt: snapshot.captured_at,
-    windows,
-  };
+  for (const bucket of candidates) {
+    const windows = codexDisplayWindows(bucket);
+    if (windows.length === 0) continue;
+    return {
+      provider: "Codex",
+      scope: bucket.limit_name ?? bucket.limit_id,
+      capturedAt: snapshot.captured_at,
+      windows,
+    };
+  }
+  return null;
 }
 
 /** Format only fresh truthful windows; cached snapshots age out after one hour. */
@@ -207,7 +252,9 @@ export function formatProviderUsageLimits(
 ): FormattedProviderUsageLimits | null {
   if (
     !snapshot ||
-    !Number.isInteger(snapshot.capturedAt) ||
+    !Number.isSafeInteger(snapshot.capturedAt) ||
+    snapshot.capturedAt <= 0 ||
+    snapshot.capturedAt > nowSeconds + 300 ||
     nowSeconds - snapshot.capturedAt > HARD_TTL_SECONDS ||
     !Array.isArray(snapshot.windows)
   ) {
@@ -220,11 +267,15 @@ export function formatProviderUsageLimits(
   if (windows.length === 0) return null;
   const provider = snapshot.provider || "Provider";
   const scope = snapshot.scope || provider;
+  const accessibleScope =
+    normalizedLimitName(provider) === normalizedLimitName(scope)
+      ? provider
+      : `${provider} ${scope}`;
   return {
     text: windows
       .map((window) => `${window.label}:${Math.round(Math.min(window.usedPercent, 100))}%`)
       .join(" "),
-    ariaLabel: `${provider} ${scope} usage: ${windows
+    ariaLabel: `${accessibleScope} usage: ${windows
       .map(
         (window) =>
           `${window.ariaLabel || window.label} ${Math.round(Math.min(window.usedPercent, 100))}% used`,

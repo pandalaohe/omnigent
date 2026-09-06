@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import tarfile
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
@@ -17,6 +19,8 @@ from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.custom_agent_bundles import patch_bundle
+from omnigent.server.custom_agents_store import CustomAgentsStore
+from omnigent.server.routes import custom_agents as custom_agents_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -361,6 +365,155 @@ async def test_detail_includes_template_identity_for_pinned_backfill(
         )
         assert response.status_code == 200, response.text
         assert response.json()["agent_template_id"] == template_id
+
+
+def test_patch_replaces_pax_sized_member_without_truncation() -> None:
+    raw = b"""spec_version: 1
+name: old
+executor:
+  type: omnigent
+  config:
+    harness: codex
+"""
+    archive_bytes = io.BytesIO()
+    with tarfile.open(fileobj=archive_bytes, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(raw)
+        info.pax_headers = {"size": str(len(raw))}
+        archive.addfile(info, io.BytesIO(raw))
+
+    new_name = "a-name-longer-than-the-original-pax-sized-config-member"
+    updated = patch_bundle(archive_bytes.getvalue(), {"name": new_name})
+
+    assert validate_agent_bundle(updated).name == new_name
+    config = members(updated)["config.yaml"][0]
+    assert yaml.safe_load(config)["name"] == new_name
+
+
+def test_repeated_instruction_edits_reuse_generated_member() -> None:
+    once = patch_bundle(bundle(), {"instructions": "First revision"})
+    twice = patch_bundle(once, {"instructions": "Second revision"})
+
+    generated = [name for name in members(twice) if name.startswith("catalog-instructions-")]
+    assert len(generated) == 1
+    assert members(twice)[generated[0]][0] == b"Second revision"
+    assert validate_agent_bundle(twice).instructions == "Second revision"
+
+
+@pytest.mark.asyncio
+async def test_chunked_multipart_stops_reading_after_request_limit(
+    db_uri: str,
+    tmp_path: Path,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    monkeypatch.setattr(custom_agents_routes, "MAX_MULTIPART_REQUEST_BYTES", 1024)
+    boundary = "catalog-boundary"
+    prefix = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="bundle"; filename="agent.tar.gz"\r\n'
+        "Content-Type: application/gzip\r\n\r\n"
+    ).encode()
+    chunks = [prefix, *([b"x" * 256] * 20), f"\r\n--{boundary}--\r\n".encode()]
+    yielded = 0
+
+    async def stream() -> AsyncIterator[bytes]:
+        nonlocal yielded
+        for chunk in chunks:
+            yielded += 1
+            yield chunk
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/custom-agents",
+            headers={
+                "x-test-user": "alice",
+                "content-type": f"multipart/form-data; boundary={boundary}",
+            },
+            content=stream(),
+        )
+
+    assert response.status_code == 413
+    assert yielded < len(chunks)
+
+
+@pytest.mark.asyncio
+async def test_detail_validates_bundle_only_once_per_artifact(
+    db_uri: str,
+    tmp_path: Path,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle()
+    agent_id = "ca_cache_probe"
+    location = bundle_location(agent_id, original)
+    artifacts.put(location, original)
+    CustomAgentsStore(db_uri).create(
+        "alice",
+        {
+            "id": agent_id,
+            "name": "custom-reviewer",
+            "description": "Original description",
+            "harness": "codex",
+            "model": "test-model",
+            "bundle_location": location,
+        },
+    )
+    original_get = artifacts.get
+    reads = 0
+
+    def counted_get(key: str) -> bytes:
+        nonlocal reads
+        reads += 1
+        return original_get(key)
+
+    monkeypatch.setattr(artifacts, "get", counted_get)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = f"/v1/custom-agents/{agent_id}"
+        first = await client.get(path, headers={"x-test-user": "alice"})
+        second = await client.get(path, headers={"x-test-user": "alice"})
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["instructions"] == "Original instructions"
+    assert reads == 1
+
+
+@pytest.mark.asyncio
+async def test_same_content_patch_cas_keeps_winner_bundle(
+    db_uri: str,
+    tmp_path: Path,
+    runtime_init: None,
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers=headers,
+            files={"bundle": ("agent.tar.gz", bundle())},
+        )
+        assert created.status_code == 201
+        path = f"/v1/custom-agents/{created.json()['id']}"
+        payload = {"name": "Concurrent_winner", "version": 1}
+        results = await asyncio.gather(
+            client.patch(path, headers=headers, json=payload),
+            client.patch(path, headers=headers, json=payload),
+        )
+
+        assert sorted(response.status_code for response in results) == [200, 409], [
+            (response.status_code, response.text) for response in results
+        ]
+        contents = await client.get(path + "/contents", headers=headers)
+        assert contents.status_code == 200
+        assert validate_agent_bundle(contents.content).name == "Concurrent_winner"
 
 
 @pytest.mark.asyncio

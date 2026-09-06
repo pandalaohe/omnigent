@@ -414,7 +414,7 @@ describe("Composer status line (branch + context ring)", () => {
           [sourceKey]: {
             provider: "Codex",
             scope: "Codex",
-            capturedAt: 1_900_000_000,
+            capturedAt: Math.floor(Date.now() / 1000),
             windows: [{ label: "5h", ariaLabel: "5 hour", usedPercent: 13 }],
           },
         },

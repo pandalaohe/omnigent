@@ -9378,6 +9378,43 @@
       },
       "post": {
         "operationId": "create_custom_agent_v1_custom_agents_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "source_session_id": {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "title": "Source Session Id",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source_session_id"
+                ],
+                "title": "CustomAgentImport",
+                "type": "object"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "bundle": {
+                    "format": "binary",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "bundle"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {

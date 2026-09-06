@@ -15,6 +15,7 @@ import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useCustomAgents } from "@/lib/customAgentsApi";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 
@@ -291,6 +292,11 @@ beforeEach(() => {
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [SEEDED_WORKSPACE] }));
   setHosts([host()]);
   setAgents([agent()]);
+  vi.mocked(useCustomAgents).mockReturnValue({
+    data: [],
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useCustomAgents>);
 });
 
 afterEach(() => {
@@ -370,6 +376,53 @@ describe("NewChatLandingScreen create flow", () => {
 
     // On success the screen routes to the freshly created session.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("posts a saved Agent id even when its name matches a hidden legacy agent", async () => {
+    vi.mocked(useCustomAgents).mockReturnValue({
+      data: [
+        {
+          id: "ca_kimi",
+          name: "kimi",
+          description: null,
+          harness: "codex",
+          model: null,
+          version: 1,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      isPending: false,
+      error: null,
+    } as unknown as ReturnType<typeof useCustomAgents>);
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Headers({ "Content-Type": "application/gzip" }),
+        blob: async () => new Blob(["saved-agent-bundle"]),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ session_id: "conv_new" }),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ runner_id: "runner_new" }),
+      } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    selectAgent("ca_kimi");
+    typeMessage("use the saved agent");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(3));
+    const calls = vi.mocked(authenticatedFetch).mock.calls;
+    expect(calls[0]?.[0]).toBe("/v1/custom-agents/ca_kimi/contents");
+    expect(calls[1]?.[0]).toBe("/v1/sessions");
+    const form = calls[1]?.[1]?.body as FormData;
+    const metadata = JSON.parse(form.get("metadata") as string);
+    expect(metadata.labels).toEqual({ "omnigent:agent-template-id": "ca_kimi" });
   });
 
   it("records the launched workspace under its host without corrupting other recents", async () => {

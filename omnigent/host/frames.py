@@ -1583,11 +1583,19 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
-        codex_rate_limits=validate_codex_rate_limits_snapshot(msg.get("codex_rate_limits")),
+        codex_rate_limits=_optional_codex_rate_limits_snapshot(msg),
         filesystem_roots=(
             _required_bool(msg, "filesystem_roots") if "filesystem_roots" in msg else False
         ),
     )
+
+
+def _optional_codex_rate_limits_snapshot(msg: _JsonObject) -> _JsonObject | None:
+    """Drop malformed optional telemetry without rejecting Host registration."""
+    try:
+        return validate_codex_rate_limits_snapshot(msg.get("codex_rate_limits"))
+    except ValueError:
+        return None
 
 
 def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:

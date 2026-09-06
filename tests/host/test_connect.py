@@ -982,6 +982,50 @@ async def test_live_host_skips_codex_probe_until_harness_is_ready() -> None:
     _cleanup_host(host)
 
 
+async def test_live_host_keeps_quota_refresh_alive_after_unexpected_probe_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = {
+        "captured_at": 1_900_000_000,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 11.0,
+                        "window_duration_mins": 300,
+                    }
+                ],
+            }
+        ],
+    }
+    attempts = 0
+
+    async def _read() -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise LookupError("unexpected optional-probe failure")
+        return snapshot
+
+    monkeypatch.setattr("omnigent.host.connect.read_codex_rate_limits_snapshot", _read)
+    monkeypatch.setattr("omnigent.host.connect.CODEX_RATE_LIMITS_REFRESH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._configured_harnesses = {"codex": True}
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    assert attempts >= 2
+    assert host._codex_rate_limits == snapshot
+    _cleanup_host(host)
+
+
 async def test_live_host_does_not_repeat_unchanged_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4431,6 +4475,14 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
     from omnigent import codex_native_app_server
 
     monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness",
+        lambda _harness: {
+            "kind": "subscription",
+            "label": "Subscription",
+            "name": "codex",
+        },
+    )
+    monkeypatch.setattr(
         codex_native_app_server,
         "resolve_native_codex_launch",
         lambda *, model: codex_native_app_server.NativeCodexLaunch(
@@ -4583,6 +4635,14 @@ async def test_model_options_frame_replies_off_the_receive_loop(
     from omnigent import codex_native_app_server
     from omnigent.host.frames import encode_host_frame
 
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness",
+        lambda _harness: {
+            "kind": "subscription",
+            "label": "Subscription",
+            "name": "codex",
+        },
+    )
     monkeypatch.setattr(
         codex_native_app_server,
         "resolve_native_codex_launch",
