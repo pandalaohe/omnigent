@@ -707,7 +707,8 @@ function SubagentRow({
     canStopChildren &&
     (status.activity === "launching" ||
       status.activity === "working" ||
-      status.activity === "awaiting");
+      status.activity === "awaiting" ||
+      (status.activity === "unverified" && child.busy));
   return (
     <>
       <li className="relative">

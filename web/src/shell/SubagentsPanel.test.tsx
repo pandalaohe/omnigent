@@ -506,40 +506,46 @@ describe("SubagentsPanel", () => {
     // by the dedicated "shows the status word only for notable states" test.
   });
 
-  it("lets the user stop a working sub-agent without deleting its history", () => {
-    mockChildTree({
-      conv_root: [
-        childInfo({
-          id: "conv_stuck",
-          title: "claude_code:stuck-worker",
-          tool: "claude_code",
-          session_name: "stuck-worker",
-          current_task_status: "in_progress",
-          busy: true,
-        }),
-        childInfo({
-          id: "conv_done",
-          title: "claude_code:finished-worker",
-          tool: "claude_code",
-          session_name: "finished-worker",
-          current_task_status: "completed",
-          busy: false,
-        }),
-      ],
-    });
+  it.each([false, true])(
+    "lets the user stop busy work with uncertain activity=%s",
+    (nativeActivityUnverified) => {
+      mockChildTree({
+        conv_root: [
+          childInfo({
+            id: "conv_stuck",
+            title: "claude_code:stuck-worker",
+            tool: "claude_code",
+            session_name: "stuck-worker",
+            native_activity_unverified: nativeActivityUnverified,
+            current_task_status: "in_progress",
+            busy: true,
+          }),
+          childInfo({
+            id: "conv_done",
+            title: "claude_code:finished-worker",
+            tool: "claude_code",
+            session_name: "finished-worker",
+            current_task_status: "completed",
+            busy: false,
+          }),
+        ],
+      });
 
-    renderPanel({ rootSessionId: "conv_root" });
+      renderPanel({ rootSessionId: "conv_root" });
 
-    expect(screen.getAllByTestId("stop-subagent")).toHaveLength(1);
-    fireEvent.click(screen.getByRole("button", { name: "Stop sub-agent stuck-worker" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent("Its conversation and history are kept.");
+      expect(screen.getAllByTestId("stop-subagent")).toHaveLength(1);
+      fireEvent.click(screen.getByRole("button", { name: "Stop sub-agent stuck-worker" }));
+      expect(screen.getByRole("dialog")).toHaveTextContent(
+        "Its conversation and history are kept.",
+      );
 
-    fireEvent.click(screen.getByTestId("stop-subagent-confirm"));
-    expect(stopSessionMutate).toHaveBeenCalledWith(
-      "conv_stuck",
-      expect.objectContaining({ onSuccess: expect.any(Function) }),
-    );
-  });
+      fireEvent.click(screen.getByTestId("stop-subagent-confirm"));
+      expect(stopSessionMutate).toHaveBeenCalledWith(
+        "conv_stuck",
+        expect.objectContaining({ onSuccess: expect.any(Function) }),
+      );
+    },
+  );
 
   it("offers Stop while a sub-agent is launching or awaiting input", () => {
     mockChildTree({
