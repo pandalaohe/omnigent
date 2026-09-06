@@ -31,6 +31,7 @@ import yaml
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.runtime import set_runner_client
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
@@ -116,6 +117,19 @@ def _seed_child(
     )
 
 
+def _empty_terminal_runner() -> httpx.AsyncClient:
+    page = {"object": "list", "data": [], "first_id": None, "last_id": None, "has_more": False}
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=page)),
+        base_url="http://runner.test",
+    )
+
+
+async def _child_row(client: httpx.AsyncClient, parent_id: str, child_id: str) -> dict[str, Any]:
+    rows = (await client.get(f"/v1/sessions/{parent_id}/child_sessions")).json()["data"]
+    return next(row for row in rows if row["id"] == child_id)
+
+
 # ── 404 ──────────────────────────────────────────────────
 
 
@@ -154,8 +168,7 @@ async def test_replayed_unverified_native_child_is_not_busy_and_live_activity_re
             },
         )
         assert response.status_code == 202, response.text
-        rows = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
-        row = next(value for value in rows if value["id"] == child.id)
+        row = await _child_row(client, parent["id"], child.id)
         assert row["busy"] is False
         assert row["current_task_status"] is None
         assert row["activity_unverified"] is True
@@ -182,23 +195,122 @@ async def test_replayed_unverified_native_child_is_not_busy_and_live_activity_re
         # A Server restart drops the process-local cache. The durable label
         # must still keep this row out of busy/B and out of the false Done state.
         sessions_module._session_status_cache.pop(child.id, None)
-        rows = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
-        row = next(value for value in rows if value["id"] == child.id)
+        row = await _child_row(client, parent["id"], child.id)
         assert row["busy"] is False
         assert row["current_task_status"] is None
         assert row["activity_unverified"] is True
 
+        # A newly resumed turn also supersedes a terminal verdict repaired for
+        # the child's earlier dispatch; both durable markers must be cleared.
+        conv_store.set_labels(child.id, {"omnigent.subagent.terminal_status": "completed"})
         response = await client.post(
             f"/v1/sessions/{child.id}/events",
             json={"type": "external_session_status", "data": {"status": "running"}},
         )
         assert response.status_code == 202, response.text
-        rows = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
-        row = next(value for value in rows if value["id"] == child.id)
+        row = await _child_row(client, parent["id"], child.id)
         assert row["busy"] is True
         assert row["activity_unverified"] is False
+        refreshed = conv_store.get_conversation(child.id)
+        assert refreshed is not None
+        assert refreshed.labels.get("omnigent.subagent.terminal_status") == ""
     finally:
         sessions_module._session_status_cache.pop(child.id, None)
+
+
+async def test_empty_native_parent_terminal_inventory_invalidates_stale_child_activity(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The inventory that renders a dead TUI also clears false child activity."""
+    parent = await _create_parent_session(client, "missing-native-terminal-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(
+        parent["id"],
+        {
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
+    )
+    conv_store.replace_runner_id(parent["id"], "runner-parent")
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:stale-running",
+        agent_id=parent["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    )
+    conv_store.replace_runner_id(child.id, "runner-parent")
+    conv_store.set_session_live_status(child.id, "running")
+    sessions_module._session_status_cache[child.id] = "running"
+    runner = _empty_terminal_runner()
+    set_runner_client(runner)
+    try:
+        terminals = await client.get(
+            f"/v1/sessions/{parent['id']}/resources/terminals?order=asc&limit=1000"
+        )
+        assert terminals.status_code == 200, terminals.text
+        assert terminals.json()["data"] == []
+
+        child_row = await _child_row(client, parent["id"], child.id)
+        assert child_row["busy"] is False
+        assert child_row["activity_unverified"] is True
+
+        sessions_module._session_status_cache.pop(child.id, None)
+        cold_child_row = await _child_row(client, parent["id"], child.id)
+        assert cold_child_row["busy"] is False
+        assert cold_child_row["activity_unverified"] is True
+        assert cold_child_row["current_task_status"] is None
+
+        parent_row = next(
+            row
+            for row in (await client.get("/v1/sessions")).json()["data"]
+            if row["id"] == parent["id"]
+        )
+        assert parent_row["background_activity_count"] == 0
+        assert parent_row["status"] == "idle"
+    finally:
+        set_runner_client(None)
+        await runner.aclose()
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+async def test_terminal_inventory_survives_best_effort_reconciliation_failure(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repair-store failure cannot turn a successful terminal GET into 500."""
+    from omnigent.server.routes._sessions import subagent_reconciliation
+
+    parent = await _create_parent_session(client, "terminal-repair-failure-parent")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "claude-code-native-ui"})
+    store.replace_runner_id(parent["id"], "runner-parent")
+    runner = _empty_terminal_runner()
+
+    async def _fail_repair(**_kwargs: Any) -> int:
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(
+        subagent_reconciliation,
+        "_invalidate_native_subagents_for_missing_parent_terminal_impl",
+        _fail_repair,
+    )
+    set_runner_client(runner)
+    try:
+        response = await client.get(
+            f"/v1/sessions/{parent['id']}/resources/terminals?order=asc&limit=1000"
+        )
+    finally:
+        set_runner_client(None)
+        await runner.aclose()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"] == []
 
 
 async def test_activity_unverified_rejects_live_and_non_claude_native_sessions(

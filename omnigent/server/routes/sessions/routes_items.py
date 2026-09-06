@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from fastapi import (
     APIRouter,
@@ -10,6 +11,8 @@ from fastapi import (
     Request,
 )
 
+from omnigent.entities import Conversation
+from omnigent.entities.pagination import PagedList
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -33,8 +36,12 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
+    _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -54,6 +61,83 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
 _subagent_reconcile_locks: dict[str, asyncio.Lock] = {}
+_native_lazy_reconcile_after: dict[str, float] = {}
+_NATIVE_LAZY_RECONCILE_INTERVAL_S = 300.0
+_NATIVE_LAZY_RECONCILE_RETRY_S = 30.0
+
+
+async def _lazy_reconcile_native_children(
+    session_id: str,
+    parent: Conversation,
+    page: PagedList[Conversation],
+    limit: int,
+    order: str,
+    conversation_store: ConversationStore,
+) -> PagedList[Conversation]:
+    """Best-effort repair active native children on an unfiltered owner read."""
+    has_active_native_child = any(
+        child.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        == _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
+        and child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) != "true"
+        and child.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+        not in {"completed", "failed", "stopped", "killed"}
+        and child.live_status in {"running", "waiting"}
+        for child in page.data
+    )
+    if not has_active_native_child or time.monotonic() < _native_lazy_reconcile_after.get(
+        session_id, 0.0
+    ):
+        return page
+
+    _native_lazy_reconcile_after[session_id] = time.monotonic() + _NATIVE_LAZY_RECONCILE_INTERVAL_S
+    if len(_native_lazy_reconcile_after) > 2048:
+        _native_lazy_reconcile_after.pop(next(iter(_native_lazy_reconcile_after)))
+    lock = _subagent_reconcile_locks.setdefault(session_id, asyncio.Lock())
+    if lock.locked():
+        return page
+    try:
+        async with lock:
+            runner_client = await _get_runner_client(
+                session_id,
+                get_server_runner_router(),
+                conversation=parent,
+            )
+            if runner_client is None:
+                _native_lazy_reconcile_after[session_id] = (
+                    time.monotonic() + _NATIVE_LAZY_RECONCILE_RETRY_S
+                )
+                return page
+            result = await reconcile_native_subagents(
+                parent_session_id=session_id,
+                parent=parent,
+                children=page.data,
+                conversation_store=conversation_store,
+                runner_client=runner_client,
+            )
+            if not result["corrected"]:
+                return page
+            return await asyncio.to_thread(
+                conversation_store.list_conversations,
+                limit=limit,
+                kind="sub_agent",
+                parent_conversation_id=session_id,
+                order=order,
+                sort_by="created_at",
+            )
+    except Exception:
+        _native_lazy_reconcile_after[session_id] = (
+            time.monotonic() + _NATIVE_LAZY_RECONCILE_RETRY_S
+        )
+        _logger.warning(
+            "Lazy native sub-agent reconciliation failed for %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return page
+    finally:
+        if not lock.locked() and _subagent_reconcile_locks.get(session_id) is lock:
+            _subagent_reconcile_locks.pop(session_id, None)
 
 
 def register_items_routes(
@@ -399,6 +483,20 @@ def register_items_routes(
             sort_by="created_at",
             title=title_filter,
         )
+        if (
+            (access.level is None or access.level >= LEVEL_OWNER)
+            and parent.parent_conversation_id is None
+            and parent.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+            and after is None
+            and before is None
+            and tool is None
+            and session_name is None
+            and not page.has_more
+        ):
+            page = await _lazy_reconcile_native_children(
+                session_id, parent, page, limit, order, conversation_store
+            )
         data = await _child_session_summaries_from_conversations(
             page.data,
             session_id,

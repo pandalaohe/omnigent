@@ -35,6 +35,7 @@ _logger = logging.getLogger(__name__)
 
 _REQUEST_TYPE = "response.elicitation_request"
 _RESOLVED_TYPE = "response.elicitation_resolved"
+_STALE_TYPE = "response.elicitation_stale"
 
 # Max length of the elicitation prompt echoed into the parent's notice.
 _REASON_MAX_CHARS = 200
@@ -137,6 +138,8 @@ class SubagentBlockNotifier:
         # stored only while a handler waits on the matching signal so entries
         # never outlive the notice they inform.
         self._verdicts: dict[str, str] = {}
+        # Wake stale waiters only to retire them, without a resolution notice.
+        self._silently_discarded: set[str] = set()
         # Strong refs so scheduled wake futures aren't GC'd mid-flight; close() cancels them.
         self._inflight: set[concurrent.futures.Future[None]] = set()
 
@@ -161,6 +164,16 @@ class SubagentBlockNotifier:
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
         event_type = event.get("type")
+        if event_type == _STALE_TYPE:
+            with self._lock:
+                self._notified.discard(elicitation_id)
+                signal = self._resolution_signals.get(elicitation_id)
+                if signal is not None:
+                    self._silently_discarded.add(elicitation_id)
+            if signal is not None:
+                with contextlib.suppress(RuntimeError):
+                    self._loop.call_soon_threadsafe(signal.set)
+            return
         if event_type == _RESOLVED_TYPE:
             with self._lock:
                 self._notified.discard(elicitation_id)
@@ -305,6 +318,9 @@ class SubagentBlockNotifier:
                 return
             await signal.wait()
             with self._lock:
+                if elicitation_id in self._silently_discarded:
+                    self._silently_discarded.discard(elicitation_id)
+                    return
                 verdict = self._verdicts.pop(elicitation_id, None)
             await self._deliver_with_retry(
                 parent_id, child, _format_resolution_notice(child, verdict), armed_id=None
@@ -313,6 +329,7 @@ class SubagentBlockNotifier:
             with self._lock:
                 self._resolution_signals.pop(elicitation_id, None)
                 self._verdicts.pop(elicitation_id, None)
+                self._silently_discarded.discard(elicitation_id)
 
     async def _deliver_with_retry(
         self,

@@ -9779,6 +9779,8 @@ def _child_session_summary_from_conversation(
     )
     if activity_unverified:
         busy = False
+        # Durable quarantine wins after restart even if live_status is stale.
+        cached_status = "activity_unverified"
     last_task_error = _last_task_error_from_labels(labels)
     current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
     if last_task_error is not None:

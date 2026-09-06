@@ -204,7 +204,12 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
     audit_event_logger().log(level, "turn %s", outcome, extra=extra)
 
 
-def publish(conversation_id: str, event: dict[str, Any]) -> int:
+def publish(
+    conversation_id: str,
+    event: dict[str, Any],
+    *,
+    track_pending: bool = True,
+) -> int:
     """
     Broadcast an event to every active subscriber of the given
     conversation (called from sync workflow thread). The event
@@ -227,6 +232,8 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
         the Omnigent route layer validates each emitted dict against
         the union before serializing, so an unmodelled event
         fails loud at the SSE boundary.
+    :param track_pending: Disable only after atomically discarding a stale
+        elicitation generation that must not wake its parent notifier.
     :returns: The number of subscriber slots the event was dispatched
         toward (``0`` when nothing was listening or the event was
         suppressed). A slow subscriber's queue may still overflow after
@@ -247,7 +254,8 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
     # ``response.elicitation_request`` events; every other event
     # type is a single dict lookup and a return. A suppressed event is
     # always a text delta, never an elicitation, so this still runs.
-    pending_elicitations.record_publish(conversation_id, event)
+    if track_pending:
+        pending_elicitations.record_publish(conversation_id, event)
     if live_event is None:
         return 0
     with _lock:

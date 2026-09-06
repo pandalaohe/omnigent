@@ -26,20 +26,33 @@ class _ProcessManager:
 
 
 @pytest.mark.asyncio
-async def test_native_subagent_status_endpoint_returns_probe_result_without_harness_call(
+@pytest.mark.parametrize(
+    ("parent_id", "parent_registered"),
+    [("parent-current", True), ("parent-released", False)],
+    ids=["registered", "released"],
+)
+async def test_native_subagent_status_endpoint_reads_current_bridge_without_harness_call(
     monkeypatch: pytest.MonkeyPatch,
+    parent_id: str,
+    parent_registered: bool,
 ) -> None:
     server_requests: list[tuple[str, str]] = []
+    bridge_id = f"bridge-{parent_id.removeprefix('parent-')}"
 
     def server_handler(request: httpx.Request) -> httpx.Response:
         server_requests.append((request.method, request.url.path))
         return httpx.Response(
             200,
-            json={"labels": {"omnigent.claude_native.bridge_id": "bridge-current"}},
+            json={
+                "labels": {
+                    "omnigent.wrapper": "claude-code-native-ui",
+                    "omnigent.claude_native.bridge_id": bridge_id,
+                }
+            },
         )
 
     expected: status_probe.NativeSubagentProbeResult = {
-        "parent_session_id": "parent-current",
+        "parent_session_id": parent_id,
         "claude_session_id": "claude-session",
         "parent_complete_byte_offset": 420,
         "children": [],
@@ -56,27 +69,39 @@ async def test_native_subagent_status_endpoint_returns_probe_result_without_harn
         base_url="http://server",
     ) as server_client:
         app = create_runner_app(
-            process_manager=_ProcessManager("parent-current"),  # type: ignore[arg-type]
+            process_manager=_ProcessManager(*([parent_id] if parent_registered else [])),  # type: ignore[arg-type]
             server_client=server_client,
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://runner",
         ) as client:
-            response = await client.get("/v1/sessions/parent-current/native_subagent_status")
+            response = await client.get(f"/v1/sessions/{parent_id}/native_subagent_status")
 
     assert response.status_code == 200
-    assert response.json() == expected
-    assert calls == [("parent-current", "bridge-current")]
-    assert server_requests == [
-        ("GET", "/v1/sessions/parent-current/labels"),
-    ]
+    assert response.json() == {**expected, "bridge_id": bridge_id}
+    assert calls == [(parent_id, bridge_id)]
+    assert server_requests == [("GET", f"/v1/sessions/{parent_id}/labels")]
 
 
 @pytest.mark.asyncio
-async def test_native_subagent_status_endpoint_rejects_unowned_session() -> None:
+async def test_native_subagent_status_endpoint_rejects_non_claude_server_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_probe(*, parent_session_id: str, bridge_id: str) -> Any:
+        calls.append((parent_session_id, bridge_id))
+        raise AssertionError("non-Claude session reached the bridge probe")
+
+    monkeypatch.setattr(status_probe, "probe_native_subagent_status", fake_probe)
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={"labels": {"omnigent.wrapper": "codex-native-ui"}},
+            )
+        ),
         base_url="http://server",
     ) as server_client:
         app = create_runner_app(
@@ -87,10 +112,50 @@ async def test_native_subagent_status_endpoint_rejects_unowned_session() -> None
             transport=httpx.ASGITransport(app=app),
             base_url="http://runner",
         ) as client:
-            response = await client.get("/v1/sessions/parent-missing/native_subagent_status")
+            response = await client.get("/v1/sessions/not-claude/native_subagent_status")
 
     assert response.status_code == 404
     assert response.json()["error"] == "not_found"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_response",
+    [
+        pytest.param(httpx.Response(503), id="server-error"),
+        pytest.param(httpx.Response(200, json=[]), id="non-object-payload"),
+        pytest.param(httpx.Response(200, json={"labels": []}), id="non-object-labels"),
+    ],
+)
+async def test_native_subagent_status_endpoint_reports_server_label_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    server_response: httpx.Response,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_probe(*, parent_session_id: str, bridge_id: str) -> Any:
+        calls.append((parent_session_id, bridge_id))
+        raise AssertionError("label lookup failure reached the bridge probe")
+
+    monkeypatch.setattr(status_probe, "probe_native_subagent_status", fake_probe)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: server_response),
+        base_url="http://server",
+    ) as server_client:
+        app = create_runner_app(
+            process_manager=_ProcessManager(),  # type: ignore[arg-type]
+            server_client=server_client,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://runner",
+        ) as client:
+            response = await client.get("/v1/sessions/parent/native_subagent_status")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "server_labels_unavailable"
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -98,7 +163,10 @@ async def test_native_subagent_status_endpoint_preserves_probe_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def server_handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"labels": {}})
+        return httpx.Response(
+            200,
+            json={"labels": {"omnigent.wrapper": "claude-code-native-ui"}},
+        )
 
     def reject_probe(*, parent_session_id: str, bridge_id: str) -> Any:
         del parent_session_id, bridge_id
@@ -141,7 +209,10 @@ async def test_native_subagent_status_endpoint_vetoes_independently_resumed_chil
     child_runtime_active: bool,
 ) -> None:
     def server_handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"labels": {}})
+        return httpx.Response(
+            200,
+            json={"labels": {"omnigent.wrapper": "claude-code-native-ui"}},
+        )
 
     terminal_child: status_probe.NativeSubagentProbeChild = {
         "server_session_id": "child-resumed",

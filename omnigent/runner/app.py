@@ -364,6 +364,25 @@ async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
     return _server_version
 
 
+async def _fetch_current_session_labels(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> dict[str, str] | None:
+    """Return current Server labels, or ``None`` when they cannot be trusted."""
+    labels_path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/labels"
+    try:
+        response = await server_client.get(labels_path, timeout=1.0)
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if response.status_code != 200 or not isinstance(payload, Mapping):
+        return None
+    labels = payload.get("labels")
+    if not isinstance(labels, Mapping):
+        return None
+    return {str(key): str(value) for key, value in labels.items()}
+
+
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     """
     Log *exc* in full and return a generic detail string safe for clients.
@@ -4385,14 +4404,6 @@ def create_runner_app(
                     "detail": "Native sub-agent status needs a HarnessProcessManager.",
                 },
             )
-        if not process_manager.has_session(session_id):
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "error": "not_found",
-                    "detail": f"No session '{session_id}' on this runner.",
-                },
-            )
         harness = _session_harness_name(session_id)
         if harness is not None and harness != "claude-native":
             return JSONResponse(
@@ -4408,8 +4419,25 @@ def create_runner_app(
             probe_native_subagent_status,
         )
 
-        envelope = _fresh_session_init_envelope(session_id)
-        labels = envelope.snapshot.labels if envelope is not None else None
+        # The bridge can outlive HarnessProcessManager; current Server labels
+        # fence it against a stale session binding.
+        labels = await _fetch_current_session_labels(server_client, session_id)
+        if labels is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "server_labels_unavailable",
+                    "detail": "Current Server session labels are unavailable.",
+                },
+            )
+        if labels.get("omnigent.wrapper") != "claude-code-native-ui":
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "not_found",
+                    "detail": f"Session '{session_id}' is not a Claude-native parent.",
+                },
+            )
         bridge_id = await _claude_native_bridge_id_with_optional_labels(
             server_client=server_client,
             session_id=session_id,
@@ -4448,7 +4476,7 @@ def create_runner_app(
                 child["status"] = "unverified"
                 child["terminal_status"] = None
                 child["reason"] = "independent_child_runtime_present"
-        return JSONResponse(status_code=200, content=result)
+        return JSONResponse(status_code=200, content={**result, "bridge_id": bridge_id})
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:

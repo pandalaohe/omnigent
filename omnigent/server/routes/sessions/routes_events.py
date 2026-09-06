@@ -1500,13 +1500,24 @@ def register_events_routes(
             if (
                 conv.kind == "sub_agent"
                 and conv.labels.get("omnigent.wrapper") == "claude-code-native-ui-subagent"
-                and conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
                 and status in {"running", "completed", "failed", "stopped", "killed"}
+                and (
+                    conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+                    or (
+                        status == "running"
+                        and conv.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+                        in {"completed", "failed", "stopped", "killed"}
+                    )
+                )
             ):
+                label_updates = {_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: ""}
+                if status == "running":
+                    # New activity supersedes the prior dispatch's terminal verdict.
+                    label_updates[_SUBAGENT_TERMINAL_STATUS_LABEL_KEY] = ""
                 await asyncio.to_thread(
                     conversation_store.set_labels,
                     session_id,
-                    {_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: ""},
+                    label_updates,
                 )
             # ``None`` (field absent) = no information; leave the sticky
             # tally untouched (the PTY-activity ``idle`` carries none). An

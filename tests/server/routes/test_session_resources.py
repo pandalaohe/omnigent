@@ -3642,6 +3642,55 @@ async def test_relay_persists_terminal_resource_deleted_from_runner() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repair_fails", [False, True], ids=["success", "store-failure"])
+async def test_relay_native_main_terminal_delete_reconciles_without_breaking_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    repair_fails: bool,
+) -> None:
+    from omnigent.server.routes._sessions import subagent_reconciliation
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    store = _ConversationStore()
+    calls: list[dict[str, object]] = []
+
+    async def _repair(**kwargs: object) -> int:
+        calls.append(kwargs)
+        if repair_fails:
+            raise RuntimeError("store unavailable")
+        return 1
+
+    monkeypatch.setattr(
+        subagent_reconciliation,
+        "_invalidate_native_subagents_for_missing_parent_terminal_impl",
+        _repair,
+    )
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.resource.deleted",
+                    "resource_id": "terminal_claude_main",
+                    "resource_type": "terminal",
+                    "session_id": session_id,
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream(session_id, client, store, runner_id="runner-parent")  # type: ignore[arg-type]
+
+    events = [item for item in store.appended_items if item.type == "resource_event"]
+    assert len(events) == 1
+    assert len(calls) == 1
+    assert calls[0]["parent_session_id"] == session_id
+    assert calls[0]["parent"] is store.get_conversation(session_id)
+    assert calls[0]["conversation_store"] is store
+    assert calls[0]["observed_runner_id"] == "runner-parent"
+
+
+@pytest.mark.asyncio
 async def test_relay_persists_failed_status_error_labels_from_runner() -> None:
     """Runner ``session.status: failed`` error details survive reload."""
     from omnigent.server.routes.sessions import _relay_runner_stream

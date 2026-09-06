@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.runtime import pending_elicitations
 from omnigent.server import session_live_state
 from omnigent.server.routes._sessions import (
     subagent_reconciliation as reconciliation_module,
@@ -79,6 +80,7 @@ def _probe_payload(
     ).hexdigest()
     return {
         "parent_session_id": parent_id,
+        "bridge_id": parent_id,
         "claude_session_id": "claude-session-a",
         "parent_complete_byte_offset": 123,
         "children": [
@@ -115,11 +117,164 @@ async def _seed_parent_via_api(
     return parent
 
 
+async def _seed_running_native_pair(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    name: str,
+    *,
+    parent_runner: str = "runner-parent",
+    child_runner: str = "runner-parent",
+) -> tuple[SqlAlchemyConversationStore, dict[str, Any], Any, Any]:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = await _seed_parent_via_api(client, store, name)
+    store.replace_runner_id(parent["id"], parent_runner)
+    child = _seed_native_child(store, parent_id=parent["id"], agent_id=parent["agent_id"])
+    store.replace_runner_id(child.id, child_runner)
+    store.set_session_live_status(child.id, "running")
+    reconciliation_module._session_status_cache[child.id] = "running"
+    parent_row = store.get_conversation(parent["id"])
+    assert parent_row is not None
+    return store, parent, child, parent_row
+
+
 def _runner_client(payload: dict[str, Any], status_code: int = 200) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _request: httpx.Response(status_code, json=payload)),
         base_url="http://runner.test",
     )
+
+
+@pytest.mark.asyncio
+async def test_first_complete_child_list_repairs_stale_native_terminal_state(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opening Agents repairs restart-stale activity from the existing bridge."""
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = await _seed_parent_via_api(client, store, "lazy-reconcile-parent")
+    child = _seed_native_child(store, parent_id=parent["id"], agent_id=parent["agent_id"])
+    store.set_session_live_status(child.id, "running")
+    reconciliation_module._session_status_cache[child.id] = "running"
+    runner = _runner_client(_probe_payload(parent["id"], child.id))
+
+    async def _existing_runner(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return runner
+
+    monkeypatch.setattr(routes_items_module, "_get_runner_client", _existing_runner)
+    try:
+        response = await client.get(f"/v1/sessions/{parent['id']}/child_sessions?limit=1000")
+    finally:
+        await runner.aclose()
+        reconciliation_module._session_status_cache.pop(child.id, None)
+
+    assert response.status_code == 200, response.text
+    row = next(value for value in response.json()["data"] if value["id"] == child.id)
+    assert row["busy"] is False
+    assert row["current_task_status"] == "completed"
+    assert parent["id"] not in routes_items_module._subagent_reconcile_locks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_runner", "child_runner", "observed_runner"),
+    [
+        ("runner-parent", "runner-child", "runner-parent"),
+        ("runner-new", "runner-new", "runner-old"),
+    ],
+    ids=["child-rebound", "stale-relay"],
+)
+async def test_missing_parent_terminal_rejects_mismatched_runner_binding(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    parent_runner: str,
+    child_runner: str,
+    observed_runner: str,
+) -> None:
+    store, parent, child, parent_row = await _seed_running_native_pair(
+        client,
+        db_uri,
+        "runner-mismatch-parent",
+        parent_runner=parent_runner,
+        child_runner=child_runner,
+    )
+    try:
+        changed = (
+            await reconciliation_module.invalidate_native_subagents_for_missing_parent_terminal(
+                parent_session_id=parent["id"],
+                parent=parent_row,
+                conversation_store=store,
+                observed_runner_id=observed_runner,
+            )
+        )
+        current = store.get_conversation(child.id)
+        assert current is not None
+        assert changed == 0
+        assert current.labels.get(_UNVERIFIED_KEY) != "true"
+        assert reconciliation_module._session_status_cache[child.id] == "running"
+    finally:
+        reconciliation_module._session_status_cache.pop(child.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_activity", ["response", "prompt"])
+async def test_missing_parent_terminal_preserves_new_activity_during_cas(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    new_activity: str,
+) -> None:
+    store, parent, child, parent_row = await _seed_running_native_pair(
+        client, db_uri, f"missing-terminal-{new_activity}-race"
+    )
+    old_prompt = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit-reused",
+        "params": {"message": "Old prompt"},
+    }
+    new_prompt = {**old_prompt, "params": {"message": "New turn prompt"}}
+    if new_activity == "response":
+        reconciliation_module._session_active_response_cache[child.id] = "response-old"
+    else:
+        pending_elicitations.record_publish(child.id, old_prompt)
+    original_reconcile = SqlAlchemyConversationStore.reconcile_native_subagent_status
+
+    def _reconcile_then_start_new_activity(
+        self: SqlAlchemyConversationStore, *args: Any, **kwargs: Any
+    ) -> Any:
+        result = original_reconcile(self, *args, **kwargs)
+        if new_activity == "response":
+            reconciliation_module._session_active_response_cache[child.id] = "response-new"
+        else:
+            pending_elicitations.record_publish(child.id, new_prompt)
+        return result
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "reconcile_native_subagent_status",
+        _reconcile_then_start_new_activity,
+    )
+    try:
+        changed = (
+            await reconciliation_module.invalidate_native_subagents_for_missing_parent_terminal(
+                parent_session_id=parent["id"],
+                parent=parent_row,
+                conversation_store=store,
+                observed_runner_id="runner-parent",
+            )
+        )
+        current = store.get_conversation(child.id)
+        assert current is not None
+        assert changed == 0
+        assert current.labels.get(_UNVERIFIED_KEY) != "true"
+        if new_activity == "response":
+            assert reconciliation_module._session_active_response_cache[child.id] == "response-new"
+        else:
+            assert pending_elicitations.snapshot_for(child.id) == [new_prompt]
+    finally:
+        pending_elicitations.resolve(child.id, "elicit-reused")
+        reconciliation_module._session_status_cache.pop(child.id, None)
+        reconciliation_module._session_active_response_cache.pop(child.id, None)
 
 
 @pytest.mark.asyncio
@@ -144,12 +299,28 @@ async def test_reconcile_route_corrects_only_reliable_terminal_metadata(
     reconciliation_module._session_active_response_cache[child.id] = "old-response"
     reconciliation_module._session_background_task_count_cache[child.id] = 1
     reconciliation_module._session_background_tasks_cache[child.id] = []
+    stale_prompt = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit-stale-terminal",
+        "params": {"message": "Approve stale work?"},
+    }
+    pending_elicitations.record_publish(child.id, stale_prompt)
+    pending_elicitations.record_publish(
+        parent["id"],
+        {
+            **stale_prompt,
+            "params": {
+                **stale_prompt["params"],
+                "target_session_id": child.id,
+            },
+        },
+    )
     published: list[tuple[str, dict[str, Any]]] = []
     parent_updates: list[tuple[str, str]] = []
     monkeypatch.setattr(
         reconciliation_module.session_stream,
         "publish",
-        lambda session_id, payload: published.append((session_id, payload)),
+        lambda session_id, payload, **_kwargs: published.append((session_id, payload)),
     )
     monkeypatch.setattr(
         reconciliation_module,
@@ -185,6 +356,8 @@ async def test_reconcile_route_corrects_only_reliable_terminal_metadata(
     assert child.id not in reconciliation_module._session_active_response_cache
     assert child.id not in reconciliation_module._session_background_task_count_cache
     assert child.id not in reconciliation_module._session_background_tasks_cache
+    assert pending_elicitations.count_for(child.id) == 0
+    assert pending_elicitations.count_for(parent["id"]) == 0
     assert parent_updates == [(child.id, "idle")]
     assert any(
         session_id == child.id
@@ -230,6 +403,44 @@ async def test_reconcile_route_preserves_unverified_child(
     assert unchanged is not None
     assert unchanged.live_status == "running"
     assert _TERMINAL_KEY not in unchanged.labels
+
+
+@pytest.mark.asyncio
+async def test_reconcile_route_preserves_child_on_another_runner(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parent transcript evidence cannot settle an independently rebound child."""
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = await _seed_parent_via_api(client, store, "reconcile-rebound-parent")
+    store.replace_runner_id(parent["id"], "runner-parent")
+    child = _seed_native_child(store, parent_id=parent["id"], agent_id=parent["agent_id"])
+    store.replace_runner_id(child.id, "runner-child")
+    store.set_session_live_status(child.id, "running")
+    runner = _runner_client(_probe_payload(parent["id"], child.id))
+
+    async def _existing_runner(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return runner
+
+    monkeypatch.setattr(routes_items_module, "_get_runner_client", _existing_runner)
+    try:
+        response = await client.post(f"/v1/sessions/{parent['id']}/child_sessions/reconcile")
+    finally:
+        await runner.aclose()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["details"] == [
+        {
+            "session_id": child.id,
+            "outcome": "unverified",
+            "reason": "child_on_another_runner",
+        }
+    ]
+    current = store.get_conversation(child.id)
+    assert current is not None
+    assert current.live_status == "running"
+    assert _TERMINAL_KEY not in current.labels
 
 
 @pytest.mark.asyncio
@@ -488,6 +699,7 @@ async def test_reconcile_route_preserves_same_status_new_turn_during_cas(
     assert persisted[-2:] == [(child.id, "idle"), (child.id, "running")]
     current = store.get_conversation(child.id)
     assert current is not None and current.live_status == "running"
+    assert current.labels.get(_TERMINAL_KEY) in {None, ""}
 
 
 @pytest.mark.asyncio
@@ -515,6 +727,35 @@ async def test_reconcile_route_reports_old_host_without_changing_state(
     assert "Update the custom Host" in response.text
     unchanged = store.get_conversation(child.id)
     assert unchanged is not None and unchanged.live_status == "running"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_route_reports_missing_parent_transcript_without_upgrade_advice(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = await _seed_parent_via_api(client, store, "reconcile-missing-transcript")
+    child = _seed_native_child(store, parent_id=parent["id"], agent_id=parent["agent_id"])
+    store.set_session_live_status(child.id, "running")
+    runner = _runner_client(
+        {"error": "native_parent_not_found", "detail": "bridge unavailable"},
+        status_code=404,
+    )
+
+    async def _existing_runner(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return runner
+
+    monkeypatch.setattr(routes_items_module, "_get_runner_client", _existing_runner)
+    try:
+        response = await client.post(f"/v1/sessions/{parent['id']}/child_sessions/reconcile")
+    finally:
+        await runner.aclose()
+
+    assert response.status_code == 503
+    assert "transcript evidence" in response.text
+    assert "Update the custom Host" not in response.text
 
 
 def test_reconcile_cas_rejects_new_running_edge_without_new_item(db_uri: str) -> None:

@@ -6238,6 +6238,7 @@ async def _relay_runner_stream(
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     ready: asyncio.Event | None = None,
+    runner_id: str | None = None,
 ) -> None:
     """
     Run the runner-stream relay, riding out transient tunnel drops.
@@ -6275,6 +6276,7 @@ async def _relay_runner_stream(
                 runner_client,
                 conversation_store,
                 ready,
+                runner_id,
             )
             return
         except _RelayTransportLost as lost:
@@ -6368,6 +6370,7 @@ async def _relay_runner_stream_once(
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     ready: asyncio.Event | None = None,
+    runner_id: str | None = None,
 ) -> None:
     """
     Subscribe to the runner's SSE stream and relay events locally.
@@ -6759,6 +6762,25 @@ async def _relay_runner_stream_once(
                             and _session_terminal_pending_cache.get(session_id, False)
                         ):
                             _publish_terminal_pending(session_id, False)
+                        if (
+                            isinstance(resource_data, ResourceEventData)
+                            and resource_data.event_type == "session.resource.deleted"
+                            and resource_data.resource_type == "terminal"
+                            and resource_data.resource_id == "terminal_claude_main"
+                        ):
+                            from omnigent.server.routes._sessions.subagent_reconciliation import (
+                                invalidate_native_subagents_for_missing_parent_terminal,
+                            )
+
+                            invalidate_missing_terminal = (
+                                invalidate_native_subagents_for_missing_parent_terminal
+                            )
+                            if runner_id is not None:
+                                await invalidate_missing_terminal(
+                                    parent_session_id=session_id,
+                                    conversation_store=conversation_store,
+                                    observed_runner_id=runner_id,
+                                )
 
                     # Intelligent-model-router decision emitted by the runner's
                     # cost advisor at turn start. Persist as a display-only
@@ -7047,6 +7069,7 @@ def _ensure_runner_relay(
             runner_client,
             relay_store,
             ready,
+            runner_id,
         ),
         name=f"runner-relay-{session_id}",
     )
