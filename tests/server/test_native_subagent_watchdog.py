@@ -99,6 +99,75 @@ async def test_omission_is_uncertain_not_a_terminal_transition() -> None:
 
 
 @pytest.mark.asyncio
+async def test_timeout_fanout_preserves_durable_running_on_cache_miss(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions import helpers as helpers_module
+    from omnigent.server.routes._sessions.common import _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(title="parent")
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="child",
+        parent_conversation_id=parent.id,
+    )
+    store.set_session_live_status(child.id, "running")
+    _session_status_cache.pop(child.id, None)
+    published: list[tuple[str, dict]] = []
+    changed = asyncio.Event()
+
+    monkeypatch.setattr(
+        session_live_state,
+        "submit",
+        lambda _description, fn, *args, **_kwargs: fn(*args),
+    )
+    monkeypatch.setattr(
+        helpers_module.session_stream,
+        "publish",
+        lambda session_id, payload: published.append((session_id, payload)),
+    )
+    session_live_state.configure(store)
+
+    def fan_out(children: frozenset[str]) -> None:
+        for child_id in children:
+            helpers_module._publish_child_status_to_parent(
+                child_id,
+                _session_status_cache.get(child_id),
+            )
+        changed.set()
+
+    async def verify(_parent: str, _binding: str) -> bool:
+        return True
+
+    watch = NativeSubagentWatchdog(
+        verify=verify,
+        changed=fan_out,
+        heartbeat_timeout_s=0.005,
+        retry_s=0.005,
+    )
+    try:
+        watch.heartbeat(parent.id, "runner", snapshot(children={child.id: "running"}))
+        await asyncio.wait_for(changed.wait(), 1)
+        child_event = next(
+            payload
+            for session_id, payload in published
+            if session_id == parent.id and payload.get("type") == "session.child_session.updated"
+        )
+        assert child_event["child"]["busy"] is True
+        assert child_event["child"]["native_activity_unverified"] is True
+    finally:
+        await watch.close()
+        session_live_state.configure(None)
+        _session_status_cache.pop(child.id, None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["stop", "archive", "delete", "rebind"])
 async def test_lifecycle_disarm_cancels_pending_probe_and_rejects_old_source(reason) -> None:
     entered = asyncio.Event()

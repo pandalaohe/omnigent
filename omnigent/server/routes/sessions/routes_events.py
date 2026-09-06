@@ -506,7 +506,7 @@ def register_events_routes(
 
     def _native_inventory_changed(children: frozenset[str]) -> None:
         for child_id in children:
-            _publish_child_status_to_parent(child_id, _session_status_cache.get(child_id, "idle"))
+            _publish_child_status_to_parent(child_id, _session_status_cache.get(child_id))
 
     native_watchdog = NativeSubagentWatchdog(
         verify=_verify_native_inventory,

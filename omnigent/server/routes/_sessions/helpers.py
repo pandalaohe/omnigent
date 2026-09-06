@@ -4289,7 +4289,7 @@ def _require_permission_mode_forward(
     return settled if isinstance(settled, str) and settled else mode
 
 
-def _publish_child_status_to_parent(session_id: str, status: str) -> None:
+def _publish_child_status_to_parent(session_id: str, status: str | None) -> None:
     """
     Mirror a status transition onto the session's parent stream.
 
@@ -4308,8 +4308,10 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
 
     :param session_id: Session whose cached status just changed,
         e.g. ``"conv_child123"``.
-    :param status: The new status, e.g. ``"running"``. Captured here rather
-        than re-read on the worker so each edge fans out its own value.
+    :param status: The new status, e.g. ``"running"``. ``None`` lets the
+        worker resolve the latest cache or durable row after a Server restart.
+        Explicit edges are captured here so a burst of transitions fans out
+        each edge's own value.
     """
     store = session_live_state.conversation_store()
     if store is None:
@@ -9765,6 +9767,8 @@ def _child_session_summary_from_conversation(
         durable_status = labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
         if durable_status in ("completed", "failed", "stopped", "killed"):
             cached_status = durable_status
+    if cached_status is None and conv.live_status in ("idle", "running", "waiting", "failed"):
+        cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
