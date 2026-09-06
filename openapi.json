@@ -11474,6 +11474,47 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/child_sessions/reconcile": {
+      "post": {
+        "description": "Verify and repair stale direct native sub-agent status metadata.\n\nThe action is owner-only and intentionally accepts no child ids. It\nfreezes every direct child, asks the already-bound runner for a\nread-only parent-transcript verdict, then applies each reliable\nterminal result through a store compare-and-set. It never launches or\nresumes a runner and never writes conversation items or parent inboxes.",
+        "operationId": "reconcile_child_sessions_v1_sessions__session_id__child_sessions_reconcile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconcile Child Sessions",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/codex_goal": {
       "delete": {
         "description": "Clear the current Codex app-server goal.\n\n**Returns:** Whether Codex removed an existing goal.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can clear the goal.",

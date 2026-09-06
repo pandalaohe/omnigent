@@ -9606,7 +9606,7 @@ def _child_session_summary_from_conversation(
     # Derive busy from the relay-fed cache; tasks table is gone.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
-    if cached_status is None:
+    if cached_status is None or cached_status == "idle":
         durable_status = labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
         if durable_status in ("completed", "failed", "stopped", "killed"):
             cached_status = durable_status

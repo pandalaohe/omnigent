@@ -34,6 +34,7 @@ from omnigent.host.frames import (
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
+    pending_elicitations,
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -962,9 +963,38 @@ def register_events_routes(
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
                 raise
+            stop_conv = None
             if not stop_delivered:
-                # No runner resolved: nothing else lifts the fence (same as interrupt).
+                # No runner resolved: honor the owner's cancellation of the
+                # stale Server lifecycle, including cached running/waiting state.
+                # This does not prove an unreachable native process exited;
+                # any later real runner status remains authoritative.
+                # This keeps the conversation and all items intact; Stop is a
+                # lifecycle transition, not deletion.
                 _interrupt_fenced_sessions.discard(session_id)
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                # A dead runner can also strand approval/question Futures.
+                # Resolve every tracked prompt as cancelled before the terminal
+                # status fan-out: this clears the child badge, flips live cards,
+                # and mirrors the resolution through all ancestor streams.
+                for pending in pending_elicitations.snapshot_for(session_id):
+                    elicitation_id = pending.get("elicitation_id")
+                    if isinstance(elicitation_id, str) and elicitation_id:
+                        await _resolve_elicitation(
+                            session_id,
+                            {"elicitation_id": elicitation_id, "action": "cancel"},
+                            runner_router,
+                            conversation_store,
+                        )
+                if stop_conv is not None and stop_conv.kind == "sub_agent":
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "stopped"},
+                    )
+                _publish_status(session_id, "idle", background_task_count=0)
             # Host-spawned sessions run on a dedicated runner the host
             # launched for this one session. Killing the pane (above) leaves
             # that runner connected, so GET /health keeps reporting
@@ -975,7 +1005,10 @@ def register_events_routes(
             # command" banner a CLI-launched session reaches on exit. Read
             # host_id / runner_id from the owner-gated session row so we can
             # only ever stop the runner bound to this session.
-            stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if stop_delivered:
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
             if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
                 # Mark the tunnel drop as intentional BEFORE tearing it down so
                 # the relay's disconnect handler renders a quiet stopped state

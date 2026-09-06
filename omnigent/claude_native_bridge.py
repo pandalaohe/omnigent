@@ -2474,6 +2474,7 @@ def read_transcript_items_from_offset(
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
     include_sidechains: bool = False,
+    end_offset: int | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items appended after a byte offset.
@@ -2502,12 +2503,15 @@ def read_transcript_items_from_offset(
         leave the sub-agent's child Omnigent conversation empty. The
         default ``False`` keeps the parent-transcript path
         unchanged.
+    :param end_offset: Optional frozen byte boundary for read-only probes.
+        Records crossing it remain unread.
     :returns: Parsed items plus updated line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
         transcript_path,
         byte_offset=byte_offset,
         start_line=start_line,
+        end_offset=end_offset,
     )
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
@@ -3048,6 +3052,7 @@ def _read_complete_jsonl_records(
     byte_offset: int,
     start_line: int,
     emit_after_line: int | None = None,
+    end_offset: int | None = None,
 ) -> _JsonlReadResult:
     """
     Read complete newline-terminated records from a JSONL file.
@@ -3064,12 +3069,16 @@ def _read_complete_jsonl_records(
     :param emit_after_line: When provided, complete records at or
         before this line number are counted for cursor migration but
         not decoded or stored.
+    :param end_offset: Optional frozen upper byte boundary. Records crossing
+        the boundary are treated as a trailing partial record.
     :returns: Complete records plus updated line and byte cursors.
     """
     if byte_offset < 0:
         raise ValueError(f"byte_offset must be non-negative, got {byte_offset}")
     if start_line < 0:
         raise ValueError(f"start_line must be non-negative, got {start_line}")
+    if end_offset is not None and end_offset < 0:
+        raise ValueError(f"end_offset must be non-negative, got {end_offset}")
     records: list[_JsonlRecord] = []
     cursor = start_line
     position = byte_offset
@@ -3077,15 +3086,16 @@ def _read_complete_jsonl_records(
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             file_size = handle.tell()
+            read_end = file_size if end_offset is None else min(file_size, end_offset)
             if byte_offset > file_size:
                 handle.seek(0)
                 cursor = 0
                 position = 0
             else:
                 handle.seek(byte_offset)
-            while True:
+            while position < read_end:
                 record_start = position
-                raw = handle.readline()
+                raw = handle.readline(read_end - position)
                 if not raw:
                     break
                 if not raw.endswith(b"\n"):
