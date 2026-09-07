@@ -4309,7 +4309,8 @@ def _publish_child_status_to_parent(session_id: str, status: str | None) -> None
     :param session_id: Session whose cached status just changed,
         e.g. ``"conv_child123"``.
     :param status: The new status, e.g. ``"running"``. ``None`` lets the
-        worker resolve the latest cache or durable row after a Server restart.
+        worker resolve the latest durable terminal/quarantine state, then the
+        cache or live row, after a Server restart or best-effort repair.
         Explicit edges are captured here so a burst of transitions fans out
         each edge's own value.
     """
@@ -4322,12 +4323,23 @@ def _publish_child_status_to_parent(session_id: str, status: str | None) -> None
         if conv is None or conv.parent_conversation_id is None:
             return
         parent_id = conv.parent_conversation_id
+        resolved_status = status
+        if resolved_status is None:
+            terminal_status = conv.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+            if terminal_status == "failed":
+                resolved_status = "failed"
+            elif terminal_status in {"completed", "stopped", "killed"}:
+                resolved_status = "idle"
+            elif conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true":
+                resolved_status = "activity_unverified"
+            else:
+                resolved_status = _session_status_cache.get(conv.id) or conv.live_status
         items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
         summary = _child_session_summary_from_conversation(
             conv,
             parent_id,
             _latest_message_preview(items_by_child.get(conv.id, [])),
-            cached_status=status,
+            cached_status=resolved_status,
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -9756,24 +9768,21 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
-    if cached_status is None:
-        cached_status = _session_status_cache.get(conv.id)
-    if cached_status is None or cached_status == "idle":
-        # ``idle`` is the public session-status representation for every
-        # successful terminal edge. A durable child label refines that generic
-        # value so an intentional Stop renders as stopped (not completed) on
-        # live fan-out and subsequent snapshots.
-        durable_status = labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
-        if durable_status in ("completed", "failed", "stopped", "killed"):
-            cached_status = durable_status
-    if cached_status is None and conv.live_status in ("idle", "running", "waiting", "failed"):
-        cached_status = conv.live_status
+    # A structured terminal label is stronger than quarantine and transient
+    # cache/live state, including when an old conflicted row contains both.
+    durable_status = labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+    if durable_status in ("completed", "failed", "stopped", "killed"):
+        cached_status = durable_status
+    else:
+        if cached_status is None:
+            cached_status = _session_status_cache.get(conv.id)
+        if cached_status is None and conv.live_status in ("idle", "running", "waiting", "failed"):
+            cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
         busy = False
-    activity_unverified = (
+    activity_unverified = durable_status not in ("completed", "failed", "stopped", "killed") and (
         cached_status == "activity_unverified"
         or labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
     )

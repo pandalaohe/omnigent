@@ -4001,7 +4001,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         expected: NativeSubagentReconcileFingerprint,
         *,
-        live_status: str,
+        expected_parent: NativeSubagentReconcileFingerprint | None = None,
+        live_status: str | None,
         label_updates: dict[str, str],
     ) -> NativeSubagentReconcileWriteResult:
         """Conditionally persist a native child terminal state in one transaction."""
@@ -4013,87 +4014,95 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         workspace_id = current_workspace_id()
         with self._conv_session_immediate("reconcile_native_subagent_status") as session:
-            # append() takes this same lock before allocating a new item. This
-            # makes the latest-item comparison and the repair linearizable.
-            self._lock_conversation(session, expected.conversation_id)
-            conv_row = session.get(
-                SqlConversation,
-                (workspace_id, expected.conversation_id),
-            )
-            if (
-                conv_row is None
-                or conv_row.parent_conversation_id != expected.parent_conversation_id
-            ):
-                return "stale"
 
-            meta_query = select(SqlConversationMetadata).where(
-                SqlConversationMetadata.workspace_id == workspace_id,
-                SqlConversationMetadata.id == expected.conversation_id,
-            )
-            if self._meta_supports_for_update:
-                meta_query = meta_query.with_for_update()
-            meta = session.scalars(meta_query).first()
-            current_live_status = (
-                decode_session_live_status(meta.live_status)
-                if meta is not None and meta.live_status is not None
-                else None
-            )
-            if meta is None or current_live_status != expected.live_status:
-                return "stale"
-            if (
-                meta.runner_id != expected.runner_id
-                or meta.host_id != expected.host_id
-                or meta.external_session_id != expected.external_session_id
-            ):
-                return "stale"
-
-            latest_item_id = session.execute(
-                select(SqlConversationItem.id)
-                .where(
-                    SqlConversationItem.workspace_id == workspace_id,
-                    SqlConversationItem.conversation_id == expected.conversation_id,
+            def _read_locked(
+                frozen: NativeSubagentReconcileFingerprint,
+            ) -> tuple[SqlConversationMetadata, dict[str, tuple[str, int]]] | None:
+                # append() takes this same lock, so the latest-item check and
+                # repair are linearizable. Parent is read first for a stable
+                # parent-then-child lock order.
+                self._lock_conversation(session, frozen.conversation_id)
+                row = session.get(SqlConversation, (workspace_id, frozen.conversation_id))
+                if row is None or row.parent_conversation_id != frozen.parent_conversation_id:
+                    return None
+                meta_query = select(SqlConversationMetadata).where(
+                    SqlConversationMetadata.workspace_id == workspace_id,
+                    SqlConversationMetadata.id == frozen.conversation_id,
                 )
-                .order_by(SqlConversationItem.position.desc())
-                .limit(1)
-            ).scalar_one_or_none()
-            if latest_item_id != expected.latest_item_id:
-                return "stale"
+                if self._meta_supports_for_update:
+                    meta_query = meta_query.with_for_update()
+                frozen_meta = session.scalars(meta_query).first()
+                live_status = (
+                    decode_session_live_status(frozen_meta.live_status)
+                    if frozen_meta is not None and frozen_meta.live_status is not None
+                    else None
+                )
+                if (
+                    frozen_meta is None
+                    or live_status != frozen.live_status
+                    or frozen_meta.runner_id != frozen.runner_id
+                    or frozen_meta.host_id != frozen.host_id
+                    or frozen_meta.external_session_id != frozen.external_session_id
+                ):
+                    return None
+                latest_item_id = session.execute(
+                    select(SqlConversationItem.id)
+                    .where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        SqlConversationItem.conversation_id == frozen.conversation_id,
+                    )
+                    .order_by(SqlConversationItem.position.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if latest_item_id != frozen.latest_item_id:
+                    return None
+                label_keys = tuple(key for key, _value, _stamp in frozen.label_states)
+                label_query = select(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == workspace_id,
+                    SqlConversationLabel.conversation_id == frozen.conversation_id,
+                    SqlConversationLabel.key.in_(label_keys),
+                )
+                if self._supports_for_update:
+                    label_query = label_query.with_for_update()
+                labels = {
+                    row.key: (row.value, row.updated_at)
+                    for row in session.scalars(label_query).all()
+                }
+                label_states = tuple(
+                    (key, labels[key][0], labels[key][1]) if key in labels else (key, None, None)
+                    for key in label_keys
+                )
+                return (frozen_meta, labels) if label_states == frozen.label_states else None
 
-            label_keys = tuple(key for key, _value, _stamp in expected.label_states)
-            label_query = select(SqlConversationLabel).where(
-                SqlConversationLabel.workspace_id == workspace_id,
-                SqlConversationLabel.conversation_id == expected.conversation_id,
-                SqlConversationLabel.key.in_(label_keys),
-            )
-            if self._supports_for_update:
-                label_query = label_query.with_for_update()
-            current_rows = session.scalars(label_query).all()
-            current_labels = {row.key: (row.value, row.updated_at) for row in current_rows}
-            current_label_states = tuple(
-                (key, current_labels[key][0], current_labels[key][1])
-                if key in current_labels
-                else (key, None, None)
-                for key in label_keys
-            )
-            if current_label_states != expected.label_states:
+            parent_state = _read_locked(expected_parent) if expected_parent is not None else None
+            if expected_parent is not None and parent_state is None:
+                return "stale"
+            current_state = _read_locked(expected)
+            if current_state is None:
+                return "stale"
+            meta, current_labels = current_state
+            if parent_state is not None and meta.runner_id != parent_state[0].runner_id:
                 return "stale"
 
             stamp = now_epoch()
-            missing_updates = {
-                key: value for key, value in label_updates.items() if key not in current_labels
-            }
-            if missing_updates:
+
+            def _reserve_missing_labels(
+                conversation_id: str,
+                updates: dict[str, str],
+            ) -> NativeSubagentReconcileWriteResult:
+                if not updates:
+                    return "corrected"
                 dialect = session.bind.dialect.name if session.bind is not None else ""
                 if dialect not in ("sqlite", "postgresql"):
                     return "unsupported"
                 rows = [
                     {
-                        "conversation_id": expected.conversation_id,
+                        "conversation_id": conversation_id,
                         "key": key,
                         "value": value[:LABEL_VALUE_MAX_LEN],
                         "updated_at": stamp,
                     }
-                    for key, value in missing_updates.items()
+                    for key, value in updates.items()
                 ]
                 if dialect == "sqlite":
                     from sqlalchemy.dialects.sqlite import insert as guarded_insert
@@ -4114,14 +4123,47 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if getattr(insert_result, "rowcount", -1) != len(rows):
                     session.rollback()
                     return "stale"
+                return "corrected"
 
-            meta.live_status = encode_session_live_status(live_status)
+            parent_reservations: dict[str, str] = {}
+            if expected_parent is not None and parent_state is not None:
+                parent_reservations = {
+                    key: "" for key, value, _stamp in expected_parent.label_states if value is None
+                }
+                reserve_result = _reserve_missing_labels(
+                    expected_parent.conversation_id,
+                    parent_reservations,
+                )
+                if reserve_result != "corrected":
+                    return reserve_result
+
+            missing_updates = {
+                key: value for key, value in label_updates.items() if key not in current_labels
+            }
+            reserve_result = _reserve_missing_labels(expected.conversation_id, missing_updates)
+            if reserve_result != "corrected":
+                return reserve_result
+
+            if live_status is not None:
+                meta.live_status = encode_session_live_status(live_status)
             if label_updates:
                 _upsert_labels(
                     session,
                     expected.conversation_id,
                     label_updates,
                     stamp,
+                )
+            if parent_reservations:
+                # The short-lived rows make absent-label inserts conflict on
+                # PostgreSQL, then disappear in the same commit so legacy
+                # fallback semantics remain exactly "missing".
+                assert expected_parent is not None
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == expected_parent.conversation_id,
+                        SqlConversationLabel.key.in_(parent_reservations),
+                    )
                 )
             return "corrected"
 

@@ -9,14 +9,22 @@ import httpx
 import pytest
 from sqlalchemy.orm import Session
 
-from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.entities.conversation import (
+    MessageData,
+    NewConversationItem,
+    ResourceEventData,
+)
 from omnigent.runtime import pending_elicitations
 from omnigent.server import session_live_state
+from omnigent.server.routes._sessions import (
+    helpers as helpers_module,
+)
 from omnigent.server.routes._sessions import (
     subagent_reconciliation as reconciliation_module,
 )
 from omnigent.server.routes._sessions.subagent_reconciliation import (
     _FINGERPRINT_LABEL_KEYS,
+    _PARENT_RUNTIME_LABEL_KEYS,
 )
 from omnigent.server.routes.sessions import routes_items as routes_items_module
 from omnigent.stores.conversation_store import sqlalchemy_store as sqlalchemy_store_module
@@ -31,6 +39,7 @@ _SUBAGENT_ID_KEY = "omnigent.claude_native.subagent_id"
 _TOOL_USE_ID_KEY = "omnigent.claude_native.tool_use_id"
 _TERMINAL_KEY = "omnigent.subagent.terminal_status"
 _UNVERIFIED_KEY = "omnigent.subagent.activity_unverified"
+_GENERATION_KEY = "omnigent.subagent.status_generation"
 _ERROR_CODE_KEY = "omnigent.last_task_error_code"
 _ERROR_MESSAGE_KEY = "omnigent.last_task_error_message"
 
@@ -212,6 +221,137 @@ async def test_missing_parent_terminal_rejects_mismatched_runner_binding(
         assert changed == 0
         assert current.labels.get(_UNVERIFIED_KEY) != "true"
         assert reconciliation_module._session_status_cache[child.id] == "running"
+    finally:
+        reconciliation_module._session_status_cache.pop(child.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "race",
+    [
+        "child_rebind",
+        "parent_rebind",
+        "terminal_recreated_during_cas",
+    ],
+)
+async def test_missing_parent_terminal_cas_rejects_changed_runtime_evidence(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
+) -> None:
+    store, parent, child, parent_row = await _seed_running_native_pair(
+        client, db_uri, f"missing-terminal-{race}"
+    )
+    changed_evidence = False
+    original_fingerprint = SqlAlchemyConversationStore.get_native_subagent_reconcile_fingerprint
+    original_list = SqlAlchemyConversationStore.list_conversations
+
+    def _recreate_terminal(target: SqlAlchemyConversationStore) -> None:
+        nonlocal changed_evidence
+        changed_evidence = True
+        target.append(
+            parent["id"],
+            [
+                NewConversationItem(
+                    type="resource_event",
+                    response_id="terminal-recreated",
+                    data=ResourceEventData(
+                        event_type="session.resource.created",
+                        resource_id="terminal_claude_main",
+                        resource_type="terminal",
+                        resource={"id": "terminal_claude_main", "type": "terminal"},
+                    ),
+                )
+            ],
+        )
+
+    def _fingerprint_after_child_rebind(
+        self: SqlAlchemyConversationStore,
+        conversation_id: str,
+        label_keys: tuple[str, ...],
+    ) -> Any:
+        nonlocal changed_evidence
+        if conversation_id == child.id and not changed_evidence:
+            changed_evidence = True
+            self.replace_runner_id(child.id, "runner-other")
+        return original_fingerprint(self, conversation_id, label_keys)
+
+    def _list_then_change_parent(
+        self: SqlAlchemyConversationStore, *args: Any, **kwargs: Any
+    ) -> Any:
+        nonlocal changed_evidence
+        page = original_list(self, *args, **kwargs)
+        if kwargs.get("parent_conversation_id") != parent["id"] or changed_evidence:
+            return page
+        changed_evidence = True
+        if race == "parent_rebind":
+            self.replace_runner_id(parent["id"], "runner-new")
+        else:
+            _recreate_terminal(self)
+        return page
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        (
+            "get_native_subagent_reconcile_fingerprint"
+            if race == "child_rebind"
+            else "list_conversations"
+        ),
+        (_fingerprint_after_child_rebind if race == "child_rebind" else _list_then_change_parent),
+    )
+    try:
+        invalidated = (
+            await reconciliation_module.invalidate_native_subagents_for_missing_parent_terminal(
+                parent_session_id=parent["id"],
+                parent=parent_row,
+                conversation_store=store,
+                observed_runner_id="runner-parent",
+            )
+        )
+        current = store.get_conversation(child.id)
+        assert changed_evidence
+        assert invalidated == 0
+        assert current is not None
+        if race == "child_rebind":
+            assert current.runner_id == "runner-other"
+        assert current.labels.get(_UNVERIFIED_KEY) != "true"
+    finally:
+        reconciliation_module._session_status_cache.pop(child.id, None)
+
+
+def test_latest_child_fanout_prefers_durable_terminal_over_quarantine(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = _seed_native_child(store, parent_id=parent.id)
+    store.set_session_live_status(child.id, "running")
+    store.set_labels(
+        child.id,
+        {_TERMINAL_KEY: "completed", _UNVERIFIED_KEY: "true"},
+    )
+    reconciliation_module._session_status_cache[child.id] = "running"
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr(session_live_state, "_store", store)
+    monkeypatch.setattr(
+        session_live_state,
+        "submit",
+        lambda _description, fn, *args, **_kwargs: fn(*args),
+    )
+    monkeypatch.setattr(
+        helpers_module.session_stream,
+        "publish",
+        lambda session_id, payload: published.append((session_id, payload)),
+    )
+    try:
+        helpers_module._publish_child_status_to_parent(child.id, None)
+        event = next(payload for session_id, payload in published if session_id == parent.id)
+        assert event["child"]["current_task_status"] == "completed"
+        assert event["child"]["busy"] is False
+        assert event["child"]["activity_unverified"] is False
     finally:
         reconciliation_module._session_status_cache.pop(child.id, None)
 
@@ -778,6 +918,44 @@ def test_reconcile_cas_rejects_new_running_edge_without_new_item(db_uri: str) ->
     assert current is not None and current.live_status == "running"
 
 
+def test_reconcile_cas_rejects_same_second_terminal_running_aba(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = _seed_native_child(store, parent_id=parent.id)
+    store.set_session_live_status(child.id, "running")
+    store.set_labels(
+        child.id,
+        {_TERMINAL_KEY: "", _UNVERIFIED_KEY: "", _GENERATION_KEY: "turn-a"},
+        updated_at=100,
+    )
+    frozen = store.get_native_subagent_reconcile_fingerprint(child.id, _FINGERPRINT_LABEL_KEYS)
+    assert frozen is not None
+
+    store.set_session_live_status(child.id, "idle")
+    store.set_labels(
+        child.id,
+        {_TERMINAL_KEY: "completed", _UNVERIFIED_KEY: "", _GENERATION_KEY: "turn-b"},
+        updated_at=100,
+    )
+    store.set_session_live_status(child.id, "running")
+    store.set_labels(
+        child.id,
+        {_TERMINAL_KEY: "", _UNVERIFIED_KEY: "", _GENERATION_KEY: "turn-c"},
+        updated_at=100,
+    )
+
+    result = store.reconcile_native_subagent_status(
+        frozen,
+        live_status="running",
+        label_updates={_UNVERIFIED_KEY: "true", _GENERATION_KEY: "repair"},
+    )
+    assert result == "stale"
+    current = store.get_conversation(child.id)
+    assert current is not None and current.live_status == "running"
+    assert current.labels[_GENERATION_KEY] == "turn-c"
+    assert current.labels[_UNVERIFIED_KEY] == ""
+
+
 def test_reconcile_cas_rejects_failure_label_change_at_same_live_status(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation()
@@ -846,16 +1024,30 @@ def test_reconcile_cas_rejects_new_latest_item(db_uri: str) -> None:
     assert _TERMINAL_KEY not in current.labels
 
 
+@pytest.mark.parametrize("conflict_owner", ["child", "parent"])
 def test_reconcile_cas_rejects_missing_label_insert_during_apply(
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, conflict_owner: str
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation()
+    parent_frozen = None
+    if conflict_owner == "parent":
+        store.set_labels(parent.id, {"omnigent.wrapper": _PARENT_WRAPPER})
+        store.replace_runner_id(parent.id, "runner-parent")
     child = _seed_native_child(store, parent_id=parent.id)
+    if conflict_owner == "parent":
+        store.replace_runner_id(child.id, "runner-parent")
+        parent_frozen = store.get_native_subagent_reconcile_fingerprint(
+            parent.id, _PARENT_RUNTIME_LABEL_KEYS
+        )
+        assert parent_frozen is not None
     store.set_session_live_status(child.id, "running")
     frozen = store.get_native_subagent_reconcile_fingerprint(child.id, _FINGERPRINT_LABEL_KEYS)
     assert frozen is not None
+    conflict_id = parent.id if conflict_owner == "parent" else child.id
+    conflict_key = (
+        "omnigent.claude_native.bridge_id" if conflict_owner == "parent" else _TERMINAL_KEY
+    )
 
     original_execute = Session.execute
     inserted = False
@@ -868,9 +1060,9 @@ def test_reconcile_cas_rejects_missing_label_insert_during_apply(
             inserted = True
             self.add(
                 sqlalchemy_store_module.SqlConversationLabel(
-                    conversation_id=child.id,
-                    key=_TERMINAL_KEY,
-                    value="",
+                    conversation_id=conflict_id,
+                    key=conflict_key,
+                    value="bridge-new" if conflict_owner == "parent" else "",
                     updated_at=1,
                 )
             )
@@ -880,8 +1072,13 @@ def test_reconcile_cas_rejects_missing_label_insert_during_apply(
     monkeypatch.setattr(Session, "execute", _insert_conflict_before_guard)
     result = store.reconcile_native_subagent_status(
         frozen,
-        live_status="idle",
-        label_updates={_TERMINAL_KEY: "completed", _UNVERIFIED_KEY: ""},
+        expected_parent=parent_frozen,
+        live_status="running",
+        label_updates={
+            _TERMINAL_KEY: "completed",
+            _UNVERIFIED_KEY: "",
+            _GENERATION_KEY: "repair",
+        },
     )
 
     assert inserted

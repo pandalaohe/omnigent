@@ -124,6 +124,7 @@ from omnigent.server.routes._sessions.common import (
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
+    _SUBAGENT_STATUS_GENERATION_LABEL_KEY,
     _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
@@ -1466,27 +1467,45 @@ def register_events_routes(
                     "external_session_status data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            force_native_child_fanout = False
             if status == "activity_unverified":
-                durable_terminal = conv.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+                from omnigent.server.routes._sessions.subagent_reconciliation import (
+                    _FINGERPRINT_LABEL_KEYS,
+                )
+
+                fingerprint = await asyncio.to_thread(
+                    conversation_store.get_native_subagent_reconcile_fingerprint,
+                    session_id,
+                    _FINGERPRINT_LABEL_KEYS,
+                )
+                fingerprint_labels = (
+                    {key: value for key, value, _stamp in fingerprint.label_states}
+                    if fingerprint is not None
+                    else {}
+                )
+                durable_terminal = fingerprint_labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
                 if durable_terminal in {"completed", "failed", "stopped", "killed"}:
                     public_terminal = "failed" if durable_terminal == "failed" else "idle"
-                    previous_status = _session_status_cache.get(session_id)
                     _session_status_cache[session_id] = public_terminal
-                    if previous_status != public_terminal:
-                        _publish_child_status_to_parent(session_id, public_terminal)
+                    _publish_child_status_to_parent(session_id, None)
                     return {"queued": False}
-                await asyncio.to_thread(
-                    conversation_store.set_labels,
-                    session_id,
-                    {
+                if fingerprint is None:
+                    return {"queued": False}
+                write_result = await asyncio.to_thread(
+                    conversation_store.reconcile_native_subagent_status,
+                    fingerprint,
+                    live_status=None,
+                    label_updates={
                         _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: "true",
+                        _SUBAGENT_STATUS_GENERATION_LABEL_KEY: secrets.token_hex(16),
                         _SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "",
                     },
                 )
-                previous_status = _session_status_cache.get(session_id)
+                if write_result != "corrected":
+                    _publish_child_status_to_parent(session_id, None)
+                    return {"queued": False}
                 _session_status_cache[session_id] = status
-                if previous_status != status:
-                    _publish_child_status_to_parent(session_id, status)
+                _publish_child_status_to_parent(session_id, None)
                 return {"queued": False}
             if (
                 status in {"idle", "waiting"}
@@ -1497,28 +1516,6 @@ def register_events_routes(
                 # until new activity or a structured terminal edge arrives.
                 _session_status_cache[session_id] = "activity_unverified"
                 return {"queued": False}
-            if (
-                conv.kind == "sub_agent"
-                and conv.labels.get("omnigent.wrapper") == "claude-code-native-ui-subagent"
-                and status in {"running", "completed", "failed", "stopped", "killed"}
-                and (
-                    conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
-                    or (
-                        status == "running"
-                        and conv.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
-                        in {"completed", "failed", "stopped", "killed"}
-                    )
-                )
-            ):
-                label_updates = {_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: ""}
-                if status == "running":
-                    # New activity supersedes the prior dispatch's terminal verdict.
-                    label_updates[_SUBAGENT_TERMINAL_STATUS_LABEL_KEY] = ""
-                await asyncio.to_thread(
-                    conversation_store.set_labels,
-                    session_id,
-                    label_updates,
-                )
             # ``None`` (field absent) = no information; leave the sticky
             # tally untouched (the PTY-activity ``idle`` carries none). An
             # explicit ``0`` from a ``Stop`` hook is authoritative and clears
@@ -1580,10 +1577,26 @@ def register_events_routes(
                 if status in {"running", "waiting"}:
                     durable_terminal_status = ""
                 if durable_terminal_status in ("", "completed", "failed", "stopped", "killed"):
+                    label_updates = {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: durable_terminal_status}
+                    is_native_claude_child = (
+                        conv.labels.get("omnigent.wrapper") == "claude-code-native-ui-subagent"
+                    )
+                    if is_native_claude_child and (
+                        status == "running"
+                        or durable_terminal_status in {"completed", "failed", "stopped", "killed"}
+                    ):
+                        # Running and terminal edges atomically supersede the
+                        # prior dispatch markers. A unique generation makes a
+                        # terminal→running ABA visible even inside one second.
+                        label_updates[_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY] = ""
+                        label_updates[_SUBAGENT_STATUS_GENERATION_LABEL_KEY] = secrets.token_hex(
+                            16
+                        )
+                        force_native_child_fanout = True
                     await asyncio.to_thread(
                         conversation_store.set_labels,
                         session_id,
-                        {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: durable_terminal_status},
+                        label_updates,
                     )
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
@@ -1632,6 +1645,10 @@ def register_events_routes(
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
+            if force_native_child_fanout:
+                # A same-value cache edge is still a durable marker change;
+                # always send the latest DB projection to the parent rail.
+                _publish_child_status_to_parent(session_id, None)
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
             # No latency or token deltas are available on this path.

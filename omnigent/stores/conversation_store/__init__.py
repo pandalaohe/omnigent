@@ -1502,12 +1502,15 @@ class ConversationStore(ABC):
         self,
         expected: NativeSubagentReconcileFingerprint,
         *,
-        live_status: str,
+        expected_parent: NativeSubagentReconcileFingerprint | None = None,
+        live_status: str | None,
         label_updates: dict[str, str],
     ) -> NativeSubagentReconcileWriteResult:
         """Apply a terminal repair only while *expected* still matches.
 
-        The comparison and writes are one transaction. Implementations that
+        The child comparison, optional parent runtime comparison, and writes
+        are one transaction. ``None`` preserves the frozen live status.
+        Implementations that
         split conversations/labels and Omnigent metadata across independent
         databases must return ``"unsupported"`` instead of weakening the
         compare-and-set guarantee.

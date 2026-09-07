@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import secrets
 from typing import Any, Literal
 
 import httpx
@@ -23,6 +24,7 @@ from omnigent.server.routes._sessions.common import (
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
     _LAST_TASK_ERROR_TITLE_LABEL_KEY,
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
+    _SUBAGENT_STATUS_GENERATION_LABEL_KEY,
     _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _session_active_response_cache,
     _session_background_task_count_cache,
@@ -51,8 +53,10 @@ _FINGERPRINT_LABEL_KEYS = (
     _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY,
     _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
+    _SUBAGENT_STATUS_GENERATION_LABEL_KEY,
     *_FAILURE_LABEL_KEYS,
 )
+_PARENT_RUNTIME_LABEL_KEYS = (_WRAPPER_LABEL_KEY, _BRIDGE_ID_LABEL_KEY)
 _logger = logging.getLogger(__name__)
 
 
@@ -254,6 +258,24 @@ def _runtime_identity(conversation: Any) -> tuple[str | None, ...]:
     )
 
 
+def _runtime_fingerprint_matches(
+    conversation: Any,
+    fingerprint: NativeSubagentReconcileFingerprint,
+) -> bool:
+    """Return whether a frozen parent still represents *conversation*."""
+    labels = _fingerprint_labels(fingerprint)
+    return (
+        fingerprint.conversation_id == conversation.id
+        and fingerprint.parent_conversation_id == conversation.parent_conversation_id
+        and fingerprint.runner_id == conversation.runner_id
+        and fingerprint.host_id == conversation.host_id
+        and fingerprint.external_session_id == conversation.external_session_id
+        and all(
+            labels.get(key) == conversation.labels.get(key) for key in _PARENT_RUNTIME_LABEL_KEYS
+        )
+    )
+
+
 def _unverified_detail(session_id: str, reason: str) -> dict[str, str]:
     return {"session_id": session_id, "outcome": "unverified", "reason": reason}
 
@@ -417,6 +439,19 @@ async def reconcile_native_subagents(
             "no state was changed.",
             code=ErrorCode.CONFLICT,
         )
+    parent_fingerprint = await asyncio.to_thread(
+        conversation_store.get_native_subagent_reconcile_fingerprint,
+        parent_session_id,
+        _PARENT_RUNTIME_LABEL_KEYS,
+    )
+    if parent_fingerprint is None or not _runtime_fingerprint_matches(
+        current_parent, parent_fingerprint
+    ):
+        raise OmnigentError(
+            "The native session binding changed while its status was being checked; "
+            "no state was changed.",
+            code=ErrorCode.CONFLICT,
+        )
     by_server_id: dict[str, _ProbeChild | None] = {}
     for row in probe.children:
         by_server_id[row.server_session_id] = (
@@ -465,6 +500,14 @@ async def reconcile_native_subagents(
         terminal_status = row.terminal_status
         desired_live, label_updates = _desired_terminal_state(terminal_status)
         durable_matches = _already_matches_terminal(fingerprint, terminal_status)
+        repair_updates = (
+            {}
+            if durable_matches
+            else {
+                **label_updates,
+                _SUBAGENT_STATUS_GENERATION_LABEL_KEY: secrets.token_hex(16),
+            }
+        )
         display_matches = _display_state_matches_terminal(
             observed_display[session_id], desired_live
         )
@@ -482,8 +525,9 @@ async def reconcile_native_subagents(
             write_result = await asyncio.to_thread(
                 conversation_store.reconcile_native_subagent_status,
                 fingerprint,
+                expected_parent=parent_fingerprint,
                 live_status=desired_live,
-                label_updates={} if durable_matches else label_updates,
+                label_updates=repair_updates,
             )
         except Exception:  # noqa: BLE001 - surface partial failure in counts.
             write_result = "stale"
@@ -498,7 +542,7 @@ async def reconcile_native_subagents(
                     conversation_store=conversation_store,
                     original=fingerprint,
                     repair_live_status=desired_live,
-                    repair_label_updates=label_updates,
+                    repair_label_updates=repair_updates,
                     current_display_status=current_status,
                 )
                 session_live_state.persist_live_status(session_id, desired_live)
@@ -583,6 +627,18 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
         return 0
     if current_parent is None or _runtime_identity(current_parent) != _runtime_identity(parent):
         return 0
+    try:
+        parent_fingerprint = await asyncio.to_thread(
+            conversation_store.get_native_subagent_reconcile_fingerprint,
+            parent_session_id,
+            _PARENT_RUNTIME_LABEL_KEYS,
+        )
+    except Exception:  # noqa: BLE001 - best-effort self-heal must not break its caller.
+        return 0
+    if parent_fingerprint is None or not _runtime_fingerprint_matches(
+        current_parent, parent_fingerprint
+    ):
+        return 0
 
     try:
         page = await asyncio.to_thread(
@@ -628,14 +684,20 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
                 extra={"session_id": child.id},
             )
             continue
-        if fingerprint is None or fingerprint.parent_conversation_id != parent_session_id:
+        if (
+            fingerprint is None
+            or fingerprint.parent_conversation_id != parent_session_id
+            or fingerprint.runner_id != parent_fingerprint.runner_id
+        ):
             continue
         labels = _fingerprint_labels(fingerprint)
         observed_status = _session_status_cache.get(child.id) or fingerprint.live_status
+        # A transient idle display edge is not a terminal verdict; durable
+        # running/waiting still needs quarantine after the parent TUI vanished.
         if (
             labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY) in _TERMINAL_STATUSES
             or labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
-            or observed_status not in {"running", "waiting", "activity_unverified"}
+            or observed_status not in {"idle", "running", "waiting", "activity_unverified"}
             or fingerprint.live_status not in {"running", "waiting"}
         ):
             continue
@@ -645,11 +707,15 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
         if _display_fingerprint(child.id) != observed_display or pending_changed:
             continue
 
-        label_updates = {_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: "true"}
+        label_updates = {
+            _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: "true",
+            _SUBAGENT_STATUS_GENERATION_LABEL_KEY: secrets.token_hex(16),
+        }
         try:
             write_result = await asyncio.to_thread(
                 conversation_store.reconcile_native_subagent_status,
                 fingerprint,
+                expected_parent=parent_fingerprint,
                 live_status=fingerprint.live_status,
                 label_updates=label_updates,
             )
@@ -664,6 +730,22 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
         if write_result != "corrected":
             continue
 
+        try:
+            settled = await asyncio.to_thread(
+                conversation_store.get_native_subagent_reconcile_fingerprint,
+                child.id,
+                _FINGERPRINT_LABEL_KEYS,
+            )
+        except Exception:  # noqa: BLE001 - a stale fan-out is worse than no fan-out.
+            settled = None
+        settled_labels = _fingerprint_labels(settled) if settled is not None else {}
+        if (
+            settled is None
+            or settled_labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY) in _TERMINAL_STATUSES
+            or settled_labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) != "true"
+        ):
+            continue
+
         pending_changed = _pending_fingerprint(parent_session_id, child.id) != observed_pending
         if _display_fingerprint(child.id) != observed_display or pending_changed:
             await _restore_repair_after_new_activity(
@@ -675,23 +757,11 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
             )
             continue
 
-        _session_status_cache[child.id] = "activity_unverified"
         _session_active_response_cache.pop(child.id, None)
         _session_background_task_count_cache.pop(child.id, None)
         _session_background_tasks_cache.pop(child.id, None)
         _silently_clear_pending(observed_pending)
-        event = SessionStatusEvent(
-            type="session.status",
-            conversation_id=child.id,
-            status="idle",
-            background_task_count=0,
-        )
-        payload = event.model_dump()
-        payload.pop("response_id", None)
-        payload.pop("background_tasks", None)
-        payload.pop("blocked_on", None)
-        session_stream.publish(child.id, payload)
-        _publish_child_status_to_parent(child.id, "activity_unverified")
+        _publish_child_status_to_parent(child.id, None)
         invalidated += 1
 
     return invalidated

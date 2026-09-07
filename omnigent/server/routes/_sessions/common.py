@@ -188,6 +188,9 @@ _SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
 _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY = "omnigent.subagent.activity_unverified"
 
 
+_SUBAGENT_STATUS_GENERATION_LABEL_KEY = "omnigent.subagent.status_generation"
+
+
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE: str = "external_codex_subagent_start"
 
 
@@ -1023,6 +1026,7 @@ __all__ = [
     "_STOP_SESSION_TYPE",
     "_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
+    "_SUBAGENT_STATUS_GENERATION_LABEL_KEY",
     "_SUBAGENT_TERMINAL_STATUS_LABEL_KEY",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
