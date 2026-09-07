@@ -137,7 +137,11 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
+from omnigent.runner.native.interrupt import (
+    MarkSubagentTerminalAndWake,
+    NativeInterruptRunner,
+    native_session_has_active_work,
+)
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -7153,6 +7157,9 @@ def create_runner_app(
         publish_event=_publish_event,
         mark_subagent_terminal_and_wake=_mark_subagent_terminal_and_wake,
         session_sub_agent_names=_session_sub_agent_names,
+        session_has_active_work=lambda session_id: native_session_has_active_work(
+            _native_pane_status.get(session_id), session_id in _active_turns
+        ),
         codex_bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,

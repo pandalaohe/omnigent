@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import secrets
 import time
 import weakref
@@ -250,6 +251,61 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 _retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+_interrupt_delivery_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+async def _deliver_interrupt_once(session_id: str, runner_router: RunnerRouter | None) -> None:
+    """Forward one interrupt and publish only after the runner accepts it."""
+    runner_result = await _forward_session_change_to_runner(
+        session_id,
+        runner_router,
+        {"type": _INTERRUPT_TYPE},
+    )
+    if runner_result is None or not 200 <= runner_result.status_code < 300:
+        # The turn keeps running and nothing else lifts the fence — remove it
+        # so the turn's remaining output isn't dropped and a retry can forward.
+        _interrupt_fenced_sessions.discard(session_id)
+        if runner_result is None:
+            message = (
+                "Interrupt was not delivered because no live runner was available. "
+                "The turn is still running; reconnect and try again."
+            )
+        else:
+            message = (
+                "The runner rejected the interrupt with status "
+                f"{runner_result.status_code}. The turn is still running; try again."
+            )
+        raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE)
+    if runner_result.body:
+        try:
+            interrupt_result = json.loads(runner_result.body)
+        except (TypeError, ValueError):
+            interrupt_result = None
+        if isinstance(interrupt_result, dict) and interrupt_result.get("interrupted") is False:
+            # Runner authoritatively observed that the terminal had already
+            # settled before this delayed control arrived. Nothing was cancelled,
+            # so do not fence output or publish a false cancelled decoration.
+            _interrupt_fenced_sessions.discard(session_id)
+            return
+    if session_id not in _interrupt_fenced_sessions:
+        # A terminal or next-running edge won the race while Runner handled the
+        # control. That edge is authoritative; publishing interrupted now would
+        # retroactively cancel the settled/new turn in connected clients.
+        return
+    # Only tell clients that the turn was interrupted after the runner confirms
+    # that the native bridge/app-server accepted the control and the original
+    # turn fence still identifies the same unsettled boundary.
+    _publish_interrupted(session_id)
+
+
+def _forget_interrupt_delivery(session_id: str, task: asyncio.Task[None]) -> None:
+    """Drop a completed delivery task without cancelling shared delivery."""
+    if _interrupt_delivery_tasks.get(session_id) is task:
+        _interrupt_delivery_tasks.pop(session_id, None)
+    # Retrieve a failure even if every HTTP waiter disconnected. Awaiters still
+    # receive the same exception from the completed task.
+    if not task.cancelled():
+        task.exception()
 
 
 class _DeletionClaimLease:
@@ -1041,32 +1097,23 @@ def register_events_routes(
             return wake_conv, _client
 
         if body.type == _INTERRUPT_TYPE:
-            _publish_interrupted(session_id)
-            # Fence the cancelled turn (see _interrupt_fenced_sessions).
-            _interrupt_fenced_sessions.add(session_id)
-            runner_client = await _get_runner_client(
-                session_id,
-                runner_router,
-            )
-            interrupt_delivered = False
-            if runner_client is not None:
-                try:
-                    interrupt_resp = await runner_client.post(
-                        f"/v1/sessions/{session_id}/events",
-                        json={"type": "interrupt"},
-                        timeout=5.0,
-                    )
-                    interrupt_delivered = interrupt_resp.status_code < 400
-                except (httpx.HTTPError, ConnectionError):
-                    # WSTunnelTransport raises bare ConnectionError on tunnel close.
-                    _logger.exception(
-                        "Interrupt forward failed for %r",
-                        session_id,
-                    )
-            if not interrupt_delivered:
-                # The turn keeps running and nothing else lifts the fence —
-                # remove it so the turn's remaining output isn't dropped.
-                _interrupt_fenced_sessions.discard(session_id)
+            delivery = _interrupt_delivery_tasks.get(session_id)
+            if delivery is None:
+                if session_id in _interrupt_fenced_sessions:
+                    # A prior delivery already landed and its cancelled turn has
+                    # not crossed the fence-clearing boundary yet. Treat repeat
+                    # taps/clients as idempotent: a second Ctrl+C at Claude's
+                    # idle composer can exit the interactive CLI.
+                    return {"queued": False}
+                _interrupt_fenced_sessions.add(session_id)
+                delivery = asyncio.create_task(_deliver_interrupt_once(session_id, runner_router))
+                _interrupt_delivery_tasks[session_id] = delivery
+                delivery.add_done_callback(
+                    lambda done, sid=session_id: _forget_interrupt_delivery(sid, done)
+                )
+            # Multiple clients share the same delivery result. Shield it so one
+            # disconnected request cannot cancel the interrupt for every waiter.
+            await asyncio.shield(delivery)
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)

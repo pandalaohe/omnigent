@@ -742,7 +742,7 @@ export interface ChatActions {
     agentId: string,
     opts?: SendOptions,
   ) => Promise<void>;
-  stop: () => void;
+  stop: () => Promise<void>;
   switchTo: (conversationId: string | null) => Promise<void>;
   submitApproval: (
     elicitationId: string,
@@ -950,6 +950,10 @@ interface SendChain {
   tail: Promise<void>;
 }
 const sendChains = new Map<string | symbol, SendChain>();
+// A confirmed interrupt keeps the Stop affordance visible until the server or
+// stream settles it. Coalesce rapid repeat taps so one mobile double-tap cannot
+// inject Ctrl+C twice into the same native TUI.
+const interruptRequestsInFlight = new Set<string>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -1947,52 +1951,25 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  stop: () => {
+  stop: async () => {
     const sessionId = get().conversationId;
-    if (!sessionId) return;
-    // Fire-and-forget interrupt; the server emits session.interrupted
-    // + response.incomplete on the open stream, which the pump
-    // translates into the cancelled bubble decoration. We deliberately
-    // do NOT abort the local SSE stream — it remains open across
-    // turns; switchTo or tab unload is the only thing that tears it
-    // down.
-    void interruptSession(sessionId).catch(() => {
-      // Interrupt is best-effort. A network failure here means the
-      // user's cancel won't reach the server, but the local UI already
-      // reflects the user's stop request below.
-    });
-    setActive((s) => {
-      if (s.conversationId !== sessionId) return {};
-      const patch: Partial<ChatState> = {
-        pendingUserMessages: [],
-        status: "idle",
-        sessionStatus: "idle",
-        backgroundTaskCount: 0,
-        backgroundTasks: [],
-        blockedOn: null,
-      };
-      if (s.activeResponse?.state === "streaming") {
-        patch.activeResponse = {
-          ...s.activeResponse,
-          state: "cancelled",
-          error: null,
-        };
-      }
-      return patch;
-    });
-    // Optimistic, unbacked write: unlike the session.status SSE caller, no
-    // server event backs this, so a poll that interleaves while the turn is
-    // genuinely still running may briefly revert the sidebar dot — the helper's
-    // "never fights the poller" contract doesn't hold here. Self-corrects on the
-    // real idle event.
-    patchConversationStatusInCache(sessionId, "idle");
-    // Mirror the session.status handler: a sub-agent's row lives in its parent's
-    // child-sessions list, not the sidebar, so refresh the rail in lockstep.
-    const snapshot = queryClient?.getQueryData<Session>(["session", sessionId]);
-    if (snapshot?.parentSessionId) {
-      queryClient?.invalidateQueries({
-        queryKey: childSessionsQueryKey(snapshot.parentSessionId),
-      });
+    if (!sessionId || interruptRequestsInFlight.has(sessionId)) return;
+    interruptRequestsInFlight.add(sessionId);
+    // Keep the stream and lifecycle state live until the server confirms that
+    // the runner accepted the interrupt. Optimistically forcing idle here hid
+    // native bridge/app-server failures and made Stop look successful while the
+    // vendor process kept generating.
+    try {
+      await interruptSession(sessionId);
+    } catch (err) {
+      const { message, code } = describeInterruptFailure(err);
+      // The request can outlive navigation. Attach the failure to the session
+      // whose Stop failed so it remains visible when the user returns.
+      setterFor(sessionId)((s) => ({
+        blocks: [...s.blocks, makeClientErrorBlock(message, code)],
+      }));
+    } finally {
+      interruptRequestsInFlight.delete(sessionId);
     }
   },
 
@@ -6339,6 +6316,14 @@ function describeSendFailure(err: unknown): { message: string; code: string } {
       code: "",
     };
   }
+  if (err instanceof ApiError) {
+    return { message: err.message, code: err.code ?? "" };
+  }
+  return { message: err instanceof Error ? err.message : String(err), code: "" };
+}
+
+/** Preserve the runner's interrupt-specific failure instead of send-time copy. */
+function describeInterruptFailure(err: unknown): { message: string; code: string } {
   if (err instanceof ApiError) {
     return { message: err.message, code: err.code ?? "" };
   }

@@ -3748,7 +3748,7 @@ describe("chatStore — stop", () => {
     expect(controller.signal.aborted).toBe(false);
   });
 
-  it("clears local working state immediately while the interrupt ack is pending", () => {
+  it("keeps the real working state until the server or stream confirms interruption", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",
       pendingUserMessages: [
@@ -3763,48 +3763,128 @@ describe("chatStore — stop", () => {
     });
     seedConversationsCache([conv("conv_abc", "running")]);
 
-    useChatStore.getState().stop();
+    await useChatStore.getState().stop();
 
     const state = useChatStore.getState();
-    expect(state.pendingUserMessages).toEqual([]);
-    expect(state.status).toBe("idle");
-    expect(state.sessionStatus).toBe("idle");
+    expect(state.pendingUserMessages).toHaveLength(1);
+    expect(state.status).toBe("streaming");
+    expect(state.sessionStatus).toBe("running");
     expect(state.activeResponse).toEqual({
       responseId: "resp_1",
-      state: "cancelled",
+      state: "streaming",
       error: null,
     });
-    expect(readConversationRows()[0]?.status).toBe("idle");
+    expect(readConversationRows()[0]?.status).toBe("running");
   });
 
-  it("leaves a non-streaming activeResponse untouched on stop", () => {
-    // Pins the `state === "streaming"` guard: stop() still clears the working
-    // state, but must NOT overwrite a non-streaming activeResponse (dropping the
-    // guard would clobber a completed response with a cancelled decoration).
+  it("surfaces an interrupt rejection and leaves the native turn running", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",
-      pendingUserMessages: [
-        { tempId: "pend_1", content: [{ type: "input_text", text: "stop me" }] },
-      ],
-      activeResponse: { responseId: "resp_1", state: "completed", error: null },
+      blocks: [],
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
       status: "streaming",
       sessionStatus: "running",
     });
     seedConversationsCache([conv("conv_abc", "running")]);
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return mockResponse(
+          {
+            error: {
+              code: "runner_unavailable",
+              message: "The native runner rejected the interrupt.",
+            },
+          },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
 
-    useChatStore.getState().stop();
+    await useChatStore.getState().stop();
 
     const state = useChatStore.getState();
-    expect(state.pendingUserMessages).toEqual([]);
-    expect(state.status).toBe("idle");
-    expect(state.sessionStatus).toBe("idle");
-    // Untouched — the guard skipped the cancelled overwrite.
+    expect(state.status).toBe("streaming");
+    expect(state.sessionStatus).toBe("running");
     expect(state.activeResponse).toEqual({
       responseId: "resp_1",
-      state: "completed",
+      state: "streaming",
       error: null,
     });
-    expect(readConversationRows()[0]?.status).toBe("idle");
+    expect(readConversationRows()[0]?.status).toBe("running");
+    expect(state.blocks.at(-1)).toMatchObject({
+      type: "error",
+      message: "The native runner rejected the interrupt.",
+      code: "runner_unavailable",
+    });
+  });
+
+  it("records a Stop rejection on its session after the user navigates away", async () => {
+    let settleInterrupt!: (response: Response) => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return new Promise<Response>((resolve) => {
+          settleInterrupt = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const stopped = bindConversationForTest("conv_abc", {
+      blocks: [],
+      status: "streaming",
+      sessionStatus: "running",
+    });
+
+    const request = useChatStore.getState().stop();
+    await tick();
+    bindConversationForTest("conv_other", { blocks: [] });
+    settleInterrupt(
+      mockResponse(
+        {
+          error: {
+            code: "runner_unavailable",
+            message: "The native runner rejected the interrupt.",
+          },
+        },
+        { ok: false, status: 503 },
+      ),
+    );
+    await request;
+
+    expect(stopped.get().blocks.at(-1)).toMatchObject({
+      type: "error",
+      message: "The native runner rejected the interrupt.",
+      code: "runner_unavailable",
+    });
+    expect(useChatStore.getState().blocks).toEqual([]);
+  });
+
+  it("coalesces repeat Stop taps while interrupt delivery is pending", async () => {
+    let releaseInterrupt!: () => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return new Promise<Response>((resolve) => {
+          releaseInterrupt = () => resolve(mockResponse({ queued: false }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+    });
+
+    const first = useChatStore.getState().stop();
+    const second = useChatStore.getState().stop();
+    await tick();
+
+    const events = fetchMock.mock.calls.filter(([u]) =>
+      String(u).endsWith("/v1/sessions/conv_abc/events"),
+    );
+    expect(events).toHaveLength(1);
+    releaseInterrupt();
+    await Promise.all([first, second]);
   });
 
   it("no-op when no session is bound", () => {

@@ -17,6 +17,18 @@ def _append(path: Path, record: dict[str, object], *, complete: bool = True) -> 
         handle.write(payload + (b"\n" if complete else b""))
 
 
+def _goal_status(condition: str, *, met: bool) -> dict[str, object]:
+    return {
+        "type": "attachment",
+        "attachment": {
+            "type": "goal_status",
+            "met": met,
+            "sentinel": True,
+            "condition": condition,
+        },
+    }
+
+
 def test_goal_snapshot_uses_latest_complete_structured_event(tmp_path: Path) -> None:
     transcript = tmp_path / "session.jsonl"
     _append(transcript, {"type": "active_goal", "value": {"title": "old"}})
@@ -31,6 +43,74 @@ def test_goal_snapshot_uses_latest_complete_structured_event(tmp_path: Path) -> 
     assert snapshot.byte_offset < transcript.stat().st_size
 
 
+@pytest.mark.parametrize(
+    "record",
+    [
+        {
+            "type": "attachment",
+            "attachment": {"type": "goal_status", "sentinel": True, "met": False},
+        },
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "goal_status",
+                "sentinel": True,
+                "met": False,
+                "condition": 1,
+            },
+        },
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "goal_status",
+                "sentinel": 1,
+                "met": False,
+                "condition": "ship",
+            },
+        },
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "goal_status",
+                "sentinel": True,
+                "met": "false",
+                "condition": "ship",
+            },
+        },
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "sentinel": True,
+                "met": False,
+                "condition": "ship",
+            },
+        },
+        {
+            "type": "user",
+            "attachment": {
+                "type": "goal_status",
+                "sentinel": True,
+                "met": False,
+                "condition": "ship",
+            },
+            "message": {"role": "user", "content": "Goal set: ship"},
+        },
+        {"type": "user", "message": {"role": "user", "content": "Goal set: ship"}},
+    ],
+)
+def test_goal_snapshot_ignores_non_authoritative_records(
+    tmp_path: Path, record: dict[str, object]
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    _append(transcript, record)
+
+    snapshot = bridge.read_latest_transcript_goal_state(transcript)
+
+    assert snapshot.goal_state_observed is False
+    assert snapshot.latest_goal_state is None
+
+
 @pytest.mark.asyncio
 async def test_reattach_recovers_goal_without_replaying_or_moving_cursor(tmp_path: Path) -> None:
     transcript = tmp_path / "session.jsonl"
@@ -38,10 +118,18 @@ async def test_reattach_recovers_goal_without_replaying_or_moving_cursor(tmp_pat
         transcript,
         {"type": "user", "uuid": "old-message", "message": {"role": "user", "content": "old"}},
     )
-    _append(transcript, {"type": "active_goal", "value": {"title": "ship"}})
+    _append(transcript, _goal_status("ship", met=False))
+    _append(
+        transcript,
+        {
+            "type": "user",
+            "uuid": "goal-query",
+            "message": {"role": "user", "content": "Goal set: ship"},
+        },
+    )
     state = forwarder.TranscriptForwardState(
         transcript_path=transcript,
-        line_cursor=2,
+        line_cursor=3,
         byte_offset=transcript.stat().st_size,
         cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(
             transcript, transcript.stat().st_size
@@ -78,7 +166,7 @@ async def test_reattach_recovers_goal_without_replaying_or_moving_cursor(tmp_pat
 @pytest.mark.asyncio
 async def test_failed_recovery_retries_and_new_incremental_clear_wins(tmp_path: Path) -> None:
     transcript = tmp_path / "session.jsonl"
-    _append(transcript, {"type": "active_goal", "value": {"title": "ship"}})
+    _append(transcript, _goal_status("ship", met=False))
     active_end = transcript.stat().st_size
     state = forwarder.TranscriptForwardState(
         transcript_path=transcript,
@@ -119,7 +207,7 @@ async def test_failed_recovery_retries_and_new_incremental_clear_wins(tmp_path: 
             retry_tracker=tracker,
             dedupe=dedupe,
         )
-        _append(transcript, {"type": "active_goal", "value": None})
+        _append(transcript, _goal_status("ship", met=True))
         second = await forwarder._forward_available_items(
             client=client,
             session_id="conv",

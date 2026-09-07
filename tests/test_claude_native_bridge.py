@@ -4265,17 +4265,16 @@ def test_inject_user_message_raises_when_draft_never_submits(
         inject_user_message(bridge_dir, content="fix the flaky test")
 
 
-def test_inject_interrupt_sends_escape_keystroke(
+def test_inject_interrupt_sends_ctrl_c_keystroke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    inject_interrupt issues ``tmux send-keys ... Escape`` on the pane.
+    inject_interrupt issues ``tmux send-keys ... C-c`` on the pane.
 
-    Without the ``-l`` flag, tmux interprets ``Escape`` as the key
-    name (the single ASCII byte 0x1b). If the flag leaks in or the
-    keyword changes, Claude won't see a cancel and the Omnigent stop
-    button silently degrades back to a no-op.
+    Claude Code 2.1.263 leaves a foreground Bash tool running after
+    Escape; Ctrl+C is the key that actually interrupts that foreground
+    process while leaving the interactive Claude session alive.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -4308,7 +4307,7 @@ def test_inject_interrupt_sends_escape_keystroke(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_interrupt(bridge_dir)
 
-    # One tmux call: send Escape (no literal flag). If 2+, a stray
+    # One tmux call: send Ctrl+C (no literal flag). If 2+, a stray
     # Enter or extra key was appended; if 0, the call was skipped.
     assert len(captured) == 1, f"Expected 1 tmux send-keys call, got {len(captured)}."
     assert captured[0] == [
@@ -4318,7 +4317,7 @@ def test_inject_interrupt_sends_escape_keystroke(
         "send-keys",
         "-t",
         "claude:0.0",
-        "Escape",
+        "C-c",
     ]
 
 
@@ -4328,10 +4327,10 @@ def test_inject_interrupt_raises_when_tmux_target_never_published(
     """
     inject_interrupt fails loud if tmux.json hasn't been written.
 
-    The runner route catches RuntimeError and returns 503 so the
-    Omnigent server falls back to the DBOS cancel path. Swallowing this
-    silently would make the stop button appear to work while
-    actually doing nothing.
+    The runner route catches RuntimeError and returns 503; the Omnigent
+    server preserves that failure instead of publishing an interruption.
+    Swallowing this silently would make the stop button appear to work
+    while actually doing nothing.
     """
     with pytest.raises(RuntimeError, match="tmux target is not advertised"):
         inject_interrupt(tmp_path / "bridge", timeout_s=0.0)

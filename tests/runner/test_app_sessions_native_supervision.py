@@ -2501,18 +2501,18 @@ async def test_concurrent_subagent_completions_coalesce_into_one_wake() -> None:
 
 
 @pytest.mark.asyncio
-async def test_events_interrupt_on_native_session_injects_escape_without_marker(
+async def test_events_interrupt_on_native_session_injects_ctrl_c_without_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     POST ``/events`` with ``{"type": "interrupt"}`` on a claude-native
-    session sends Escape to the pane — and nothing else to the transcript.
+    session sends Ctrl+C to the pane — and nothing else to the transcript.
 
-    The interrupt handler's whole job is the Escape keystroke. This test
+    The interrupt handler's whole job is the Ctrl+C keystroke. This test
     pins the three properties of that handler:
 
     1. ``inject_interrupt`` is called with the bridge dir derived from
-       the conversation id (the Escape keystroke that actually stops
+       the conversation id (the Ctrl+C keystroke that actually stops
        Claude).
     2. NO ``[System: interrupted]`` marker is appended to the runner's
        in-memory ``_session_histories``. That synthetic marker is for
@@ -2523,12 +2523,12 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
        AP-side mirror from Claude's real transcript.
     3. NO ``session.status: idle`` is enqueued: idle on interrupt now
        comes solely from the terminal's PTY-activity watcher (it sees
-       the pane quiesce after the Escape), which also keeps the session
+       the pane quiesce after Ctrl+C), which also keeps the session
        ``running`` if the interrupt didn't take. Synthesizing idle here
        would bypass the watcher's running/idle dedupe and could strand
        the UI on idle.
 
-    If side effect 1 is missing, the Escape never lands and Claude keeps
+    If side effect 1 is missing, Ctrl+C never lands and Claude keeps
     generating; if a marker reappears in 2, the holdover that forged the
     user bubble is back; if a synthesized idle reappears in 3, the
     watcher desync bug is back.
@@ -2577,6 +2577,7 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
             },
         )
         assert create_resp.status_code == 201, create_resp.text
+        app.state.native_pane_status["664449321754215750a1d43e89fca21e"] = "running"
 
         # POST /events with type=interrupt. By the time this returns,
         # ``_handle_claude_native_interrupt`` has fully run — the sync
@@ -2607,7 +2608,7 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
             if isinstance(item, dict):
                 queued_events.append(item)
 
-    # 1) tmux Escape was sent via inject_interrupt.
+    # 1) tmux Ctrl+C was sent via inject_interrupt.
     # 0 = the dispatch fell through to the generic forward-to-harness
     # path (which 404s for native — silent regression).
     assert int_resp.status_code == 204, (
@@ -2804,7 +2805,7 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
     ``inject_interrupt`` can't reach tmux.
 
     Sister to the happy-path test. The contract is: if the runner
-    can't actually deliver Escape (e.g. tmux pane gone, bridge dir
+    can't actually deliver Ctrl+C (e.g. tmux pane gone, bridge dir
     not yet advertised), it must not (a) persist any
     ``[System: interrupted]`` marker (native never appends one — this
     also confirms the 503 early-return doesn't) and (b) publish
@@ -2855,6 +2856,7 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
             },
         )
         assert create_resp.status_code == 201, create_resp.text
+        app.state.native_pane_status["57ac398df7e3972b95ddba8d6109f396"] = "running"
 
         int_resp = await client.post(
             "/v1/sessions/57ac398df7e3972b95ddba8d6109f396/events",
@@ -2912,7 +2914,7 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
         e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
     ]
     assert status_idle == [], (
-        f"No session.status: idle should be enqueued when the Escape "
+        f"No session.status: idle should be enqueued when the Ctrl+C "
         f"injection failed; got {status_idle!r}. "
         f"If non-empty, _publish_event fired before the 503 early "
         f"return — same reordering concern as the marker."

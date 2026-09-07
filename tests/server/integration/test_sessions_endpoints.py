@@ -6274,6 +6274,17 @@ async def test_post_interrupt_without_data_field_is_accepted(
         "omnigent.server.routes.sessions.session_stream.publish",
         capture_publish,
     )
+
+    async def _accept_interrupt(*_args: Any, **_kwargs: Any) -> Any:
+        """Model a runner that confirms the bare interrupt control."""
+        from omnigent.server.routes import sessions as sessions_module
+
+        return sessions_module._RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _accept_interrupt,
+    )
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
@@ -9865,29 +9876,28 @@ async def test_external_user_message_seeds_title_on_claude_native_session(
     )
 
 
-async def test_interrupt_on_claude_native_session_skips_idle_publish_on_runner_failure(
+async def test_interrupt_on_claude_native_session_surfaces_runner_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    If the runner couldn't deliver the Escape (e.g. tmux pane gone),
-    Omnigent must NOT lie to the UI by publishing idle. The spinner spins
-    is the right signal — it tells the user the cancel didn't land.
+    If the runner couldn't deliver the control, Omnigent returns failure
+    and does not publish an interruption.
 
     After the interrupt-unification refactor the Omnigent side no longer
     publishes ``session.status: idle`` itself at all. Idle on a
     claude-native interrupt now comes from the runner's PTY activity
-    watcher once the pane quiesces after the Escape (a failed Escape
-    naturally surfaces as "no idle" — the pane keeps changing). This
-    test acts as a regression guard against re-adding an AP-side idle
-    publish — if someone reintroduces the pre-refactor "publish idle on
-    2xx" logic, the 503 path here would start leaking idle.
+    watcher once the pane quiesces after the interrupt. The API response
+    is part of that truth boundary: returning 202 after the runner rejected
+    the request makes the web stop button report success while the native
+    process keeps generating.
     """
     from omnigent.runtime import session_stream, set_runner_client
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """Return 503 — the bridge-not-ready shape from the runner."""
-        del request
+        if request.method != "POST":
+            return httpx.Response(204)
         return httpx.Response(503, json={"error": "claude_native_interrupt_failed"})
 
     published: list[dict[str, Any]] = []
@@ -9920,17 +9930,15 @@ async def test_interrupt_on_claude_native_session_skips_idle_publish_on_runner_f
             f"/v1/sessions/{session['id']}/events",
             json={"type": "interrupt", "data": {}},
         )
-        assert resp.status_code == 202, resp.text
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"]["code"] == "runner_unavailable"
     finally:
         await fake_runner.aclose()
         set_runner_client(None)
 
-    # interrupted still fires (the UI marks the bubble cancelled);
-    # idle does not (the Escape didn't land).
+    # Neither interrupted nor idle may fire: the control did not land.
     interrupted = [e for e in published if e.get("type") == "session.interrupted"]
-    assert interrupted, (
-        f"session.interrupted should still publish on runner failure; got {published!r}"
-    )
+    assert not interrupted, f"failed delivery must not publish interrupted; got {published!r}"
     idle_status = [
         e for e in published if e.get("type") == "session.status" and e.get("status") == "idle"
     ]
@@ -10358,9 +10366,10 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
             f"/v1/sessions/{session_id}/events",
             json={"type": "interrupt", "data": {}},
         )
-        # Interrupt is best-effort and still ACKs (the UI already marked the
-        # bubble interrupted); the fence removal below is the fix under test.
-        assert resp.status_code == 202, resp.text
+        # A failed delivery is actionable: the UI keeps the real working state
+        # and can show the user that Stop did not land.
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"]["code"] == "runner_unavailable"
         assert session_id not in _interrupt_fenced_sessions, (
             "a failed interrupt forward must remove the fence it installed — "
             "leaving it set drops the rest of the still-running turn"
@@ -10369,6 +10378,148 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         if session_id is not None:
             _interrupt_fenced_sessions.discard(session_id)
         await fake_runner.aclose()
+
+
+async def test_concurrent_interrupts_share_one_failed_delivery(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent Stop requests share one result instead of racing the fence."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    forwards = 0
+
+    async def _fail_once(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal forwards
+        forwards += 1
+        entered.set()
+        await release.wait()
+        return sessions_module._RunnerForwardResult(status_code=503, body="rejected")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._forward_session_change_to_runner",
+        _fail_once,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    try:
+        first = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt", "data": {}},
+            )
+        )
+        second = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt", "data": {}},
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        # Let both ASGI requests reach the shared-delivery await before the
+        # runner result settles; a later arrival after failure is a real retry.
+        await asyncio.sleep(0.05)
+        release.set()
+        first_response, second_response = await asyncio.gather(first, second)
+
+        assert first_response.status_code == 503, first_response.text
+        assert second_response.status_code == 503, second_response.text
+        assert forwards == 1, "concurrent Stop requests must share one runner delivery"
+        assert session_id not in _interrupt_fenced_sessions
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
+
+
+async def test_interrupt_noop_after_terminal_idle_does_not_publish_cancellation(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner's authoritative idle result closes a delayed Stop without lying."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    published: list[dict[str, Any]] = []
+
+    async def _already_idle(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions_module._RunnerForwardResult(
+            status_code=200,
+            body='{"interrupted":false,"reason":"idle"}',
+        )
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _already_idle,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "interrupt", "data": {}},
+        )
+
+        assert response.status_code == 202, response.text
+        assert session_id not in _interrupt_fenced_sessions
+        assert not [event for event in published if event.get("type") == "session.interrupted"]
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
+
+
+async def test_terminal_edge_during_interrupt_delivery_wins_over_late_publish(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal edge while Runner is handling Stop prevents stale publish."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+    published: list[dict[str, Any]] = []
+
+    async def _slow_success(*_args: Any, **_kwargs: Any) -> Any:
+        delivery_started.set()
+        await release_delivery.wait()
+        return sessions_module._RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _slow_success,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    try:
+        pending = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt", "data": {}},
+            )
+        )
+        await asyncio.wait_for(delivery_started.wait(), timeout=1.0)
+        # Model the relay receiving the turn's terminal/new-running edge before
+        # the Runner POST completes; orchestration clears the same fence.
+        _interrupt_fenced_sessions.discard(session_id)
+        release_delivery.set()
+        response = await pending
+
+        assert response.status_code == 202, response.text
+        assert not [event for event in published if event.get("type") == "session.interrupted"]
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
 
 
 async def test_interrupt_forward_success_keeps_stop_fence(
@@ -10386,9 +10537,13 @@ async def test_interrupt_forward_success_keeps_stop_fence(
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import _interrupt_fenced_sessions
 
+    interrupt_forwards = 0
+
     def _handler(request: httpx.Request) -> httpx.Response:
         """Accept the interrupt POST (2xx) and all other requests."""
-        del request
+        nonlocal interrupt_forwards
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            interrupt_forwards += 1
         return httpx.Response(202)
 
     fake_runner = httpx.AsyncClient(
@@ -10416,6 +10571,14 @@ async def test_interrupt_forward_success_keeps_stop_fence(
             json={"type": "interrupt", "data": {}},
         )
         assert resp.status_code == 202, resp.text
+        repeat = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "interrupt", "data": {}},
+        )
+        assert repeat.status_code == 202, repeat.text
+        assert interrupt_forwards == 1, (
+            "a repeat Stop before the fence clears must not inject a second Ctrl+C"
+        )
         # 2xx from the runner = the cancel landed; the fence must stay so
         # the dying turn's trailing response.* events are suppressed.
         assert session_id in _interrupt_fenced_sessions, (

@@ -269,6 +269,13 @@ def native_agent_for_cancel(wrapper_label: str | None) -> NativeCodingAgent | No
     return None
 
 
+def native_session_has_active_work(pane_status: str | None, has_active_turn: bool) -> bool:
+    """Prefer an observed pane state over a possibly-lagging task slot."""
+    if pane_status is not None:
+        return pane_status in {"running", "waiting"}
+    return has_active_turn
+
+
 def native_cancel_capability(wrapper_label: str | None) -> str:
     """Classify a child's wrapper for parent-side ``sys_cancel_task`` routing.
 
@@ -302,6 +309,7 @@ class NativeInterruptRunner:
         publish_event: Callable[[str, dict[str, object]], None],
         mark_subagent_terminal_and_wake: MarkSubagentTerminalAndWake,
         session_sub_agent_names: Mapping[str, str],
+        session_has_active_work: Callable[[str], bool],
         codex_bridge_state_for_session: CodexBridgeStateForSession,
         client_safe_error_detail: ClientSafeErrorDetail,
         logger: logging.Logger,
@@ -311,6 +319,7 @@ class NativeInterruptRunner:
         self._publish_event = publish_event
         self._mark_subagent_terminal_and_wake = mark_subagent_terminal_and_wake
         self._session_sub_agent_names = session_sub_agent_names
+        self._session_has_active_work = session_has_active_work
         self._codex_bridge_state_for_session = codex_bridge_state_for_session
         self._client_safe_error_detail = client_safe_error_detail
         self._logger = logger
@@ -466,10 +475,32 @@ class NativeInterruptRunner:
     async def _claude_interrupt(self, conv_id: str) -> Response:
         from omnigent.claude_native_bridge import bridge_dir_for_bridge_id, inject_interrupt
 
+        if not self._session_has_active_work(conv_id):
+            # A delayed Web Stop can arrive after the terminal's authoritative
+            # idle edge. Ctrl+C is not a harmless no-op at Claude's composer:
+            # two presses exit the interactive CLI. Treat the stale control as
+            # already settled instead of injecting into an idle pane.
+            self._logger.debug("claude-native interrupt: no active work for %s", conv_id)
+            return JSONResponse(
+                status_code=200,
+                content={"interrupted": False, "reason": "idle"},
+            )
+
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=self._server_client,
             session_id=conv_id,
         )
+        if not self._session_has_active_work(conv_id):
+            # The bridge-id lookup crosses an async boundary. Re-check at the
+            # last safe point so a terminal idle edge during that await cannot
+            # turn the pending control into Ctrl+C at Claude's idle composer.
+            self._logger.debug(
+                "claude-native interrupt: work settled during bridge lookup for %s", conv_id
+            )
+            return JSONResponse(
+                status_code=200,
+                content={"interrupted": False, "reason": "idle"},
+            )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         try:
             await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)

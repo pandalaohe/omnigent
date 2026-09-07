@@ -529,14 +529,23 @@ class ClaudeGoalStateSnapshot:
 
 
 def _goal_state_from_transcript_entry(entry: _JsonObject) -> tuple[bool, str | None]:
-    """Read Claude Code's structured ``active_goal`` transcript event."""
-    if entry.get("type") != "active_goal" or "value" not in entry:
-        return False, None
-    value = entry.get("value")
-    if value is None:
-        return True, None
-    if isinstance(value, dict):
-        return True, "active"
+    """Read Claude Code's structured Goal transcript events."""
+    if entry.get("type") == "active_goal" and "value" in entry:
+        value = entry.get("value")
+        if value is None:
+            return True, None
+        if isinstance(value, dict):
+            return True, "active"
+    attachment = entry.get("attachment")
+    if (
+        entry.get("type") == "attachment"
+        and isinstance(attachment, dict)
+        and attachment.get("type") == "goal_status"
+        and attachment.get("sentinel") is True
+        and isinstance(attachment.get("met"), bool)
+        and isinstance(attachment.get("condition"), str)
+    ):
+        return True, None if attachment["met"] else "active"
     return False, None
 
 
@@ -3392,10 +3401,11 @@ def inject_interrupt(
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
     """
-    Send an Escape keystroke into the Claude terminal via tmux send-keys.
+    Send Ctrl+C into the Claude terminal via tmux send-keys.
 
-    Claude Code's TUI cancels an in-flight response on a single
-    ``Escape``. The harness's ``run_turn`` for ``claude-native``
+    Claude Code can leave a foreground tool process running after ``Escape``;
+    ``Ctrl+C`` interrupts the foreground process group while preserving the
+    interactive session. The harness's ``run_turn`` for ``claude-native``
     returns immediately after the tmux paste (the long-running work
     happens inside the ``claude`` binary in the pane, not the
     harness), so the scaffold's interrupt path can't reach it — this
@@ -3411,8 +3421,8 @@ def inject_interrupt(
         time, or if the ``tmux send-keys`` invocation fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    # No ``-l``: tmux must interpret ``C-c`` as the Ctrl+C key name.
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-c")
 
 
 def kill_session(
@@ -3432,8 +3442,8 @@ def kill_session(
     it kills the tmux session outright, which terminates ``claude`` and
     everything in the pane.
 
-    Unlike :func:`inject_interrupt` (which sends a single ``Escape`` to
-    cancel an in-flight response but leaves the session alive), this is
+    Unlike :func:`inject_interrupt` (which sends one ``Ctrl+C`` to interrupt
+    foreground work but leaves the interactive session alive), this is
     a hard stop. Once the pane is gone the wrapper's reconnect loop
     observes the terminal resource disappear and tears the session
     down through its normal end-of-session path, so no transcript items
