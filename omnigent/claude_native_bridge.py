@@ -1735,12 +1735,13 @@ def build_hook_settings(
         ask_uq_hook: _JsonObject = {
             "type": "command",
             "command": shlex.join(ask_uq_command_parts),
-            # Short timeout: if the web-UI elicitation isn't answered
-            # within 10s, the hook returns empty output so Claude falls
-            # through to its TUI picker in bypassPermissions mode. In
-            # default mode this hook exits immediately (no-op), so the
-            # timeout is irrelevant there.
-            "timeout": 10,
+            # Wait as long as the PermissionRequest hook above does: the
+            # web-UI card stays up until the user answers it. The old 10s
+            # budget fell through to Claude's TUI picker, which a web-UI
+            # user never sees, and the PermissionRequest fallback then
+            # denied the call. In default mode this hook exits immediately
+            # (no-op), so the timeout is irrelevant there.
+            "timeout": 86400,
         }
         # The ``AskUserQuestion`` matcher only fires if that tool is actually
         # callable. A session launched with ``--disallowedTools AskUserQuestion``
