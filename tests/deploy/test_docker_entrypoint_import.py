@@ -105,6 +105,34 @@ def test_docker_entrypoint_wires_the_user_preferences_store() -> None:
     assert "user_preferences_store" in wired_keywords
 
 
+def test_docker_entrypoint_runs_the_schema_initializer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Container startup must include legacy revision repair before Alembic."""
+    from deploy.docker.entrypoint import run_migrations
+    from omnigent.db import utils as db_utils
+
+    class _Engine:
+        disposed = False
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    engine = _Engine()
+    calls: list[tuple[object, str]] = []
+    monkeypatch.setattr("sqlalchemy.create_engine", lambda _url: engine)
+    monkeypatch.setattr(
+        db_utils,
+        "_initialize_or_verify_schema",
+        lambda candidate, url: calls.append((candidate, url)),
+    )
+
+    run_migrations("postgresql+psycopg://example/omnigent")
+
+    assert calls == [(engine, "postgresql+psycopg://example/omnigent")]
+    assert engine.disposed is True
+
+
 # ── artifact-store resolution + selection ────────────────────────────────
 # OMNIGENT_ARTIFACT_URI=s3://… selects the remote S3ArtifactStore (durable on an
 # ephemeral/multi-replica deploy); anything else falls back to local. The URI is

@@ -103,11 +103,11 @@ def run_migrations(database_url: str) -> None:
     """
     import sqlalchemy
 
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
+    from omnigent.db.utils import _initialize_or_verify_schema
 
     migration_engine = sqlalchemy.create_engine(database_url)
     try:
-        _run_alembic_upgrade(migration_engine, database_url)
+        _initialize_or_verify_schema(migration_engine, database_url)
     finally:
         migration_engine.dispose()
 
