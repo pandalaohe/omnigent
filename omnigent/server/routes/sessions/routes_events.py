@@ -194,6 +194,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_runner_client,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _archive_close_in_progress,
     _best_effort_stop,
     _child_session_summaries_from_conversations,
     _dispatch_session_event_to_runner,
@@ -219,6 +220,7 @@ from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
 )
 from omnigent.server.routes._sessions.subagent_reconciliation import _read_native_subagent_probe
+from omnigent.server.runner_session_init import conversation_archive_lineage
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ConversationDeleted,
@@ -234,6 +236,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     DELETION_CLAIM_HEARTBEAT_INTERVAL_S,
     DELETION_CLAIM_STALE_AFTER_S,
+    ConversationArchiveClosingError,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
@@ -307,6 +310,67 @@ def _forget_interrupt_delivery(session_id: str, task: asyncio.Task[None]) -> Non
     # receive the same exception from the completed task.
     if not task.cancelled():
         task.exception()
+
+
+async def _archive_blocks_external_user_work(
+    request: Request,
+    conv: Any,
+    conversation_store: ConversationStore,
+    *,
+    allow_inflight_spawn_without_close: bool = False,
+) -> bool:
+    """Fence user work and preserve in-flight spawns only for close=false."""
+    scopes = await conversation_archive_lineage(conv, conversation_store)
+    if any(_archive_close_in_progress(scope.id) for scope in scopes):
+        return True
+    for scope in scopes:
+        if getattr(scope, "archive_close_claimed", False):
+            return True
+        archive_revision = getattr(scope, "archive_revision", 0)
+        if (
+            scope.archived
+            and getattr(scope, "archive_close_requested_revision", None) == archive_revision
+        ):
+            return True
+    archived_scopes = [scope for scope in scopes if scope.archived]
+    if not archived_scopes:
+        return False
+    if not allow_inflight_spawn_without_close:
+        return True
+    host_store = getattr(request.app.state, "host_store", None)
+    if host_store is None:
+        return True
+    for scope in archived_scopes:
+        if scope.host_id is None:
+            return True
+        try:
+            host = await asyncio.to_thread(host_store.get_host, scope.host_id)
+        except Exception:
+            _logger.warning(
+                "Could not load CLI retention policy for archived session %s; "
+                "using legacy user-work gate",
+                scope.id,
+                exc_info=True,
+            )
+            return True
+        if (
+            host is None
+            or host.cli_retention_policy is None
+            or host.cli_retention_policy.close_on_archive
+        ):
+            return True
+    return False
+
+
+async def _persist_subagent_start_with_archive_fence(factory: Any, *args: Any) -> Any:
+    """Translate the store's atomic archive-vs-child result to a 409."""
+    try:
+        return await factory(*args)
+    except ConversationArchiveClosingError as exc:
+        raise OmnigentError(
+            "Session is being archived. Unarchive it before starting new work.",
+            code=ErrorCode.CONFLICT,
+        ) from exc
 
 
 class _DeletionClaimLease:
@@ -809,6 +873,29 @@ def register_events_routes(
                 parse_client_side_tool_specs(body.tools)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        archived_user_work = body.type in {
+            _RETRY_SESSION_TYPE,
+            _COMPACT_TYPE,
+            _SLASH_COMMAND_TYPE,
+        } or (body.type == "message" and body.data.get("role") == "user")
+        archived_start_work = body.type in {
+            _EXTERNAL_ACP_SUBAGENT_START_TYPE,
+            _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
+            _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+            _EXTERNAL_SUBAGENT_START_TYPE,
+        }
+        if (
+            archived_user_work or archived_start_work
+        ) and await _archive_blocks_external_user_work(
+            request,
+            conv,
+            conversation_store,
+            allow_inflight_spawn_without_close=(archived_start_work and not archived_user_work),
+        ):
+            raise OmnigentError(
+                "Session is archived. Unarchive it before starting new work.",
+                code=ErrorCode.CONFLICT,
+            )
         if body.type == _RETRY_SESSION_TYPE:
             return await _retry_session_single_flight(
                 request=request,
@@ -1889,7 +1976,8 @@ def register_events_routes(
             await _persist_external_goal_state(session_id, conv, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
-            child_id, existing_child = await _persist_external_subagent_start(
+            child_id, existing_child = await _persist_subagent_start_with_archive_fence(
+                _persist_external_subagent_start,
                 session_id,
                 conv,
                 body,
@@ -1900,7 +1988,8 @@ def register_events_routes(
             # ``external_session_status`` events to the child id.
             return {"queued": False, "child_session_id": child_id, "existing": existing_child}
         if body.type == _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE:
-            child_id = await _persist_external_antigravity_subagent_start(
+            child_id = await _persist_subagent_start_with_archive_fence(
+                _persist_external_antigravity_subagent_start,
                 session_id,
                 conv,
                 body,
@@ -1910,7 +1999,8 @@ def register_events_routes(
             # steps into this id.
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_CODEX_SUBAGENT_START_TYPE:
-            child_id = await _persist_external_codex_subagent_start(
+            child_id = await _persist_subagent_start_with_archive_fence(
+                _persist_external_codex_subagent_start,
                 session_id,
                 conv,
                 body,
@@ -1918,7 +2008,8 @@ def register_events_routes(
             )
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_ACP_SUBAGENT_START_TYPE:
-            child_id = await _persist_external_acp_subagent_start(
+            child_id = await _persist_subagent_start_with_archive_fence(
+                _persist_external_acp_subagent_start,
                 session_id,
                 conv,
                 body,

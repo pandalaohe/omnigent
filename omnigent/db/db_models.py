@@ -844,6 +844,67 @@ class SqlProject(OmnigentBase):
     )
 
 
+class SqlCliReleaseIntent(ConversationBase):
+    """Durable, generation-fenced request to release one session runtime."""
+
+    __tablename__ = "cli_release_intents"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dedupe_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    root_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    target_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    host_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    runner_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    family: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    policy_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    archive_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    runtime_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    activity_token: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    idle_threshold_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    next_attempt_at: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "dedupe_key", name="uq_cli_release_intents_dedupe"),
+        Index(
+            "ix_cli_release_intents_due",
+            "workspace_id",
+            "status",
+            "next_attempt_at",
+            "id",
+        ),
+        Index(
+            "ix_cli_release_intents_host",
+            "workspace_id",
+            "host_id",
+            "status",
+            "id",
+        ),
+        Index(
+            "ix_cli_release_intents_root",
+            "workspace_id",
+            "root_session_id",
+            "archive_revision",
+            "status",
+        ),
+    )
+
+
 class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.
@@ -920,6 +981,17 @@ class SqlConversation(ConversationBase):
     # Timestamp of the most recent transition into archived state. Unlike
     # updated_at, later title/model/label edits do not move this value.
     archived_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Monotonic archive transition revision and durable close request state.
+    # These live on the same row as ``archived`` so an archive transition and
+    # its teardown intent commit atomically across Server replicas.
+    archive_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    archive_close_requested_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    archive_close_completed_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    archive_close_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    archive_close_claimed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    archive_close_last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # Row-local mirror of the public archive-lock label. Keeping the delete
     # gate on this row makes lock-vs-claim a single conditional UPDATE across
     # Postgres/SQLite workers; the label remains the wire-compatible surface.
@@ -1430,6 +1502,17 @@ class SqlHost(OmnigentBase):
     # User-selected starting directory for this physical host. Host-native
     # syntax is preserved (POSIX, Windows drive, or UNC).
     default_workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # Versioned Host policy for retaining idle main-session CLIs. NULL keeps
+    # legacy idle-reaper behavior and archive-close=true compatibility.
+    cli_retention_policy: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    cli_retention_revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        default=0,
+    )
+    cli_retention_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cli_retention_claimed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         CheckConstraint(

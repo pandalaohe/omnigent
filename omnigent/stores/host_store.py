@@ -24,6 +24,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
@@ -98,6 +99,12 @@ class Host:
     default_workspace: str | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
+    cli_retention_policy: CliRetentionPolicy | None = None
+    cli_retention_revision: int = 0
+
+
+class HostCliRetentionRevisionConflictError(RuntimeError):
+    """The Host policy changed after the caller loaded it."""
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -149,6 +156,20 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailabilit
     return {k: v for k, v in parsed.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
+def _parse_cli_retention_policy(raw: str | None) -> CliRetentionPolicy | None:
+    """Parse the stored policy, degrading malformed legacy bytes to unconfigured."""
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            return None
+        return CliRetentionPolicy.from_dict(value)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        _logger.warning("Ignoring malformed hosts.cli_retention_policy value")
+        return None
+
+
 def _row_to_host(row: SqlHost) -> Host:
     """
     Convert a :class:`SqlHost` ORM row to a :class:`Host` entity.
@@ -169,6 +190,8 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
         default_workspace=row.default_workspace,
+        cli_retention_policy=_parse_cli_retention_policy(row.cli_retention_policy),
+        cli_retention_revision=row.cli_retention_revision,
     )
 
 
@@ -416,6 +439,8 @@ class HostStore:
         sandbox_id = row.sandbox_id
         default_workspace = row.default_workspace
         terminating_sandbox_id = row.terminating_sandbox_id
+        cli_retention_policy = row.cli_retention_policy
+        cli_retention_revision = row.cli_retention_revision
 
         bound_ids = list(
             session.execute(
@@ -460,6 +485,8 @@ class HostStore:
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
             default_workspace=default_workspace,
+            cli_retention_policy=cli_retention_policy,
+            cli_retention_revision=cli_retention_revision,
         )
         session.add(new_row)
         session.flush()
@@ -476,6 +503,109 @@ class HostStore:
             session.flush()
 
         return new_row
+
+    def claim_cli_retention(
+        self,
+        host_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+        stale_before: int,
+    ) -> bool:
+        """Lease Host pool selection without mutating its liveness timestamp."""
+        with self._session("claim_cli_retention") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        or_(
+                            SqlHost.cli_retention_claim_token.is_(None),
+                            SqlHost.cli_retention_claimed_at.is_(None),
+                            SqlHost.cli_retention_claimed_at < stale_before,
+                        ),
+                    )
+                    .values(
+                        cli_retention_claim_token=token,
+                        cli_retention_claimed_at=claimed_at,
+                    )
+                ),
+            )
+            return bool(result.rowcount)
+
+    def renew_cli_retention(self, host_id: str, token: str, *, claimed_at: int) -> bool:
+        """Refresh only the Host selection lease owned by ``token``."""
+        with self._session("renew_cli_retention") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.cli_retention_claim_token == token,
+                    )
+                    .values(cli_retention_claimed_at=claimed_at)
+                ),
+            )
+            return bool(result.rowcount)
+
+    def release_cli_retention(self, host_id: str, token: str) -> bool:
+        """Release only the matching Host pool-selection lease."""
+        with self._session("release_cli_retention") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.cli_retention_claim_token == token,
+                    )
+                    .values(cli_retention_claim_token=None, cli_retention_claimed_at=None)
+                ),
+            )
+            return bool(result.rowcount)
+
+    def reset_cli_retention_policy(
+        self,
+        host_id: str,
+        *,
+        expected_revision: int,
+        expected_user_id: str | None = None,
+        expected_claim_token: str | None = None,
+    ) -> Host | None:
+        """CAS one Host back to legacy CLI lifecycle behavior."""
+        with self._session("reset_cli_retention_policy") as session:
+            conditions = [
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+                SqlHost.cli_retention_revision == expected_revision,
+            ]
+            if expected_user_id is not None:
+                conditions.append(SqlHost.user_id == expected_user_id)
+            if expected_claim_token is not None:
+                conditions.append(SqlHost.cli_retention_claim_token == expected_claim_token)
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(*conditions)
+                    .values(
+                        cli_retention_policy=None,
+                        cli_retention_revision=expected_revision + 1,
+                    )
+                ),
+            )
+            if not result.rowcount:
+                row = session.get(SqlHost, (current_workspace_id(), host_id))
+                if row is None:
+                    return None
+                raise HostCliRetentionRevisionConflictError(host_id)
+            row = session.get(SqlHost, (current_workspace_id(), host_id))
+            return _row_to_host(row) if row is not None else None
 
     def _reown_host_id(
         self,
@@ -549,6 +679,8 @@ class HostStore:
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
             default_workspace=existing.default_workspace,
+            cli_retention_policy=_parse_cli_retention_policy(existing.cli_retention_policy),
+            cli_retention_revision=existing.cli_retention_revision,
         )
 
     def set_offline(self, host_id: str) -> None:
@@ -809,6 +941,55 @@ class HostStore:
             ).scalar_one()
             # updated_at is the host liveness heartbeat. A preference write
             # must not make a stale `status=online` row look live again.
+            return _row_to_host(row)
+
+    def replace_cli_retention_policy(
+        self,
+        host_id: str,
+        policy: CliRetentionPolicy,
+        *,
+        expected_revision: int,
+        expected_user_id: str | None = None,
+        expected_claim_token: str | None = None,
+    ) -> Host | None:
+        """Replace one Host policy when its revision still matches."""
+        encoded = json.dumps(policy.to_dict(), separators=(",", ":"), sort_keys=True)
+        with self._session("replace_host_cli_retention_policy") as session:
+            conditions = [
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+                SqlHost.cli_retention_revision == expected_revision,
+            ]
+            if expected_user_id is not None:
+                conditions.append(SqlHost.user_id == expected_user_id)
+            if expected_claim_token is not None:
+                conditions.append(SqlHost.cli_retention_claim_token == expected_claim_token)
+            result = session.execute(
+                update(SqlHost)
+                .where(*conditions)
+                .values(
+                    cli_retention_policy=encoded,
+                    cli_retention_revision=SqlHost.cli_retention_revision + 1,
+                )
+            )
+            if getattr(result, "rowcount", None) != 1:
+                exists = session.execute(
+                    select(SqlHost.host_id).where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                    )
+                ).scalar_one_or_none()
+                if exists is None:
+                    return None
+                raise HostCliRetentionRevisionConflictError(
+                    f"Host {host_id!r} CLI retention policy revision changed"
+                )
+            row = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+            ).scalar_one()
             return _row_to_host(row)
 
     def register_managed_host(

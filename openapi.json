@@ -809,6 +809,379 @@
         "title": "ClearCodexGoalResponse",
         "type": "object"
       },
+      "CliRetentionApplication": {
+        "description": "Versioned UI-facing evidence for whether a saved policy is active.",
+        "properties": {
+          "absent": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Absent"
+          },
+          "bound": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bound"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "policy_revision": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Policy Revision",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "legacy",
+              "host_offline",
+              "other_replica",
+              "pending",
+              "unknown",
+              "partial",
+              "unsupported",
+              "applied"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "supported": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supported"
+          },
+          "unknown": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unknown"
+          },
+          "unsupported": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unsupported"
+          }
+        },
+        "required": [
+          "status",
+          "policy_revision"
+        ],
+        "title": "CliRetentionApplication",
+        "type": "object"
+      },
+      "CliRetentionFamilyRuntime": {
+        "description": "Observed CLI state counts for one supported runtime family.",
+        "properties": {
+          "active": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Active",
+            "type": "integer"
+          },
+          "below_threshold": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Below Threshold",
+            "type": "integer"
+          },
+          "idle": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Idle",
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "idle",
+          "active",
+          "below_threshold",
+          "total"
+        ],
+        "title": "CliRetentionFamilyRuntime",
+        "type": "object"
+      },
+      "CliRetentionPolicyInput": {
+        "additionalProperties": false,
+        "description": "Strict Host policy payload.",
+        "properties": {
+          "close_on_archive": {
+            "title": "Close On Archive",
+            "type": "boolean"
+          },
+          "idle_threshold_minutes": {
+            "format": "int64",
+            "maximum": 10080.0,
+            "minimum": 1.0,
+            "title": "Idle Threshold Minutes",
+            "type": "integer"
+          },
+          "max_idle_clis": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Idle Clis"
+          },
+          "version": {
+            "format": "int64",
+            "maximum": 1.0,
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "idle_threshold_minutes",
+          "max_idle_clis",
+          "close_on_archive"
+        ],
+        "title": "CliRetentionPolicyInput",
+        "type": "object"
+      },
+      "CliRetentionPolicyResponse": {
+        "description": "Stable response contract consumed by the Host settings UI.",
+        "properties": {
+          "application": {
+            "$ref": "#/components/schemas/CliRetentionApplication"
+          },
+          "configured": {
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "contract_version": {
+            "const": 1,
+            "default": 1,
+            "format": "int64",
+            "title": "Contract Version",
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/CliRetentionPolicyInput"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CliRetentionRuntime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "configured",
+          "revision",
+          "policy",
+          "runtime",
+          "application"
+        ],
+        "title": "CliRetentionPolicyResponse",
+        "type": "object"
+      },
+      "CliRetentionRuntime": {
+        "description": "Latest owner-replica reconciliation projection for one Host.",
+        "properties": {
+          "application": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CliRetentionApplication"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "configured": {
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "families": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/CliRetentionFamilyRuntime"
+            },
+            "title": "Families",
+            "type": "object"
+          },
+          "lease": {
+            "anyOf": [
+              {
+                "const": "busy",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
+          "policy_revision": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Policy Revision"
+          },
+          "released": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Released"
+          },
+          "reset": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reset"
+          },
+          "scheduled": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled"
+          },
+          "unavailable": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailable"
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "title": "CliRetentionRuntime",
+        "type": "object"
+      },
       "ClientTaskCancelEvent": {
         "description": "Server-side request that the client cancel a tunneled tool call.\n\nEmitted by `omnigent/runtime/workflow.py` when a parent\ncancellation needs to propagate to a long-running async client\ntool. Wire shape matches `workflow.py:4258-4266`.",
         "properties": {
@@ -4128,6 +4501,44 @@
           "delta"
         ],
         "title": "ReasoningTextDeltaEvent",
+        "type": "object"
+      },
+      "ReplaceCliRetentionPolicyRequest": {
+        "additionalProperties": false,
+        "description": "Compare-and-swap replacement for one Host policy.",
+        "properties": {
+          "expected_revision": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/CliRetentionPolicyInput"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "policy"
+        ],
+        "title": "ReplaceCliRetentionPolicyRequest",
+        "type": "object"
+      },
+      "ResetCliRetentionPolicyRequest": {
+        "additionalProperties": false,
+        "description": "Compare-and-swap reset to the Host's legacy lifecycle behavior.",
+        "properties": {
+          "expected_revision": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "ResetCliRetentionPolicyRequest",
         "type": "object"
       },
       "ResetSessionModelOverrideRequest": {
@@ -10032,6 +10443,151 @@
           }
         },
         "summary": "Update Host",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/cli-retention": {
+      "delete": {
+        "description": "CAS the Host back to legacy TTL behavior and unmanage live CLIs.",
+        "operationId": "reset_cli_retention_policy_v1_hosts__host_id__cli_retention_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetCliRetentionPolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CliRetentionPolicyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Cli Retention Policy",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "get": {
+        "description": "Return one Host's effective idle-CLI policy and CAS revision.",
+        "operationId": "get_cli_retention_policy_v1_hosts__host_id__cli_retention_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CliRetentionPolicyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Cli Retention Policy",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "put": {
+        "description": "Replace one Host's policy if the caller still owns its revision.",
+        "operationId": "replace_cli_retention_policy_v1_hosts__host_id__cli_retention_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplaceCliRetentionPolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CliRetentionPolicyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replace Cli Retention Policy",
         "tags": [
           "hosts"
         ]

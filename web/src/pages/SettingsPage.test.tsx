@@ -215,6 +215,11 @@ vi.mock("@/components/ContextUsageSettings", () => ({
     </div>
   ),
 }));
+vi.mock("@/components/CliRetentionSettings", () => ({
+  CliRetentionSettings: () => (
+    <div data-testid="cli-retention-settings">Host-scoped idle CLI retention</div>
+  ),
+}));
 // The admin management surfaces are lazy-loaded and own heavy data layers of
 // their own; stub them so these tests only assert SettingsPage's section
 // routing (that /settings/members and /settings/policies render the right one).
@@ -425,6 +430,15 @@ describe("SettingsPage", () => {
 
     expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(localStorage.getItem(CONTEXT_INDICATOR_STORAGE_KEY)).toBe("compact");
+  });
+
+  it("renders Host CLI retention in Runtime & resources", () => {
+    renderPage("/settings/runtime-resources");
+
+    expect(screen.getByRole("heading", { name: "Runtime & resources" })).toBeInTheDocument();
+    expect(screen.getByTestId("cli-retention-settings")).toHaveTextContent(
+      "Host-scoped idle CLI retention",
+    );
   });
 
   it("keeps polling and mobile controls together under shortcuts", () => {

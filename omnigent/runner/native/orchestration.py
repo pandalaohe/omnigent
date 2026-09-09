@@ -172,7 +172,7 @@ class _CodexNativeModelOptionsNotReady(RuntimeError):
     """Raised when Codex model options are requested before bridge startup."""
 
 
-async def _cancel_auto_forwarder_task(session_id: str) -> None:
+async def _cancel_auto_forwarder_task(session_id: str) -> bool:
     """
     Cancel and await the session's registered transcript forwarder, if any.
 
@@ -188,7 +188,7 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
     """
     task = _AUTO_FORWARDER_TASKS.pop(session_id, None)
     if task is None or task.done():
-        return
+        return True
     task.cancel()
     # asyncio.wait absorbs the CancelledError and bounds the wait on a hung cancellation.
     _done, pending = await asyncio.wait({task}, timeout=_AUTO_FORWARDER_CANCEL_TIMEOUT_S)
@@ -198,6 +198,8 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
             session_id,
             _AUTO_FORWARDER_CANCEL_TIMEOUT_S,
         )
+        return False
+    return True
 
 
 async def teardown_codex_native_app_server(session_id: str) -> None:
@@ -1522,13 +1524,10 @@ async def _supervise_opencode_forwarder(
     try:
         await forwarder.run()
     finally:
-        leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
-        if leftover is not None:
-            with contextlib.suppress(Exception):
-                await leftover.close()
-        elif server is not None:
-            with contextlib.suppress(Exception):
-                await server.close()
+        if _AUTO_OPENCODE_SERVERS.get(session_id) is server:
+            _AUTO_OPENCODE_SERVERS.pop(session_id)
+        with contextlib.suppress(Exception):
+            await server.close()
 
 
 # Permission decisions can park a human approval card server-side
@@ -4579,6 +4578,7 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 workspace=workspace,
                 event_client=event_client,
+                owned_app_server=app_server,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 subagent_router=_codex_router,
@@ -4590,6 +4590,7 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
+                owned_app_server=app_server,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4637,6 +4638,7 @@ async def _codex_discover_thread_and_forward(
     codex_home: Path,
     workspace: str,
     event_client: CodexAppServerClient,
+    owned_app_server: CodexNativeAppServer | None = None,
     routing_summary: str,
     login_required: bool = False,
     subagent_router: SubagentRouter | None = None,
@@ -4691,6 +4693,9 @@ async def _codex_discover_thread_and_forward(
         supervise_forwarder,
         wait_for_thread_started,
     )
+
+    if owned_app_server is None:
+        owned_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
     from omnigent.runner._entry import (
         _make_auth_token_factory,
         _RunnerDatabricksAuth,
@@ -4832,7 +4837,10 @@ async def _codex_discover_thread_and_forward(
         # in its own ``finally``; ``close()`` is idempotent. The app-server
         # subprocess is ours to stop, else it orphans one process per session.
         # Pop first so the dict never holds a closed reference.
-        leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        current_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+        leftover_app_server = owned_app_server
+        if current_app_server is owned_app_server:
+            _AUTO_CODEX_APP_SERVERS.pop(session_id)
         with contextlib.suppress(Exception):
             await event_client.close()
         if leftover_app_server is not None:
@@ -4848,6 +4856,7 @@ async def _codex_forward_known_thread(
     bridge_dir: Path,
     codex_ws_url: str,
     thread_id: str,
+    owned_app_server: CodexNativeAppServer | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4874,6 +4883,9 @@ async def _codex_forward_known_thread(
         _RunnerDatabricksAuth,
     )
 
+    if owned_app_server is None:
+        owned_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
@@ -4889,7 +4901,10 @@ async def _codex_forward_known_thread(
             auth=_RunnerDatabricksAuth(auth_factory),
         )
     finally:
-        leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        current_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+        leftover_app_server = owned_app_server
+        if current_app_server is owned_app_server:
+            _AUTO_CODEX_APP_SERVERS.pop(session_id)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()

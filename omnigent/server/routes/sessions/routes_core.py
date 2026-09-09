@@ -167,6 +167,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status,
     _run_managed_launch,
     _spawn_archive_stop,
+    _spawn_archive_unfence,
 )
 from omnigent.server.schemas import (
     ArchivedSessionFacetsResponse,
@@ -2302,6 +2303,34 @@ def register_core_routes(
                     code=ErrorCode.CONFLICT,
                 )
 
+        assert conv is not None
+        close_on_archive = False
+        if body.archived is True and not conv.archived:
+            # Resolve the Host policy before the row mutation so the archive
+            # transition and its close request commit atomically below.
+            close_on_archive = True
+            if conv.host_id is not None:
+                host_store = getattr(request.app.state, "host_store", None)
+                if host_store is not None:
+                    try:
+                        policy_host = await asyncio.to_thread(
+                            host_store.get_host,
+                            conv.host_id,
+                        )
+                    except Exception:
+                        _logger.warning(
+                            "Could not load CLI retention policy for archived session %s; "
+                            "using legacy close behavior",
+                            session_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if (
+                            policy_host is not None
+                            and policy_host.cli_retention_policy is not None
+                        ):
+                            close_on_archive = policy_host.cli_retention_policy.close_on_archive
+
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2321,6 +2350,7 @@ def register_core_routes(
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
+            close_cli_on_archive=close_on_archive,
         )
         if updated is None:
             raise _session_not_found()
@@ -2335,11 +2365,23 @@ def register_core_routes(
             # the stop's per-runner timeouts (seconds against a wedged or
             # asleep runner). Archive has no client-side stop, so this also
             # carries the host-runner teardown.
-            _spawn_archive_stop(
+            if (
+                close_on_archive
+                and updated.archive_close_requested_revision == updated.archive_revision
+            ):
+                _spawn_archive_stop(
+                    session_id,
+                    conversation_store,
+                    runner_router,
+                    getattr(request.app.state, "host_registry", None),
+                    getattr(request.app.state, "archive_close_coordinator", None),
+                )
+        elif body.archived is False and conv.archived:
+            _spawn_archive_unfence(
                 session_id,
+                updated.archive_revision,
                 conversation_store,
                 runner_router,
-                getattr(request.app.state, "host_registry", None),
             )
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries

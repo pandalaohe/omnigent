@@ -268,6 +268,11 @@ class Conversation:
     git_branch: str | None = None
     archived: bool = False
     archived_at: int | None = None
+    archive_revision: int = 0
+    archive_close_requested_revision: int | None = None
+    archive_close_completed_revision: int | None = None
+    archive_close_claimed: bool = False
+    archive_close_last_error: str | None = None
     # Live-state fields written by the replica holding the runner tunnel
     # so any replica's session list can serve them. ``live_status`` is the
     # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",

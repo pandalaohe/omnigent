@@ -66,6 +66,91 @@ function isSafePositiveInteger(value: unknown): value is number {
 }
 
 /** Rebuild a bounded snapshot from untrusted REST JSON, or hide it. */
+export interface CliRetentionPolicy {
+  version: 1;
+  idle_threshold_minutes: number;
+  max_idle_clis: number | null;
+  close_on_archive: boolean;
+}
+
+export type CliRetentionApplicationStatus =
+  | "legacy"
+  | "host_offline"
+  | "other_replica"
+  | "pending"
+  | "unknown"
+  | "partial"
+  | "unsupported"
+  | "applied";
+
+export interface CliRetentionApplication {
+  status: CliRetentionApplicationStatus;
+  policy_revision: number;
+  observed_at: number | null;
+  bound?: number | null;
+  supported?: number | null;
+  absent?: number | null;
+  unsupported?: number | null;
+  unknown?: number | null;
+}
+
+export interface CliRetentionFamilyStats {
+  idle: number;
+  active: number;
+  below_threshold: number;
+  total: number;
+}
+
+export interface CliRetentionRuntime {
+  configured: boolean;
+  owner?: boolean | null;
+  policy_revision?: number | null;
+  observed_at?: number | null;
+  application?: CliRetentionApplication | null;
+  families: Record<string, CliRetentionFamilyStats>;
+  scheduled?: string[] | null;
+  released?: string[] | null;
+  reset?: string[] | null;
+  unavailable?: string[] | null;
+  lease?: "busy" | null;
+}
+
+export interface HostCliRetentionResponse {
+  contract_version: 1;
+  configured: boolean;
+  revision: number;
+  policy: CliRetentionPolicy;
+  runtime: CliRetentionRuntime | null;
+  application: CliRetentionApplication;
+}
+
+export type CliRetentionRequestFailure =
+  "conflict" | "busy" | "host_offline" | "other_replica" | "unknown";
+
+export class CliRetentionRequestError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+  readonly failure: CliRetentionRequestFailure;
+
+  constructor({ status, code, message }: { status: number; code: string | null; message: string }) {
+    super(message);
+    this.name = "CliRetentionRequestError";
+    this.status = status;
+    this.code = code;
+    const normalized = message.toLowerCase();
+    this.failure =
+      code === "wrong_replica" || normalized.includes("another replica")
+        ? "other_replica"
+        : normalized.includes("host is offline") || normalized.includes("host offline")
+          ? "host_offline"
+          : normalized.includes("currently reconciling")
+            ? "busy"
+            : status === 409
+              ? "conflict"
+              : "unknown";
+  }
+}
+
 export function parseCodexRateLimitsSnapshot(value: unknown): CodexRateLimitsSnapshot | null {
   if (!isRecord(value) || !isSafePositiveInteger(value.captured_at)) return null;
   if (
@@ -195,6 +280,100 @@ export function useHosts(options: UseHostsOptions = {}) {
     staleTime: refetchOnFocus ? 0 : 30_000,
     refetchOnWindowFocus: refetchOnFocus,
     refetchInterval: enabled ? 60_000 : false,
+  });
+}
+
+export const hostCliRetentionQueryKey = (hostId: string | null) =>
+  ["host-cli-retention", hostId] as const;
+
+async function cliRetentionError(res: Response): Promise<CliRetentionRequestError> {
+  let message = `${res.status} ${res.statusText}`.trim();
+  let code: string | null = null;
+  try {
+    const body = (await res.json()) as {
+      detail?: string;
+      error?: { code?: string; message?: string };
+    };
+    if (typeof body.detail === "string" && body.detail) message = body.detail;
+    if (typeof body.error?.message === "string" && body.error.message) {
+      message = body.error.message;
+    }
+    if (typeof body.error?.code === "string" && body.error.code) code = body.error.code;
+  } catch {
+    // Keep the HTTP status line when an intermediary returns a non-JSON body.
+  }
+  return new CliRetentionRequestError({ status: res.status, code, message });
+}
+
+async function fetchHostCliRetention(hostId: string): Promise<HostCliRetentionResponse> {
+  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/cli-retention`);
+  if (!res.ok) throw await cliRetentionError(res);
+  return (await res.json()) as HostCliRetentionResponse;
+}
+
+/** Effective idle-CLI policy plus the latest Runner application snapshot for one Host. */
+export function useHostCliRetention(hostId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: hostCliRetentionQueryKey(hostId),
+    queryFn: () => fetchHostCliRetention(hostId as string),
+    enabled: enabled && hostId !== null,
+    staleTime: 5_000,
+    refetchInterval: enabled && hostId !== null ? 5_000 : false,
+    refetchOnWindowFocus: true,
+    retry: false,
+  });
+}
+
+interface ReplaceHostCliRetentionInput {
+  expected_revision: number;
+  policy: CliRetentionPolicy;
+}
+
+/** CAS-replace one Host's policy and refresh its runtime projection. */
+export function useReplaceHostCliRetention(hostId: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: ReplaceHostCliRetentionInput): Promise<HostCliRetentionResponse> => {
+      if (hostId === null) throw new Error("Select a Host before saving.");
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/cli-retention`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(input),
+        },
+      );
+      if (!res.ok) throw await cliRetentionError(res);
+      return (await res.json()) as HostCliRetentionResponse;
+    },
+    onSuccess: (response) => {
+      queryClient.setQueryData(hostCliRetentionQueryKey(hostId), response);
+      void queryClient.invalidateQueries({ queryKey: hostCliRetentionQueryKey(hostId) });
+    },
+  });
+}
+
+/** CAS-delete one Host's override so its existing layered lifecycle rules resume. */
+export function useResetHostCliRetention(hostId: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (expectedRevision: number): Promise<HostCliRetentionResponse> => {
+      if (hostId === null) throw new Error("Select a Host before restoring legacy rules.");
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/cli-retention`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ expected_revision: expectedRevision }),
+        },
+      );
+      if (!res.ok) throw await cliRetentionError(res);
+      return (await res.json()) as HostCliRetentionResponse;
+    },
+    onSuccess: (response) => {
+      queryClient.setQueryData(hostCliRetentionQueryKey(hostId), response);
+      void queryClient.invalidateQueries({ queryKey: hostCliRetentionQueryKey(hostId) });
+    },
   });
 }
 

@@ -322,7 +322,10 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
 )
-from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.runner_session_init import (
+    RunnerSessionInitializer,
+    runner_archive_states_for_conversation,
+)
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
@@ -669,7 +672,93 @@ async def _best_effort_stop(
 
 # Strong references to detached archive stops so the tasks can't be
 # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
-_detached_stop_tasks: set[asyncio.Task[None]] = set()
+_detached_stop_tasks: set[asyncio.Task[Any]] = set()
+# Root session ids whose archive-triggered teardown has not settled. The gate
+# is separate from ``archived`` because close_on_archive=false intentionally
+# lets an archived session's existing runtime continue.
+_archive_close_intents: set[str] = set()
+
+
+def _archive_close_in_progress(root_session_id: str) -> bool:
+    """Return whether an archive-triggered resource teardown still owns the root."""
+    return root_session_id in _archive_close_intents
+
+
+async def _archive_stop_one(
+    target_id: str,
+    conversation: Any,
+    runner_router: Any,
+    host_registry: Any,
+    *,
+    archive_scope_id: str | None = None,
+    archive_revision: int | None = None,
+    stop_host_runner: bool = True,
+) -> bool:
+    """Release one captured session binding for a durable target intent."""
+    from omnigent.server.routes import sessions as _facade
+
+    released = False
+    try:
+        runner_client = await _get_runner_client(
+            target_id,
+            runner_router,
+            conversation=conversation,
+        )
+        if runner_client is not None:
+            response = await runner_client.post(
+                f"/v1/sessions/{target_id}/cli-retention/release",
+                json={
+                    "reason": "archive",
+                    "archive_scope_id": archive_scope_id or target_id,
+                    **(
+                        {"archive_revision": archive_revision}
+                        if archive_revision is not None
+                        else {}
+                    ),
+                },
+                timeout=10.0,
+            )
+            released = response.status_code < 400 or response.status_code == 404
+        elif conversation.runner_id is None:
+            released = True
+    except Exception:  # noqa: BLE001 - Host stop remains the captured-binding fallback.
+        _logger.debug(
+            "Archive target release failed for %s",
+            target_id,
+            exc_info=True,
+            extra={"session_id": target_id},
+        )
+
+    if (
+        stop_host_runner
+        and conversation.host_id is not None
+        and conversation.runner_id is not None
+    ):
+        _intentional_stop_sessions.add(target_id)
+        try:
+            stopped = await _facade._stop_session_host_runner(
+                target_id,
+                conversation.host_id,
+                conversation.runner_id,
+                host_registry,
+            )
+        except Exception:  # noqa: BLE001 - retry remains durable when release also failed.
+            stopped = False
+            _logger.debug(
+                "Archive target Host runner stop failed for %s",
+                target_id,
+                exc_info=True,
+                extra={"session_id": target_id},
+            )
+        if not stopped:
+            _intentional_stop_sessions.discard(target_id)
+        # The last target on this Host Runner owns its teardown. A successful
+        # per-session release is not enough to complete the durable intent if
+        # the dedicated runner could not be stopped; keep retrying until the
+        # Host acknowledges the stop (or a later worker proves the binding is
+        # gone by another means).
+        return stopped
+    return released
 
 
 async def _archive_stop(
@@ -677,7 +766,7 @@ async def _archive_stop(
     conversation_store: ConversationStore,
     runner_router: Any,
     host_registry: Any,
-) -> None:
+) -> bool:
     """
     Stop an archived session and tear down its host-launched runner.
 
@@ -699,45 +788,138 @@ async def _archive_stop(
         tunnels, or ``None`` when host support is not wired.
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
-    from omnigent.server.native_subagent_watchdog import disarm_native_subagent_watchdogs
     from omnigent.server.routes import sessions as _facade
 
-    disarm_native_subagent_watchdogs(session_id)
+    try:
+        descendant_ids = await _collect_descendant_conversation_ids(
+            conversation_store,
+            session_id,
+        )
+    except Exception:  # noqa: BLE001
+        _logger.debug(
+            "Archive descendant lookup failed for %s; releasing the root only",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        descendant_ids = []
+
+    targets = [session_id, *descendant_ids]
+    # Freeze resource ownership before any stop request can detach or rebind a
+    # session. A quick unarchive may allow a later generation only after this
+    # close intent settles; late cleanup must keep addressing the old runner.
+    target_conversations: dict[str, Any] = {}
+    release_results: dict[str, bool] = {}
+    for target_id in targets:
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, target_id)
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Archive resource binding lookup failed for %s",
+                target_id,
+                exc_info=True,
+                extra={"session_id": target_id},
+            )
+            release_results[target_id] = False
+            continue
+        if conv is not None:
+            target_conversations[target_id] = conv
+            release_results[target_id] = not bool(conv.runner_id)
+        else:
+            # A descendant deleted after enumeration has no remaining runtime
+            # binding to close.
+            release_results[target_id] = True
+
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
-    try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Archive host-runner teardown lookup failed for %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
+    root_archive_revision = getattr(target_conversations.get(session_id), "archive_revision", None)
+    # The legacy stop path only interrupts work. The runner-owned release
+    # endpoint also tears down an idle native pane, SDK harness subprocess,
+    # forwarder/app-server, and session router without touching history.
+    for target_id in targets:
+        try:
+            runner_client = await _get_runner_client(
+                target_id,
+                runner_router,
+                conversation=target_conversations.get(target_id),
+            )
+            if runner_client is None:
+                continue
+            response = await runner_client.post(
+                f"/v1/sessions/{target_id}/cli-retention/release",
+                json={
+                    "reason": "archive",
+                    "archive_scope_id": session_id,
+                    **(
+                        {"archive_revision": root_archive_revision}
+                        if isinstance(root_archive_revision, int)
+                        else {}
+                    ),
+                },
+                timeout=10.0,
+            )
+            if response.status_code >= 400 and response.status_code != 404:
+                release_results[target_id] = False
+                _logger.warning(
+                    "Runner failed to release archived CLI resources for %s (status=%s body=%s)",
+                    target_id,
+                    response.status_code,
+                    response.text,
+                    extra={"session_id": target_id},
+                )
+            else:
+                release_results[target_id] = True
+        except Exception:  # noqa: BLE001 — archive stays committed; Host stop is the fallback
+            release_results[target_id] = False
+            _logger.debug(
+                "Archive runner resource release failed for %s",
+                target_id,
+                exc_info=True,
+                extra={"session_id": target_id},
+            )
+
+    # Terminate every distinct Host-launched runner in the archived tree after
+    # the runner had a chance to clean its session-scoped resources. Descendants
+    # may share the root runner, so de-duplicate by (host, runner).
+    stopped_bindings: set[tuple[str, str]] = set()
+    successfully_stopped_bindings: set[tuple[str, str]] = set()
+    for target_id in targets:
+        conv = target_conversations.get(target_id)
+        if conv is None or not conv.host_id or not conv.runner_id:
+            continue
+        binding = (conv.host_id, conv.runner_id)
+        if binding in stopped_bindings:
+            continue
+        stopped_bindings.add(binding)
+        _intentional_stop_sessions.add(target_id)
+        try:
+            delivered = await _facade._stop_session_host_runner(
+                target_id,
+                conv.host_id,
+                conv.runner_id,
+                host_registry,
+            )
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Archive host-runner teardown failed for %s",
+                target_id,
+                exc_info=True,
+                extra={"session_id": target_id},
+            )
+            delivered = False
+        if not delivered:
+            _intentional_stop_sessions.discard(target_id)
+        else:
+            successfully_stopped_bindings.add(binding)
+
+    for target_id, conv in target_conversations.items():
+        binding = (
+            (conv.host_id, conv.runner_id)
+            if conv.host_id is not None and conv.runner_id is not None
+            else None
         )
-        return
-    if conv is None or not conv.host_id or not conv.runner_id:
-        return
-    # Mark the tunnel drop intentional BEFORE tearing it down so the relay
-    # renders a quiet stopped state rather than "runner_disconnected".
-    _intentional_stop_sessions.add(session_id)
-    try:
-        delivered = await _facade._stop_session_host_runner(
-            session_id,
-            conv.host_id,
-            conv.runner_id,
-            host_registry,
-        )
-    except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Archive host-runner teardown failed for %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        delivered = False
-    if not delivered:
-        # No tunnel drop will follow, so the marker would outlive this stop
-        # and later swallow a genuine runner_disconnected as a quiet idle.
-        _intentional_stop_sessions.discard(session_id)
+        if binding is not None and binding in successfully_stopped_bindings:
+            release_results[target_id] = True
+    return all(release_results.get(target_id, False) for target_id in targets)
 
 
 def _spawn_archive_stop(
@@ -745,6 +927,7 @@ def _spawn_archive_stop(
     conversation_store: ConversationStore,
     runner_router: Any,
     host_registry: Any = None,
+    archive_close_coordinator: Any = None,
 ) -> None:
     """
     Run :func:`_archive_stop` as a retained background task.
@@ -762,8 +945,79 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     """
+    if archive_close_coordinator is not None:
+        archive_close_coordinator.trigger(session_id)
+        return
+
+    _archive_close_intents.add(session_id)
     task = asyncio.create_task(
         _archive_stop(session_id, conversation_store, runner_router, host_registry)
+    )
+    _detached_stop_tasks.add(task)
+
+    def _finish(done: asyncio.Task[Any]) -> None:
+        _detached_stop_tasks.discard(done)
+        _archive_close_intents.discard(session_id)
+
+    task.add_done_callback(_finish)
+
+
+async def _unfence_unarchived_tree(
+    session_id: str,
+    revision: int,
+    conversation_store: ConversationStore,
+    runner_router: Any,
+) -> None:
+    """Tell every currently reachable target that a newer unarchive won."""
+    try:
+        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+    except Exception:  # noqa: BLE001 - a later user event carries the same revision.
+        descendant_ids = []
+    for target_id in [session_id, *descendant_ids]:
+        try:
+            conversation = await asyncio.to_thread(conversation_store.get_conversation, target_id)
+            if conversation is None or conversation.runner_id is None:
+                continue
+            runner_client = await _get_runner_client(
+                target_id,
+                runner_router,
+                conversation=conversation,
+            )
+            if runner_client is None:
+                continue
+            await runner_client.post(
+                f"/v1/sessions/{target_id}/cli-retention/archive-state",
+                json={
+                    "archive_scope_id": session_id,
+                    "archive_revision": revision,
+                    "archived": False,
+                },
+                timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001 - first later event repeats the versioned clear.
+            _logger.debug(
+                "Could not clear archive runtime fence for %s",
+                target_id,
+                exc_info=True,
+                extra={"session_id": target_id},
+            )
+
+
+def _spawn_archive_unfence(
+    session_id: str,
+    revision: int,
+    conversation_store: ConversationStore,
+    runner_router: Any,
+) -> None:
+    """Clear Runner archive fences without delaying the unarchive response."""
+    task = asyncio.create_task(
+        _unfence_unarchived_tree(
+            session_id,
+            revision,
+            conversation_store,
+            runner_router,
+        ),
+        name=f"archive-cli-unfence:{session_id}",
     )
     _detached_stop_tasks.add(task)
     task.add_done_callback(_detached_stop_tasks.discard)
@@ -4113,6 +4367,10 @@ async def _ensure_runner_session_initialized(
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
+    archive_states = await runner_archive_states_for_conversation(
+        conv,
+        conversation_store,
+    )
     try:
         if initializer is not None:
             resp = await initializer.initialize(
@@ -4120,6 +4378,7 @@ async def _ensure_runner_session_initialized(
                 runner_client,
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                 suppress_recovery_turn=suppress_recovery_turn,
+                archive_states=archive_states,
             )
         else:
             from omnigent.version import VERSION
@@ -4130,6 +4389,7 @@ async def _ensure_runner_session_initialized(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
+                    archive_states=archive_states,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
@@ -5244,6 +5504,14 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    if runner_body["type"] == "message" and runner_body.get("role") == "user":
+        archive_states = await runner_archive_states_for_conversation(
+            conv,
+            conversation_store,
+        )
+        runner_body["_archive_states"] = [
+            state.model_dump(mode="json") for state in archive_states
+        ]
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they

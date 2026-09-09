@@ -12,6 +12,7 @@ import {
   BotIcon,
   ArrowLeftIcon,
   BlocksIcon,
+  CpuIcon,
   DownloadIcon,
   GaugeIcon,
   GitBranchIcon,
@@ -41,6 +42,7 @@ export type SettingsSectionId =
   | "integrations"
   | "shortcuts"
   | "context-usage"
+  | "runtime-resources"
   | "import"
   | "account"
   | "members"
@@ -58,6 +60,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "integrations",
   "shortcuts",
   "context-usage",
+  "runtime-resources",
   "import",
   "account",
   "members",
@@ -104,6 +107,7 @@ export function settingsNavGroups(
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },
     { id: "context-usage", label: "Context & usage", icon: GaugeIcon },
+    { id: "runtime-resources", label: "Runtime & resources", icon: CpuIcon },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
   // Sandbox Integrations appears once any connection provider is wired

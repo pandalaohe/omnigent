@@ -110,6 +110,7 @@ import {
 import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutEditor } from "@/components/KeyboardShortcutEditor";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
+import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
 import {
   MobileSessionTitleSetting,
@@ -329,6 +330,7 @@ export function SettingsPage() {
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "context-usage" && <ContextUsageSection />}
+      {section === "runtime-resources" && <RuntimeResourcesSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
@@ -1895,6 +1897,17 @@ function ContextUsageSection() {
         <CompactProgressIndicatorControl />
         <ContextUsageSettings />
       </div>
+    </Section>
+  );
+}
+
+function RuntimeResourcesSection() {
+  return (
+    <Section
+      title="Runtime & resources"
+      description="Control Host-scoped runtime lifetimes and inspect their current state."
+    >
+      <CliRetentionSettings />
     </Section>
   );
 }

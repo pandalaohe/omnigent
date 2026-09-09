@@ -13,6 +13,26 @@ SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 2
 SESSION_INIT_PAYLOAD_KEY = "session_init"
 
 
+class RunnerArchiveState(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
+    """One archive operation's revision in its own stable root namespace."""
+
+    scope_id: str
+    revision: int = Field(ge=0)
+    archived: bool
+
+
+def runner_archive_state(conversation: Conversation) -> RunnerArchiveState:
+    """Project one conversation's own archive-operation revision."""
+    revision = conversation.archive_revision
+    return RunnerArchiveState(
+        scope_id=conversation.id,
+        revision=revision,
+        archived=(
+            conversation.archived and conversation.archive_close_requested_revision == revision
+        ),
+    )
+
+
 class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
     """Server-owned session state needed while starting a runner session."""
 
@@ -30,6 +50,10 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     external_session_id: str | None = None
     parent_session_id: str | None = None
     root_session_id: str | None = None
+    archived: bool = False
+    archive_revision: int = 0
+    archive_fenced: bool = False
+    archive_states: list[RunnerArchiveState] = Field(default_factory=list)
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -56,10 +80,15 @@ def build_runner_session_init_payload(
     *,
     server_version: str,
     suppress_recovery_turn: bool = False,
+    archive_states: list[RunnerArchiveState] | None = None,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     if conversation.agent_id is None:
         raise ValueError("runner session initialization requires an agent_id")
+    own_archive_state = runner_archive_state(conversation)
+    effective_archive_states = (
+        archive_states if archive_states is not None else [own_archive_state]
+    )
     envelope = RunnerSessionInitEnvelope(
         protocol_version=SESSION_INIT_PROTOCOL_VERSION,
         server_version=server_version,
@@ -80,6 +109,10 @@ def build_runner_session_init_payload(
             external_session_id=conversation.external_session_id,
             parent_session_id=conversation.parent_conversation_id,
             root_session_id=conversation.root_conversation_id,
+            archived=conversation.archived,
+            archive_revision=conversation.archive_revision,
+            archive_fenced=own_archive_state.archived,
+            archive_states=effective_archive_states,
         ),
     )
     return {

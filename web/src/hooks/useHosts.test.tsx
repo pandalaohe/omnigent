@@ -1,5 +1,5 @@
 import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -11,6 +11,10 @@ import {
   useInstallHarness,
   useInstallingHarnesses,
   useStoreCredential,
+  CliRetentionRequestError,
+  useHostCliRetention,
+  useReplaceHostCliRetention,
+  useResetHostCliRetention,
 } from "./useHosts";
 
 const fetchMock = vi.fn();
@@ -370,6 +374,99 @@ describe("useCodexRateLimits", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     expect(result.current.data).toBeNull();
+  });
+});
+
+describe("Host CLI retention hooks", () => {
+  const response = {
+    contract_version: 1 as const,
+    configured: true,
+    revision: 3,
+    policy: {
+      version: 1 as const,
+      idle_threshold_minutes: 60,
+      max_idle_clis: 10,
+      close_on_archive: true,
+    },
+    runtime: {
+      configured: true,
+      families: {
+        claude: { idle: 2, active: 1, below_threshold: 3, total: 6 },
+      },
+    },
+    application: {
+      status: "applied" as const,
+      policy_revision: 3,
+      observed_at: 1_900_000_000,
+    },
+  };
+
+  it("loads the structured runtime projection for an encoded Host id", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(response));
+
+    const { result } = renderHook(() => useHostCliRetention("host/a"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/hosts/host%2Fa/cli-retention");
+    expect(result.current.data?.runtime?.families.claude).toEqual({
+      idle: 2,
+      active: 1,
+      below_threshold: 3,
+      total: 6,
+    });
+  });
+
+  it("sends CAS replace and reset requests with the current revision", async () => {
+    fetchMock.mockResolvedValue(mockResponse(response));
+    const { result } = renderHook(
+      () => ({
+        replace: useReplaceHostCliRetention("host/a"),
+        reset: useResetHostCliRetention("host/a"),
+      }),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.replace.mutateAsync({
+        expected_revision: 2,
+        policy: response.policy,
+      });
+      await result.current.reset.mutateAsync(3);
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/v1/hosts/host%2Fa/cli-retention",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ expected_revision: 2, policy: response.policy }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/v1/hosts/host%2Fa/cli-retention",
+      expect.objectContaining({
+        method: "DELETE",
+        body: JSON.stringify({ expected_revision: 3 }),
+      }),
+    );
+  });
+
+  it("distinguishes a reconciliation retry from a stale-revision conflict", () => {
+    expect(
+      new CliRetentionRequestError({
+        status: 409,
+        code: null,
+        message: "CLI retention is currently reconciling; retry",
+      }).failure,
+    ).toBe("busy");
+    expect(
+      new CliRetentionRequestError({
+        status: 409,
+        code: null,
+        message: "CLI retention policy changed",
+      }).failure,
+    ).toBe("conflict");
   });
 });
 

@@ -1607,3 +1607,350 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     # The callback got the exact runner id and error string off the frame.
     assert received == [("runner_x", "exited with code 1")]
+
+
+async def test_host_cli_retention_policy_defaults_and_cas_update(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A Host policy is opt-in, versioned, and replaced with compare-and-swap."""
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        initial = await client.get(f"/v1/hosts/{_HOST_ID}/cli-retention")
+        updated = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={
+                "expected_revision": 0,
+                "policy": {
+                    "version": 1,
+                    "idle_threshold_minutes": 60,
+                    "max_idle_clis": 10,
+                    "close_on_archive": False,
+                },
+            },
+        )
+        stale = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={
+                "expected_revision": 0,
+                "policy": {
+                    "version": 1,
+                    "idle_threshold_minutes": 30,
+                    "max_idle_clis": 5,
+                    "close_on_archive": True,
+                },
+            },
+        )
+        reread = await client.get(f"/v1/hosts/{_HOST_ID}/cli-retention")
+
+    assert initial.status_code == 200
+    assert initial.json() == {
+        "contract_version": 1,
+        "configured": False,
+        "revision": 0,
+        "policy": {
+            "version": 1,
+            "idle_threshold_minutes": 60,
+            "max_idle_clis": None,
+            "close_on_archive": True,
+        },
+        "runtime": None,
+        "application": {
+            "status": "legacy",
+            "policy_revision": 0,
+            "observed_at": None,
+        },
+    }
+    assert updated.status_code == 200
+    assert updated.json() == {
+        "contract_version": 1,
+        "configured": True,
+        "revision": 1,
+        "policy": {
+            "version": 1,
+            "idle_threshold_minutes": 60,
+            "max_idle_clis": 10,
+            "close_on_archive": False,
+        },
+        "runtime": None,
+        "application": {
+            "status": "pending",
+            "policy_revision": 1,
+            "observed_at": None,
+        },
+    }
+    assert stale.status_code == 409
+    assert reread.json() == updated.json()
+
+
+async def test_host_cli_retention_policy_can_be_reset_with_cas(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        configured = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={
+                "expected_revision": 0,
+                "policy": {
+                    "version": 1,
+                    "idle_threshold_minutes": 60,
+                    "max_idle_clis": 10,
+                    "close_on_archive": True,
+                },
+            },
+        )
+        reset = await client.request(
+            "DELETE",
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={"expected_revision": 1},
+        )
+        stale = await client.request(
+            "DELETE",
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={"expected_revision": 1},
+        )
+
+    assert configured.status_code == 200
+    assert reset.status_code == 200
+    assert reset.json()["configured"] is False
+    assert reset.json()["revision"] == 2
+    assert reset.json()["application"]["status"] == "pending"
+    assert stale.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("reset_sessions", "unavailable_sessions", "expected_status"),
+    [
+        (["session-reset"], ["session-unavailable"], "partial"),
+        ([], ["session-unavailable"], "pending"),
+        (["session-reset"], [], "legacy"),
+    ],
+)
+async def test_host_cli_retention_reset_reports_runtime_transition_status(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    reset_sessions: list[str],
+    unavailable_sessions: list[str],
+    expected_status: str,
+) -> None:
+    app, registry, host_store, conv_store = host_api_app
+    _comm = await _connect_host(app, registry)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        configured = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={
+                "expected_revision": 0,
+                "policy": {
+                    "version": 1,
+                    "idle_threshold_minutes": 60,
+                    "max_idle_clis": 10,
+                    "close_on_archive": True,
+                },
+            },
+        )
+    assert configured.status_code == 200
+
+    class _Coordinator:
+        result: dict[str, object] | None = None
+
+        class _Lease:
+            token = "test-lease"
+
+            async def ensure_owned(self):
+                return None
+
+        @contextlib.asynccontextmanager
+        async def lease_for_host(self, host_id):
+            assert host_id == _HOST_ID
+            assert host_store.claim_cli_retention(
+                host_id,
+                self._Lease.token,
+                claimed_at=100,
+                stale_before=0,
+            )
+            try:
+                yield self._Lease()
+            finally:
+                host_store.release_cli_retention(host_id, self._Lease.token)
+
+        async def reset_host_under_lease(self, host_id, *, policy_revision, lease):
+            assert host_id == _HOST_ID
+            assert lease.token == "test-lease"
+            self.result = {
+                "configured": False,
+                "policy_revision": policy_revision,
+                "observed_at": 1_900_000_000,
+                "reset": reset_sessions,
+                "unavailable": unavailable_sessions,
+            }
+            return self.result
+
+        def last_result(self, host_id):
+            assert host_id == _HOST_ID
+            return self.result
+
+    coordinator = _Coordinator()
+    reset_app = FastAPI()
+    reset_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            cli_retention_coordinator=coordinator,
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=reset_app), base_url="http://test"
+    ) as client:
+        reset = await client.request(
+            "DELETE",
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={"expected_revision": 1},
+        )
+
+    assert reset.status_code == 200
+    assert reset.json()["configured"] is False
+    assert reset.json()["revision"] == 2
+    assert reset.json()["application"] == {
+        "status": expected_status,
+        "policy_revision": 2,
+        "observed_at": 1_900_000_000,
+    }
+    assert reset.json()["runtime"]["reset"] == reset_sessions
+    assert reset.json()["runtime"]["unavailable"] == unavailable_sessions
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"version": 1, "idle_threshold_minutes": 0, "max_idle_clis": 10, "close_on_archive": True},
+        {
+            "version": 1,
+            "idle_threshold_minutes": 10081,
+            "max_idle_clis": 10,
+            "close_on_archive": True,
+        },
+        {
+            "version": 1,
+            "idle_threshold_minutes": 60,
+            "max_idle_clis": 101,
+            "close_on_archive": True,
+        },
+        {
+            "version": 1,
+            "idle_threshold_minutes": 60,
+            "max_idle_clis": -1,
+            "close_on_archive": True,
+        },
+    ],
+)
+async def test_host_cli_retention_policy_rejects_out_of_range_values(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    policy: dict[str, object],
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={"expected_revision": 0, "policy": policy},
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("missing_field", ["version", "max_idle_clis"])
+async def test_host_cli_retention_policy_requires_complete_replacement_fields(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    missing_field: str,
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+    policy: dict[str, object] = {
+        "version": 1,
+        "idle_threshold_minutes": 60,
+        "max_idle_clis": None,
+        "close_on_archive": True,
+    }
+    policy.pop(missing_field)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={"expected_revision": 0, "policy": policy},
+        )
+
+    assert response.status_code == 422
+
+
+async def test_live_host_cli_retention_write_routes_to_tunnel_owner(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
+) -> None:
+    """A live Host policy mutation must execute on its tunnel-owning replica."""
+    owner_app, owner_registry, _owner_store, _owner_conversations = host_api_app
+    _comm = await _connect_host(owner_app, owner_registry)
+
+    other_app, other_registry, _other_store, _other_conversations = _build_host_api_app(db_uri)
+    assert other_registry.get(_HOST_ID) is None
+    async with AsyncClient(
+        transport=ASGITransport(app=other_app), base_url="http://test"
+    ) as client:
+        response = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={
+                "expected_revision": 0,
+                "policy": {
+                    "version": 1,
+                    "idle_threshold_minutes": 60,
+                    "max_idle_clis": 10,
+                    "close_on_archive": True,
+                },
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
+
+async def test_live_host_cli_retention_read_reports_other_replica(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
+) -> None:
+    """A policy read remains available on a replica without the Host tunnel."""
+    owner_app, owner_registry, _owner_store, _owner_conversations = host_api_app
+    _comm = await _connect_host(owner_app, owner_registry)
+    async with AsyncClient(
+        transport=ASGITransport(app=owner_app), base_url="http://test"
+    ) as client:
+        configured = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={
+                "expected_revision": 0,
+                "policy": {
+                    "version": 1,
+                    "idle_threshold_minutes": 60,
+                    "max_idle_clis": 10,
+                    "close_on_archive": True,
+                },
+            },
+        )
+    assert configured.status_code == 200
+
+    other_app, other_registry, _other_store, _other_conversations = _build_host_api_app(db_uri)
+    assert other_registry.get(_HOST_ID) is None
+    async with AsyncClient(
+        transport=ASGITransport(app=other_app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/cli-retention")
+
+    assert response.status_code == 200
+    assert response.json()["application"] == {
+        "status": "other_replica",
+        "policy_revision": 1,
+        "observed_at": None,
+    }

@@ -6797,6 +6797,15 @@ async def _dispatch_skill_slash_command_to_runner(
         # right persisted copy (see _forward_event_to_runner).
         "persisted_item_id": persisted_items[1].id,
     }
+    from omnigent.server.runner_session_init import (
+        runner_archive_states_for_conversation,
+    )
+
+    archive_states = await runner_archive_states_for_conversation(
+        conv,
+        conversation_store,
+    )
+    runner_body["_archive_states"] = [state.model_dump(mode="json") for state in archive_states]
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )

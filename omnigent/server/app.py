@@ -107,7 +107,10 @@ from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.routes.user_settings import create_user_settings_router
-from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.runner_session_init import (
+    RunnerSessionInitializer,
+    runner_archive_states_for_conversation,
+)
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.schemas import (
     CurrentUserResponse,
@@ -1328,6 +1331,32 @@ def create_app(
         host_registry=host_registry,
         host_store=host_store,
     )
+    from omnigent.server.archive_close import ArchiveCloseCoordinator
+    from omnigent.server.cli_release_store import CliReleaseIntentStore
+
+    cli_release_intent_store = CliReleaseIntentStore(
+        conversation_store.conversation_storage_location or conversation_store.storage_location
+    )
+    archive_close_coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversation_store,
+        host_store=host_store,
+        host_registry=host_registry,
+        runner_router=runner_router,
+        intent_store=cli_release_intent_store,
+    )
+    cli_retention_coordinator = None
+    if host_store is not None:
+        from omnigent.server.cli_retention import CliRetentionCoordinator
+
+        cli_retention_coordinator = CliRetentionCoordinator(
+            host_store=host_store,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            intent_store=cli_release_intent_store,
+            release_coordinator=archive_close_coordinator,
+            host_registry=host_registry,
+        )
+        archive_close_coordinator.set_host_lock_provider(cli_retention_coordinator.lease_for_host)
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
@@ -1405,6 +1434,7 @@ def create_app(
         set_harness_process_manager(harness_pm)
 
         set_runner_router(runner_router)
+        await archive_close_coordinator.start()
 
         # Wake a blocked sub-agent's immediate parent: hooks
         # ``pending_elicitations.record_publish`` to post a ``[System: …]``
@@ -1581,6 +1611,9 @@ def create_app(
 
             await cancel_managed_launch_tasks()
             await background_title_coordinator.shutdown()
+            if cli_retention_coordinator is not None:
+                await cli_retention_coordinator.shutdown()
+            await archive_close_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
@@ -1605,6 +1638,9 @@ def create_app(
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
+    app.state.cli_retention_coordinator = cli_retention_coordinator
+    app.state.archive_close_coordinator = archive_close_coordinator
+    app.state.cli_release_intent_store = cli_release_intent_store
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
@@ -3274,10 +3310,15 @@ def create_app(
                 )
             else:
                 try:
+                    archive_states = await runner_archive_states_for_conversation(
+                        conv,
+                        conversation_store,
+                    )
                     await runner_session_initializer.initialize(
                         conv,
                         routed.client,
                         timeout=10.0,
+                        archive_states=archive_states,
                     )
                 except Exception:
                     _logger.exception(
@@ -3325,6 +3366,16 @@ def create_app(
             cached_sandbox = _session_sandbox_status_cache.get(conv.id)
             if cached_sandbox is not None and cached_sandbox.stage == "failed":
                 _publish_sandbox_status(conv.id, "ready")
+        archive_close_coordinator.trigger_pending(runner_id=runner_id)
+        if cli_retention_coordinator is not None and host_store is not None:
+            for host_id in {conv.host_id for conv in convs if conv.host_id is not None}:
+                host = await asyncio.to_thread(host_store.get_host, host_id)
+                if host is not None and host.cli_retention_policy is None:
+                    await cli_retention_coordinator.reset_host(
+                        host_id, policy_revision=host.cli_retention_revision
+                    )
+                else:
+                    cli_retention_coordinator.trigger(host_id)
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -3371,6 +3422,9 @@ def create_app(
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
+            if cli_retention_coordinator is not None:
+                cli_retention_coordinator.trigger(_host_id)
+            archive_close_coordinator.trigger_pending(host_id=_host_id)
 
         app.include_router(
             create_host_tunnel_router(
@@ -3396,6 +3450,7 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
+                cli_retention_coordinator=cli_retention_coordinator,
             ),
             prefix="/v1",
             tags=["hosts"],

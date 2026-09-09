@@ -781,11 +781,10 @@ async def test_close_removes_instance_lock(tmp_path: Path) -> None:
     instance.close.assert_awaited_once()
 
 
-async def test_close_with_timeout_still_returns_true(tmp_path: Path) -> None:
+async def test_close_timeout_keeps_exact_instance_retryable(tmp_path: Path) -> None:
     """
-    If ``instance.close()`` times out, ``close`` still returns ``True``
-    (the instance was found and removal from the registry succeeded).
-    The timeout is logged but does not propagate.
+    If ``instance.close()`` times out, ``close`` returns ``False`` and
+    restores the exact instance and lock so durable cleanup can retry it.
     """
     reg = TerminalRegistry()
     instance = TerminalInstance(
@@ -801,7 +800,8 @@ async def test_close_with_timeout_still_returns_true(tmp_path: Path) -> None:
 
     instance.close = _hang_forever  # type: ignore[method-assign]
     reg._by_conversation["conv_a"] = {("bash", "s1"): instance}
-    reg._instance_locks[("conv_a", "bash", "s1")] = threading.Lock()
+    lock = threading.Lock()
+    reg._instance_locks[("conv_a", "bash", "s1")] = lock
 
     # The close should not hang — it uses asyncio.wait_for with _CLOSE_TIMEOUT_S.
     # We patch _CLOSE_TIMEOUT_S to a tiny value so the test finishes quickly.
@@ -814,8 +814,9 @@ async def test_close_with_timeout_still_returns_true(tmp_path: Path) -> None:
     finally:
         reg_mod._CLOSE_TIMEOUT_S = original
 
-    assert result is True
-    assert reg.get("conv_a", "bash", "s1") is None
+    assert result is False
+    assert reg.get("conv_a", "bash", "s1") is instance
+    assert reg.get_instance_lock("conv_a", "bash", "s1") is lock
 
 
 async def test_cleanup_conversation_tolerates_close_exception(tmp_path: Path) -> None:

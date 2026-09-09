@@ -89,9 +89,11 @@ PROJECT_LABEL_KEY = "omni_project"
 ARCHIVE_LOCK_LABEL_KEY = "omnigent.archive_locked"
 DELETION_CLAIM_STALE_AFTER_S = 15 * 60
 DELETION_CLAIM_HEARTBEAT_INTERVAL_S = 60
+ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S = 15 * 60
 
 DeletionClaimResult = Literal["claimed", "locked", "busy", "not_found"]
 ArchiveLockWriteResult = Literal["updated", "busy", "not_found"]
+ArchiveCloseClaimResult = Literal["claimed", "stale", "busy", "not_found"]
 NativeSubagentReconcileWriteResult = Literal["corrected", "stale", "unsupported"]
 
 
@@ -330,6 +332,10 @@ class ConversationNotFoundError(Exception):
 
 class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
+
+
+class ConversationArchiveClosingError(Exception):
+    """Raised when a child create loses to its root archive-close transition."""
 
 
 class NameAlreadyExistsError(Exception):
@@ -905,6 +911,7 @@ class ConversationStore(ABC):
         share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        close_cli_on_archive: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """
@@ -961,6 +968,8 @@ class ConversationStore(ABC):
         :param archived: New archived state. ``True`` archives
             (hides from the default listing), ``False`` unarchives,
             ``None`` leaves unchanged.
+        :param close_cli_on_archive: Atomically create a durable teardown
+            request when this call transitions ``archived`` to ``True``.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
@@ -980,6 +989,67 @@ class ConversationStore(ABC):
             or any session override changed concurrently. Other settings and
             metadata remain unchanged.
         """
+        ...
+
+    @abstractmethod
+    def list_pending_archive_closes(self, *, limit: int = 200) -> list[Conversation]:
+        """List archived roots whose durable CLI teardown is incomplete."""
+        ...
+
+    @abstractmethod
+    def pending_archive_close_workspaces(self) -> set[int]:
+        """Return workspace ids containing incomplete archive close requests."""
+        ...
+
+    @abstractmethod
+    def claim_archive_close(
+        self,
+        conversation_id: str,
+        revision: int,
+        token: str,
+        *,
+        claimed_at: int,
+        stale_before: int,
+    ) -> ArchiveCloseClaimResult:
+        """Lease one still-current archive teardown request across replicas."""
+        ...
+
+    @abstractmethod
+    def complete_archive_close(
+        self,
+        conversation_id: str,
+        revision: int,
+        token: str,
+    ) -> bool:
+        """Complete only the claimed, still-current archive revision."""
+        ...
+
+    @abstractmethod
+    def renew_archive_close_claim(
+        self,
+        conversation_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+    ) -> bool:
+        """Refresh one archive-close lease while the opaque token still owns it."""
+        ...
+
+    @abstractmethod
+    def release_archive_close_claim(
+        self,
+        conversation_id: str,
+        revision: int,
+        token: str,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        """Release a retryable claim and retain a bounded diagnostic."""
+        ...
+
+    @abstractmethod
+    def finalize_archive_close(self, conversation_id: str, revision: int) -> bool:
+        """Mark a current root request complete after every target completed."""
         ...
 
     @abstractmethod

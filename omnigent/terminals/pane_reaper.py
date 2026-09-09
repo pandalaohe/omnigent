@@ -37,8 +37,9 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -80,7 +81,8 @@ _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 
 
-class PaneRef(NamedTuple):
+@dataclass(frozen=True)
+class PaneRef:
     """A live native CLI pane the reaper may reclaim.
 
     :param conversation_id: AP-allocated conversation id, e.g. ``"conv_abc123"``.
@@ -94,6 +96,7 @@ class PaneRef(NamedTuple):
     terminal_id: str
     terminal_name: str
     socket_path: Path
+    instance: Any | None = None
 
 
 def resolve_native_pane_idle_timeout_s() -> float:
@@ -162,8 +165,127 @@ class NativePaneReaper:
         self._reaper_interval_s = reaper_interval_s
         # conversation_id -> monotonic time it was last observed busy.
         self._last_busy_at: dict[str, float] = {}
+        # Server-managed sessions use the configurable pool policy. Their
+        # panes are still observed here, but the legacy per-pane TTL may not
+        # close them independently.
+        self._managed_conversations: set[str] = set()
         self._task: asyncio.Task[None] | None = None
         self._started = False
+
+    def manage(self, conversation_id: str) -> None:
+        """Hand one conversation's automatic close decision to the Server pool."""
+        self._managed_conversations.add(conversation_id)
+
+    def unmanage(self, conversation_id: str) -> None:
+        """Return a conversation to the legacy timeout policy."""
+        self._managed_conversations.discard(conversation_id)
+
+    def note_activity(self, conversation_id: str) -> None:
+        """Re-arm the idle clock when Runner lifecycle evidence observes work."""
+        self._last_busy_at[conversation_id] = time.monotonic()
+
+    def has_managed_panes(self) -> bool:
+        """Return whether a retained pane should keep its Runner alive."""
+        live = {pane.conversation_id for pane in self._list_native_panes()}
+        self._managed_conversations.intersection_update(live)
+        return bool(self._managed_conversations)
+
+    def _pane_for_conversation(self, conversation_id: str) -> PaneRef | None:
+        return next(
+            (
+                pane
+                for pane in self._list_native_panes()
+                if pane.conversation_id == conversation_id
+            ),
+            None,
+        )
+
+    async def retention_snapshot(
+        self,
+        conversation_id: str,
+        *,
+        idle_threshold_s: float,
+    ) -> dict[str, str | float | bool] | None:
+        """Describe one managed pane using the same busy evidence as teardown."""
+        pane = self._pane_for_conversation(conversation_id)
+        if pane is None:
+            self._managed_conversations.discard(conversation_id)
+            return None
+        now = time.monotonic()
+        busy = await self._is_busy(pane)
+        if busy:
+            self._last_busy_at[conversation_id] = now
+        last_busy = self._last_busy_at.setdefault(conversation_id, now)
+        idle_seconds = 0.0 if busy else max(0.0, now - last_busy)
+        return {
+            "family": pane.terminal_name,
+            "busy": busy,
+            "eligible": not busy and idle_seconds >= idle_threshold_s,
+            "idle_seconds": idle_seconds,
+            "activity_token": f"{last_busy:.9f}",
+        }
+
+    async def release_if_idle(
+        self,
+        conversation_id: str,
+        *,
+        idle_threshold_s: float,
+        expected_activity_token: str,
+    ) -> str:
+        """Release one still-eligible pane selected from a prior snapshot."""
+        pane = self._pane_for_conversation(conversation_id)
+        if pane is None:
+            return "absent"
+        now = time.monotonic()
+        if await self._is_busy(pane):
+            self._last_busy_at[conversation_id] = now
+            return "busy"
+        last_busy = self._last_busy_at.setdefault(conversation_id, now)
+        if expected_activity_token != f"{last_busy:.9f}":
+            return "stale"
+        if now - last_busy < idle_threshold_s:
+            return "not_eligible"
+        # Close the selection→reap race using the same final busy probe as the
+        # legacy scanner. A new turn/output/client re-arms the clock.
+        if await self._is_busy(pane):
+            self._last_busy_at[conversation_id] = time.monotonic()
+            return "busy"
+        was_managed = conversation_id in self._managed_conversations
+        self._managed_conversations.discard(conversation_id)
+        try:
+            await self._reap(pane)
+        except Exception:
+            if was_managed:
+                self._managed_conversations.add(conversation_id)
+            _logger.exception(
+                "native pane retention release failed for conversation %s",
+                conversation_id,
+            )
+            return "failed"
+        self._last_busy_at.pop(conversation_id, None)
+        return "released"
+
+    async def release_now(self, conversation_id: str) -> str:
+        """Unconditionally close one pane for an explicit lifecycle action."""
+        pane = self._pane_for_conversation(conversation_id)
+        if pane is None:
+            self._managed_conversations.discard(conversation_id)
+            self._last_busy_at.pop(conversation_id, None)
+            return "absent"
+        was_managed = conversation_id in self._managed_conversations
+        self._managed_conversations.discard(conversation_id)
+        try:
+            await self._reap(pane)
+        except Exception:
+            if was_managed:
+                self._managed_conversations.add(conversation_id)
+            _logger.exception(
+                "native pane explicit release failed for conversation %s",
+                conversation_id,
+            )
+            return "failed"
+        self._last_busy_at.pop(conversation_id, None)
+        return "released"
 
     async def start(self) -> None:
         """Spawn the reaper loop (idempotent)."""
@@ -234,11 +356,15 @@ class NativePaneReaper:
         now = time.monotonic()
         busy_convs = {p.conversation_id for p in panes if await self._is_busy(p)}
         for pane in self._classify(now, panes, busy_convs):
+            if pane.conversation_id in self._managed_conversations:
+                continue
             # Re-check immediately before teardown: selection happened above with
             # possibly-stale signals, and a turn / client / autonomous run may
             # have started since (the select→reap race). Re-arm and skip if so.
             if await self._is_busy(pane):
                 self._last_busy_at[pane.conversation_id] = time.monotonic()
+                continue
+            if pane.conversation_id in self._managed_conversations:
                 continue
             _logger.info(
                 "reaping idle native pane for conversation %s (%s; idle > %.0fs)",

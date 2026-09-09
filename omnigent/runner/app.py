@@ -155,6 +155,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
+from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLifecycle
 from omnigent.runner.subagent_routing import (
     PLAIN_SESSION,
     SessionRoutingClass,
@@ -2905,6 +2906,41 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
+    # One per-session lifecycle boundary shared by runtime creation and CLI
+    # retention teardown.
+    _cli_runtime_lifecycle = SessionRuntimeLifecycle()
+
+    def _cli_runtime_lock(session_id: str) -> asyncio.Lock:
+        return _cli_runtime_lifecycle.lock_for(session_id)
+
+    app.state.cli_runtime_lifecycle = _cli_runtime_lifecycle
+
+    def _apply_archive_states(session_id: str, raw_states: object) -> None:
+        """Apply well-formed Server archive scopes and ignore malformed hints."""
+        if not isinstance(raw_states, list):
+            return
+        for raw_state in raw_states:
+            if not isinstance(raw_state, dict):
+                continue
+            scope_id = raw_state.get("scope_id")
+            revision = raw_state.get("revision")
+            archived = raw_state.get("archived")
+            if (
+                not isinstance(scope_id, str)
+                or not scope_id
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 0
+                or not isinstance(archived, bool)
+            ):
+                continue
+            _cli_runtime_lifecycle.observe_archive_state(
+                session_id,
+                scope_id=scope_id,
+                revision=revision,
+                archived=archived,
+            )
+
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
     # Detached watchers answering a /model confirm dialog that pops after
@@ -2947,8 +2983,35 @@ def create_runner_app(
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
+    _session_background_task_counts: dict[str, int] = {}
+
+    def _session_has_cli_retention_protection(session_id: str) -> bool:
+        if session_id in _active_turns:
+            return True
+        if process_manager is not None and process_manager.has_active_turn(session_id):
+            return True
+        if pending_approvals.has_pending(session_id):
+            return True
+        if any(
+            not task.done() for task, _cancel in _session_async_tasks.get(session_id, {}).values()
+        ):
+            return True
+        if any(not task.done() for task in _session_timers.get(session_id, {}).values()):
+            return True
+        if _session_background_task_counts.get(session_id, 0) > 0:
+            return True
+        return any(
+            entry.status in {"launching", "running", "waiting"}
+            or (entry.status in _SUBAGENT_TERMINAL_STATUSES and not entry.delivered)
+            for entry in list_subagent_work(session_id)
+        )
 
     def _has_active_work() -> bool:
+        pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if pane_reaper is not None and pane_reaper.has_managed_panes():
+            return True
+        if process_manager is not None and process_manager.has_retention_managed_sessions():
+            return True
         if _active_turns:
             return True
         if _has_live_async_tasks(_session_async_tasks):
@@ -3149,11 +3212,15 @@ def create_runner_app(
         background_task_count: int | None = None,
         background_tasks: list[dict[str, object]] | None = None,
     ) -> None:
+        pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if pane_reaper is not None:
+            pane_reaper.note_activity(session_id)
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         if background_task_count is not None:
             event["background_task_count"] = background_task_count
+            _session_background_task_counts[session_id] = background_task_count
         if background_tasks is not None:
             event["background_tasks"] = background_tasks
         _publish_event(session_id, event)
@@ -3738,6 +3805,33 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
+        session_id = body.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return await _initialize_session_locked(body)
+        raw_envelope = body.get("session_init")
+        raw_snapshot = raw_envelope.get("snapshot") if isinstance(raw_envelope, dict) else None
+        if isinstance(raw_snapshot, dict):
+            _apply_archive_states(session_id, raw_snapshot.get("archive_states"))
+        expected_runtime_token = _cli_runtime_lifecycle.runtime_token(session_id)
+        async with _cli_runtime_lock(session_id):
+            if not _cli_runtime_lifecycle.runtime_start_allowed(
+                session_id
+            ) or not _cli_runtime_lifecycle.runtime_token_matches(
+                session_id, expected_runtime_token
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "stale_generation", "detail": "session is archiving"},
+                )
+            _cli_runtime_lifecycle.mark_starting(session_id)
+            response = await _initialize_session_locked(body)
+            if response.status_code < 400:
+                _cli_runtime_lifecycle.mark_live(session_id)
+            else:
+                _cli_runtime_lifecycle.finish_reclaim(session_id)
+            return response
+
+    async def _initialize_session_locked(body: _JsonObject) -> JSONResponse:
         if process_manager is None:
             return JSONResponse(
                 status_code=501,
@@ -4254,7 +4348,11 @@ def create_runner_app(
                     "browser_renderer_available": False,
                 }
                 _turn_task = asyncio.create_task(
-                    _run_turn_bg(msg_body, session_id),
+                    _run_turn_bg(
+                        msg_body,
+                        session_id,
+                        _cli_runtime_lifecycle.runtime_token(session_id),
+                    ),
                     name=f"turn-recover-{session_id}",
                 )
                 _active_turns[session_id] = _turn_task
@@ -4556,7 +4654,8 @@ def create_runner_app(
         await resource_registry.cleanup_session(session_id)
 
         if process_manager is not None:
-            await process_manager.release(session_id)
+            if await process_manager.release(session_id) is False:
+                raise RuntimeError("harness subprocess did not exit during CLI release")
 
         await _delete_native_bridge_dirs(
             server_client=server_client,
@@ -7016,7 +7115,11 @@ def create_runner_app(
             _begin_turn_slot(session_id)
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
-                _run_turn_bg(next_body, session_id),
+                _run_turn_bg(
+                    next_body,
+                    session_id,
+                    _cli_runtime_lifecycle.runtime_token(session_id),
+                ),
                 name=f"turn-cont-{session_id}",
             )
             _active_turns[session_id] = _turn_task
@@ -7377,6 +7480,7 @@ def create_runner_app(
     async def _run_turn_bg(
         msg_body: _JsonObject,
         conv: str,
+        expected_runtime_token: str,
     ) -> None:
         _subagent_wake_pending.discard(conv)
         # Capture our own task so the finally floor can identity-compare before
@@ -7389,7 +7493,20 @@ def create_runner_app(
         _desynced_sessions.discard(conv)
         _desync_terminalized.pop(conv, None)
         try:
-            await _run_turn_bg_setup_and_stream(msg_body, conv)
+            async with _cli_runtime_lock(conv):
+                if not _cli_runtime_lifecycle.runtime_start_allowed(
+                    conv
+                ) or not _cli_runtime_lifecycle.runtime_token_matches(
+                    conv, expected_runtime_token
+                ):
+                    _on_proxy_stream_end(
+                        conv,
+                        error={"message": "turn superseded by session archive"},
+                    )
+                    return
+                _cli_runtime_lifecycle.mark_starting(conv)
+                _cli_runtime_lifecycle.mark_live(conv)
+                await _run_turn_bg_setup_and_stream(msg_body, conv)
         except _ContextWindowOverflow:
             # Re-raise so the streaming-phase handler (which publishes the
             # error event) is never shadowed by the generic except below.
@@ -8657,6 +8774,15 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            _apply_archive_states(
+                conversation_id,
+                message_body.pop("_archive_states", None),
+            )
+            if not _cli_runtime_lifecycle.runtime_start_allowed(conversation_id):
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "session_archived", "detail": "session is archiving"},
+                )
 
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
@@ -8768,7 +8894,27 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
-                    response = await _stream_message_to_harness(message_body, conversation_id)
+                    expected_runtime_token = _cli_runtime_lifecycle.runtime_token(conversation_id)
+                    async with _cli_runtime_lock(conversation_id):
+                        if not _cli_runtime_lifecycle.runtime_start_allowed(
+                            conversation_id
+                        ) or not _cli_runtime_lifecycle.runtime_token_matches(
+                            conversation_id, expected_runtime_token
+                        ):
+                            _on_proxy_stream_end(
+                                conversation_id,
+                                error={"message": "turn superseded by session archive"},
+                            )
+                            return JSONResponse(
+                                status_code=409,
+                                content={
+                                    "error": "stale_generation",
+                                    "detail": "session is archiving",
+                                },
+                            )
+                        _cli_runtime_lifecycle.mark_starting(conversation_id)
+                        _cli_runtime_lifecycle.mark_live(conversation_id)
+                        response = await _stream_message_to_harness(message_body, conversation_id)
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,
@@ -8777,7 +8923,11 @@ def create_runner_app(
                     return response
 
                 _turn_task = asyncio.create_task(
-                    _run_turn_bg(message_body, conversation_id),
+                    _run_turn_bg(
+                        message_body,
+                        conversation_id,
+                        _cli_runtime_lifecycle.runtime_token(conversation_id),
+                    ),
                     name=f"turn-{conversation_id}",
                 )
                 _active_turns[conversation_id] = _turn_task
@@ -9360,6 +9510,31 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/resources/terminals")
     async def create_session_terminal(
+        session_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        expected_runtime_token = _cli_runtime_lifecycle.runtime_token(session_id)
+        async with _cli_runtime_lock(session_id):
+            if not _cli_runtime_lifecycle.runtime_start_allowed(
+                session_id
+            ) or not _cli_runtime_lifecycle.runtime_token_matches(
+                session_id, expected_runtime_token
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": {"code": "stale_generation", "message": "session is archiving"}
+                    },
+                )
+            _cli_runtime_lifecycle.mark_starting(session_id)
+            response = await _create_session_terminal_locked(session_id, request)
+            if response.status_code < 400:
+                _cli_runtime_lifecycle.mark_live(session_id)
+            else:
+                _cli_runtime_lifecycle.finish_reclaim(session_id)
+            return response
+
+    async def _create_session_terminal_locked(
         session_id: str,
         request: Request,
     ) -> JSONResponse:
@@ -11770,7 +11945,11 @@ def create_runner_app(
                         "browser_renderer_available": False,
                     }
                     _turn_task = asyncio.create_task(
-                        _run_turn_bg(msg_body, session_id),
+                        _run_turn_bg(
+                            msg_body,
+                            session_id,
+                            _cli_runtime_lifecycle.runtime_token(session_id),
+                        ),
                         name=f"turn-catchup-{session_id}",
                     )
                     _active_turns[session_id] = _turn_task
@@ -11808,14 +11987,14 @@ def create_runner_app(
                 if is_native_harness(
                     resource_registry.terminal_resource_role(conv_id, terminal_id)
                 ):
-                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
+                    instance = _pane_reaper_registry.get(conv_id, name, "main")
+                    if instance is not None:
+                        panes.append(PaneRef(conv_id, terminal_id, name, socket_path, instance))
             return panes
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
-            if conv_id in _active_turns or (
-                process_manager is not None and process_manager.has_active_turn(conv_id)
-            ):
+            if _session_has_cli_retention_protection(conv_id):
                 return True
             if _native_pane_status.get(conv_id) == "running":
                 return True
@@ -11834,21 +12013,26 @@ def create_runner_app(
             )
 
         async def _reap_native_pane(pane: PaneRef) -> None:
+            closed = False
             try:
-                await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
-            finally:
-                # Closing the codex TUI pane leaves its per-session app-server
-                # (and forwarder) running — no-op for other harnesses. Tear it
-                # down in ``finally`` so an idle-reaped codex session can't orphan
-                # a ``codex app-server`` for the runner's lifetime even when the
-                # pane close above partially fails (the very leak this guards).
-                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
-                _publish_terminal_deleted_event(
-                    conversation_id=pane.conversation_id,
-                    terminal_name=pane.terminal_name,
-                    session_key="main",
-                    publish_event=_publish_event,
+                closed = await resource_registry.close_terminal(
+                    pane.conversation_id,
+                    pane.terminal_id,
+                    expected_instance=pane.instance,
                 )
+                if not closed:
+                    raise RuntimeError("native pane generation changed before retention release")
+            finally:
+                # A failed expected-instance close means a newer pane already
+                # owns the session. Never tear down its app-server.
+                if closed:
+                    await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                    _publish_terminal_deleted_event(
+                        conversation_id=pane.conversation_id,
+                        terminal_name=pane.terminal_name,
+                        session_key="main",
+                        publish_event=_publish_event,
+                    )
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,
@@ -11857,6 +12041,367 @@ def create_runner_app(
         )
     else:
         app.state.native_pane_reaper = None
+
+    async def _finish_cli_release(session_id: str) -> None:
+        """Release non-terminal runtime pieces owned by one CLI session."""
+        if not await _cancel_auto_forwarder_task(session_id):
+            raise RuntimeError("native forwarder did not stop before runtime cleanup")
+        relay_binding = _session_comment_relays.pop(session_id, None)
+        if relay_binding is not None:
+            relay_binding.relay.close()
+        if process_manager is not None:
+            if await process_manager.release(session_id) is False:
+                raise RuntimeError("harness subprocess did not exit during CLI release")
+        await _native_runtime.teardown_codex_native_app_server(session_id)
+        await _delete_native_bridge_dirs(
+            server_client=server_client,
+            session_id=session_id,
+        )
+        from omnigent.runner.subagent_routing import shutdown_session_router
+        from omnigent.runner.tool_dispatch import forget_spawn_family
+
+        await asyncio.to_thread(shutdown_session_router, session_id)
+        forget_spawn_family(session_id)
+
+    @app.get("/v1/sessions/{session_id}/cli-retention")
+    async def get_session_cli_retention(
+        session_id: str,
+        idle_threshold_seconds: float = Query(gt=0, le=604_800),
+        host_id: str = Query(min_length=1, max_length=128),
+        policy_revision: int = Query(ge=0),
+    ) -> JSONResponse:
+        """Return an idle snapshot and hand legacy pane TTL ownership to the pool."""
+        _cli_runtime_lifecycle.observe_policy(
+            session_id,
+            host_id=host_id,
+            revision=policy_revision,
+        )
+        reaper = app.state.native_pane_reaper
+        snapshot = None
+        protected = _session_has_cli_retention_protection(session_id)
+        if protected:
+            if reaper is not None:
+                reaper.note_activity(session_id)
+            if process_manager is not None:
+                process_manager.note_activity(session_id)
+        if reaper is not None:
+            reaper.manage(session_id)
+            pane_snapshot = await reaper.retention_snapshot(
+                session_id,
+                idle_threshold_s=idle_threshold_seconds,
+            )
+            if pane_snapshot is not None:
+                snapshot = {
+                    **pane_snapshot,
+                    "present": True,
+                    "supported": True,
+                    "activity_token": f"pane:{pane_snapshot['activity_token']}",
+                }
+                if process_manager is not None:
+                    process_manager.manage_for_retention(session_id)
+            else:
+                reaper.unmanage(session_id)
+        if snapshot is None and process_manager is not None:
+            process_manager.manage_for_retention(session_id)
+            snapshot = await process_manager.retention_snapshot(
+                session_id,
+                idle_threshold_s=idle_threshold_seconds,
+            )
+            if snapshot is None or not snapshot.get("supported"):
+                process_manager.unmanage_for_retention(session_id)
+            elif isinstance(snapshot.get("activity_token"), str):
+                snapshot["activity_token"] = f"harness:{snapshot['activity_token']}"
+        if snapshot is not None and protected:
+            snapshot.update({"busy": True, "eligible": False, "idle_seconds": 0.0})
+        if snapshot is None:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "session_id": session_id,
+                    "host_id": host_id,
+                    "policy_revision": policy_revision,
+                    "runtime_generation": _cli_runtime_lifecycle.runtime_token(session_id),
+                    "present": False,
+                    "supported": reaper is not None or process_manager is not None,
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "session_id": session_id,
+                "host_id": host_id,
+                "policy_revision": policy_revision,
+                "runtime_generation": _cli_runtime_lifecycle.runtime_token(session_id),
+                **snapshot,
+            },
+        )
+
+    @app.post("/v1/sessions/{session_id}/cli-retention/reset")
+    async def reset_session_cli_retention(
+        session_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Return one session to legacy pane/harness TTL ownership."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            body = None
+        host_id = body.get("host_id") if isinstance(body, dict) else None
+        policy_revision = body.get("policy_revision") if isinstance(body, dict) else None
+        if (
+            not isinstance(host_id, str)
+            or not host_id
+            or isinstance(policy_revision, bool)
+            or not isinstance(policy_revision, int)
+            or policy_revision < 0
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_input", "detail": "invalid retention reset"},
+            )
+        async with _cli_runtime_lock(session_id):
+            if not _cli_runtime_lifecycle.observe_policy(
+                session_id, host_id=host_id, revision=policy_revision
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={"session_id": session_id, "status": "stale_policy"},
+                )
+            reaper = app.state.native_pane_reaper
+            if reaper is not None:
+                reaper.unmanage(session_id)
+            if process_manager is not None:
+                process_manager.unmanage_for_retention(session_id)
+        return JSONResponse(
+            status_code=200,
+            content={"session_id": session_id, "status": "reset"},
+        )
+
+    async def _release_session_cli_retention_locked(
+        session_id: str,
+        body: dict[str, Any],
+    ) -> JSONResponse:
+        """Execute one release while holding the session lifecycle lock."""
+        reaper = app.state.native_pane_reaper
+        reason = body["reason"]
+        if reason == "idle_pool_overflow":
+            threshold = body.get("idle_threshold_seconds")
+            token = body.get("expected_activity_token")
+            runtime_generation = body.get("runtime_generation")
+            policy_host_id = body.get("host_id")
+            policy_revision = body.get("policy_revision")
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or threshold <= 0
+                or not isinstance(token, str)
+                or not token
+                or not isinstance(runtime_generation, str)
+                or not runtime_generation
+                or not isinstance(policy_host_id, str)
+                or not policy_host_id
+                or isinstance(policy_revision, bool)
+                or not isinstance(policy_revision, int)
+                or policy_revision < 0
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "invalid idle release guard"},
+                )
+            if not _cli_runtime_lifecycle.policy_matches(
+                session_id,
+                host_id=policy_host_id,
+                revision=policy_revision,
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={"session_id": session_id, "status": "stale_policy"},
+                )
+            if _session_has_cli_retention_protection(session_id):
+                if reaper is not None:
+                    reaper.note_activity(session_id)
+                if process_manager is not None:
+                    process_manager.note_activity(session_id)
+                return JSONResponse(
+                    status_code=409,
+                    content={"session_id": session_id, "status": "busy"},
+                )
+            if not _cli_runtime_lifecycle.claim_reclaim(
+                session_id,
+                expected_runtime_token=runtime_generation,
+                policy_host_id=policy_host_id,
+                policy_revision=policy_revision,
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={"session_id": session_id, "status": "stale_generation"},
+                )
+            if token.startswith("pane:") and reaper is not None:
+                release_status = await reaper.release_if_idle(
+                    session_id,
+                    idle_threshold_s=float(threshold),
+                    expected_activity_token=token.removeprefix("pane:"),
+                )
+            elif token.startswith("harness:") and process_manager is not None:
+                release_status = await process_manager.release_if_retention_idle(
+                    session_id,
+                    idle_threshold_s=float(threshold),
+                    expected_activity_token=token.removeprefix("harness:"),
+                )
+            else:
+                _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "unknown idle release token"},
+                )
+            if release_status != "released":
+                _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
+                status_code = 409 if release_status in {"busy", "stale", "not_eligible"} else 200
+                return JSONResponse(
+                    status_code=status_code,
+                    content={"session_id": session_id, "status": release_status},
+                )
+        else:
+            archive_scope_id = body.get("archive_scope_id")
+            archive_revision = body.get("archive_revision")
+            if (
+                not isinstance(archive_scope_id, str)
+                or not archive_scope_id
+                or isinstance(archive_revision, bool)
+                or not isinstance(archive_revision, int)
+                or not _cli_runtime_lifecycle.archive_fence_matches(
+                    session_id,
+                    scope_id=archive_scope_id,
+                    revision=archive_revision,
+                )
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={"session_id": session_id, "status": "stale_archive"},
+                )
+            if not _cli_runtime_lifecycle.claim_reclaim(session_id):
+                return JSONResponse(
+                    status_code=409,
+                    content={"session_id": session_id, "status": "reclaiming"},
+                )
+            release_status = "absent" if reaper is None else await reaper.release_now(session_id)
+            if release_status == "failed":
+                _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
+                return JSONResponse(
+                    status_code=500,
+                    content={"session_id": session_id, "status": "failed"},
+                )
+        try:
+            await _finish_cli_release(session_id)
+        except BaseException:
+            _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
+            raise
+        _cli_runtime_lifecycle.finish_reclaim(session_id)
+        return JSONResponse(
+            status_code=200,
+            content={"session_id": session_id, "status": "released"},
+        )
+
+    @app.post("/v1/sessions/{session_id}/cli-retention/release")
+    async def release_session_cli_retention(session_id: str, request: Request) -> JSONResponse:
+        """Release a conditionally idle CLI or force one closed for archive."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            body = None
+        if not isinstance(body, dict) or body.get("reason") not in {
+            "idle_pool_overflow",
+            "archive",
+        }:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_input", "detail": "invalid CLI release reason"},
+            )
+        if body["reason"] == "archive":
+            archive_scope_id = body.get("archive_scope_id", session_id)
+            archive_revision = body.get("archive_revision")
+            if not isinstance(archive_scope_id, str) or not archive_scope_id:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "invalid archive scope"},
+                )
+            if archive_revision is None:
+                # Compatibility for an older Server: establish a monotonic
+                # local fence that a later versioned unarchive can supersede.
+                archive_revision = (
+                    _cli_runtime_lifecycle.archive_revision(session_id, archive_scope_id) + 1
+                )
+            if (
+                isinstance(archive_revision, bool)
+                or not isinstance(archive_revision, int)
+                or archive_revision < 0
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "invalid archive revision"},
+                )
+            if not _cli_runtime_lifecycle.observe_archive_state(
+                session_id,
+                scope_id=archive_scope_id,
+                revision=archive_revision,
+                archived=True,
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={"session_id": session_id, "status": "stale_archive"},
+                )
+            body["archive_scope_id"] = archive_scope_id
+            body["archive_revision"] = archive_revision
+            # Interrupt outside the lifecycle lock: a background turn holds the
+            # lock for its full runtime-start/stream section, so cancellation is
+            # what makes it release the lock promptly for archive teardown.
+            harness = _session_harness_name(session_id)
+            await _native_interrupt_runner.stop(harness, session_id)
+            await _cancel_inprocess_turn(session_id)
+        async with _cli_runtime_lock(session_id):
+            return await _release_session_cli_retention_locked(session_id, body)
+
+    @app.post("/v1/sessions/{session_id}/cli-retention/archive-state")
+    async def update_session_cli_archive_state(
+        session_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Apply the Server's versioned unarchive fence before runtime reuse."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            body = None
+        revision = body.get("archive_revision") if isinstance(body, dict) else None
+        archived = body.get("archived") if isinstance(body, dict) else None
+        scope_id = body.get("archive_scope_id") if isinstance(body, dict) else None
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+            or not isinstance(archived, bool)
+            or not isinstance(scope_id, str)
+            or not scope_id
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_input", "detail": "invalid archive state"},
+            )
+        async with _cli_runtime_lock(session_id):
+            applied = _cli_runtime_lifecycle.observe_archive_state(
+                session_id,
+                scope_id=scope_id,
+                revision=revision,
+                archived=archived,
+            )
+        return JSONResponse(
+            status_code=200 if applied else 409,
+            content={
+                "session_id": session_id,
+                "status": "applied" if applied else "stale_archive",
+            },
+        )
+
+    app.state.finish_cli_release = _finish_cli_release
 
     return app
 

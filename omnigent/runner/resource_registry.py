@@ -1576,6 +1576,8 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         terminal_id: str,
+        *,
+        expected_instance: TerminalInstance | None = None,
     ) -> bool:
         """Close a terminal resource by id.
 
@@ -1590,10 +1592,13 @@ class SessionResourceRegistry:
             session_id,
         ):
             if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
+                if expected_instance is not None and entry.instance is not expected_instance:
+                    return False
                 closed = await self._terminal_registry.close(
                     session_id,
                     entry.terminal_name,
                     entry.session_key,
+                    expected=expected_instance,
                 )
                 if closed:
                     with self._lock:

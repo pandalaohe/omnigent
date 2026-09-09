@@ -8,10 +8,53 @@ from typing import TYPE_CHECKING
 import httpx
 
 from omnigent.entities import Conversation
-from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runner.session_init_protocol import (
+    RunnerArchiveState,
+    build_runner_session_init_payload,
+    runner_archive_state,
+)
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.stores import ConversationStore
+
+
+async def conversation_archive_lineage(
+    conversation: Conversation,
+    conversation_store: ConversationStore,
+) -> list[Conversation]:
+    """Load the session and every persisted ancestor exactly once."""
+    lineage = [conversation]
+    seen = {conversation.id}
+    parent_id = getattr(conversation, "parent_conversation_id", None)
+    while parent_id is not None and parent_id not in seen:
+        parent = await asyncio.to_thread(
+            conversation_store.get_conversation,
+            parent_id,
+        )
+        if parent is None:
+            break
+        lineage.append(parent)
+        seen.add(parent.id)
+        parent_id = getattr(parent, "parent_conversation_id", None)
+    root_id = getattr(conversation, "root_conversation_id", None)
+    if root_id and root_id not in seen:
+        root = await asyncio.to_thread(
+            conversation_store.get_conversation,
+            root_id,
+        )
+        if root is not None:
+            lineage.append(root)
+    return lineage
+
+
+async def runner_archive_states_for_conversation(
+    conversation: Conversation,
+    conversation_store: ConversationStore,
+) -> list[RunnerArchiveState]:
+    """Project every archive scope that can fence this session runtime."""
+    lineage = await conversation_archive_lineage(conversation, conversation_store)
+    return [runner_archive_state(item) for item in lineage]
 
 
 class RunnerSessionInitializer:
@@ -21,7 +64,7 @@ class RunnerSessionInitializer:
         self._registry = registry
         self._server_version = server_version
         self._tasks: dict[
-            tuple[str, int, str, str, str | None],
+            tuple[str, int, str, str, str | None, tuple[tuple[str, int, bool], ...]],
             asyncio.Task[httpx.Response],
         ] = {}
 
@@ -32,6 +75,7 @@ class RunnerSessionInitializer:
         *,
         timeout: float,
         suppress_recovery_turn: bool = False,
+        archive_states: list[RunnerArchiveState] | None = None,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
         runner_id = conversation.runner_id
@@ -43,12 +87,17 @@ class RunnerSessionInitializer:
         # identity fallback keeps embedded/test transports usable without
         # weakening the real tunnel-generation key.
         generation = id(connection) if connection is not None else id(runner_client)
+        effective_archive_states = archive_states or [runner_archive_state(conversation)]
+        archive_key = tuple(
+            (state.scope_id, state.revision, state.archived) for state in effective_archive_states
+        )
         key = (
             runner_id,
             generation,
             conversation.id,
             agent_id,
             conversation.sub_agent_name,
+            archive_key,
         )
         task = self._tasks.get(key)
         if task is None:
@@ -59,6 +108,7 @@ class RunnerSessionInitializer:
                         conversation,
                         server_version=self._server_version,
                         suppress_recovery_turn=suppress_recovery_turn,
+                        archive_states=effective_archive_states,
                     ),
                     timeout=timeout,
                 ),

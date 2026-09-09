@@ -31,6 +31,7 @@ from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
+    SqlCliReleaseIntent,
     SqlComment,
     SqlConversation,
     SqlConversationItem,
@@ -95,9 +96,11 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
+    ArchiveCloseClaimResult,
     ArchivedConversationFacets,
     ArchiveLockWriteResult,
     ConversationAlreadyExistsError,
+    ConversationArchiveClosingError,
     ConversationNotFoundError,
     ConversationStore,
     CreatedSession,
@@ -285,6 +288,11 @@ def _to_conversation(
         git_branch=meta.git_branch if meta else None,
         archived=row.archived,
         archived_at=row.archived_at,
+        archive_revision=row.archive_revision,
+        archive_close_requested_revision=row.archive_close_requested_revision,
+        archive_close_completed_revision=row.archive_close_completed_revision,
+        archive_close_claimed=row.archive_close_claim_token is not None,
+        archive_close_last_error=row.archive_close_last_error,
         live_status=(
             decode_session_live_status(meta.live_status)
             if meta and meta.live_status is not None
@@ -1040,22 +1048,44 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         new_id = conversation_id if conversation_id is not None else generate_conversation_id()
         try:
-            # Get parent's root from AP, then write AP row and Omnigent meta separately.
-            root_id = new_id
-            if parent_conversation_id is not None:
-                with self._conv_session("select_parent_conversation") as ap_sess:
-                    parent_row = ap_sess.get(
-                        SqlConversation,
-                        (current_workspace_id(), parent_conversation_id),
-                    )
-                    if parent_row is None:
-                        raise ConversationNotFoundError(
-                            f"parent conversation {parent_conversation_id!r} does not exist"
-                        )
-                    root_id = parent_row.root_conversation_id
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
-            with self._conv_session("insert_conversation") as ap_sess:
+            # Full ancestor validation and child INSERT share one write
+            # transaction. On SQLite BEGIN IMMEDIATE serializes archive vs
+            # child-create; on row-locking databases every ancestor row is
+            # locked before the INSERT, matching the row an archive transition
+            # mutates whether it targets the top root or a middle subtree.
+            with self._conv_session_immediate("insert_conversation") as ap_sess:
+                root_id = new_id
+                if parent_conversation_id is not None:
+                    ancestor_id: str | None = parent_conversation_id
+                    seen_ancestors: set[str] = set()
+                    while ancestor_id is not None and ancestor_id not in seen_ancestors:
+                        seen_ancestors.add(ancestor_id)
+                        self._lock_conversation(ap_sess, ancestor_id)
+                        ancestor = ap_sess.get(
+                            SqlConversation,
+                            (current_workspace_id(), ancestor_id),
+                        )
+                        if ancestor is None:
+                            raise ConversationNotFoundError(
+                                f"ancestor conversation {ancestor_id!r} does not exist"
+                            )
+                        if ancestor_id == parent_conversation_id:
+                            root_id = ancestor.root_conversation_id
+                        if (
+                            ancestor.archived
+                            and ancestor.archive_close_requested_revision
+                            == ancestor.archive_revision
+                        ):
+                            raise ConversationArchiveClosingError(
+                                f"ancestor conversation {ancestor_id!r} is archived"
+                            )
+                        ancestor_id = ancestor.parent_conversation_id
+                    if ancestor_id is not None:
+                        raise ConversationArchiveClosingError(
+                            "conversation ancestry contains a cycle"
+                        )
                 # Application-level (parent, title) uniqueness — there is no DB
                 # unique constraint. Only children are scoped; top-level sessions
                 # (NULL parent) may reuse titles freely. The SELECT seeks this
@@ -1453,6 +1483,212 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row is None:
                 return "not_found"
             return "locked" if row.archive_locked else "busy"
+
+    def list_pending_archive_closes(self, *, limit: int = 200) -> list[Conversation]:
+        """Return bounded durable archive teardown work in stable order."""
+        with self._conv_session("list_pending_archive_closes") as session:
+            ids = list(
+                session.scalars(
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.archived.is_(True),
+                        SqlConversation.archive_close_requested_revision.is_not(None),
+                        or_(
+                            SqlConversation.archive_close_completed_revision.is_(None),
+                            SqlConversation.archive_close_completed_revision
+                            != SqlConversation.archive_close_requested_revision,
+                        ),
+                    )
+                    .order_by(SqlConversation.archived_at, SqlConversation.id)
+                    .limit(limit)
+                )
+            )
+        rows: list[Conversation] = []
+        for conversation_id in ids:
+            conversation = self.get_conversation(conversation_id)
+            if conversation is not None:
+                rows.append(conversation)
+        return rows
+
+    def pending_archive_close_workspaces(self) -> set[int]:
+        """Find every tenant partition with restart-recoverable archive work."""
+        with self._conv_session("pending_archive_close_workspaces") as session:
+            return set(
+                session.scalars(
+                    select(SqlConversation.workspace_id)
+                    .where(
+                        SqlConversation.archived.is_(True),
+                        SqlConversation.archive_close_requested_revision.is_not(None),
+                        or_(
+                            SqlConversation.archive_close_completed_revision.is_(None),
+                            SqlConversation.archive_close_completed_revision
+                            != SqlConversation.archive_close_requested_revision,
+                        ),
+                    )
+                    .distinct()
+                )
+            )
+
+    def claim_archive_close(
+        self,
+        conversation_id: str,
+        revision: int,
+        token: str,
+        *,
+        claimed_at: int,
+        stale_before: int,
+    ) -> ArchiveCloseClaimResult:
+        """Lease one current archive-close request using a conditional UPDATE."""
+        workspace_id = current_workspace_id()
+        claim_available = or_(
+            SqlConversation.archive_close_claim_token.is_(None),
+            SqlConversation.archive_close_claimed_at.is_(None),
+            SqlConversation.archive_close_claimed_at < stale_before,
+        )
+        with self._conv_session("claim_archive_close") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == workspace_id,
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.archived.is_(True),
+                        SqlConversation.archive_revision == revision,
+                        SqlConversation.archive_close_requested_revision == revision,
+                        or_(
+                            SqlConversation.archive_close_completed_revision.is_(None),
+                            SqlConversation.archive_close_completed_revision != revision,
+                        ),
+                        claim_available,
+                    )
+                    .values(
+                        archive_close_claim_token=token,
+                        archive_close_claimed_at=claimed_at,
+                        archive_close_last_error=None,
+                    )
+                ),
+            )
+            if result.rowcount > 0:
+                return "claimed"
+            row = session.get(SqlConversation, (workspace_id, conversation_id))
+            if row is None:
+                return "not_found"
+            current = (
+                row.archived
+                and row.archive_revision == revision
+                and row.archive_close_requested_revision == revision
+                and row.archive_close_completed_revision != revision
+            )
+            return "busy" if current else "stale"
+
+    def complete_archive_close(
+        self,
+        conversation_id: str,
+        revision: int,
+        token: str,
+    ) -> bool:
+        """Commit success only while the same archive revision and lease remain."""
+        with self._conv_session("complete_archive_close") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.archived.is_(True),
+                        SqlConversation.archive_revision == revision,
+                        SqlConversation.archive_close_requested_revision == revision,
+                        SqlConversation.archive_close_claim_token == token,
+                    )
+                    .values(
+                        archive_close_completed_revision=revision,
+                        archive_close_claim_token=None,
+                        archive_close_claimed_at=None,
+                        archive_close_last_error=None,
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+    def renew_archive_close_claim(
+        self,
+        conversation_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+    ) -> bool:
+        """Renew a root lease, including while unarchive waits for cleanup."""
+        with self._conv_session("renew_archive_close_claim") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.archive_close_claim_token == token,
+                    )
+                    .values(archive_close_claimed_at=claimed_at)
+                ),
+            )
+            return result.rowcount > 0
+
+    def release_archive_close_claim(
+        self,
+        conversation_id: str,
+        revision: int,
+        token: str,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        """Return retryable work to the queue without clearing its request."""
+        del revision  # token identity remains valid after an unarchive supersedes revision
+        detail = error[:512] if error else None
+        with self._conv_session("release_archive_close_claim") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.archive_close_claim_token == token,
+                    )
+                    .values(
+                        archive_close_claim_token=None,
+                        archive_close_claimed_at=None,
+                        archive_close_last_error=detail,
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+    def finalize_archive_close(self, conversation_id: str, revision: int) -> bool:
+        """Complete a root request only if its archive revision is still current."""
+        with self._conv_session("finalize_archive_close") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.archived.is_(True),
+                        SqlConversation.archive_revision == revision,
+                        SqlConversation.archive_close_requested_revision == revision,
+                    )
+                    .values(
+                        archive_close_completed_revision=revision,
+                        archive_close_claim_token=None,
+                        archive_close_claimed_at=None,
+                        archive_close_last_error=None,
+                    )
+                ),
+            )
+            return result.rowcount > 0
 
     def release_conversation_deletion(self, conversation_id: str, token: str) -> bool:
         """Clear a claim only when the opaque owner token still matches."""
@@ -3648,6 +3884,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        close_cli_on_archive: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """
@@ -3770,6 +4007,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     row.archived = archived
                     row.archived_at = now if archived else None
+                    row.archive_revision += 1
+                    # Keep an already-held lease until its worker settles. An
+                    # unarchive supersedes the requested revision, so the old
+                    # worker cannot mark success, while the retained token keeps
+                    # new work fenced until in-flight teardown returns.
+                    row.archive_close_last_error = None
+                    if archived and close_cli_on_archive:
+                        row.archive_close_requested_revision = row.archive_revision
+                    elif not archived:
+                        row.archive_close_requested_revision = None
                     ap_changed = True
             if ap_changed:
                 row.updated_at = now
@@ -5417,6 +5664,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(subtree_ids),
+                )
+            )
+            ap_sess.execute(
+                delete(SqlCliReleaseIntent).where(
+                    SqlCliReleaseIntent.workspace_id == current_workspace_id(),
+                    or_(
+                        SqlCliReleaseIntent.root_session_id.in_(subtree_ids),
+                        SqlCliReleaseIntent.target_session_id.in_(subtree_ids),
+                    ),
                 )
             )
             ap_sess.execute(

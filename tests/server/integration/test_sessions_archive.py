@@ -21,12 +21,14 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -145,6 +147,46 @@ async def test_archive_running_session_attempts_stop(
         _sessions_common._session_status_cache.pop(session_id, None)
 
 
+async def test_archive_can_leave_cli_running_when_host_policy_disables_close(
+    app,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Explicit close_on_archive=false gates the existing archive stop path."""
+    session = await create_test_session(client, name="archive-without-close")
+    session_id = session["id"]
+    host_id = "7a2b3c4d5e6f1234567890abcdef0123"
+    host_store = HostStore(db_uri)
+    app.state.host_store = host_store
+    host_store.upsert_on_connect(host_id, "archive-test-host", "local")
+    host_store.replace_cli_retention_policy(
+        host_id,
+        CliRetentionPolicy(
+            idle_threshold_minutes=60,
+            max_idle_clis=10,
+            close_on_archive=False,
+        ),
+        expected_revision=0,
+    )
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        session_id,
+        host_id,
+        workspace="/tmp/archive-without-close",
+    )
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            await _drain_detached_stops()
+        assert resp.status_code == 200
+        assert resp.json()["archived"] is True
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
 async def test_archive_does_not_block_on_slow_stop(
     client: httpx.AsyncClient,
 ) -> None:
@@ -161,10 +203,12 @@ async def test_archive_does_not_block_on_slow_stop(
     session_id = session["id"]
 
     release = asyncio.Event()
+    stop_started = asyncio.Event()
     stopped: list[str] = []
 
     async def _parked_stop(sid: str, *_args: object) -> None:
         stopped.append(sid)
+        stop_started.set()
         await release.wait()
 
     _sessions_common._session_status_cache[session_id] = "running"
@@ -178,15 +222,16 @@ async def test_archive_does_not_block_on_slow_stop(
             )
             assert resp.status_code == 200
             assert resp.json()["archived"] is True
-            # The detached task starts on a subsequent loop pass and parks
-            # on the release gate — the stop still runs.
-            for _ in range(100):
-                if stopped:
-                    break
-                await asyncio.sleep(0)
+            # The detached task crosses a worker-thread DB read before it
+            # reaches the stop. Wait for its explicit start signal rather than
+            # assuming a fixed number of event-loop yields schedules a Windows
+            # executor thread.
+            await asyncio.wait_for(stop_started.wait(), timeout=5.0)
             assert stopped == [session_id]
+            assert _sessions_orchestration._archive_close_in_progress(session_id) is True
             release.set()
             await _drain_detached_stops()
+            assert _sessions_orchestration._archive_close_in_progress(session_id) is False
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
 
@@ -392,6 +437,45 @@ async def test_archive_idle_session(
     mock_stop.assert_not_awaited()
 
 
+async def test_archive_releases_idle_hostless_cli_resources(
+    client: httpx.AsyncClient,
+) -> None:
+    """Archive closes an idle CLI even when no Host runner can be terminated."""
+    session = await create_test_session(client, name="archive-idle-hostless-cli")
+    session_id = session["id"]
+    posts: list[tuple[str, dict[str, object]]] = []
+
+    class _RunnerClient:
+        async def post(self, url, *, json, timeout):
+            del timeout
+            posts.append((url, json))
+
+            class _Response:
+                status_code = 200
+                text = ""
+
+            return _Response()
+
+    async def _runner_client(*_args, **_kwargs):
+        return _RunnerClient()
+
+    with patch.object(_sessions_facade, "_get_runner_client", _runner_client):
+        resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+        await _drain_detached_stops()
+
+    assert resp.status_code == 200
+    assert posts == [
+        (
+            f"/v1/sessions/{session_id}/cli-retention/release",
+            {
+                "reason": "archive",
+                "archive_scope_id": session_id,
+                "archive_revision": 1,
+            },
+        )
+    ]
+
+
 async def test_unarchive_skips_stop(
     client: httpx.AsyncClient,
 ) -> None:
@@ -400,6 +484,10 @@ async def test_unarchive_skips_stop(
     session_id = session["id"]
 
     await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    # Let the archive operation that owns the stop settle before isolating the
+    # unarchive request. A durable archive worker may start after the PATCH
+    # response; that stop still belongs to the preceding archive transition.
+    await _drain_detached_stops()
 
     mock_stop = AsyncMock()
     _sessions_common._session_status_cache[session_id] = "running"
@@ -414,6 +502,30 @@ async def test_unarchive_skips_stop(
         mock_stop.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_archived_session_rejects_new_user_work_until_unarchived(
+    client: httpx.AsyncClient,
+) -> None:
+    """A new message cannot race an archive close by relaunching its CLI."""
+    session = await create_test_session(client, name="archive-read-only")
+    session_id = session["id"]
+    archived = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    await _drain_detached_stops()
+    assert archived.status_code == 200
+
+    rejected = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "wake anyway"}],
+            },
+        },
+    )
+    assert rejected.status_code == 409
+    assert "unarchive" in rejected.text.lower()
 
 
 # ── Agent contents download ──────────────────────────────

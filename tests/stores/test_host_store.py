@@ -8,11 +8,13 @@ import pytest
 from sqlalchemy import event, update
 from sqlalchemy.orm import Session
 
+from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.db.db_models import SqlHost, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
     Host,
+    HostCliRetentionRevisionConflictError,
     HostStore,
     host_is_live,
 )
@@ -113,6 +115,48 @@ def test_default_workspace_update_requires_the_current_owner(host_store: HostSto
     stored = host_store.get_host(host_id)
     assert stored is not None
     assert stored.default_workspace is None
+
+
+def test_cli_retention_cas_rejects_a_host_reowned_after_authorization(
+    host_store: HostStore,
+    db_uri: str,
+) -> None:
+    host_id = "8e86e6ce1d0e454a89098823d28cf7e0"
+    host_store.upsert_on_connect(host_id, "test-laptop", "alice@example.com")
+    configured = host_store.replace_cli_retention_policy(
+        host_id,
+        CliRetentionPolicy(max_idle_clis=10),
+        expected_revision=0,
+        expected_user_id="alice@example.com",
+    )
+    assert configured is not None
+
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(
+            update(SqlHost).where(SqlHost.host_id == host_id).values(user_id="bob@example.com")
+        )
+        session.commit()
+
+    with pytest.raises(HostCliRetentionRevisionConflictError):
+        host_store.replace_cli_retention_policy(
+            host_id,
+            CliRetentionPolicy(max_idle_clis=1),
+            expected_revision=1,
+            expected_user_id="alice@example.com",
+        )
+    with pytest.raises(HostCliRetentionRevisionConflictError):
+        host_store.reset_cli_retention_policy(
+            host_id,
+            expected_revision=1,
+            expected_user_id="alice@example.com",
+        )
+
+    stored = host_store.get_host(host_id)
+    assert stored is not None
+    assert stored.user_id == "bob@example.com"
+    assert stored.cli_retention_policy == CliRetentionPolicy(max_idle_clis=10)
+    assert stored.cli_retention_revision == 1
 
 
 def test_upsert_updates_existing_host_on_reconnect(

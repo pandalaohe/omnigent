@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from typing import Any
 
 import httpx
@@ -14,7 +15,10 @@ from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
     parse_runner_session_init_envelope,
 )
-from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.runner_session_init import (
+    RunnerSessionInitializer,
+    runner_archive_states_for_conversation,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -106,6 +110,85 @@ async def test_initializer_evicts_rejected_result_for_retry() -> None:
 
     assert first.status_code == second.status_code == 503
     assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_initializer_reposts_after_archive_revision_changes() -> None:
+    registry = _Registry()
+    client = _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        registry,
+        server_version="0.6.0.dev0",
+    )
+    archived = dataclasses.replace(
+        _conversation(),
+        archived=True,
+        archive_revision=1,
+        archive_close_requested_revision=1,
+    )
+    unarchived = dataclasses.replace(
+        archived,
+        archived=False,
+        archive_revision=2,
+        archive_close_requested_revision=None,
+    )
+
+    await initializer.initialize(archived, client, timeout=10)  # type: ignore[arg-type]
+    await initializer.initialize(unarchived, client, timeout=10)  # type: ignore[arg-type]
+
+    assert len(client.calls) == 2
+    assert client.calls[0]["session_init"]["snapshot"]["archive_fenced"] is True
+    assert client.calls[1]["session_init"]["snapshot"]["archive_fenced"] is False
+
+
+def test_completed_archive_keeps_runner_fenced_until_unarchive() -> None:
+    completed = dataclasses.replace(
+        _conversation(),
+        archived=True,
+        archive_revision=1,
+        archive_close_requested_revision=1,
+        archive_close_completed_revision=1,
+    )
+
+    payload = build_runner_session_init_payload(completed, server_version="0.6.0.dev0")
+    envelope = parse_runner_session_init_envelope(payload)
+    assert envelope is not None
+
+    assert envelope.snapshot.archive_states[0].model_dump(mode="json") == {
+        "scope_id": completed.id,
+        "revision": 1,
+        "archived": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_archive_states_include_an_archived_intermediate_ancestor(
+    db_uri: str,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation()
+    child = conversations.create_conversation(parent_conversation_id=root.id)
+    grandchild = conversations.create_conversation(parent_conversation_id=child.id)
+    archived_child = conversations.update_conversation(
+        child.id,
+        archived=True,
+        close_cli_on_archive=True,
+    )
+    assert archived_child is not None
+    current_grandchild = conversations.get_conversation(grandchild.id)
+    assert current_grandchild is not None
+
+    states = await runner_archive_states_for_conversation(
+        current_grandchild,
+        conversations,
+    )
+
+    assert [(state.scope_id, state.revision, state.archived) for state in states] == [
+        (grandchild.id, 0, False),
+        (child.id, 1, True),
+        (root.id, 0, False),
+    ]
 
 
 @pytest.mark.asyncio

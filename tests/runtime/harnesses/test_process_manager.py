@@ -1455,7 +1455,7 @@ async def test_release_during_spawn_leaves_no_live_process(
 
     await manager.start()
     get_task: asyncio.Task[object] | None = None
-    release_task: asyncio.Task[None] | None = None
+    release_task: asyncio.Task[bool] | None = None
     allow_bind = asyncio.Event()
     try:
         spawned: list[asyncio.subprocess.Process] = []
@@ -1493,7 +1493,7 @@ async def test_release_during_spawn_leaves_no_live_process(
         allow_bind.set()
         client = await get_task
         assert client is not None
-        assert await release_task is None
+        assert await release_task is True
 
         socket_path = manager.instance_dir / f"conv-{conv_id}.sock"
         assert not manager.has_session(conv_id)
@@ -1528,7 +1528,7 @@ async def test_release_invalidates_queued_get_client(
     await manager.start()
     get_a: asyncio.Task[object] | None = None
     get_b: asyncio.Task[object] | None = None
-    release_task: asyncio.Task[None] | None = None
+    release_task: asyncio.Task[bool] | None = None
     allow_bind = asyncio.Event()
     try:
         spawned: list[asyncio.subprocess.Process] = []
@@ -1566,7 +1566,7 @@ async def test_release_invalidates_queued_get_client(
         allow_bind.set()
         client_a = await get_a
         assert client_a is not None
-        assert await release_task is None
+        assert await release_task is True
 
         done, pending = await asyncio.wait({get_b})
         assert not pending
@@ -1595,6 +1595,125 @@ async def test_release_invalidates_queued_get_client(
         allow_bind.set()
         await _cancel_pending(get_a, get_b, release_task)
         await manager.shutdown()
+
+
+async def test_release_keeps_unconfirmed_process_registered_for_retry(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process that survives terminate and kill must remain addressable."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    class _StuckProcess:
+        returncode = None
+
+        async def wait(self) -> None:
+            await asyncio.Event().wait()
+
+    class _Client:
+        async def aclose(self) -> None:
+            return None
+
+    class _Endpoint:
+        def __init__(self) -> None:
+            self.cleanup_calls = 0
+
+        def cleanup(self) -> None:
+            self.cleanup_calls += 1
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    process = _StuckProcess()
+    endpoint = _Endpoint()
+    entry = _SubprocessEntry(
+        process=process,  # type: ignore[arg-type]
+        client=_Client(),  # type: ignore[arg-type]
+        endpoint=endpoint,  # type: ignore[arg-type]
+        harness="openai-agents",
+    )
+    conversation_id = "conv_stuck_release"
+    manager._entries[conversation_id] = entry
+    manager._retention_managed.add(conversation_id)
+    monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.001)
+    monkeypatch.setattr(pm_mod._proc, "terminate_tree", lambda _process: None)
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", lambda _process: None)
+
+    assert await manager.release(conversation_id) is False
+    assert manager._entries[conversation_id] is entry
+    assert conversation_id in manager._retention_managed
+    assert endpoint.cleanup_calls == 0
+
+
+async def test_agent_switch_does_not_overwrite_process_that_survived_teardown(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Process:
+        returncode = None
+
+    entry = _SubprocessEntry(
+        process=_Process(),  # type: ignore[arg-type]
+        client=object(),  # type: ignore[arg-type]
+        endpoint=object(),  # type: ignore[arg-type]
+        harness="claude-sdk",
+    )
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._started = True
+    manager._entries["conv_switch"] = entry
+    spawned = False
+
+    async def _failed_close(_entry: _SubprocessEntry) -> bool:
+        assert _entry is entry
+        return False
+
+    async def _unexpected_spawn(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("surviving process must block successor spawn")
+
+    monkeypatch.setattr(manager, "_close_entry", _failed_close)
+    monkeypatch.setattr(manager, "_spawn_entry", _unexpected_spawn)
+
+    with pytest.raises(RuntimeError, match="survived agent-switch teardown"):
+        await manager.get_client("conv_switch", "openai-agents")
+    assert manager._entries["conv_switch"] is entry
+    assert spawned is False
+
+
+async def test_failed_retention_close_keeps_activity_token_retryable(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Process:
+        returncode = None
+
+    entry = _SubprocessEntry(
+        process=_Process(),  # type: ignore[arg-type]
+        client=object(),  # type: ignore[arg-type]
+        endpoint=object(),  # type: ignore[arg-type]
+        harness="openai-agents",
+    )
+    entry.last_used_at = time.monotonic() - 120
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._entries["conv_retry"] = entry
+    manager.manage_for_retention("conv_retry")
+    activity_token = manager._retention_activity_token("conv_retry", entry)
+
+    async def _failed_close(_entry: _SubprocessEntry) -> bool:
+        assert _entry is entry
+        return False
+
+    monkeypatch.setattr(manager, "_close_entry", _failed_close)
+
+    assert (
+        await manager.release_if_retention_idle(
+            "conv_retry",
+            idle_threshold_s=60,
+            expected_activity_token=activity_token,
+        )
+        == "failed"
+    )
+    assert manager._entries["conv_retry"] is entry
+    assert manager._retention_activity_token("conv_retry", entry) == activity_token
 
 
 async def test_shutdown_during_spawn_leaves_no_live_process(

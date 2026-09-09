@@ -453,9 +453,11 @@ class TerminalRegistry:
             between the check and the removal.
         :returns: ``True`` if a live instance was closed, ``False``
             if no live instance was found (already-closed or
-            never-launched), or if *expected* no longer occupies the key.
+            never-launched), if *expected* no longer occupies the key,
+            or if close timed out and the instance was restored for retry.
         """
         key = (terminal_name, session_key)
+        lock_key = (conversation_id, terminal_name, session_key)
         with self._lock:
             slot = self._by_conversation.get(conversation_id)
             if slot is None:
@@ -471,18 +473,41 @@ class TerminalRegistry:
             # ``get_instance_lock`` calls return ``None`` for this
             # closed instance (callers surface a "not running"
             # error to the LLM).
-            self._instance_locks.pop((conversation_id, terminal_name, session_key), None)
+            instance_lock = self._instance_locks.pop(lock_key, None)
         if instance is None:
             return False
+
+        def _restore_unclosed_instance() -> None:
+            """Keep a failed close addressable unless a successor owns its key."""
+            with self._lock:
+                current_slot = self._by_conversation.setdefault(conversation_id, {})
+                current = current_slot.get(key)
+                if current is None:
+                    current_slot[key] = instance
+                    self._instance_locks[lock_key] = instance_lock or threading.Lock()
+                elif current is not instance:
+                    logger.error(
+                        "Could not restore unclosed terminal %s:%s in conv %s; "
+                        "a successor already owns the key",
+                        terminal_name,
+                        session_key,
+                        conversation_id,
+                    )
+
         try:
             await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
         except asyncio.TimeoutError:
+            _restore_unclosed_instance()
             logger.warning(
                 "Terminal close timed out for %s:%s in conv %s",
                 terminal_name,
                 session_key,
                 conversation_id,
             )
+            return False
+        except BaseException:
+            _restore_unclosed_instance()
+            raise
         return True
 
     async def cleanup_conversation(self, conversation_id: str) -> None:

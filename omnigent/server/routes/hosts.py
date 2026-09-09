@@ -19,11 +19,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
+from omnigent.cli_retention import DEFAULT_CLI_RETENTION_POLICY, CliRetentionPolicy
 from omnigent.codex_rate_limits import CODEX_RATE_LIMITS_HARD_TTL_S
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import add_audit_attrs
@@ -49,6 +50,10 @@ from omnigent.onboarding.harness_install import (
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
+from omnigent.server.cli_retention import (
+    CliRetentionHostLeaseBusy,
+    CliRetentionHostLeaseLost,
+)
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
@@ -59,7 +64,12 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import HostStore, host_is_live
+from omnigent.stores.host_store import (
+    Host,
+    HostCliRetentionRevisionConflictError,
+    HostStore,
+    host_is_live,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -430,6 +440,92 @@ class UpdateHostRequest(BaseModel):
     default_workspace: str | None
 
 
+class CliRetentionPolicyInput(BaseModel):
+    """Strict Host policy payload."""
+
+    version: int = Field(ge=1, le=1)
+    idle_threshold_minutes: int = Field(ge=1, le=10_080)
+    max_idle_clis: int | None = Field(ge=0, le=100)
+    close_on_archive: bool
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class ReplaceCliRetentionPolicyRequest(BaseModel):
+    """Compare-and-swap replacement for one Host policy."""
+
+    expected_revision: int = Field(ge=0)
+    policy: CliRetentionPolicyInput
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class ResetCliRetentionPolicyRequest(BaseModel):
+    """Compare-and-swap reset to the Host's legacy lifecycle behavior."""
+
+    expected_revision: int = Field(ge=0)
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class CliRetentionApplication(BaseModel):
+    """Versioned UI-facing evidence for whether a saved policy is active."""
+
+    status: Literal[
+        "legacy",
+        "host_offline",
+        "other_replica",
+        "pending",
+        "unknown",
+        "partial",
+        "unsupported",
+        "applied",
+    ]
+    policy_revision: int = Field(ge=0)
+    observed_at: int | None = None
+    bound: int | None = Field(default=None, ge=0)
+    supported: int | None = Field(default=None, ge=0)
+    absent: int | None = Field(default=None, ge=0)
+    unsupported: int | None = Field(default=None, ge=0)
+    unknown: int | None = Field(default=None, ge=0)
+
+
+class CliRetentionFamilyRuntime(BaseModel):
+    """Observed CLI state counts for one supported runtime family."""
+
+    idle: int = Field(ge=0)
+    active: int = Field(ge=0)
+    below_threshold: int = Field(ge=0)
+    total: int = Field(ge=0)
+
+
+class CliRetentionRuntime(BaseModel):
+    """Latest owner-replica reconciliation projection for one Host."""
+
+    configured: bool
+    owner: bool | None = None
+    policy_revision: int | None = Field(default=None, ge=0)
+    observed_at: int | None = None
+    application: CliRetentionApplication | None = None
+    families: dict[str, CliRetentionFamilyRuntime] = Field(default_factory=dict)
+    scheduled: list[str] | None = None
+    released: list[str] | None = None
+    reset: list[str] | None = None
+    unavailable: list[str] | None = None
+    lease: Literal["busy"] | None = None
+
+
+class CliRetentionPolicyResponse(BaseModel):
+    """Stable response contract consumed by the Host settings UI."""
+
+    contract_version: Literal[1] = 1
+    configured: bool
+    revision: int = Field(ge=0)
+    policy: CliRetentionPolicyInput
+    runtime: CliRetentionRuntime | None
+    application: CliRetentionApplication
+
+
 class StoreHarnessCredentialRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{id}/harnesses/{harness}/credential``.
 
@@ -552,6 +648,7 @@ def create_hosts_router(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     feature_flags: FeatureFlags | None = None,
+    cli_retention_coordinator: Any = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -724,6 +821,212 @@ def create_hosts_router(
             "host_id": updated.host_id,
             "default_workspace": updated.default_workspace,
         }
+
+    def _cli_retention_response(host: Host) -> CliRetentionPolicyResponse:
+        policy = host.cli_retention_policy or DEFAULT_CLI_RETENTION_POLICY
+        runtime = (
+            cli_retention_coordinator.last_result(host.host_id)
+            if cli_retention_coordinator is not None
+            else None
+        )
+        configured = host.cli_retention_policy is not None
+        if not configured:
+            observed_at = None
+            if host.cli_retention_revision == 0:
+                application_status = "legacy"
+            elif not host_is_live(host):
+                application_status = "host_offline"
+            elif runtime is None or runtime.get("policy_revision") != host.cli_retention_revision:
+                application_status = "pending"
+            else:
+                reset = runtime.get("reset")
+                unavailable = runtime.get("unavailable")
+                observed_at = runtime.get("observed_at")
+                if not isinstance(reset, list) or not isinstance(unavailable, list):
+                    application_status = "pending"
+                elif unavailable:
+                    application_status = "partial" if reset else "pending"
+                else:
+                    application_status = "legacy"
+            application = {
+                "status": application_status,
+                "policy_revision": host.cli_retention_revision,
+                "observed_at": observed_at,
+            }
+        elif not host_is_live(host):
+            application = {
+                "status": "host_offline",
+                "policy_revision": host.cli_retention_revision,
+                "observed_at": None,
+            }
+        elif host_registry.get(host.host_id) is None:
+            application = {
+                "status": "other_replica",
+                "policy_revision": host.cli_retention_revision,
+                "observed_at": None,
+            }
+        elif runtime is None or runtime.get("policy_revision") != host.cli_retention_revision:
+            application = {
+                "status": "pending",
+                "policy_revision": host.cli_retention_revision,
+                "observed_at": None,
+            }
+        else:
+            application = {
+                **runtime.get("application", {"status": "unknown"}),
+                "policy_revision": host.cli_retention_revision,
+                "observed_at": runtime.get("observed_at"),
+            }
+        runtime_payload = None
+        if runtime is not None:
+            runtime_payload = dict(runtime)
+            runtime_application = runtime_payload.get("application")
+            if isinstance(runtime_application, dict):
+                runtime_payload["application"] = {
+                    **runtime_application,
+                    "policy_revision": host.cli_retention_revision,
+                    "observed_at": runtime.get("observed_at"),
+                }
+        return CliRetentionPolicyResponse(
+            contract_version=1,
+            configured=configured,
+            revision=host.cli_retention_revision,
+            policy=CliRetentionPolicyInput.model_validate(policy.to_dict()),
+            runtime=(
+                CliRetentionRuntime.model_validate(runtime_payload)
+                if runtime_payload is not None
+                else None
+            ),
+            application=CliRetentionApplication.model_validate(application),
+        )
+
+    @router.get(
+        "/hosts/{host_id}/cli-retention",
+        response_model_exclude_unset=True,
+    )
+    async def get_cli_retention_policy(
+        request: Request, host_id: str
+    ) -> CliRetentionPolicyResponse:
+        """Return one Host's effective idle-CLI policy and CAS revision."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        return _cli_retention_response(host)
+
+    @router.put(
+        "/hosts/{host_id}/cli-retention",
+        response_model_exclude_unset=True,
+    )
+    async def replace_cli_retention_policy(
+        request: Request,
+        host_id: str,
+        body: ReplaceCliRetentionPolicyRequest,
+    ) -> CliRetentionPolicyResponse:
+        """Replace one Host's policy if the caller still owns its revision."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        # A live Host has exactly one tunnel-owning Server replica. Route the
+        # write to that owner so its in-process Host lock serializes policy
+        # replacement with the final destructive release check. Offline Hosts
+        # have no live release path and may safely persist policy on any replica;
+        # the owner picks it up on reconnect.
+        if host_is_live(host) and host_registry.get(host_id) is None:
+            raise _host_absent_error(host)
+        policy = CliRetentionPolicy.from_dict(body.policy.model_dump())
+        try:
+            if cli_retention_coordinator is None:
+                updated = await asyncio.to_thread(
+                    host_store.replace_cli_retention_policy,
+                    host_id,
+                    policy,
+                    expected_revision=body.expected_revision,
+                    expected_user_id=host.user_id,
+                )
+            else:
+                async with cli_retention_coordinator.lease_for_host(host_id) as lease:
+                    await lease.ensure_owned()
+                    updated = await asyncio.to_thread(
+                        host_store.replace_cli_retention_policy,
+                        host_id,
+                        policy,
+                        expected_revision=body.expected_revision,
+                        expected_user_id=host.user_id,
+                        expected_claim_token=lease.token,
+                    )
+                    if updated is not None:
+                        await cli_retention_coordinator.cancel_pending_idle(host_id)
+        except HostCliRetentionRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail="CLI retention policy changed") from exc
+        except (CliRetentionHostLeaseBusy, CliRetentionHostLeaseLost) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="CLI retention is currently reconciling; retry",
+            ) from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if cli_retention_coordinator is not None:
+            cli_retention_coordinator.trigger(host_id)
+        return _cli_retention_response(updated)
+
+    @router.delete(
+        "/hosts/{host_id}/cli-retention",
+        response_model_exclude_unset=True,
+    )
+    async def reset_cli_retention_policy(
+        request: Request,
+        host_id: str,
+        body: ResetCliRetentionPolicyRequest,
+    ) -> CliRetentionPolicyResponse:
+        """CAS the Host back to legacy TTL behavior and unmanage live CLIs."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        if host_is_live(host) and host_registry.get(host_id) is None:
+            raise _host_absent_error(host)
+        try:
+            if cli_retention_coordinator is None:
+                updated = await asyncio.to_thread(
+                    host_store.reset_cli_retention_policy,
+                    host_id,
+                    expected_revision=body.expected_revision,
+                    expected_user_id=host.user_id,
+                )
+            else:
+                async with cli_retention_coordinator.lease_for_host(host_id) as lease:
+                    await lease.ensure_owned()
+                    updated = await asyncio.to_thread(
+                        host_store.reset_cli_retention_policy,
+                        host_id,
+                        expected_revision=body.expected_revision,
+                        expected_user_id=host.user_id,
+                        expected_claim_token=lease.token,
+                    )
+                    if updated is not None:
+                        await cli_retention_coordinator.reset_host_under_lease(
+                            host_id,
+                            policy_revision=updated.cli_retention_revision,
+                            lease=lease,
+                        )
+        except HostCliRetentionRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail="CLI retention policy changed") from exc
+        except (CliRetentionHostLeaseBusy, CliRetentionHostLeaseLost) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="CLI retention is currently reconciling; retry",
+            ) from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        return _cli_retention_response(updated)
 
     @router.get("/hosts/{host_id}/codex-rate-limits")
     async def get_host_codex_rate_limits(request: Request, host_id: str) -> dict[str, Any]:

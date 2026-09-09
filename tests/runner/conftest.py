@@ -262,6 +262,10 @@ class _FakeProcessManager:
         self.marked_in_flight: list[tuple[str, str]] = []
         self.cleared_in_flight: list[str] = []
         self.activity_noted: list[str] = []
+        self.managed_for_retention: set[str] = set()
+        self.managed_for_retention_calls: list[str] = []
+        self.retention_snapshot_result: dict[str, object] | None = None
+        self.retention_releases: list[tuple[str, float, str]] = []
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -306,6 +310,42 @@ class _FakeProcessManager:
         """Record a release and remove the session."""
         self.released.append(conversation_id)
         self._sessions.discard(conversation_id)
+        self.managed_for_retention.discard(conversation_id)
+
+    def manage_for_retention(self, conversation_id: str) -> None:
+        """Record that the Server pool owns this session's idle close decision."""
+        self.managed_for_retention_calls.append(conversation_id)
+        self.managed_for_retention.add(conversation_id)
+
+    def unmanage_for_retention(self, conversation_id: str) -> None:
+        """Return a fake session to legacy idle management."""
+        self.managed_for_retention.discard(conversation_id)
+
+    def has_retention_managed_sessions(self) -> bool:
+        """Report whether the fake holds any Server-managed sessions."""
+        return bool(self.managed_for_retention)
+
+    async def retention_snapshot(
+        self,
+        conversation_id: str,
+        *,
+        idle_threshold_s: float,
+    ) -> dict[str, object] | None:
+        del conversation_id, idle_threshold_s
+        return self.retention_snapshot_result
+
+    async def release_if_retention_idle(
+        self,
+        conversation_id: str,
+        *,
+        idle_threshold_s: float,
+        expected_activity_token: str,
+    ) -> str:
+        self.retention_releases.append(
+            (conversation_id, idle_threshold_s, expected_activity_token)
+        )
+        self.managed_for_retention.discard(conversation_id)
+        return "released"
 
 
 class _ReadTimeoutTransport(httpx.AsyncBaseTransport):

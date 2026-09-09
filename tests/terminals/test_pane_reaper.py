@@ -135,6 +135,32 @@ async def test_scan_recheck_spares_pane_that_became_busy() -> None:
     assert f.busy_calls == 2  # classify + re-check
 
 
+async def test_retention_release_failure_keeps_pane_managed_for_retry() -> None:
+    f = _Fakes()
+    pane = _pane("conv_a")
+    f.panes = [pane]
+    reaper = _make(f, timeout=10.0)
+    reaper.manage("conv_a")
+
+    async def _fail(_pane: PaneRef) -> None:
+        raise RuntimeError("close timeout")
+
+    reaper._reap = _fail
+    reaper._last_busy_at["conv_a"] = time.monotonic() - 100
+    activity_token = f"{reaper._last_busy_at['conv_a']:.9f}"
+
+    assert (
+        await reaper.release_if_idle(
+            "conv_a",
+            idle_threshold_s=10,
+            expected_activity_token=activity_token,
+        )
+        == "failed"
+    )
+    assert reaper.has_managed_panes() is True
+    assert f"{reaper._last_busy_at['conv_a']:.9f}" == activity_token
+
+
 # ── Env resolver ────────────────────────────────────────────────────────────
 
 
@@ -166,6 +192,9 @@ async def test_loop_reaps_idle_pane() -> None:
     f = _Fakes()
     f.panes = [_pane("conv_a")]
     r = _make(f, timeout=0.0001, interval=0.01)
+    # Windows' event-loop clock resolution can treat 10 ms timers as ready in
+    # the same tick, so seed an already-idle clock instead of relying on delay.
+    r._last_busy_at["conv_a"] = time.monotonic() - 1
     await r.start()
     try:
         for _ in range(100):

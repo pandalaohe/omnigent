@@ -10923,8 +10923,9 @@ async def test_get_client_signals_resync_on_model_and_agent_switch(
 
     closed: list[Any] = []
 
-    async def _fake_close(entry: Any) -> None:
+    async def _fake_close(entry: Any) -> bool:
         closed.append(entry)
+        return True
 
     async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
         del conv_id
@@ -10985,8 +10986,9 @@ async def test_get_client_isolates_respawn_hook_failure(
 
     pm.set_respawn_hook(_boom_hook)
 
-    async def _fake_close(entry: Any) -> None:
+    async def _fake_close(entry: Any) -> bool:
         del entry
+        return True
 
     spawned: list[Any] = []
 

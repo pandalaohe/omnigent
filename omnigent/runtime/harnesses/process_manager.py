@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.cli_retention import cli_family_for_resident_harness
 from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
@@ -592,6 +593,9 @@ class HarnessProcessManager:
         # instead of respawning after teardown, while a fresh ``get_client``
         # started after release samples the new generation and may respawn.
         self._release_generations: dict[str, int] = {}
+        # Sessions governed by the Server's idle-CLI pool keep their harness
+        # subprocess until an explicit overflow/archive release arrives.
+        self._retention_managed: set[str] = set()
         # Top-level lock for ``_entries`` / ``_spawn_locks`` dict
         # mutations themselves (the entries within are guarded by
         # their per-conv locks).
@@ -627,6 +631,102 @@ class HarnessProcessManager:
             runner is wired).
         """
         self._on_harness_respawn = hook
+
+    def manage_for_retention(self, conversation_id: str) -> None:
+        """Disable the legacy harness TTL for one Server-managed session."""
+        self._retention_managed.add(conversation_id)
+
+    def unmanage_for_retention(self, conversation_id: str) -> None:
+        """Return one session's harness subprocess to the legacy TTL."""
+        self._retention_managed.discard(conversation_id)
+
+    def has_retention_managed_sessions(self) -> bool:
+        """Return whether a retained harness should keep its Runner alive."""
+        self._retention_managed.intersection_update(self._entries)
+        return bool(self._retention_managed)
+
+    def _retention_activity_token(
+        self,
+        conversation_id: str,
+        entry: _SubprocessEntry,
+    ) -> str:
+        generation = self._release_generations.get(conversation_id, 0)
+        return f"{generation}:{entry.last_used_at:.9f}"
+
+    async def retention_snapshot(
+        self,
+        conversation_id: str,
+        *,
+        idle_threshold_s: float,
+    ) -> dict[str, str | float | bool] | None:
+        """Describe a verified resident harness without creating one."""
+        async with self._registry_lock:
+            entry = self._entries.get(conversation_id)
+            if entry is None or entry.process.returncode is not None:
+                return None
+            family = cli_family_for_resident_harness(entry.harness)
+            if family is None:
+                return {"present": True, "supported": False}
+            busy = conversation_id in self._in_flight_response_ids
+            idle_seconds = 0.0 if busy else max(0.0, time.monotonic() - entry.last_used_at)
+            return {
+                "present": True,
+                "supported": True,
+                "family": family,
+                "busy": busy,
+                "eligible": not busy and idle_seconds >= idle_threshold_s,
+                "idle_seconds": idle_seconds,
+                "activity_token": self._retention_activity_token(conversation_id, entry),
+            }
+
+    async def release_if_retention_idle(
+        self,
+        conversation_id: str,
+        *,
+        idle_threshold_s: float,
+        expected_activity_token: str,
+    ) -> str:
+        """Release the exact resident harness generation selected as idle."""
+        spawn_lock = await self._get_spawn_lock(conversation_id)
+        async with spawn_lock:
+            async with self._registry_lock:
+                entry = self._entries.get(conversation_id)
+                if entry is None or entry.process.returncode is not None:
+                    self._retention_managed.discard(conversation_id)
+                    return "absent"
+                if cli_family_for_resident_harness(entry.harness) is None:
+                    self._retention_managed.discard(conversation_id)
+                    return "unsupported"
+                if conversation_id in self._in_flight_response_ids:
+                    entry.last_used_at = time.monotonic()
+                    return "busy"
+                if expected_activity_token != self._retention_activity_token(
+                    conversation_id, entry
+                ):
+                    return "stale"
+                if time.monotonic() - entry.last_used_at < idle_threshold_s:
+                    return "not_eligible"
+                released = self._entries.pop(conversation_id)
+                self._retention_managed.discard(conversation_id)
+            try:
+                closed = await self._close_entry(released)
+            except BaseException:
+                async with self._registry_lock:
+                    if conversation_id not in self._entries:
+                        self._entries[conversation_id] = released
+                        self._retention_managed.add(conversation_id)
+                raise
+            if closed:
+                async with self._registry_lock:
+                    self._release_generations[conversation_id] = (
+                        self._release_generations.get(conversation_id, 0) + 1
+                    )
+                return "released"
+            async with self._registry_lock:
+                if conversation_id not in self._entries:
+                    self._entries[conversation_id] = released
+                    self._retention_managed.add(conversation_id)
+            return "failed"
 
     @property
     def instance_dir(self) -> Path:
@@ -781,7 +881,10 @@ class HarnessProcessManager:
                     conversation_id,
                     entry.process.returncode,
                 )
-                await self._close_entry(entry)
+                if not await self._close_entry(entry):
+                    raise RuntimeError(
+                        f"dead harness for conversation {conversation_id!r} could not be reaped"
+                    )
                 entry = None
             if entry is not None and harness != "any" and entry.harness != harness:
                 # The harness is fixed at spawn time (it selects which runner
@@ -805,7 +908,11 @@ class HarnessProcessManager:
                     harness,
                 )
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
-                await self._close_entry(entry)
+                if not await self._close_entry(entry):
+                    raise RuntimeError(
+                        f"harness for conversation {conversation_id!r} "
+                        "survived agent-switch teardown"
+                    )
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
             if entry is not None and harness not in _LIVE_MODEL_CONFIG_HARNESSES:
@@ -822,7 +929,11 @@ class HarnessProcessManager:
                         requested_model,
                     )
                     replaced_response_id = self._in_flight_response_ids.get(conversation_id)
-                    await self._close_entry(entry)
+                    if not await self._close_entry(entry):
+                        raise RuntimeError(
+                            f"harness for conversation {conversation_id!r} "
+                            "survived model-switch teardown"
+                        )
                     entry = None
                     respawn_reason = "harness_respawn_model_switch"
             if entry is None:
@@ -837,7 +948,8 @@ class HarnessProcessManager:
                 # this spawn lock, so a concurrent release cannot invalidate
                 # mid-spawn — it runs after we drop the lock.
                 if self._shutting_down:
-                    await self._close_entry(entry)
+                    if not await self._close_entry(entry):
+                        self._entries[conversation_id] = entry
                     raise RuntimeError(
                         "HarnessProcessManager shut down during spawn for "
                         f"conversation {conversation_id!r}"
@@ -1044,7 +1156,7 @@ class HarnessProcessManager:
 
     async def release(
         self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
-    ) -> None:
+    ) -> bool:
         """
         Terminate and unregister the subprocess for a conversation.
 
@@ -1095,23 +1207,52 @@ class HarnessProcessManager:
                         current is None
                         or current.last_used_at > only_if_idle_cutoff
                         or conversation_id in self._in_flight_response_ids
+                        or conversation_id in self._retention_managed
                     ):
                         _logger.info(
                             "skipping idle reap for conversation %s: entry became "
                             "active or was already released during the pass",
                             conversation_id,
                         )
-                        return
-                self._release_generations[conversation_id] = (
-                    self._release_generations.get(conversation_id, 0) + 1
-                )
+                        return False
+                # A conditional legacy-TTL release must observe pool ownership
+                # before clearing it. Explicit releases relinquish the marker
+                # with the same registry mutation that removes the process.
+                was_retention_managed = conversation_id in self._retention_managed
+                self._retention_managed.discard(conversation_id)
                 entry = self._entries.pop(conversation_id, None)
+                if entry is None:
+                    self._release_generations[conversation_id] = (
+                        self._release_generations.get(conversation_id, 0) + 1
+                    )
                 # NOTE: ``_spawn_locks[conversation_id]`` intentionally
                 # NOT popped — see this method's docstring for the
                 # per-conv lock-identity invariant rationale.
             if entry is None:
-                return
-            await self._close_entry(entry)
+                return True
+            try:
+                closed = await self._close_entry(entry)
+            except BaseException:
+                async with self._registry_lock:
+                    if conversation_id not in self._entries:
+                        self._entries[conversation_id] = entry
+                        if was_retention_managed:
+                            self._retention_managed.add(conversation_id)
+                raise
+            if closed:
+                async with self._registry_lock:
+                    self._release_generations[conversation_id] = (
+                        self._release_generations.get(conversation_id, 0) + 1
+                    )
+                return True
+            # The process is still alive. Keep the exact handle retryable while
+            # the spawn lock prevents a successor from taking this key.
+            async with self._registry_lock:
+                if conversation_id not in self._entries:
+                    self._entries[conversation_id] = entry
+                    if was_retention_managed:
+                        self._retention_managed.add(conversation_id)
+            return False
 
     async def shutdown(self) -> None:
         """
@@ -1141,13 +1282,22 @@ class HarnessProcessManager:
         # mutates ``_entries``.
         async with self._registry_lock:
             conv_ids = list(set(self._entries) | set(self._spawn_locks))
+        all_released = True
         for conv_id in conv_ids:
-            await self.release(conv_id)
+            if not await self.release(conv_id):
+                all_released = False
         # Best-effort cleanup of our instance dir. If a subprocess
         # we couldn't kill is still holding a socket file, the
         # rmtree leaves it behind; the next Omnigent boot's orphan
         # sweep handles it.
-        shutil.rmtree(self._instance_dir, ignore_errors=True)
+        if all_released:
+            shutil.rmtree(self._instance_dir, ignore_errors=True)
+        else:
+            _logger.error(
+                "leaving harness instance directory %s for orphan recovery; "
+                "at least one subprocess exit was not confirmed",
+                self._instance_dir,
+            )
         self._started = False
 
     async def _get_spawn_lock(self, conversation_id: str) -> asyncio.Lock:
@@ -1359,7 +1509,7 @@ class HarnessProcessManager:
             env=effective_env,
         )
 
-    async def _close_entry(self, entry: _SubprocessEntry) -> None:
+    async def _close_entry(self, entry: _SubprocessEntry) -> bool:
         """
         Close the httpx client, terminate the subprocess, and
         remove its socket file.
@@ -1377,7 +1527,7 @@ class HarnessProcessManager:
         :param entry: The bookkeeping record to tear down.
         """
         try:
-            await entry.client.aclose()
+            await asyncio.wait_for(entry.client.aclose(), timeout=_RELEASE_GRACE_S)
         except Exception:
             # A broken transport must not skip the subprocess kill below.
             _logger.exception("error closing harness client during teardown; continuing")
@@ -1390,20 +1540,24 @@ class HarnessProcessManager:
                     _proc.terminate_tree(entry.process)
                     await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
                 except Exception:
-                    # Graceful SIGTERM didn't complete — it timed out, or
-                    # send_signal/wait raised (e.g. the process vanished
-                    # mid-teardown). Force-kill best-effort; a process that
-                    # is already gone is already done.
-                    with contextlib.suppress(Exception):
+                    # Graceful SIGTERM did not confirm exit. Escalate, but keep
+                    # the entry registered if the hard-kill also cannot prove
+                    # termination so durable retention work can retry it.
+                    try:
                         _proc.kill_tree(entry.process)
-                        await entry.process.wait()
-            with contextlib.suppress(Exception):
-                close_subprocess_transport(entry.process)
-            # Best-effort socket cleanup. uvicorn's atexit usually
-            # handles this when SIGTERM lands cleanly, but a
-            # hard-killed runner won't. No-op for TCP endpoints.
-            with contextlib.suppress(Exception):
-                entry.endpoint.cleanup()
+                        await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                    except Exception:
+                        _logger.exception("harness subprocess did not exit during teardown")
+            closed = entry.process.returncode is not None
+            if closed:
+                with contextlib.suppress(Exception):
+                    close_subprocess_transport(entry.process)
+                # Best-effort socket cleanup. uvicorn's atexit usually
+                # handles this when SIGTERM lands cleanly, but a
+                # hard-killed runner won't. No-op for TCP endpoints.
+                with contextlib.suppress(Exception):
+                    entry.endpoint.cleanup()
+        return closed
 
     async def _idle_reaper_loop(self) -> None:
         """
@@ -1462,6 +1616,8 @@ class HarnessProcessManager:
             # Snapshot under the lock; ``release`` runs outside so I/O can't block writers.
             async with self._registry_lock:
                 for conv_id, entry in self._entries.items():
+                    if conv_id in self._retention_managed:
+                        continue
                     if entry.last_used_at > cutoff:
                         continue
                     if conv_id in self._in_flight_response_ids:
