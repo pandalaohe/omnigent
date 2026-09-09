@@ -98,10 +98,20 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 
 
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
+_EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE: str = "external_native_subagent_snapshot"
 
 
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed"}
+    {
+        "idle",
+        "running",
+        "waiting",
+        "completed",
+        "failed",
+        "stopped",
+        "killed",
+        "activity_unverified",
+    }
 )
 
 
@@ -170,6 +180,15 @@ _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY = "omnigent.claude_native.tool_use_id"
 
 
 _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY = "omnigent.claude_native.description"
+
+
+_SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
+
+
+_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY = "omnigent.subagent.activity_unverified"
+
+
+_SUBAGENT_STATUS_GENERATION_LABEL_KEY = "omnigent.subagent.status_generation"
 
 
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE: str = "external_codex_subagent_start"
@@ -263,6 +282,10 @@ _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
 
+_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY: str = "omnigent.last_auto_compact_token_limit"
+
+_LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY: str = "omnigent.last_provider_usage_limits"
+
 
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 
@@ -286,6 +309,15 @@ _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
 _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
+
+
+_EXTERNAL_GOAL_STATE_TYPE: str = "external_goal_state"
+
+
+_EXTERNAL_GOAL_STATE_VALUES: frozenset[str] = frozenset({"active", "paused"})
+
+
+_GOAL_STATE_LABEL_KEY: str = "omnigent.goal_state"
 
 
 _CLAUDE_NATIVE_WRAPPER_LABEL_KEY = "omnigent.wrapper"
@@ -466,6 +498,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
+    _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MCP_STARTUP_TYPE,
@@ -475,6 +508,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
+    _EXTERNAL_GOAL_STATE_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
@@ -918,10 +952,13 @@ __all__ = [
     "_EXTERNAL_COMPACTION_STATUS_VALUES",
     "_EXTERNAL_CONVERSATION_ITEM_TYPE",
     "_EXTERNAL_ELICITATION_RESOLVED_TYPE",
+    "_EXTERNAL_GOAL_STATE_TYPE",
+    "_EXTERNAL_GOAL_STATE_VALUES",
     "_EXTERNAL_MCP_STARTUP_STATUS_VALUES",
     "_EXTERNAL_MCP_STARTUP_TYPE",
     "_EXTERNAL_MODEL_CHANGE_TYPE",
     "_EXTERNAL_MODEL_OPTIONS_TYPE",
+    "_EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE",
     "_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE",
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
     "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
@@ -938,6 +975,7 @@ __all__ = [
     "_EXTERNAL_TOOL_OUTPUT_DELTA_TYPE",
     "_FENCE_EXEMPT_EVENT_TYPES",
     "_FORK_HISTORY_NATIVE_HARNESSES",
+    "_GOAL_STATE_LABEL_KEY",
     "_HARNESS_ELICITATION_REPARK_GRACE_S",
     "_HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES",
     "_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S",
@@ -986,7 +1024,10 @@ __all__ = [
     "_SNAPSHOT_RUNNER_TIMEOUT_S",
     "_STOP_RUNNER_RESULT_TIMEOUT_S",
     "_STOP_SESSION_TYPE",
+    "_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
+    "_SUBAGENT_STATUS_GENERATION_LABEL_KEY",
+    "_SUBAGENT_TERMINAL_STATUS_LABEL_KEY",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",

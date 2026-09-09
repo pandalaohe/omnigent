@@ -1,5 +1,7 @@
+import { readLastCreatedWorkspace, writeLastCreatedWorkspace } from "@/lib/lastCreatedWorkspace";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -13,6 +15,7 @@ import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useCustomAgents } from "@/lib/customAgentsApi";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -83,6 +86,10 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  useCustomAgents: vi.fn(() => ({ data: [], isPending: false, error: null })),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({
@@ -103,6 +110,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
 // always set here, so keep this inert (returns no listing).
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
+  useHostFilesystemRoots: () => ({ data: undefined, isLoading: false, error: null }),
   // WorkspacePicker reads this on mount when the file browser opens;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
@@ -262,7 +270,8 @@ function openWorktree(): void {
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const customAgents = screen.queryByTestId("new-chat-landing-custom-agents");
+    fireEvent.click(customAgents ?? screen.getByTestId("new-chat-landing-harness-more"));
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
@@ -323,6 +332,11 @@ beforeEach(() => {
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [SEEDED_WORKSPACE] }));
   setHosts([host()]);
   setAgents([agent()]);
+  vi.mocked(useCustomAgents).mockReturnValue({
+    data: [],
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useCustomAgents>);
 });
 
 afterEach(() => {
@@ -331,6 +345,47 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it("prefers the last successful create directory over general recent activity", async () => {
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify({ host_1: ["/Users/corey/switched-host-location"] }),
+    );
+    writeLastCreatedWorkspace("host_1", "/Users/corey/created-session-location");
+
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "created-session-location",
+      ),
+    );
+  });
+
+  it("preserves a legal trailing-space directory in the create and its host default", async () => {
+    const exactWorkspace = "/Users/corey/projects/legal-trailing-space ";
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [exactWorkspace] }));
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "legal-trailing-space",
+      ),
+    );
+    typeMessage("inspect the exact directory");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { workspace: string };
+    expect(body.workspace).toBe(exactWorkspace);
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+    expect(readLastCreatedWorkspace("host_1")).toBe(exactWorkspace);
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -365,239 +420,51 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
-  it("resolves a navigate-first create from the exact-token top-level pushed row", async () => {
-    let resolveCreate!: (response: Response) => void;
-    vi.mocked(authenticatedFetch).mockReturnValueOnce(
-      new Promise<Response>((resolve) => {
-        resolveCreate = resolve;
-      }) as ReturnType<typeof authenticatedFetch>,
-    );
-    beginLocalConversationMock.mockReturnValue({
-      tempConvId: "temp:1234567890abcdef1234567890abcdef",
-      pendingMsgTempId: "pend_1",
-      createToken: "1234567890abcdef1234567890abcdef",
-    });
-
-    renderLanding();
-    await waitForWorkspaceSeed();
-    typeMessage("inspect the repo");
-    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-
-    await waitFor(() =>
-      expect(navigateMock).toHaveBeenCalledWith("/c/temp:1234567890abcdef1234567890abcdef"),
-    );
-    await waitFor(() => expect(pushMatchers).toHaveLength(1));
-    const isOurs = pushMatchers[0]!;
-    expect(
-      isOurs({
-        id: "conv_pushed",
-        parent_session_id: null,
-        labels: { "omnigent.client_create_token": "1234567890abcdef1234567890abcdef" },
-      }),
-    ).toBe(true);
-    expect(
-      isOurs({
-        id: "conv_wrong",
-        parent_session_id: null,
-        labels: { "omnigent.client_create_token": "ffffffffffffffffffffffffffffffff" },
-      }),
-    ).toBe(false);
-    expect(isOurs({ id: "conv_missing", parent_session_id: null })).toBe(false);
-    expect(
-      isOurs({
-        id: "conv_child",
-        parent_session_id: "conv_parent",
-        labels: { "omnigent.client_create_token": "1234567890abcdef1234567890abcdef" },
-      }),
-    ).toBe(false);
-
-    act(() =>
-      announcePushedSession?.({
-        id: "conv_pushed",
-        parent_session_id: null,
-        labels: { "omnigent.client_create_token": "1234567890abcdef1234567890abcdef" },
-      }),
-    );
-    await waitFor(() =>
-      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
-        "temp:1234567890abcdef1234567890abcdef",
-        "conv_pushed",
-        "ag_hello",
-        "inspect the repo",
-        [],
-        "pend_1",
-        null,
-        navigateMock,
-        expect.any(Function),
-      ),
-    );
-    expect(resolveCreate).toBeTypeOf("function");
-  });
-
-  it("keeps a managed create on its temp route until the HTTP response succeeds", async () => {
-    let resolveCreate!: (response: Response) => void;
-    vi.mocked(authenticatedFetch).mockReturnValueOnce(
-      new Promise<Response>((resolve) => {
-        resolveCreate = resolve;
-      }) as ReturnType<typeof authenticatedFetch>,
-    );
-    beginLocalConversationMock.mockReturnValue({
-      tempConvId: "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      pendingMsgTempId: "pend_managed",
-      createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    });
-
-    renderLanding([], { managed_sandboxes_enabled: true });
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
-    typeMessage("start a sandbox");
-    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-
-    await waitFor(() =>
-      expect(navigateMock).toHaveBeenCalledWith("/c/temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    );
-    expect(pushMatchers).toHaveLength(0);
-    expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
-
-    resolveCreate({
-      ok: true,
-      json: async () => ({ id: "conv_managed" }),
-    } as unknown as Response);
-    await waitFor(() =>
-      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
-        "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "conv_managed",
-        "ag_hello",
-        "start a sandbox",
-        [],
-        "pend_managed",
-        null,
-        navigateMock,
-        expect.any(Function),
-      ),
-    );
-  });
-
-  it("removes a managed temp conversation when the HTTP response rejects it", async () => {
-    let resolveCreate!: (response: Response) => void;
-    vi.mocked(authenticatedFetch).mockReturnValueOnce(
-      new Promise<Response>((resolve) => {
-        resolveCreate = resolve;
-      }) as ReturnType<typeof authenticatedFetch>,
-    );
-    beginLocalConversationMock.mockReturnValue({
-      tempConvId: "temp:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      pendingMsgTempId: "pend_managed_fail",
-      createToken: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    });
-
-    renderLanding([], { managed_sandboxes_enabled: true });
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
-    typeMessage("start a sandbox");
-    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
-    expect(pushMatchers).toHaveLength(0);
-
-    resolveCreate({
-      ok: false,
-      status: 503,
-      json: async () => ({ detail: "managed launch rejected" }),
-    } as unknown as Response);
-    await waitFor(() =>
-      expect(removeLocalConversationMock).toHaveBeenCalledWith(
-        "temp:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      ),
-    );
-    expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
-  });
-
-  it("keeps a failed create's restored draft when a newer create succeeds", async () => {
-    let resolveFirst!: (response: Response) => void;
-    let resolveSecond!: (response: Response) => void;
+  it("posts a saved Agent id even when its name matches a hidden legacy agent", async () => {
+    vi.mocked(useCustomAgents).mockReturnValue({
+      data: [
+        {
+          id: "ca_kimi",
+          name: "kimi",
+          description: null,
+          harness: "codex",
+          model: null,
+          version: 1,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      isPending: false,
+      error: null,
+    } as unknown as ReturnType<typeof useCustomAgents>);
     vi.mocked(authenticatedFetch)
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveFirst = resolve;
-        }) as ReturnType<typeof authenticatedFetch>,
-      )
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveSecond = resolve;
-        }) as ReturnType<typeof authenticatedFetch>,
-      );
-    beginLocalConversationMock
-      .mockReturnValueOnce({
-        tempConvId: "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        pendingMsgTempId: "pend_a",
-        createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      })
-      .mockReturnValueOnce({
-        tempConvId: "temp:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        pendingMsgTempId: "pend_b",
-        createToken: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      });
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Headers({ "Content-Type": "application/gzip" }),
+        blob: async () => new Blob(["saved-agent-bundle"]),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ session_id: "conv_new" }),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ runner_id: "runner_new" }),
+      } as unknown as Response);
 
     renderLanding();
     await waitForWorkspaceSeed();
-    typeMessage("restore this draft");
+    selectAgent("ca_kimi");
+    typeMessage("use the saved agent");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
-    cleanup();
 
-    renderLanding();
-    await waitForWorkspaceSeed();
-    typeMessage("newer successful create");
-    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
-    expect(pushMatchers).toHaveLength(2);
-    const firstRow = {
-      id: "conv_first",
-      parent_session_id: null,
-      labels: { "omnigent.client_create_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-    };
-    const secondRow = {
-      id: "conv_second",
-      parent_session_id: null,
-      labels: { "omnigent.client_create_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-    };
-    expect(pushMatchers[0]?.(firstRow)).toBe(true);
-    expect(pushMatchers[0]?.(secondRow)).toBe(false);
-    expect(pushMatchers[1]?.(firstRow)).toBe(false);
-    expect(pushMatchers[1]?.(secondRow)).toBe(true);
-    cleanup();
-
-    resolveFirst({
-      ok: false,
-      status: 500,
-      json: async () => ({ detail: "first create failed" }),
-    } as unknown as Response);
-    await waitFor(() =>
-      expect(removeLocalConversationMock).toHaveBeenCalledWith(
-        "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      ),
-    );
-
-    resolveSecond({
-      ok: true,
-      json: async () => ({ id: "conv_second" }),
-    } as unknown as Response);
-    await waitFor(() =>
-      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
-        "temp:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "conv_second",
-        "ag_hello",
-        "newer successful create",
-        [],
-        "pend_b",
-        null,
-        navigateMock,
-        expect.any(Function),
-      ),
-    );
-
-    renderLanding();
-    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("restore this draft");
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(3));
+    const calls = vi.mocked(authenticatedFetch).mock.calls;
+    expect(calls[0]?.[0]).toBe("/v1/custom-agents/ca_kimi/contents");
+    expect(calls[1]?.[0]).toBe("/v1/sessions");
+    const form = calls[1]?.[1]?.body as FormData;
+    const metadata = JSON.parse(form.get("metadata") as string);
+    expect(metadata.labels).toEqual({ "omnigent:agent-template-id": "ca_kimi" });
   });
 
   it("records the launched workspace under its host without corrupting other recents", async () => {
@@ -897,6 +764,7 @@ describe("NewChatLandingScreen create flow", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [file] },
     });
+    await screen.findByLabelText(/Image attachment diagram\.png/);
     typeMessage("what is in this image?");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -908,6 +776,10 @@ describe("NewChatLandingScreen create flow", () => {
         text: "what is in this image?",
         skill: null,
         files: [file],
+        composerParts: [
+          { type: "attachment", file },
+          { type: "text", text: "what is in this image?" },
+        ],
       }),
     );
   });
@@ -938,6 +810,34 @@ describe("NewChatLandingScreen create flow", () => {
         skill: { name: "review-pr", args: "123 focus on auth" },
         files: [],
       }),
+    );
+  });
+
+  it("keeps a bundled-skill-looking first message plain when it has an attachment", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    setAgents([agent({ skills: [{ name: "review-pr", description: "Review a pull request" }] })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("/review-pr 123");
+    const file = new File(["x"], "diagram.png", { type: "image/png" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({
+          text: "/review-pr 123",
+          skill: null,
+          files: [file],
+        }),
+      ),
     );
   });
 
@@ -2073,11 +1973,8 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick the non-default agent (Radix opens on pointerdown). "second_agent"
-    // is a custom agent, so it lives in the "Custom agents" submenu.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_two"));
+    // Pick the non-default agent from the selection-only menu.
+    selectAgent("ag_two");
     // The explicit pick persists immediately — no session has to be created
     // for the preference to stick.
     expect(localStorage.getItem("omnigent:last-agent-id")).toBe("ag_two");

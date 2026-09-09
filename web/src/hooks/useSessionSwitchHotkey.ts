@@ -13,6 +13,10 @@ import { useEffect, useRef } from "react";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+} from "@/lib/keyboardShortcutPreferences";
 
 /** Surfaces that keep bracket chords or must not navigate behind an overlay. */
 const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor, [cmdk-input]";
@@ -37,12 +41,14 @@ export function useSessionSwitchHotkey(
     const handler = (e: globalThis.KeyboardEvent): void => {
       // Ignore auto-repeat: holding the chord would race through sessions.
       if (e.repeat) return;
-      // Cmd/Ctrl only — no Alt (that's the sidebar-toggle chord) or Shift.
-      if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
-      // Match the physical bracket key (e.code is layout/modifier-stable), the
-      // same way the sidebar-toggle sibling does.
-      const dir = e.code === "BracketRight" ? 1 : e.code === "BracketLeft" ? -1 : 0;
-      if (dir === 0) return;
+      const defaultChord = hasCommandModifier(e, isMac) && !e.altKey && !e.shiftKey;
+      const previous = hasCustomShortcutBindings("previousSession")
+        ? eventMatchesShortcutAction(e, "previousSession")
+        : defaultChord && e.code === "BracketLeft";
+      const next = hasCustomShortcutBindings("nextSession")
+        ? eventMatchesShortcutAction(e, "nextSession")
+        : defaultChord && e.code === "BracketRight";
+      if (!previous && !next) return;
 
       // Yield when a focused widget claimed the chord before this window listener.
       if (e.defaultPrevented) return;
@@ -56,16 +62,17 @@ export function useSessionSwitchHotkey(
 
       e.preventDefault(); // suppress the browser's ⌘[ / ⌘] Back/Forward gesture
       e.stopPropagation();
+      const dir = next ? 1 : -1;
       const current = active ? ids.indexOf(active) : -1;
       // Off-list: ] enters at the top, [ at the bottom. Otherwise step + wrap.
-      const next =
+      const nextIndex =
         current === -1
           ? dir === 1
             ? 0
             : ids.length - 1
           : (current + dir + ids.length) % ids.length;
 
-      const nextId = ids[next];
+      const nextId = ids[nextIndex];
       if (nextId && nextId !== active) navigate(`/c/${nextId}`);
     };
 

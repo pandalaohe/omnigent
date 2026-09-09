@@ -267,7 +267,7 @@ class SessionStatusPoller:
     Owns the small amount of state the claude-native watcher needs across
     ticks: the lazily-resolved file path, an mtime short-circuit so an
     unchanged file costs one ``stat``, and edge-deduping so a status
-    callback fires only on ``running`` ⇄ ``idle`` transitions.
+    callback fires only on meaningful foreground/background transitions.
 
     Lifecycle, all on the single watcher thread (no lock needed):
 
@@ -285,11 +285,14 @@ class SessionStatusPoller:
     file structurally cannot report: a killed Claude leaves its record behind
     (see :meth:`retire`).
 
-    :param on_status: Callback invoked as ``(runner_status, blocked_on)``
-        on each transition (and once on first read). Fires when either part
-        changes, so ``busy`` → ``waiting`` still delivers its reason even
-        though both map to :data:`RUNNING`. Must not block the watcher
-        thread for long.
+    :param on_status: Callback invoked as ``(runner_status, blocked_on,
+        background_task_count)`` on each transition (and once on first read).
+        ``background_task_count`` is an authoritative ``0`` only when Claude's
+        raw status is ``idle``; other statuses carry ``None`` so they never
+        overwrite the Stop hook's exact shell tally. Fires when any part
+        changes, so ``shell`` → ``idle`` clears a finished background shell
+        even though both map to :data:`IDLE`. Must not block the watcher thread
+        for long.
     :param pane_pid_getter: Returns the terminal's current pane pid, or
         ``None``. Called during resolution; on the omnigent launch path
         this pid names the status file.
@@ -302,7 +305,7 @@ class SessionStatusPoller:
     def __init__(
         self,
         *,
-        on_status: Callable[[str, str | None], None],
+        on_status: Callable[[str, str | None, int | None], None],
         pane_pid_getter: Callable[[], int | None],
         session_id_getter: Callable[[], str | None],
         config_dir: Path | None = None,
@@ -320,7 +323,7 @@ class SessionStatusPoller:
         self._attempts = 0
         self._exhausted = False
         self._last_mtime: float | None = None
-        self._last_edge: tuple[str, str | None] | None = None
+        self._last_edge: tuple[str, str | None, int | None] | None = None
         self._last_status: SessionStatus | None = None
 
     @property
@@ -451,8 +454,12 @@ class SessionStatusPoller:
             self._last_edge = None
             return
         self._last_status = status
-        edge = (status.runner_status, status.blocked_on)
+        # ``idle`` is the one raw value that proves no background shell remains.
+        # ``shell`` also maps to runner-idle (the prompt accepts input), but must
+        # preserve the Stop hook's exact positive count until this later edge.
+        background_task_count = 0 if status.raw_status == "idle" else None
+        edge = (status.runner_status, status.blocked_on, background_task_count)
         if edge == self._last_edge:
             return
         self._last_edge = edge
-        self._on_status(status.runner_status, status.blocked_on)
+        self._on_status(status.runner_status, status.blocked_on, background_task_count)

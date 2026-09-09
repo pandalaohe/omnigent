@@ -39,14 +39,23 @@ class HostService:
     log_path: Path | None = None
 
 
+def _current_uid() -> int:
+    """Return the POSIX uid used to address a launchd GUI domain."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        raise HostServiceError("The current platform does not expose a POSIX user id.")
+    return int(getuid())
+
+
 def _service_for_current_platform() -> HostService:
     """Return the current platform's per-user service description."""
     system = platform.system()
     if system == "Darwin":
+        home = Path(os.environ.get("HOME", Path.home())).expanduser()
         log_path = data_dir() / "logs" / "host" / "service.log"
         return HostService(
             kind="launchd",
-            path=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
+            path=home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
             label=LAUNCHD_LABEL,
             log_path=log_path,
         )
@@ -148,14 +157,19 @@ def _atomic_write(path: Path, content: bytes) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp_path = Path(temp_name)
     try:
-        os.fchmod(fd, 0o600)
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as handle:
+            fd = -1
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
         path.chmod(0o600)
     finally:
+        if fd >= 0:
+            os.close(fd)
         if temp_path.exists():
             temp_path.unlink()
 
@@ -219,7 +233,7 @@ def _enable_launchd(service: HostService, content: bytes) -> None:
     assert service.log_path is not None
     service.log_path.parent.mkdir(parents=True, exist_ok=True)
     previous = service.path.read_bytes() if service.path.exists() else None
-    domain = f"gui/{os.getuid()}"
+    domain = f"gui/{_current_uid()}"
     _run_best_effort(["launchctl", "bootout", f"{domain}/{service.label}"])
     _atomic_write(service.path, content)
     try:
@@ -306,7 +320,7 @@ def disable_user_host_service() -> HostService:
     service = _service_for_current_platform()
     still_running = False
     if service.kind == "launchd":
-        domain = f"gui/{os.getuid()}"
+        domain = f"gui/{_current_uid()}"
         service_target = f"{domain}/{service.label}"
         _run_best_effort(["launchctl", "bootout", service_target])
         still_running = not _wait_for_launchd_unload(service_target)
@@ -328,3 +342,39 @@ def disable_user_host_service() -> HostService:
             "was removed, so it will not return at the next login."
         )
     return service
+
+
+def pause_user_host_service() -> HostService | None:
+    """Stop the user's Host service while preserving its definition."""
+    service = _service_for_current_platform()
+    if not service.path.exists():
+        return None
+    if service.kind == "launchd":
+        domain = f"gui/{_current_uid()}"
+        service_target = f"{domain}/{service.label}"
+        _run_best_effort(["launchctl", "bootout", service_target])
+        if not _wait_for_launchd_unload(service_target):
+            raise HostServiceError(
+                f"launchd service {service.label!r} did not stop before the update."
+            )
+    else:
+        _run_checked(["systemctl", "--user", "stop", service.label])
+    return service
+
+
+def resume_user_host_service(service: HostService) -> None:
+    """Start a service previously returned by :func:`pause_user_host_service`."""
+    if not service.path.exists():
+        raise HostServiceError(f"Host service definition disappeared: {service.path}")
+    if service.kind == "launchd":
+        _run_checked(
+            [
+                "launchctl",
+                "bootstrap",
+                f"gui/{_current_uid()}",
+                str(service.path),
+            ]
+        )
+    else:
+        _run_checked(["systemctl", "--user", "daemon-reload"])
+        _run_checked(["systemctl", "--user", "start", service.label])

@@ -551,6 +551,34 @@ async def test_resolution_notice_follows_delivered_wake(
 
 
 @pytest.mark.asyncio
+async def test_stale_discard_after_delivered_wake_sends_no_resolution_notice(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """Self-healing removes a dead prompt without waking or messaging again."""
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="claude_code:stale", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+    )
+    pending_elicitations.set_elicitation_observer(notifier.observe)
+    event = _request_event("elicit_stale")
+
+    pending_elicitations.record_publish(child.id, event)
+    await _wait_for_calls(dispatch, expected=1)
+    assert pending_elicitations.discard_stale(child.id, event) is True
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert len(dispatch.calls) == 1
+    assert not elicitation_armed(notifier, "elicit_stale")
+
+
+@pytest.mark.asyncio
 async def test_resolution_notice_states_decline_verdict(
     conv_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { SessionStateBadge } from "./SessionStateBadge";
+import { BackgroundActivityBadge, GoalActivityBadge, SessionStateBadge } from "./SessionStateBadge";
 import type { SessionState } from "@/hooks/useSessionState";
 
 function renderBadge(state: SessionState) {
@@ -69,5 +69,35 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(dot?.getAttribute("class")).toContain("size-1.5");
     expect(dot?.getAttribute("class")).not.toContain("running-pulse-dot");
     expect(container.querySelector(".bg-info")).toBeNull();
+  });
+});
+
+describe("BackgroundActivityBadge", () => {
+  it("renders a compact B with a count-aware accessible label", () => {
+    render(
+      <TooltipProvider>
+        <BackgroundActivityBadge count={2} />
+      </TooltipProvider>,
+    );
+    const badge = screen.getByTestId("background-activity-badge");
+    expect(badge).toHaveTextContent("B");
+    expect(badge).toHaveAttribute("aria-label", "2 background activities running");
+  });
+});
+
+describe("GoalActivityBadge", () => {
+  it.each([
+    ["active", "Goal active", "text-status-green"],
+    ["paused", "Goal paused", "text-status-yellow"],
+  ] as const)("renders %s as a compact G", (state, label, tone) => {
+    render(
+      <TooltipProvider>
+        <GoalActivityBadge state={state} />
+      </TooltipProvider>,
+    );
+    const badge = screen.getByTestId("goal-activity-badge");
+    expect(badge).toHaveTextContent("G");
+    expect(badge).toHaveAttribute("aria-label", label);
+    expect(badge).toHaveClass(tone);
   });
 });

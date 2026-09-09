@@ -657,13 +657,60 @@ aside[aria-label="Workspace"][data-maximized] {
  * the only in-header climb-out of a sub-agent. Hide the empty nav when there
  * is no parent link (top-level). Not scoped to a width media query so it
  * holds on wider native shells (e.g. iPad) too. */
-[data-ios-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)),
-[data-android-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)) {
+:is([data-ios-native], [data-android-native]):not([data-native-mobile-header="conversation-title"])
+  .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)) {
   display: none;
 }
-[data-ios-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link),
-[data-android-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link) {
+:is([data-ios-native], [data-android-native]):not([data-native-mobile-header="conversation-title"])
+  .conversation-breadcrumb
+  > :not(a.breadcrumb-parent-link) {
   display: none;
+}
+.breadcrumb-native-session-title {
+  display: none;
+}
+
+/* Optional native-mobile title mode swaps the native main pill for the Web
+ * session title. Folder and desktop-only actions stay hidden. */
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)) {
+  display: flex;
+}
+
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb {
+  max-width: min(56vw, 16rem);
+}
+
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb
+  > :not(a.breadcrumb-parent-link, .breadcrumb-session-title, .breadcrumb-native-session-title) {
+  display: none;
+}
+
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb
+  > .breadcrumb-session-title,
+:is([data-ios-native], [data-android-native])[data-native-mobile-header="conversation-title"]
+  .conversation-breadcrumb
+  > .breadcrumb-native-session-title {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (width < 48rem) {
+  :is(
+      [data-ios-native],
+      [data-android-native]
+    )[data-native-mobile-header="conversation-title"][data-sidebar-open="true"]
+    .conversations-sidebar
+    .sidebar-brand {
+    visibility: hidden;
+    pointer-events: none;
+  }
 }
 
 /* The iOS WKWebView runs full-screen under the keyboard at every responsive

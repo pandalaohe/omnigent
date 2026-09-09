@@ -17,6 +17,7 @@ import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
 import { parseBackgroundTasks } from "./sse";
+import { providerUsageLimitsFromWire } from "./providerUsageLimits";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -105,6 +106,7 @@ interface ModelUsageWire {
 interface SessionResponseWire {
   id: string;
   agent_id: string;
+  agent_template_id?: string | null;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
   agent_name?: string | null;
   runner_id?: string | null;
@@ -137,6 +139,9 @@ interface SessionResponseWire {
    */
   background_tasks?: BackgroundTaskInfo[] | null;
   created_at: number;
+  updated_at?: number | null;
+  archived_at?: number | null;
+  archived?: boolean;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent or a user-supplied string for a top-level session.
@@ -171,6 +176,8 @@ interface SessionResponseWire {
   /** Owner opt-in: view-level collaborators may browse workspace files. */
   share_workspace_files?: boolean;
   context_window?: number | null;
+  auto_compact_token_limit?: number | null;
+  provider_usage_limits?: unknown;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
   /**
@@ -311,6 +318,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   return {
     id: wire.id,
     agentId: wire.agent_id,
+    ...(wire.agent_template_id !== undefined ? { agentTemplateId: wire.agent_template_id } : {}),
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
@@ -319,6 +327,9 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     createdAt: wire.created_at,
+    updatedAt: wire.updated_at ?? wire.created_at,
+    archivedAt: wire.archived_at ?? null,
+    archived: wire.archived ?? false,
     title: wire.title ?? null,
     labels: wire.labels,
     workspace: wire.workspace ?? null,
@@ -334,6 +345,10 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subagentRoutingOverride: wire.subagent_routing_override,
     shareWorkspaceFiles: wire.share_workspace_files ?? false,
     contextWindow: wire.context_window,
+    autoCompactTokenLimit: wire.auto_compact_token_limit,
+    ...(wire.provider_usage_limits !== undefined
+      ? { providerUsageLimits: providerUsageLimitsFromWire(wire.provider_usage_limits) }
+      : {}),
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
@@ -1086,6 +1101,60 @@ export interface SessionItemsPage {
   items: ConversationItem[];
   /** True when older items exist before the first item in this page. */
   hasMore: boolean;
+}
+
+export interface SessionItemsWindow {
+  items: ConversationItem[];
+  anchorId: string;
+  hasOlder: boolean;
+  hasNewer: boolean;
+}
+
+export interface SessionItemSearchResult {
+  items: ConversationItem[];
+  hasMore: boolean;
+}
+
+/** Search the full persisted transcript without hydrating every item. */
+export async function searchSessionItems(
+  sessionId: string,
+  searchQuery: string,
+  limit = 1000,
+): Promise<SessionItemSearchResult> {
+  const params = new URLSearchParams({ search_query: searchQuery, limit: String(limit) });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items/search?${params}`,
+  );
+  const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
+  return { items: page.data, hasMore: page.has_more };
+}
+
+/** Fetch a bounded chronological transcript window centered on one item. */
+export async function fetchSessionItemsWindow(
+  sessionId: string,
+  anchorId: string,
+  { before = 30, after = 30 }: { before?: number; after?: number } = {},
+): Promise<SessionItemsWindow> {
+  const params = new URLSearchParams({
+    anchor_id: anchorId,
+    before: String(before),
+    after: String(after),
+  });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items/window?${params}`,
+  );
+  const payload = await readJsonOrThrow<{
+    data: ConversationItem[];
+    anchor_id: string;
+    has_older: boolean;
+    has_newer: boolean;
+  }>(res);
+  return {
+    items: payload.data,
+    anchorId: payload.anchor_id,
+    hasOlder: payload.has_older,
+    hasNewer: payload.has_newer,
+  };
 }
 
 /**

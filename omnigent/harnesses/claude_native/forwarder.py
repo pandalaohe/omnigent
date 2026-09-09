@@ -10,8 +10,9 @@ import logging
 import os
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -31,6 +32,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_claude_session_id,
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
+    read_latest_transcript_goal_state,
     read_message_deltas_from_offset,
     read_permission_mode,
     read_transcript_items_from_offset,
@@ -41,16 +43,12 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
-from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
-from omnigent.harnesses.claude_native.status import sync_raw_status_context
-from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
-from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.native._native_post_delivery import (
-    append_dead_letter,
-    post_external_session_status,
-    post_may_have_been_delivered,
-)
-from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.claude_native_status import sync_raw_status_context
+from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.model_metadata import concrete_reported_model
+from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
+from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 _FORWARDER_STATE_FILE = "transcript_forwarder.json"
 _HOOK_STATE_FILE = "hook_forwarder.json"
@@ -64,6 +62,10 @@ _HOOKS_FILE = "hooks.jsonl"
 # a handful over its lifetime, so a small bound is ample while still
 # surviving a cursor rewind that re-reads an already-persisted summary.
 _MAX_PERSISTED_COMPACTION_SEQS = 16
+_MAX_PERSISTED_COMPACTION_SUMMARIES = 32
+_COMPACTION_HOOK_FALLBACK_WAIT_S = 2.0
+_compaction_locks: dict[str, asyncio.Lock] = {}
+_SUBAGENT_RECOVERY_BATCH_ITEMS = 64
 
 # Cap on the in-memory ``(message_id, index)`` dedupe ring for streamed
 # deltas. The byte offset already prevents re-reading on the normal
@@ -72,13 +74,13 @@ _MAX_PERSISTED_COMPACTION_SEQS = 16
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
 
-# Seconds of transcript inactivity after which we publish ``idle`` for
-# a sub-agent. The transcript is the only signal we have for sub-agent
-# completion in Phase A (no SubagentStop hook is subscribed); 5s is the
-# shortest window that comfortably absorbs a stalled tool call without
-# flickering the badge. Phase B will replace this with an authoritative
-# hook signal and drop the heuristic.
-_SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+# Structured task notifications are the authoritative sub-agent terminal
+# signal. This longer window is only a compatibility fallback for Claude runs
+# that never emit one, and it is eligible solely when the last child record is
+# a real assistant answer (never a tool call/result or opening text followed by
+# tool activity).
+_SUBAGENT_TERMINAL_QUIESCENCE_S = 30.0
+_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -101,6 +103,10 @@ _DEFAULT_POLL_INTERVAL_S = 0.25
 # it runs well below the poll interval; a mode switch is a human action and 2s
 # of lag is imperceptible.
 _PERMISSION_MODE_POLL_INTERVAL_S = 2.0
+# Claude's statusLine refreshes ``captured_at`` on every render even when the
+# provider allowance windows are unchanged. Refresh a stable snapshot every
+# five minutes instead of persisting and broadcasting every render.
+_PROVIDER_USAGE_LIMITS_REFRESH_INTERVAL_S = 300
 # Hard ceiling on one poll iteration of the forward loop. A silently stalled
 # await anywhere in the pipeline used to stop mirroring, status and the busy
 # signal forever; the deadline cancels the stall (the traceback names it) and
@@ -313,10 +319,10 @@ class _PendingCompaction:
     """
     One in-flight compaction awaiting its boundary persist.
 
-    Minted from a ``PreCompact`` hook and consumed by whichever
-    completion signal arrives first — the transcript's
-    ``isCompactSummary`` record (primary, durable) or the
-    ``SessionStart source=compact`` hook (secondary, best-effort).
+    Minted from a ``PreCompact`` hook and consumed by the transcript's
+    authoritative ``isCompactSummary`` record. ``SessionStart
+    source=compact`` only acknowledges the generation and starts the bounded
+    fallback window.
 
     :param seq: Monotonic sequence number for this compaction within the
         session, e.g. ``3``. Used as the idempotency key so a boundary is
@@ -345,11 +351,10 @@ class CompactionForwardState:
 
     Persisted at ``{bridge_dir}/compaction_forwarder.json`` and shared by the
     hook and transcript forwarders. A compaction is bracketed by a
-    ``PreCompact`` hook and completed by *either* the transcript's
-    ``isCompactSummary`` record *or* the ``SessionStart source=compact`` hook;
-    both reconcile against one durable token so exactly one Omnigent
-    ``compaction`` boundary is persisted per compaction, regardless of arrival
-    order or a missing completion hook.
+    ``PreCompact`` hook and completed by the transcript's
+    ``isCompactSummary`` record. The compact ``SessionStart`` is an
+    acknowledgement only; if the summary is not durable by the deadline, one
+    marked fallback is persisted and later superseded by the summary.
 
     :param pending: The compaction awaiting a boundary persist, or ``None``.
     :param last_seq: Highest sequence number minted so far; each ``PreCompact``
@@ -375,6 +380,9 @@ class CompactionForwardState:
     last_precompact_cursor: int = 0
     expect_completion_ack: bool = False
     expect_completion_ack_seq: int = 0
+    acknowledged_at: float | None = None
+    fallback_persisted_seq: int = 0
+    persisted_summary_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -384,9 +392,8 @@ class SubagentEntry:
 
     One of these per Claude-side sub-agent. Tracks the Omnigent child
     Conversation id we minted (so subsequent items POST to the
-    right session), the transcript file byte offset already
-    forwarded, and the wall-clock timestamp of the last item we
-    saw (for the idle-status heuristic).
+    right session), transcript cursor, correlated Task tool id, durable
+    terminal signal, and the narrowly-scoped legacy quiet fallback.
 
     :param subagent_id: Stable Claude-side identifier, also the
         ``agent-<id>`` filename stem, e.g. ``"a5c7effac5a9a35ab"``.
@@ -404,25 +411,47 @@ class SubagentEntry:
         so a failed later item can leave the cursor behind without
         re-posting earlier accepted items on the next poll.
     :param last_activity_ts: Unix timestamp of the most recent item
-        observed in this sub-agent's transcript. Used by the idle
-        heuristic — when ``now - last_activity_ts >
-        _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
-        ``external_session_status: idle`` event. ``None`` when no
-        items have been seen yet (so the heuristic doesn't fire
-        before there's anything to be quiescent about).
+        observed in this sub-agent's transcript.
     :param last_status: Last status string POSTed for this
         sub-agent — used to dedupe so we don't spam ``running`` or
-        ``idle`` events on every tick when nothing changed. ``None``
-        means no status has been posted yet.
+        terminal events on every tick when nothing changed. ``None`` means no
+        status has been posted yet.
+    :param quiet_terminal_output: Assistant result eligible for the legacy
+        long-quiet fallback. A newer call, result, user input, or meta item
+        clears it.
+    :param terminal_status: Correlated structured status from the parent Task
+        notification, retained until the Server acknowledges delivery.
+    :param terminal_output: Result carried by the correlated Task notification.
+    :param terminal_replayed: Whether the terminal notification was restored
+        from Omnigent's cold-resume metadata rather than emitted live by Claude.
+    :param recovery_watermark: Frozen complete-record EOF for a child already
+        known by the Server. While set, the prefix is reconciled as history and
+        cannot produce live activity.
+    :param parent_recovery_watermark: Frozen parent transcript boundary for
+        this existing child's terminal notification only.
+    :param recovery_after: Server item id acknowledged immediately before the
+        next historical item.
+    :param recovery_seen_source_ids: Historical item source ids already
+        acknowledged within the frozen prefix.
     """
 
     subagent_id: str
     child_conversation_id: str
-    parent_subagent_id: str | None = None
+    tool_use_id: str | None = None
     byte_offset: int = 0
     seen_source_ids: tuple[str, ...] = ()
     last_activity_ts: float | None = None
     last_status: str | None = None
+    quiet_terminal_output: str | None = None
+    terminal_status: str | None = None
+    terminal_output: str | None = None
+    terminal_replayed: bool = False
+    activity_unverified: bool = False
+    status_reconcile_pending: bool = False
+    recovery_watermark: int | None = None
+    parent_recovery_watermark: int | None = None
+    recovery_after: str | None = None
+    recovery_seen_source_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -439,9 +468,21 @@ class SubagentForwardState:
         per-sub-agent entry. New sub-agents discovered on disk are
         inserted here after the Omnigent server returns a child
         Conversation id.
+    :param parent_byte_offset: Byte cursor for structured Task notifications
+        in the parent transcript.
+    :param parent_line_cursor: Matching legacy line cursor for diagnostics and
+        cursor migration.
     """
 
     subagents: dict[str, SubagentEntry]
+    parent_byte_offset: int = 0
+    parent_line_cursor: int = 0
+    pending_registration_watermarks: dict[str, tuple[int, int, str]] = field(default_factory=dict)
+    pending_terminal_notifications: dict[str, tuple[str, str | None, bool]] = field(
+        default_factory=dict
+    )
+    terminal_recovery_version: int = 1
+    legacy_terminal_recovery_watermark: int | None = None
 
 
 @dataclass(frozen=True)
@@ -560,11 +601,20 @@ class _ForwardDedupeState:
 
     usage: dict[str, float] | None = None
     context_window: int | None = None
+    provider_usage_limits: dict[str, object] | None = None
     recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
     posted_model: str | None = None
     observed_title: str | None = None
     posted_title: str | None = None
+    posted_goal_state: str | None = None
+    posted_goal_state_known: bool = False
+    observed_goal_state: str | None = None
+    observed_goal_state_known: bool = False
+    observed_goal_byte_offset: int = -1
+    goal_recovery_path: Path | None = None
+    goal_recovery_file_id: tuple[int, int] | None = None
+    goal_recovery_max_size: int = -1
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
     # Kept to suppress duplicate posts when S hasn't advanced.
@@ -609,6 +659,27 @@ class _ForwardDedupeState:
     # whose ``PreCompact`` was missed from later hijacking an unrelated
     # genuine compaction's token.
     pending_compaction_dismiss_seq: int | None = None
+
+
+def _provider_usage_limits_should_post(
+    current: dict[str, object] | None,
+    previous: dict[str, object] | None,
+) -> bool:
+    """Return whether a provider snapshot is materially new or due for refresh."""
+    if current is None:
+        return False
+    if previous is None:
+        return True
+    current_content = {key: value for key, value in current.items() if key != "captured_at"}
+    previous_content = {key: value for key, value in previous.items() if key != "captured_at"}
+    if current_content != previous_content:
+        return True
+    current_captured = current.get("captured_at")
+    previous_captured = previous.get("captured_at")
+    if type(current_captured) is not int or type(previous_captured) is not int:
+        return current != previous
+    elapsed = current_captured - previous_captured
+    return elapsed < 0 or elapsed >= _PROVIDER_USAGE_LIMITS_REFRESH_INTERVAL_S
 
 
 @dataclass(frozen=True)
@@ -863,7 +934,10 @@ async def forward_claude_transcript_to_session(
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        NativeSubagentSnapshotPublisher(client, observation_timeout_s=35.0) as snapshots,
+    ):
         while True:
             try:
                 async with asyncio.timeout(_FORWARD_LOOP_STALL_DEADLINE_S):
@@ -897,6 +971,7 @@ async def forward_claude_transcript_to_session(
                             new_session_id=rotation,
                             agent_name=agent_name,
                         )
+                        snapshots.update(session_id, {}, retired=True)
                         session_id = rotation
                         state = None
                         hook_state = None
@@ -933,6 +1008,7 @@ async def forward_claude_transcript_to_session(
                         state=hook_state,
                     )
                     if rotation is not None:
+                        snapshots.update(session_id, {}, retired=True)
                         session_id = rotation
                         state = None
                         hook_state = None
@@ -973,6 +1049,7 @@ async def forward_claude_transcript_to_session(
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
                     transcript_path = read_transcript_path(bridge_dir)
                     if transcript_path is not None:
+                        previous_state = state
                         state = await _ensure_state_for_transcript(
                             bridge_dir=bridge_dir,
                             state=state,
@@ -980,6 +1057,11 @@ async def forward_claude_transcript_to_session(
                             start_at_end=start_at_end,
                             session_id=current_session_id,
                             start_at_offset=start_at_offset,
+                        )
+                        await _recover_goal_state_from_transcript(
+                            transcript_path=transcript_path,
+                            dedupe=dedupe,
+                            force=(previous_state is not None and previous_state != state),
                         )
                         # Read deltas first for the lowest-latency preview. The
                         # runtime reconciler handles either delta/item order.
@@ -1026,6 +1108,21 @@ async def forward_claude_transcript_to_session(
                             # (the user-message reset only fires on the next turn).
                             response_id=state.current_response_id,
                         )
+                        try:
+                            await _maybe_persist_compaction_fallback(
+                                client,
+                                session_id=current_session_id,
+                                bridge_dir=bridge_dir,
+                            )
+                        except Exception:  # noqa: BLE001
+                            _logger.warning(
+                                "Failed to persist bounded compaction hook fallback; "
+                                "session=%s bridge_dir=%s",
+                                current_session_id,
+                                bridge_dir,
+                                exc_info=True,
+                                extra={"session_id": current_session_id},
+                            )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
                         # the ``PreCompact`` ``in_progress`` that raised the
@@ -1053,6 +1150,10 @@ async def forward_claude_transcript_to_session(
                             start_retry_tracker=subagent_start_retries,
                             item_retry_tracker=subagent_item_retries,
                             status_retry_tracker=subagent_status_retries,
+                        )
+                        snapshots.update(
+                            current_session_id,
+                            _native_subagent_snapshot(subagent_state),
                         )
                         # Reconcile + POST cumulative cost AFTER sub-agents are
                         # forwarded so the estimate sees this poll's sub-agent
@@ -1112,6 +1213,22 @@ async def forward_claude_transcript_to_session(
             await asyncio.sleep(poll_interval_s)
 
 
+def _native_subagent_snapshot(state: SubagentForwardState) -> dict[str, str]:
+    """Inventory only: preserve historical uncertainty and structured outcomes."""
+    return {
+        entry.child_conversation_id: (
+            entry.terminal_status
+            or (
+                "activity_unverified"
+                if entry.activity_unverified
+                else entry.last_status or "activity_unverified"
+            )
+        )
+        for entry in state.subagents.values()
+        if entry.child_conversation_id
+    }
+
+
 def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
     """
     Resolve the on-disk ``subagents/`` directory for a Claude session.
@@ -1153,6 +1270,59 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
     subagents_raw = raw.get("subagents", {})
     if not isinstance(subagents_raw, dict):
         return SubagentForwardState(subagents={})
+    parent_byte_offset = raw.get("parent_byte_offset", 0)
+    parent_line_cursor = raw.get("parent_line_cursor", 0)
+    pending_registration_raw = raw.get("pending_registration_watermarks", {})
+    pending_raw = raw.get("pending_terminal_notifications", {})
+    terminal_recovery_version = raw.get("terminal_recovery_version", 0)
+    legacy_terminal_recovery_watermark = raw.get("legacy_terminal_recovery_watermark")
+    if not isinstance(parent_byte_offset, int) or parent_byte_offset < 0:
+        parent_byte_offset = 0
+    if not isinstance(parent_line_cursor, int) or parent_line_cursor < 0:
+        parent_line_cursor = 0
+    if not isinstance(terminal_recovery_version, int) or terminal_recovery_version < 0:
+        terminal_recovery_version = 0
+    if (
+        not isinstance(legacy_terminal_recovery_watermark, int)
+        or legacy_terminal_recovery_watermark < 0
+    ):
+        legacy_terminal_recovery_watermark = None
+    pending_registration_watermarks: dict[str, tuple[int, int, str]] = {}
+    if isinstance(pending_registration_raw, dict):
+        for subagent_id, row in pending_registration_raw.items():
+            if not isinstance(subagent_id, str) or not isinstance(row, dict):
+                continue
+            child_watermark = row.get("child_watermark")
+            parent_watermark = row.get("parent_watermark")
+            registration_id = row.get("registration_id")
+            if (
+                isinstance(child_watermark, int)
+                and child_watermark >= 0
+                and isinstance(parent_watermark, int)
+                and parent_watermark >= 0
+            ):
+                pending_registration_watermarks[subagent_id] = (
+                    child_watermark,
+                    parent_watermark,
+                    registration_id
+                    if isinstance(registration_id, str) and registration_id
+                    else uuid.uuid4().hex,
+                )
+    pending_terminal_notifications: dict[str, tuple[str, str | None, bool]] = {}
+    if isinstance(pending_raw, dict):
+        for tool_use_id, row in pending_raw.items():
+            if not isinstance(tool_use_id, str) or not isinstance(row, dict):
+                continue
+            status = row.get("status")
+            output = row.get("output")
+            replayed = row.get("replayed", False)
+            if not isinstance(status, str) or status not in _SUBAGENT_TERMINAL_STATUSES:
+                continue
+            if output is not None and not isinstance(output, str):
+                output = None
+            if not isinstance(replayed, bool):
+                replayed = False
+            pending_terminal_notifications[tool_use_id] = (status, output, replayed)
     entries: dict[str, SubagentEntry] = {}
     for subagent_id, row in subagents_raw.items():
         if not isinstance(subagent_id, str) or not isinstance(row, dict):
@@ -1163,6 +1333,17 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         seen_source_ids = row.get("seen_source_ids", [])
         last_activity_ts = row.get("last_activity_ts")
         last_status = row.get("last_status")
+        tool_use_id = row.get("tool_use_id")
+        quiet_terminal_output = row.get("quiet_terminal_output")
+        terminal_status = row.get("terminal_status")
+        terminal_output = row.get("terminal_output")
+        terminal_replayed = row.get("terminal_replayed", False)
+        activity_unverified = row.get("activity_unverified", False)
+        status_reconcile_pending = row.get("status_reconcile_pending", False)
+        recovery_watermark = row.get("recovery_watermark")
+        entry_parent_recovery_watermark = row.get("parent_recovery_watermark")
+        recovery_after = row.get("recovery_after")
+        recovery_seen_source_ids = row.get("recovery_seen_source_ids", [])
         # Empty string is a valid parked sentinel written by
         # ``_forward_available_subagents`` after the start POST exhausts
         # its permanent-failure budget. Preserving it across restarts is
@@ -1181,16 +1362,63 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             last_activity_ts = None
         if last_status is not None and not isinstance(last_status, str):
             last_status = None
+        if tool_use_id is not None and not isinstance(tool_use_id, str):
+            tool_use_id = None
+        if quiet_terminal_output is not None and not isinstance(quiet_terminal_output, str):
+            quiet_terminal_output = None
+        if terminal_status not in _SUBAGENT_TERMINAL_STATUSES:
+            terminal_status = None
+        if terminal_output is not None and not isinstance(terminal_output, str):
+            terminal_output = None
+        if not isinstance(terminal_replayed, bool):
+            terminal_replayed = False
+        if not isinstance(activity_unverified, bool):
+            activity_unverified = False
+        if not isinstance(status_reconcile_pending, bool):
+            status_reconcile_pending = False
+        if not isinstance(recovery_watermark, int) or recovery_watermark < byte_offset:
+            recovery_watermark = None
+        if (
+            not isinstance(entry_parent_recovery_watermark, int)
+            or entry_parent_recovery_watermark < parent_byte_offset
+        ):
+            entry_parent_recovery_watermark = None
+        if recovery_after is not None and not isinstance(recovery_after, str):
+            recovery_after = None
+        if not isinstance(recovery_seen_source_ids, list) or not all(
+            isinstance(source_id, str) for source_id in recovery_seen_source_ids
+        ):
+            recovery_seen_source_ids = []
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
             child_conversation_id=child_id,
-            parent_subagent_id=parent_subagent_id,
+            tool_use_id=tool_use_id,
             byte_offset=byte_offset,
             seen_source_ids=tuple(seen_source_ids),
             last_activity_ts=last_activity_ts,
             last_status=last_status,
+            quiet_terminal_output=quiet_terminal_output,
+            terminal_status=terminal_status,
+            terminal_output=terminal_output,
+            terminal_replayed=terminal_replayed,
+            activity_unverified=activity_unverified,
+            status_reconcile_pending=status_reconcile_pending,
+            recovery_watermark=recovery_watermark,
+            parent_recovery_watermark=entry_parent_recovery_watermark,
+            recovery_after=recovery_after,
+            recovery_seen_source_ids=tuple(recovery_seen_source_ids),
         )
-    return SubagentForwardState(subagents=entries)
+    return SubagentForwardState(
+        subagents=entries,
+        parent_byte_offset=parent_byte_offset,
+        parent_line_cursor=parent_line_cursor,
+        pending_registration_watermarks=pending_registration_watermarks,
+        pending_terminal_notifications=pending_terminal_notifications,
+        terminal_recovery_version=(
+            terminal_recovery_version if entries else max(terminal_recovery_version, 1)
+        ),
+        legacy_terminal_recovery_watermark=legacy_terminal_recovery_watermark,
+    )
 
 
 def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState) -> None:
@@ -1206,14 +1434,44 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
         "subagents": {
             entry.subagent_id: {
                 "child_conversation_id": entry.child_conversation_id,
-                "parent_subagent_id": entry.parent_subagent_id,
+                "tool_use_id": entry.tool_use_id,
                 "byte_offset": entry.byte_offset,
                 "seen_source_ids": list(entry.seen_source_ids),
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
+                "quiet_terminal_output": entry.quiet_terminal_output,
+                "terminal_status": entry.terminal_status,
+                "terminal_output": entry.terminal_output,
+                "terminal_replayed": entry.terminal_replayed,
+                "activity_unverified": entry.activity_unverified,
+                "status_reconcile_pending": entry.status_reconcile_pending,
+                "recovery_watermark": entry.recovery_watermark,
+                "parent_recovery_watermark": entry.parent_recovery_watermark,
+                "recovery_after": entry.recovery_after,
+                "recovery_seen_source_ids": list(entry.recovery_seen_source_ids),
             }
             for entry in state.subagents.values()
         },
+        "parent_byte_offset": state.parent_byte_offset,
+        "parent_line_cursor": state.parent_line_cursor,
+        "pending_registration_watermarks": {
+            subagent_id: {
+                "child_watermark": child_watermark,
+                "parent_watermark": parent_watermark,
+                "registration_id": registration_id,
+            }
+            for subagent_id, (child_watermark, parent_watermark, registration_id) in (
+                state.pending_registration_watermarks.items()
+            )
+        },
+        "pending_terminal_notifications": {
+            tool_use_id: {"status": status, "output": output, "replayed": replayed}
+            for tool_use_id, (status, output, replayed) in (
+                state.pending_terminal_notifications.items()
+            )
+        },
+        "terminal_recovery_version": state.terminal_recovery_version,
+        "legacy_terminal_recovery_watermark": state.legacy_terminal_recovery_watermark,
         "updated_at": time.time(),
     }
     _write_json_atomic(bridge_dir / _SUBAGENT_STATE_FILE, payload)
@@ -1270,6 +1528,14 @@ def _parse_json_response(resp: httpx.Response, *, context: str) -> dict[str, obj
     return {str(key): value for key, value in payload.items()}
 
 
+@dataclass(frozen=True)
+class _ExternalSubagentStartResult:
+    """Server identity result for one native child registration."""
+
+    child_session_id: str
+    existing: bool
+
+
 async def _post_external_subagent_start(
     client: httpx.AsyncClient,
     *,
@@ -1278,10 +1544,10 @@ async def _post_external_subagent_start(
     agent_type: str,
     description: str,
     tool_use_id: str,
-) -> str:
+    registration_id: str,
+) -> _ExternalSubagentStartResult:
     """
-    POST ``external_subagent_start`` to the Omnigent server and return the
-    minted child Conversation id.
+    POST ``external_subagent_start`` and return the child identity boundary.
 
     :param client: Omnigent HTTP client.
     :param parent_session_id: Parent (claude-native) conversation id,
@@ -1295,7 +1561,10 @@ async def _post_external_subagent_start(
         e.g. ``"Investigate web UI session data flow"``.
     :param tool_use_id: Parent transcript's ``Task`` tool-use block
         id this sub-agent was spawned from, e.g. ``"toolu_..."``.
-    :returns: The Omnigent child conversation id, e.g. ``"conv_child456"``.
+    :param registration_id: Durable idempotency id reused across retries of
+        this one Host-side registration attempt.
+    :returns: Child conversation id plus whether it already existed. A Server
+        that omits ``existing`` is treated conservatively as pre-existing.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     :raises KeyError: If the server response is missing
         ``child_session_id`` — indicates a server/forwarder version
@@ -1311,6 +1580,7 @@ async def _post_external_subagent_start(
                 "agent_type": agent_type,
                 "description": description,
                 "tool_use_id": tool_use_id,
+                "registration_id": registration_id,
             },
         },
     )
@@ -1319,7 +1589,11 @@ async def _post_external_subagent_start(
     child_session_id = body.get("child_session_id")
     if not isinstance(child_session_id, str) or not child_session_id:
         raise KeyError("child_session_id")
-    return child_session_id
+    existing = body.get("existing")
+    return _ExternalSubagentStartResult(
+        child_session_id=child_session_id,
+        existing=existing if isinstance(existing, bool) else True,
+    )
 
 
 def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
@@ -1358,89 +1632,235 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     }
 
 
-def _tool_use_ids_in_transcript(
+def _freeze_complete_transcript_offset(
     transcript_path: Path,
     *,
+    agent_name: str,
     include_sidechains: bool,
-) -> set[str]:
-    """Return assistant tool-use ids from a Claude transcript.
-
-    A partial trailing record is ignored because Claude may still be writing it;
-    the next watcher poll reads the completed record.
-
-    :param transcript_path: Claude JSONL transcript to inspect.
-    :param include_sidechains: Whether records mirrored from child agents
-        belong to this transcript owner.
-    :returns: Tool-use ids owned by this transcript.
-    """
+) -> int:
+    """Return the complete-record EOF frozen at function entry."""
     try:
-        # ``errors="replace"`` tolerates a snapshot that ends mid-multibyte char
-        # while Claude is writing; the mangled tail line fails JSON parse below
-        # and is skipped, and the completed record is read on the next poll.
-        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        raw_end = transcript_path.stat().st_size
     except OSError:
-        return set()
-    tool_use_ids: set[str] = set()
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(record, dict):
-            continue
-        if record.get("isSidechain") is True and not include_sidechains:
-            continue
-        message = record.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
-            # Restricting to it keeps an unrelated tool-use id collision from
-            # making a legitimate spawn look ambiguous.
-            if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
-                continue
-            tool_use_id = block.get("id")
-            if isinstance(tool_use_id, str) and tool_use_id:
-                tool_use_ids.add(tool_use_id)
-    return tool_use_ids
+        raw_end = 0
+    return read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name=agent_name,
+        include_sidechains=include_sidechains,
+        end_offset=raw_end,
+    ).byte_offset
 
 
-def _subagent_parents_by_tool_use(
-    transcript_path: Path,
-    subagents_dir: Path,
-) -> dict[str, str | None]:
-    """Correlate Claude spawn tool ids to their immediate transcript owner.
-
-    Reads the root transcript and every ``agent-*.jsonl`` in full. The caller
-    only invokes this when unregistered meta files exist, so idle sessions pay
-    nothing. The common case is a transient spawn burst; the exception is an
-    orphan meta whose spawn record never lands, which keeps the transcripts
-    re-read on every poll until it appears (or the process restarts).
-    """
-    owners: dict[str, str | None] = {}
-    ambiguous: set[str] = set()
-    transcript_owners: list[tuple[Path, str | None]] = [(transcript_path, None)]
-    transcript_owners.extend(
-        (path, _subagent_id_from_meta_path(path))
-        for path in sorted(subagents_dir.glob("agent-*.jsonl"))
+async def _post_external_recovery_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    item: ClaudeTranscriptItem,
+    recovery_after: str | None,
+) -> str:
+    """Reconcile one frozen historical item and return its Server item id."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": item.item_type,
+                "item_data": item.data,
+                "response_id": item.response_id,
+                "source_id": item.source_id,
+                "recovery_after": recovery_after,
+            },
+        },
     )
-    for path, owner_id in transcript_owners:
-        for tool_use_id in _tool_use_ids_in_transcript(
-            path,
-            include_sidechains=owner_id is not None,
+    resp.raise_for_status()
+    body = _parse_json_response(resp, context="sub-agent history recovery")
+    item_id = body.get("item_id")
+    if (
+        not isinstance(item_id, str)
+        or not item_id
+        or body.get("replayed") is not True
+        or body.get("recovery") is not True
+    ):
+        raise RuntimeError("sub-agent history recovery response did not confirm the chain")
+    return item_id
+
+
+def _subagent_quiet_terminal_output(item: ClaudeTranscriptItem) -> str | None:
+    """Return final-answer text only when this item is terminal-shaped.
+
+    Every non-assistant item clears the fallback candidate. In particular, a
+    tool result after an opening sentence must remain ``running`` until Claude
+    writes a final assistant answer or the parent records a task notification.
+    """
+    if item.item_type != "message":
+        return None
+    if item.data.get("role") != "assistant" or item.data.get("is_meta") is True:
+        return None
+    content = item.data.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        text
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "output_text"
+        and isinstance((text := block.get("text")), str)
+        and text
+    ]
+    output = "\n".join(parts).strip()
+    return output or None
+
+
+def _structured_terminal_evidence(
+    result: TranscriptReadResult,
+) -> dict[str, tuple[str, str | None]]:
+    """Return terminal Agent/Task outcomes from one frozen transcript read.
+
+    Historical prose, a quiet file, and an ordinary tool result are not
+    lifecycle evidence.  The only accepted sources are bridge-parsed native
+    task notifications or a correlated Agent/Task call plus output carrying an
+    explicit terminal ``tool_status``.
+    """
+    evidence: dict[str, tuple[str, str | None]] = {}
+    for notification in result.task_notifications:
+        status = notification.status
+        if (
+            notification.tool_use_id is not None
+            and isinstance(status, str)
+            and status in _SUBAGENT_TERMINAL_STATUSES
         ):
-            if tool_use_id in owners and owners[tool_use_id] != owner_id:
-                ambiguous.add(tool_use_id)
-            else:
-                owners[tool_use_id] = owner_id
-    for tool_use_id in ambiguous:
-        owners.pop(tool_use_id, None)
-    return owners
+            evidence[notification.tool_use_id] = (
+                status,
+                notification.result,
+            )
+
+    agent_calls = {
+        call_id
+        for item in result.items
+        if item.item_type == "function_call"
+        and item.data.get("name") in {"Agent", "Task"}
+        and isinstance((call_id := item.data.get("call_id")), str)
+        and call_id
+    }
+    for item in result.items:
+        if item.item_type != "function_call_output":
+            continue
+        call_id = item.data.get("call_id")
+        status = item.data.get("tool_status")
+        if (
+            not isinstance(call_id, str)
+            or call_id not in agent_calls
+            or not isinstance(status, str)
+            or status not in _SUBAGENT_TERMINAL_STATUSES
+        ):
+            continue
+        raw_output = item.data.get("output")
+        evidence[call_id] = (
+            status,
+            raw_output if isinstance(raw_output, str) and raw_output else None,
+        )
+    return evidence
+
+
+async def _prepare_legacy_subagent_terminal_recovery(
+    *,
+    bridge_dir: Path,
+    transcript_path: Path,
+    state: SubagentForwardState,
+    agent_name: str,
+) -> SubagentForwardState:
+    """Classify pre-migration children from terminal-only parent history.
+
+    The frozen prefix is inspected once and never forwarded as conversation
+    items.  This fixes durable legacy ``last_status=running`` snapshots after a
+    Host restart without duplicating the old prompt or restarting a child.
+    Delivery acknowledgement remains per entry, so a failed status POST is
+    retried independently of the completed scan.
+    """
+    if state.terminal_recovery_version >= 1:
+        return state
+    try:
+        transcript_size = transcript_path.stat().st_size
+        with transcript_path.open("rb") as handle:
+            handle.read(1)
+    except OSError:
+        return state
+    watermark = state.legacy_terminal_recovery_watermark
+    updated = state
+    froze_now = watermark is None or (watermark == 0 and transcript_size > 0)
+    if froze_now:
+        watermark = await asyncio.to_thread(
+            _freeze_complete_transcript_offset,
+            transcript_path,
+            agent_name=agent_name,
+            include_sidechains=False,
+        )
+    if froze_now and watermark < transcript_size:
+        # A trailing record is incomplete. Do not burn the one-time migration
+        # while Claude is still writing the terminal evidence it may contain.
+        return replace(updated, legacy_terminal_recovery_watermark=None)
+    updated = replace(updated, legacy_terminal_recovery_watermark=watermark)
+    await _write_subagent_forward_state_async(bridge_dir, updated)
+    try:
+        historical = await asyncio.to_thread(
+            read_transcript_items_from_offset,
+            transcript_path,
+            0,
+            start_line=0,
+            agent_name=agent_name,
+            current_response_id=None,
+            include_sidechains=False,
+            end_offset=watermark,
+        )
+    except (OSError, ValueError):
+        _logger.warning(
+            "Could not scan frozen parent transcript for legacy sub-agent terminal evidence; "
+            "bridge_dir=%s watermark=%s",
+            bridge_dir,
+            watermark,
+            exc_info=True,
+        )
+        return updated
+
+    evidence = _structured_terminal_evidence(historical)
+    entries: dict[str, SubagentEntry] = {}
+    for subagent_id, entry in updated.subagents.items():
+        terminal = evidence.get(entry.tool_use_id) if entry.tool_use_id is not None else None
+        if terminal is not None:
+            status, output = terminal
+            entries[subagent_id] = replace(
+                entry,
+                terminal_status=status,
+                terminal_output=output,
+                terminal_replayed=True,
+                activity_unverified=False,
+                status_reconcile_pending=True,
+            )
+        elif entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES:
+            entries[subagent_id] = replace(
+                entry,
+                terminal_replayed=True,
+                activity_unverified=False,
+                status_reconcile_pending=True,
+            )
+        elif entry.last_status in {"running", "waiting"}:
+            entries[subagent_id] = replace(
+                entry,
+                activity_unverified=True,
+                status_reconcile_pending=True,
+            )
+        else:
+            entries[subagent_id] = entry
+    updated = replace(
+        updated,
+        subagents=entries,
+        terminal_recovery_version=1,
+        legacy_terminal_recovery_watermark=None,
+    )
+    await _write_subagent_forward_state_async(bridge_dir, updated)
+    return updated
 
 
 async def _forward_available_subagents(
@@ -1457,8 +1877,8 @@ async def _forward_available_subagents(
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
-    conversations for them, tail their transcripts, and publish
-    quiescence-based status.
+    conversations for them, tail their transcripts, and publish status from
+    structured task notifications with a conservative transcript fallback.
 
     Idempotent across forwarder restarts: ``state`` (persisted to
     ``subagent_forwarder.json``) holds the Omnigent child id and byte
@@ -1486,46 +1906,90 @@ async def _forward_available_subagents(
         existing sub-agents' cursors advanced.
     """
     subagents_dir = _subagents_dir_for_transcript(transcript_path)
-    if not subagents_dir.is_dir():
-        return state
+
+    # Existing rows from the old schema may lack the correlation id. Recover
+    # it before the one-time parent scan; otherwise explicit historical
+    # terminal evidence would be missed forever.
+    pre_migration = state
+    for subagent_id, entry in list(pre_migration.subagents.items()):
+        if entry.tool_use_id is not None:
+            continue
+        meta = await asyncio.to_thread(
+            _read_subagent_meta, subagents_dir / f"agent-{subagent_id}.meta.json"
+        )
+        if meta is None:
+            continue
+        pre_migration = replace(
+            pre_migration,
+            subagents={
+                **pre_migration.subagents,
+                subagent_id: replace(entry, tool_use_id=meta["toolUseId"]),
+            },
+        )
+    if pre_migration != state:
+        await _write_subagent_forward_state_async(bridge_dir, pre_migration)
+
+    updated = await _prepare_legacy_subagent_terminal_recovery(
+        bridge_dir=bridge_dir,
+        transcript_path=transcript_path,
+        state=pre_migration,
+        agent_name=agent_name,
+    )
 
     # ── Register newly-appeared sub-agents ──────────────
     # ``glob`` is sync; offload to a thread so we don't stat the
     # filesystem on the event loop.
     meta_paths = await asyncio.to_thread(lambda: sorted(subagents_dir.glob(_SUBAGENT_META_GLOB)))
-    updated = state
-    candidate_meta_paths = [
-        path
-        for path in meta_paths
-        if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
-        and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
-    ]
-    parents_by_tool_use = (
-        await asyncio.to_thread(
-            _subagent_parents_by_tool_use,
-            transcript_path,
-            subagents_dir,
-        )
-        if candidate_meta_paths
-        else {}
-    )
-    pending: list[tuple[Path, dict[str, str], str | None]] = []
-    for meta_path in candidate_meta_paths:
+    for meta_path in meta_paths:
+        # ``agent-<id>.meta.json`` → ``<id>``
+        subagent_id = meta_path.stem.removeprefix("agent-").removesuffix(".meta")
+        if subagent_id in updated.subagents:
+            continue
+        retry_key = f"subagent_start:{subagent_id}"
+        if start_retry_tracker.retry_delay_s(retry_key) is not None:
+            continue
         meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
         if meta is None:
             continue
-        tool_use_id = meta["toolUseId"]
-        if tool_use_id not in parents_by_tool_use:
-            # No transcript owns this spawn yet: the record is still mid-write, or
-            # it resolved to two owners and was dropped as ambiguous. Either way we
-            # retry next tick; log so a persistent miss (e.g. a transcript-format
-            # drift) is diagnosable rather than silent.
-            _logger.debug(
-                "Deferring claude-native sub-agent with no resolved parent; "
-                "parent_session=%s subagent_id=%s tool_use_id=%s",
-                parent_session_id,
-                _subagent_id_from_meta_path(meta_path),
-                tool_use_id,
+        registration_watermarks = updated.pending_registration_watermarks.get(subagent_id)
+        if registration_watermarks is None:
+            child_watermark, parent_watermark = await asyncio.gather(
+                asyncio.to_thread(
+                    _freeze_complete_transcript_offset,
+                    subagents_dir / f"agent-{subagent_id}.jsonl",
+                    agent_name=agent_name,
+                    include_sidechains=True,
+                ),
+                asyncio.to_thread(
+                    _freeze_complete_transcript_offset,
+                    transcript_path,
+                    agent_name=agent_name,
+                    include_sidechains=False,
+                ),
+            )
+            registration_watermarks = (
+                child_watermark,
+                parent_watermark,
+                uuid.uuid4().hex,
+            )
+            updated = replace(
+                updated,
+                pending_registration_watermarks={
+                    **updated.pending_registration_watermarks,
+                    subagent_id: registration_watermarks,
+                },
+            )
+            await _write_subagent_forward_state_async(bridge_dir, updated)
+        _child_watermark, _parent_watermark, registration_id = registration_watermarks
+        try:
+            start_result = await _post_external_subagent_start(
+                client,
+                parent_session_id=parent_session_id,
+                subagent_id=subagent_id,
+                agent_type=meta["agentType"],
+                description=meta["description"],
+                tool_use_id=meta["toolUseId"],
+                registration_id=registration_id,
             )
             continue
         pending.append((meta_path, meta, parents_by_tool_use[tool_use_id]))
@@ -1635,6 +2099,45 @@ async def _forward_available_subagents(
                     exc_info=True,
                     extra={"session_id": immediate_parent_session_id},
                 )
+                # Dead-letter the dropped payload for recovery (#1120; replay #1579).
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=parent_session_id,
+                    event_type="external_subagent_start",
+                    payload={
+                        "subagent_id": subagent_id,
+                        "agent_type": meta["agentType"],
+                        "description": meta["description"],
+                        "tool_use_id": meta["toolUseId"],
+                        "registration_id": registration_id,
+                    },
+                    reason="permanent HTTP failure after retries",
+                    # Claude only dead-letters permanent 4xx (it retries
+                    # transient failures forever), so the server proved it
+                    # rejected the item: never ambiguous, never replayable (#1579).
+                    delivered_ambiguous=False,
+                    http_status=_http_status_for_log(exc),
+                )
+                # Park this sub-agent: insert a sentinel entry so we
+                # don't keep retrying. ``child_conversation_id=""``
+                # is filtered out by the tail / status loops below.
+                updated = replace(
+                    updated,
+                    subagents={
+                        **updated.subagents,
+                        subagent_id: SubagentEntry(
+                            subagent_id=subagent_id,
+                            child_conversation_id="",
+                            tool_use_id=meta["toolUseId"],
+                        ),
+                    },
+                    pending_registration_watermarks={
+                        key: value
+                        for key, value in updated.pending_registration_watermarks.items()
+                        if key != subagent_id
+                    },
+                )
+                await _write_subagent_forward_state_async(bridge_dir, updated)
                 continue
             start_retry_tracker.clear(retry_key)
             updated = SubagentForwardState(
@@ -1647,21 +2150,141 @@ async def _forward_available_subagents(
                     ),
                 }
             )
-            await _write_subagent_forward_state_async(bridge_dir, updated)
-            made_progress = True
-        if not made_progress:
-            # A full pass registered nothing: every deferred child is waiting on a
-            # parent we haven't seen on disk yet. Retry next tick; log the stuck
-            # set so a parent that never arrives doesn't strand children silently.
-            if deferred:
-                _logger.debug(
-                    "Deferring claude-native sub-agents whose parent is not yet "
-                    "registered; parent_session=%s pending=%s",
-                    parent_session_id,
-                    [_subagent_id_from_meta_path(path) for path, _, _ in deferred],
+            continue
+        start_retry_tracker.clear(retry_key)
+        child_watermark, parent_watermark, _registration_id = registration_watermarks
+        pending_registration_watermarks = dict(updated.pending_registration_watermarks)
+        pending_registration_watermarks.pop(subagent_id, None)
+        updated = replace(
+            updated,
+            subagents={
+                **updated.subagents,
+                subagent_id: SubagentEntry(
+                    subagent_id=subagent_id,
+                    child_conversation_id=start_result.child_session_id,
+                    tool_use_id=meta["toolUseId"],
+                    recovery_watermark=(child_watermark if start_result.existing else None),
+                    parent_recovery_watermark=(
+                        parent_watermark
+                        if start_result.existing and parent_watermark > updated.parent_byte_offset
+                        else None
+                    ),
+                ),
+            },
+            pending_registration_watermarks=pending_registration_watermarks,
+        )
+        await _write_subagent_forward_state_async(bridge_dir, updated)
+
+    parent_state_before_scan = updated
+    # Older durable rows predate ``tool_use_id``. Recover it from the still-
+    # canonical meta file so a completion notification can be correlated after
+    # a forwarder restart or in-place upgrade.
+    for subagent_id, entry in list(updated.subagents.items()):
+        if entry.tool_use_id is not None:
+            continue
+        meta = await asyncio.to_thread(
+            _read_subagent_meta, subagents_dir / f"agent-{subagent_id}.meta.json"
+        )
+        if meta is None:
+            continue
+        recovered = replace(entry, tool_use_id=meta["toolUseId"])
+        updated = replace(updated, subagents={**updated.subagents, subagent_id: recovered})
+
+    # Task notifications live in the PARENT transcript, not the child JSONL.
+    # Tail them with an independent durable cursor: the ordinary transcript
+    # cursor may already have advanced when terminal delivery is retried after a
+    # disconnect/restart. Re-reading from zero once upgrades legacy state safely.
+    parent_result: TranscriptReadResult | None = None
+    recovery_boundaries = sorted(
+        {
+            entry.parent_recovery_watermark
+            for entry in updated.subagents.values()
+            if entry.parent_recovery_watermark is not None
+            and entry.parent_recovery_watermark > updated.parent_byte_offset
+        }
+    )
+    parent_recovery = recovery_boundaries[0] if recovery_boundaries else None
+    # Do not consume the parent baseline while a child registration outcome is
+    # unknown: an eventual ``existing=true`` must still be able to mark old XML
+    # terminal notifications as replayed.
+    if not updated.pending_registration_watermarks:
+        parent_result = await asyncio.to_thread(
+            read_transcript_items_from_offset,
+            transcript_path,
+            updated.parent_byte_offset,
+            start_line=updated.parent_line_cursor,
+            agent_name=agent_name,
+            end_offset=parent_recovery,
+        )
+    pending_notifications = dict(updated.pending_terminal_notifications)
+    for notification in () if parent_result is None else parent_result.task_notifications:
+        status = notification.status
+        if (
+            notification.tool_use_id is not None
+            and isinstance(status, str)
+            and status in _SUBAGENT_TERMINAL_STATUSES
+        ):
+            matching_entry = next(
+                (
+                    entry
+                    for entry in updated.subagents.values()
+                    if entry.tool_use_id == notification.tool_use_id
+                ),
+                None,
+            )
+            replayed_for_child = (
+                parent_recovery is not None
+                and matching_entry is not None
+                and matching_entry.parent_recovery_watermark is not None
+                and matching_entry.parent_recovery_watermark >= parent_recovery
+            )
+            pending_notifications[notification.tool_use_id] = (
+                status,
+                notification.result,
+                notification.replayed or replayed_for_child,
+            )
+    if pending_notifications:
+        entries = dict(updated.subagents)
+        for subagent_id, entry in entries.items():
+            if entry.tool_use_id is None:
+                continue
+            notification = pending_notifications.pop(entry.tool_use_id, None)
+            if notification is None:
+                continue
+            terminal_status, terminal_output, terminal_replayed = notification
+            entries[subagent_id] = replace(
+                entry,
+                terminal_status=terminal_status,
+                terminal_output=terminal_output,
+                terminal_replayed=terminal_replayed,
+                activity_unverified=False,
+            )
+        updated = replace(
+            updated,
+            subagents=entries,
+            pending_terminal_notifications=pending_notifications,
+        )
+    if parent_result is not None and (
+        parent_result.byte_offset != updated.parent_byte_offset
+        or parent_result.line_cursor != updated.parent_line_cursor
+        or parent_recovery is not None
+    ):
+        updated = replace(
+            updated,
+            parent_byte_offset=parent_result.byte_offset,
+            parent_line_cursor=parent_result.line_cursor,
+            subagents={
+                subagent_id: (
+                    replace(entry, parent_recovery_watermark=None)
+                    if entry.parent_recovery_watermark is not None
+                    and entry.parent_recovery_watermark <= parent_result.byte_offset
+                    else entry
                 )
-            break
-        pending = deferred
+                for subagent_id, entry in updated.subagents.items()
+            },
+        )
+    if updated != parent_state_before_scan:
+        await _write_subagent_forward_state_async(bridge_dir, updated)
 
     # ── Tail each tracked sub-agent's transcript ────────
     now = time.time()
@@ -1671,7 +2294,135 @@ async def _forward_available_subagents(
             continue
         jsonl_path = subagents_dir / f"agent-{subagent_id}.jsonl"
         if not jsonl_path.exists():
+            if entry.status_reconcile_pending:
+                desired_status = (
+                    entry.terminal_status
+                    if entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES
+                    else "activity_unverified"
+                    if entry.activity_unverified
+                    else None
+                )
+                if desired_status is not None:
+                    retry_key = f"subagent_status:{entry.child_conversation_id}"
+                    if status_retry_tracker.retry_delay_s(retry_key) is None:
+                        try:
+                            await post_external_session_status(
+                                client,
+                                session_id=entry.child_conversation_id,
+                                status=desired_status,
+                                output=(
+                                    entry.terminal_output
+                                    if desired_status in _SUBAGENT_TERMINAL_STATUSES
+                                    else None
+                                ),
+                                replayed=True,
+                            )
+                        except httpx.HTTPError as exc:
+                            status_retry_tracker.record_failure(retry_key, exc)
+                            _logger.warning(
+                                "Failed to reconcile legacy Claude sub-agent status; "
+                                "child=%s status=%s",
+                                entry.child_conversation_id,
+                                desired_status,
+                                exc_info=True,
+                            )
+                        else:
+                            status_retry_tracker.clear(retry_key)
+                            entry = replace(
+                                entry,
+                                last_status=desired_status,
+                                status_reconcile_pending=False,
+                            )
+                            updated = replace(
+                                updated,
+                                subagents={**updated.subagents, subagent_id: entry},
+                            )
+                            await _write_subagent_forward_state_async(bridge_dir, updated)
             continue
+        if entry.recovery_watermark is not None:
+            recovery_watermark = entry.recovery_watermark
+            recovery_result = await asyncio.to_thread(
+                read_transcript_items_from_offset,
+                jsonl_path,
+                0,
+                start_line=0,
+                agent_name=agent_name,
+                current_response_id=None,
+                include_sidechains=True,
+                end_offset=recovery_watermark,
+            )
+            recovery_seen = set(entry.recovery_seen_source_ids)
+            unmatched = [
+                item for item in recovery_result.items if item.source_id not in recovery_seen
+            ]
+            recovery_blocked = False
+            for item in unmatched[:_SUBAGENT_RECOVERY_BATCH_ITEMS]:
+                retry_key = f"subagent_recovery:{entry.child_conversation_id}:{item.source_id}"
+                if item_retry_tracker.retry_delay_s(retry_key) is not None:
+                    recovery_blocked = True
+                    break
+                try:
+                    recovery_item_id = await _post_external_recovery_item(
+                        client,
+                        session_id=entry.child_conversation_id,
+                        item=item,
+                        recovery_after=entry.recovery_after,
+                    )
+                except httpx.HTTPError as exc:
+                    decision = item_retry_tracker.record_failure(retry_key, exc)
+                    _logger.warning(
+                        "Claude sub-agent history reconciliation held; child=%s "
+                        "source_id=%s attempt=%s http_status=%s",
+                        entry.child_conversation_id,
+                        item.source_id,
+                        decision.attempts,
+                        _http_status_for_log(exc),
+                        exc_info=True,
+                    )
+                    recovery_blocked = True
+                    break
+                except RuntimeError:
+                    _logger.warning(
+                        "Claude sub-agent history reconciliation was not confirmed; "
+                        "child=%s source_id=%s",
+                        entry.child_conversation_id,
+                        item.source_id,
+                        exc_info=True,
+                    )
+                    recovery_blocked = True
+                    break
+                item_retry_tracker.clear(retry_key)
+                recovery_seen.add(item.source_id)
+                entry = replace(
+                    entry,
+                    recovery_after=recovery_item_id,
+                    recovery_seen_source_ids=(*entry.recovery_seen_source_ids, item.source_id),
+                )
+                updated = replace(
+                    updated,
+                    subagents={**updated.subagents, subagent_id: entry},
+                )
+                await _write_subagent_forward_state_async(bridge_dir, updated)
+            recovery_complete = not recovery_blocked and all(
+                item.source_id in recovery_seen for item in recovery_result.items
+            )
+            if not recovery_complete:
+                continue
+            entry = replace(
+                entry,
+                byte_offset=recovery_watermark,
+                seen_source_ids=_bounded_seen_source_ids(
+                    [*entry.seen_source_ids, *entry.recovery_seen_source_ids]
+                ),
+                recovery_watermark=None,
+                recovery_after=None,
+                recovery_seen_source_ids=(),
+            )
+            updated = replace(
+                updated,
+                subagents={**updated.subagents, subagent_id: entry},
+            )
+            await _write_subagent_forward_state_async(bridge_dir, updated)
         # Reuse the parent-transcript parser, but pass
         # ``include_sidechains=True`` — every record in a sub-agent's
         # own ``agent-<id>.jsonl`` carries ``isSidechain: true``
@@ -1703,7 +2454,7 @@ async def _forward_available_subagents(
                 items_failed = True
                 break
             try:
-                await _post_external_conversation_item(
+                is_new_item = await _post_external_conversation_item(
                     client,
                     session_id=entry.child_conversation_id,
                     item=item,
@@ -1747,9 +2498,10 @@ async def _forward_available_subagents(
                         new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
+                        quiet_terminal_output=_subagent_quiet_terminal_output(item),
                     )
-                    updated = SubagentForwardState(
-                        subagents={**updated.subagents, subagent_id: new_entry}
+                    updated = replace(
+                        updated, subagents={**updated.subagents, subagent_id: new_entry}
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
@@ -1773,9 +2525,10 @@ async def _forward_available_subagents(
                         new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
+                        quiet_terminal_output=_subagent_quiet_terminal_output(item),
                     )
-                    updated = SubagentForwardState(
-                        subagents={**updated.subagents, subagent_id: new_entry}
+                    updated = replace(
+                        updated, subagents={**updated.subagents, subagent_id: new_entry}
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
@@ -1799,23 +2552,29 @@ async def _forward_available_subagents(
                 items_failed = True
                 break
             item_retry_tracker.clear(retry_key)
-            had_item = True
+            had_item = had_item or is_new_item
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
             new_entry = replace(
                 new_entry,
-                byte_offset=entry.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                last_activity_ts=now,
+                last_activity_ts=now if is_new_item else new_entry.last_activity_ts,
+                quiet_terminal_output=_subagent_quiet_terminal_output(item),
+                activity_unverified=False if is_new_item else new_entry.activity_unverified,
+                status_reconcile_pending=(
+                    True
+                    if is_new_item and new_entry.activity_unverified
+                    else new_entry.status_reconcile_pending
+                ),
             )
-            updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
+            updated = replace(updated, subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
         # Only advance the cursor when every item this tick was
         # posted successfully (or there were no items at all).
         # Advancing past a failed item permanently skips it.
         if not items_failed and (result.byte_offset != entry.byte_offset or had_item):
             new_entry = replace(
-                entry,
+                new_entry,
                 byte_offset=result.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now if had_item else entry.last_activity_ts,
@@ -1826,26 +2585,32 @@ async def _forward_available_subagents(
             # but leave byte_offset at the previous tick's value so
             # the failed items get retried.
             new_entry = replace(
-                entry,
+                new_entry,
+                byte_offset=entry.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
             )
 
-        # Quiescence-based status. Sub-agent transcripts don't carry
-        # an explicit "done" record (Claude doesn't expose one), so
-        # we infer "running" from item flow and "idle" from quiet
-        # time. The dedupe on ``last_status`` avoids spamming the
-        # cache on every tick when nothing changed.
+        # Structured parent notifications are authoritative. Transcript silence
+        # is not a completion signal: an assistant can emit text before another
+        # tool call, so settling from a quiet timer can deliver a false result.
         desired_status: str | None = None
-        if had_item:
+        desired_output: str | None = None
+        desired_replayed = False
+        if new_entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES:
+            desired_status = new_entry.terminal_status
+            desired_output = new_entry.terminal_output
+            desired_replayed = new_entry.terminal_replayed
+        elif new_entry.activity_unverified:
+            desired_status = "activity_unverified"
+            desired_replayed = True
+        elif new_entry.last_status in _SUBAGENT_TERMINAL_STATUSES:
+            desired_status = None
+        elif had_item:
             desired_status = "running"
-        elif (
-            new_entry.last_activity_ts is not None
-            and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
-            and new_entry.last_status != "idle"
+        if desired_status is not None and (
+            desired_status != new_entry.last_status or new_entry.status_reconcile_pending
         ):
-            desired_status = "idle"
-        if desired_status is not None and desired_status != new_entry.last_status:
             retry_key = f"subagent_status:{entry.child_conversation_id}"
             if status_retry_tracker.retry_delay_s(retry_key) is None:
                 try:
@@ -1853,26 +2618,62 @@ async def _forward_available_subagents(
                         client,
                         session_id=entry.child_conversation_id,
                         status=desired_status,
+                        output=desired_output,
+                        replayed=desired_replayed,
                     )
                 except httpx.HTTPError as exc:
                     decision = status_retry_tracker.record_failure(retry_key, exc)
-                    _logger.warning(
-                        "Failed to forward claude-native sub-agent status; "
-                        "child=%s status=%s attempt=%s next_retry_s=%.3f "
-                        "http_status=%s",
-                        entry.child_conversation_id,
-                        desired_status,
-                        decision.attempts,
-                        decision.delay_s,
-                        _http_status_for_log(exc),
-                        exc_info=True,
-                    )
+                    if decision.exhausted:
+                        _logger.error(
+                            "Dropping claude-native sub-agent status after bounded "
+                            "delivery failures; child=%s status=%s attempts=%s "
+                            "http_status=%s",
+                            entry.child_conversation_id,
+                            desired_status,
+                            decision.attempts,
+                            _http_status_for_log(exc),
+                            exc_info=True,
+                        )
+                        append_dead_letter(
+                            bridge_dir,
+                            session_id=entry.child_conversation_id,
+                            event_type="external_session_status",
+                            payload={
+                                "status": desired_status,
+                                "output": desired_output,
+                                **({"replayed": True} if desired_replayed else {}),
+                            },
+                            reason="terminal status delivery not confirmed after retries",
+                            delivered_ambiguous=False,
+                            http_status=_http_status_for_log(exc),
+                        )
+                        new_entry = replace(
+                            new_entry,
+                            last_status=desired_status,
+                            status_reconcile_pending=False,
+                        )
+                    else:
+                        _logger.warning(
+                            "Failed to forward claude-native sub-agent status; "
+                            "child=%s status=%s attempt=%s next_retry_s=%.3f "
+                            "http_status=%s",
+                            entry.child_conversation_id,
+                            desired_status,
+                            decision.attempts,
+                            decision.delay_s,
+                            _http_status_for_log(exc),
+                            exc_info=True,
+                        )
                 else:
                     status_retry_tracker.clear(retry_key)
-                    new_entry = replace(new_entry, last_status=desired_status)
+                    new_entry = replace(
+                        new_entry,
+                        last_status=desired_status,
+                        status_reconcile_pending=False,
+                    )
 
         if new_entry is not entry:
-            updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
+            updated = replace(updated, subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
 
     return updated
@@ -2763,6 +3564,54 @@ def reset_transcript_forward_state(bridge_dir: Path, *, reset_hooks: bool = True
             (bridge_dir / filename).unlink()
 
 
+def prepare_transcript_forward_state_for_resume(
+    bridge_dir: Path,
+    transcript_path: Path,
+    *,
+    session_id: str,
+) -> bool:
+    """
+    Preserve a valid resume cursor or seed an invalid one at transcript EOF.
+
+    Local Claude transcripts are authoritative on cold resume.  Their durable
+    forwarding cursor is equally important: a valid cursor catches up any
+    locally-written tail, while an invalid cursor must not replay ambiguous
+    history.  In the latter case this function retains the transcript for
+    Claude, replaces only the cursor with an EOF cursor, and returns ``False``
+    so the caller can surface degraded synchronization to the user.
+
+    :returns: ``True`` only when the existing path, offset, and fingerprint
+        were all valid and the state was preserved unchanged.
+    """
+    state = _read_forward_state(bridge_dir)
+    if (
+        state is not None
+        and state.transcript_path == transcript_path
+        and state.byte_offset is not None
+        and state.cursor_fingerprint is not None
+    ):
+        validated = _validated_transcript_state(
+            state,
+            bridge_dir=bridge_dir,
+            session_id=session_id,
+        )
+        if validated == state:
+            return True
+
+    reset_transcript_forward_state(bridge_dir)
+    byte_offset = _transcript_end_offset(transcript_path)
+    _write_forward_state(
+        bridge_dir,
+        TranscriptForwardState(
+            transcript_path=transcript_path,
+            line_cursor=0,
+            byte_offset=byte_offset,
+            cursor_fingerprint=_jsonl_cursor_fingerprint(transcript_path, byte_offset),
+        ),
+    )
+    return False
+
+
 async def _ensure_hook_state(
     bridge_dir: Path,
     *,
@@ -2910,11 +3759,11 @@ async def _forward_available_status_events(
         )
         # Subagent lifecycle hooks land in the same hooks.jsonl as parent
         # events because subagent processes inherit the parent's hook
-        # settings. With running/idle now PTY-derived, the only mapped
-        # status left is ``StopFailure`` → ``failed``: a subagent's
-        # failure must NOT flip the parent session to ``failed`` — the
-        # parent turn is still running while it awaits the Agent tool
-        # result.
+        # settings. Parent ``Stop`` remains the authoritative turn-end idle
+        # edge (including response-id settle and shell tally); PTY activity
+        # owns only running transitions. A child ``Stop``/``StopFailure`` must
+        # not flip the parent: child completion is correlated separately by
+        # the subagent watcher via the parent's structured task notification.
         if status is not None and _is_subagent_hook_record(record):
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
@@ -2970,13 +3819,11 @@ async def _forward_available_status_events(
                         event_cursor=record.event_cursor,
                     )
                 elif compaction_status == "completed":
-                    # Secondary, best-effort persist. The transcript's
-                    # ``isCompactSummary`` record is the primary, durable
-                    # persister (it carries the summary text and always
-                    # fires — this hook is flaky). Persist here if the
-                    # pending token is still unconsumed; on failure leave the
-                    # token set so the transcript path still completes it.
-                    seq = await _consume_pending_compaction(
+                    # This hook acknowledges that Claude resumed after
+                    # compaction; it does not authorize an immediate SDK
+                    # snapshot. Give the authoritative transcript summary a
+                    # bounded durability window before fallback.
+                    await _acknowledge_compaction_completion(
                         bridge_dir,
                         claude_session_id=record.claude_session_id,
                         transcript_path=(
@@ -2985,97 +3832,6 @@ async def _forward_available_status_events(
                             else None
                         ),
                     )
-                    if seq is None:
-                        # No pending token: either the transcript path already
-                        # persisted this boundary (a trailing ack to absorb),
-                        # or the ``PreCompact`` was dropped / the forwarder
-                        # attached after it fired. The legacy
-                        # standalone-completion safety must still persist
-                        # exactly one boundary in the latter case, or resume
-                        # reloads the full pre-compaction history.
-                        seq = await _claim_standalone_completion(bridge_dir)
-                    if seq is not None:
-                        # Persist the boundary with the SAME hold-cursor +
-                        # backoff discipline as the transcript path (P2-2). A
-                        # transient POST failure must not advance past this
-                        # completion hook and lose the boundary: for a genuine
-                        # hook-only standalone compaction no transcript summary
-                        # will ever arrive to retry it. Hold the hook cursor at
-                        # this record and retry next poll; the pending token
-                        # (minted here or by ``_claim_standalone_completion``)
-                        # makes the retry idempotent — the re-seen hook
-                        # re-consumes the same seq rather than minting a new
-                        # one. Exhausted permanent failures drop the boundary
-                        # and advance so a hard rejection can't wedge the hook
-                        # stream forever.
-                        retry_key = f"compaction-hook:{record.event_cursor}"
-                        if retry_tracker.retry_delay_s(retry_key) is not None:
-                            return durable
-                        try:
-                            await _persist_native_compaction_item(
-                                client,
-                                session_id=session_id,
-                                bridge_dir=bridge_dir,
-                            )
-                        except httpx.HTTPError as exc:
-                            if post_may_have_been_delivered(exc):
-                                # Ambiguous delivery: the boundary may already
-                                # be committed. Mark persisted and advance
-                                # rather than risk a duplicate on retry.
-                                _logger.warning(
-                                    "Ambiguous compaction boundary POST (hook path) for %s "
-                                    "(may be committed); marking persisted to avoid a "
-                                    "duplicate boundary; seq=%s",
-                                    session_id,
-                                    seq,
-                                    exc_info=True,
-                                )
-                                retry_tracker.clear(retry_key)
-                                await _mark_compaction_persisted(bridge_dir, seq)
-                            else:
-                                decision = retry_tracker.record_failure(retry_key, exc)
-                                if decision.exhausted:
-                                    _logger.error(
-                                        "Dropping compaction boundary (hook path) after "
-                                        "permanent HTTP failures; session=%s seq=%s "
-                                        "attempts=%s http_status=%s; leaving pending "
-                                        "token for a possible transcript-path retry",
-                                        session_id,
-                                        seq,
-                                        decision.attempts,
-                                        _http_status_for_log(exc),
-                                        extra={"session_id": session_id},
-                                    )
-                                    # Fall through to advance the cursor.
-                                else:
-                                    _logger.warning(
-                                        "Failed to persist compaction boundary (hook path); "
-                                        "session=%s seq=%s attempt=%s "
-                                        "permanent=%s next_retry_s=%.3f http_status=%s",
-                                        session_id,
-                                        seq,
-                                        decision.attempts,
-                                        decision.permanent,
-                                        decision.delay_s,
-                                        _http_status_for_log(exc),
-                                        exc_info=True,
-                                        extra={"session_id": session_id},
-                                    )
-                                    return durable
-                        except Exception:  # noqa: BLE001
-                            # Non-HTTP failure (e.g. reading Claude session
-                            # messages). Hold the cursor and retry next poll.
-                            _logger.warning(
-                                "Unexpected error persisting compaction boundary "
-                                "(hook path) for %s; seq=%s; holding cursor for retry",
-                                session_id,
-                                seq,
-                                exc_info=True,
-                            )
-                            return durable
-                        else:
-                            retry_tracker.clear(retry_key)
-                            await _mark_compaction_persisted(bridge_dir, seq)
                 durable = next_durable
                 await _write_hook_state_async(bridge_dir, durable)
                 continue
@@ -3359,7 +4115,158 @@ def _compact_summary_text(item: ClaudeTranscriptItem) -> str | None:
     return "\n".join(parts) if parts else None
 
 
+def _compaction_lock(bridge_dir: Path) -> asyncio.Lock:
+    """Return the process-local reconciliation lock for one bridge."""
+    key = str(bridge_dir.resolve())
+    lock = _compaction_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _compaction_locks[key] = lock
+    return lock
+
+
+def _native_message_from_transcript_record(
+    record: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Convert one Claude message record to the #6364-compatible native shape."""
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    content = message.get("content")
+    if role not in {"user", "assistant"} or not isinstance(content, (str, list)):
+        return None
+    return {"type": "message", "role": role, "content": content}
+
+
+def _compacted_messages_from_summary_chain(
+    records: list[dict[str, object]],
+    *,
+    summary: Mapping[str, object],
+    boundary: Mapping[str, object] | None,
+) -> list[dict[str, object]]:
+    """
+    Build Claude's compacted context in resumable transcript order.
+
+    ``preservedMessages.uuids`` is membership metadata, not an ordering
+    contract. Preserved records are copied from the pre-boundary main chain,
+    so order them by their durable transcript position after proving that
+    each record is an ancestor of the boundary. This excludes sidechains even
+    when their UUIDs appear in malformed metadata and keeps assistant
+    ``tool_use`` records ahead of their user ``tool_result`` children.
+    """
+    summary_message = _native_message_from_transcript_record(summary)
+    if summary_message is None:
+        raise ValueError("compact summary has no native message")
+    snapshot = [summary_message]
+    if boundary is None:
+        return snapshot
+
+    metadata = boundary.get("compactMetadata")
+    preserved = metadata.get("preservedMessages") if isinstance(metadata, dict) else None
+    preserved_uuids = preserved.get("uuids") if isinstance(preserved, dict) else None
+    if not isinstance(preserved_uuids, list):
+        return snapshot
+    requested = {value for value in preserved_uuids if isinstance(value, str)}
+    if not requested:
+        return snapshot
+
+    by_uuid = {
+        record_uuid: record
+        for record in records
+        if isinstance((record_uuid := record.get("uuid")), str)
+    }
+    ancestor_uuids: set[str] = set()
+    parent_uuid = boundary.get("parentUuid")
+    while isinstance(parent_uuid, str) and parent_uuid not in ancestor_uuids:
+        ancestor_uuids.add(parent_uuid)
+        parent = by_uuid.get(parent_uuid)
+        if parent is None:
+            break
+        parent_uuid = parent.get("parentUuid")
+
+    for record in records:
+        record_uuid = record.get("uuid")
+        if (
+            not isinstance(record_uuid, str)
+            or record_uuid not in requested
+            or record_uuid not in ancestor_uuids
+            or record.get("isSidechain") is True
+        ):
+            continue
+        message = _native_message_from_transcript_record(record)
+        if message is not None:
+            snapshot.append(message)
+    return snapshot
+
+
+def _read_native_compaction_snapshot(
+    transcript_path: Path,
+    summary_source_id: str,
+) -> tuple[str, list[dict[str, object]]]:
+    """
+    Read the compacted context from Claude's authoritative JSONL artifact.
+
+    The summary UUID identifies the exact ``isCompactSummary`` record. Its
+    parent must be the adjacent ``compact_boundary`` record when one is
+    present. Claude records any additionally preserved native messages in
+    that boundary's ``compactMetadata.preservedMessages.uuids`` list.
+    """
+    summary_uuid = summary_source_id.split(":", 1)[0]
+    records: list[dict[str, object]] = []
+    by_uuid: dict[str, dict[str, object]] = {}
+    with transcript_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.endswith("\n"):
+                break
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict):
+                continue
+            records.append(value)
+            record_uuid = value.get("uuid")
+            if isinstance(record_uuid, str):
+                by_uuid[record_uuid] = value
+
+    summary = by_uuid.get(summary_uuid)
+    if summary is None or summary.get("isCompactSummary") is not True:
+        raise ValueError(f"compact summary {summary_uuid!r} is not durable in {transcript_path}")
+    parent_uuid = summary.get("parentUuid")
+    boundary = by_uuid.get(parent_uuid) if isinstance(parent_uuid, str) else None
+    if boundary is not None and (
+        boundary.get("type") != "system" or boundary.get("subtype") != "compact_boundary"
+    ):
+        raise ValueError(f"compact summary {summary_uuid!r} has a non-boundary parent")
+    snapshot = _compacted_messages_from_summary_chain(
+        records,
+        summary=summary,
+        boundary=boundary,
+    )
+    return summary_uuid, snapshot
+
+
 async def _handle_compact_summary_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    item: ClaudeTranscriptItem,
+    retry_tracker: _PostRetryTracker,
+) -> bool:
+    """Serialize duplicate summary callbacks through one reconciliation lock."""
+    async with _compaction_lock(bridge_dir):
+        return await _handle_compact_summary_item_unlocked(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            item=item,
+            retry_tracker=retry_tracker,
+        )
+
+
+async def _handle_compact_summary_item_unlocked(
     client: httpx.AsyncClient,
     *,
     session_id: str,
@@ -3393,70 +4300,58 @@ async def _handle_compact_summary_item(
     :returns: ``True`` when the caller may advance past this record,
         ``False`` when it must be retried later.
     """
+    state = _read_compaction_state(bridge_dir)
+    summary_id = item.source_id.split(":", 1)[0]
+    if summary_id in state.persisted_summary_ids:
+        _compaction_skip_stats.expected_skip += 1
+        return True
     seq = await _consume_pending_compaction(
         bridge_dir,
         claude_session_id=None,
         transcript_path=None,
     )
     if seq is None:
-        # No correlated pending compaction — a historical/replayed summary,
-        # one the hook path already persisted, or a genuine ``PreCompact``
-        # miss. Distinguish the benign cases from a true miss so the latter
-        # is observable rather than silently dropped, then close any pending
-        # completion-ack window (this summary starts a new cycle for the
-        # completion hook). Either way, report handled so the caller advances
-        # past the record without forwarding it as a bubble.
-        state = _read_compaction_state(bridge_dir)
-        if state.pending is None and not state.persisted_seqs:
-            _compaction_skip_stats.precompact_miss += 1
-            # NB: the *_process_total counters are module-global, accumulating
-            # across ALL sessions in this forwarder process (reset only on a
-            # fresh process / the test seam), not per-session. The session=/
-            # session= fields scope THIS skip; the total is process-wide.
-            _logger.warning(
-                "Skipping isCompactSummary with no pending PreCompact and no "
-                "persisted boundary (likely a missed PreCompact hook); "
-                "session=%s precompact_miss_process_total=%s",
-                session_id,
-                _compaction_skip_stats.precompact_miss,
-                extra={"session_id": session_id},
-            )
-        else:
+        # The transcript can become durable before the hook stream exposes
+        # PreCompact. Claim a generation for this authoritative record rather
+        # than dropping the first signal. A persisted summary id is the replay
+        # guard; the hook token is no longer the permission source.
+        seq = await _claim_standalone_completion(bridge_dir)
+        if seq is None:
             _compaction_skip_stats.expected_skip += 1
-            _logger.debug(
-                "Skipping isCompactSummary with no consumable token (expected "
-                "replay/dedupe); session=%s expected_skip_process_total=%s",
-                session_id,
-                _compaction_skip_stats.expected_skip,
-                extra={"session_id": session_id},
-            )
-        await _note_transcript_summary_without_token(bridge_dir)
-        return True
+            return True
+        _compaction_skip_stats.precompact_miss += 1
+        state = _read_compaction_state(bridge_dir)
     retry_key = f"compaction:{seq}"
     if retry_tracker.retry_delay_s(retry_key) is not None:
         return False
+    state = _read_compaction_state(bridge_dir)
+    transcript_path = (
+        Path(state.pending.transcript_path)
+        if state.pending is not None and state.pending.transcript_path
+        else read_transcript_path(bridge_dir)
+    )
+    if transcript_path is None:
+        _logger.warning(
+            "Holding compact summary until its transcript path is known; session=%s seq=%s",
+            session_id,
+            seq,
+        )
+        return False
     try:
+        durable_summary_id, compacted_messages = await asyncio.to_thread(
+            _read_native_compaction_snapshot,
+            transcript_path,
+            item.source_id,
+        )
         await _persist_native_compaction_item(
             client,
             session_id=session_id,
             bridge_dir=bridge_dir,
             summary_override=_compact_summary_text(item),
+            compacted_messages_override=compacted_messages,
+            snapshot_source="transcript",
         )
     except httpx.HTTPError as exc:
-        if post_may_have_been_delivered(exc):
-            # Ambiguous delivery: the boundary may already be committed.
-            # Mark persisted and advance rather than risk a duplicate
-            # boundary — mirrors the item-forwarding ambiguous-failure rule.
-            _logger.warning(
-                "Ambiguous compaction boundary POST for %s (may be committed); "
-                "marking persisted to avoid a duplicate boundary; seq=%s",
-                session_id,
-                seq,
-                exc_info=True,
-            )
-            retry_tracker.clear(retry_key)
-            await _mark_compaction_persisted(bridge_dir, seq, expect_completion_ack=True)
-            return True
         decision = retry_tracker.record_failure(retry_key, exc)
         _logger.warning(
             "Failed to persist compaction boundary (transcript path); "
@@ -3472,7 +4367,8 @@ async def _handle_compact_summary_item(
         )
         return False
     except Exception:  # noqa: BLE001
-        # Non-HTTP failure (e.g. reading Claude session messages). Retry.
+        # The artifact may not yet contain the complete summary line. Hold the
+        # cursor and retry; never replace this normal path with an SDK snapshot.
         _logger.warning(
             "Unexpected error persisting compaction boundary (transcript path) for %s; seq=%s",
             session_id,
@@ -3485,7 +4381,12 @@ async def _handle_compact_summary_item(
     # completion hook may still trail this summary for the SAME compaction;
     # arm the completion-ack window so that hook is absorbed, not persisted
     # again as a spurious standalone boundary.
-    await _mark_compaction_persisted(bridge_dir, seq, expect_completion_ack=True)
+    await _mark_compaction_persisted(
+        bridge_dir,
+        seq,
+        expect_completion_ack=True,
+        summary_id=durable_summary_id,
+    )
     return True
 
 
@@ -3527,6 +4428,17 @@ async def _forward_available_items(
         dedupe.pending_settled_response_id = state.pending_settled_response_id
     result = await asyncio.to_thread(
         _read_transcript_items_for_state, state, agent_name, dedupe.settled_response_id
+    )
+    if result.goal_state_observed and result.byte_offset >= dedupe.observed_goal_byte_offset:
+        dedupe.observed_goal_state = result.latest_goal_state
+        dedupe.observed_goal_state_known = True
+        dedupe.observed_goal_byte_offset = result.byte_offset
+    await _post_observed_goal_state_if_needed(
+        client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        dedupe=dedupe,
+        retry_tracker=retry_tracker,
     )
     items = result.items
     if not items:
@@ -3788,6 +4700,16 @@ async def _forward_available_items(
     window_changed = (
         resolved_context_window is not None and resolved_context_window != dedupe.context_window
     )
+    raw_provider_usage_limits = (
+        status_state.get("provider_usage_limits") if status_state is not None else None
+    )
+    provider_usage_limits = (
+        dict(raw_provider_usage_limits) if isinstance(raw_provider_usage_limits, dict) else None
+    )
+    provider_limits_changed = _provider_usage_limits_should_post(
+        provider_usage_limits,
+        dedupe.provider_usage_limits,
+    )
     # OTel token usage is sourced from the transcript, NOT from ``posted_usage``.
     # ``posted_usage`` prefers the statusLine gauge, which is re-read every poll
     # and moves while a message is still streaming, so recording it would emit
@@ -3798,19 +4720,22 @@ async def _forward_available_items(
     # provider actually charged for.
     token_usage = _gen_ai_usage_tokens(result.latest_usage)
     record_token_usage = token_usage if token_usage != dedupe.recorded_token_usage else None
-    if usage_changed or window_changed:
+    if usage_changed or window_changed or provider_limits_changed:
         try:
             await _post_external_session_usage(
                 client,
                 session_id=session_id,
                 usage=posted_usage,
                 context_window=resolved_context_window,
+                provider_usage_limits=provider_usage_limits,
                 token_usage=record_token_usage,
             )
             if usage_changed:
                 dedupe.usage = posted_usage
             if window_changed:
                 dedupe.context_window = resolved_context_window
+            if provider_limits_changed:
+                dedupe.provider_usage_limits = provider_usage_limits
             if record_token_usage is not None:
                 dedupe.recorded_token_usage = record_token_usage
         except httpx.HTTPError as exc:
@@ -3844,6 +4769,101 @@ async def _forward_available_items(
         title=result.latest_custom_title,
     )
     return updated
+
+
+async def _recover_goal_state_from_transcript(
+    *,
+    transcript_path: Path,
+    dedupe: _ForwardDedupeState,
+    force: bool = False,
+) -> None:
+    """Recover Goal metadata once for a transcript generation.
+
+    Reattach cursors intentionally skip old message records. Goal state is
+    session metadata, so it is recovered independently without moving that
+    cursor or replaying any conversation item.
+    """
+    try:
+        file_stat = await asyncio.to_thread(transcript_path.stat)
+    except OSError:
+        return
+    file_id = (file_stat.st_dev, file_stat.st_ino)
+    same_file = (
+        dedupe.goal_recovery_path == transcript_path and dedupe.goal_recovery_file_id == file_id
+    )
+    shrank = same_file and file_stat.st_size < dedupe.goal_recovery_max_size
+    if not force and same_file and not shrank:
+        dedupe.goal_recovery_max_size = max(dedupe.goal_recovery_max_size, file_stat.st_size)
+        return
+    # Offsets and pending posts belong to one file generation. Absence of a
+    # Goal record in its replacement is not an instruction to clear the Goal.
+    dedupe.observed_goal_state = None
+    dedupe.observed_goal_state_known = False
+    dedupe.observed_goal_byte_offset = -1
+    dedupe.posted_goal_state_known = False
+    try:
+        snapshot = await asyncio.to_thread(read_latest_transcript_goal_state, transcript_path)
+        scanned_stat = await asyncio.to_thread(transcript_path.stat)
+    except OSError:
+        return
+    scanned_file_id = (scanned_stat.st_dev, scanned_stat.st_ino)
+    if scanned_file_id != file_id or scanned_stat.st_size < file_stat.st_size:
+        return
+    dedupe.goal_recovery_path = transcript_path
+    dedupe.goal_recovery_file_id = file_id
+    dedupe.goal_recovery_max_size = scanned_stat.st_size
+    if not snapshot.goal_state_observed:
+        return
+    dedupe.observed_goal_state = snapshot.latest_goal_state
+    dedupe.observed_goal_state_known = True
+    dedupe.observed_goal_byte_offset = snapshot.byte_offset
+    # A new transcript generation may be reconnecting to a Server whose
+    # provider-neutral label was not restored. Re-assert the recovered value.
+    dedupe.posted_goal_state_known = False
+
+
+async def _post_observed_goal_state_if_needed(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    dedupe: _ForwardDedupeState,
+    retry_tracker: _PostRetryTracker,
+) -> None:
+    """Post the latest observed Goal state, retaining it across HTTP failures."""
+    if not dedupe.observed_goal_state_known or (
+        dedupe.posted_goal_state_known and dedupe.posted_goal_state == dedupe.observed_goal_state
+    ):
+        return
+    retry_key = (
+        f"goal:{dedupe.observed_goal_byte_offset}:"
+        f"{dedupe.observed_goal_state if dedupe.observed_goal_state is not None else 'none'}"
+    )
+    if retry_tracker.retry_delay_s(retry_key) is not None:
+        return
+    try:
+        await _post_external_goal_state(
+            client,
+            session_id=session_id,
+            state=dedupe.observed_goal_state,
+        )
+    except httpx.HTTPError as exc:
+        decision = retry_tracker.record_failure(retry_key, exc)
+        _logger.warning(
+            "Failed to forward Claude Goal state; session=%s bridge_dir=%s "
+            "attempt=%s next_retry_s=%.3f http_status=%s",
+            session_id,
+            bridge_dir,
+            decision.attempts,
+            decision.delay_s,
+            _http_status_for_log(exc),
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    retry_tracker.clear(retry_key)
+    dedupe.posted_goal_state = dedupe.observed_goal_state
+    dedupe.posted_goal_state_known = True
 
 
 def _read_hook_events_for_state(
@@ -4186,7 +5206,7 @@ async def _post_external_conversation_item(
     *,
     session_id: str,
     item: ClaudeTranscriptItem,
-) -> None:
+) -> bool:
     """
     Post one mirrored transcript item to the Sessions API.
 
@@ -4218,15 +5238,17 @@ async def _post_external_conversation_item(
                     "item_type": item.item_type,
                     "item_data": item.data,
                     "response_id": item.response_id,
-                    # Server-side idempotency key: the forwarder retries a
-                    # timed-out POST it cannot know the disposition of, so
-                    # the server derives the item's id from this and treats
-                    # a re-post as a no-op instead of a duplicate.
                     "source_id": item.source_id,
                 },
             },
         )
         resp.raise_for_status()
+        # Historical import is not evidence of a running native child.
+        # Older servers omit the flag and keep their prior behavior.
+        if not resp.content:
+            return True
+        body = _parse_json_response(resp, context="external conversation item")
+        return body.get("replayed") is not True
 
 
 async def _post_external_output_text_delta(
@@ -4340,12 +5362,13 @@ async def _post_external_session_usage(
     session_id: str,
     usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
+    provider_usage_limits: dict[str, object] | None = None,
     token_usage: dict[str, int] | None = None,
 ) -> None:
     """
     Post one ``external_session_usage`` event to the Sessions API.
 
-    At least one of ``usage`` / ``context_window`` must be set; a
+    At least one of ``usage`` / ``context_window`` / ``provider_usage_limits`` must be set; a
     payload with neither is a no-op (the server would 400 it).
 
     :param client: Omnigent HTTP client.
@@ -4367,6 +5390,8 @@ async def _post_external_session_usage(
         payload.update(usage)
     if context_window is not None:
         payload["context_window"] = context_window
+    if provider_usage_limits is not None:
+        payload["provider_usage_limits"] = provider_usage_limits
     if not payload:
         return
     from omnigent.runtime import telemetry
@@ -4750,6 +5775,9 @@ async def _persist_native_compaction_item(
     session_id: str,
     bridge_dir: Path,
     summary_override: str | None = None,
+    compacted_messages_override: list[dict[str, object]] | None = None,
+    snapshot_source: str = "hook_fallback",
+    fallback_snapshot_loaded: bool = False,
 ) -> None:
     """
     Persist a compaction boundary item to the conversation store.
@@ -4761,11 +5789,11 @@ async def _persist_native_compaction_item(
     session resume knows the compaction boundary — items before this
     marker are summarized and don't need to be loaded.
 
-    After writing the boundary, it also reads the post-compaction
-    transcript from Claude's own session state via
-    ``get_session_messages`` and includes them as ``compacted_messages``
-    so session resume in ephemeral environments can reconstruct context
-    without the CLI's local transcript files.
+    The normal summary path supplies ``compacted_messages_override`` from
+    Claude's JSONL transcript. Only the bounded hook fallback omits it and
+    reads ``get_session_messages``; that event is explicitly marked
+    ``snapshot_source=hook_fallback`` so a later transcript snapshot can
+    supersede it.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -4790,23 +5818,9 @@ async def _persist_native_compaction_item(
 
     # Read the post-compaction session messages so session resume can
     # reconstruct context in ephemeral environments.
-    compacted_messages: list[dict[str, object]] | None = None
-    try:
-        from claude_agent_sdk import get_session_messages
-
-        claude_sid = read_claude_session_id(bridge_dir)
-        if claude_sid:
-            msgs = get_session_messages(claude_sid)
-            compacted_messages = [
-                {"type": "message", "role": m.type, "content": m.message.get("content", [])}
-                for m in msgs
-                if isinstance(m.message, dict)
-            ]
-    except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Failed to read Claude session messages for compaction persist",
-            exc_info=True,
-        )
+    compacted_messages = compacted_messages_override
+    if compacted_messages is None and not fallback_snapshot_loaded:
+        compacted_messages = await _read_sdk_compaction_snapshot(bridge_dir)
 
     summary = (
         summary_override
@@ -4818,6 +5832,7 @@ async def _persist_native_compaction_item(
         "last_item_id": last_item_id,
         "model": "unknown",
         "token_count": 0,
+        "snapshot_source": snapshot_source,
     }
     if compacted_messages is not None:
         event_data["compacted_messages"] = compacted_messages
@@ -4830,6 +5845,37 @@ async def _persist_native_compaction_item(
         },
     )
     resp.raise_for_status()
+
+
+async def _read_sdk_compaction_snapshot(
+    bridge_dir: Path,
+) -> list[dict[str, object]] | None:
+    """Read the synchronous Claude SDK fallback without blocking the loop."""
+
+    def _read() -> list[dict[str, object]] | None:
+        try:
+            from claude_agent_sdk import get_session_messages
+
+            claude_sid = read_claude_session_id(bridge_dir)
+            if not claude_sid:
+                return None
+            return [
+                {
+                    "type": "message",
+                    "role": message.type,
+                    "content": message.message.get("content", []),
+                }
+                for message in get_session_messages(claude_sid)
+                if isinstance(message.message, dict)
+            ]
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Failed to read Claude session messages for compaction fallback",
+                exc_info=True,
+            )
+            return None
+
+    return await asyncio.to_thread(_read)
 
 
 async def _patch_external_session_id(
@@ -4969,6 +6015,20 @@ async def _post_external_session_todos(
     resp.raise_for_status()
 
 
+async def _post_external_goal_state(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    state: str | None,
+) -> None:
+    """Post Claude's structured Goal state to the provider-neutral marker."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_goal_state", "data": {"state": state}},
+    )
+    resp.raise_for_status()
+
+
 def _is_permanent_http_error(exc: httpx.HTTPError) -> bool:
     """
     Return whether ``exc`` is a permanent Omnigent rejection.
@@ -5003,7 +6063,17 @@ def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
         body = exc.response.json()
     except Exception:  # noqa: BLE001 — best-effort body parse
         return False
-    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    if error == "subagent_delivery_not_confirmed":
+        return True
+    if not isinstance(error, dict):
+        return False
+    if error.get("code") == "subagent_delivery_not_confirmed":
+        return True
+    message = error.get("message")
+    return isinstance(message, str) and "subagent_delivery_not_confirmed" in message
 
 
 def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
@@ -5107,6 +6177,18 @@ def _read_compaction_state(bridge_dir: Path) -> CompactionForwardState:
     persisted_seqs: tuple[int, ...] = ()
     if isinstance(persisted_raw, list):
         persisted_seqs = tuple(s for s in persisted_raw if isinstance(s, int))
+    acknowledged_at = raw.get("acknowledged_at")
+    if not isinstance(acknowledged_at, (int, float)):
+        acknowledged_at = None
+    fallback_persisted_seq = raw.get("fallback_persisted_seq")
+    if not isinstance(fallback_persisted_seq, int) or fallback_persisted_seq < 0:
+        fallback_persisted_seq = 0
+    summary_ids_raw = raw.get("persisted_summary_ids")
+    persisted_summary_ids = (
+        tuple(value for value in summary_ids_raw if isinstance(value, str))
+        if isinstance(summary_ids_raw, list)
+        else ()
+    )
     pending: _PendingCompaction | None = None
     pending_raw = raw.get("pending")
     if isinstance(pending_raw, dict):
@@ -5128,6 +6210,9 @@ def _read_compaction_state(bridge_dir: Path) -> CompactionForwardState:
         last_precompact_cursor=last_precompact_cursor,
         expect_completion_ack=expect_completion_ack,
         expect_completion_ack_seq=expect_completion_ack_seq,
+        acknowledged_at=acknowledged_at,
+        fallback_persisted_seq=fallback_persisted_seq,
+        persisted_summary_ids=persisted_summary_ids,
     )
 
 
@@ -5146,6 +6231,9 @@ def _write_compaction_state(bridge_dir: Path, state: CompactionForwardState) -> 
         "last_precompact_cursor": state.last_precompact_cursor,
         "expect_completion_ack": state.expect_completion_ack,
         "expect_completion_ack_seq": state.expect_completion_ack_seq,
+        "acknowledged_at": state.acknowledged_at,
+        "fallback_persisted_seq": state.fallback_persisted_seq,
+        "persisted_summary_ids": list(state.persisted_summary_ids),
         "updated_at": time.time(),
     }
     if state.pending is not None:
@@ -5202,7 +6290,8 @@ async def _note_precompact(
         next_seq = state.last_seq + 1
         _write_compaction_state(
             bridge_dir,
-            CompactionForwardState(
+            replace(
+                state,
                 pending=_PendingCompaction(
                     seq=next_seq,
                     claude_session_id=claude_session_id,
@@ -5210,7 +6299,6 @@ async def _note_precompact(
                     seen_at=time.time(),
                 ),
                 last_seq=next_seq,
-                persisted_seqs=state.persisted_seqs,
                 last_precompact_cursor=(
                     event_cursor if event_cursor is not None else state.last_precompact_cursor
                 ),
@@ -5219,6 +6307,8 @@ async def _note_precompact(
                 # is now moot.
                 expect_completion_ack=False,
                 expect_completion_ack_seq=0,
+                acknowledged_at=None,
+                fallback_persisted_seq=0,
             ),
         )
 
@@ -5299,11 +6389,130 @@ async def _consume_pending_compaction(
     return await asyncio.to_thread(_check)
 
 
+async def _acknowledge_compaction_completion(
+    bridge_dir: Path,
+    *,
+    claude_session_id: str | None,
+    transcript_path: str | None,
+    now: float | None = None,
+) -> int | None:
+    """Record the compact SessionStart without consuming its generation."""
+
+    def _mutate() -> int | None:
+        state = _read_compaction_state(bridge_dir)
+        pending = state.pending
+        if pending is None:
+            ack_seq = state.expect_completion_ack_seq
+            if state.expect_completion_ack and ack_seq > 0 and ack_seq in state.persisted_seqs:
+                _write_compaction_state(
+                    bridge_dir,
+                    replace(
+                        state,
+                        expect_completion_ack=False,
+                        expect_completion_ack_seq=0,
+                    ),
+                )
+                return None
+            next_seq = state.last_seq + 1
+            pending = _PendingCompaction(
+                seq=next_seq,
+                claude_session_id=claude_session_id,
+                transcript_path=transcript_path,
+                seen_at=now if now is not None else time.time(),
+            )
+            state = replace(state, pending=pending, last_seq=next_seq)
+        elif not _compaction_identifiers_match(
+            pending,
+            claude_session_id=claude_session_id,
+            transcript_path=transcript_path,
+        ):
+            return None
+        if pending.seq in state.persisted_seqs:
+            return None
+        acknowledged_at = (
+            state.acknowledged_at
+            if state.acknowledged_at is not None
+            else (now if now is not None else time.time())
+        )
+        _write_compaction_state(
+            bridge_dir,
+            replace(
+                state,
+                acknowledged_at=acknowledged_at,
+                expect_completion_ack=False,
+                expect_completion_ack_seq=0,
+            ),
+        )
+        return pending.seq
+
+    return await asyncio.to_thread(_mutate)
+
+
+async def _maybe_persist_compaction_fallback(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    now: float | None = None,
+) -> bool:
+    """Persist one marked SDK fallback after the summary durability deadline."""
+    current_time = now if now is not None else time.time()
+    async with _compaction_lock(bridge_dir):
+        state = _read_compaction_state(bridge_dir)
+        pending = state.pending
+        if (
+            pending is None
+            or state.acknowledged_at is None
+            or current_time - state.acknowledged_at < _COMPACTION_HOOK_FALLBACK_WAIT_S
+            or state.fallback_persisted_seq == pending.seq
+            or pending.seq in state.persisted_seqs
+        ):
+            return False
+
+        pending_seq = pending.seq
+
+    # The SDK API is synchronous and may perform slow disk reads. Keep both it
+    # and its worker-thread wait outside the reconciliation lock so a durable
+    # transcript summary that arrives meanwhile can supersede this fallback.
+    compacted_messages = await _read_sdk_compaction_snapshot(bridge_dir)
+
+    async with _compaction_lock(bridge_dir):
+        latest = _read_compaction_state(bridge_dir)
+        if (
+            latest.pending is None
+            or latest.pending.seq != pending_seq
+            or latest.fallback_persisted_seq == pending_seq
+            or pending_seq in latest.persisted_seqs
+        ):
+            return False
+        try:
+            await _persist_native_compaction_item(
+                client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                compacted_messages_override=compacted_messages,
+                snapshot_source="hook_fallback",
+                fallback_snapshot_loaded=True,
+            )
+        except httpx.HTTPError as exc:
+            if not post_may_have_been_delivered(exc):
+                raise
+        latest = _read_compaction_state(bridge_dir)
+        if latest.pending is None or latest.pending.seq != pending_seq:
+            return False
+        _write_compaction_state(
+            bridge_dir,
+            replace(latest, fallback_persisted_seq=pending_seq),
+        )
+        return True
+
+
 async def _mark_compaction_persisted(
     bridge_dir: Path,
     seq: int,
     *,
     expect_completion_ack: bool = False,
+    summary_id: str | None = None,
 ) -> None:
     """
     Record that the boundary for ``seq`` was persisted; clear the token.
@@ -5326,22 +6535,26 @@ async def _mark_compaction_persisted(
         persisted = tuple(state.persisted_seqs)
         if seq not in persisted:
             persisted = (*persisted, seq)[-_MAX_PERSISTED_COMPACTION_SEQS:]
+        summary_ids = state.persisted_summary_ids
+        if summary_id is not None and summary_id not in summary_ids:
+            summary_ids = (*summary_ids, summary_id)[-_MAX_PERSISTED_COMPACTION_SUMMARIES:]
         pending = state.pending
         if pending is not None and pending.seq == seq:
             pending = None
         _write_compaction_state(
             bridge_dir,
-            CompactionForwardState(
+            replace(
+                state,
                 pending=pending,
-                last_seq=state.last_seq,
                 persisted_seqs=persisted,
-                last_precompact_cursor=state.last_precompact_cursor,
                 expect_completion_ack=expect_completion_ack,
                 # Bind the ack window to THIS boundary's seq so a trailing
                 # completion hook is only absorbed as an ack for the exact
                 # compaction the transcript path just persisted, never a
                 # different one whose PreCompact also went missing (P2-1).
                 expect_completion_ack_seq=(seq if expect_completion_ack else 0),
+                acknowledged_at=None,
+                persisted_summary_ids=summary_ids,
             ),
         )
 
@@ -5370,11 +6583,8 @@ async def _note_transcript_summary_without_token(bridge_dir: Path) -> None:
             return
         _write_compaction_state(
             bridge_dir,
-            CompactionForwardState(
-                pending=state.pending,
-                last_seq=state.last_seq,
-                persisted_seqs=state.persisted_seqs,
-                last_precompact_cursor=state.last_precompact_cursor,
+            replace(
+                state,
                 expect_completion_ack=False,
                 expect_completion_ack_seq=0,
             ),
@@ -5410,13 +6620,13 @@ async def _discard_pending_compaction(bridge_dir: Path, seq: int) -> bool:
             return False
         _write_compaction_state(
             bridge_dir,
-            CompactionForwardState(
+            replace(
+                state,
                 pending=None,
-                last_seq=state.last_seq,
-                persisted_seqs=state.persisted_seqs,
-                last_precompact_cursor=state.last_precompact_cursor,
                 expect_completion_ack=False,
                 expect_completion_ack_seq=0,
+                acknowledged_at=None,
+                fallback_persisted_seq=0,
             ),
         )
         return True
@@ -5535,11 +6745,9 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
             # stale ack (P2-1).
             _write_compaction_state(
                 bridge_dir,
-                CompactionForwardState(
+                replace(
+                    state,
                     pending=None,
-                    last_seq=state.last_seq,
-                    persisted_seqs=state.persisted_seqs,
-                    last_precompact_cursor=state.last_precompact_cursor,
                     expect_completion_ack=False,
                     expect_completion_ack_seq=0,
                 ),
@@ -5561,7 +6769,8 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
         next_seq = state.last_seq + 1
         _write_compaction_state(
             bridge_dir,
-            CompactionForwardState(
+            replace(
+                state,
                 pending=_PendingCompaction(
                     seq=next_seq,
                     claude_session_id=None,
@@ -5569,10 +6778,10 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
                     seen_at=time.time(),
                 ),
                 last_seq=next_seq,
-                persisted_seqs=state.persisted_seqs,
-                last_precompact_cursor=state.last_precompact_cursor,
                 expect_completion_ack=False,
                 expect_completion_ack_seq=0,
+                acknowledged_at=time.time(),
+                fallback_persisted_seq=0,
             ),
         )
         return next_seq

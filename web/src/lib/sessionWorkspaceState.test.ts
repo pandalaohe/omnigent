@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
+import {
+  readInheritLastRightRailTab,
+  readLastExplicitRightRailTab,
+  readSessionWorkspaceState,
+  writeInheritLastRightRailTab,
+  writeLastExplicitRightRailTab,
+  writeSessionWorkspaceState,
+} from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
 // Mirrors MAX_SESSIONS in the source; the pruning tests below seed exactly this
@@ -11,6 +18,20 @@ afterEach(() => {
 });
 
 describe("sessionWorkspaceState", () => {
+  it("stores the last tab from an explicit rail selection", () => {
+    expect(readLastExplicitRightRailTab()).toBe("files");
+    writeLastExplicitRightRailTab("archive");
+    expect(readLastExplicitRightRailTab()).toBe("archive");
+  });
+
+  it("defaults new sessions to inheriting the last explicit tab and persists opt-out", () => {
+    expect(readInheritLastRightRailTab()).toBe(true);
+    writeInheritLastRightRailTab(false);
+    expect(readInheritLastRightRailTab()).toBe(false);
+    writeInheritLastRightRailTab(true);
+    expect(readInheritLastRightRailTab()).toBe(true);
+  });
+
   it("returns an empty object for an unknown session", () => {
     // No stored entry must read as a clean "fresh session" state, not an error.
     expect(readSessionWorkspaceState("conv_unknown")).toEqual({});

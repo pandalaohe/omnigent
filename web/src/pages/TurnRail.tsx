@@ -33,19 +33,14 @@ export function TurnRail({
   turns,
   hasMoreHistory,
   loadingMoreHistory,
-  ensureItemVisible,
-  activeTurnId = null,
+  onJump,
+  onLoadMoreHistory,
 }: {
   turns: readonly Turn[];
   hasMoreHistory: boolean;
   loadingMoreHistory: boolean;
-  // From the virtualized transcript: pulls a windowed-out turn into the DOM
-  // before a tick click centers on it. Omitted in tests / non-virtualized use.
-  ensureItemVisible?: (id: string) => boolean;
-  // The user turn owning the viewport midpoint, computed by the transcript from
-  // the virtualizer's model (all items, not just the windowed DOM). The rail no
-  // longer scans anchor rects itself — that broke for windowed-out turns.
-  activeTurnId?: string | null;
+  onJump?: (itemId: string) => void;
+  onLoadMoreHistory?: () => void;
 }) {
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const railRef = useRef<HTMLDivElement | null>(null);
@@ -130,7 +125,8 @@ export function TurnRail({
     if (!rail) return;
     const fetchOlder = () => {
       if (rail.scrollTop < FETCH_TOP_PX && hasMoreHistory && !loadingMoreHistory) {
-        void useChatStore.getState().loadMoreHistory();
+        if (onLoadMoreHistory) onLoadMoreHistory();
+        else void useChatStore.getState().loadMoreHistory();
       }
     };
     const onWheel = (e: WheelEvent) => {
@@ -142,7 +138,7 @@ export function TurnRail({
       rail.removeEventListener("scroll", fetchOlder);
       rail.removeEventListener("wheel", onWheel);
     };
-  }, [hasMoreHistory, loadingMoreHistory]);
+  }, [hasMoreHistory, loadingMoreHistory, onLoadMoreHistory]);
 
   // Stable ref callback so React doesn't detach/re-attach every tick on every
   // render (an inline arrow changes identity each render, thrashing the Map).
@@ -246,6 +242,8 @@ export function TurnRail({
 
   return (
     <div
+      role="navigation"
+      aria-label="Conversation turns"
       // Vertically centered on the left edge (not full-height) so a short run
       // of ticks sits mid-page rather than clustering at the top. The row is
       // wide enough for the ticks; the preview box overflows to the right.
@@ -291,7 +289,9 @@ export function TurnRail({
               // Keyboard focus shows the preview via onFocus; clear it on blur
               // so tabbing away doesn't leave the preview stranded on-screen.
               onBlur={() => setHoveredId((cur) => (cur === turn.itemId ? null : cur))}
-              onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage, ensureItemVisible)}
+              onClick={() =>
+                onJump ? onJump(turn.itemId) : scrollToUserMessage(turn.itemId, flashUserMessage)
+              }
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
               // Full-pitch hit area (h-2.5, no gap between ticks) so clicking
               // anywhere in a tick's band — not just the 2px dash — registers.

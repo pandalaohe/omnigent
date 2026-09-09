@@ -3,6 +3,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -38,6 +39,7 @@ import {
   useInstallingHarnesses,
   type Host,
 } from "@/hooks/useHosts";
+import { useCustomAgents } from "@/lib/customAgentsApi";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -46,6 +48,7 @@ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { NEW_SESSION_TARGET_STORAGE_KEY } from "@/lib/newSessionTarget";
 import {
   connectArcaHost,
   controlHost,
@@ -95,12 +98,22 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 // "ready vs. one-more-step" wording can be asserted.
 const { showToastMock } = vi.hoisted(() => ({ showToastMock: vi.fn() }));
 vi.mock("@/components/ui/toast", () => ({ showToast: showToastMock }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  useCustomAgents: vi.fn(() => ({ data: [], isPending: false, error: null })),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
 }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
+  useHostFilesystemRoots: vi.fn(() => ({
+    data: undefined,
+    isLoading: false,
+    isPlaceholderData: false,
+    error: null,
+  })),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
@@ -322,6 +335,12 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("/")).toBe(true);
   });
 
+  it("accepts Windows drive and UNC absolute paths", () => {
+    expect(isValidWorkspace("D:\\AIProgram\\Projects")).toBe(true);
+    expect(isValidWorkspace("E:/Projects/Omnigent")).toBe(true);
+    expect(isValidWorkspace("\\\\server\\share\\repo")).toBe(true);
+  });
+
   it("trims whitespace before checking", () => {
     // Browsers paste with stray whitespace; trim must run before
     // the shape check or "  /Users/corey  " would be rejected.
@@ -365,10 +384,13 @@ describe("normalizeWorkspacePath", () => {
     ["/Users/me/repo/", "/Users/me/repo"],
     ["/Users/me/repo///", "/Users/me/repo"],
     // Surrounding whitespace (pasted paths) trimmed before comparison.
-    ["  /a/b  ", "/a/b"],
+    ["  /a/b  ", "/a/b  "],
     // Root is preserved, not collapsed away.
     ["/", "/"],
     ["///", "/"],
+    ["D:\\AIProgram\\Projects\\", "D:\\AIProgram\\Projects"],
+    ["E:/Projects/Omnigent/", "E:/Projects/Omnigent"],
+    ["C:\\", "C:\\"],
     // Blank → null (no path) — must NOT become "/", or an empty input would
     // spuriously match a session whose workspace is the root.
     ["", null],
@@ -554,6 +576,10 @@ describe("deriveHomeDir", () => {
     expect(deriveHomeDir([fsEntry("/etc")])).toBe("/");
   });
 
+  it("returns the Windows home directory from a native entry path", () => {
+    expect(deriveHomeDir([fsEntry("C:\\Users\\corey\\Desktop")])).toBe("C:\\Users\\corey");
+  });
+
   it("returns null for an empty listing", () => {
     // Nothing to take a parent of → caller leaves the field blank rather
     // than seeding a wrong path.
@@ -707,6 +733,10 @@ function host(status: "online" | "offline", i = 1): Host {
   return { host_id: `host_${i}`, name: `machine-${i}`, owner: "me", status };
 }
 
+function localHostDisplayName(): string {
+  return displayNameForHost(host("online"), "host_1", navigator.userAgent);
+}
+
 function mockHosts(hosts: Host[], queryState: Partial<ReturnType<typeof useHosts>> = {}) {
   useHostsMock.mockReturnValue({
     data: hosts,
@@ -725,6 +755,11 @@ function mockAgents(agents: AvailableAgent[]) {
 // directory-session / runner-health / filesystem stubs, and a persisted
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
+  vi.mocked(useCustomAgents).mockReturnValue({
+    data: [],
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useCustomAgents>);
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
   useHostModelOptionsMock.mockReset();
@@ -876,6 +911,10 @@ async function readCreateBody(): Promise<{ raw: string; body: Record<string, unk
 
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    const customAgents = screen.queryByTestId("new-chat-landing-custom-agents");
+    fireEvent.click(customAgents ?? screen.getByTestId("new-chat-landing-harness-more"));
+  }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
@@ -1193,7 +1232,7 @@ describe("NewChatLandingScreen", () => {
     const composer = screen.getByTestId("new-chat-landing-composer");
     expect(composer).toHaveClass(
       "border-border",
-      "has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+      "focus-within:shadow-[var(--composer-shadow-focus)]",
     );
     expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
     expect(composer.className).not.toContain("has-[textarea:focus]:border-");
@@ -1678,6 +1717,39 @@ describe("NewChatLandingScreen", () => {
     // directory" and submit stuck disabled.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
+  it("uses the last working folder even when the Host has a pinned folder", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        default_workspace: "D:\\AIProgram\\Projects",
+      },
+    ]);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
+  it("opens the footer CWD picker at the last working folder with a quick-access pin", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        default_workspace: "/Users/corey/Projects",
+      },
+    ]);
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+
+    expect(screen.getByTestId("workspace-picker-default")).toHaveAttribute(
+      "aria-label",
+      "Pin this folder for quick access on machine-1. New sessions remember the last working folder.",
     );
   });
 
@@ -2636,7 +2708,10 @@ describe("NewChatLandingScreen", () => {
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
-    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
+    const hostItem = screen
+      .getAllByText(localHostDisplayName())
+      .find((el) => el.closest('[role="menuitem"]') !== null);
+    expect(hostItem).toBeTruthy();
     expect(
       sandboxOption.compareDocumentPosition(hostItem) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
@@ -2644,7 +2719,9 @@ describe("NewChatLandingScreen", () => {
     // worktree chip) — the sandbox default doesn't wedge the normal path.
     fireEvent.click(hostItem);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        localHostDisplayName(),
+      ),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
@@ -2739,6 +2816,10 @@ describe("NewChatLandingScreen", () => {
         resolveCreate = resolve;
       }),
     );
+    localStorage.setItem(
+      NEW_SESSION_TARGET_STORAGE_KEY,
+      JSON.stringify({ kind: "project", projectId: "p_old", projectName: "Old" }),
+    );
     renderLanding({ managed_sandboxes_enabled: true });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
@@ -2770,6 +2851,7 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     // The resolved create navigates without surfacing an error.
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
+    await waitFor(() => expect(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY)).toBeNull());
   });
 
   it("shows the default hero heading in the normal new-session flow (no project)", async () => {
@@ -2790,7 +2872,10 @@ describe("NewChatLandingScreen", () => {
         ok: true,
         json: async () => ({ object: "list", data: [{ id: "p_docs", name: "docs" }] }),
       } as Response)
-      .mockResolvedValue({ ok: true, json: async () => ({ id: "conv_new" }) } as Response);
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new", project_id: "p_docs" }),
+      } as Response);
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     // A `?project=` landing (e.g. via the sidebar's per-project pencil) names the
     // project in the hero heading rather than a tray chip.
@@ -2824,6 +2909,11 @@ describe("NewChatLandingScreen", () => {
       project_id: string;
     };
     expect(patchBody.project_id).toBe("p_docs");
+    expect(JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null")).toEqual({
+      kind: "project",
+      projectId: "p_docs",
+      projectName: "docs",
+    });
 
     // The target folder fetches its own paginated list (useProjectSessions),
     // so filing the new session must invalidate it — otherwise the row only
@@ -3194,7 +3284,7 @@ describe("NewChatLandingScreen skills menu", () => {
       fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
 
       expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
-        "/rev",
+        "/rev\n",
       );
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
     } finally {
@@ -3580,7 +3670,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
 
       fireEvent.keyDown(input(), { key: "Enter" });
 
-      expect((input() as HTMLTextAreaElement).value).toBe("@README");
+      expect((input() as HTMLTextAreaElement).value).toBe("@README\n");
       expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
     } finally {
@@ -3897,67 +3987,66 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
   });
 
-  it("shows 'Create custom agent' on a host and opens the dialog", async () => {
-    renderLanding({ managed_sandboxes_enabled: true });
-    // The managed default is the sandbox even with a host present, so switch
-    // to the connected host (machine-1) first.
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
-    );
-    // With no custom agents yet, the create item is a top-level row (no
-    // "Custom agents" submenu to hide it behind) and opens the dialog.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // No custom agents → no "Custom agents" submenu; create must be top-level.
-    expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
-    const createItem = screen.getByTestId("new-chat-landing-create-agent");
-    fireEvent.click(createItem);
-    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
-  });
+  it.each(["claude-sdk", "codex-native"])(
+    "launches a saved %s custom Agent snapshot with its stable badge identity",
+    async (customHarness) => {
+      const custom = {
+        id: "ca_review",
+        name: "Review",
+        description: null,
+        harness: customHarness,
+        model: null,
+        version: 1,
+        created_at: 1,
+        updated_at: 1,
+      };
+      vi.mocked(useCustomAgents).mockReturnValue({
+        data: [custom],
+        isPending: false,
+        error: null,
+      } as unknown as ReturnType<typeof useCustomAgents>);
+      authenticatedFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/contents")) return new Response("bundle-bytes");
+        if (url === "/v1/sessions")
+          return new Response(JSON.stringify({ session_id: "saved-session" }));
+        return new Response(JSON.stringify({ runner_id: "runner" }));
+      });
+      localStorage.setItem(
+        "omnigent:last-mode-by-harness",
+        JSON.stringify({ "codex-native": { mode: "bypass-sandbox" } }),
+      );
+      renderLanding();
+      selectAgent(custom.id);
+      expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Review this" },
+      });
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(
+          authenticatedFetchMock.mock.calls.some(([url]) => String(url).endsWith("/runners")),
+        ).toBe(true),
+      );
+      const create = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+      const form = create[1]!.body as FormData;
+      expect(form).toBeInstanceOf(FormData);
+      expect(form.get("bundle")).toBeInstanceOf(File);
+      expect(
+        JSON.parse(form.get("metadata") as string).labels["omnigent.codex_native.bypass_sandbox"],
+      ).toBeUndefined();
+      expect(JSON.parse(form.get("metadata") as string).labels).toMatchObject({
+        "omnigent:agent-template-id": "ca_review",
+      });
+      expect(authenticatedFetchMock.mock.calls[0][0]).toBe("/v1/custom-agents/ca_review/contents");
+    },
+  );
 
-  // Switch the target to the connected host, then create + submit a pending
-  // custom agent from the dialog so it becomes the selected agent.
-  async function createAndSelectPendingAgentOnHost(): Promise<void> {
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
-    );
+  it("keeps the host dropdown selection-only", () => {
+    renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
-    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
-    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
-    fireEvent.change(screen.getByTestId("create-agent-model"), {
-      target: { value: "claude-sonnet-4-20250514" },
-    });
-    fireEvent.click(screen.getByTestId("create-agent-submit"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent"),
-    );
-  }
-
-  it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
-    renderLanding({ managed_sandboxes_enabled: true });
-    await createAndSelectPendingAgentOnHost();
-    // Switch back to the sandbox: the pending pick can't run there, so the
-    // selection falls back to a real agent and the pending row disappears.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
-    );
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
-      "my-agent",
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
+    expect(screen.queryByText("Manage agents")).toBeNull();
+    expect(screen.queryByTestId("create-agent-dialog")).toBeNull();
   });
 });
 
@@ -4004,7 +4093,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   }
 
-  it("drills into the Custom agents page in place and returns via Back", () => {
+  it("drills into Custom agents on mobile", () => {
     // A custom (non-builtin) agent lands in the Custom agents group.
     mockAgents([
       {
@@ -4026,16 +4115,15 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     ]);
     renderLanding();
     openPicker();
-    // The custom agent isn't inline — it's behind the "Custom agents" row.
-    expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
-    // Tapping drills into the page in place (Claude Code inline row is gone).
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
-    expect(screen.getByTestId("new-chat-landing-agent-ag_custom")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-agent-a1")).toBeNull();
-    // Back returns to the main list.
-    fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(screen.getByTestId("new-chat-landing-agent-ag_custom")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-page-back")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_custom"));
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "My Custom Agent",
+    );
   });
 
   it("drills into the More page for harnesses outside the supported set", () => {

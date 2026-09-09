@@ -1,3 +1,5 @@
+import { AgentBadge } from "@/components/AgentBadge";
+import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
 import {
   type ComponentType,
   type CSSProperties,
@@ -38,6 +40,8 @@ import {
   LayoutDashboardIcon,
   Loader2Icon,
   MailIcon,
+  MailOpenIcon,
+  MessageCircleCheckIcon,
   MessageCircleDashedIcon,
   Maximize2Icon,
   Minimize2Icon,
@@ -73,7 +77,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
-import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -147,19 +151,36 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
-import { SessionStateBadge } from "@/components/SessionStateBadge";
+import {
+  BackgroundActivityBadge,
+  GoalActivityBadge,
+  SessionStateBadge,
+} from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
+import { useNewSessionTarget } from "@/hooks/useNewSessionTarget";
+import {
+  newSessionRoute,
+  newSessionTargetLabel,
+  type NewSessionTarget,
+} from "@/lib/newSessionTarget";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import {
+  getConversationForegroundStatus,
+  getSessionState,
+  type SessionState,
+} from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
+  isExplicitlyUnread,
+  markConversationsSeen,
   markConversationUnread,
   useConversationReadState,
 } from "@/hooks/useUnseenConversations";
@@ -169,6 +190,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { useSessionPollingHotkeys } from "@/hooks/useSessionPollingHotkeys";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -388,8 +410,8 @@ function useActiveNavItem(): {
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
 } {
-  const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const location = useLocation();
+  const rebasePath = useRebasePath();
   const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
@@ -400,12 +422,7 @@ function useActiveNavItem(): {
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
   const isNewSessionRoute =
-    activeConversationId == null &&
-    !isInboxPage &&
-    !isCanvasPage &&
-    !isTasksPage &&
-    !isUsagePage &&
-    !isExtensionRoute;
+    location.pathname.replace(/\/+$/, "") === rebasePath("/").replace(/\/+$/, "");
   const requestedProject = isNewSessionRoute
     ? new URLSearchParams(location.search).get("project")
     : null;
@@ -580,8 +597,17 @@ function SidebarImpl({
   onOpenSearch,
   peek,
 }: SidebarProps) {
+  const navigate = useNavigate();
   const branding = useBranding();
   const serverInfo = useServerInfo();
+  const { showGoalSessionMarkers } = useSessionNavigationPreferences();
+  const { data: newSessionProjects } = useProjects();
+  const {
+    target: newSessionTarget,
+    route: newSessionTargetRoute,
+    selectNoProject: selectNoProjectNewSessionTarget,
+    selectProject: selectProjectNewSessionTarget,
+  } = useNewSessionTarget(newSessionProjects);
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [selectionMode, setSelectionMode] = useState(false);
@@ -730,22 +756,31 @@ function SidebarImpl({
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);
 
-  // Inbox badge — total approval prompts across loaded rows. We read from both
-  // conversationsQuery (all-sessions, page 1 coverage) AND filteredConversationsQuery
-  // (tab-scoped, grows as the user scrolls) so that scrolling any filtered tab
-  // extends badge coverage — the two caches overlap and dedup handles it.
+  // Inbox badge — total approval prompts across both the all-sessions page and
+  // the active tab's loaded pages. Deduplicate the overlapping query caches.
   const loadedRows = useMemo(() => {
     const rows = [
       ...(conversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
       ...(filteredConversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
     ];
     const seen = new Set<string>();
-    return rows.filter((c) => {
-      if (seen.has(c.id)) return false;
-      seen.add(c.id);
+    return rows.filter((conversation) => {
+      if (seen.has(conversation.id)) return false;
+      seen.add(conversation.id);
       return true;
     });
   }, [conversationsQuery.data, filteredConversationsQuery.data]);
+  useUnseenTick();
+  const unreadConversations = loadedRows.filter(
+    (conversation) =>
+      !(showGoalSessionMarkers && conversation.goal_state === "active") &&
+      (isExplicitlyUnread(conversation.id) ||
+        isConversationUnseen(
+          conversation.id,
+          conversation.updated_at,
+          getConversationForegroundStatus(conversation),
+        )),
+  );
   const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
   // Plus unseen file comments — the badge counts everything the Inbox
   // page lists. Comment queries are shared with the page/FileViewer
@@ -773,6 +808,77 @@ function SidebarImpl({
     activeExtensionPageId,
     newSessionProjectName,
   } = useActiveNavItem();
+  const onNewSessionComposer = isNewChatPage || newSessionProjectName !== null;
+  const pendingComposerTargetRef = useRef<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    if (!onNewSessionComposer || newSessionProjects === undefined) return;
+    const pendingTarget = pendingComposerTargetRef.current;
+    if (pendingTarget !== undefined) {
+      if (pendingTarget !== newSessionProjectName) return;
+      pendingComposerTargetRef.current = undefined;
+    }
+    if (newSessionProjectName === null) {
+      if (newSessionTarget.kind !== "none") selectNoProjectNewSessionTarget();
+      return;
+    }
+    const project = newSessionProjects.find(
+      (candidate) => candidate.name === newSessionProjectName,
+    );
+    if (!project) return;
+    if (
+      newSessionTarget.kind === "project" &&
+      newSessionTarget.projectId === project.id &&
+      newSessionTarget.projectName === project.name
+    ) {
+      return;
+    }
+    selectProjectNewSessionTarget(project);
+  }, [
+    newSessionProjectName,
+    newSessionProjects,
+    newSessionTarget,
+    onNewSessionComposer,
+    selectNoProjectNewSessionTarget,
+    selectProjectNewSessionTarget,
+  ]);
+
+  const selectProjectTarget = useCallback(
+    (project: { id: string | null; name: string }) => {
+      if (onNewSessionComposer) pendingComposerTargetRef.current = project.name;
+      selectProjectNewSessionTarget(project);
+      if (!onNewSessionComposer) return;
+      navigate(
+        newSessionRoute({
+          kind: "project",
+          projectId: project.id,
+          projectName: project.name,
+        }),
+      );
+    },
+    [navigate, onNewSessionComposer, selectProjectNewSessionTarget],
+  );
+  const selectNoProjectTarget = useCallback(() => {
+    if (onNewSessionComposer) pendingComposerTargetRef.current = null;
+    selectNoProjectNewSessionTarget();
+    if (!onNewSessionComposer) return;
+    navigate("/");
+  }, [navigate, onNewSessionComposer, selectNoProjectNewSessionTarget]);
+
+  const routeTarget: NewSessionTarget =
+    newSessionProjectName !== null
+      ? {
+          kind: "project",
+          projectId:
+            newSessionProjects?.find((project) => project.name === newSessionProjectName)?.id ??
+            null,
+          projectName: newSessionProjectName,
+        }
+      : { kind: "none" };
+  const displayedNewSessionTarget = onNewSessionComposer ? routeTarget : newSessionTarget;
+  const selectedNewSessionProjectName =
+    displayedNewSessionTarget.kind === "project" ? displayedNewSessionTarget.projectName : null;
+  const noProjectNewSessionTargetSelected = displayedNewSessionTarget.kind === "none";
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -1028,8 +1134,21 @@ function SidebarImpl({
           this row shares the window's top strip with the traffic lights: the
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
-          Inert in a browser and on other platforms, which keep the row below. */}
+            Inert in a browser and on other platforms, which keep the row below. */}
             <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+              {unreadConversations.length > 0 && !selectionMode && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Mark all sessions as read"
+                  data-testid="mark-all-sessions-read-mobile"
+                  className="sidebar-glass-chip size-9 shrink-0 rounded-full p-0 text-primary md:hidden"
+                  onClick={() => markConversationsSeen(unreadConversations)}
+                >
+                  <MessageCircleCheckIcon className="size-4" />
+                </Button>
+              )}
               {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -1041,7 +1160,10 @@ function SidebarImpl({
                 onClick={onNavClick}
                 data-testid="sidebar-brand"
                 componentId="sidebar.home"
-                className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
+                className={cn(
+                  "sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70",
+                  unreadConversations.length > 0 && !selectionMode && "max-md:hidden",
+                )}
               >
                 {branding.app_name ? (
                   <span className="text-[15px] font-semibold tracking-tight">
@@ -1094,8 +1216,9 @@ function SidebarImpl({
               lands under "My sessions" — so snap the tab back there on click
               (the button stays visible on both tabs). */}
                 <Link
-                  to="/"
+                  to={newSessionTargetRoute}
                   componentId="sidebar.new_chat"
+                  aria-label={`New session in ${newSessionTargetLabel(newSessionTarget)}`}
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
@@ -1109,7 +1232,13 @@ function SidebarImpl({
                         : "text-muted-foreground",
                     )}
                   />
-                  New session
+                  <span className="min-w-0 flex-1 truncate">New session</span>
+                  <span
+                    data-testid="new-session-target-label"
+                    className="ml-auto max-w-28 truncate text-sm text-muted-foreground"
+                  >
+                    {newSessionTargetLabel(newSessionTarget)}
+                  </span>
                 </Link>
               </Button>
               {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
@@ -1238,10 +1367,14 @@ function SidebarImpl({
               >
                 <ConversationList
                   conversationsQuery={displayQuery}
+                  unreadConversations={unreadConversations}
                   scrollContainerRef={scrollContainerRef}
                   onRowClick={onNavClick}
                   searchQuery=""
-                  newSessionProjectName={newSessionProjectName}
+                  selectedNewSessionProjectName={selectedNewSessionProjectName}
+                  noProjectNewSessionTargetSelected={noProjectNewSessionTargetSelected}
+                  onSelectProjectNewSessionTarget={selectProjectTarget}
+                  onSelectNoProjectNewSessionTarget={selectNoProjectTarget}
                   activeTab={activeTab}
                   onActiveTabChange={switchTab}
                   multiUser={multiUser}
@@ -1360,6 +1493,7 @@ function ProjectFolder({
   activeConversationId,
   expanded,
   active,
+  onSelectNewSessionTarget,
   marker,
   onToggleCollapsed,
   pinnedConversationIds,
@@ -1390,7 +1524,9 @@ function ProjectFolder({
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
-  marker: SessionState | null;
+  /** Select this project as the destination for global new-session actions. */
+  onSelectNewSessionTarget: () => void;
+  marker: ProjectMarkerState;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
   activeOverride: ActiveChatOverride | null;
@@ -1486,7 +1622,10 @@ function ProjectFolder({
           )
         }
         active={active}
-        marker={marker}
+        onSelect={onSelectNewSessionTarget}
+        selectionLabel={`Use ${name} for new sessions`}
+        marker={marker.state}
+        backgroundActivityCount={marker.backgroundActivityCount}
         conversations={conversations}
         activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
@@ -1508,6 +1647,7 @@ function ProjectFolder({
                 className="font-medium text-primary underline-offset-4 hover:underline"
                 onClick={(e) => {
                   e.stopPropagation();
+                  onSelectNewSessionTarget();
                   onRowClick(e);
                 }}
               >
@@ -1519,16 +1659,22 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions projectName={name} onNavigate={onRowClick} actions={menuActions} />
+          <ProjectFolderActions
+            projectName={name}
+            onNavigate={onRowClick}
+            onSelectTarget={onSelectNewSessionTarget}
+            actions={menuActions}
+          />
         }
-        // Touch exposes these actions through the header's long-press menu.
-        actionHoverOnly
+        // Touch keeps the direct pencil and menu visible; fine-pointer desktop
+        // layouts reveal the same cluster on header hover/focus.
         headerContextMenu={
           <ContextMenuContent className="min-w-40">
             <ProjectFolderMenuItems
               components={contextBundle}
               projectName={name}
               onNavigate={onRowClick}
+              onSelectTarget={onSelectNewSessionTarget}
               actions={menuActions}
             />
           </ContextMenuContent>
@@ -1554,12 +1700,16 @@ function ProjectFolder({
 
 interface ConversationListProps {
   conversationsQuery: ReturnType<typeof useConversations>;
+  unreadConversations: Conversation[];
   // The scrollable ancestor, used as the infinite-scroll observer root.
   scrollContainerRef: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
-  /** Project selected on the new-session composer route, if any. */
-  newSessionProjectName: string | null;
+  /** Persisted target, overridden while an explicit new-session route is open. */
+  selectedNewSessionProjectName: string | null;
+  noProjectNewSessionTargetSelected: boolean;
+  onSelectProjectNewSessionTarget: (project: { id: string | null; name: string }) => void;
+  onSelectNoProjectNewSessionTarget: () => void;
   activeTab: SidebarTab;
   onActiveTabChange: (tab: SidebarTab) => void;
   /** Multi-user server; gates the "Shared" filter option. */
@@ -1581,10 +1731,14 @@ interface ConversationListProps {
 
 function ConversationList({
   conversationsQuery,
+  unreadConversations,
   scrollContainerRef,
   onRowClick,
   searchQuery,
-  newSessionProjectName,
+  selectedNewSessionProjectName,
+  noProjectNewSessionTargetSelected,
+  onSelectProjectNewSessionTarget,
+  onSelectNoProjectNewSessionTarget,
   activeTab,
   onActiveTabChange,
   multiUser,
@@ -1603,6 +1757,7 @@ function ConversationList({
   // Row-invariant values resolved once here and shared with rows via context
   // (see IsMobileContext etc.), so each row doesn't run its own copy.
   const viewerId = useViewerId();
+  const { showGoalSessionMarkers } = useSessionNavigationPreferences();
   const isMobile = useIsMobileViewport();
   const serverInfo = useServerInfo();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
@@ -1618,7 +1773,6 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
-
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
@@ -2064,6 +2218,71 @@ function ConversationList({
       ...visible("Chats", sections.sessions),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
+
+  const pollingArchive = useArchiveConversation();
+  const conversationPages = conversationsQuery.data?.pages;
+  const hasNextConversationPage = conversationsQuery.hasNextPage;
+  const fetchNextConversationPage = conversationsQuery.fetchNextPage;
+  const getPollingConversations = useCallback(async () => {
+    let pages = conversationPages ?? [];
+    let hasMore = hasNextConversationPage;
+    while (hasMore) {
+      // Cursor pagination is sequential: each request needs the cursor returned by the prior page.
+      // eslint-disable-next-line no-await-in-loop
+      const result = await fetchNextConversationPage();
+      pages = result.data?.pages ?? pages;
+      hasMore = result.hasNextPage ?? false;
+    }
+    const allWithPinned = dedupeConversationsById([
+      ...pages.flatMap((page) => page.data),
+      ...pinnedConversations,
+    ]).filter((conversation) => conversation.archived !== true);
+    const pinned = orderByPinnedTimestamp(
+      allWithPinned.filter((conversation) => pinnedSet.has(conversation.id)),
+    );
+    const pinnedIds = new Set(pinned.map((conversation) => conversation.id));
+    const projectRows: Conversation[] = [];
+    const filedIds = new Set<string>();
+    for (const project of projects) {
+      const rows = sortByUpdatedAtDesc(
+        allWithPinned.filter(
+          (conversation) =>
+            isOwnedByViewer(conversation, viewerId) &&
+            !pinnedIds.has(conversation.id) &&
+            ((project.id !== null && conversation.project_id === project.id) ||
+              conversation.labels?.[PROJECT_LABEL_KEY] === project.name),
+        ),
+        activeOverride,
+      );
+      for (const row of rows) filedIds.add(row.id);
+      projectRows.push(...rows);
+    }
+    const rest = sortByUpdatedAtDesc(
+      allWithPinned.filter(
+        (conversation) => !pinnedIds.has(conversation.id) && !filedIds.has(conversation.id),
+      ),
+      activeOverride,
+    );
+    return [...pinned, ...projectRows, ...rest];
+  }, [
+    conversationPages,
+    hasNextConversationPage,
+    fetchNextConversationPage,
+    pinnedConversations,
+    pinnedSet,
+    projects,
+    viewerId,
+    activeOverride,
+  ]);
+  useSessionPollingHotkeys({
+    activeId,
+    getConversations: getPollingConversations,
+    onArchive: async (id) => {
+      await pollingArchive.mutateAsync({ id, archived: true });
+      showArchivedToast();
+    },
+    canArchive: (conversation) => isOwnedByViewer(conversation, viewerId),
+  });
   // Getter for the shift-select range, built on demand (at click time). Scopes
   // to whichever section is selectable: the flat Sessions list, or the sessions
   // across expanded project folders (in render order). For projects scope the
@@ -2253,10 +2472,13 @@ function ConversationList({
                       windowConversations={group.conversations}
                       activeConversationId={displayedActiveId}
                       expanded={expandedProjects.includes(group.name)}
-                      active={newSessionProjectName === group.name}
+                      active={selectedNewSessionProjectName === group.name}
+                      onSelectNewSessionTarget={() =>
+                        onSelectProjectNewSessionTarget({ id: group.id, name: group.name })
+                      }
                       // Best-effort marker from the globally-loaded window: a
                       // collapsed folder hasn't fetched its own sessions yet.
-                      marker={projectMarkerState(group.conversations)}
+                      marker={projectMarkerState(group.conversations, showGoalSessionMarkers)}
                       onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                       pinnedConversationIds={pinnedConversationIds}
                       activeOverride={activeOverride}
@@ -2291,6 +2513,9 @@ function ConversationList({
                   >
                     <ConversationSection
                       title="Sessions"
+                      active={noProjectNewSessionTargetSelected}
+                      onSelect={onSelectNoProjectNewSessionTarget}
+                      selectionLabel="Use No Project for new sessions"
                       conversations={sections.sessions}
                       activeConversationId={displayedActiveId}
                       emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
@@ -2316,28 +2541,52 @@ function ConversationList({
                       }
                       headerAction={
                         // The filter stays reachable while bulk-selecting;
-                        // switching scope just exits selection. Only the
-                        // "select" entry point hides, being already active.
+                        // switching scope just exits selection. The read-all
+                        // and select entry points hide while selection owns
+                        // the header.
                         !selectionMode ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label="Select sessions"
-                                data-testid="toggle-selection-mode"
-                                className="text-muted-foreground"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onEnterSelectionMode("sessions");
-                                }}
-                              >
-                                <ListChecksIcon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Select sessions</TooltipContent>
-                          </Tooltip>
+                          <>
+                            {unreadConversations.length > 0 && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon-xs"
+                                    aria-label="Mark all sessions as read"
+                                    data-testid="mark-all-sessions-read"
+                                    className="text-muted-foreground max-md:hidden"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      markConversationsSeen(unreadConversations);
+                                    }}
+                                  >
+                                    <MailOpenIcon className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="bottom">Mark all as read</TooltipContent>
+                              </Tooltip>
+                            )}
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="Select sessions"
+                                  data-testid="toggle-selection-mode"
+                                  className="text-muted-foreground"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onEnterSelectionMode("sessions");
+                                  }}
+                                >
+                                  <ListChecksIcon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Select sessions</TooltipContent>
+                            </Tooltip>
+                          </>
                         ) : undefined
                       }
                       persistentHeaderAction={
@@ -2468,37 +2717,56 @@ function UngroupDropZone() {
 
 /**
  * Aggregate the sidebar marker for a project from its conversations, using
- * the same precedence a row uses (awaiting > unseen > running). Returned as a
- * {@link SessionState} so a collapsed project header can render the exact
- * same {@link SessionStateBadge} the rows do. ``null`` = no marker.
+ * the same foreground precedence a row uses (awaiting > unseen > running),
+ * while summing background activity independently so both can be rendered.
  */
-function projectMarkerState(conversations: Conversation[]): SessionState | null {
+interface ProjectMarkerState {
+  state: SessionState | null;
+  backgroundActivityCount: number;
+}
+
+function projectMarkerState(
+  conversations: Conversation[],
+  showGoalSessionMarkers: boolean,
+): ProjectMarkerState {
   let awaiting = 0;
   let unseen = false;
   let running = false;
+  let backgroundActivityCount = 0;
   for (const c of conversations) {
+    const foregroundStatus = getConversationForegroundStatus(c);
+    backgroundActivityCount += c.background_activity_count ?? 0;
     const pending = c.pending_elicitations_count ?? 0;
     if (pending > 0) {
       awaiting += pending;
-    } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
+    } else if (
+      !(showGoalSessionMarkers && c.goal_state === "active") &&
+      isConversationUnseen(c.id, c.updated_at, foregroundStatus)
+    ) {
       unseen = true;
-    } else if (c.status === "running") {
+    } else if (foregroundStatus === "running") {
       running = true;
     }
   }
-  if (awaiting > 0) return { kind: "awaiting", count: awaiting };
-  if (unseen) return { kind: "unseen" };
-  if (running) return { kind: "running" };
-  return null;
+  const state: SessionState | null =
+    awaiting > 0
+      ? { kind: "awaiting", count: awaiting }
+      : unseen
+        ? { kind: "unseen" }
+        : running
+          ? { kind: "running" }
+          : null;
+  return { state, backgroundActivityCount };
 }
 
 // The shared collapsible header used by every sidebar section and section
-// group, so they all align and animate identically (icon · title ·
-// hover-chevron · collapsed marker).
+// group, so they all align and animate identically (icon · title · markers ·
+// hover-chevron).
 function SectionHeader({
   title,
   icon,
   marker,
+  backgroundActivityCount = 0,
   active = false,
   hasAction,
   actionHoverOnly,
@@ -2506,12 +2774,16 @@ function SectionHeader({
   actionFocusVisible,
   collapsed,
   onToggleCollapsed,
+  onSelect,
+  selectionLabel,
   contextMenu,
   contextMenuDisabled,
 }: {
   title: string;
   icon?: ReactNode;
   marker?: SessionState | null;
+  /** Sum of background work hidden inside this collapsed section. */
+  backgroundActivityCount?: number;
   /** Whether this header represents the current page context. */
   active?: boolean;
   /** Whether the section also renders header controls overlaid at the right
@@ -2531,12 +2803,16 @@ function SectionHeader({
   actionFocusVisible?: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** When present, the name chooses a new-session destination and the
+      separately rendered chevron remains the only expand/collapse control. */
+  onSelect?: () => void;
+  selectionLabel?: string;
   /** Optional context-menu content for the header button. */
   contextMenu?: ReactNode;
   /** Suppresses the header context menu while another interaction owns it. */
   contextMenuDisabled?: boolean;
 }) {
-  const showsMarker = collapsed && marker != null;
+  const showsMarker = collapsed && (marker != null || backgroundActivityCount > 0);
   // Right-edge offset of the marker when no header control is painted: it
   // matches the rows' badge slot (-mr-1 trims an icon folder's px-2 to the
   // right-1 edge; mr-1 pushes a padless header out to it). One media condition
@@ -2579,14 +2855,17 @@ function SectionHeader({
   const button = (
     <button
       type="button"
-      aria-expanded={!collapsed}
-      aria-current={active ? "page" : undefined}
+      aria-expanded={onSelect ? undefined : !collapsed}
+      aria-current={!onSelect && active ? "page" : undefined}
+      aria-pressed={onSelect ? active : undefined}
+      aria-label={onSelect ? (selectionLabel ?? `Use ${title} for new sessions`) : undefined}
       onClick={(event) => {
         // A pointer click would otherwise leave the header focus-within,
         // keeping the hover-revealed controls up at rest. Keyboard toggles
         // (detail 0) keep focus for the ring.
         if (event.detail > 0) event.currentTarget.blur();
-        onToggleCollapsed();
+        if (onSelect) onSelect();
+        else onToggleCollapsed();
       }}
       className={cn(
         contextMenu && "select-none [-webkit-touch-callout:none]",
@@ -2599,6 +2878,8 @@ function SectionHeader({
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
             )
           : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+        onSelect && "pl-8",
+        onSelect && !icon && active && cn("rounded-md", SIDEBAR_ACTIVE_HIGHLIGHT),
       )}
     >
       {icon ? (
@@ -2607,31 +2888,41 @@ function SectionHeader({
         // rather than trailing the name. Mobile (no hover) keeps the folder
         // icon and shows the trailing chevron below.
         <span className="relative flex size-4 shrink-0 items-center justify-center">
-          <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+          <span
+            className={cn(
+              "flex",
+              !onSelect &&
+                "md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0",
+            )}
+          >
             {icon}
           </span>
-          <ChevronRightIcon
-            className={cn(
-              "absolute size-3.5 opacity-0 transition-[transform,opacity]",
-              !collapsed && "rotate-90",
-              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-            )}
-          />
+          {!onSelect && (
+            <ChevronRightIcon
+              className={cn(
+                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+                !collapsed && "rotate-90",
+                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+              )}
+            />
+          )}
         </span>
       ) : null}
       <span className="min-w-0 truncate">{title}</span>
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
-      <ChevronRightIcon
-        className={cn(
-          "size-3.5 shrink-0 transition-[transform,opacity]",
-          !collapsed && "rotate-90",
-          icon
-            ? "md:hidden"
-            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-        )}
-      />
+      {!onSelect && (
+        <ChevronRightIcon
+          className={cn(
+            "size-3.5 shrink-0 transition-[transform,opacity]",
+            !collapsed && "rotate-90",
+            icon
+              ? "md:hidden"
+              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+          )}
+        />
+      )}
       {/* A hidden row inside this collapsed section carries a marker — surface
             the exact same badge a row would show, pinned to the right edge. */}
       {showsMarker && (
@@ -2646,20 +2937,23 @@ function SectionHeader({
             // Dot/spinner markers get the fixed size-6 centered box (center
             // lands 16px from the edge, matching the rows). The "awaiting"
             // pill keeps its natural width so its label isn't clipped.
-            isDotMarker(marker) && "w-6",
+            isDotMarker(marker ?? null) && backgroundActivityCount === 0 && "w-6",
             // Fade out so the revealed kebab takes the marker's place,
             // mirroring a row's time/marker slot.
             hasAction && cn(markerFade, actionFocusFade),
           )}
         >
-          <SessionStateBadge state={marker} />
+          {marker && <SessionStateBadge state={marker} />}
+          {backgroundActivityCount > 0 && (
+            <BackgroundActivityBadge count={backgroundActivityCount} />
+          )}
         </span>
       )}
     </button>
   );
 
   return (
-    <h2>
+    <h2 className="relative">
       {contextMenu && !contextMenuDisabled ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
@@ -2667,6 +2961,23 @@ function SectionHeader({
         </ContextMenu>
       ) : (
         button
+      )}
+      {onSelect && (
+        <button
+          type="button"
+          aria-label={title}
+          aria-expanded={!collapsed}
+          onClick={(event) => {
+            event.stopPropagation();
+            if (event.detail > 0) event.currentTarget.blur();
+            onToggleCollapsed();
+          }}
+          className="-translate-y-1/2 absolute top-1/2 left-1 z-10 flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <ChevronRightIcon
+            className={cn("size-3.5 transition-transform", !collapsed && "rotate-90")}
+          />
+        </button>
       )}
     </h2>
   );
@@ -2868,12 +3179,15 @@ function ConversationSection({
   title,
   icon,
   marker,
+  backgroundActivityCount,
   active,
   conversations,
   activeConversationId,
   pinnedConversationIds,
   collapsed,
   onToggleCollapsed,
+  onSelect,
+  selectionLabel,
   onRowClick,
   onTogglePinned,
   selectionMode,
@@ -2894,6 +3208,8 @@ function ConversationSection({
   icon?: ReactNode;
   /** When collapsed, the aggregate marker of hidden rows (same badge as a row). */
   marker?: SessionState | null;
+  /** Aggregate background work surfaced only while the section is collapsed. */
+  backgroundActivityCount?: number;
   /** Whether this section header represents the current page context. */
   active?: boolean;
   conversations: Conversation[];
@@ -2905,6 +3221,8 @@ function ConversationSection({
   /** Whether this section is currently collapsed. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  onSelect?: () => void;
+  selectionLabel?: string;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -2932,6 +3250,7 @@ function ConversationSection({
       can expand that (possibly brand-new) project folder. */
   onProjectAssigned?: (projectName: string) => void;
 }) {
+  const { showGoalSessionMarkers } = useSessionNavigationPreferences();
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const protectsCollapsedBadge = isCollapsed && marker != null;
@@ -2946,12 +3265,15 @@ function ConversationSection({
             title={title}
             icon={icon}
             marker={marker}
+            backgroundActivityCount={backgroundActivityCount}
             active={active}
             hasAction={headerAction != null}
             actionHoverOnly={actionHoverOnly}
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            onSelect={onSelect}
+            selectionLabel={selectionLabel}
             contextMenu={headerContextMenu}
             contextMenuDisabled={selectionMode}
           />
@@ -3040,6 +3362,7 @@ function ConversationSection({
                   isSelected={selectedIds.has(conv.id)}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={onProjectAssigned}
+                  showGoalSessionMarkers={showGoalSessionMarkers}
                 />
               ))}
             </ul>
@@ -3492,6 +3815,59 @@ function SessionTooltipContent({
   );
 }
 
+function splitWorkspacePath(workspace: string): { prefix: string; tail: string } {
+  const match = /^(.*[\\/])([^\\/]+)$/.exec(workspace);
+  return match ? { prefix: match[1]!, tail: match[2]! } : { prefix: "", tail: workspace };
+}
+
+function SessionWorkspaceDetail({ workspace }: { workspace: string }) {
+  const { prefix, tail } = splitWorkspacePath(workspace);
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-testid="session-workspace-detail"
+          aria-label={`Working directory: ${workspace}`}
+          className="mx-2 mb-1 ml-8 flex min-w-0 max-w-[calc(100%-6rem)] items-center gap-1 rounded px-1 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onPointerDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+        >
+          <FolderIcon aria-hidden className="size-3 shrink-0" />
+          <span
+            data-testid="session-workspace-path"
+            className="flex min-w-0 max-w-full items-baseline overflow-hidden"
+          >
+            {prefix && (
+              <span data-testid="session-workspace-prefix" className="min-w-0 truncate">
+                {prefix}
+              </span>
+            )}
+            <span data-testid="session-workspace-tail" className="shrink-0">
+              {tail}
+            </span>
+          </span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        side="bottom"
+        align="start"
+        collisionPadding={16}
+        className="w-auto max-w-[calc(100vw-2rem)] p-2.5 text-sm"
+      >
+        <p className="font-medium">Working directory</p>
+        <p className="mt-1 max-w-80 break-all font-mono text-xs text-muted-foreground">
+          {workspace}
+        </p>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 // Max gap between the first click and the dblclick of one double-click.
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
@@ -3506,6 +3882,7 @@ function ConversationRowImpl({
   isSelected,
   onToggleSelected,
   onProjectAssigned,
+  showGoalSessionMarkers,
 }: {
   conversation: Conversation;
   // Computed by the list owner against the resolved top-level root (so a
@@ -3519,6 +3896,7 @@ function ConversationRowImpl({
   isSelected: boolean;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  showGoalSessionMarkers: boolean;
 }) {
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
@@ -3612,6 +3990,7 @@ function ConversationRowImpl({
   const firstClassProjectName =
     conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
   const currentProject = firstClassProjectName ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
+  const unfiledWorkspace = currentProject === null ? conversation.workspace?.trim() : "";
   // Pinned sessions are lifted OUT of their project folder into the flat
   // "Pinned" section, so the row no longer shows which project it belongs to.
   // For those rows only, surface the project in a hover flyout. Non-pinned
@@ -3664,9 +4043,17 @@ function ConversationRowImpl({
   // invisible until the turn finishes (then the dot lights like any unseen
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
-  const hasUnseenMessages = readState.unseen && (!isActive || readState.explicitlyUnread);
+  const goalState = showGoalSessionMarkers ? (conversation.goal_state ?? null) : null;
+  const isLogicallyUnread =
+    isConversationUnseen(
+      conversation.id,
+      conversation.updated_at,
+      getConversationForegroundStatus(conversation),
+    ) &&
+    (!isActive || isExplicitlyUnread(conversation.id));
+  const hasUnseenMessages = isLogicallyUnread && goalState !== "active";
   // "Mark as unread" is offered on any row not already showing the dot.
-  const canMarkUnread = !hasUnseenMessages;
+  const canMarkUnread = !isLogicallyUnread;
   // Badge precedence: a pending approval ("Needs response") outranks the
   // unread dot — a session that's both unread and awaiting input should
   // surface the actionable approval tag. The row still renders bold (the
@@ -3688,13 +4075,19 @@ function ConversationRowImpl({
       : hasUnseenMessages
         ? { kind: "unseen" as const }
         : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
+  const backgroundActivityCount = Math.max(0, conversation.background_activity_count ?? 0);
+  const hasBackgroundActivity = backgroundActivityCount > 0;
+  const hasGoalMarker = goalState === "active" || goalState === "paused";
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
-  const showDraftIndicator = hasDraft && !isActive;
-  const showSharedIndicator = !isOwner;
-  const hasSessionIndicator = sessionState !== null || showDraftIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
+  const showDraftIndicator = hasDraft && !isActive && !hasBackgroundActivity && !hasGoalMarker;
+  const hasTrailingIndicator =
+    sessionState !== null || hasBackgroundActivity || hasGoalMarker || showDraftIndicator;
+  const compactMarkerCount =
+    (sessionState !== null && sessionState.kind !== "awaiting" ? 1 : 0) +
+    (hasBackgroundActivity ? 1 : 0) +
+    (hasGoalMarker ? 1 : 0);
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -3879,14 +4272,18 @@ function ConversationRowImpl({
         // rest, before hover reveals the controls.
         !selectionMode &&
           (sessionState?.kind === "awaiting"
-            ? showSharedIndicator
-              ? "pr-36"
-              : "pr-29"
-            : hasSessionIndicator && showSharedIndicator
-              ? "pr-14"
-              : hasTrailingIndicator
-                ? "pr-8"
-                : "pr-2"),
+            ? hasBackgroundActivity && hasGoalMarker
+              ? "pr-[10.25rem]"
+              : hasBackgroundActivity || hasGoalMarker
+                ? "pr-[8.75rem]"
+                : "pr-29"
+            : compactMarkerCount >= 3
+              ? "pr-17"
+              : compactMarkerCount === 2
+                ? "pr-12"
+                : hasTrailingIndicator
+                  ? "pr-8"
+                  : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -3898,6 +4295,7 @@ function ConversationRowImpl({
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
+      data-goal-state={goalState ?? undefined}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
         // Swallow the click that trails a drag so it doesn't navigate.
@@ -3935,7 +4333,15 @@ function ConversationRowImpl({
     >
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
-      <div className="flex w-full items-center">
+      <div className="flex w-full items-center gap-1.5">
+        <AgentBadge
+          agentId={
+            conversation.labels[AGENT_TEMPLATE_LABEL] ??
+            conversation.agent_template_id ??
+            conversation.agent_id ??
+            null
+          }
+        />
         <span
           className={cn(
             "relative min-w-0 truncate",
@@ -4050,6 +4456,9 @@ function ConversationRowImpl({
           <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
         </Tooltip>
       )}
+      {!selectionMode && unfiledWorkspace && (
+        <SessionWorkspaceDetail workspace={unfiledWorkspace} />
+      )}
       {selectionMode ? (
         <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
           {isSelected ? (
@@ -4062,16 +4471,24 @@ function ConversationRowImpl({
         <span
           className={cn(
             SESSION_STATE_SLOT_CLASS,
-            "right-1",
+            unfiledWorkspace && "top-4",
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in
             // the fixed centered box so it lines up under the kebab.
-            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
+            isDotMarker(sessionState) &&
+              (compactMarkerCount >= 3
+                ? "w-16 justify-center gap-1"
+                : compactMarkerCount === 2
+                  ? "w-11 justify-center gap-1"
+                  : SESSION_STATE_DOT_SLOT_CLASS),
+            sessionState?.kind === "awaiting" &&
+              (hasBackgroundActivity || hasGoalMarker) &&
+              "gap-1",
           )}
         >
           {sessionState !== null ? (
             <SessionStateBadge state={sessionState} />
-          ) : (
+          ) : showDraftIndicator ? (
             <span
               role="img"
               aria-label="Draft"
@@ -4080,7 +4497,9 @@ function ConversationRowImpl({
             >
               <MessageCircleDashedIcon aria-hidden className="size-3.5" />
             </span>
-          )}
+          ) : null}
+          {hasBackgroundActivity && <BackgroundActivityBadge count={backgroundActivityCount} />}
+          {hasGoalMarker && <GoalActivityBadge state={goalState} />}
         </span>
       ) : null}
       {!selectionMode && showSharedIndicator && (
@@ -4103,7 +4522,12 @@ function ConversationRowImpl({
           gap to its left. Hidden entirely while selecting (bulk mode owns the
           row controls). */}
       {!selectionMode && (
-        <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+        <div
+          className={cn(
+            "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
+            unfiledWorkspace && "top-4",
+          )}
+        >
           {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
           {!isArchived && (
@@ -4427,7 +4851,11 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "project_id",
   "owner",
   "pending_elicitations_count",
-  "provisional",
+  "goal_state",
+  "foreground_status",
+  "background_activity_count",
+  "agent_id",
+  "agent_template_id",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
@@ -4446,6 +4874,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
   return (
     prev.isActive === next.isActive &&
     prev.isPinned === next.isPinned &&
+    prev.showGoalSessionMarkers === next.showGoalSessionMarkers &&
     prev.selectionMode === next.selectionMode &&
     prev.isSelected === next.isSelected &&
     prev.onClick === next.onClick &&
@@ -4507,28 +4936,26 @@ function PinnedProjectFlyoutContent({
 
 // ── ProjectFolderActions ──────────────────────────────────────────────────────
 
-/** Fine-hover shortcuts for project actions and starting a pre-filed session. */
+/** Project actions and a shortcut for starting a pre-filed session. */
 function ProjectFolderActions({
   projectName,
   onNavigate,
+  onSelectTarget,
   actions,
 }: {
   projectName: string;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSelectTarget: () => void;
   actions: ProjectFolderMenuActions;
 }) {
   return (
     // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
     // pin↔kebab spacing, so the two icon columns line up across row types.
     <div className="flex items-center gap-0.5">
-      {/* A redundant shortcut for the kebab's always-present "New session"
-          item, so it is genuinely absent (not just clipped) wherever no fine
-          hover pointer can reveal it: on touch, folding fully into the kebab
-          instead of leaving a duplicate focus stop for keyboard/AT users. On
-          hover+fine it is display-flex and revealed on hover or keyboard focus
-          by the overlay's opacity. */}
+      {/* Keep project-scoped creation directly visible on touch screens. The
+          labeled menu item remains an equivalent path. */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -4538,7 +4965,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
+            className="text-muted-foreground"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -4546,6 +4973,7 @@ function ProjectFolderActions({
                 // Keep the click off the folder's collapse toggle, then run the
                 // shared nav handler (closes the sidebar overlay on mobile).
                 e.stopPropagation();
+                onSelectTarget();
                 onNavigate(e);
               }}
             >
@@ -4555,7 +4983,12 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        onNavigate={onNavigate}
+        onSelectTarget={onSelectTarget}
+        actions={actions}
+      />
     </div>
   );
 }
@@ -4567,11 +5000,13 @@ function ProjectFolderMenuItems({
   components: C,
   projectName,
   onNavigate,
+  onSelectTarget,
   actions,
 }: {
   components: MenuComponents;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSelectTarget: () => void;
   actions: ProjectFolderMenuActions;
 }) {
   useEffect(() => {
@@ -4587,6 +5022,7 @@ function ProjectFolderMenuItems({
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
             e.stopPropagation();
+            onSelectTarget();
             onNavigate(e);
           }}
         >
@@ -4923,25 +5359,26 @@ function useProjectFolderMenu(
 function ProjectFolderMenu({
   projectName,
   onNavigate,
+  onSelectTarget,
   actions,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSelectTarget: () => void;
   actions: ProjectFolderMenuActions;
 }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        {/* Revealed on hover for fine hover pointers at any width; otherwise
-            sr-only so touch and assistive tech keep a focusable, announced
-            trigger for the same actions the long-press menu also opens. */}
+        {/* Touch screens keep the menu visible; fine-pointer desktop layouts
+            reveal the controls cluster on header hover/focus. */}
         <Button
           type="button"
           variant="ghost"
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
+          className="text-muted-foreground"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
@@ -4952,6 +5389,7 @@ function ProjectFolderMenu({
           components={dropdownBundle}
           projectName={projectName}
           onNavigate={onNavigate}
+          onSelectTarget={onSelectTarget}
           actions={actions}
         />
       </DropdownMenuContent>

@@ -140,6 +140,35 @@ def test_the_cli_is_probed_once_per_host_process(
     assert calls == ["/bin/codex"]
 
 
+def test_bundled_catalog_probe_bypasses_a_configured_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compact metadata comes from Codex's built-in model definitions."""
+    calls: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(_catalog())
+
+    def _run(argv: list[str], **_kwargs: Any) -> _Completed:  # type: ignore[explicit-any]
+        calls.append(argv)
+        return _Completed()
+
+    monkeypatch.setattr(codex_executor.subprocess, "run", _run)
+
+    catalog = codex_executor._probe_codex_model_catalog(
+        "/bin/codex",
+        tmp_path,
+        timeout=2.0,
+        bundled=True,
+    )
+
+    assert catalog is not None
+    assert calls == [["/bin/codex", "debug", "models", "--bundled"]]
+
+
 def test_an_in_place_codex_upgrade_is_re_probed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

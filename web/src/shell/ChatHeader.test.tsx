@@ -41,6 +41,7 @@ const mobileMenu = {
   terminalFirst: false,
   executionLogsOpen: false,
   filesPanelOpen: false,
+  archivePanelOpen: false,
   subagentsPanelOpen: false,
   shellsPanelOpen: false,
   hideTerminalsTab: false,
@@ -52,6 +53,7 @@ const mobileMenu = {
   agentCount: 1,
   onOpenFiles: () => {},
   onOpenChanges: () => {},
+  onOpenArchive: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
   onOpenMainExecutionLog: () => {},
@@ -400,6 +402,9 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(back).toHaveTextContent("Back");
     expect(back).not.toHaveTextContent("Fix the login bug");
     expect(back.querySelector(".lucide-chevron-left")).not.toBeNull();
+    expect(document.querySelector(".breadcrumb-native-session-title")).toHaveTextContent(
+      "Fix the login bug",
+    );
   });
 
   it("still links back to the parent when the breadcrumb title is unresolved", () => {
@@ -791,9 +796,10 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Mark as unread",
       "Add to project",
       "Files",
+      "Archived sessions",
       "Changes",
       "Agents1",
-      "Archive",
+      "Archive this session",
       "Delete",
     ]);
   });
@@ -816,6 +822,25 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
     expect(onOpenFiles).toHaveBeenCalled();
+  });
+
+  it("opens the Archive Library drawer from the mobile session menu", () => {
+    const onOpenArchive = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      mobileMenu: { ...mobileMenu, onOpenArchive },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archived sessions" }));
+    expect(onOpenArchive).toHaveBeenCalledOnce();
   });
 
   it("keeps the rail entries reachable when the session isn't owner-managed", () => {

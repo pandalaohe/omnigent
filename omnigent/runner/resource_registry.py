@@ -366,7 +366,13 @@ class SessionResourceRegistry:
         # working status that replaces the hook-based ``UserPromptSubmit``
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
-        self._session_status_publisher: Callable[[str, str, str | None], None] | None = None
+        self._session_status_publisher: (
+            Callable[
+                [str, str, str | None, int | None, list[dict[str, object]] | None],
+                None,
+            ]
+            | None
+        ) = None
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -378,7 +384,12 @@ class SessionResourceRegistry:
         # dedup against one baseline. Kept separate from the exit memo above,
         # which the turn-start hook also writes — deduping against that one
         # would swallow the turn's real ``running``.
-        self._published_session_status: dict[str, tuple[str, str | None]] = {}
+        self._published_session_status: dict[str, tuple[str, str | None, int | None]] = {}
+        # Exact background-shell state last observed from the native forwarder.
+        # Unlike the server's cache this runner survives a server restart, so it
+        # can replay the tally/detail when the tunnel reconnects. An explicit
+        # zero or failed status removes the entry; absent counts leave it alone.
+        self._background_task_replay: dict[str, tuple[int, list[dict[str, object]] | None]] = {}
         # Live claude-native status-file pollers, per session. Held so a
         # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
         # poller keeps its own edge/mtime baselines on the watcher thread, and
@@ -413,7 +424,10 @@ class SessionResourceRegistry:
 
     def set_session_status_publisher(
         self,
-        publisher: Callable[[str, str, str | None], None],
+        publisher: Callable[
+            [str, str, str | None, int | None, list[dict[str, object]] | None],
+            None,
+        ],
     ) -> None:
         """Install the PTY-activity-derived session-status publisher.
 
@@ -425,10 +439,12 @@ class SessionResourceRegistry:
         directly. Only the claude-native agent terminal's watcher calls
         it — see :meth:`_start_terminal_activity_watcher`.
 
-        :param publisher: Callable ``(session_id, status, blocked_on) ->
-            None`` where *status* is ``"running"`` or ``"idle"`` and
-            *blocked_on* is a short reason the agent is parked on a dialog
-            (e.g. ``"permission prompt"``), or ``None``.
+        :param publisher: Callable ``(session_id, status, blocked_on,
+            background_task_count, background_tasks) -> None`` where *status* is ``"running"``
+            or ``"idle"``, *blocked_on* is a short reason the agent is parked
+            on a dialog (e.g. ``"permission prompt"``), and an explicit
+            background count is supplied only when the status source can prove
+            it authoritatively.
         """
         self._session_status_publisher = publisher
 
@@ -475,30 +491,40 @@ class SessionResourceRegistry:
         with self._lock:
             self._published_session_status.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
+            self._background_task_replay.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
 
-    def _claim_status_edge(self, session_id: str, status: str, blocked_on: str | None) -> bool:
+    def _claim_status_edge(
+        self,
+        session_id: str,
+        status: str,
+        blocked_on: str | None,
+        background_task_count: int | None,
+    ) -> bool:
         """Record an edge as published, reporting whether it was a change.
 
-        Keyed on the ``(status, blocked_on)`` pair so a session that stays
-        ``running`` while it parks on a dialog still delivers the reason.
+        Keyed on ``(status, blocked_on, background_task_count)`` so a session
+        that stays ``running`` while it parks on a dialog still delivers the
+        reason, and ``shell`` → ``idle`` can publish an authoritative zero.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: Status about to be published, e.g. ``"running"``.
         :param blocked_on: Reason the agent is parked, or ``None``.
+        :param background_task_count: Authoritative shell tally, or ``None``.
         :returns: ``True`` when this differs from the last published edge
             (so the caller should publish), ``False`` when it is a duplicate.
         """
         with self._lock:
-            if self._published_session_status.get(session_id) == (status, blocked_on):
+            edge = (status, blocked_on, background_task_count)
+            if self._published_session_status.get(session_id) == edge:
                 return False
-            self._published_session_status[session_id] = (status, blocked_on)
+            self._published_session_status[session_id] = edge
             return True
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
         """Adopt an externally-published *status* as the dedup baseline."""
         with self._lock:
-            self._published_session_status[session_id] = (status, None)
+            self._published_session_status[session_id] = (status, None, None)
 
     def resync_session_statuses(self) -> None:
         """Re-arm every status source so it republishes what it already sent.
@@ -525,6 +551,19 @@ class SessionResourceRegistry:
             sessions = sorted(self._published_session_status)
             self._published_session_status.clear()
             pollers = list(self._status_pollers.values())
+            background_replays = [
+                (
+                    session_id,
+                    self._last_session_status.get(session_id, "idle"),
+                    count,
+                    [dict(task) for task in tasks] if tasks is not None else None,
+                )
+                for session_id, (count, tasks) in self._background_task_replay.items()
+            ]
+        publisher = self._session_status_publisher
+        if publisher is not None:
+            for session_id, status, count, tasks in background_replays:
+                publisher(session_id, status, None, count, tasks)
         for poller in pollers:
             poller.resync()
         if sessions or pollers:
@@ -549,7 +588,14 @@ class SessionResourceRegistry:
         """
         self._set_session_status_memo(session_id, "running")
 
-    def note_external_session_status(self, session_id: str, status: str) -> None:
+    def note_external_session_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        background_task_count: int | None = None,
+        background_tasks: list[dict[str, object]] | None = None,
+    ) -> None:
         """Record a terminal-observed external status for exit classification.
 
         Structured native forwarders can know turn completion more reliably than
@@ -566,12 +612,36 @@ class SessionResourceRegistry:
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
+        :param background_task_count: Authoritative background-shell tally from
+            the native Stop edge. ``None`` preserves the prior replay state.
+        :param background_tasks: Optional per-shell detail backing a positive
+            tally. Copied before retention so request-owned data cannot mutate it.
         """
         if status == "idle":
             self._set_session_status_memo(session_id, "idle")
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
+        with self._lock:
+            if status == "failed" or background_task_count == 0:
+                self._background_task_replay.pop(session_id, None)
+            elif background_task_count is not None and background_task_count > 0:
+                self._background_task_replay[session_id] = (
+                    background_task_count,
+                    [dict(task) for task in background_tasks]
+                    if background_tasks is not None
+                    else None,
+                )
         self._sync_status_edge(session_id, status)
+        if status == "idle":
+            # Hook delivery and file polling run independently. A delayed Stop
+            # can arrive after the next turn already wrote busy; resetting only
+            # the registry edge leaves the poller's unchanged-mtime gate silent.
+            # Recheck the authoritative current file on its next normal tick.
+            # Explicit failure/termination must not be reset by a stale file.
+            with self._lock:
+                poller = self._status_pollers.get(session_id)
+            if poller is not None:
+                poller.resync()
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
@@ -1195,7 +1265,11 @@ class SessionResourceRegistry:
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
 
-        def _publish_status(status: str, blocked_on: str | None = None) -> None:
+        def _publish_status(
+            status: str,
+            blocked_on: str | None = None,
+            background_task_count: int | None = None,
+        ) -> None:
             # Publish one running/idle edge: dedup against the last value,
             # memo for exit classification, and hop to the loop (publishers
             # are loop-only). Shared by the PTY edges and the claude-native
@@ -1205,10 +1279,23 @@ class SessionResourceRegistry:
             # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
-            if not self._claim_status_edge(session_id, status, blocked_on):
+            # Claude's status-file poller owns the authoritative shell-finished
+            # zero. Clear the reconnect replay before deduping/publishing so a
+            # later Server restart cannot resurrect an already-finished B.
+            if background_task_count == 0:
+                with self._lock:
+                    self._background_task_replay.pop(session_id, None)
+            if not self._claim_status_edge(session_id, status, blocked_on, background_task_count):
                 return
             self._set_session_status_memo(session_id, status)
-            loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
+            loop.call_soon_threadsafe(
+                status_publisher,
+                session_id,
+                status,
+                blocked_on,
+                background_task_count,
+                None,
+            )
 
         def _file_owns_status() -> bool:
             # Once Claude's own status file is readable it is the session's
@@ -1361,7 +1448,7 @@ class SessionResourceRegistry:
         *,
         session_id: str,
         instance: TerminalInstance,
-        on_status: Callable[[str, str | None], None],
+        on_status: Callable[[str, str | None, int | None], None],
     ) -> SessionStatusPoller:
         """Build the claude-native ``sessions/<pid>.json`` status poller.
 
@@ -1377,9 +1464,11 @@ class SessionResourceRegistry:
             the bridge directory holding the captured Claude session uuid.
         :param instance: The launched terminal instance (exposes
             ``pane_pid_sync``).
-        :param on_status: Callback fired as ``(status, blocked_on)`` on each
-            transition, where *status* is ``running`` / ``idle`` and
-            *blocked_on* names the dialog the agent is parked on, if any.
+        :param on_status: Callback fired as ``(status, blocked_on,
+            background_task_count)`` on each transition, where *status* is
+            ``running`` / ``idle``, *blocked_on* names the dialog the agent is
+            parked on, if any, and the count is an authoritative zero when the
+            status file proves all background shells finished.
         :returns: A ``SessionStatusPoller`` the watcher drives per tick.
         """
         from omnigent.harnesses.claude_native.bridge import (

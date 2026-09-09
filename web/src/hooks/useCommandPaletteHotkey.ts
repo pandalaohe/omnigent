@@ -12,6 +12,12 @@
 // consume — see `focusOwnsHotkey`.
 
 import { useEffect, useRef } from "react";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+} from "@/lib/keyboardShortcutPreferences";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 
@@ -27,12 +33,15 @@ export function isCommandPaletteHotkey(
   e: globalThis.KeyboardEvent,
   isMac: boolean = isMacPlatform(),
 ): boolean {
-  if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return false;
   // AltGr reports as Ctrl+Alt on some layouts; the altKey check above already
   // rejects it, but guard explicitly so intl typing never triggers the palette.
   if (e.getModifierState("AltGraph")) return false;
   // Match the letter, not a physical code — ⌘ doesn't remap "k" across layouts.
-  return e.key === "k" || e.key === "K";
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("commandPalette")) return false;
+  if (!hasCustomShortcutBindings("commandPalette")) {
+    return hasCommandModifier(e, isMac) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k";
+  }
+  return eventMatchesShortcutAction(e, "commandPalette");
 }
 
 /**

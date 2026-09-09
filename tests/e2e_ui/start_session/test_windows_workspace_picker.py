@@ -90,6 +90,9 @@ _FS_TEMPLATE: dict[str, list[tuple[str, str]]] = {
     "C:\\Users\\alice\\Documents": [("notes.txt", "file")],
     "C:\\Users\\alice\\work": [("omnigent-app", "directory")],
     "C:\\Users\\alice\\work\\omnigent-app": [("README.md", "file")],
+    "D:\\": [("Projects", "directory")],
+    "D:\\Projects": [("omnigent", "directory")],
+    "E:\\": [("Archive", "directory")],
 }
 
 
@@ -141,6 +144,24 @@ def _list_dir_reply(
     :param fs: This connection's simulated filesystem.
     :returns: The result frame a Windows host daemon would produce.
     """
+    if frame.path == "":
+        entries = [
+            HostListDirEntry(
+                name=drive,
+                path=drive,
+                type="directory",
+                bytes=None,
+                modified_at=0,
+            )
+            for drive in ("C:\\", "D:\\", "E:\\")
+        ]
+        return HostListDirResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            entries=entries[: frame.limit],
+            has_more=len(entries) > frame.limit,
+        )
+
     key = _win_resolve(frame.path)
     children = fs.get(key)
     if children is None:
@@ -390,6 +411,40 @@ def test_windows_home_child_click_navigates_into_folder(live_server: str) -> Non
     the click is rejected with an error instead of navigating.
     """
     _run_in_fresh_loop(_drive_home_child_click(live_server))
+
+
+def test_windows_computer_roots_browse_drive(live_server: str) -> None:
+    """Computer view lists native drive roots and opens the selected drive."""
+    _run_in_fresh_loop(_drive_computer_roots(live_server))
+
+
+async def _drive_computer_roots(base_url: str) -> None:
+    async with _windows_host(base_url) as host_id, async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        page = await context.new_page()
+        try:
+            await _open_picker_at_windows_home(page, base_url, host_id)
+            await page.get_by_test_id("workspace-picker-roots").dispatch_event("click")
+
+            for drive in ("C:\\", "D:\\", "E:\\"):
+                await expect(page.get_by_test_id(f"workspace-picker-entry-{drive}")).to_be_visible(
+                    timeout=10_000
+                )
+            await expect(page.get_by_test_id("workspace-picker-path-input")).to_be_disabled()
+
+            screenshot_path = os.environ.get("OMNI_E2E_SCREENSHOT")
+            if screenshot_path:
+                await page.screenshot(path=screenshot_path, full_page=True)
+
+            await page.get_by_test_id("workspace-picker-entry-D:\\").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-entry-Projects")).to_be_visible(
+                timeout=10_000
+            )
+            await expect(page.get_by_test_id("workspace-picker-path-input")).to_have_value("D:\\")
+        finally:
+            await context.close()
+            await browser.close()
 
 
 async def _drive_home_child_click(base_url: str) -> None:

@@ -322,6 +322,23 @@ def test_record_publish_handles_resolved_event_for_unknown_id() -> None:
     assert pending_elicitations.count_for("conv_a") == 0
 
 
+def test_discard_stale_removes_only_the_observed_prompt() -> None:
+    """A same-id prompt republished after observation is a new generation."""
+    observed = _elicit_event("elicit_1")
+    pending_elicitations.record_publish("conv_a", observed)
+    replacement = {
+        **observed,
+        "params": {"message": "Approve the newer turn?", "mode": "form"},
+    }
+    pending_elicitations.record_publish("conv_a", replacement)
+
+    assert pending_elicitations.discard_stale("conv_a", observed) is False
+    assert pending_elicitations.snapshot_for("conv_a") == [replacement]
+
+    assert pending_elicitations.discard_stale("conv_a", replacement) is True
+    assert pending_elicitations.count_for("conv_a") == 0
+
+
 def test_snapshot_for_returns_full_event_payloads() -> None:
     """
     :func:`snapshot_for` returns the event dicts originally passed

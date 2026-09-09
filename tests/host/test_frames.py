@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -230,6 +231,7 @@ def test_hello_frame_round_trip() -> None:
         frame_protocol_version=1,
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
+        filesystem_roots=True,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -237,6 +239,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
+    assert decoded.filesystem_roots is True
 
 
 def test_hello_frame_empty_runners() -> None:
@@ -253,6 +256,25 @@ def test_hello_frame_empty_runners() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.runners == []
+    assert decoded.filesystem_roots is False
+
+
+def test_hello_frame_omitted_filesystem_roots_is_legacy_false() -> None:
+    """An older Host that omits the capability keeps root browsing disabled."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "older-host",
+                "runners": [],
+            }
+        )
+    )
+
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.filesystem_roots is False
 
 
 def test_launch_runner_frame_round_trip() -> None:
@@ -359,6 +381,66 @@ def test_harness_readiness_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
+
+
+def test_codex_rate_limits_survive_hello_and_refresh_frames() -> None:
+    """Only the bounded sanitized quota shape crosses the Host wire."""
+    snapshot = {
+        "captured_at": 1_900_000_000,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 11.0,
+                        "window_duration_mins": 300,
+                    }
+                ],
+            }
+        ],
+    }
+    hello = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="laptop",
+        codex_rate_limits=snapshot,
+    )
+    decoded_hello = decode_host_frame(encode_host_frame(hello))
+    assert isinstance(decoded_hello, HostHelloFrame)
+    assert decoded_hello.codex_rate_limits == snapshot
+
+    refresh = HostCodexRateLimitsFrame(codex_rate_limits=snapshot)
+    decoded_refresh = decode_host_frame(encode_host_frame(refresh))
+    assert isinstance(decoded_refresh, HostCodexRateLimitsFrame)
+    assert decoded_refresh.codex_rate_limits == snapshot
+
+
+def test_codex_rate_limits_frame_rejects_unbounded_payload() -> None:
+    with pytest.raises(ValueError, match="codex rate-limit snapshot"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.codex_rate_limits",
+                    "codex_rate_limits": {"account": {"email": "private@example.com"}},
+                }
+            )
+        )
+
+
+def test_host_hello_drops_invalid_optional_codex_rate_limits() -> None:
+    """Malformed advisory telemetry must not reject an otherwise valid hello."""
+    hello = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="laptop",
+        codex_rate_limits={"captured_at": 1, "limits": []},
+    )
+
+    decoded = decode_host_frame(encode_host_frame(hello))
+
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.codex_rate_limits is None
 
 
 def test_hello_frame_gateway_inference_round_trip() -> None:

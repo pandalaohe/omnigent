@@ -164,6 +164,13 @@ describe("childActivity", () => {
     expect(result).toEqual({ activity: "working", label: "Working" });
   });
 
+  it("returns activity unverified without a working spinner", () => {
+    const result = childActivity(
+      childInfo({ id: "x", busy: false, activity_unverified: true }),
+    );
+    expect(result).toEqual({ activity: "unverified", label: "Activity unverified" });
+  });
+
   it("returns failed when last_task_error is set", () => {
     const result = childActivity(
       childInfo({ id: "x", last_task_error: { code: "err", message: "boom" } }),

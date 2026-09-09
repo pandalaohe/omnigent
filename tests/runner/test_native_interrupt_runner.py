@@ -10,6 +10,7 @@ no-handler fall-through contract (antigravity/opencode), and the 503 mapping.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -69,6 +70,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         "publish_event": _publish,
         "mark_subagent_terminal_and_wake": _mark_and_wake,
         "session_sub_agent_names": {},
+        "session_has_active_work": lambda _session_id: True,
         "codex_bridge_state_for_session": _codex_bridge_state,
         "client_safe_error_detail": _client_safe,
         "logger": logging.getLogger("test.interrupt"),
@@ -96,6 +98,27 @@ def test_native_cancel_capability_follows_stop_registry() -> None:
 
     assert native_cancel_capability(None) == "inprocess"
     assert native_cancel_capability("not-a-native-wrapper") == "inprocess"
+
+
+@pytest.mark.parametrize(
+    ("pane_status", "has_active_turn", "expected"),
+    [
+        ("running", False, True),
+        ("waiting", False, True),
+        ("idle", True, False),
+        (None, True, True),
+        (None, False, False),
+    ],
+)
+def test_native_session_has_active_work_prefers_observed_pane_status(
+    pane_status: str | None,
+    has_active_turn: bool,
+    expected: bool,
+) -> None:
+    """An explicit idle pane wins over a lagging active-turn cleanup slot."""
+    from omnigent.runner.native.interrupt import native_session_has_active_work
+
+    assert native_session_has_active_work(pane_status, has_active_turn) is expected
 
 
 @pytest.mark.asyncio
@@ -337,3 +360,93 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     assert isinstance(resp, Response) and resp.status_code == 204
     assert injected == [("dir/bid-conv_cl", 1.0)]
     assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+
+
+@pytest.mark.asyncio
+async def test_claude_interrupt_skips_stale_stop_after_terminal_turns_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle edge immediately before Stop prevents Ctrl+C injection."""
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    bridge_lookups: list[str] = []
+
+    async def _unexpected_bridge_lookup(*, server_client: Any, session_id: str) -> str:
+        del server_client
+        bridge_lookups.append(session_id)
+        return "unexpected"
+
+    monkeypatch.setattr(
+        interrupt_mod,
+        "_claude_native_bridge_id_for_session",
+        _unexpected_bridge_lookup,
+    )
+    from omnigent.runner.native.interrupt import native_session_has_active_work
+
+    pane_status = {"conv_cl": "running"}
+    active_turns = {"conv_cl"}
+    runner, captured = _make_runner(
+        session_has_active_work=lambda session_id: native_session_has_active_work(
+            pane_status.get(session_id), session_id in active_turns
+        )
+    )
+
+    # The terminal settles after the UI issued Stop but before Runner handles it;
+    # the task-slot cleanup intentionally still lags behind the authoritative pane.
+    pane_status["conv_cl"] = "idle"
+    resp = await runner.interrupt("claude-native", "conv_cl")
+
+    assert isinstance(resp, Response) and resp.status_code == 200
+    assert resp.body == b'{"interrupted":false,"reason":"idle"}'
+    assert bridge_lookups == []
+    assert captured["wakes"] == []
+
+
+@pytest.mark.asyncio
+async def test_claude_interrupt_rechecks_idle_after_bridge_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal edge during bridge lookup closes the last injection race."""
+    import omnigent.claude_native_bridge as claude_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+    from omnigent.runner.native.interrupt import native_session_has_active_work
+
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+    injected: list[str] = []
+
+    async def _slow_bridge_lookup(*, server_client: Any, session_id: str) -> str:
+        del server_client
+        lookup_started.set()
+        await release_lookup.wait()
+        return f"bid-{session_id}"
+
+    monkeypatch.setattr(
+        interrupt_mod,
+        "_claude_native_bridge_id_for_session",
+        _slow_bridge_lookup,
+    )
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(
+        claude_bridge,
+        "inject_interrupt",
+        lambda bridge_dir, *, timeout_s: injected.append(bridge_dir),
+    )
+    pane_status = {"conv_cl": "running"}
+    active_turns = {"conv_cl"}
+    runner, captured = _make_runner(
+        session_has_active_work=lambda session_id: native_session_has_active_work(
+            pane_status.get(session_id), session_id in active_turns
+        )
+    )
+
+    pending = asyncio.create_task(runner.interrupt("claude-native", "conv_cl"))
+    await asyncio.wait_for(lookup_started.wait(), timeout=1.0)
+    pane_status["conv_cl"] = "idle"
+    release_lookup.set()
+    resp = await pending
+
+    assert isinstance(resp, Response) and resp.status_code == 200
+    assert resp.body == b'{"interrupted":false,"reason":"idle"}'
+    assert injected == []
+    assert captured["wakes"] == []

@@ -1,6 +1,5 @@
 import {
   type FormEvent,
-  type KeyboardEvent,
   memo,
   useCallback,
   useEffect,
@@ -17,7 +16,6 @@ import {
   FileTextIcon,
   FolderIcon,
   GitBranchIcon,
-  ImageIcon,
   Loader2Icon,
   PaperclipIcon,
   SettingsIcon,
@@ -33,15 +31,33 @@ import {
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { Button } from "@/components/ui/button";
+import {
+  InlineComposerEditor,
+  type InlineComposerEditorHandle,
+} from "@/components/InlineComposerEditor";
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
+import { validateAttachments } from "@/lib/attachments";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
-import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import {
-  serverSwitcherHiddenForSurface,
-  useSurfaceFrontmost,
-} from "@/hooks/useNativeServerSwitcher";
+  COMPOSER_ATTACHMENT_PLACEHOLDER,
+  composerAttachments,
+  composerPartsFromProjection,
+  composerPartsToProjection,
+  composerPartsToText,
+  legacyComposerParts,
+  normalizeComposerParts,
+  replaceComposerText,
+  type ComposerDraftPart,
+} from "@/lib/composerContent";
+import { useAppShellSidebarOpen, useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import { shouldHideNativeServerSwitcher } from "@/lib/sessionNavigationPreferences";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
+import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
+import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
+import { resolveUsageContextLimits, usageContextSourceKey } from "@/lib/usageContextPreferences";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -53,7 +69,6 @@ import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
-import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
   derivePermissionLevel,
@@ -112,6 +127,7 @@ export {
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
+  ScrollToBottomOnSessionOpen,
   SessionSharedContext,
   UserMessageNavConnected,
   WORKING_MESSAGES,
@@ -176,7 +192,17 @@ import {
   hostBacksHarnessWithGateway,
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
-import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import {
+  type CodexRateLimitsSnapshot,
+  useCodexRateLimits,
+  useHostModelOptions,
+  useHosts,
+} from "@/hooks/useHosts";
+import {
+  formatProviderUsageLimits,
+  providerUsageLimitsFromCodex,
+  type FormattedProviderUsageLimits,
+} from "@/lib/providerUsageLimits";
 import {
   Dialog,
   DialogContent,
@@ -571,6 +597,7 @@ export function ChatPage() {
     if (
       !shouldSendInitialPrompt({
         initialPrompt: initialPrompt?.prompt.text ?? null,
+        hasAttachments: (initialPrompt?.prompt.files?.length ?? 0) > 0,
         promptConversationId: initialPrompt?.conversationId ?? null,
         sentForConversationId: initialPromptSentForConvRef.current,
         conversationId: urlConvId,
@@ -607,6 +634,7 @@ export function ChatPage() {
     sessionId: string;
     text: string;
     files: File[];
+    composerParts?: ComposerDraftPart[];
   } | null>(null);
 
   // Replay the queued message once the picker's bind brings the runner
@@ -619,9 +647,11 @@ export function ChatPage() {
     if (pendingResumePrompt === null || !agentId || !urlConvId) return;
     if (pendingResumePrompt.sessionId !== urlConvId) return;
     if (runnerOnline !== true) return;
-    const { text, files } = pendingResumePrompt;
+    const { text, files, composerParts } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files);
+    void useChatStore.getState().send(text, agentId, files, {
+      ...(composerParts ? { composerParts } : {}),
+    });
   }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
   // Opened when the user tries to interact with an unreachable session
@@ -841,6 +871,10 @@ export function ChatPage() {
     hostProbeHarness ?? "",
     hostProbeHarness !== null && sessionModelOptions.length === 0,
   );
+  const { data: codexRateLimits } = useCodexRateLimits(
+    activeSession?.hostId ?? null,
+    fallbackPickerKind === "codex" && activeSession?.hostId != null,
+  );
   // Identity-stable on purpose: substitute only when the host rows actually
   // exist, else keep the store's own array reference — a fresh [] here would
   // re-render every options consumer (composer, gear, agent-info popover) on
@@ -863,7 +897,7 @@ export function ChatPage() {
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
   const onSend = useCallback(
-    (text: string, files?: File[]) => {
+    (text: string, files?: File[], composerParts?: ComposerDraftPart[]) => {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
       if (isTempConvId(urlConvId)) return;
@@ -873,7 +907,12 @@ export function ChatPage() {
       // into a session the user may switch to first; carry any attachments
       // so the replay sends the same payload.
       if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
+        setPendingResumePrompt({
+          sessionId: urlConvId,
+          text,
+          files: files ?? [],
+          ...(composerParts ? { composerParts } : {}),
+        });
         setResumeDirDialogOpen(true);
         return;
       }
@@ -898,10 +937,11 @@ export function ChatPage() {
           readAlwaysSteer(),
         )
       ) {
-        chat.enqueueMessage(text, files);
+        chat.enqueueMessage(text, files, composerParts);
         return;
       }
       void useChatStore.getState().send(text, agentId, files, {
+        ...(composerParts ? { composerParts } : {}),
         onConversationCreated: (newId) => {
           // Eager URL update: the moment the server tells us this
           // conversation's id, promote `/` → `/c/:newId`. Replace (not
@@ -1057,6 +1097,7 @@ export function ChatPage() {
       showModels={modelPickerKind !== null}
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
+      codexRateLimits={codexRateLimits}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
       showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
@@ -1275,7 +1316,7 @@ interface MainAgentSurfaceProps {
   liveness: SessionLiveness;
   agentsError: unknown;
   disabled: boolean;
-  onSend: (text: string, files?: File[]) => void;
+  onSend: (text: string, files?: File[], composerParts?: ComposerDraftPart[]) => void;
   /**
    * Invoke a skill via the `slash_command` event path. Gated off inside
    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
@@ -1303,6 +1344,8 @@ interface MainAgentSurfaceProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  /** Latest structured Codex account limits reported by the bound Host. */
+  codexRateLimits?: CodexRateLimitsSnapshot | null;
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
@@ -1449,6 +1492,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   showModels,
   modelPickerKind,
   codexModelOptions,
+  codexRateLimits,
   showCodexPlanMode,
   showClaudePermissionMode = false,
   showCodexApprovalMode = false,
@@ -1512,10 +1556,18 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     showTerminal ? terminalSurfaceEl : containerEl,
     !!conversationId,
   );
+  const { nativeMobileHeaderMode, scrollToBottomOnSessionOpen } = useSessionNavigationPreferences();
+  const sidebarOpen = useAppShellSidebarOpen();
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(surfaceFrontmost));
-  }, [surfaceFrontmost]);
+    setNativeServerSwitcherHidden(
+      shouldHideNativeServerSwitcher({
+        frontmost: surfaceFrontmost,
+        sidebarOpen,
+        headerMode: nativeMobileHeaderMode,
+      }),
+    );
+  }, [nativeMobileHeaderMode, sidebarOpen, surfaceFrontmost]);
   useEffect(() => {
     if (!isIOSShell()) return;
     return () => setNativeServerSwitcherHidden(true);
@@ -1525,6 +1577,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
   // read and drive the scroll.
   const [scroller, setScroller] = useState<ConversationScroller | null>(null);
+  const autoScrolledConversationIdRef = useRef<string | null>(null);
   // While the iOS edge-swipe is driving the sidebar drawer, make the transcript
   // ignore the finger so it doesn't scroll along with the drag. On iOS the page
   // is viewport-locked, so the transcript scrolls as an inner overflow:auto
@@ -1566,9 +1619,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   }, [scroller]);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const handleSend = useCallback(
-    (text: string, files?: File[]) => {
+    (text: string, files?: File[], composerParts?: ComposerDraftPart[]) => {
       setSendScrollNonce((n) => n + 1);
-      onSend(text, files);
+      onSend(text, files, composerParts);
     },
     [onSend],
   );
@@ -1608,11 +1661,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // shrink in this same task — otherwise the pin reads a stale scrollHeight
   // and the browser paints the spacer's later RO settle as a visible shift.
   const spacerMeasureRef = useRef<(() => void) | null>(null);
-  // Whether the transcript was physically at the bottom as of its last scroll
-  // event. Evaluated lazily-per-event (not at pin time) so the write never
-  // reads the just-shrunk viewport, where any distance readouts are already
-  // off the bottom by the growth amount — an escaped reader must be detected
-  // from their escape scroll, not from the shrink it preceded.
   const pinnedToBottomRef = useRef(false);
   useEffect(() => {
     const scrollEl = scroller?.el;
@@ -1628,21 +1676,14 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
 
   const pinScrollOnComposerGrowth = useCallback(() => {
     spacerMeasureRef.current?.();
-    // Read through a local so the linter doesn't flag the DOM write as
-    // a mutation of the outer `scroller` state ref.
     const scrollEl = scroller?.el;
     if (!scrollEl) return;
     const lockState = scroller?.state;
     if (!lockState?.isAtBottom || lockState.escapedFromLock) return;
-    // A reader who escaped the bottom (or never arrived) keeps their
-    // position: growth must not yank it down.
+    // Do not pull a reader who intentionally scrolled away back to the bottom.
     if (!pinnedToBottomRef.current) return;
-    // Park at the same position stick-to-bottom settles on (one pixel short
-    // of the maximum); writing the exact bottom would leave the settle one
-    // pixel lower than the library's park and trail a 1px snap-back.
     scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
   }, [scroller]);
-
   // Persistent terminal surfaces for terminal-first sessions. Each is
   // mounted from the moment its terminal is reachable — not just when the
   // view is open — and kept mounted as a visibility-toggled overlay, so
@@ -1735,6 +1776,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             agentsError={agentsError}
             sandboxLaunching={sandboxLaunching}
             terminalFirst={terminalFirst}
+            conversationId={conversationId}
+            scrollToBottomOnSessionOpen={scrollToBottomOnSessionOpen}
+            openedConversationIdRef={autoScrolledConversationIdRef}
             spacerMeasureRef={spacerMeasureRef}
           />
           {/* Floating reply button — scoped to the conversation container. */}
@@ -1767,6 +1811,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showModels={showModels}
             modelPickerKind={modelPickerKind}
             codexModelOptions={codexModelOptions}
+            codexRateLimits={codexRateLimits}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
             showCodexApprovalMode={showCodexApprovalMode}
@@ -1850,7 +1895,7 @@ interface ComposerProps {
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
   disabled: boolean;
-  onSend: (text: string, files?: File[]) => void;
+  onSend: (text: string, files?: File[], composerParts?: ComposerDraftPart[]) => void;
   /**
    * Send a recognised skill as a `slash_command` event (the REPL's wire
    * shape) instead of plaintext. When present and the typed command names
@@ -1890,6 +1935,8 @@ interface ComposerProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  /** Latest structured Codex account limits supplied by the page owner. */
+  codexRateLimits?: CodexRateLimitsSnapshot | null;
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
@@ -1947,14 +1994,7 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
-  /**
-   * Synchronous pin: called in the same task as the composer's height
-   * change so the transcript stays bottom-locked before the browser
-   * paints the now-smaller viewport with the scroll offset stale — Gecko
-   * visibly paints that intermediate frame, bouncing the last visible
-   * message. A same-task write is the only ordering no engine paints past.
-   * The callback itself decides whether the reader is bottom-locked.
-   */
+  /** Preserve a locked transcript before composer growth shrinks its viewport. */
   onViewportShrinkPinScroll?: () => void;
 }
 
@@ -2022,24 +2062,63 @@ export function buildSlashCommandWithArgsSet(
 /** Circumference of the progress ring (r=5.5). */
 const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
 
-/** Circular progress ring showing how much context window is used, with the used percentage beside it. */
-function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tokensUsed: number }) {
-  const pct = Math.min(tokensUsed / contextWindow, 1);
+/** Select and format the active Codex bucket without inventing missing windows. */
+export function formatCodexRateLimits(
+  snapshot: CodexRateLimitsSnapshot | null | undefined,
+  model: string | null | undefined,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): FormattedProviderUsageLimits | null {
+  return formatProviderUsageLimits(providerUsageLimitsFromCodex(snapshot, model), nowSeconds);
+}
+
+function ProviderUsageLimitsStatus({ value }: { value: FormattedProviderUsageLimits }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          data-testid="composer-provider-usage-limits"
+          className="whitespace-nowrap text-xs tabular-nums text-muted-foreground"
+          aria-label={value.ariaLabel}
+        >
+          {value.text}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-56 text-center text-sm">
+        <p>{value.scope} usage.</p>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/** Circular progress ring for either the full context window or the reported compact budget. */
+function ContextRing({
+  contextWindow,
+  autoCompactTokenLimit,
+  tokensUsed,
+}: {
+  contextWindow: number;
+  autoCompactTokenLimit: number | null;
+  tokensUsed: number;
+}) {
+  const mode = useContextIndicatorMode();
+  const compactMode = mode === "compact" && autoCompactTokenLimit != null;
+  const denominator = compactMode ? autoCompactTokenLimit : contextWindow;
+  const pct = Math.min(tokensUsed / denominator, 1);
   // Arc, %, label, and tooltip all encode context USED: a fresh session
   // shows an empty ring at 0% and the ring fills as context is consumed.
   const usedArc = pct * RING_CIRCUMFERENCE;
   const usedPct = Math.round(pct * 100);
 
+  const accessibleLabel = compactMode
+    ? `${usedPct}% of compact budget used`
+    : `${usedPct}% of context used`;
   const color =
     pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
 
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span
-          className={cn("flex items-center gap-1.5", color)}
-          aria-label={`${usedPct}% of context used`}
-        >
+        <span className={cn("flex items-center gap-1.5", color)} aria-label={accessibleLabel}>
           <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
             {/* Track */}
             <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
@@ -2063,7 +2142,9 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
         </span>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-44 text-center text-sm">
-        <p className="tabular-nums">{usedPct}% of context used.</p>
+        <p className="tabular-nums">
+          {tokensUsed.toLocaleString()} / {denominator.toLocaleString()} tokens
+        </p>
       </TooltipContent>
     </Tooltip>
   );
@@ -2180,9 +2261,11 @@ function ComposerStatusLine({
   goal,
   isSubAgentSession,
   onHostReconnect,
+  codexRateLimits,
 }: {
   goal: Goal | null;
   isSubAgentSession: boolean;
+  codexRateLimits?: CodexRateLimitsSnapshot | null;
   /**
    * Opens the reconnect help dialog, handed to the host badge — which turns
    * itself into a clickable reconnect affordance when its bound host is
@@ -2196,8 +2279,14 @@ function ComposerStatusLine({
   // window (mirrors ChatPage's top-level `sessionConvId`).
   const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const contextWindow = useChatStore((s) => s.contextWindow);
+  const autoCompactTokenLimit = useChatStore((s) => s.autoCompactTokenLimit);
+  const sessionProviderUsageLimits = useChatStore((s) => s.providerUsageLimits);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
+  const llmModel = useChatStore((s) => s.llmModel);
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const boundAgentName = useChatStore((s) => s.boundAgentName);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
+  const usageContextPreferences = useUsageContextPreferences();
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
@@ -2207,6 +2296,29 @@ function ComposerStatusLine({
   // from the same source the badge does so the tray's render guard matches.
   const { session } = useSession(sessionId);
   const isHostBound = !!session?.hostId;
+  const isCodexSession = sessionHarness === "codex" || sessionHarness === "codex-native";
+  const usageSourceKey = usageContextSourceKey({
+    hostId: session?.hostId,
+    agentName: boundAgentName,
+    harness: sessionHarness,
+    model: llmModel,
+  });
+  const stableProviderUsageLimits = useStableProviderUsageLimits({
+    preferences: usageContextPreferences,
+    sourceKey: usageSourceKey,
+    fresh: isCodexSession
+      ? providerUsageLimitsFromCodex(codexRateLimits, llmModel)
+      : sessionProviderUsageLimits,
+    agentName: boundAgentName,
+    harness: sessionHarness,
+  });
+  const formattedRateLimits = formatProviderUsageLimits(stableProviderUsageLimits);
+  const resolvedLimits = resolveUsageContextLimits(
+    usageContextPreferences,
+    usageSourceKey,
+    contextWindow,
+    autoCompactTokenLimit,
+  );
 
   // PR link → opens the workspace rail's GitHub tab. Shares the info query's
   // cache with the GitHub panel, so opening the tab is instant.
@@ -2226,7 +2338,14 @@ function ComposerStatusLine({
   const showGoal = !!conversationId && goal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
-    !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
+    !!conversationId &&
+    resolvedLimits.contextWindow != null &&
+    resolvedLimits.contextWindow > 0 &&
+    tokensUsed != null;
+  const showRateLimits =
+    !!conversationId &&
+    usageContextPreferences.showProviderUsageLimits &&
+    formattedRateLimits != null;
   // A host-bound session shows the badge, so the tray must render for it even
   // with no branch/ring yet — otherwise the host + context footer vanishes for
   // sessions with no worktree branch (e.g. codex) until the ring populates.
@@ -2234,7 +2353,15 @@ function ComposerStatusLine({
   // the badge is where it lives and an unreachable session often has no
   // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPr && !showPlanMode && !showGoal && !showRing && !showHostBadge)
+  if (
+    !showBranch &&
+    !showPr &&
+    !showPlanMode &&
+    !showGoal &&
+    !showRing &&
+    !showRateLimits &&
+    !showHostBadge
+  )
     return null;
 
   return (
@@ -2284,7 +2411,16 @@ function ComposerStatusLine({
           </span>
         )}
         {showGoal && goal && <GoalStatusPill goal={goal} />}
-        {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
+        {showRateLimits && formattedRateLimits && (
+          <ProviderUsageLimitsStatus value={formattedRateLimits} />
+        )}
+        {showRing && (
+          <ContextRing
+            contextWindow={resolvedLimits.contextWindow!}
+            autoCompactTokenLimit={resolvedLimits.autoCompactTokenLimit}
+            tokensUsed={tokensUsed}
+          />
+        )}
       </div>
     </div>
   );
@@ -2531,6 +2667,7 @@ function ComposerImpl({
   showModels,
   modelPickerKind,
   codexModelOptions,
+  codexRateLimits = null,
   showCodexPlanMode,
   showClaudePermissionMode = false,
   showCodexApprovalMode = false,
@@ -2547,9 +2684,33 @@ function ComposerImpl({
   wrapperLabel = null,
   onViewportShrinkPinScroll,
 }: ComposerProps) {
-  const [value, setValue] = useState("");
+  const [composerParts, setComposerParts] = useState<ComposerDraftPart[]>([]);
+  const composerPartsRef = useRef(composerParts);
+  composerPartsRef.current = composerParts;
+  const value = composerPartsToProjection(composerParts);
+  const files = composerAttachments(composerParts);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const filesRef = useRef(files);
+  filesRef.current = files;
+  const inlineEditorRef = useRef<InlineComposerEditorHandle>(null);
+  const replaceComposerParts = useCallback((next: readonly ComposerDraftPart[]) => {
+    const normalized = normalizeComposerParts(next);
+    composerPartsRef.current = normalized;
+    setComposerParts(normalized);
+    inlineEditorRef.current?.setParts(normalized);
+  }, []);
+  const setValue = useCallback(
+    (next: string) => {
+      const nextParts =
+        filesRef.current.length > 0 && !next.includes(COMPOSER_ATTACHMENT_PLACEHOLDER)
+          ? replaceComposerText(composerPartsRef.current, next)
+          : composerPartsFromProjection(next, filesRef.current);
+      replaceComposerParts(nextParts);
+    },
+    [replaceComposerParts],
+  );
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
-  const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
@@ -2587,13 +2748,28 @@ function ComposerImpl({
   const { trackClick } = useOmnigentAnalytics();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  if (textareaRef.current === null) {
+    textareaRef.current = {
+      get selectionStart() {
+        return inlineEditorRef.current?.getSelection().start ?? 0;
+      },
+      get selectionEnd() {
+        return inlineEditorRef.current?.getSelection().end ?? 0;
+      },
+      setSelectionRange(start: number, end: number) {
+        inlineEditorRef.current?.setSelection(start, end);
+      },
+      focus() {
+        inlineEditorRef.current?.focus();
+      },
+      scrollTop: 0,
+      scrollLeft: 0,
+    } as HTMLTextAreaElement;
+  }
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(value, setValue, textareaRef);
   const isComposingRef = useRef(false);
-  // Highlight overlay mirroring the textarea; scroll-synced so the tinted
-  // `/skill` token stays aligned once the draft grows past the visible rows.
-  const backdropRef = useRef<HTMLDivElement>(null);
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -2690,10 +2866,6 @@ function ComposerImpl({
   const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
-  const valueRef = useRef(value);
-  valueRef.current = value;
-  const filesRef = useRef(files);
-  filesRef.current = files;
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
   // the input, which would delete the draft. Only save when the user
@@ -2712,8 +2884,7 @@ function ComposerImpl({
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
-    setValue(restored?.text ?? "");
-    setFiles(restored?.files ?? []);
+    replaceComposerParts(composerPartsFromProjection(restored?.text ?? "", restored?.files ?? []));
     dirtyRef.current = false;
     // Publish which conversation the composer's text now belongs to. The
     // failed-send restore below reads value/files through refs, which still
@@ -2729,7 +2900,7 @@ function ComposerImpl({
         files: filesRef.current,
       });
     };
-  }, [conversationId]);
+  }, [conversationId, replaceComposerParts]);
 
   // Publish edits as they happen so the open sidebar updates immediately,
   // rather than only learning about a draft when this composer unmounts.
@@ -2786,9 +2957,6 @@ function ComposerImpl({
     files.length === 0;
   // Query = what the user typed after the leading "/".
   const menuQuery = menuOpen ? trimmedValue.slice(1) : "";
-  // Tint the `/skill` token blue while the draft reads as a slash command, so
-  // the command shape is signalled as the user types it.
-  const composerIsCommand = files.length === 0 && isSlashCommandText(value);
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -2936,19 +3104,19 @@ function ComposerImpl({
     });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
-    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
-      useChatStore.setState({ pendingRetryStableId: null });
-      return;
-    }
-    setValue(failedSendDraft.text);
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
     dirtyRef.current = true;
-    if (failedSendDraft.files.length > 0) {
-      const { accepted, errors } = validateAttachments(failedSendDraft.files);
-      setFiles(accepted);
-      setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-    }
+    const recovered =
+      failedSendDraft.composerParts ??
+      legacyComposerParts(failedSendDraft.text, failedSendDraft.files);
+    const { accepted, errors } = validateAttachments(composerAttachments(recovered));
+    const acceptedFiles = new Set(accepted);
+    replaceComposerParts(
+      recovered.filter((part) => part.type === "text" || acceptedFiles.has(part.file)),
+    );
+    setAttachmentError(errors[0] ?? null);
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId]);
+  }, [failedSendDraft, conversationId, settledConversationId, replaceComposerParts]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -3087,26 +3255,6 @@ function ComposerImpl({
     }
   };
 
-  // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
-  // Growth stays in the flex column so the transcript viewport ends where the
-  // composer begins instead of letting the card cover visible output.
-  // The onGrowth pin re-locks the transcript bottom in the same task as the
-  // height change, before any paint — see the prop doc on ComposerProps.
-  const onGrowthRef = useRef(onViewportShrinkPinScroll);
-  useLayoutEffect(() => {
-    onGrowthRef.current = onViewportShrinkPinScroll;
-  });
-  // The hook measures on every keystroke, but growth only changes at line
-  // wraps: skip the spacer re-measure and transcript pin while the box rests
-  // at an unchanged height.
-  const lastGrowthPxRef = useRef<number | null>(null);
-  const onGrowth = useCallback((px: number) => {
-    if (lastGrowthPxRef.current === px) return;
-    lastGrowthPxRef.current = px;
-    onGrowthRef.current?.();
-  }, []);
-  useAutoGrowTextarea(textareaRef, value, 10, onGrowth);
-
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
   const { appendEntry, recallPrevious, recallNext, resetCursor } = usePromptHistory(conversationId);
@@ -3116,37 +3264,22 @@ function ComposerImpl({
   const recallingRef = useRef(false);
 
   const addFiles = (incoming: File[]) => {
-    // Reject unsupported types (only images, PDF, and text/code) and
-    // oversized files up front — before the upload — with a friendly
-    // message. The server enforces the same limits authoritatively.
-    const { accepted, errors } = validateAttachments(incoming);
-    if (accepted.length > 0) {
-      setFiles((prev) => [...prev, ...accepted]);
-      dirtyRef.current = true;
-      // Return focus to the composer so the user can keep typing right
-      // after attaching (the file picker / paperclip button steals it).
-      if (!isMobileRef.current) textareaRef.current?.focus();
-    }
-    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-  };
-
-  // Files dropped anywhere in the chat column attach here, not just on the
-  // composer box. Scoped to the column so the sidebar and workspace rail keep
-  // their own drag behavior; with no such ancestor the card is the target.
-  const [dropTarget, setDropTarget] = useState<HTMLElement | null>(null);
-  const bindComposerCard = useCallback((el: HTMLDivElement | null) => {
-    setDropTarget(el?.closest<HTMLElement>("[data-chat-surface]") ?? el);
-  }, []);
-  const isDragActive = useFileDropTarget(dropTarget, addFiles);
-
-  const removeFile = (index: number) => {
-    setFiles((prev) => prev.filter((_, i) => i !== index));
-    setAttachmentError(null);
+    inlineEditorRef.current?.insertFiles(incoming);
     dirtyRef.current = true;
   };
 
+  // Files dropped anywhere in the chat column attach at the editor's current
+  // caret, preserving the broad drop target while keeping an exact insertion point.
+  const [dropTarget, setDropTarget] = useState<HTMLElement | null>(null);
+  const bindComposerCard = useCallback((element: HTMLDivElement | null) => {
+    setDropTarget(element?.closest<HTMLElement>("[data-chat-surface]") ?? element);
+  }, []);
+  const isDragActive = useFileDropTarget(dropTarget, addFiles);
+
   const submit = () => {
-    const trimmed = value.trim();
+    const trimmedProjection = value.trim();
+    const trimmedParts = composerPartsFromProjection(trimmedProjection, files);
+    const trimmed = composerPartsToText(trimmedParts).trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
@@ -3236,17 +3369,21 @@ function ComposerImpl({
     // (codex says "Attached file:"). Folders carry a trailing "/" so the
     // agent knows to open the directory. The native vendor reads the on-disk
     // workspace file/folder from this marker; no upload happens.
-    const messageText =
-      buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
+    const preamble = buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble;
+    const orderedParts = normalizeComposerParts([
+      ...(preamble ? [{ type: "text" as const, text: preamble }] : []),
+      ...trimmedParts,
+    ]);
+    const messageText = preamble + composerPartsToText(trimmedParts);
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
     if (trimmed) appendEntry(trimmed);
-    onSend(messageText, files.length > 0 ? files : undefined);
+    if (files.length > 0) onSend(messageText, files, orderedParts);
+    else onSend(messageText, undefined);
     dirtyRef.current = true;
-    setValue("");
-    setFiles([]);
+    replaceComposerParts([]);
     setAttachmentError(null);
     setMentionedItems([]);
     setMention(null);
@@ -3262,7 +3399,7 @@ function ComposerImpl({
     submit();
   };
 
-  const applyRecall = (ta: HTMLTextAreaElement, recalled: string) => {
+  const applyRecall = (recalled: string) => {
     recallingRef.current = true;
     setValue(recalled);
     dirtyRef.current = true;
@@ -3270,19 +3407,22 @@ function ComposerImpl({
     // this, the browser leaves the caret at its previous index, which can
     // land mid-word and feels broken.
     queueMicrotask(() => {
-      ta.setSelectionRange(recalled.length, recalled.length);
+      inlineEditorRef.current?.setSelection(recalled.length, recalled.length);
     });
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
-      return;
+  const handleKeyDown = (
+    e: globalThis.KeyboardEvent,
+    selection: { start: number; end: number },
+  ): boolean => {
+    if (isImeCompositionKeyEvent({ nativeEvent: e }, isComposingRef.current)) {
+      return false;
     }
 
     // Touch-primary newline behavior outranks autocomplete and desktop submit
     // preferences. Leave the event untouched so the textarea inserts it.
     if (preventsKeyboardSubmit && e.key === "Enter") {
-      return;
+      return false;
     }
 
     const shouldSubmitFromKeyboard = isComposerSendKey(
@@ -3292,7 +3432,7 @@ function ComposerImpl({
         metaKey: e.metaKey,
         ctrlKey: e.ctrlKey,
         altKey: e.altKey,
-        isComposing: e.nativeEvent.isComposing,
+        isComposing: e.isComposing,
       },
       submitWithModEnter,
       preventsKeyboardSubmit,
@@ -3304,7 +3444,7 @@ function ComposerImpl({
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
-    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return true;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -3313,12 +3453,12 @@ function ComposerImpl({
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setMenuIndex((i) => (i + 1) % menuMatches.length);
-        return;
+        return true;
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
         setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
-        return;
+        return true;
       }
       if (
         !shouldPreferSendOverCompletion &&
@@ -3327,14 +3467,14 @@ function ComposerImpl({
       ) {
         e.preventDefault();
         applyMenuSelection(menuMatches[menuIndex]!);
-        return;
+        return true;
       }
       if (e.key === "Escape") {
         e.preventDefault();
         // Dismiss the menu by clearing the input so the user can start fresh.
         setValue("");
         setMenuIndex(-1);
-        return;
+        return true;
       }
     }
 
@@ -3345,9 +3485,9 @@ function ComposerImpl({
       // The mention menu is briefly closed while its listing loads (see
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
       // token isn't sent as a chat message. The menu reopens when entries land.
-      if (mentionListingPending) return;
+      if (mentionListingPending) return true;
       submit();
-      return;
+      return true;
     }
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
@@ -3355,7 +3495,7 @@ function ComposerImpl({
     if (e.key === "Escape" && isStreaming) {
       e.preventDefault();
       onStop();
-      return;
+      return true;
     }
     // ArrowUp/Down recall — only when the caret is already at the very
     // start (ArrowUp) or end (ArrowDown) of the text.  Checking for the
@@ -3369,38 +3509,30 @@ function ComposerImpl({
     // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
     // fire even mid-compose; without this guard the recall below intercepts
     // them (replacing the draft) and the hotkeys appear broken in the composer.
-    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      const ta = e.currentTarget;
-      if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+    if (
+      files.length === 0 &&
+      (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey
+    ) {
+      if (e.key === "ArrowUp" && selection.start === 0) {
         const recalled = recallPrevious(value);
         if (recalled !== null) {
           e.preventDefault();
-          applyRecall(ta, recalled);
+          applyRecall(recalled);
+          return true;
         }
-      } else if (e.key === "ArrowDown" && ta.selectionEnd === ta.value.length) {
+      } else if (e.key === "ArrowDown" && selection.end === value.length) {
         const recalled = recallNext();
         if (recalled !== null) {
           e.preventDefault();
-          applyRecall(ta, recalled);
+          applyRecall(recalled);
+          return true;
         }
       }
     }
-  };
-
-  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const pastedFiles: File[] = [];
-    for (const item of items) {
-      if (item.kind === "file") {
-        const file = item.getAsFile();
-        if (file) pastedFiles.push(file);
-      }
-    }
-    if (pastedFiles.length > 0) {
-      e.preventDefault();
-      addFiles(pastedFiles);
-    }
+    return false;
   };
 
   return (
@@ -3444,8 +3576,9 @@ function ComposerImpl({
           // Re-sending re-queues it (busy) or sends it (idle).
           const target = queuedMessages.find((m) => m.queueId === queueId);
           if (!target) return;
-          setValue(target.text);
-          setFiles(target.files ?? []);
+          replaceComposerParts(
+            target.composerParts ?? legacyComposerParts(target.text, target.files ?? []),
+          );
           dequeueMessage(queueId);
           textareaRef.current?.focus();
         }}
@@ -3458,7 +3591,6 @@ function ComposerImpl({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-      {/* Drop cue, spanning the chat column this composer belongs to. */}
       {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
@@ -3468,7 +3600,7 @@ function ComposerImpl({
         // Opaque card edge for transcript clearance; status shelf below is translucent.
         data-composer-card
         className={cn(
-          "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-composer transition-[border-color,box-shadow] has-[textarea:focus]:shadow-composer-focus",
+          "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-composer transition-[border-color,box-shadow] focus-within:shadow-composer-focus",
           CHAT_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
@@ -3517,137 +3649,52 @@ function ComposerImpl({
             ))}
           </div>
         )}
-        {/* Highlight overlay: a textarea can only paint its text one color, so
-            to tint just the `/skill` token we hide the textarea's own glyphs
-            (text-transparent, caret kept visible) and render an aligned mirror
-            behind it. Same box/typography so wrapping matches the textarea
-            exactly. Only mounted while the draft is a command. */}
-        <div className="relative overflow-hidden">
-          {composerIsCommand && (
-            <div
-              ref={backdropRef}
-              aria-hidden
-              data-testid="composer-highlight-overlay"
-              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-4 pt-3 pb-2 text-ui text-foreground"
-            >
-              {(() => {
-                const split = splitSlashCommand(value);
-                if (!split) return value;
-                return (
-                  <>
-                    {split.before}
-                    <span className="text-brand-accent">{split.token}</span>
-                    {split.after}
-                  </>
-                );
-              })()}
-            </div>
-          )}
-          <textarea
-            ref={textareaRef}
-            value={value}
-            onChange={(e) => {
-              setValue(e.target.value);
-              dirtyRef.current = true;
-              if (commandError !== null) setCommandError(null);
-              // A rejected attachment is never added, so there's no chip to
-              // remove and nothing else would ever clear this. Left sticky it
-              // reads as a blocker on a composer the user can actually submit.
-              if (attachmentError !== null) setAttachmentError(null);
-              // Recompute the active "@"-mention from the caret on every
-              // keystroke (native coding-agent sessions — ``mentionEnabled``).
-              setMention(
-                mentionEnabled
-                  ? detectMentionAt(
-                      e.target.value,
-                      e.target.selectionStart ?? e.target.value.length,
-                    )
-                  : null,
-              );
-              // Treat user-driven changes as exiting recall mode. Recall-
-              // driven setValue toggles `recallingRef` first so we skip the
-              // reset for that one tick.
-              if (recallingRef.current) recallingRef.current = false;
-              else resetCursor();
-            }}
-            onFocus={() => {
-              // From here the textarea's caret is one the user placed, so
-              // dictation inserts there instead of at the end of the draft.
-              dictation.noteFocus();
-            }}
-            onCompositionStart={() => {
-              isComposingRef.current = true;
-            }}
-            onCompositionEnd={() => {
-              isComposingRef.current = false;
-            }}
-            onKeyDown={handleKeyDown}
-            onBlur={() => {
-              // Dismiss the "@"-mention menu when focus leaves the textarea
-              // (clicking a chip's ✕, the Send button, or another field).
-              // Menu rows ``preventDefault`` on mousedown so selecting an entry
-              // keeps focus and does NOT blur — this only fires for genuine
-              // focus-out, where the lingering menu would otherwise float.
-              dismissMention();
-            }}
-            onPaste={handlePaste}
-            onScroll={(e) => {
-              // Keep the overlay's scroll position locked to the textarea's.
-              if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
-            }}
-            aria-label="Message the agent"
-            placeholder={
-              readOnlyReason !== null
-                ? readOnlyReason
-                : isReadOnly
-                  ? "You have read-only access to this session"
-                  : unreachable
-                    ? "Session offline — reconnect below to continue"
-                    : hasPendingElicitation
-                      ? "Respond to the pending request above to continue"
-                      : disabled
-                        ? "Waiting for agents…"
-                        : isStreaming
-                          ? "Send a follow-up (queued) — Esc to stop"
-                          : "Send a message…"
-            }
-            rows={1}
-            disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
-            data-slash-command={composerIsCommand ? "true" : undefined}
-            className={cn(
-              "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
-              // Hand glyph painting to the overlay while a command is drafted;
-              // the caret stays visible via caret-foreground.
-              composerIsCommand && "text-transparent caret-foreground",
-            )}
-          />
-        </div>
-        {/* File chips — shown below textarea when files are attached */}
-        {files.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-            {files.map((file, i) => (
-              <span
-                key={attachmentKey(file)}
-                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-              >
-                {file.type.startsWith("image/") ? (
-                  <ImageIcon className="size-3 shrink-0" />
-                ) : (
-                  <FileTextIcon className="size-3 shrink-0" />
-                )}
-                <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
-                <button
-                  type="button"
-                  onClick={() => removeFile(i)}
-                  className="ml-0.5 rounded-full hover:text-foreground"
-                  aria-label={`Remove ${file.name || "image.png"}`}
-                >
-                  <XIcon className="size-3" />
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
+        <InlineComposerEditor
+          ref={inlineEditorRef}
+          initialParts={composerParts}
+          onHeightChange={onViewportShrinkPinScroll}
+          onChange={(nextParts) => {
+            composerPartsRef.current = nextParts;
+            setComposerParts(nextParts);
+            dirtyRef.current = true;
+            if (commandError !== null) setCommandError(null);
+            if (attachmentError !== null) setAttachmentError(null);
+            const projection = composerPartsToProjection(nextParts);
+            const caret = inlineEditorRef.current?.getSelection().start ?? projection.length;
+            setMention(mentionEnabled ? detectMentionAt(projection, caret) : null);
+            if (recallingRef.current) recallingRef.current = false;
+            else resetCursor();
+          }}
+          onRejectedFiles={(errors) =>
+            setAttachmentError(errors.length > 0 ? errors.join("\n") : null)
+          }
+          onFocus={() => dictation.noteFocus()}
+          onCompositionStart={() => {
+            isComposingRef.current = true;
+          }}
+          onCompositionEnd={() => {
+            isComposingRef.current = false;
+          }}
+          onKeyDown={handleKeyDown}
+          onBlur={dismissMention}
+          ariaLabel="Message the agent"
+          placeholder={
+            readOnlyReason !== null
+              ? readOnlyReason
+              : isReadOnly
+                ? "You have read-only access to this session"
+                : unreachable
+                  ? "Session offline — reconnect below to continue"
+                  : hasPendingElicitation
+                    ? "Respond to the pending request above to continue"
+                    : disabled
+                      ? "Waiting for agents…"
+                      : isStreaming
+                        ? "Send a follow-up (queued) — Esc to stop"
+                        : "Send a message…"
+          }
+          disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
+        />
         {/* Rejected-attachment feedback: unsupported type or too large */}
         {attachmentError !== null && (
           <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
@@ -3898,6 +3945,7 @@ function ComposerImpl({
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
         onHostReconnect={onShowReconnectHelp}
+        codexRateLimits={codexRateLimits}
       />
     </form>
   );
@@ -3994,6 +4042,7 @@ export function computeShowsWorking(
  */
 export function shouldSendInitialPrompt(params: {
   initialPrompt: string | null;
+  hasAttachments?: boolean;
   promptConversationId: string | null;
   sentForConversationId: string | null;
   conversationId: string | null | undefined;
@@ -4002,7 +4051,7 @@ export function shouldSendInitialPrompt(params: {
 }): boolean {
   // Reject falsy (null or "") so a manipulated router state can't fire
   // send("") — defense-in-depth alongside the dialog's blank guard.
-  if (!params.initialPrompt) return false;
+  if (!params.initialPrompt && params.hasAttachments !== true) return false;
   // The prompt must still belong to the active session. `initialPrompt` is
   // set by an effect whose `setInitialPrompt` doesn't flush until the next
   // render, so when the user switches `/c/:a` → `/c/:b` the auto-send effect
@@ -4037,19 +4086,27 @@ export function shouldSendInitialPrompt(params: {
  * @param prompt The consumed pending prompt, e.g.
  *   ``{ text: "/review-pr 123", skill: { name: "review-pr", args: "123" } }``.
  * @param agentId Resolved agent id, e.g. ``"ag_abc123"``.
- * @param send ``chatStore.send`` — posts a plain user message. Always
- *   called with no files: the landing composer has no attachments.
+ * @param send ``chatStore.send`` — posts a plain user message.
  * @param sendSlashCommand ``chatStore.sendSlashCommand`` — posts a
  *   ``slash_command`` event.
  */
 export function dispatchInitialPrompt(
   prompt: PendingInitialPrompt,
   agentId: string,
-  send: (text: string, agentId: string, files: File[]) => Promise<void>,
+  send: (
+    text: string,
+    agentId: string,
+    files: File[],
+    opts?: { composerParts?: ComposerDraftPart[] },
+  ) => Promise<void>,
   sendSlashCommand: (name: string, args: string, agentId: string) => Promise<void>,
 ): void {
-  if (prompt.skill) {
+  if (prompt.skill && (prompt.files?.length ?? 0) === 0) {
     void sendSlashCommand(prompt.skill.name, prompt.skill.args, agentId);
+  } else if (prompt.composerParts) {
+    void send(prompt.text, agentId, prompt.files ?? [], {
+      composerParts: prompt.composerParts,
+    });
   } else {
     void send(prompt.text, agentId, prompt.files ?? []);
   }

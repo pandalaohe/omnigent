@@ -21,6 +21,11 @@ import types
 import pytest
 
 from omnigent.server.routes import sessions as _sessions_mod
+from omnigent.server.routes._sessions.helpers import (
+    _MAX_FORWARDED_BACKGROUND_TASK_BYTES,
+    _parse_background_tasks,
+    _session_background_activity_count,
+)
 from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -113,6 +118,38 @@ def test_failure_clears_tally_and_wins_over_count() -> None:
     assert _session_status_with_child_rollup(_SID, []) == "failed"
 
 
+def test_background_badge_counts_only_live_child_states() -> None:
+    """Finished children leave B while running/waiting children remain."""
+    running_child = "conv_bg_running_child"
+    waiting_child = "conv_bg_waiting_child"
+    idle_child = "conv_bg_idle_child"
+    failed_child = "conv_bg_failed_child"
+    child_ids = [running_child, waiting_child, idle_child, failed_child]
+    _sessions_mod._session_status_cache.update(
+        {
+            _SID: "idle",
+            running_child: "running",
+            waiting_child: "waiting",
+            idle_child: "idle",
+            failed_child: "failed",
+        }
+    )
+    _sessions_mod._session_background_task_count_cache[_SID] = 1
+    try:
+        assert _session_background_activity_count(_SID, child_ids) == 3
+
+        _sessions_mod._session_status_cache[running_child] = "idle"
+        _sessions_mod._session_status_cache[waiting_child] = "failed"
+        assert _session_background_activity_count(_SID, child_ids) == 1
+
+        # A failed owner cannot have a trustworthy sticky shell tally.
+        _sessions_mod._session_status_cache[_SID] = "failed"
+        assert _session_background_activity_count(_SID, child_ids) == 0
+    finally:
+        for child_id in child_ids:
+            _sessions_mod._session_status_cache.pop(child_id, None)
+
+
 # ── background-task detail rides with the tally ─────────────────────────────
 
 
@@ -123,6 +160,19 @@ def test_background_tasks_detail_stored_with_positive_count() -> None:
     _publish_status(_SID, "idle", background_task_count=2, background_tasks=tasks)
     assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
     assert _sessions_mod._session_background_tasks_cache.get(_SID) == tasks
+
+
+def test_background_task_parser_caps_fields_and_total_payload_bytes() -> None:
+    oversized = {"status": "running", "command": "x" * 8193}
+    bounded = [{"status": "running", "command": "x" * 8192} for _ in range(100)]
+
+    parsed = _parse_background_tasks([oversized, *bounded])
+
+    assert parsed is not None
+    assert all(task.command != oversized["command"] for task in parsed)
+    assert sum(len((task.command or "").encode("utf-8")) for task in parsed) <= (
+        _MAX_FORWARDED_BACKGROUND_TASK_BYTES
+    )
 
 
 def test_background_tasks_detail_empty_when_count_only() -> None:

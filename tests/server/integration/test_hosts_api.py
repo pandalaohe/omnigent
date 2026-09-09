@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    HostCodexRateLimitsFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     encode_host_frame,
@@ -59,6 +60,7 @@ def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    filesystem_roots: bool = False,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -78,6 +80,7 @@ def _make_hello(
             name=name,
             configured_harnesses=configured_harnesses,
             gateway_inference=gateway_inference,
+            filesystem_roots=filesystem_roots,
         )
     )
 
@@ -140,6 +143,7 @@ async def _connect_host(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    filesystem_roots: bool = False,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -162,7 +166,12 @@ async def _connect_host(
     await comm.send_input(
         {
             "type": "websocket.receive",
-            "text": _make_hello(name, configured_harnesses, gateway_inference),
+            "text": _make_hello(
+                name,
+                configured_harnesses,
+                gateway_inference,
+                filesystem_roots,
+            ),
         },
     )
     while registry.get(host_id) is None:
@@ -216,6 +225,70 @@ async def test_list_hosts_returns_connected_host(
     # field must be present and None so clients can tell it apart from
     # server-managed hosts without a schema sniff.
     assert hosts[0]["sandbox_provider"] is None
+
+
+async def test_codex_rate_limits_refresh_is_available_only_from_live_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A Host refresh becomes a sanitized REST snapshot and vanishes offline."""
+    app, registry, _hs, _cs = host_api_app
+    comm = await _connect_host(app, registry)
+    snapshot = {
+        "captured_at": int(time.time()),
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 11.0,
+                        "window_duration_mins": 300,
+                    },
+                    {
+                        "kind": "secondary",
+                        "used_percent": 6.0,
+                        "window_duration_mins": 10_080,
+                    },
+                ],
+            }
+        ],
+    }
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(HostCodexRateLimitsFrame(codex_rate_limits=snapshot)),
+        }
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for _ in range(50):
+            response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
+            if response.json()["rate_limits"] is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert response.status_code == 200
+        assert response.json() == {"rate_limits": snapshot}
+
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        stale_snapshot = {**snapshot, "captured_at": int(time.time()) - 3601}
+        conn.hello.codex_rate_limits = stale_snapshot
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
+        assert response.json() == {"rate_limits": None}
+
+        future_snapshot = {**snapshot, "captured_at": int(time.time()) + 301}
+        conn.hello.codex_rate_limits = future_snapshot
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
+        assert response.json() == {"rate_limits": None}
+
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        for _ in range(50):
+            if registry.get(_HOST_ID) is None:
+                break
+            await asyncio.sleep(0.01)
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
+        assert response.status_code == 200
+        assert response.json() == {"rate_limits": None}
 
 
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(
@@ -282,6 +355,79 @@ async def test_get_host_returns_details(
     assert data["sandbox_provider"] is None
 
 
+async def test_patch_host_default_workspace_persists_and_surfaces(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        patched = await client.patch(
+            f"/v1/hosts/{_HOST_ID}",
+            json={"default_workspace": "D:\\AIProgram\\Projects"},
+        )
+        listed = await client.get("/v1/hosts")
+
+    assert patched.status_code == 200
+    assert patched.json()["default_workspace"] == "D:\\AIProgram\\Projects"
+    assert listed.json()["hosts"][0]["default_workspace"] == "D:\\AIProgram\\Projects"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        missing = await client.patch(f"/v1/hosts/{_HOST_ID}", json={})
+        cleared = await client.patch(f"/v1/hosts/{_HOST_ID}", json={"default_workspace": None})
+    assert missing.status_code == 422
+    assert cleared.status_code == 200
+    assert cleared.json()["default_workspace"] is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["relative/path", "~", "\\\\", "\\\\server", "ä:\\folder", "bad\x00path", "/" + "a" * 2048],
+)
+async def test_patch_host_default_workspace_rejects_invalid_paths(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    value: str,
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(f"/v1/hosts/{_HOST_ID}", json={"default_workspace": value})
+
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize("value", ["\\\\server\\share", "/tmp/project "])
+async def test_patch_host_default_workspace_preserves_valid_native_paths(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    value: str,
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(f"/v1/hosts/{_HOST_ID}", json={"default_workspace": value})
+
+    assert response.status_code == 200
+    assert response.json()["default_workspace"] == value
+
+
+async def test_patch_host_default_workspace_reports_concurrent_owner_change(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, registry, host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+    monkeypatch.setattr(host_store, "set_default_workspace", lambda *args, **kwargs: None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            f"/v1/hosts/{_HOST_ID}", json={"default_workspace": "D:\\Projects"}
+        )
+
+    assert response.status_code == 409
+
+
 async def test_hosts_api_surfaces_configured_harnesses(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
@@ -335,6 +481,34 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
 
     assert resp.status_code == 200
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
+
+
+async def test_hosts_api_gates_filesystem_roots_on_host_capability(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry, filesystem_roots=True)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.json()["hosts"][0]["filesystem_roots"] is True
+    assert single.json()["filesystem_roots"] is True
+
+
+async def test_hosts_api_hides_filesystem_roots_for_older_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.json()["hosts"][0]["filesystem_roots"] is False
+    assert single.json()["filesystem_roots"] is False
 
 
 async def test_hosts_api_surfaces_gateway_inference(
@@ -909,6 +1083,27 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+async def test_patch_host_default_workspace_403_wrong_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A user cannot change another user's picker starting directory."""
+    app, _registry, host_store, _cs = multi_user_app
+    host_id = "6a4670481346725470e480959336424b"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            f"/v1/hosts/{host_id}",
+            headers={"x-test-user": "bob@test.com"},
+            json={"default_workspace": "D:\\Bob"},
+        )
+
+    assert response.status_code == 403
+    stored = host_store.get_host(host_id)
+    assert stored is not None
+    assert stored.default_workspace is None
 
 
 async def test_launch_runner_403_wrong_owner(

@@ -31,6 +31,7 @@ import yaml
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.runtime import set_runner_client
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -116,6 +117,19 @@ def _seed_child(
     )
 
 
+def _empty_terminal_runner() -> httpx.AsyncClient:
+    page = {"object": "list", "data": [], "first_id": None, "last_id": None, "has_more": False}
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=page)),
+        base_url="http://runner.test",
+    )
+
+
+async def _child_row(client: httpx.AsyncClient, parent_id: str, child_id: str) -> dict[str, Any]:
+    rows = (await client.get(f"/v1/sessions/{parent_id}/child_sessions")).json()["data"]
+    return next(row for row in rows if row["id"] == child_id)
+
+
 # ── 404 ──────────────────────────────────────────────────
 
 
@@ -125,6 +139,383 @@ async def test_child_sessions_404_for_nonexistent_session(
     """Route returns 404 when the parent session does not exist."""
     resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/child_sessions")
     assert resp.status_code == 404
+
+
+async def test_replayed_unverified_native_child_is_not_busy_and_live_activity_restores_it(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A legacy running snapshot is quarantined until a new live edge arrives."""
+    parent = await _create_parent_session(client, "unverified-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:legacy",
+        agent_id=parent["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    )
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "activity_unverified", "replayed": True},
+            },
+        )
+        assert response.status_code == 202, response.text
+        row = await _child_row(client, parent["id"], child.id)
+        assert row["busy"] is False
+        assert row["current_task_status"] is None
+        assert row["activity_unverified"] is True
+
+        snapshot = (await client.get(f"/v1/sessions/{child.id}")).json()
+        assert snapshot["status"] == "idle"
+
+        sessions_module._session_status_cache[child.id] = "running"
+        parent_row = next(
+            row
+            for row in (await client.get("/v1/sessions")).json()["data"]
+            if row["id"] == parent["id"]
+        )
+        assert parent_row["background_activity_count"] == 0
+        assert parent_row["status"] == "idle"
+
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert response.status_code == 202, response.text
+        assert sessions_module._session_status_cache[child.id] == "activity_unverified"
+
+        # A Server restart drops the process-local cache. The durable label
+        # must still keep this row out of busy/B and out of the false Done state.
+        sessions_module._session_status_cache.pop(child.id, None)
+        row = await _child_row(client, parent["id"], child.id)
+        assert row["busy"] is False
+        assert row["current_task_status"] is None
+        assert row["activity_unverified"] is True
+
+        # A newly resumed turn also supersedes a terminal verdict repaired for
+        # the child's earlier dispatch; both durable markers must be cleared.
+        conv_store.set_labels(child.id, {"omnigent.subagent.terminal_status": "completed"})
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={"type": "external_session_status", "data": {"status": "running"}},
+        )
+        assert response.status_code == 202, response.text
+        row = await _child_row(client, parent["id"], child.id)
+        assert row["busy"] is True
+        assert row["activity_unverified"] is False
+        refreshed = conv_store.get_conversation(child.id)
+        assert refreshed is not None
+        assert refreshed.labels.get("omnigent.subagent.terminal_status") == ""
+        assert refreshed.labels.get("omnigent.subagent.status_generation")
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+async def test_native_terminal_event_atomically_clears_concurrent_quarantine(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal verdict wins when quarantine lands immediately before it."""
+    parent = await _create_parent_session(client, "terminal-wins-quarantine-race")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:terminal-race",
+        agent_id=parent["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    )
+    original_set_labels = SqlAlchemyConversationStore.set_labels
+    injected = False
+
+    def _inject_quarantine_before_terminal_write(
+        self: SqlAlchemyConversationStore,
+        conversation_id: str,
+        labels: dict[str, str],
+    ) -> None:
+        nonlocal injected
+        if (
+            conversation_id == child.id
+            and labels.get("omnigent.subagent.terminal_status") == "completed"
+            and not injected
+        ):
+            injected = True
+            original_set_labels(
+                self,
+                child.id,
+                {"omnigent.subagent.activity_unverified": "true"},
+            )
+        original_set_labels(self, conversation_id, labels)
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "set_labels",
+        _inject_quarantine_before_terminal_write,
+    )
+    parent_updates: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        routes_events_module,
+        "_publish_child_status_to_parent",
+        lambda session_id, status: parent_updates.append((session_id, status)),
+    )
+    # The terminal edge's public value is also idle, so ordinary cache-value
+    # dedupe cannot be responsible for the required durable-state fanout.
+    sessions_module._session_status_cache[child.id] = "idle"
+    runner = _empty_terminal_runner()
+    set_runner_client(runner)
+    try:
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={"type": "external_session_status", "data": {"status": "completed"}},
+        )
+        assert response.status_code == 202, response.text
+        current = conv_store.get_conversation(child.id)
+        assert injected
+        assert current is not None
+        assert current.labels.get("omnigent.subagent.terminal_status") == "completed"
+        assert current.labels.get("omnigent.subagent.activity_unverified") != "true"
+        assert current.labels.get("omnigent.subagent.status_generation")
+        assert parent_updates == [(child.id, None)]
+        row = await _child_row(client, parent["id"], child.id)
+        assert row["current_task_status"] == "completed"
+        assert row["activity_unverified"] is False
+    finally:
+        set_runner_client(None)
+        await runner.aclose()
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+async def test_empty_native_parent_terminal_inventory_invalidates_stale_child_activity(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A dead parent TUI quarantines a child after its final visible output."""
+    parent = await _create_parent_session(client, "missing-native-terminal-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(
+        parent["id"],
+        {
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
+    )
+    conv_store.replace_runner_id(parent["id"], "runner-parent")
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:stale-running",
+        agent_id=parent["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    )
+    conv_store.replace_runner_id(child.id, "runner-parent")
+    conv_store.set_session_live_status(child.id, "running")
+    conv_store.append(
+        child.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="native-child-final",
+                data=MessageData(
+                    role="assistant",
+                    agent="Explore",
+                    content=[{"type": "output_text", "text": "CHILD_DONE"}],
+                ),
+            )
+        ],
+    )
+    # Claude's child can emit its final visible output and a transient idle
+    # display edge without a structured terminal verdict. The durable relay
+    # status remains running, which otherwise leaves the Agents rail on
+    # Working forever after the parent's terminal has disappeared.
+    sessions_module._session_status_cache[child.id] = "idle"
+    runner = _empty_terminal_runner()
+    set_runner_client(runner)
+    try:
+        terminals = await client.get(
+            f"/v1/sessions/{parent['id']}/resources/terminals?order=asc&limit=1000"
+        )
+        assert terminals.status_code == 200, terminals.text
+        assert terminals.json()["data"] == []
+
+        child_row = await _child_row(client, parent["id"], child.id)
+        assert child_row["busy"] is False
+        assert child_row["activity_unverified"] is True
+        persisted_child = conv_store.get_conversation(child.id)
+        assert persisted_child is not None
+        assert persisted_child.live_status == "running"
+        assert persisted_child.labels.get("omnigent.subagent.status_generation")
+        persisted_parent = conv_store.get_conversation(parent["id"])
+        assert persisted_parent is not None
+        assert "omnigent.claude_native.bridge_id" not in persisted_parent.labels
+
+        sessions_module._session_status_cache.pop(child.id, None)
+        cold_child_row = await _child_row(client, parent["id"], child.id)
+        assert cold_child_row["busy"] is False
+        assert cold_child_row["activity_unverified"] is True
+        assert cold_child_row["current_task_status"] is None
+
+        parent_row = next(
+            row
+            for row in (await client.get("/v1/sessions")).json()["data"]
+            if row["id"] == parent["id"]
+        )
+        assert parent_row["background_activity_count"] == 0
+        assert parent_row["status"] == "idle"
+    finally:
+        set_runner_client(None)
+        await runner.aclose()
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+async def test_terminal_inventory_survives_best_effort_reconciliation_failure(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repair-store failure cannot turn a successful terminal GET into 500."""
+    from omnigent.server.routes._sessions import subagent_reconciliation
+
+    parent = await _create_parent_session(client, "terminal-repair-failure-parent")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "claude-code-native-ui"})
+    store.replace_runner_id(parent["id"], "runner-parent")
+    runner = _empty_terminal_runner()
+
+    async def _fail_repair(**_kwargs: Any) -> int:
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(
+        subagent_reconciliation,
+        "_invalidate_native_subagents_for_missing_parent_terminal_impl",
+        _fail_repair,
+    )
+    set_runner_client(runner)
+    try:
+        response = await client.get(
+            f"/v1/sessions/{parent['id']}/resources/terminals?order=asc&limit=1000"
+        )
+    finally:
+        set_runner_client(None)
+        await runner.aclose()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"] == []
+
+
+async def test_activity_unverified_rejects_live_and_non_claude_native_sessions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Only a replayed Claude-native child may invalidate historical activity."""
+    parent = await _create_parent_session(client, "unverified-validation-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:legacy",
+    )
+    conv_store.set_labels(
+        child.id,
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    )
+    live = await client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_status", "data": {"status": "activity_unverified"}},
+    )
+    wrong_session = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "activity_unverified", "replayed": True},
+        },
+    )
+    assert live.status_code == 400
+    assert wrong_session.status_code == 400
+
+
+@pytest.mark.parametrize("terminal_timing", ["before", "during_cas"])
+async def test_activity_unverified_does_not_override_durable_terminal_status(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_timing: str,
+) -> None:
+    """An unknown replay cannot downgrade stronger structured completion evidence."""
+    parent = await _create_parent_session(client, "unverified-terminal-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:completed",
+    )
+    conv_store.set_labels(
+        child.id,
+        {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            **(
+                {"omnigent.subagent.terminal_status": "completed"}
+                if terminal_timing == "before"
+                else {}
+            ),
+        },
+    )
+    original_reconcile = SqlAlchemyConversationStore.reconcile_native_subagent_status
+    injected = False
+
+    def _complete_before_unverified_cas(
+        self: SqlAlchemyConversationStore, *args: Any, **kwargs: Any
+    ) -> Any:
+        nonlocal injected
+        injected = True
+        self.set_labels(
+            child.id,
+            {
+                "omnigent.subagent.terminal_status": "completed",
+                "omnigent.subagent.activity_unverified": "",
+                "omnigent.subagent.status_generation": "terminal",
+            },
+        )
+        sessions_module._session_status_cache[child.id] = "idle"
+        return original_reconcile(self, *args, **kwargs)
+
+    if terminal_timing == "during_cas":
+        monkeypatch.setattr(
+            SqlAlchemyConversationStore,
+            "reconcile_native_subagent_status",
+            _complete_before_unverified_cas,
+        )
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "activity_unverified", "replayed": True},
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert sessions_module._session_status_cache[child.id] == "idle"
+        assert injected is (terminal_timing == "during_cas")
+        row = await _child_row(client, parent["id"], child.id)
+        assert row["current_task_status"] == "completed"
+        assert row["activity_unverified"] is False
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
 
 
 # ── Empty ────────────────────────────────────────────────

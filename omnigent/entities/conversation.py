@@ -101,6 +101,12 @@ class Conversation:
         nested ``by_model`` object. Persisted as a JSON column and
         loaded by the policy engine builder at workflow start. Empty
         dict when no LLM calls have been recorded yet.
+    :param provider_usage_limits: Latest sanitized account allowance
+        snapshot reported by the active harness. ``None`` until a harness
+        reports comparable windows. Stored with conversation metadata rather
+        than labels because the snapshot can exceed the label value limit.
+    :param session_todos: Latest validated native-harness plan forwarded for
+        Web display. Persisted so the snapshot survives Server restarts.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
         Set at session creation via ``POST /v1/sessions`` metadata
@@ -216,6 +222,8 @@ class Conversation:
         listing (and the sidebar), surfacing only when the caller
         passes ``include_archived=True``. ``False`` for normal
         sessions; toggled via ``PATCH /v1/sessions/{id}``.
+    :param archived_at: Unix epoch seconds when the session most recently
+        transitioned into the archived state. ``None`` while active.
     :param project_id: The first-class project this session is filed
         under, or ``None`` if unfiled. Owner-private membership; see
         ``designs/PROJECTS_PRD.md``.
@@ -225,6 +233,9 @@ class Conversation:
         if the title also matched), so the search UI can show *where* the
         session matched. Never persisted (not a DB column) and ``None`` on
         every non-search read path and title-only matches.
+    :param search_item_id: Stable item id for ``search_snippet``. Transient and
+        populated together with the snippet so readers can open the matching
+        part of a long transcript without walking every earlier page.
     """
 
     id: str
@@ -240,6 +251,8 @@ class Conversation:
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)
+    provider_usage_limits: dict[str, Any] | None = None
+    session_todos: list[dict[str, Any]] = field(default_factory=list)
     reasoning_effort: str | None = None
     model_override: str | None = None
     reported_model: str | None = None
@@ -254,6 +267,7 @@ class Conversation:
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    archived_at: int | None = None
     # Live-state fields written by the replica holding the runner tunnel
     # so any replica's session list can serve them. ``live_status`` is the
     # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",
@@ -265,6 +279,10 @@ class Conversation:
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
+    search_item_id: str | None = None
+    search_response_id: str | None = None
+    search_item_created_at: int | None = None
+    search_match_count: int = 0
 
 
 # ── Conversation item data types ───────────────────────
@@ -374,10 +392,21 @@ class FunctionCallOutputData(BaseModel):
     :param call_id: The call_id this output corresponds to,
         e.g. ``"call_abc123"``.
     :param output: The tool's string result.
+    :param tool_status: Optional status carried by a native harness's
+        structured tool-result metadata, e.g. ``"running"`` or
+        ``"completed"``. Named separately from the conversation item's own
+        ``status`` so flattening the API shape cannot overwrite it.
+    :param is_async: Whether the native tool result represents background
+        work that is still running.
+    :param is_error: Whether the native harness marked the tool result as an
+        error. Missing on conversation items written by older versions.
     """
 
     call_id: str
     output: str
+    tool_status: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    is_async: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    is_error: bool | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ErrorData(BaseModel):
@@ -491,7 +520,8 @@ class CompactionData(BaseModel):
     model: str | None = None
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
-    window_id: int | str | None = None
+    window_id: int | None = None
+    snapshot_source: Literal["transcript", "hook_fallback"] | None = None
 
     @field_validator("compacted_messages")
     @classmethod
@@ -807,13 +837,12 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
-    # Deterministic item id for idempotent appends. When set, the store uses
-    # it as the item's id and treats an already-persisted item with this id
-    # as the append's result instead of inserting a duplicate — the retry
-    # contract for at-least-once producers (a transcript forwarder cannot
-    # know whether a timed-out POST committed). Same 32-hex shape the store
-    # mints itself; ``None`` keeps the store-assigned random id.
-    stable_id: str | None = None
+    # Internal store key for a vendor transcript record. Ordinary messages
+    # retain random IDs; native forwarders supply their stable source identity.
+    idempotency_key: str | None = Field(default=None, exclude=True)
+    # Ordered cold-transcript recovery; None is the beginning of history.
+    native_recovery: bool = Field(default=False, exclude=True)
+    recovery_after: str | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -852,10 +881,46 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
-    # In-process signal only (excluded from every dump / API shape): ``True``
-    # when an idempotent append found this item already persisted under its
-    # ``stable_id``, so the caller can skip a duplicate's side effects.
-    deduplicated: bool = Field(default=False, exclude=True)
+    replayed: bool = Field(default=False, exclude=True)
+
+    def matches_native_replay(self, incoming: NewConversationItem, *, exact_source: bool) -> bool:
+        """Compare vendor data, allowing stored uploads only with a known source ID."""
+        if self.type != incoming.type:
+            return False
+        if self.data == incoming.data:
+            return True
+        old, new = self.data, incoming.data
+        if not (
+            exact_source
+            and isinstance(old, MessageData)
+            and isinstance(new, MessageData)
+            and old.role == new.role == "user"
+            and old.model_dump(exclude={"content"}) == new.model_dump(exclude={"content"})
+        ):
+            return False
+        file_types = {"input_image", "input_file"}
+        if not any(block.get("type") in file_types for block in old.content) or any(
+            block.get("type") in file_types for block in new.content
+        ):
+            return False
+
+        def mirrored_text(content: list[dict[str, Any]], *, strip_markers: bool) -> str:
+            text = "\n".join(
+                str(block.get("text", ""))
+                for block in content
+                if block.get("type") in {"input_text", "output_text", "text"}
+            )
+            if strip_markers:
+                text = "\n".join(
+                    line
+                    for line in text.splitlines()
+                    if not _ATTACHMENT_MARKER_RE.fullmatch(line.strip())
+                )
+            return " ".join(text.split())
+
+        return mirrored_text(old.content, strip_markers=False) == mirrored_text(
+            new.content, strip_markers=True
+        )
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:

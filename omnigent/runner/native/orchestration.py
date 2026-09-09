@@ -2064,6 +2064,18 @@ async def _resolve_pi_resume_session(
     return None
 
 
+def _native_forwarder_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Authenticate trusted in-process forwarders with the current runner.
+
+    Keep this copy separate from hook configuration and terminal environment:
+    harness subprocesses must not inherit the runner control-plane token.
+    """
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import with_runner_binding_token
+
+    return with_runner_binding_token(headers, _runner_tunnel_binding_token_from_env())
+
+
 async def _auto_create_pi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2339,6 +2351,45 @@ _CODEX_THREAD_RESET_NOTICE = (
     "history here is intact, but Codex's own memory of the earlier turns is not "
     "restored."
 )
+
+
+async def _post_claude_degraded_sync_notice(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> None:
+    """Best-effort user-visible notice for an invalid local forward cursor."""
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "harness",
+                        "code": "claude_degraded_sync",
+                        "message": (
+                            "Resumed existing local Claude context. The saved synchronization "
+                            "cursor was missing or invalid, so conversation synchronization "
+                            "continues from the current terminal "
+                            "position; earlier terminal output may be absent from this chat."
+                        ),
+                        "level": "info",
+                    },
+                },
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "claude-native: failed to surface degraded-sync notice for session %s",
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _post_codex_thread_reset_notice(
@@ -3789,7 +3840,7 @@ async def _auto_create_kimi_terminal(
     _forwarder_task = asyncio.create_task(
         supervise_kimi_forwarder(
             base_url=server_url,
-            headers={},
+            headers=_native_forwarder_headers(_runner_headers),
             session_id=session_id,
             bridge_dir=bridge_dir,
             kimi_home=bridge_dir / "kimi-code-home",
@@ -4765,7 +4816,7 @@ async def _codex_discover_thread_and_forward(
 
         await supervise_forwarder(
             base_url=server_url,
-            headers=headers,
+            headers=_native_forwarder_headers(headers),
             session_id=session_id,
             bridge_dir=bridge_dir,
             app_server_url=codex_ws_url,
@@ -4830,7 +4881,7 @@ async def _codex_forward_known_thread(
     try:
         await supervise_forwarder(
             base_url=server_url,
-            headers=headers,
+            headers=_native_forwarder_headers(headers),
             session_id=session_id,
             bridge_dir=bridge_dir,
             app_server_url=codex_ws_url,
@@ -6672,7 +6723,6 @@ async def _auto_create_claude_terminal(
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)
-    reset_transcript_forward_state(bridge_dir)
     _logger.info(
         "Claude terminal bridge prepared: session=%s",
         session_id,
@@ -6743,14 +6793,8 @@ async def _auto_create_claude_terminal(
             extra={"session_id": session_id},
         )
 
-    # Cold resume: when this session wraps a prior Claude session,
-    # synthesize the local ``~/.claude/projects/<workspace>/<sid>.jsonl``
-    # transcript that Claude's ``--resume`` reads, then pass ``--resume``.
-    # The CLI does this client-side via ``_resolve_cold_resume_args``;
-    # doing it here lets a daemon / web-UI launch resume too. Best-effort:
-    # on any failure we launch fresh rather than point ``--resume`` at a
-    # transcript that doesn't exist. See
-    # designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    # Preserve native local history and its cursor on same-host resume.
+    # Reconstruct from Server only when no valid local transcript exists.
     resume_external_session_id: str | None = None
     # Byte length of the resume transcript this launch synthesized, measured
     # BEFORE Claude starts. The forwarder seeds its cursor from this rather than
@@ -6758,25 +6802,34 @@ async def _auto_create_claude_terminal(
     # hook, and the executor's prompt inject waits on the same boot, so a
     # ``stat`` taken later routinely skips the freshly-injected message.
     resume_prefix_bytes: int | None = None
+    resume_state_prepared = False
     if server_client is not None and session_external_id is not None:
-        from omnigent.harnesses.claude_native.main import _ensure_local_claude_resume_transcript
+        from omnigent.claude_native import (
+            _ensure_local_claude_resume_transcript,
+            _prepare_cold_resume_forward_state,
+        )
 
-        try:
-            _transcript = await _ensure_local_claude_resume_transcript(
-                server_client,
+        resolution = await _ensure_local_claude_resume_transcript(
+            server_client,
+            session_id=session_id,
+            external_session_id=session_external_id,
+            workspace=Path(workspace).resolve(),
+        )
+        if resolution.path is not None:
+            resume_external_session_id = session_external_id
+            degraded_sync = _prepare_cold_resume_forward_state(
+                bridge_dir=bridge_dir,
+                resolution=resolution,
                 session_id=session_id,
-                external_session_id=session_external_id,
-                workspace=Path(workspace).resolve(),
             )
-            if _transcript is not None:
-                resume_external_session_id = session_external_id
-                resume_prefix_bytes = _measured_prefix_bytes(_transcript)
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            _logger.warning(
-                "Could not synthesize Claude resume transcript for %s; launching without --resume",
-                session_id,
-                exc_info=True,
-            )
+            if degraded_sync:
+                await _post_claude_degraded_sync_notice(
+                    session_id=session_id,
+                    server_client=server_client,
+                )
+            resume_state_prepared = True
+            if resolution.synthesized:
+                resume_prefix_bytes = _measured_prefix_bytes(resolution.path)
     elif session_external_id is None and fork_source_external_id is not None:
         # Forked clone with no native session yet: clone the SOURCE's
         # local Claude transcript into the clone's OWN project dir under a
@@ -6857,12 +6910,13 @@ async def _auto_create_claude_terminal(
         our_uuid = str(uuid.uuid4())
         _clone_workspace = Path(workspace).resolve()
         try:
-            _built = await _ensure_local_claude_resume_transcript(
+            _built_resolution = await _ensure_local_claude_resume_transcript(
                 server_client,
                 session_id=session_id,
                 external_session_id=our_uuid,
                 workspace=_clone_workspace,
             )
+            _built = _built_resolution.path
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _built = None
             _logger.warning(
@@ -6899,6 +6953,8 @@ async def _auto_create_claude_terminal(
                     session_id,
                     exc_info=True,
                 )
+    if not resume_state_prepared:
+        reset_transcript_forward_state(bridge_dir)
     _logger.info(
         "Claude terminal cold-resume decision: session=%s external_session_id_set=%s "
         "fork_source_set=%s resume_enabled=%s",
@@ -7388,7 +7444,7 @@ async def _auto_create_claude_terminal(
         try:
             await supervise_forwarder(
                 base_url=server_url,
-                headers=_runner_headers,
+                headers=_native_forwarder_headers(_runner_headers),
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 agent_name="claude-native-ui",

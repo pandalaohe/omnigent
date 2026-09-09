@@ -18,8 +18,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  readLastExplicitRightRailTab,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import {
+  readSessionNavigationPreferences,
+  writeSessionNavigationPreferences,
+} from "@/lib/sessionNavigationPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -462,7 +469,7 @@ function mockConversations(
     runner_id?: string | null;
     workspace?: string | null;
     created_at?: number;
-    provisional?: boolean;
+    goal_state?: "active" | "paused" | null;
   }[],
 ) {
   useConvMock.mockReturnValue({
@@ -480,7 +487,7 @@ function mockConversations(
             host_id: c.host_id ?? null,
             runner_id: c.runner_id ?? null,
             workspace: c.workspace ?? null,
-            provisional: c.provisional,
+            goal_state: c.goal_state ?? null,
           })),
           first_id: null,
           last_id: null,
@@ -564,6 +571,42 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+describe("Goal session frame", () => {
+  it("frames the complete active chat column and leaves the workspace outside", () => {
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: "active" }]);
+    renderShell("/c/conv_goal");
+
+    const frame = screen.getByTestId("session-goal-frame");
+    expect(frame).toHaveAttribute("data-goal-state", "active");
+    expect(frame).toHaveClass("inset-y-0", "left-0", "ring-status-green/80");
+    expect(frame).toHaveStyle({ right: "var(--workspace-panel-offset)" });
+  });
+
+  it("uses yellow for a paused Goal", () => {
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: "paused" }]);
+    renderShell("/c/conv_goal");
+
+    const frame = screen.getByTestId("session-goal-frame");
+    expect(frame).toHaveAttribute("data-goal-state", "paused");
+    expect(frame).toHaveClass("ring-status-yellow/80");
+  });
+
+  it("removes the frame after completion and when the preference is off", () => {
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: null }]);
+    const completed = renderShell("/c/conv_goal");
+    expect(screen.queryByTestId("session-goal-frame")).toBeNull();
+    completed.unmount();
+
+    writeSessionNavigationPreferences({
+      ...readSessionNavigationPreferences(),
+      showGoalSessionMarkers: false,
+    });
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: "active" }]);
+    renderShell("/c/conv_goal");
+    expect(screen.queryByTestId("session-goal-frame")).toBeNull();
+  });
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
@@ -1847,7 +1890,7 @@ describe("Workspace rail maximize", () => {
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
-  it("pins the sidebar open on /settings so the Back row is reachable", () => {
+  it("pins the sidebar open on desktop /settings so the Back row is reachable", () => {
     // The settings nav replaces the session list INSIDE the sidebar, and its
     // Back row is the only way off the page. Collapsed, that row is clipped and
     // inert — the user is stranded with no visible exit. Entering /settings must
@@ -1856,6 +1899,33 @@ describe("Workspace rail maximize", () => {
     renderShell("/settings");
 
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("starts with the settings drawer closed on mobile so section content is reachable", () => {
+    const realMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as typeof window.matchMedia;
+
+    try {
+      mockConversations([]);
+      renderShell("/settings");
+
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    } finally {
+      window.matchMedia = realMatchMedia;
+    }
   });
 
   it("refuses to collapse the sidebar while on /settings", () => {
@@ -2665,7 +2735,7 @@ describe("Right workspace card visibility", () => {
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
   });
 
-  it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
+  it("keeps the card mounted with Agents and Archive for a minimal agent", async () => {
     // A no-os_env agent (available: false) with no shells
     // still has the unconditional Agents tab (the panel lists at least
     // the main agent), so the card mounts, the Agents tab is selected
@@ -2682,8 +2752,11 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
-    // The tab-fallback effect lands on Agents (the only available tab).
-    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /Archive/i })).toBeInTheDocument();
+    // The tab-fallback effect lands on Agents, the first available tab.
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true"),
+    );
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
@@ -2805,6 +2878,28 @@ describe("Right workspace card visibility", () => {
 
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
+  });
+
+  it("uses the last explicitly clicked rail tab for a fresh session", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_explicit_a", permission_level: null },
+      { id: "conv_explicit_b", permission_level: null },
+    ]);
+
+    const first = renderShell("/c/conv_explicit_a");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Archive/i }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(readLastExplicitRightRailTab()).toBe("archive");
+    first.unmount();
+
+    renderShell("/c/conv_explicit_b");
+    expect(screen.getByRole("tab", { name: /Archive/i })).toHaveAttribute("aria-selected", "true");
   });
 
   it("restores the open file tabs per session (independent of the ?file= param)", () => {
@@ -3367,6 +3462,35 @@ describe("Mobile session menu", () => {
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     return trigger;
   }
+
+  it("opens archived sessions as a full-screen drawer from the mobile menu", () => {
+    const realMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as typeof window.matchMedia;
+    try {
+      mockConversations([{ id: "conv_abc", permission_level: null }]);
+      renderShell("/c/conv_abc");
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Session actions" }), {
+        button: 0,
+      });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Archived sessions" }));
+      const drawer = screen.getByTestId("archive-panel-drawer");
+      expect(drawer).toHaveAttribute("data-state", "open");
+      expect(drawer).toHaveClass("mobile-panel-drawer");
+      expect(within(drawer).getByText("Archived sessions")).toBeInTheDocument();
+      expect(within(drawer).getByTestId("archive-library-rail")).toBeInTheDocument();
+    } finally {
+      window.matchMedia = realMatchMedia;
+    }
+  });
 
   it("lists the native session's menu entries (Terminals folds into the pill)", () => {
     useEnvironmentMock.mockReturnValue({

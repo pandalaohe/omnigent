@@ -14,7 +14,7 @@ import math
 import re
 import secrets
 import time
-import uuid
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
@@ -67,6 +67,10 @@ from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
     PolicyResult,
+)
+from omnigent.provider_usage_limits import (
+    parse_provider_usage_limits_snapshot_json,
+    validate_provider_usage_limits_snapshot,
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
@@ -153,8 +157,11 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _FENCE_EXEMPT_EVENT_TYPES,
+    _GOAL_STATE_LABEL_KEY,
+    _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
     _LAST_CONTEXT_TOKENS_LABEL_KEY,
     _LAST_CONTEXT_WINDOW_LABEL_KEY,
+    _LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY,
     _MANAGED_RESUMABLE_TUNNEL_STALE_S,
     _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
     _MODEL_TOKEN_KEYS,
@@ -162,6 +169,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S,
     _RUNNER_SESSION_INIT_TIMEOUT_S,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
@@ -256,6 +264,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_terminal_name_for_harness,
     _NativeTerminalEnsureOutcome,
     _owner_from_grants,
+    _parse_background_tasks,
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
@@ -294,6 +303,7 @@ from omnigent.server.routes._sessions.helpers import (
     _routing_decision_item_from_sse,
     _RunnerForwardResult,
     _seed_missing_title_from_user_message,
+    _session_background_activity_count,
     _session_status_from_cache,
     _session_status_with_child_rollup,
     _SessionEventDispatchResult,
@@ -327,6 +337,7 @@ from omnigent.server.schemas import (
     SessionListItem,
     SessionModelEvent,
     SessionResponse,
+    SessionSearchMatch,
     SessionStatusEvent,
     SessionUsageEvent,
     SkillSummary,
@@ -343,6 +354,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    NativeReplayConflictError,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -686,8 +698,10 @@ async def _archive_stop(
         tunnels, or ``None`` when host support is not wired.
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
+    from omnigent.server.native_subagent_watchdog import disarm_native_subagent_watchdogs
     from omnigent.server.routes import sessions as _facade
 
+    disarm_native_subagent_watchdogs(session_id)
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -795,6 +809,8 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    activity_unverified_child_ids: set[str] | None = None,
+    agent_template_ids: Mapping[str, str] | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -847,16 +863,44 @@ def _build_session_list_item(
     # dots straight from the list (no separate fetch). Built per-user here —
     # `user_id` is the requesting caller, never broadcast to other viewers.
     viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
+    own_activity_unverified = conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
     return SessionListItem(
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
+        agent_template_id=(agent_template_ids or {}).get(conv.agent_id),
         status=_list_status_with_starting(
-            _session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
+            (
+                "idle"
+                if own_activity_unverified
+                else _session_status_with_child_rollup(
+                    conv.id,
+                    child_session_ids,
+                    conv.live_status,
+                    activity_unverified_child_ids,
+                )
+            ),
             conv.id,
+        ),
+        foreground_status=(
+            "idle"
+            if own_activity_unverified
+            else _session_status_from_cache(conv.id, conv.live_status)
+        ),
+        background_activity_count=_session_background_activity_count(
+            conv.id,
+            child_session_ids,
+            conv.live_status,
+            activity_unverified_child_ids,
+        ),
+        goal_state=(
+            cast(Literal["active", "paused"], conv.labels[_GOAL_STATE_LABEL_KEY])
+            if conv.labels.get(_GOAL_STATE_LABEL_KEY) in {"active", "paused"}
+            else None
         ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
+        archived_at=conv.archived_at,
         title=title_without_closed_marker(conv.title),
         # Collapse per-user pin keys to the canonical bare key for this viewer
         # (never leak another user's pin key), then add the closed marker.
@@ -894,6 +938,20 @@ def _build_session_list_item(
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,
+        search_match_count=conv.search_match_count,
+        search_match=(
+            SessionSearchMatch(
+                item_id=conv.search_item_id,
+                response_id=conv.search_response_id,
+                created_at=conv.search_item_created_at,
+                snippet=conv.search_snippet,
+            )
+            if conv.search_item_id is not None
+            and conv.search_response_id is not None
+            and conv.search_item_created_at is not None
+            and conv.search_snippet is not None
+            else None
+        ),
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
     )
@@ -1077,17 +1135,43 @@ def _build_session_response(
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
+    raw_auto_compact_token_limit = conv.labels.get(_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY)
+    auto_compact_token_limit = (
+        int(raw_auto_compact_token_limit)
+        if isinstance(raw_auto_compact_token_limit, str)
+        and raw_auto_compact_token_limit.isdigit()
+        and int(raw_auto_compact_token_limit) > 0
+        else None
+    )
+    provider_usage_limits = conv.provider_usage_limits
+    raw_provider_usage_limits = conv.labels.get(_LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY)
+    if provider_usage_limits is None and isinstance(raw_provider_usage_limits, str):
+        # Split-DB deployments migrate metadata and labels through separate
+        # connections, so Alembic cannot backfill the legacy label there. Read
+        # it compatibly until the next Host report writes first-class metadata.
+        provider_usage_limits = parse_provider_usage_limits_snapshot_json(
+            raw_provider_usage_limits,
+            repair_clipped_label=True,
+        )
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
+        agent_template_id=(
+            getattr(agent_store, "get_template_ids", lambda _ids: {})([conv.agent_id]).get(
+                conv.agent_id
+            )
+            if agent_store is not None and conv.agent_id is not None
+            else None
+        ),
         agent_name=agent_name,
         status=status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
+        archived_at=conv.archived_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
         runner_id=conv.runner_id,
@@ -1113,6 +1197,8 @@ def _build_session_response(
         subagent_routing_override=conv.subagent_routing_override,
         share_workspace_files=conv.share_workspace_files,
         context_window=context_window,
+        auto_compact_token_limit=auto_compact_token_limit,
+        provider_usage_limits=provider_usage_limits,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
         # total (this session + its sub-agents) when the caller computed
@@ -1145,10 +1231,9 @@ def _build_session_response(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
-        # Replay the latest todo list for claude-native sessions.
-        # Populated by _handle_external_session_todos; empty list for
-        # non-claude-native sessions or before the first poll tick.
-        todos=_session_todos_cache.get(conv.id, []),
+        # Prefer the live cache and fall back to persisted metadata after a
+        # Server restart/deployment. Empty before the first harness report.
+        todos=_session_todos_cache.get(conv.id, conv.session_todos),
         skills=skills or [],
         model_options=[
             NativeModelOption.model_validate(option) for option in (model_options or [])
@@ -1631,6 +1716,30 @@ async def _persist_external_session_usage(
             "external_session_usage data.context_window must be a positive int",
             code=ErrorCode.INVALID_INPUT,
         )
+    has_auto_compact_token_limit = "auto_compact_token_limit" in body.data
+    raw_auto_compact_token_limit = body.data.get("auto_compact_token_limit")
+    if (
+        has_auto_compact_token_limit
+        and raw_auto_compact_token_limit is not None
+        and (
+            isinstance(raw_auto_compact_token_limit, bool)
+            or not isinstance(raw_auto_compact_token_limit, int)
+            or raw_auto_compact_token_limit <= 0
+        )
+    ):
+        raise OmnigentError(
+            "external_session_usage data.auto_compact_token_limit must be a positive int",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    has_provider_usage_limits = "provider_usage_limits" in body.data
+    raw_provider_usage_limits = body.data.get("provider_usage_limits")
+    try:
+        provider_usage_limits = validate_provider_usage_limits_snapshot(raw_provider_usage_limits)
+    except ValueError as exc:
+        raise OmnigentError(
+            f"external_session_usage data.provider_usage_limits is invalid: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
     _CUMULATIVE_USAGE_KEYS = (
         "cumulative_cost_usd",
         # ``policy_cost_usd`` alone is a valid post: mid-turn the displayed
@@ -1641,10 +1750,18 @@ async def _persist_external_session_usage(
         "cumulative_output_tokens",
     )
     has_cumulative = any(body.data.get(k) is not None for k in _CUMULATIVE_USAGE_KEYS)
-    if raw_tokens is None and raw_window is None and not has_cumulative:
+    if (
+        raw_tokens is None
+        and raw_window is None
+        and not has_auto_compact_token_limit
+        and not has_provider_usage_limits
+        and not has_cumulative
+    ):
         raise OmnigentError(
             "external_session_usage requires at least one of "
-            "data.context_tokens, data.context_window, or a cumulative usage field",
+            "data.context_tokens, data.context_window, data.auto_compact_token_limit, "
+            "data.provider_usage_limits, "
+            "or a cumulative usage field",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -1678,11 +1795,33 @@ async def _persist_external_session_usage(
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
     if raw_window is not None:
         label_updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(raw_window)
-    await asyncio.to_thread(
-        conversation_store.set_labels,
-        session_id,
-        label_updates,
-    )
+    if has_auto_compact_token_limit and raw_auto_compact_token_limit is not None:
+        label_updates[_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY] = str(raw_auto_compact_token_limit)
+    if label_updates:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            label_updates,
+        )
+    if has_auto_compact_token_limit and raw_auto_compact_token_limit is None:
+        await asyncio.to_thread(
+            conversation_store.delete_label,
+            session_id,
+            _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
+        )
+    if has_provider_usage_limits:
+        await asyncio.to_thread(
+            conversation_store.set_provider_usage_limits,
+            session_id,
+            provider_usage_limits,
+        )
+        # Remove the legacy label after the metadata write. Old snapshots can
+        # exceed conversation_labels.value (256 chars) and become invalid JSON.
+        await asyncio.to_thread(
+            conversation_store.delete_label,
+            session_id,
+            _LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY,
+        )
     # The displayed cost is this session's SUBTREE total (itself + its
     # sub-agents), matching the GET snapshot. A sub-agent persists its spend on
     # its own child conversation, so broadcasting only this session's own cost
@@ -1706,12 +1845,18 @@ async def _persist_external_session_usage(
         event_payload["context_tokens"] = raw_tokens
     if raw_window is not None:
         event_payload["context_window"] = raw_window
+    if has_auto_compact_token_limit:
+        event_payload["auto_compact_token_limit"] = raw_auto_compact_token_limit
+    if has_provider_usage_limits:
+        event_payload["provider_usage_limits"] = provider_usage_limits
     if subtree_cost is not None:
         event_payload["total_cost_usd"] = subtree_cost
     if usage_by_model is not None:
         event_payload["usage_by_model"] = usage_by_model
     event = SessionUsageEvent(**event_payload)
-    session_stream.publish(session_id, event.model_dump(exclude_none=True))
+    # ``exclude_unset`` preserves an explicit compact-limit null, which clears
+    # a stale threshold after the current Host/model becomes unresolvable.
+    session_stream.publish(session_id, event.model_dump(exclude_unset=True))
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
@@ -2212,6 +2357,11 @@ async def _persist_external_codex_subagent_start(
     )
 
 
+_external_item_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -2219,9 +2369,26 @@ async def _persist_external_conversation_item(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-    permission_store: PermissionStore | None = None,
-    user_id: str | None = None,
-) -> str:
+) -> tuple[str, bool]:
+    """Serialize mirrored input consumption with replay detection for a session."""
+    lock = _external_item_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _external_item_locks[session_id] = lock
+    async with lock:
+        return await _persist_external_conversation_item_locked(
+            session_id, conv, body, conversation_store, created_by, background_title_coordinator
+        )
+
+
+async def _persist_external_conversation_item_locked(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+) -> tuple[str, bool]:
     """
     Persist and broadcast a conversation item produced outside AP.
 
@@ -2240,32 +2407,42 @@ async def _persist_external_conversation_item(
         directly in the native terminal (no pending-input entry exists
         for those). ``None`` in single-user / unauthenticated mode —
         no label is stamped in that case.
-    :returns: Store-assigned conversation item id.
+    :returns: Store-assigned item id and whether this was a replay.
     """
     item = _parse_external_conversation_item(body)
-    # An at-least-once producer (the native transcript forwarders) retries a
-    # timed-out POST it cannot know the disposition of, so the item's id is
-    # derived from its ``source_id`` and the append is idempotent — the
-    # dedupe check rides the append's own transaction, under its
-    # conversation lock, costing the hot path no extra query. A dedupe hit
-    # comes back flagged so the duplicate's side effects are unwound below
-    # (no re-broadcast, and a wrongly-drained pending input is restored).
-    source_id = body.data.get("source_id")
-    if source_id is not None:
-        if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256:
+    if "recovery_after" in body.data:
+        after = body.data["recovery_after"]
+        if (
+            conv.kind != "sub_agent"
+            or conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
+            or item.idempotency_key is None
+            or (after is not None and (not isinstance(after, str) or not after))
+        ):
             raise OmnigentError(
-                "external_conversation_item data.source_id must be a "
-                "non-empty string of at most 256 characters",
-                code=ErrorCode.INVALID_INPUT,
+                "Invalid native child recovery cursor", code=ErrorCode.INVALID_INPUT
             )
-        item = item.model_copy(
-            update={
-                "stable_id": uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
-                ).hex
-            }
+        historical = item.model_copy(update={"native_recovery": True, "recovery_after": after})
+        try:
+            persisted = (
+                await asyncio.to_thread(conversation_store.append, session_id, [historical])
+            )[0]
+        except NativeReplayConflictError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        # Hydration is not new input or work: no pending-input consumption,
+        # title generation, unread event, elicitation, or Runner delivery.
+        return persisted.id, True
+    if item.idempotency_key is not None:
+        existing = await asyncio.to_thread(
+            conversation_store.find_idempotent_item,
+            session_id,
+            item.idempotency_key,
         )
+        if existing is not None:
+            if not existing.matches_native_replay(item, exact_source=True):
+                raise OmnigentError("Transcript source identity changed", code=ErrorCode.CONFLICT)
+            # A forwarder restart may replay old user messages. Do not consume
+            # a new pending input, seed a title, or broadcast them as new work.
+            return existing.id, True
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -2290,7 +2467,10 @@ async def _persist_external_conversation_item(
             drained = matched.matched
             skipped_kiro_pending = matched.skipped
         else:
-            drained = pending_inputs.resolve_oldest(session_id)
+            drained = pending_inputs.resolve_oldest_for_mirrored_text(
+                session_id,
+                _message_text(item.data.content) or "",
+            )
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -2326,27 +2506,13 @@ async def _persist_external_conversation_item(
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
         enabled=await background_session_titles_enabled_for_user(permission_store, user_id),
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
-    persisted = persisted_items[-1]
-    if persisted.deduplicated:
-        # A re-post of an already-committed item: nothing new to render or
-        # title. Every pending entry consumed above belongs to a LATER user
-        # message — restore in original queue order (skipped entries preceded
-        # the match; restore prepends, so reverse).
-        for entry in reversed([*skipped_kiro_pending, drained]):
-            if entry is not None:
-                pending_inputs.restore(session_id, entry)
-        return persisted.id
-    # Not a duplicate: publish side effects for each skipped Kiro pair.
-    # Items are [user0, error0, user1, error1, ...]; 2 per skipped entry.
-    for i, skipped in enumerate(skipped_kiro_pending):
-        persisted_user = persisted_items[i * 2]
-        persisted_error = persisted_items[i * 2 + 1]
-        if not persisted_user.deduplicated:
-            _publish_input_consumed(
-                session_id, persisted_user, cleared_pending_id=skipped.pending_id
-            )
-            _publish_external_conversation_item(session_id, persisted_error)
+    try:
+        persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    except NativeReplayConflictError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+    persisted = persisted_items[0]
+    if persisted.replayed:
+        return persisted.id, True
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()
@@ -2354,7 +2520,7 @@ async def _persist_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
-    return persisted.id
+    return persisted.id, False
 
 
 def _build_skipped_kiro_items(
@@ -2430,26 +2596,34 @@ async def _enrich_terminal_status_with_subagent_output(
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
-    :param status: Status edge; only the terminal ``"idle"`` / ``"failed"``
-        edges are enriched.
+    :param status: Status edge. Legacy ``"idle"`` plus structured
+        ``"completed"`` / ``"failed"`` / ``"stopped"`` / ``"killed"``
+        terminal edges are enriched.
     :param session_id: Sub-agent session id, e.g. ``"conv_child123"``.
     :param conversation_store: Store read for the child's assistant text.
     :returns: ``data`` with ``"output"`` added when a terminal edge has a
         persisted assistant message; otherwise unchanged.
     """
-    if status not in ("idle", "failed"):
+    if status not in ("idle", "completed", "failed", "stopped", "killed"):
         return data
     existing = data.get("output")
-    if status == "failed" and isinstance(existing, str) and existing.strip():
+    if isinstance(existing, str) and existing.strip():
         return data
     output = await asyncio.to_thread(
         _latest_assistant_text_from_store,
         conversation_store,
         session_id,
     )
-    if output is None:
-        return data
-    return {**data, "output": output}
+    if output is not None:
+        return {**data, "output": output}
+    safe_fallbacks = {
+        "completed": "Sub-agent completed without a reliable final result.",
+        "failed": "Error: native sub-agent failed without a reliable error detail.",
+        "stopped": "Sub-agent stopped before producing a reliable final result.",
+        "killed": "Sub-agent was killed before producing a reliable final result.",
+    }
+    fallback = safe_fallbacks.get(status)
+    return {**data, "output": fallback} if fallback is not None else data
 
 
 async def _heal_subagent_runner_binding_via_parent(
@@ -6097,6 +6271,7 @@ async def _relay_runner_stream(
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     ready: asyncio.Event | None = None,
+    runner_id: str | None = None,
 ) -> None:
     """
     Run the runner-stream relay, riding out transient tunnel drops.
@@ -6134,6 +6309,7 @@ async def _relay_runner_stream(
                 runner_client,
                 conversation_store,
                 ready,
+                runner_id,
             )
             return
         except _RelayTransportLost as lost:
@@ -6227,6 +6403,7 @@ async def _relay_runner_stream_once(
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     ready: asyncio.Event | None = None,
+    runner_id: str | None = None,
 ) -> None:
     """
     Subscribe to the runner's SSE stream and relay events locally.
@@ -6381,10 +6558,23 @@ async def _relay_runner_stream_once(
                             # — the PTY idle oscillates on mid-turn lulls and
                             # would deliver a premature, lock-out completion.
                             raw_blocked_on = event.get("blocked_on")
+                            raw_background_task_count = event.get("background_task_count")
+                            background_task_count = (
+                                raw_background_task_count
+                                if isinstance(raw_background_task_count, int)
+                                and not isinstance(raw_background_task_count, bool)
+                                and raw_background_task_count >= 0
+                                else None
+                            )
+                            background_tasks = _parse_background_tasks(
+                                event.get("background_tasks")
+                            )
                             _publish_status(
                                 session_id,
                                 status,
                                 status_error,
+                                background_task_count=background_task_count,
+                                background_tasks=background_tasks,
                                 blocked_on=(
                                     raw_blocked_on
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on
@@ -6605,6 +6795,25 @@ async def _relay_runner_stream_once(
                             and _session_terminal_pending_cache.get(session_id, False)
                         ):
                             _publish_terminal_pending(session_id, False)
+                        if (
+                            isinstance(resource_data, ResourceEventData)
+                            and resource_data.event_type == "session.resource.deleted"
+                            and resource_data.resource_type == "terminal"
+                            and resource_data.resource_id == "terminal_claude_main"
+                        ):
+                            from omnigent.server.routes._sessions.subagent_reconciliation import (
+                                invalidate_native_subagents_for_missing_parent_terminal,
+                            )
+
+                            invalidate_missing_terminal = (
+                                invalidate_native_subagents_for_missing_parent_terminal
+                            )
+                            if runner_id is not None:
+                                await invalidate_missing_terminal(
+                                    parent_session_id=session_id,
+                                    conversation_store=conversation_store,
+                                    observed_runner_id=runner_id,
+                                )
 
                     # Intelligent-model-router decision emitted by the runner's
                     # cost advisor at turn start. Persist as a display-only
@@ -6893,6 +7102,7 @@ def _ensure_runner_relay(
             runner_client,
             relay_store,
             ready,
+            runner_id,
         ),
         name=f"runner-relay-{session_id}",
     )
@@ -9836,11 +10046,16 @@ async def _get_session_snapshot(
             ),
         )
 
-    # A server recycle clears this cache while the persisted relay status survives.
-    # Prefer it because native injection can finish before an external harness turn,
-    # making the runner's generic active-turn probe report a false ``idle``.
-    status = _session_status_from_cache(session_id, conv.live_status)
-    if status == "idle":
+    # Native runners inject a prompt and return before the CLI turn ends.
+    # Their generic GET status can therefore be idle while the persisted
+    # status-file/hook signal is still running. Preserve that signal on restart.
+    activity_unverified = conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+    if activity_unverified:
+        _session_status_cache[session_id] = "activity_unverified"
+        status = "idle"
+    else:
+        status = _session_status_from_cache(session_id, conv.live_status)
+    if status == "idle" and not activity_unverified:
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a
         # freshly bound session (the relay's GET /stream is still in its

@@ -95,6 +95,7 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    default_workspace: str | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
 
@@ -167,6 +168,7 @@ def _row_to_host(row: SqlHost) -> Host:
         terminating_sandbox_id=row.terminating_sandbox_id,
         deleted_at=row.deleted_at,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        default_workspace=row.default_workspace,
     )
 
 
@@ -412,6 +414,7 @@ class HostStore:
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
+        default_workspace = row.default_workspace
         terminating_sandbox_id = row.terminating_sandbox_id
 
         bound_ids = list(
@@ -456,6 +459,7 @@ class HostStore:
             sandbox_id=sandbox_id,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
+            default_workspace=default_workspace,
         )
         session.add(new_row)
         session.flush()
@@ -544,6 +548,7 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            default_workspace=existing.default_workspace,
         )
 
     def set_offline(self, host_id: str) -> None:
@@ -772,6 +777,38 @@ class HostStore:
             ).scalar_one_or_none()
             if row is None:
                 return None
+            return _row_to_host(row)
+
+    def set_default_workspace(
+        self,
+        host_id: str,
+        default_workspace: str | None,
+        *,
+        expected_user_id: str,
+    ) -> Host | None:
+        """Persist a Host preference only while the expected owner still owns it."""
+        with self._session("set_host_default_workspace") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.user_id == expected_user_id,
+                    )
+                    .values(default_workspace=default_workspace)
+                ),
+            )
+            if result.rowcount != 1:
+                return None
+            row = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
+            ).scalar_one()
+            # updated_at is the host liveness heartbeat. A preference write
+            # must not make a stale `status=online` row look live again.
             return _row_to_host(row)
 
     def register_managed_host(

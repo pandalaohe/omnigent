@@ -39,6 +39,7 @@ import {
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
+  ScrollToBottomOnSessionOpen,
   UserMessageNavConnected,
   WorkingIndicator,
   bubbleKey,
@@ -76,6 +77,9 @@ export interface TranscriptProps {
   sandboxLaunching: boolean;
   /** Terminal-first spin-up bits for the cold-launch empty state. */
   terminalFirst: { isTerminalFirst: boolean; terminalStartingUp?: boolean } | null | undefined;
+  conversationId: string | null;
+  scrollToBottomOnSessionOpen: boolean;
+  openedConversationIdRef: { current: string | null };
   /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
   spacerMeasureRef: React.RefObject<(() => void) | null>;
 }
@@ -115,6 +119,9 @@ function TranscriptImpl({
   agentsError,
   sandboxLaunching,
   terminalFirst,
+  conversationId,
+  scrollToBottomOnSessionOpen,
+  openedConversationIdRef,
   spacerMeasureRef,
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
@@ -325,6 +332,11 @@ function TranscriptImpl({
             )}
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
+            <ScrollToBottomOnSessionOpen
+              conversationId={conversationId}
+              enabled={scrollToBottomOnSessionOpen}
+              openedConversationIdRef={openedConversationIdRef}
+            />
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <KeepBottomOnViewportResize />
             <ConversationScrollRefBridge onScroller={setScroller} />

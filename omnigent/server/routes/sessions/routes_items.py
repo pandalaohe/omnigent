@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from fastapi import (
     APIRouter,
@@ -10,6 +11,9 @@ from fastapi import (
     Request,
 )
 
+from omnigent.entities import Conversation
+from omnigent.entities.pagination import PagedList
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -20,6 +24,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
 )
@@ -31,18 +36,108 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
+    _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
+from omnigent.server.routes._sessions.helpers import _get_runner_client
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
+)
+from omnigent.server.routes._sessions.subagent_reconciliation import (
+    reconcile_native_subagents,
 )
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SessionItemsWindow,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+_subagent_reconcile_locks: dict[str, asyncio.Lock] = {}
+_native_lazy_reconcile_after: dict[str, float] = {}
+_NATIVE_LAZY_RECONCILE_INTERVAL_S = 300.0
+_NATIVE_LAZY_RECONCILE_RETRY_S = 30.0
+
+
+async def _lazy_reconcile_native_children(
+    session_id: str,
+    parent: Conversation,
+    page: PagedList[Conversation],
+    limit: int,
+    order: str,
+    conversation_store: ConversationStore,
+) -> PagedList[Conversation]:
+    """Best-effort repair active native children on an unfiltered owner read."""
+    has_active_native_child = any(
+        child.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        == _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
+        and child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) != "true"
+        and child.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+        not in {"completed", "failed", "stopped", "killed"}
+        and child.live_status in {"running", "waiting"}
+        for child in page.data
+    )
+    if not has_active_native_child or time.monotonic() < _native_lazy_reconcile_after.get(
+        session_id, 0.0
+    ):
+        return page
+
+    _native_lazy_reconcile_after[session_id] = time.monotonic() + _NATIVE_LAZY_RECONCILE_INTERVAL_S
+    if len(_native_lazy_reconcile_after) > 2048:
+        _native_lazy_reconcile_after.pop(next(iter(_native_lazy_reconcile_after)))
+    lock = _subagent_reconcile_locks.setdefault(session_id, asyncio.Lock())
+    if lock.locked():
+        return page
+    try:
+        async with lock:
+            runner_client = await _get_runner_client(
+                session_id,
+                get_server_runner_router(),
+                conversation=parent,
+            )
+            if runner_client is None:
+                _native_lazy_reconcile_after[session_id] = (
+                    time.monotonic() + _NATIVE_LAZY_RECONCILE_RETRY_S
+                )
+                return page
+            result = await reconcile_native_subagents(
+                parent_session_id=session_id,
+                parent=parent,
+                children=page.data,
+                conversation_store=conversation_store,
+                runner_client=runner_client,
+            )
+            if not result["corrected"]:
+                return page
+            return await asyncio.to_thread(
+                conversation_store.list_conversations,
+                limit=limit,
+                kind="sub_agent",
+                parent_conversation_id=session_id,
+                order=order,
+                sort_by="created_at",
+            )
+    except Exception:
+        _native_lazy_reconcile_after[session_id] = (
+            time.monotonic() + _NATIVE_LAZY_RECONCILE_RETRY_S
+        )
+        _logger.warning(
+            "Lazy native sub-agent reconciliation failed for %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return page
+    finally:
+        if not lock.locked() and _subagent_reconcile_locks.get(session_id) is lock:
+            _subagent_reconcile_locks.pop(session_id, None)
 
 
 def register_items_routes(
@@ -109,6 +204,204 @@ def register_items_routes(
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/child_sessions/reconcile",
+        response_model=None,
+    )
+    async def reconcile_child_sessions(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, object]:
+        """Verify and repair stale direct native sub-agent status metadata.
+
+        The action is owner-only and intentionally accepts no child ids. It
+        freezes every direct child, asks the already-bound runner for a
+        read-only parent-transcript verdict, then applies each reliable
+        terminal result through a store compare-and-set. It never launches or
+        resumes a runner and never writes conversation items or parent inboxes.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+        parent = access.conversation
+        if parent is None:
+            parent = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if parent is None:
+            raise _session_not_found()
+        if (
+            parent.parent_conversation_id is not None
+            or parent.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+        ):
+            raise OmnigentError(
+                "Sub-agent status reconciliation is available only on a root Claude Code session.",
+                code=ErrorCode.CONFLICT,
+            )
+
+        page = await asyncio.to_thread(
+            conversation_store.list_conversations,
+            limit=1000,
+            kind="sub_agent",
+            parent_conversation_id=session_id,
+            order="desc",
+            sort_by="created_at",
+            include_archived=False,
+        )
+        if page.has_more:
+            raise OmnigentError(
+                "This session has more than 1000 direct children; no state was changed.",
+                code=ErrorCode.CONFLICT,
+            )
+        # Re-check ownership on every selected child. Child authorization
+        # normally delegates to this parent, but retaining the per-resource
+        # check keeps a malformed hierarchy from broadening this mutation.
+        for child in page.data:
+            await _require_access_and_level(
+                user_id,
+                child.id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+            )
+
+        lock = _subagent_reconcile_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            raise OmnigentError(
+                "Sub-agent status is already being checked for this session.",
+                code=ErrorCode.CONFLICT,
+            )
+        try:
+            async with lock:
+                runner_client = await _get_runner_client(
+                    session_id,
+                    get_server_runner_router(),
+                    conversation=parent,
+                )
+                if runner_client is None:
+                    raise OmnigentError(
+                        "The Host is offline or has no active runner for this session; reconnect it and try again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                return await reconcile_native_subagents(
+                    parent_session_id=session_id,
+                    parent=parent,
+                    children=page.data,
+                    conversation_store=conversation_store,
+                    runner_client=runner_client,
+                )
+        finally:
+            if not lock.locked() and _subagent_reconcile_locks.get(session_id) is lock:
+                _subagent_reconcile_locks.pop(session_id, None)
+
+    @router.get(
+        "/sessions/{session_id}/items/search",
+        response_model=None,
+        responses={200: {"model": PaginatedList}},
+    )
+    async def search_session_items(
+        request: Request,
+        session_id: str,
+        search_query: str = Query(min_length=1, max_length=500),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> PaginatedList:
+        """Search committed items inside one authorized session."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+
+        matches = await asyncio.to_thread(
+            conversation_store.search_visible_items_literal,
+            session_id,
+            search_query,
+            limit=limit + 1,
+        )
+        has_more = len(matches) > limit
+        visible = matches[:limit]
+        return PaginatedList(
+            data=[item.to_api_dict() for item in visible],
+            first_id=visible[0].id if visible else None,
+            last_id=visible[-1].id if visible else None,
+            has_more=has_more,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/items/window",
+        response_model=SessionItemsWindow,
+    )
+    async def get_session_items_window(
+        request: Request,
+        session_id: str,
+        anchor_id: str = Query(min_length=1),
+        before: int = Query(default=30, ge=1, le=100),
+        after: int = Query(default=30, ge=1, le=100),
+    ) -> SessionItemsWindow:
+        """Return a bounded chronological window around one committed item."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+
+        older_page, newer_page = await asyncio.gather(
+            asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                limit=before,
+                after=anchor_id,
+                order="desc",
+            ),
+            asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                limit=after,
+                after=anchor_id,
+                order="asc",
+            ),
+        )
+
+        # list_items cursors are exclusive. Resolve the anchor through the
+        # closest newer item, or through the newest item when the anchor is last.
+        if newer_page.data:
+            anchor_page = await asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                limit=1,
+                after=newer_page.data[0].id,
+                order="desc",
+            )
+        else:
+            anchor_page = await asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                limit=1,
+                order="desc",
+            )
+        if not anchor_page.data or anchor_page.data[0].id != anchor_id:
+            raise OmnigentError("Session item not found", code=ErrorCode.NOT_FOUND)
+
+        items = [*reversed(older_page.data), anchor_page.data[0], *newer_page.data]
+        return SessionItemsWindow(
+            data=[item.to_api_dict() for item in items],
+            anchor_id=anchor_id,
+            first_id=items[0].id if items else None,
+            last_id=items[-1].id if items else None,
+            has_older=older_page.has_more,
+            has_newer=newer_page.has_more,
         )
 
     # ── GET /sessions/{session_id}/child_sessions ────────────────
@@ -190,6 +483,20 @@ def register_items_routes(
             sort_by="created_at",
             title=title_filter,
         )
+        if (
+            (access.level is None or access.level >= LEVEL_OWNER)
+            and parent.parent_conversation_id is None
+            and parent.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+            and after is None
+            and before is None
+            and tool is None
+            and session_name is None
+            and not page.has_more
+        ):
+            page = await _lazy_reconcile_native_children(
+                session_id, parent, page, limit, order, conversation_store
+            )
         data = await _child_session_summaries_from_conversations(
             page.data,
             session_id,

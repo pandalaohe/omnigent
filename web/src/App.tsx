@@ -65,6 +65,10 @@ const UsagePage = withPageView(
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+const ArchiveSessionPage = withPageView(
+  "archive_reference",
+  lazy(() => import("@/pages/ArchiveSessionPage").then((m) => ({ default: m.ArchiveSessionPage }))),
+);
 
 // A release-feature route stays registered so a hard load never falls through
 // to the catch-all "Page not found" while the /v1/info probe is in flight; the
@@ -168,6 +172,7 @@ function App({ basename }: AppProps = {}) {
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route path={`${prefix}/archive/:sessionId`} element={<ArchiveSessionPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route
             path={`${prefix}/canvas`}

@@ -20,15 +20,22 @@ import { useEffect } from "react";
 import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import type { ElicitationBlock } from "@/lib/blocks";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+} from "@/lib/keyboardShortcutPreferences";
 import { useChatStore } from "@/store/chatStore";
 
 export function useApproveHotkey(isMac = isMacPlatform()): void {
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Platform command modifier, not Alt/Shift (mirrors the session-switch guard):
-      // only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
-      if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
-      if (e.key !== "Enter") return;
+      if (hasCustomShortcutBindings("approvePrompt")) {
+        if (!eventMatchesShortcutAction(e, "approvePrompt")) return;
+      } else {
+        // Only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
+        if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
+        if (e.key !== "Enter") return;
+      }
 
       const { blocks, submitApproval } = useChatStore.getState();
       // Newest-first: accept the most recent still-pending prompt that takes a

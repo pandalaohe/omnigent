@@ -17,6 +17,12 @@ import pytest
 import tomllib
 import yaml
 
+from omnigent import (
+    codex_native,
+    codex_native_app_server,
+    codex_native_bridge,
+    codex_native_forwarder,
+)
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
@@ -49,6 +55,91 @@ def _write_codex_auth(path: Path, payload: object) -> None:
     """Write a test Codex auth.json payload."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("active", "active"),
+        ("paused", "paused"),
+        ("blocked", "paused"),
+        ("usageLimited", "paused"),
+        ("budgetLimited", "paused"),
+        ("complete", None),
+    ],
+)
+def test_normalized_codex_goal_state(status: str, expected: str | None) -> None:
+    observed, state = codex_native_forwarder._normalized_codex_goal_state({"status": status})
+    assert observed is True
+    assert state == expected
+
+
+@pytest.mark.parametrize("goal", [{}, {"status": []}, {"status": "future"}, False])
+def test_normalized_codex_goal_state_ignores_unknown(goal: object) -> None:
+    assert codex_native_forwarder._normalized_codex_goal_state(goal) == (False, None)
+
+
+def test_forwarder_posts_goal_notifications_and_dedupes(tmp_path: Path) -> None:
+    posted: list[dict[str, Any]] = []
+    forwarder_state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_123")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            for event in [
+                {"method": "thread/goal/updated", "params": {"threadId": "thread_123"}},
+                {
+                    "method": "thread/goal/updated",
+                    "params": {"threadId": "thread_123", "goal": {"status": "active"}},
+                },
+                {
+                    "method": "thread/goal/updated",
+                    "params": {"threadId": "thread_123", "goal": {"status": "active"}},
+                },
+                {
+                    "method": "thread/goal/updated",
+                    "params": {"threadId": "thread_123", "goal": {"status": "blocked"}},
+                },
+                {
+                    "method": "thread/goal/cleared",
+                    "params": {"threadId": "thread_123"},
+                },
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    expected_thread_id="thread_123",
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+    assert posted == [
+        {"type": "external_goal_state", "data": {"state": "active"}},
+        {"type": "external_goal_state", "data": {"state": "paused"}},
+        {"type": "external_goal_state", "data": {"state": None}},
+    ]
+
+
+def test_forwarder_parent_rotation_resets_goal_dedupe() -> None:
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_old",
+        posted_goal_state="active",
+        posted_goal_state_known=True,
+    )
+    forwarder_state.note_parent_rotation("conv_new")
+    assert forwarder_state.parent_session_id == "conv_new"
+    assert forwarder_state.posted_goal_state is None
+    assert forwarder_state.posted_goal_state_known is False
 
 
 def _point_codex_auth_check_at(
@@ -1770,7 +1861,8 @@ def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
     asyncio.run(run())
 
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
     ]
     assert fake_client.closed
 
@@ -1818,7 +1910,8 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
 
     assert fake_client.connected
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
     ]
     assert fake_client.closed
 
@@ -7799,6 +7892,7 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
 
         :returns: None.
         """
+        assert _kwargs["headers"] == {}
         order.append("attach")
 
     monkeypatch.setattr(chat_mod, "_remote_headers", lambda *_args, **_kwargs: {})
@@ -9348,6 +9442,120 @@ def test_session_usage_data_uses_effective_model_context_window() -> None:
     data = codex_native_forwarder._session_usage_data_from_params(params)
     assert data is not None
     assert data["context_window"] == 258_400
+
+
+def test_session_usage_data_includes_resolved_auto_compact_limit(tmp_path: Path) -> None:
+    """The usage report carries the current host/model compact point."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = bridge_dir / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    codex_native_bridge.write_codex_context_catalog(
+        bridge_dir,
+        {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "max_context_window": 872_000,
+                    "auto_compact_token_limit": 244_800,
+                    "effective_context_window_percent": 95,
+                }
+            ]
+        },
+    )
+    params = {
+        "tokenUsage": {
+            "modelContextWindow": 258_400,
+            "total": {"inputTokens": 100_000, "outputTokens": 10_000},
+        }
+    }
+
+    data = codex_native_forwarder._session_usage_data_from_params(
+        params,
+        bridge_dir=bridge_dir,
+        model="gpt-5.6-sol",
+    )
+
+    assert data is not None
+    assert data["auto_compact_token_limit"] == 244_800
+
+
+def test_session_usage_data_does_not_invent_compact_limit_from_percentage(
+    tmp_path: Path,
+) -> None:
+    """A catalog percentage alone is context sizing, not a Compact policy."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = bridge_dir / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    codex_native_bridge.write_codex_context_catalog(
+        bridge_dir,
+        {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "auto_compact_token_limit": None,
+                    "effective_context_window_percent": 95,
+                }
+            ]
+        },
+    )
+
+    data = codex_native_forwarder._session_usage_data_from_params(
+        {"tokenUsage": {"modelContextWindow": 258_400, "total": {"inputTokens": 1}}},
+        bridge_dir=bridge_dir,
+        model="gpt-5.6-sol",
+    )
+
+    assert data is not None
+    assert data["auto_compact_token_limit"] is None
+
+
+def test_session_usage_data_omits_compact_limit_for_body_after_prefix_scope(
+    tmp_path: Path,
+) -> None:
+    """A prefix-relative limit cannot be truthfully drawn on the total-context ring."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = bridge_dir / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-5.6-sol"\nmodel_auto_compact_token_limit_scope = "body_after_prefix"\n',
+        encoding="utf-8",
+    )
+    codex_native_bridge.write_codex_context_catalog(
+        bridge_dir,
+        {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "max_context_window": 872_000,
+                    "auto_compact_token_limit": None,
+                    "effective_context_window_percent": 95,
+                }
+            ]
+        },
+    )
+    params = {
+        "tokenUsage": {
+            "modelContextWindow": 258_400,
+            "total": {"inputTokens": 100_000, "outputTokens": 10_000},
+        }
+    }
+
+    data = codex_native_forwarder._session_usage_data_from_params(
+        params,
+        bridge_dir=bridge_dir,
+        model="gpt-5.6-sol",
+    )
+
+    assert data is not None
+    assert data["auto_compact_token_limit"] is None
 
 
 def test_session_usage_data_prefers_effective_context_window_over_legacy() -> None:

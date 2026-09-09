@@ -52,16 +52,10 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 // form now that typed ~-paths resolve directly.
 vi.mock("./WorkspacePicker", async (importActual) => ({
   ...(await importActual<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
-    <div data-testid="mock-workspace-picker">
-      <button
-        type="button"
-        data-testid="mock-pick-workspace"
-        onClick={() => onSelect("/Users/a/git/omnigent")}
-      >
-        pick
-      </button>
-    </div>
+  HostWorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
+    <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
+      pick
+    </button>
   ),
 }));
 

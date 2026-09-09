@@ -33,23 +33,11 @@ vi.mock("./WorkspacePathField", () => ({
     />
   ),
 }));
-// Keep the real navigability helpers but stub the picker itself — its
-// filesystem fetch isn't under test. Its "Select" button commits an absolute
-// path (onSelect), the only way browsing feeds the form now that typed
-// ~-paths resolve directly.
-vi.mock("./WorkspacePicker", async (importActual) => ({
-  ...(await importActual<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
-    <div data-testid="mock-workspace-picker">
-      <button
-        type="button"
-        data-testid="mock-pick-workspace"
-        onClick={() => onSelect("/Users/alice/git/omnigent")}
-      >
-        pick
-      </button>
-    </div>
-  ),
+vi.mock("./WorkspacePicker", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspacePickerModule>()),
+  HostWorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
+  homeFromEntries: () => null,
+  isNavigablePath: () => false,
 }));
 vi.mock("./HostLabel", () => ({
   HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,

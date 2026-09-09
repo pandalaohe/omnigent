@@ -13,6 +13,7 @@
 import type { ConversationItem } from "./conversationItems";
 import type { McpServerStartup } from "./events";
 import type { MessageContentBlock } from "./blocks";
+import type { ProviderUsageLimitsSnapshot } from "./providerUsageLimits";
 
 /** Reference to a conversation, as returned on response objects. */
 export interface ConversationRef {
@@ -262,6 +263,7 @@ export interface BackgroundTaskInfo {
 export interface Session {
   id: string;
   agentId: string;
+  agentTemplateId?: string | null;
   /**
    * Human-readable name of the bound agent, e.g. ``"research-agent"``.
    * Populated from ``SessionResponse.agent_name`` on the wire. ``null``
@@ -302,6 +304,12 @@ export interface Session {
    */
   backgroundTasks?: BackgroundTaskInfo[];
   createdAt: number;
+  /** Last persisted session activity timestamp. */
+  updatedAt?: number;
+  /** Stable timestamp of the current transition into the archive. */
+  archivedAt?: number | null;
+  /** Whether the snapshot currently belongs to the archive. */
+  archived?: boolean;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string
@@ -378,6 +386,10 @@ export interface Session {
   shareWorkspaceFiles?: boolean;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
+  /** Auto-compaction point comparable with the context ring's token count. */
+  autoCompactTokenLimit?: number | null;
+  /** Sanitized account allowance windows reported by the active harness. */
+  providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
   /**
    * Input token count from the most recently completed task's usage.
    * ``null`` when no task has completed yet. Lets the context-ring

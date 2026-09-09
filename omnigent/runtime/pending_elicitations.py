@@ -214,6 +214,28 @@ def resolve(conversation_id: str, elicitation_id: str) -> None:
         _notify_count_hook(conversation_id, count)
 
 
+def discard_stale(conversation_id: str, expected_event: dict[str, Any]) -> bool:
+    """Discard an exact stale generation without a verdict or parent wake."""
+    elicitation_id = expected_event.get("elicitation_id")
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return False
+    with _lock:
+        ids = _pending.get(conversation_id)
+        if ids is None or ids.get(elicitation_id) != expected_event:
+            return False
+        ids.pop(elicitation_id)
+        count = len(ids)
+        if not ids:
+            _pending.pop(conversation_id, None)
+    # Disarm notifier bookkeeping without fabricating a user verdict.
+    _notify_observer(
+        conversation_id,
+        {"type": "response.elicitation_stale", "elicitation_id": elicitation_id},
+    )
+    _notify_count_hook(conversation_id, count)
+    return True
+
+
 def count_for(conversation_id: str) -> int:
     """
     Return the number of outstanding elicitations for one session.

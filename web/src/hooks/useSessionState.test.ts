@@ -3,8 +3,10 @@ import { getSessionState } from "./useSessionState";
 import type { Conversation } from "@/hooks/useConversations";
 
 function conv(
-  partial: Partial<Pick<Conversation, "status" | "pending_elicitations_count">>,
-): Pick<Conversation, "status" | "pending_elicitations_count"> {
+  partial: Partial<
+    Pick<Conversation, "status" | "foreground_status" | "pending_elicitations_count">
+  >,
+): Pick<Conversation, "status" | "foreground_status" | "pending_elicitations_count"> {
   return partial;
 }
 
@@ -26,6 +28,16 @@ describe("getSessionState — priority composition", () => {
 
   it("returns running for conversation.status = running", () => {
     expect(getSessionState(conv({ status: "running" }))).toEqual({
+      kind: "running",
+    });
+  });
+
+  it("does not show the foreground spinner for child-only background activity", () => {
+    expect(getSessionState(conv({ status: "running", foreground_status: "idle" }))).toBeNull();
+  });
+
+  it("keeps the foreground spinner when the main turn and background both run", () => {
+    expect(getSessionState(conv({ status: "running", foreground_status: "running" }))).toEqual({
       kind: "running",
     });
   });

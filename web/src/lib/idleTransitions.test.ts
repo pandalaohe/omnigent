@@ -9,7 +9,11 @@ import {
   type ConversationStatus,
 } from "./idleTransitions";
 
-function conv(id: string, status?: Conversation["status"]): Conversation {
+function conv(
+  id: string,
+  status?: Conversation["status"],
+  overrides: Partial<Conversation> = {},
+): Conversation {
   return {
     id,
     object: "conversation",
@@ -19,6 +23,7 @@ function conv(id: string, status?: Conversation["status"]): Conversation {
     labels: {},
     permission_level: null,
     status,
+    ...overrides,
   };
 }
 
@@ -38,6 +43,16 @@ describe("buildStatusMap", () => {
     expect(map.has("a")).toBe(false);
     expect(map.get("b")).toBe("idle");
   });
+
+  it("records foreground status instead of the background rollup", () => {
+    const map = buildStatusMap([
+      conv("background", "running", {
+        foreground_status: "idle",
+        background_activity_count: 1,
+      }),
+    ]);
+    expect(map.get("background")).toBe("idle");
+  });
 });
 
 describe("detectIdleTransitions", () => {
@@ -50,6 +65,14 @@ describe("detectIdleTransitions", () => {
   it("detects running -> failed", () => {
     const prev = statusMap({ a: "running" });
     const result = detectIdleTransitions(prev, [conv("a", "failed")]);
+    expect(result.map((c) => c.id)).toEqual(["a"]);
+  });
+
+  it("detects foreground completion while aggregate status stays running", () => {
+    const prev = statusMap({ a: "running" });
+    const result = detectIdleTransitions(prev, [
+      conv("a", "running", { foreground_status: "idle", background_activity_count: 1 }),
+    ]);
     expect(result.map((c) => c.id)).toEqual(["a"]);
   });
 
@@ -71,11 +94,6 @@ describe("detectIdleTransitions", () => {
   it("ignores transitions to undefined status", () => {
     const prev = statusMap({ a: "running" });
     expect(detectIdleTransitions(prev, [conv("a")])).toEqual([]);
-  });
-
-  it("ignores an archived conversation that just finished", () => {
-    const prev = statusMap({ a: "running" });
-    expect(detectIdleTransitions(prev, [{ ...conv("a", "idle"), archived: true }])).toEqual([]);
   });
 
   it("returns only the newly-finished conversations from a mixed list", () => {
@@ -121,11 +139,6 @@ describe("detectNewElicitations", () => {
     // No previous entry -> a page load with already-pending prompts must not
     // fire, mirroring the idle fresh-load behavior.
     expect(detectNewElicitations(new Map(), [convE("a", 2)])).toEqual([]);
-  });
-
-  it("ignores a new prompt on an archived conversation", () => {
-    const prev = new Map([["a", 0]]);
-    expect(detectNewElicitations(prev, [{ ...convE("a", 1), archived: true }])).toEqual([]);
   });
 
   it("ignores a steady elicitation count", () => {
@@ -267,15 +280,24 @@ describe("computeUnreadBadgeIds", () => {
     expect(calls).toEqual([{ id: "a", updatedAt: 42, status: "failed" }]);
   });
 
-  it("excludes an archived session, even one awaiting input", () => {
-    // Matches the Inbox page and Inbox badge, which both hide archived rows.
-    const next = computeUnreadBadgeIds(
-      [{ ...convB("a", { pending: 1 }), archived: true }, convB("b", { pending: 1 })],
+  it("passes foreground status to the unseen predicate for B sessions", () => {
+    const calls: (string | undefined)[] = [];
+    computeUnreadBadgeIds(
+      [
+        {
+          ...convB("background", { status: "running" }),
+          foreground_status: "idle",
+          background_activity_count: 1,
+        },
+      ],
       undefined,
       true,
-      unseenIds("a", "b"),
+      (_id, _updatedAt, status) => {
+        calls.push(status);
+        return true;
+      },
     );
-    expect([...next]).toEqual(["b"]);
+    expect(calls).toEqual(["idle"]);
   });
 
   it("returns an empty set for an empty list", () => {

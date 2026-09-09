@@ -10,6 +10,7 @@ const mobileMenu = {
   terminalFirst: false,
   executionLogsOpen: false,
   filesPanelOpen: false,
+  archivePanelOpen: false,
   subagentsPanelOpen: false,
   shellsPanelOpen: false,
   hideTerminalsTab: false,
@@ -21,6 +22,7 @@ const mobileMenu = {
   agentCount: 1,
   onOpenFiles: () => undefined,
   onOpenChanges: () => undefined,
+  onOpenArchive: () => undefined,
   onOpenShells: () => undefined,
   onOpenSubagents: () => undefined,
   onOpenMainExecutionLog: () => undefined,
@@ -56,10 +58,18 @@ const meta = {
     mobileMenu,
   },
   decorators: [
-    (Story) => {
+    (Story, context) => {
+      const previewWidth = (context.parameters.previewWidth as number | undefined) ?? 720;
+      const nativeHeader = context.parameters.nativeMobileHeader as
+        "server" | "conversation-title" | undefined;
       return (
         <StoryQueryRouter route="/c/conversation-story">
-          <div className="relative h-20 w-[720px] overflow-visible rounded-xl border bg-background">
+          <div
+            className="app-shell relative h-20 max-w-[calc(100vw-3rem)] overflow-visible rounded-xl border bg-background"
+            style={{ width: previewWidth }}
+            data-ios-native={nativeHeader ? "true" : undefined}
+            data-native-mobile-header={nativeHeader}
+          >
             <Story />
           </div>
         </StoryQueryRouter>
@@ -116,5 +126,43 @@ export const ChildSessionShareDisabled: Story = {
     shareDisabledReason: "Sharing requires a deployed server",
     hasRailContent: true,
     rightPanelOpen: true,
+  },
+};
+
+const LONG_MOBILE_TITLE =
+  "Investigate why unread session polling skips the latest production conversation";
+
+export const MobileWebLongTitle: Story = {
+  parameters: { previewWidth: 342 },
+  args: {
+    sidebarOpen: false,
+    isChildSession: false,
+    conversationId: "conversation-mobile-web",
+    conversationTitle: LONG_MOBILE_TITLE,
+    projectName: null,
+  },
+};
+
+export const NativeIOSDefaultServerHeader: Story = {
+  parameters: { previewWidth: 342, nativeMobileHeader: "server" },
+  args: {
+    sidebarOpen: false,
+    isChildSession: false,
+    conversationId: "conversation-native-server",
+    conversationTitle: LONG_MOBILE_TITLE,
+    projectName: null,
+  },
+};
+
+export const NativeIOSTitleHeader: Story = {
+  parameters: { previewWidth: 342, nativeMobileHeader: "conversation-title" },
+  args: {
+    sidebarOpen: false,
+    isChildSession: false,
+    conversationId: "conversation-native-title",
+    conversationTitle: LONG_MOBILE_TITLE,
+    // Exercises the mobile title-mode rule without letting the desktop-only
+    // folder segment consume space in the native header.
+    projectName: "Omnigent",
   },
 };

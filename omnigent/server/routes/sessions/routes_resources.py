@@ -64,6 +64,7 @@ from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
+    _session_terminal_pending_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -1096,6 +1097,33 @@ def register_resources_routes(
             params=forwarded or None,
         )
         await _annotate_direct_attach(page, session_id, request)
+        data = page.get("data")
+        has_claude_main = isinstance(data, list) and any(
+            isinstance(resource, dict)
+            and isinstance(resource.get("metadata"), dict)
+            and resource["metadata"].get("terminal_name") == "claude"
+            and resource["metadata"].get("session_key") == "main"
+            for resource in data
+        )
+        if (
+            isinstance(data, list)
+            and not has_claude_main
+            and page.get("has_more") is False
+            and "after" not in forwarded
+            and "before" not in forwarded
+            and not _session_terminal_pending_cache.get(session_id, False)
+            and await _caller_owns_session(session_id, request)
+        ):
+            from omnigent.server.routes._sessions.subagent_reconciliation import (
+                invalidate_native_subagents_for_missing_parent_terminal,
+            )
+
+            await invalidate_native_subagents_for_missing_parent_terminal(
+                parent_session_id=session_id,
+                parent=conv,
+                conversation_store=conversation_store,
+                observed_runner_id=conv.runner_id,
+            )
         return page
 
     async def _caller_owns_session(session_id: str, request: Request) -> bool:

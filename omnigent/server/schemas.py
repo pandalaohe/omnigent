@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     SerializerFunctionWrapHandler,
     Strict,
     field_validator,
@@ -30,6 +31,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.server.user_preferences_store import validate_preferences_envelope
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -58,6 +60,58 @@ class PaginatedList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+
+
+class SessionItemsWindow(BaseModel):
+    """A bounded chronological item window centered on one stable item id."""
+
+    object: Literal["session.items.window"] = "session.items.window"
+    data: list[Any] = Field(default_factory=list)
+    anchor_id: str
+    first_id: str | None = None
+    last_id: str | None = None
+    has_older: bool = False
+    has_newer: bool = False
+
+
+UserPreferenceNamespace = Literal[
+    "keyboard_shortcuts",
+    "mobile_assistant",
+    "session_navigation",
+    "context_indicator",
+    "usage_context",
+    "agent_badges",
+]
+
+
+class UserPreferencesEnvelope(BaseModel):
+    """Versioned, allowlisted cross-device preference payload."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: Literal[1]
+    settings: dict[UserPreferenceNamespace, JsonValue]
+
+    @model_validator(mode="after")
+    def _validate_persisted_contract(self) -> Self:
+        validate_preferences_envelope(self.model_dump(mode="python"))
+        return self
+
+
+class UserPreferenceNamespacePatchRequest(BaseModel):
+    """Atomic partial update for one preference namespace."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    value: JsonValue | None
+
+
+class CurrentUserResponse(BaseModel):
+    """Authenticated identity and optional synchronized preferences."""
+
+    user_id: str | None
+    is_admin: bool
+    preferences: UserPreferencesEnvelope | None = None
 
 
 # ── Agents ──────────────────────────────────────────────────────
@@ -832,6 +886,9 @@ class ChildSessionSummary(BaseModel):
     current_task_id: str | None = None
     current_task_status: str | None = None
     busy: bool = False
+    activity_unverified: bool = False
+    # Connectivity observation only; does not change task status, busy or B.
+    native_activity_unverified: bool = False
     labels: dict[str, str] = Field(default_factory=dict)
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None
@@ -1830,11 +1887,11 @@ class BackgroundTaskInfo(BaseModel):
     :param command: Command the shell is running, e.g. ``"sleep 120"``.
     """
 
-    id: str | None = None
-    type: str | None = None
-    status: str | None = None
-    description: str | None = None
-    command: str | None = None
+    id: str | None = Field(default=None, max_length=256)
+    type: str | None = Field(default=None, max_length=128)
+    status: str | None = Field(default=None, max_length=128)
+    description: str | None = Field(default=None, max_length=2048)
+    command: str | None = Field(default=None, max_length=8192)
 
 
 class SessionResponse(BaseModel):
@@ -2046,12 +2103,9 @@ class SessionResponse(BaseModel):
         sessions are hidden from the default sidebar listing and
         surface only behind the "Show archived" toggle. ``False``
         for normal sessions. Toggled via ``PATCH /v1/sessions/{id}``.
-    :param todos: Current Claude Code todo list items for
-        ``omnigent claude`` sessions, as raw dicts from Claude's
-        todo JSON file. Each dict has ``content``, ``status``,
-        and ``activeForm`` keys. Empty list for non-claude-native
-        sessions or when no todos have been reported yet. Sourced
-        from the Omnigent server's in-memory ``_session_todos_cache``.
+    :param todos: Current native-harness plan items. Each dict has
+        ``content``, ``status``, and ``activeForm`` keys. Empty when no plan
+        has been reported. Persisted for snapshot recovery and live-cached.
     :param skills: Skills the bound agent has access to — the
         merged result of the agent spec's bundled ``skills``
         and the host-scope skills discovered along the agent
@@ -2099,12 +2153,14 @@ class SessionResponse(BaseModel):
 
     id: str
     agent_id: str
+    agent_template_id: str | None = None
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
     updated_at: int | None = None
+    archived_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -2126,6 +2182,11 @@ class SessionResponse(BaseModel):
     subagent_routing_override: str | None = None
     share_workspace_files: bool = False
     context_window: int | None = None
+    # Native host/model runtime threshold, omitted when it cannot be mapped
+    # truthfully to total context occupancy.
+    auto_compact_token_limit: int | None = None
+    # Sanitized account allowance windows reported by the active harness.
+    provider_usage_limits: dict[str, Any] | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
@@ -2264,6 +2325,9 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param archive_locked: Protect an archived session from bulk deletion.
+        ``True`` locks it, ``False`` unlocks it, and ``None`` leaves the
+        current lock unchanged. Owner-only.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2288,6 +2352,7 @@ class UpdateSessionRequest(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    archive_locked: bool | None = None
     project_id: str | None = None
     silent: bool = False
 
@@ -2546,6 +2611,15 @@ class SessionSwitchAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionSearchMatch(BaseModel):
+    """Stable archive-library locator for one content-search hit."""
+
+    item_id: str
+    response_id: str
+    created_at: int
+    snippet: str
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -2559,6 +2633,11 @@ class SessionListItem(BaseModel):
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
     :param status: Derived session lifecycle status.
+    :param foreground_status: Status of this session's own turn, excluding
+        child-session rollup. This distinguishes a busy main turn from
+        background-only activity while preserving ``status`` for compatibility.
+    :param background_activity_count: Number of active direct sub-agents plus
+        background shells owned by this session. ``0`` means none are known.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
     :param title: Optional human-readable title.
@@ -2650,10 +2729,15 @@ class SessionListItem(BaseModel):
 
     id: str
     agent_id: str
+    agent_template_id: str | None = None
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    foreground_status: Literal["idle", "running", "failed"]
+    background_activity_count: int = Field(ge=0)
+    goal_state: Literal["active", "paused"] | None = None
     created_at: int
     updated_at: int
+    archived_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -2673,6 +2757,8 @@ class SessionListItem(BaseModel):
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
     search_snippet: str | None = None
+    search_match: SessionSearchMatch | None = None
+    search_match_count: int = Field(default=0, ge=0)
     parent_session_id: str | None = None
     # First-class project this session is filed under, or ``None`` when
     # unfiled. Lets the sidebar group sessions by project without a follow-up
@@ -2688,6 +2774,14 @@ class SessionList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+
+
+class ArchivedSessionFacetsResponse(BaseModel):
+    """Compact filter values for ``GET /v1/sessions/archived-facets``."""
+
+    projects: list[str] = Field(default_factory=list)
+    host_ids: list[str] = Field(default_factory=list)
+    agent_names: list[str] = Field(default_factory=list)
 
 
 class ChildSessionList(BaseModel):
@@ -3023,6 +3117,8 @@ class SessionUsageEvent(_SSEEventBase):
     conversation_id: str
     context_tokens: int | None = None
     context_window: int | None = None
+    auto_compact_token_limit: int | None = None
+    provider_usage_limits: dict[str, Any] | None = None
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
 
@@ -3225,9 +3321,8 @@ class SessionTodosEvent(_SSEEventBase):
         keys, e.g. ``[{"content": "Fix the bug", "status":
         "in_progress", "activeForm": "Fixing the bug"}]``.
 
-    Category: **transient** (SSE-only). On reconnect, clients seed
-    the panel from the session snapshot's ``todos`` field, which is
-    populated by ``_session_todos_cache`` at snapshot build time.
+    Category: **transient** (SSE-only). On reconnect, clients seed the panel
+    from the persisted session snapshot's ``todos`` field.
     """
 
     type: Literal["session.todos"]

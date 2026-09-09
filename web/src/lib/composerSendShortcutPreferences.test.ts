@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
   DEFAULT_SUBMIT_WITH_MOD_ENTER,
+  composerNewLineDisposition,
   isComposerSendKey,
   parseSubmitWithModEnter,
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
 } from "./composerSendShortcutPreferences";
+import { writeShortcutPreference } from "./keyboardShortcutPreferences";
 
 afterEach(() => {
   localStorage.clear();
@@ -65,5 +67,34 @@ describe("isComposerSendKey", () => {
       false,
     );
     expect(isComposerSendKey({ key: "Enter", metaKey: true }, true, true)).toBe(false);
+  });
+});
+
+describe("composerNewLineDisposition", () => {
+  it("resolves both legacy newline modes", () => {
+    expect(composerNewLineDisposition({ key: "Enter", shiftKey: true }, false, false)).toBe(
+      "insert",
+    );
+    expect(composerNewLineDisposition({ key: "Enter" }, true, false)).toBe("insert");
+    expect(composerNewLineDisposition({ key: "Enter" }, false, false)).toBe("none");
+  });
+
+  it("blocks the browser-owned default when newline is disabled", () => {
+    writeShortcutPreference("newLine", { enabled: false });
+
+    expect(composerNewLineDisposition({ key: "Enter", shiftKey: true }, false, false)).toBe(
+      "block",
+    );
+  });
+
+  it("matches a custom newline chord while preserving the disabled state", () => {
+    writeShortcutPreference("newLine", {
+      common: [{ code: "KeyL", modifiers: ["alt"] }],
+      enabled: false,
+    });
+
+    expect(composerNewLineDisposition({ key: "l", code: "KeyL", altKey: true }, false, false)).toBe(
+      "block",
+    );
   });
 });

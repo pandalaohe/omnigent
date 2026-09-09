@@ -53,13 +53,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib import request
 
-from omnigent._platform import is_wsl, stable_user_id
-from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
-from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
-from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
-from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
-from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent import model_metadata as _model_metadata
+from omnigent._platform import stable_user_id
+from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
+from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.claude_native_status import CONTEXT_RAW_FILE
+from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
 if TYPE_CHECKING:
     import httpx
@@ -558,6 +558,22 @@ class ClaudeTranscriptItem:
 
 
 @dataclass(frozen=True)
+class ClaudeTaskNotification:
+    """Structured completion notification written into Claude's transcript.
+
+    Claude records background Task/Agent completion as a synthetic ``user``
+    message. Only fields needed for correlation and safe delivery are kept;
+    paths and the raw control-message envelope are deliberately excluded.
+    """
+
+    task_id: str
+    tool_use_id: str | None = None
+    status: str | None = None
+    result: str | None = None
+    replayed: bool = False
+
+
+@dataclass(frozen=True)
 class TranscriptReadResult:
     """
     Result of reading Claude transcript JSONL records.
@@ -591,6 +607,71 @@ class TranscriptReadResult:
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    task_notifications: tuple[ClaudeTaskNotification, ...] = ()
+    goal_state_observed: bool = False
+    latest_goal_state: str | None = None
+
+
+@dataclass(frozen=True)
+class ClaudeGoalStateSnapshot:
+    """Latest structured Goal state found in one complete transcript prefix."""
+
+    goal_state_observed: bool
+    latest_goal_state: str | None
+    byte_offset: int
+
+
+def _goal_state_from_transcript_entry(entry: _JsonObject) -> tuple[bool, str | None]:
+    """Read Claude Code's structured Goal transcript events."""
+    if entry.get("type") == "active_goal" and "value" in entry:
+        value = entry.get("value")
+        if value is None:
+            return True, None
+        if isinstance(value, dict):
+            return True, "active"
+    attachment = entry.get("attachment")
+    if (
+        entry.get("type") == "attachment"
+        and isinstance(attachment, dict)
+        and attachment.get("type") == "goal_status"
+        and attachment.get("sentinel") is True
+        and isinstance(attachment.get("met"), bool)
+        and isinstance(attachment.get("condition"), str)
+    ):
+        return True, None if attachment["met"] else "active"
+    return False, None
+
+
+def read_latest_transcript_goal_state(transcript_path: Path) -> ClaudeGoalStateSnapshot:
+    """Scan complete JSONL records and return the latest structured Goal state.
+
+    The scan retains only the latest matching event, so memory stays bounded
+    independently of transcript length. A trailing partial record is left for
+    the incremental reader once Claude completes it.
+    """
+    observed = False
+    latest_state: str | None = None
+    byte_offset = 0
+    with transcript_path.open("rb") as handle:
+        while raw := handle.readline():
+            if not raw.endswith(b"\n"):
+                break
+            byte_offset = handle.tell()
+            try:
+                entry = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(entry, dict):
+                continue
+            goal_observed, goal_state = _goal_state_from_transcript_entry(entry)
+            if goal_observed:
+                observed = True
+                latest_state = goal_state
+    return ClaudeGoalStateSnapshot(
+        goal_state_observed=observed,
+        latest_goal_state=latest_state,
+        byte_offset=byte_offset,
+    )
 
 
 @dataclass(frozen=True)
@@ -1747,12 +1828,13 @@ def build_hook_settings(
         ask_uq_hook: _JsonObject = {
             "type": "command",
             "command": shlex.join(ask_uq_command_parts),
-            # Short timeout: if the web-UI elicitation isn't answered
-            # within 10s, the hook returns empty output so Claude falls
-            # through to its TUI picker in bypassPermissions mode. In
-            # default mode this hook exits immediately (no-op), so the
-            # timeout is irrelevant there.
-            "timeout": 10,
+            # Wait as long as the PermissionRequest hook above does: the
+            # web-UI card stays up until the user answers it. The old 10s
+            # budget fell through to Claude's TUI picker, which a web-UI
+            # user never sees, and the PermissionRequest fallback then
+            # denied the call. In default mode this hook exits immediately
+            # (no-op), so the timeout is irrelevant there.
+            "timeout": 86400,
         }
         # The ``AskUserQuestion`` matcher only fires if that tool is actually
         # callable. A session launched with ``--disallowedTools AskUserQuestion``
@@ -2496,6 +2578,9 @@ def read_transcript_items_since_with_position(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    task_notifications: list[ClaudeTaskNotification] = []
+    goal_state_observed = False
+    latest_goal_state: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2505,6 +2590,11 @@ def read_transcript_items_since_with_position(
             continue
         if not isinstance(entry, dict):
             continue
+        task_notifications.extend(_task_notifications_from_entry(entry))
+        observed_goal, goal_state = _goal_state_from_transcript_entry(entry)
+        if observed_goal:
+            goal_state_observed = True
+            latest_goal_state = goal_state
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2536,6 +2626,9 @@ def read_transcript_items_since_with_position(
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        task_notifications=_dedupe_task_notifications(task_notifications),
+        goal_state_observed=goal_state_observed,
+        latest_goal_state=latest_goal_state,
     )
 
 
@@ -2548,6 +2641,7 @@ def read_transcript_items_from_offset(
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
     include_sidechains: bool = False,
+    end_offset: int | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items appended after a byte offset.
@@ -2576,12 +2670,16 @@ def read_transcript_items_from_offset(
         leave the sub-agent's child Omnigent conversation empty. The
         default ``False`` keeps the parent-transcript path
         unchanged.
+    :param end_offset: Optional frozen byte boundary. Only complete records
+        ending at or before this offset are consumed, even if the file grows
+        while it is being read.
     :returns: Parsed items plus updated line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
         transcript_path,
         byte_offset=byte_offset,
         start_line=start_line,
+        end_offset=end_offset,
     )
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
@@ -2589,6 +2687,9 @@ def read_transcript_items_from_offset(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    task_notifications: list[ClaudeTaskNotification] = []
+    goal_state_observed = False
+    latest_goal_state: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2598,6 +2699,11 @@ def read_transcript_items_from_offset(
             continue
         if not isinstance(entry, dict):
             continue
+        task_notifications.extend(_task_notifications_from_entry(entry))
+        observed_goal, goal_state = _goal_state_from_transcript_entry(entry)
+        if observed_goal:
+            goal_state_observed = True
+            latest_goal_state = goal_state
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2630,6 +2736,9 @@ def read_transcript_items_from_offset(
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        task_notifications=_dedupe_task_notifications(task_notifications),
+        goal_state_observed=goal_state_observed,
+        latest_goal_state=latest_goal_state,
     )
 
 
@@ -2912,7 +3021,9 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                     transcript_path = (
                         payload.get("transcript_path") if isinstance(payload, dict) else None
                     )
-                    if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                    if isinstance(transcript_path, str) and "subagents" in (
+                        part.casefold() for part in transcript_path.replace("\\", "/").split("/")
+                    ):
                         continue
                     return True
     except FileNotFoundError:
@@ -3117,6 +3228,7 @@ def _read_complete_jsonl_records(
     byte_offset: int,
     start_line: int,
     emit_after_line: int | None = None,
+    end_offset: int | None = None,
 ) -> _JsonlReadResult:
     """
     Read complete newline-terminated records from a JSONL file.
@@ -3133,12 +3245,16 @@ def _read_complete_jsonl_records(
     :param emit_after_line: When provided, complete records at or
         before this line number are counted for cursor migration but
         not decoded or stored.
+    :param end_offset: Optional frozen upper byte boundary. Records crossing
+        the boundary are treated as a trailing partial record.
     :returns: Complete records plus updated line and byte cursors.
     """
     if byte_offset < 0:
         raise ValueError(f"byte_offset must be non-negative, got {byte_offset}")
     if start_line < 0:
         raise ValueError(f"start_line must be non-negative, got {start_line}")
+    if end_offset is not None and end_offset < 0:
+        raise ValueError(f"end_offset must be non-negative, got {end_offset}")
     records: list[_JsonlRecord] = []
     cursor = start_line
     position = byte_offset
@@ -3146,15 +3262,16 @@ def _read_complete_jsonl_records(
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             file_size = handle.tell()
+            read_end = file_size if end_offset is None else min(file_size, end_offset)
             if byte_offset > file_size:
                 handle.seek(0)
                 cursor = 0
                 position = 0
             else:
                 handle.seek(byte_offset)
-            while True:
+            while position < read_end:
                 record_start = position
-                raw = handle.readline()
+                raw = handle.readline(read_end - position)
                 if not raw:
                     break
                 if not raw.endswith(b"\n"):
@@ -3523,10 +3640,11 @@ def inject_interrupt(
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
     """
-    Send an Escape keystroke into the Claude terminal via tmux send-keys.
+    Send Ctrl+C into the Claude terminal via tmux send-keys.
 
-    Claude Code's TUI cancels an in-flight response on a single
-    ``Escape``. The harness's ``run_turn`` for ``claude-native``
+    Claude Code can leave a foreground tool process running after ``Escape``;
+    ``Ctrl+C`` interrupts the foreground process group while preserving the
+    interactive session. The harness's ``run_turn`` for ``claude-native``
     returns immediately after the tmux paste (the long-running work
     happens inside the ``claude`` binary in the pane, not the
     harness), so the scaffold's interrupt path can't reach it — this
@@ -3542,8 +3660,8 @@ def inject_interrupt(
         time, or if the ``tmux send-keys`` invocation fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    # No ``-l``: tmux must interpret ``C-c`` as the Ctrl+C key name.
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-c")
 
 
 def kill_session(
@@ -3563,8 +3681,8 @@ def kill_session(
     it kills the tmux session outright, which terminates ``claude`` and
     everything in the pane.
 
-    Unlike :func:`inject_interrupt` (which sends a single ``Escape`` to
-    cancel an in-flight response but leaves the session alive), this is
+    Unlike :func:`inject_interrupt` (which sends one ``Ctrl+C`` to interrupt
+    foreground work but leaves the interactive session alive), this is
     a hard stop. Once the pane is gone the wrapper's reconnect loop
     observes the terminal resource disappear and tears the session
     down through its normal end-of-session path, so no transcript items
@@ -4368,15 +4486,34 @@ def _is_box_rule(line: str) -> bool:
 
     Claude Code frames the input box with a row of ``─``
     (:data:`_BOX_RULE_CHARS`), with or without corner glyphs depending on
-    the version. Both spellings count: :func:`_composer_row` anchors on
-    the rule directly above the composer, so it is the position that
-    identifies the box, not the corners.
+    the version. A renamed session decorates the opening rule with its title,
+    surrounded by spaces and rule runs. All three spellings count:
+    :func:`_composer_row` anchors on the rule directly above the composer, so
+    it is the position that identifies the box, not the corners or title.
 
     :param line: A single pane line, e.g. ``"──────────"``.
     :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
-    return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
+    if len(stripped) < 3:
+        return False
+    if all(ch in _BOX_RULE_CHARS for ch in stripped):
+        return True
+
+    prefix_len = 0
+    while prefix_len < len(stripped) and stripped[prefix_len] in _BOX_RULE_CHARS:
+        prefix_len += 1
+    suffix_start = len(stripped)
+    while suffix_start > prefix_len and stripped[suffix_start - 1] in _BOX_RULE_CHARS:
+        suffix_start -= 1
+    decoration = stripped[prefix_len:suffix_start]
+    return (
+        prefix_len >= 3
+        and len(stripped) - suffix_start >= 1
+        and decoration.startswith(" ")
+        and decoration.endswith(" ")
+        and bool(decoration.strip())
+    )
 
 
 def _submit_needle(content: str) -> str:
@@ -5787,6 +5924,21 @@ def _write_jsonrpc(
             print(raw, flush=True)
 
 
+def _concrete_transcript_model(value: object) -> str | None:
+    """Normalize a model report across an in-place package replacement."""
+    parser = getattr(_model_metadata, "concrete_reported_model", None)
+    if callable(parser):
+        return cast(Callable[[object], str | None], parser)(value)
+
+    # A Unix self-update replaces package files while the invoking CLI still
+    # holds the previous model_metadata module in memory. Keep the newly
+    # installed bridge importable until that old process finishes reconnecting.
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    return model if model and model != "<synthetic>" else None
+
+
 def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     """
     Return ``message.model`` from an assistant transcript record.
@@ -5803,7 +5955,7 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     message = entry.get("message")
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
-    return concrete_reported_model(message.get("model"))
+    return _concrete_transcript_model(message.get("model"))
 
 
 def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:
@@ -6465,6 +6617,169 @@ def _is_task_notification_text(text: str) -> bool:
     )
 
 
+def _task_notification_field(text: str, field: str) -> str | None:
+    """Return one bounded XML-like task-notification field."""
+    match = re.search(
+        rf"<{re.escape(field)}>(.*?)</{re.escape(field)}>",
+        text,
+        re.DOTALL,
+    )
+    if match is None:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+def _task_notification_from_text(text: str) -> ClaudeTaskNotification | None:
+    """Parse safe correlation/result fields from a Claude task notification."""
+    if not _is_task_notification_text(text):
+        return None
+    task_id = _task_notification_field(text, "task-id")
+    if task_id is None:
+        return None
+    return ClaudeTaskNotification(
+        task_id=task_id,
+        tool_use_id=_task_notification_field(text, "tool-use-id"),
+        status=_task_notification_field(text, "status"),
+        result=_task_notification_field(text, "result"),
+    )
+
+
+def _omnigent_task_notification(raw: object) -> ClaudeTaskNotification | None:
+    """Parse one terminal notification preserved by an Omnigent transcript rebuild."""
+    if not isinstance(raw, dict):
+        return None
+    tool_use_id = raw.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+        return None
+    status = raw.get("status")
+    if status not in _TERMINAL_BACKGROUND_TASK_STATUSES:
+        return None
+    result = raw.get("result")
+    if result is not None and not isinstance(result, str):
+        return None
+    return ClaudeTaskNotification(
+        task_id=tool_use_id,
+        tool_use_id=tool_use_id,
+        status=status,
+        result=result,
+        replayed=True,
+    )
+
+
+def _omnigent_tool_result_metadata(entry: _JsonObject) -> _JsonObject:
+    """Read lifecycle fields retained by Omnigent's transcript serializer."""
+    raw = entry.get("omnigentToolResult")
+    if not isinstance(raw, dict) or raw.get("tool_name") not in {"Agent", "Task"}:
+        return {}
+    status = raw.get("tool_status")
+    if not isinstance(status, str) or not status:
+        return {}
+    data: _JsonObject = {"tool_status": status}
+    for key in ("is_async", "is_error"):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if not isinstance(value, bool):
+            return {}
+        data[key] = value
+    return data
+
+
+def _omnigent_tool_result_notification(entry: _JsonObject) -> ClaudeTaskNotification | None:
+    """Convert one rebuilt Agent/Task result into its terminal lifecycle edge."""
+    metadata = _omnigent_tool_result_metadata(entry)
+    status = metadata.get("tool_status")
+    if not isinstance(status, str) or status not in _TERMINAL_BACKGROUND_TASK_STATUSES:
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    tool_results = [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+    if len(tool_results) != 1:
+        return None
+    block = tool_results[0]
+    tool_use_id = block.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+        return None
+    return ClaudeTaskNotification(
+        task_id=tool_use_id,
+        tool_use_id=tool_use_id,
+        status=status,
+        result=_tool_result_output(entry, block),
+        replayed=True,
+    )
+
+
+def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotification]:
+    """Extract task notifications without retaining their private path fields."""
+    notifications: list[ClaudeTaskNotification] = []
+    message = entry.get("message")
+    if isinstance(message, dict) and message.get("role") == "user":
+        content = message.get("content")
+        texts: list[str] = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(
+                text
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance((text := block.get("text")), str)
+            )
+        notifications.extend(
+            parsed for text in texts if (parsed := _task_notification_from_text(text))
+        )
+
+    preserved = entry.get("omnigentTaskNotifications")
+    if isinstance(preserved, list):
+        notifications.extend(
+            parsed for raw in preserved if (parsed := _omnigent_task_notification(raw))
+        )
+    rebuilt = _omnigent_tool_result_notification(entry)
+    if rebuilt is not None:
+        notifications.append(rebuilt)
+    return notifications
+
+
+def _dedupe_task_notifications(
+    notifications: list[ClaudeTaskNotification],
+) -> tuple[ClaudeTaskNotification, ...]:
+    """Collapse replayed terminal evidence keyed by its stable tool-use id."""
+    deduped: list[ClaudeTaskNotification] = []
+    seen_tool_use_ids: set[str] = set()
+    for notification in notifications:
+        tool_use_id = notification.tool_use_id
+        if tool_use_id is not None:
+            if tool_use_id in seen_tool_use_ids:
+                continue
+            seen_tool_use_ids.add(tool_use_id)
+        deduped.append(notification)
+    return tuple(deduped)
+
+
+def _task_notification_item_data(notification: ClaudeTaskNotification) -> _JsonObject:
+    """Build the persisted tool-result shape for a correlated notification."""
+    assert notification.tool_use_id is not None
+    data: _JsonObject = {
+        "call_id": notification.tool_use_id,
+        "output": notification.result or "",
+        "is_async": True,
+    }
+    if notification.status is not None:
+        data["tool_status"] = notification.status
+        data["is_error"] = notification.status == "failed"
+    return data
+
+
 def _local_command_transcript_items_from_entry(
     entry: _JsonObject,
     *,
@@ -6714,6 +7029,17 @@ def _user_transcript_items_from_entry(
         if any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS):
             return current_response_id, []
         if _is_task_notification_text(content):
+            notification = _task_notification_from_text(content)
+            if notification is not None and notification.tool_use_id is not None:
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, 0, "function_call_output"),
+                        item_type="function_call_output",
+                        data=_task_notification_item_data(notification),
+                        response_id=current_response_id or fallback_response_id,
+                    )
+                )
+                return current_response_id, items
             items.append(
                 ClaudeTranscriptItem(
                     source_id=_source_id(source_key, 0, "message"),
@@ -6767,6 +7093,18 @@ def _user_transcript_items_from_entry(
             ):
                 continue
             if _is_task_notification_text(text):
+                notification = _task_notification_from_text(text)
+                if notification is not None and notification.tool_use_id is not None:
+                    items.append(
+                        ClaudeTranscriptItem(
+                            source_id=_source_id(source_key, item_index, "function_call_output"),
+                            item_type="function_call_output",
+                            data=_task_notification_item_data(notification),
+                            response_id=current_response_id or fallback_response_id,
+                        )
+                    )
+                    item_index += 1
+                    continue
                 items.append(
                     ClaudeTranscriptItem(
                         source_id=_source_id(source_key, item_index, "message"),
@@ -6800,6 +7138,7 @@ def _user_transcript_items_from_entry(
                 data={
                     "call_id": call_id,
                     "output": _tool_result_output(entry, block),
+                    **_tool_result_metadata(entry, block),
                 },
                 response_id=response_id,
             )
@@ -7071,6 +7410,31 @@ def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:
     if tool_use_result is not None:
         return json.dumps(_strip_inline_image_data(tool_use_result), separators=(",", ":"))
     return ""
+
+
+def _tool_result_metadata(entry: _JsonObject, block: _JsonObject) -> _JsonObject:
+    """Keep only lifecycle metadata needed to interpret a native tool result."""
+    data: _JsonObject = {}
+    tool_use_result = entry.get("toolUseResult")
+    if isinstance(tool_use_result, dict):
+        status = tool_use_result.get("status")
+        if isinstance(status, str) and status:
+            data["tool_status"] = status
+        raw_async = tool_use_result.get("isAsync")
+        if not isinstance(raw_async, bool):
+            raw_async = tool_use_result.get("is_async")
+        if isinstance(raw_async, bool):
+            data["is_async"] = raw_async
+        raw_error = tool_use_result.get("is_error")
+        if not isinstance(raw_error, bool):
+            raw_error = tool_use_result.get("isError")
+        if isinstance(raw_error, bool):
+            data["is_error"] = raw_error
+    block_error = block.get("is_error")
+    if isinstance(block_error, bool):
+        data["is_error"] = block_error
+    data.update(_omnigent_tool_result_metadata(entry))
+    return data
 
 
 def _transcript_source_key(

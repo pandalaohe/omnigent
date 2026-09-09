@@ -17,12 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  WorkspacePicker,
-  isNavigablePath,
-  resolveWorkspacePath,
-  useResolvedHostHome,
-} from "./WorkspacePicker";
+import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { HostLabel } from "./HostLabel";
@@ -339,7 +334,7 @@ export function ResumeWithDirectoryDialog({
                     dropdownDisabled={browsing}
                   />
                   {browsing && (
-                    <WorkspacePicker
+                    <HostWorkspacePicker
                       key={browseNonce}
                       hostId={selectedHostId}
                       initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}

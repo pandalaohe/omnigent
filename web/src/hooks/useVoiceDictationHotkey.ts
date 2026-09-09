@@ -10,6 +10,10 @@
 // terminals, the Monaco editor).
 
 import { useEffect, useRef } from "react";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+} from "@/lib/keyboardShortcutPreferences";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 
@@ -22,16 +26,16 @@ export function isVoiceDictationHotkey(
   e: globalThis.KeyboardEvent,
   isMac: boolean = isMacPlatform(),
 ): boolean {
-  // Require the platform command modifier AND Alt (the browser-safe ⌘⌥ chord)
-  // and reject Shift, so ⌘⌥⇧ combos stay free for future bindings.
-  if (!hasCommandModifier(e, isMac) || !e.altKey || e.shiftKey) return false;
   // AltGr often reports as Ctrl+Alt; ignore it so intl-layout typing doesn't
   // trigger dictation. Guard the call: not every environment implements
   // getModifierState, and an unguarded call there would throw.
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
-  // Match the physical key, not the character: ⌥ rewrites "v" → "√" on macOS,
-  // but e.code is stable across layouts and modifiers.
-  return e.code === "KeyV";
+  if (!hasCustomShortcutBindings("voiceDictation")) {
+    // Require the platform command modifier AND Alt and reject Shift.
+    if (!hasCommandModifier(e, isMac) || !e.altKey || e.shiftKey) return false;
+    return e.code === "KeyV";
+  }
+  return eventMatchesShortcutAction(e, "voiceDictation");
 }
 
 /** Does focus sit inside a surface that owns its keystrokes (xterm / Monaco)? */

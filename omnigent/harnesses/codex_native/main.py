@@ -95,7 +95,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.runner.identity import with_runner_binding_token
 
 _logger = logging.getLogger(__name__)
 
@@ -735,7 +735,10 @@ def _run_with_local_server(
             )
             await _attach_with_forwarder(
                 base_url=base_url,
-                headers={},
+                headers=with_runner_binding_token(
+                    {},
+                    getattr(server_handle, "runner_binding_token", None),
+                ),
                 prepared=prepared,
                 prompt=prompt,
             )

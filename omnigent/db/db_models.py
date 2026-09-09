@@ -245,6 +245,27 @@ POLICY_SCOPE_DEFAULT = "default"
 POLICY_SCOPE_SESSION = "session"
 
 
+class SqlCustomAgent(OmnigentBase):
+    """Private library entries; never operator-trusted runtime templates."""
+
+    __tablename__ = "custom_agents"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(256))
+    name: Mapped[str] = mapped_column(String(256))
+    description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    harness: Mapped[str] = mapped_column(String(128))
+    model: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    bundle_location: Mapped[str] = mapped_column(String(512))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
+    deleted_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    __table_args__ = (Index("ix_custom_agents_owner", "workspace_id", "owner_id", "deleted_at"),)
+
+
 class SqlAgent(OmnigentBase):
     """
     SQLAlchemy model for the ``agents`` table.
@@ -375,6 +396,10 @@ class SqlUser(OmnigentBase):
     :param last_login_at: Unix epoch seconds of the most recent
         successful ``/auth/login`` (accounts mode). ``NULL`` until
         the first login.
+    :param preferences: Versioned JSON envelope for cross-device user
+        preferences. ``NULL`` means the user has never initialized synced
+        preferences; an envelope with empty ``settings`` means they explicitly
+        initialized and are using all defaults.
     """
 
     __tablename__ = "users"
@@ -392,7 +417,9 @@ class SqlUser(OmnigentBase):
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    background_session_titles_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Opaque JSON, never SQL-filtered. Compression keeps shortcut/button
+    # payloads compact without leaking persistence details into API callers.
+    preferences: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
 
 class SqlAccountToken(OmnigentBase):
@@ -684,6 +711,14 @@ class SqlConversationMetadata(OmnigentBase):
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Latest provider allowance snapshot (5h / weekly / monthly, when reported).
+    # This is structured runtime metadata, not a guardrail label: label values
+    # are capped at 256 characters and silently truncate a normal two-window
+    # snapshot before it can be parsed on session reload.
+    provider_usage_limits: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Latest native-harness plan forwarded for Web snapshot recovery. The
+    # process cache is only a live fast path; deployments must not erase it.
+    session_todos: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.
     terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.
@@ -872,12 +907,33 @@ class SqlConversation(ConversationBase):
     archived: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # Timestamp of the most recent transition into archived state. Unlike
+    # updated_at, later title/model/label edits do not move this value.
+    archived_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Row-local mirror of the public archive-lock label. Keeping the delete
+    # gate on this row makes lock-vs-claim a single conditional UPDATE across
+    # Postgres/SQLite workers; the label remains the wire-compatible surface.
+    archive_locked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    # Short-lived, opaque ownership claim held while destructive session
+    # cleanup runs.  It lives on the conversation row so archive-lock writes
+    # and delete claims linearize on the same database record across workers.
+    deletion_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deletion_claimed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # No bare created_at/updated_at indexes: the sessions list is ACL-scoped
         # (id IN (...)) and resolves via the PK; the default sidebar (archived=
         # false, updated_at DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
+        Index(
+            "ix_conversations_archived_archived_at",
+            "workspace_id",
+            "archived",
+            "archived_at",
+            "id",
+        ),
         Index(
             "ix_conversations_root_conversation_id",
             "workspace_id",
@@ -1361,6 +1417,9 @@ class SqlHost(OmnigentBase):
     deleted_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # User-selected starting directory for this physical host. Host-native
+    # syntax is preserved (POSIX, Windows drive, or UNC).
+    default_workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
 
     __table_args__ = (
         CheckConstraint(

@@ -1,6 +1,11 @@
 import type { ReactNode } from "react";
 
 import { TooltipContent } from "@/components/ui/tooltip";
+import {
+  hasCustomShortcutBindings,
+  resolveShortcutBindings,
+  shortcutBindingLabels,
+} from "@/lib/keyboardShortcutPreferences";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { cn } from "@/lib/utils";
 
@@ -12,10 +17,18 @@ export const ENTER_KEY = "↵";
 export const SHIFT_KEY = "⇧";
 
 export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
+  if (hasCustomShortcutBindings("sendMessage")) {
+    return resolveShortcutBindings("sendMessage").flatMap((binding) =>
+      shortcutBindingLabels(binding),
+    );
+  }
   return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];
 }
 
 export function composerNewLineShortcutKeys(submitWithModEnter: boolean): string[] {
+  if (hasCustomShortcutBindings("newLine")) {
+    return resolveShortcutBindings("newLine").flatMap((binding) => shortcutBindingLabels(binding));
+  }
   return submitWithModEnter ? [ENTER_KEY] : [SHIFT_KEY, ENTER_KEY];
 }
 

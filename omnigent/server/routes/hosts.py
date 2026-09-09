@@ -24,6 +24,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from omnigent.codex_rate_limits import CODEX_RATE_LIMITS_HARD_TTL_S
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
@@ -421,6 +422,14 @@ class CreateDirectoryRequest(BaseModel):
     path: str
 
 
+class UpdateHostRequest(BaseModel):
+    """Mutable user preference fields for a registered host."""
+
+    # Required but nullable: explicit null clears it; an empty or misspelled
+    # PATCH body must not silently erase an existing preference.
+    default_workspace: str | None
+
+
 class StoreHarnessCredentialRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{id}/harnesses/{harness}/credential``.
 
@@ -597,6 +606,7 @@ def create_hosts_router(
         now = now_epoch()
         result: list[dict[str, Any]] = []
         for host in hosts:
+            live_connection = host_registry.get(host.host_id)
             # Status comes from the DB, not host_registry. The registry
             # is per-replica; if a host is connected to replica B and
             # this request lands on replica A, A's registry won't know
@@ -619,6 +629,13 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    "default_workspace": host.default_workspace,
+                    # Root enumeration is a Host capability. Missing hello
+                    # metadata (older Host or another replica) fails closed so
+                    # the picker retains its home/path flow.
+                    "filesystem_roots": bool(
+                        live_connection and live_connection.hello.filesystem_roots
+                    ),
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
@@ -663,11 +680,72 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "default_workspace": host.default_workspace,
+            "filesystem_roots": bool(
+                (live_connection := host_registry.get(host.host_id))
+                and live_connection.hello.filesystem_roots
+            ),
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "runners": [],
         }
+
+    @router.patch("/hosts/{host_id}")
+    async def update_host(
+        request: Request, host_id: str, body: UpdateHostRequest
+    ) -> dict[str, Any]:
+        """Set or clear user-owned preferences for one physical host."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        value = body.default_workspace
+        if value is not None:
+            if value == "":
+                value = None
+            elif len(value) > 2048 or "\x00" in value:
+                raise HTTPException(status_code=400, detail="invalid default workspace")
+            elif not (value.startswith("/") or _is_windows_absolute_path(value)):
+                raise HTTPException(status_code=400, detail="default workspace must be absolute")
+
+        updated = await asyncio.to_thread(
+            host_store.set_default_workspace,
+            host_id,
+            value,
+            expected_user_id=host.user_id,
+        )
+        if updated is None:
+            raise HTTPException(status_code=409, detail="host ownership changed while updating")
+        return {
+            "host_id": updated.host_id,
+            "default_workspace": updated.default_workspace,
+        }
+
+    @router.get("/hosts/{host_id}/codex-rate-limits")
+    async def get_host_codex_rate_limits(request: Request, host_id: str) -> dict[str, Any]:
+        """Return the live Host's sanitized Codex subscription quota snapshot."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        conn = host_registry.get(host.host_id)
+        snapshot = conn.hello.codex_rate_limits if conn is not None else None
+        captured_at = snapshot.get("captured_at") if isinstance(snapshot, dict) else None
+        current_time = now_epoch()
+        if (
+            not isinstance(captured_at, int)
+            or captured_at > current_time + 300
+            or current_time - captured_at > CODEX_RATE_LIMITS_HARD_TTL_S
+        ):
+            snapshot = None
+        return {"rate_limits": snapshot}
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(
@@ -1007,6 +1085,8 @@ def create_hosts_router(
     async def list_host_filesystem_root(
         request: Request,
         host_id: str,
+        path: str | None = Query(default=None),
+        roots: bool = Query(default=False),
         limit: int = Query(default=_LIST_DIR_DEFAULT_LIMIT, ge=1, le=_LIST_DIR_MAX_LIMIT),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
@@ -1035,7 +1115,7 @@ def create_hosts_router(
         return await _list_host_filesystem(
             request=request,
             host_id=host_id,
-            path="~",
+            path="" if roots else (path if path else "~"),
             limit=limit,
             after=after,
             before=before,

@@ -23,11 +23,25 @@ export type SessionState =
   // returns it; the sidebar row folds it in for the bound session only.
   | { kind: "starting" };
 
+/** This session's own prompt/turn state, excluding background rollups. */
+export function getConversationForegroundStatus(
+  conversation: Pick<Conversation, "status" | "foreground_status"> | undefined | null,
+): Conversation["status"] {
+  return conversation?.foreground_status ?? conversation?.status;
+}
+
 export function getSessionState(
-  conversation: Pick<Conversation, "status" | "pending_elicitations_count"> | undefined | null,
+  conversation:
+    | Pick<Conversation, "status" | "foreground_status" | "pending_elicitations_count">
+    | undefined
+    | null,
 ): SessionState | null {
   const pending = conversation?.pending_elicitations_count ?? 0;
   if (pending > 0) return { kind: "awaiting", count: pending };
-  if (conversation?.status === "running") return { kind: "running" };
+  // Older servers omit foreground_status, so retain the aggregate status as a
+  // compatibility fallback. New servers keep child-only work out of the spinner.
+  if (getConversationForegroundStatus(conversation) === "running") {
+    return { kind: "running" };
+  }
   return null;
 }

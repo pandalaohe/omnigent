@@ -11,6 +11,7 @@ import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebar
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
@@ -35,7 +36,13 @@ import {
   dataUrlToFile,
   type DesignModeElement,
 } from "@/lib/designModePrompt";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  readInheritLastRightRailTab,
+  readLastExplicitRightRailTab,
+  readSessionWorkspaceState,
+  writeLastExplicitRightRailTab,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 import {
   readDefaultWorkspacePanelOpen,
   writeDefaultWorkspacePanelOpen,
@@ -90,6 +97,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
@@ -97,6 +105,7 @@ import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
@@ -109,6 +118,7 @@ import {
 import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+import { MobileFloatingAssistant } from "@/components/MobileFloatingAssistant";
 import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
@@ -181,6 +191,7 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 }
 
 export function AppShell() {
+  const { nativeMobileHeaderMode, showGoalSessionMarkers } = useSessionNavigationPreferences();
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -228,9 +239,12 @@ export function AppShell() {
   // create window (or on a stale temp reload, before ChatPage redirects).
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
-  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
-    conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
-  );
+  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() => {
+    if (!conversationId) return "files";
+    const persistedTab = readSessionWorkspaceState(conversationId).rightRailTab;
+    if (persistedTab) return persistedTab;
+    return readInheritLastRightRailTab() ? readLastExplicitRightRailTab() : "files";
+  });
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on any other tab the FileViewer
   // is unmounted, so the 720 floor would just waste horizontal space. Both
@@ -250,19 +264,19 @@ export function AppShell() {
   const extensionOwnsHeader = extensionId !== undefined && sidebarOpen;
   const [sidebarPeek, setSidebarPeek] = useState(false);
 
-  // The settings nav lives INSIDE the sidebar, and its "Back" row is the only
-  // way off the settings page. A collapsed sidebar therefore strands the user
-  // there — the row is still in the DOM but clipped and inert. So entering
-  // /settings pins the sidebar open (and drops any peek, which is a transient
-  // hover card, not somewhere to read a settings page from), and leaving it
-  // restores whatever the sidebar was before, so a collapsed sidebar stays a
-  // preference rather than being silently undone by a trip to settings.
+  // The settings nav lives INSIDE the sidebar. Desktop keeps it pinned open as
+  // the persistent left column; on mobile that same sidebar is a full-screen
+  // drawer, so the section content would be covered if it were pinned. Entering
+  // /settings therefore opens the nav on desktop and closes it on mobile. The
+  // header can reopen it, and choosing a settings section uses Sidebar's normal
+  // mobile navigation handler to close it again and reveal the destination.
   //
   // The pin is only needed WHILE on the page, so restoring on exit cannot
   // reintroduce the trap: by then the title-bar toggle is back and the Back row
   // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
   // stashes and restores the same state around the maximize flow.
   const { inSettings } = useSettingsRoute();
+  const mobileViewport = useIsMobileViewport();
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (inSettings) {
@@ -273,7 +287,7 @@ export function AppShell() {
         if (sidebarOpenBeforeSettingsRef.current === null) {
           sidebarOpenBeforeSettingsRef.current = wasOpen;
         }
-        return true;
+        return !mobileViewport;
       });
       setSidebarPeek(false);
       return;
@@ -284,7 +298,7 @@ export function AppShell() {
       setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
       sidebarOpenBeforeSettingsRef.current = null;
     }
-  }, [inSettings]);
+  }, [inSettings, mobileViewport]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
@@ -376,6 +390,7 @@ export function AppShell() {
   const [panelInitialKey, setPanelInitialKeyState] = useState<string | null>(null);
   const [executionLogsKey, setExecutionLogsKey] = useState<string | null>(null);
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
+  const [archivePanelOpen, setArchivePanelOpen] = useState(false);
   // Mobile-only full-screen drawers for the rail tabs that have no desktop
   // push panel of their own. On desktop these are tabs in the workspace rail;
   // on a phone they open as full-screen overlays from the session-menu FAB.
@@ -445,7 +460,8 @@ export function AppShell() {
       conversationsData?.pages.flatMap((p) => p.data).find((c) => c.id === serverConversationId) ??
       null
     );
-  }, [serverConversationId, conversationsData]);
+  }, [conversationId, conversationsData]);
+  const goalFrameState = showGoalSessionMarkers ? (activeConv?.goal_state ?? null) : null;
   // Single-conversation snapshot (shared cache with chatStore.bindStream).
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
@@ -797,6 +813,9 @@ export function AppShell() {
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
+        // Archive Library is session-independent data, but lives in the rail
+        // while the user works so references can be collected without leaving.
+        archive: true,
         // Shells have no nav tab — they open as closable soft tabs in the
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
@@ -815,7 +834,7 @@ export function AppShell() {
   // this convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "github", "subagents", "browser"] as const).find(
+    const next = (["files", "changes", "github", "subagents", "archive", "browser"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -990,6 +1009,7 @@ export function AppShell() {
   useEffect(() => {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
+    setArchivePanelOpen(false);
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setFilesPanelShowHidden(true);
@@ -1034,7 +1054,9 @@ export function AppShell() {
     // itself). ``nextTab`` stays null when there's no persisted tab and no file
     // to surface, so the tab-fallback effect can still land on the first
     // *available* tab — forcing "files" here would shadow it.
-    let nextTab: RightRailTab | null = persisted.rightRailTab ?? null;
+    let nextTab: RightRailTab | null =
+      persisted.rightRailTab ??
+      (readInheritLastRightRailTab() ? readLastExplicitRightRailTab() : null);
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
@@ -1066,6 +1088,12 @@ export function AppShell() {
     // pull the rail to Files unless it's already on a files scope.
     if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
       nextTab = "files";
+    }
+    if (nextTab !== null && !railTabsAvailable[nextTab]) {
+      nextTab =
+        (["files", "changes", "github", "subagents", "archive", "browser"] as const).find(
+          (tab) => railTabsAvailable[tab],
+        ) ?? null;
     }
     if (nextTab !== null) setRightRailTab(nextTab);
 
@@ -1262,13 +1290,10 @@ export function AppShell() {
   // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
   // floating-card layout the rest of the shell treats as a pushing panel).
   const toggleLeftSidebar = () => {
-    // On /settings the sidebar holds the only exit (the Back row), so collapsing
-    // it — by hotkey or command palette, the paths that bypass the hidden
-    // title-bar toggle — would strand the user on the page. Opening is still
-    // fine; only the collapse direction is refused. The pre-settings state stays
-    // stashed either way, so what the user had before the visit is still what
-    // gets restored on the way out.
-    if (inSettings) {
+    // Desktop settings uses the sidebar as a persistent navigation column, so
+    // refuse collapse there. Mobile settings uses it as an ordinary full-screen
+    // drawer and must allow the header/hotkey/palette to open or close it.
+    if (inSettings && !mobileViewport) {
       setSidebarOpen(true);
       setSidebarPeek(false);
       return;
@@ -1494,6 +1519,7 @@ export function AppShell() {
   const handleRightRailTabChange = useCallback(
     (next: RightRailTab) => {
       setRightRailTab(next);
+      writeLastExplicitRightRailTab(next);
       if (selectedFilePath !== null) {
         setSelectedFilePath(null);
         setFileViewerCommentsOpen(false);
@@ -1513,6 +1539,7 @@ export function AppShell() {
     clearFileViewerUrl();
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
+    setArchivePanelOpen(false); // close mobile archive drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setPanelInitialKey(key);
@@ -1661,6 +1688,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setArchivePanelOpen(false); // close mobile archive drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -1675,7 +1703,19 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setArchivePanelOpen(false); // close mobile archive drawer
     setShellsPanelOpen(true);
+  }
+
+  function openArchivePanel() {
+    setSelectedFilePath(null);
+    clearFileViewerUrl();
+    setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setShellsPanelOpen(false);
+    setArchivePanelOpen(true);
   }
 
   function openMainExecutionLog() {
@@ -1862,7 +1902,8 @@ export function AppShell() {
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
     !executionLogsOpen &&
-    !filesPanelOpen,
+    !filesPanelOpen &&
+    !archivePanelOpen,
   );
 
   return (
@@ -1887,6 +1928,7 @@ export function AppShell() {
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
+            data-native-mobile-header={nativeMobileHeaderMode}
           >
             {/* Frameless-window titlebar stand-in (macOS Electron only): the
           sidebar's electron top margin (see index.css) frees this strip of
@@ -1901,13 +1943,8 @@ export function AppShell() {
           inset-2 would drag them off the lights' centre line. The sidebar's own
           copy is hidden on mac by CSS; this one is positioned by
           .electron-sidebar-header-actions in index.css. */}
-            {/* Hidden on /settings: the settings nav replaces the session list
-          INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
-          collapse toggle up here would let the user hide the one exit and strand
-          themselves on the settings page (the row exists but is clipped and
-          inert). So on /settings the sidebar is pinned open — see
-          forceSidebarOpenInSettings — and these controls step aside rather than
-          offer an action that would break the page. */}
+            {/* Hidden on desktop /settings: the settings nav is the persistent
+          left column there. Mobile uses ChatHeader's drawer trigger instead. */}
             {isMacElectronShell() && !inSettings && (
               <div className="electron-sidebar-header-actions">
                 <SidebarHeaderActions
@@ -2029,6 +2066,7 @@ export function AppShell() {
                       terminalFirst,
                       executionLogsOpen,
                       filesPanelOpen,
+                      archivePanelOpen,
                       subagentsPanelOpen,
                       shellsPanelOpen,
                       hideTerminalsTab,
@@ -2045,6 +2083,7 @@ export function AppShell() {
                       agentCount,
                       onOpenFiles: openFilesPanel,
                       onOpenChanges: openChangesPanel,
+                      onOpenArchive: openArchivePanel,
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
@@ -2084,7 +2123,9 @@ export function AppShell() {
               push panels below sit outside the group. */}
                 {serverConversationId && workspacePanelVisible && (
                   <WorkspacePanel
-                    conversationId={serverConversationId}
+                    conversationId={conversationId}
+                    archiveInitialProject={headerProjectName}
+                    archiveInitialHostId={livenessRow?.host_id}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}
                     handleProps={inlinePanelHandleProps}
@@ -2122,6 +2163,19 @@ export function AppShell() {
                     liveness={liveness}
                     onShellCreateStart={markShellCreateStarted}
                     onShellCreateFailed={clearShellCreatePending}
+                  />
+                )}
+                {(goalFrameState === "active" || goalFrameState === "paused") && (
+                  <div
+                    aria-hidden="true"
+                    data-testid="session-goal-frame"
+                    data-goal-state={goalFrameState}
+                    className={cn(
+                      "pointer-events-none absolute inset-y-0 left-0 z-50 ring-2 ring-inset",
+                      goalFrameState === "active" && "ring-status-green/80",
+                      goalFrameState === "paused" && "ring-status-yellow/80",
+                    )}
+                    style={{ right: "var(--workspace-panel-offset)" }}
                   />
                 )}
               </div>
@@ -2175,6 +2229,16 @@ export function AppShell() {
                   testId="subagents-panel-drawer"
                 >
                   <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && (
+                <MobilePanelDrawer
+                  open={archivePanelOpen}
+                  title="Archived sessions"
+                  onClose={() => setArchivePanelOpen(false)}
+                  testId="archive-panel-drawer"
+                >
+                  <ArchiveLibraryRail />
                 </MobilePanelDrawer>
               )}
               {conversationId && (
@@ -2266,6 +2330,7 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          <MobileFloatingAssistant />
           {/* Global command palette (⌘K). Ungated so it works on every route
               and in embedded mode — the sidebar's "Search" button opens it
               there even though the ⌘K hotkey is disabled (it belongs to the

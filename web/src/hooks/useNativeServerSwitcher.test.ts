@@ -1,6 +1,21 @@
+import { renderHook, waitFor } from "@testing-library/react";
+import { act } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { isSurfaceFrontmost, serverSwitcherHiddenForSurface } from "./useNativeServerSwitcher";
+const nativeBridge = vi.hoisted(() => ({
+  setNativeServerSwitcherHidden: vi.fn(),
+}));
+
+vi.mock("@/lib/nativeBridge", () => ({
+  isIOSShell: () => true,
+  setNativeServerSwitcherHidden: nativeBridge.setNativeServerSwitcherHidden,
+}));
+
+import {
+  isSurfaceFrontmost,
+  useAppShellSidebarOpen,
+  useNativeServerSwitcherForMainSurface,
+} from "./useNativeServerSwitcher";
 
 // The native Liquid Glass Chat/Terminal bar floats over the web view, so DOM
 // stacking can't hide it — its visibility rides on `isSurfaceFrontmost`. A
@@ -53,9 +68,31 @@ function makeOpenSidebar(): HTMLElement {
 }
 
 afterEach(() => {
+  nativeBridge.setNativeServerSwitcherHidden.mockClear();
   vi.unstubAllGlobals();
   delete (document as unknown as Record<string, unknown>).elementFromPoint;
   document.body.innerHTML = "";
+});
+
+describe("useNativeServerSwitcherForMainSurface", () => {
+  it("keeps the landing top clear and moves the switcher to the sidebar in title mode", () => {
+    const { rerender, unmount } = renderHook(
+      ({ sidebarOpen }) =>
+        useNativeServerSwitcherForMainSurface(null, true, {
+          headerMode: "conversation-title",
+          sidebarOpen,
+        }),
+      { initialProps: { sidebarOpen: false } },
+    );
+
+    expect(nativeBridge.setNativeServerSwitcherHidden).toHaveBeenLastCalledWith(true);
+
+    rerender({ sidebarOpen: true });
+    expect(nativeBridge.setNativeServerSwitcherHidden).toHaveBeenLastCalledWith(false);
+
+    unmount();
+    expect(nativeBridge.setNativeServerSwitcherHidden).toHaveBeenLastCalledWith(true);
+  });
 });
 
 describe("isSurfaceFrontmost", () => {
@@ -100,41 +137,18 @@ describe("isSurfaceFrontmost", () => {
   });
 });
 
-// Server selection moved into the sidebar picker on shells that host it, so
-// the floating pill must never be requested over the main surface there — it
-// used to crowd the chat header's title and floating controls on a notched
-// iPhone. Shells without the picker bridge (older iOS builds) keep the pill
-// as their only selection affordance, following the frontmost signal.
-describe("serverSwitcherHiddenForSurface", () => {
-  function setIOSBridge(withServerPicker: boolean): void {
-    (window as unknown as Record<string, unknown>).omnigentNative = {
-      kind: "ios",
-      setBadgeCount: () => {},
-      notify: () => Promise.resolve(false),
-      setServerSwitcherHidden: () => {},
-      ...(withServerPicker
-        ? {
-            getServerPicker: () => Promise.resolve(null),
-            switchServer: () => Promise.resolve(),
-            openServerSetup: () => {},
-          }
-        : {}),
-    };
-  }
+describe("useAppShellSidebarOpen", () => {
+  it("reacts when a docked AppShell sidebar opens without covering the surface", async () => {
+    const shell = document.createElement("div");
+    shell.className = "app-shell";
+    document.body.appendChild(shell);
+    const { result } = renderHook(() => useAppShellSidebarOpen());
+    expect(result.current).toBe(false);
 
-  afterEach(() => {
-    delete (window as unknown as Record<string, unknown>).omnigentNative;
-  });
+    act(() => shell.setAttribute("data-sidebar-open", "true"));
+    await waitFor(() => expect(result.current).toBe(true));
 
-  it("keeps the pill hidden over a frontmost surface on a shell with the sidebar picker", () => {
-    setIOSBridge(true);
-    expect(serverSwitcherHiddenForSurface(true)).toBe(true);
-    expect(serverSwitcherHiddenForSurface(false)).toBe(true);
-  });
-
-  it("follows the frontmost signal on a shell without the sidebar picker", () => {
-    setIOSBridge(false);
-    expect(serverSwitcherHiddenForSurface(true)).toBe(false);
-    expect(serverSwitcherHiddenForSurface(false)).toBe(true);
+    act(() => shell.removeAttribute("data-sidebar-open"));
+    await waitFor(() => expect(result.current).toBe(false));
   });
 });

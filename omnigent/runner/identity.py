@@ -76,6 +76,22 @@ RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
 )
 
 
+def with_runner_binding_token(
+    headers: Mapping[str, str],
+    binding_token: str | None,
+) -> dict[str, str]:
+    """Bind trusted in-process native forwarder requests to their own runner.
+
+    The caller supplies its already-owned token. This does not read credential
+    stores, mint authority, mutate shared hook headers, or add a token to a
+    harness subprocess environment.
+    """
+    result = dict(headers)
+    if binding_token is not None:
+        result[RUNNER_TUNNEL_TOKEN_HEADER] = binding_token
+    return result
+
+
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:
     """Return a copy of *env* with runner-auth secrets removed.
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import secrets
+import time
 import weakref
 from collections.abc import Callable
 from typing import Any, Literal, cast
@@ -31,9 +33,11 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
+from omnigent.native_subagent_snapshot import parse_native_subagent_snapshot
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
+    pending_elicitations,
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -60,6 +64,10 @@ from omnigent.server.background_session_titles import (
     schedule_background_child_task_summary,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.native_subagent_watchdog import (
+    NativeSubagentWatchdog,
+    disarm_native_subagent_watchdogs,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -90,10 +98,12 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_COMPACTION_STATUS_VALUES,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+    _EXTERNAL_GOAL_STATE_TYPE,
     _EXTERNAL_MCP_STARTUP_STATUS_VALUES,
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
     _EXTERNAL_MODEL_OPTIONS_TYPE,
+    _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
@@ -114,12 +124,19 @@ from omnigent.server.routes._sessions.common import (
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
+    _SUBAGENT_STATUS_GENERATION_LABEL_KEY,
+    _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _logger,
     _pushed_model_options_cache,
+    _session_background_task_count_cache,
+    _session_background_tasks_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
+    _session_status_cache,
+    _session_todos_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -144,6 +161,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
     _persist_external_codex_collaboration_mode_change,
+    _persist_external_goal_state,
     _persist_external_model_change,
     _persist_external_model_options,
     _persist_external_permission_mode_change,
@@ -153,6 +171,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_policy_deny_sentinel,
     _persist_session_status_error_labels,
     _prune_session_read_state,
+    _publish_child_status_to_parent,
     _publish_compaction_completed,
     _publish_compaction_failed,
     _publish_compaction_in_progress,
@@ -199,6 +218,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _wait_for_host_bound_runner_client,
     ensure_runner_connected,
 )
+from omnigent.server.routes._sessions.subagent_reconciliation import _read_native_subagent_probe
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ConversationDeleted,
@@ -211,6 +231,10 @@ from omnigent.server.schemas import (
 from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.conversation_store import (
+    DELETION_CLAIM_HEARTBEAT_INTERVAL_S,
+    DELETION_CLAIM_STALE_AFTER_S,
+)
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -228,12 +252,148 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 _retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+_interrupt_delivery_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+async def _deliver_interrupt_once(session_id: str, runner_router: RunnerRouter | None) -> None:
+    """Forward one interrupt and publish only after the runner accepts it."""
+    runner_result = await _forward_session_change_to_runner(
+        session_id,
+        runner_router,
+        {"type": _INTERRUPT_TYPE},
+    )
+    if runner_result is None or not 200 <= runner_result.status_code < 300:
+        # The turn keeps running and nothing else lifts the fence — remove it
+        # so the turn's remaining output isn't dropped and a retry can forward.
+        _interrupt_fenced_sessions.discard(session_id)
+        if runner_result is None:
+            message = (
+                "Interrupt was not delivered because no live runner was available. "
+                "The turn is still running; reconnect and try again."
+            )
+        else:
+            message = (
+                "The runner rejected the interrupt with status "
+                f"{runner_result.status_code}. The turn is still running; try again."
+            )
+        raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE)
+    if runner_result.body:
+        try:
+            interrupt_result = json.loads(runner_result.body)
+        except (TypeError, ValueError):
+            interrupt_result = None
+        if isinstance(interrupt_result, dict) and interrupt_result.get("interrupted") is False:
+            # Runner authoritatively observed that the terminal had already
+            # settled before this delayed control arrived. Nothing was cancelled,
+            # so do not fence output or publish a false cancelled decoration.
+            _interrupt_fenced_sessions.discard(session_id)
+            return
+    if session_id not in _interrupt_fenced_sessions:
+        # A terminal or next-running edge won the race while Runner handled the
+        # control. That edge is authoritative; publishing interrupted now would
+        # retroactively cancel the settled/new turn in connected clients.
+        return
+    # Only tell clients that the turn was interrupted after the runner confirms
+    # that the native bridge/app-server accepted the control and the original
+    # turn fence still identifies the same unsettled boundary.
+    _publish_interrupted(session_id)
+
+
+def _forget_interrupt_delivery(session_id: str, task: asyncio.Task[None]) -> None:
+    """Drop a completed delivery task without cancelling shared delivery."""
+    if _interrupt_delivery_tasks.get(session_id) is task:
+        _interrupt_delivery_tasks.pop(session_id, None)
+    # Retrieve a failure even if every HTTP waiter disconnected. Awaiters still
+    # receive the same exception from the completed task.
+    if not task.cancelled():
+        task.exception()
+
+
+class _DeletionClaimLease:
+    """Keep a DB deletion claim until all shielded cleanup workers settle."""
+
+    def __init__(
+        self,
+        conversation_store: ConversationStore,
+        session_id: str,
+        token: str,
+    ) -> None:
+        self._conversation_store = conversation_store
+        self._session_id = session_id
+        self._token = token
+        self._workers: set[asyncio.Task[Any]] = set()
+        self._release_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
+
+    def start_heartbeat(self) -> None:
+        """Renew the claim until cleanup settles or ownership is lost."""
+        if self._heartbeat_task is None:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    async def _heartbeat(self) -> None:
+        while True:
+            await asyncio.sleep(DELETION_CLAIM_HEARTBEAT_INTERVAL_S)
+            try:
+                renewed = await asyncio.to_thread(
+                    self._conversation_store.renew_conversation_deletion,
+                    self._session_id,
+                    self._token,
+                    claimed_at=int(time.time()),
+                )
+            except Exception:
+                _logger.warning(
+                    "Failed to renew deletion claim for session %s",
+                    self._session_id,
+                    exc_info=True,
+                )
+                continue
+            if not renewed:
+                return
+
+    async def run(self, awaitable: Any) -> Any:
+        """Shield one cleanup operation from request-task cancellation."""
+        worker = asyncio.create_task(awaitable)
+        self._workers.add(worker)
+        return await asyncio.shield(worker)
+
+    async def to_thread(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """Run a synchronous cleanup while retaining its worker identity."""
+        return await self.run(asyncio.to_thread(func, *args, **kwargs))
+
+    def _ensure_release_task(self) -> asyncio.Task[None]:
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(self._release_when_settled())
+        return self._release_task
+
+    async def _release_when_settled(self) -> None:
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._heartbeat_task
+        await asyncio.to_thread(
+            self._conversation_store.release_conversation_deletion,
+            self._session_id,
+            self._token,
+        )
+
+    async def release(self) -> None:
+        """Release idempotently after every started worker is done."""
+        await asyncio.shield(self._ensure_release_task())
+
+    def schedule_release(self) -> None:
+        """Outer-task completion fallback; stale recovery covers loop shutdown."""
+        with contextlib.suppress(RuntimeError):
+            self._ensure_release_task()
+
 
 # POST /events types that arrive per streamed chunk — the harness echoing its
 # own live output back. Their per-call audit row is pure noise (the content is
 # already on the SSE-event logger), so the envelope is suppressed for them.
 _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
     {
+        _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
         _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
@@ -386,6 +546,32 @@ def register_events_routes(
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
+    async def _verify_native_inventory(parent_id: str, binding: str) -> bool:
+        # Only GET existing Host evidence. This does not ensure a runner,
+        # resume a native thread, inject input or settle any child task.
+        parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+        if (
+            parent is None
+            or parent.archived
+            or parent.runner_id != binding
+            or parent_id in _intentional_stop_sessions
+        ):
+            return False
+        client = await _get_runner_client(parent_id, runner_router, conversation=parent)
+        if client is not None:
+            await _read_native_subagent_probe(client, parent_id)
+        return True
+
+    def _native_inventory_changed(children: frozenset[str]) -> None:
+        for child_id in children:
+            _publish_child_status_to_parent(child_id, _session_status_cache.get(child_id))
+
+    native_watchdog = NativeSubagentWatchdog(
+        verify=_verify_native_inventory,
+        changed=_native_inventory_changed,
+    )
+    router.add_event_handler("shutdown", native_watchdog.close)
+
     def _has_runner_created_by_authority(request: Request, conv: Any) -> bool:
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token:
@@ -525,7 +711,7 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
-        if in_flight is not None:
+        if in_flight is not None and body.type != _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.
             in_flight.enter_context(_mark_dispatch_in_flight(session_id))
@@ -590,6 +776,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
+            _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
@@ -599,6 +786,7 @@ def register_events_routes(
             _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
+            _EXTERNAL_GOAL_STATE_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
@@ -910,32 +1098,23 @@ def register_events_routes(
             return wake_conv, _client
 
         if body.type == _INTERRUPT_TYPE:
-            _publish_interrupted(session_id)
-            # Fence the cancelled turn (see _interrupt_fenced_sessions).
-            _interrupt_fenced_sessions.add(session_id)
-            runner_client = await _get_runner_client(
-                session_id,
-                runner_router,
-            )
-            interrupt_delivered = False
-            if runner_client is not None:
-                try:
-                    interrupt_resp = await runner_client.post(
-                        f"/v1/sessions/{session_id}/events",
-                        json={"type": "interrupt"},
-                        timeout=5.0,
-                    )
-                    interrupt_delivered = interrupt_resp.status_code < 400
-                except (httpx.HTTPError, ConnectionError):
-                    # WSTunnelTransport raises bare ConnectionError on tunnel close.
-                    _logger.exception(
-                        "Interrupt forward failed for %r",
-                        session_id,
-                    )
-            if not interrupt_delivered:
-                # The turn keeps running and nothing else lifts the fence —
-                # remove it so the turn's remaining output isn't dropped.
-                _interrupt_fenced_sessions.discard(session_id)
+            delivery = _interrupt_delivery_tasks.get(session_id)
+            if delivery is None:
+                if session_id in _interrupt_fenced_sessions:
+                    # A prior delivery already landed and its cancelled turn has
+                    # not crossed the fence-clearing boundary yet. Treat repeat
+                    # taps/clients as idempotent: a second Ctrl+C at Claude's
+                    # idle composer can exit the interactive CLI.
+                    return {"queued": False}
+                _interrupt_fenced_sessions.add(session_id)
+                delivery = asyncio.create_task(_deliver_interrupt_once(session_id, runner_router))
+                _interrupt_delivery_tasks[session_id] = delivery
+                delivery.add_done_callback(
+                    lambda done, sid=session_id: _forget_interrupt_delivery(sid, done)
+                )
+            # Multiple clients share the same delivery result. Shield it so one
+            # disconnected request cannot cancel the interrupt for every waiter.
+            await asyncio.shield(delivery)
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)
@@ -962,9 +1141,39 @@ def register_events_routes(
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
                 raise
+            native_watchdog.disarm(session_id, retire=True)
+            stop_conv = None
             if not stop_delivered:
-                # No runner resolved: nothing else lifts the fence (same as interrupt).
+                # No runner resolved: the process is already gone, but its last
+                # running/waiting edge can remain cached and persisted forever.
+                # Settle that stale lifecycle state authoritatively before
+                # reporting success so the child leaves the parent's B rollup.
+                # This keeps the conversation and all items intact; Stop is a
+                # lifecycle transition, not deletion.
                 _interrupt_fenced_sessions.discard(session_id)
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                # A dead runner can also strand approval/question Futures.
+                # Resolve every tracked prompt as cancelled before the terminal
+                # status fan-out: this clears the child badge, flips live cards,
+                # and mirrors the resolution through all ancestor streams.
+                for pending in pending_elicitations.snapshot_for(session_id):
+                    elicitation_id = pending.get("elicitation_id")
+                    if isinstance(elicitation_id, str) and elicitation_id:
+                        await _resolve_elicitation(
+                            session_id,
+                            {"elicitation_id": elicitation_id, "action": "cancel"},
+                            runner_router,
+                            conversation_store,
+                        )
+                if stop_conv is not None and stop_conv.kind == "sub_agent":
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "stopped"},
+                    )
+                _publish_status(session_id, "idle", background_task_count=0)
             # Host-spawned sessions run on a dedicated runner the host
             # launched for this one session. Killing the pane (above) leaves
             # that runner connected, so GET /health keeps reporting
@@ -975,7 +1184,10 @@ def register_events_routes(
             # command" banner a CLI-launched session reaches on exit. Read
             # host_id / runner_id from the owner-gated session row so we can
             # only ever stop the runner bound to this session.
-            stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if stop_delivered:
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
             if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
                 # Mark the tunnel drop as intentional BEFORE tearing it down so
                 # the relay's disconnect handler renders a quiet stopped state
@@ -1165,7 +1377,7 @@ def register_events_routes(
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
-            item_id = await _persist_external_conversation_item(
+            item_id, replayed = await _persist_external_conversation_item(
                 session_id,
                 conv,
                 body,
@@ -1175,7 +1387,12 @@ def register_events_routes(
                 permission_store=permission_store,
                 user_id=user_id,
             )
-            return {"queued": False, "item_id": item_id}
+            return {
+                "queued": False,
+                "item_id": item_id,
+                "replayed": replayed,
+                **({"recovery": True} if "recovery_after" in body.data else {}),
+            }
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
             _publish_external_output_text_delta(session_id, body)
             return {"queued": False}
@@ -1213,6 +1430,55 @@ def register_events_routes(
                 )
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
+        if body.type == _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE:
+            token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+            # Unlike the legacy attribution helper, a registered token from
+            # another runner never grants authority over this parent's children.
+            if not token or not conv.runner_id or token_bound_runner_id(token) != conv.runner_id:
+                raise OmnigentError(
+                    "Snapshot requires the current bound runner", code=ErrorCode.FORBIDDEN
+                )
+            if not _is_native_terminal_session(conv):
+                raise OmnigentError(
+                    "Snapshot requires a native parent", code=ErrorCode.INVALID_INPUT
+                )
+            if conv.archived or session_id in _intentional_stop_sessions:
+                native_watchdog.disarm(session_id)
+                return {"queued": False}
+            try:
+                snapshot = parse_native_subagent_snapshot(body.data)
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            children = await asyncio.to_thread(
+                conversation_store.get_conversations,
+                list(snapshot.children),
+            )
+            if set(children) != set(snapshot.children) or any(
+                child.parent_conversation_id != session_id
+                or child.labels.get("omnigent.wrapper")
+                not in {
+                    "claude-code-native-ui-subagent",
+                    "codex-native-ui-subagent",
+                }
+                for child in children.values()
+            ):
+                raise OmnigentError(
+                    "Snapshot contains a foreign child", code=ErrorCode.INVALID_INPUT
+                )
+            current_parent = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if (
+                current_parent is None
+                or current_parent.archived
+                or current_parent.runner_id != conv.runner_id
+                or session_id in _intentional_stop_sessions
+            ):
+                return {"queued": False}
+            # Inventory can never publish status, clear B/Goal/approvals, or
+            # enqueue a result. Existing terminal events/CAS own that authority.
+            native_watchdog.heartbeat(session_id, conv.runner_id, snapshot)
+            return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
             status = body.data.get("status")
             if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
@@ -1221,12 +1487,85 @@ def register_events_routes(
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            replayed = body.data.get("replayed", False)
+            if (
+                not isinstance(replayed, bool)
+                or (status == "activity_unverified" and replayed is not True)
+                or (
+                    replayed
+                    and (
+                        conv.kind != "sub_agent"
+                        or conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
+                        or status
+                        not in {
+                            "completed",
+                            "failed",
+                            "stopped",
+                            "killed",
+                            "activity_unverified",
+                        }
+                    )
+                )
+            ):
+                raise OmnigentError(
+                    "Historical status recovery requires a native child terminal status",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             response_id = body.data.get("response_id")
             if response_id is not None and not isinstance(response_id, str):
                 raise OmnigentError(
                     "external_session_status data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            force_native_child_fanout = False
+            if status == "activity_unverified":
+                from omnigent.server.routes._sessions.subagent_reconciliation import (
+                    _FINGERPRINT_LABEL_KEYS,
+                )
+
+                fingerprint = await asyncio.to_thread(
+                    conversation_store.get_native_subagent_reconcile_fingerprint,
+                    session_id,
+                    _FINGERPRINT_LABEL_KEYS,
+                )
+                fingerprint_labels = (
+                    {key: value for key, value, _stamp in fingerprint.label_states}
+                    if fingerprint is not None
+                    else {}
+                )
+                durable_terminal = fingerprint_labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+                if durable_terminal in {"completed", "failed", "stopped", "killed"}:
+                    public_terminal = "failed" if durable_terminal == "failed" else "idle"
+                    _session_status_cache[session_id] = public_terminal
+                    _publish_child_status_to_parent(session_id, None)
+                    return {"queued": False}
+                if fingerprint is None:
+                    return {"queued": False}
+                write_result = await asyncio.to_thread(
+                    conversation_store.reconcile_native_subagent_status,
+                    fingerprint,
+                    live_status=None,
+                    label_updates={
+                        _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: "true",
+                        _SUBAGENT_STATUS_GENERATION_LABEL_KEY: secrets.token_hex(16),
+                        _SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "",
+                    },
+                )
+                if write_result != "corrected":
+                    _publish_child_status_to_parent(session_id, None)
+                    return {"queued": False}
+                _session_status_cache[session_id] = status
+                _publish_child_status_to_parent(session_id, None)
+                return {"queued": False}
+            if (
+                status in {"idle", "waiting"}
+                and conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+            ):
+                # PTY quiescence after reconnect is not proof that an old
+                # native child completed. Keep the explicit unknown state
+                # until new activity or a structured terminal edge arrives.
+                _session_status_cache[session_id] = "activity_unverified"
+                return {"queued": False}
             # ``None`` (field absent) = no information; leave the sticky
             # tally untouched (the PTY-activity ``idle`` carries none). An
             # explicit ``0`` from a ``Stop`` hook is authoritative and clears
@@ -1270,6 +1609,45 @@ def register_events_routes(
             data = await _enrich_terminal_status_with_subagent_output(
                 body.data, status, session_id, conversation_store
             )
+            # Forward only the same bounded, typed display detail that the
+            # Server accepted. The Runner retains this across reconnects, so
+            # raw/nested/oversized task objects must not become resident there.
+            if bg_count is None:
+                data.pop("background_task_count", None)
+            else:
+                data["background_task_count"] = bg_count
+            if bg_tasks is None:
+                data.pop("background_tasks", None)
+            else:
+                data["background_tasks"] = [
+                    task.model_dump(exclude_none=True) for task in bg_tasks
+                ]
+            if conv.kind == "sub_agent":
+                durable_terminal_status = "completed" if status == "idle" else status
+                if status in {"running", "waiting"}:
+                    durable_terminal_status = ""
+                if durable_terminal_status in ("", "completed", "failed", "stopped", "killed"):
+                    label_updates = {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: durable_terminal_status}
+                    is_native_claude_child = (
+                        conv.labels.get("omnigent.wrapper") == "claude-code-native-ui-subagent"
+                    )
+                    if is_native_claude_child and (
+                        status == "running"
+                        or durable_terminal_status in {"completed", "failed", "stopped", "killed"}
+                    ):
+                        # Running and terminal edges atomically supersede the
+                        # prior dispatch markers. A unique generation makes a
+                        # terminal→running ABA visible even inside one second.
+                        label_updates[_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY] = ""
+                        label_updates[_SUBAGENT_STATUS_GENERATION_LABEL_KEY] = secrets.token_hex(
+                            16
+                        )
+                        force_native_child_fanout = True
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        label_updates,
+                    )
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
             # last_task_error, not only the sub-agent parent-inbox path.
@@ -1288,30 +1666,53 @@ def register_events_routes(
                     ),
                     message=output.strip(),
                 )
+            public_status = "idle" if status in {"completed", "stopped", "killed"} else status
             if status_error is not None:
                 await _persist_session_status_error_labels(
                     session_id, status_error, conversation_store
                 )
-            elif status == "running":
+            elif status == "running" or (replayed and public_status == "idle"):
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
+            if (
+                replayed
+                and public_status == "idle"
+                and _session_status_cache.get(session_id) == "failed"
+            ):
+                # The global failed→idle guard protects a real StopFailure
+                # from the PTY watcher's trailing quiescence edge. Historical
+                # native-child terminal evidence is authoritative instead: it
+                # describes the same already-ended child after reconnect, so
+                # release only that stale cache entry before publishing the
+                # recovered terminal state. The replay was validated above and
+                # returns before Runner delivery, so this cannot wake work.
+                _session_status_cache.pop(session_id, None)
             _publish_status(
                 session_id,
-                status,
+                public_status,
                 status_error,
                 response_id=response_id,
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
+            if force_native_child_fanout:
+                # A same-value cache edge is still a durable marker change;
+                # always send the latest DB projection to the parent rail.
+                _publish_child_status_to_parent(session_id, None)
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
             # No latency or token deltas are available on this path.
-            if status in {"idle", "failed"}:
+            if replayed:
+                # Restore the display and durable terminal label only. A
+                # replay must not re-register work, enqueue a result, or wake
+                # the parent in a freshly started Runner.
+                return {"queued": False}
+            if status in {"idle", "completed", "failed", "stopped", "killed"}:
                 _tel_emit(
                     _TelTurnEndEvent(
                         installation_id=_get_installation_id(),
                         session_id=session_id,
-                        status="completed" if status == "idle" else "failed",
+                        status=("completed" if status in {"idle", "completed"} else "failed"),
                         latency_ms=None,
                         model=None,
                         input_tokens=None,
@@ -1328,7 +1729,7 @@ def register_events_routes(
             )
             if (
                 conv.kind == "sub_agent"
-                and status in {"idle", "failed"}
+                and status in {"idle", "completed", "failed", "stopped", "killed"}
                 and not _is_codex_native_subagent(conv)
             ):
                 # Codex-internal children are tracked inside the same
@@ -1482,10 +1883,13 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
-            _handle_external_session_todos(session_id, body)
+            await _handle_external_session_todos(session_id, body, conversation_store)
+            return {"queued": False}
+        if body.type == _EXTERNAL_GOAL_STATE_TYPE:
+            await _persist_external_goal_state(session_id, conv, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
-            child_id = await _persist_external_subagent_start(
+            child_id, existing_child = await _persist_external_subagent_start(
                 session_id,
                 conv,
                 body,
@@ -1494,7 +1898,7 @@ def register_events_routes(
             # Returned to the claude-native forwarder so it can address
             # subsequent ``external_conversation_item`` /
             # ``external_session_status`` events to the child id.
-            return {"queued": False, "child_session_id": child_id}
+            return {"queued": False, "child_session_id": child_id, "existing": existing_child}
         if body.type == _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE:
             child_id = await _persist_external_antigravity_subagent_start(
                 session_id,
@@ -2259,10 +2663,40 @@ def register_events_routes(
                         "Conversation not found",
                         code=ErrorCode.NOT_FOUND,
                     )
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None:
+        claim_token = secrets.token_hex(16)
+        delete_lease = _DeletionClaimLease(conversation_store, session_id, claim_token)
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            current_task.add_done_callback(lambda _task: delete_lease.schedule_release())
+        claim_now = int(time.time())
+        claim_result = await delete_lease.to_thread(
+            conversation_store.claim_conversation_deletion,
+            session_id,
+            claim_token,
+            claimed_at=claim_now,
+            stale_before=claim_now - DELETION_CLAIM_STALE_AFTER_S,
+        )
+        if claim_result == "not_found":
+            await delete_lease.release()
             raise _session_not_found()
-        await _best_effort_stop(session_id, conversation_store, runner_router)
+        if claim_result == "locked":
+            await delete_lease.release()
+            raise OmnigentError(
+                "This archived session is locked. Unlock it before deleting.",
+                code=ErrorCode.CONFLICT,
+            )
+        if claim_result == "busy":
+            await delete_lease.release()
+            raise OmnigentError(
+                "Session deletion is already in progress.",
+                code=ErrorCode.CONFLICT,
+            )
+        delete_lease.start_heartbeat()
+        conv = await delete_lease.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            await delete_lease.release()
+            raise _session_not_found()
+        await delete_lease.run(_best_effort_stop(session_id, conversation_store, runner_router))
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -2270,7 +2704,9 @@ def register_events_routes(
         # resources are gone with the runner anyway.
         runner_client: httpx.AsyncClient | None = None
         try:
-            runner_client = await _get_runner_client_for_resource_access(session_id)
+            runner_client = await delete_lease.run(
+                _get_runner_client_for_resource_access(session_id)
+            )
         except OmnigentError as exc:
             _logger.info(
                 "Skipping runner-side cleanup for %s; proceeding with server-side delete: %s",
@@ -2279,9 +2715,11 @@ def register_events_routes(
             )
         if runner_client is not None:
             try:
-                await runner_client.delete(
-                    f"/v1/sessions/{session_id}",
-                    timeout=10.0,
+                await delete_lease.run(
+                    runner_client.delete(
+                        f"/v1/sessions/{session_id}",
+                        timeout=10.0,
+                    )
                 )
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
@@ -2289,12 +2727,10 @@ def register_events_routes(
                     session_id,
                 )
         else:
-            import contextlib
-
             from omnigent.runtime import get_terminal_registry
 
             with contextlib.suppress(RuntimeError):
-                await get_terminal_registry().cleanup_conversation(session_id)
+                await delete_lease.run(get_terminal_registry().cleanup_conversation(session_id))
         # Opt-in git worktree cleanup: only when delete_branch=true and
         # the session has a server-created worktree. Runs after runner
         # teardown but before the irreversible file cleanup below: an
@@ -2307,27 +2743,30 @@ def register_events_routes(
             and conv.workspace is not None
             and conv.host_id is not None
         ):
-            await _remove_session_worktree_best_effort(
-                host_id=conv.host_id,
-                worktree_path=conv.workspace,
-                branch=conv.git_branch,
-                delete_branch=True,
-                request=request,
-                reason="session-delete",
-                conversation_store=conversation_store,
-                exclude_conversation_id=conv.id,
-                fail_if_unavailable=True,
+            await delete_lease.run(
+                _remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=True,
+                    request=request,
+                    reason="session-delete",
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=conv.id,
+                    fail_if_unavailable=True,
+                )
             )
         # Session file cleanup.
         if file_store is not None and artifact_store is not None:
-            deleted_file_ids = await asyncio.to_thread(
+            deleted_file_ids = await delete_lease.to_thread(
                 file_store.delete_all_for_session, session_id
             )
             for fid in deleted_file_ids:
-                await asyncio.to_thread(artifact_store.delete, fid)
+                await delete_lease.to_thread(artifact_store.delete, fid)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
-        deleted = await conversation_store.delete_conversation(session_id)
+        disarm_native_subagent_watchdogs(session_id)
+        deleted = await delete_lease.run(conversation_store.delete_conversation(session_id))
         if not deleted:
             raise _session_not_found()
         # The session is gone, so is its launch-progress state. Failed
@@ -2344,6 +2783,14 @@ def register_events_routes(
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.
         _pushed_model_options_cache.pop(session_id, None)
+        # The durable todo snapshot is deleted with the conversation, so its
+        # process-local fast path must go too.
+        _session_todos_cache.pop(session_id, None)
+        # Background detail and the last live status are also retained across
+        # reloads while a session exists. Deletion makes those entries dead.
+        _session_background_task_count_cache.pop(session_id, None)
+        _session_background_tasks_cache.pop(session_id, None)
+        _session_status_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.
@@ -2365,17 +2812,21 @@ def register_events_routes(
         # sandbox_id and are never touched.
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
-            bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
+            bound_host = await delete_lease.to_thread(
+                host_store_for_managed.get_host, conv.host_id
+            )
             if bound_host is not None and bound_host.sandbox_provider is not None:
                 from omnigent.server.managed_hosts import terminate_managed_host
 
-                await terminate_managed_host(
-                    bound_host,
-                    host_store_for_managed,
-                    # Supplies the launcher for the provider-side
-                    # terminate; None (config removed since launch)
-                    # still deletes the row and revokes the token.
-                    getattr(request.app.state, "sandbox_config", None),
+                await delete_lease.run(
+                    terminate_managed_host(
+                        bound_host,
+                        host_store_for_managed,
+                        # Supplies the launcher for the provider-side
+                        # terminate; None (config removed since launch)
+                        # still deletes the row and revokes the token.
+                        getattr(request.app.state, "sandbox_config", None),
+                    )
                 )
         try:
             import hashlib as _hashlib
@@ -2403,4 +2854,5 @@ def register_events_routes(
             )
         except Exception:
             pass
+        await delete_lease.release()
         return ConversationDeleted(id=session_id)

@@ -5,7 +5,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.entities import (
     Agent,
@@ -86,6 +86,39 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+ARCHIVE_LOCK_LABEL_KEY = "omnigent.archive_locked"
+DELETION_CLAIM_STALE_AFTER_S = 15 * 60
+DELETION_CLAIM_HEARTBEAT_INTERVAL_S = 60
+
+DeletionClaimResult = Literal["claimed", "locked", "busy", "not_found"]
+ArchiveLockWriteResult = Literal["updated", "busy", "not_found"]
+NativeSubagentReconcileWriteResult = Literal["corrected", "stale", "unsupported"]
+
+
+@dataclass(frozen=True)
+class NativeSubagentReconcileFingerprint:
+    """Frozen server state used to guard one native sub-agent repair.
+
+    The reconciliation endpoint obtains external terminal evidence from the
+    already-running native runner. That round trip must not be allowed to
+    overwrite a newer relay edge, transcript item, or failure detail that
+    arrived while it was in flight. The store therefore compares this full
+    fingerprint again inside the same transaction that applies the repair.
+
+    ``label_states`` carries ``(key, value, updated_at)`` triples. Missing
+    labels are represented by ``(key, None, None)`` so an insertion during the
+    probe is observable too.
+    """
+
+    conversation_id: str
+    parent_conversation_id: str | None
+    runner_id: str | None
+    host_id: str | None
+    external_session_id: str | None
+    live_status: str | None
+    latest_item_id: str | None
+    label_states: tuple[tuple[str, str | None, int | None], ...]
+
 
 # Reserved label-key PREFIX that records whether a session is "pinned" in the
 # sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
@@ -174,8 +207,11 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
+        "omnigent.last_auto_compact_token_limit",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.goal_state",
+        "omnigent.last_provider_usage_limits",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
@@ -243,6 +279,15 @@ class SessionConnectivity:
     runner_last_seen: int | None = None
 
 
+@dataclass(frozen=True)
+class ArchivedConversationFacets:
+    """Distinct filter values for the caller-visible archived session set."""
+
+    projects: list[str]
+    host_ids: list[str]
+    agent_ids: list[str]
+
+
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
 # replica refreshes live runners every ~30s (the tunnel ping interval),
 # so 3 missed refreshes = offline — the same budget the tunnel's own
@@ -268,6 +313,10 @@ def runner_seen_is_fresh(last_seen: int | None, now: int | None = None) -> bool:
         return False
     ref = now if now is not None else int(time.time())
     return last_seen >= ref - RUNNER_LIVENESS_TTL_S
+
+
+class NativeReplayConflictError(Exception):
+    """A native transcript does not match the next persisted historical item."""
 
 
 class ConversationNotFoundError(Exception):
@@ -620,6 +669,11 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def find_idempotent_item(self, conversation_id: str, key: str) -> ConversationItem | None:
+        """Find a prior append with this conversation-scoped source key."""
+        ...
+
+    @abstractmethod
     def append(
         self,
         conversation_id: str,
@@ -659,6 +713,17 @@ class ConversationStore(ABC):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
+        include_search_match: bool = True,
+        host_id: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        updated_after: int | None = None,
+        updated_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
         shared_only: bool = False,
@@ -733,8 +798,8 @@ class ConversationStore(ABC):
             filter is disabled. Powers the ``GET /v1/sessions``
             list endpoint.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Column to sort on, ``"created_at"``,
+            ``"updated_at"``, or ``"archived_at"``.
         :param search_query: Case-insensitive substring filter on
             the conversation title OR conversation item content
             (``search_text``). ``None`` or empty string disables
@@ -742,6 +807,11 @@ class ConversationStore(ABC):
             contains the query OR any of its items' search text
             does. Powers the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
+        :param active_after: Keep conversations whose activity interval ends
+            on or after this timestamp. Activity starts at session creation
+            and ends at the newest committed conversation item.
+        :param active_before: Keep conversations whose activity interval starts
+            before this exclusive timestamp.
         :param accessible_by: When set, filter to sessions the
             user has access to via ``session_permissions``. Uses
             a UNION subquery: sessions the user has a direct
@@ -805,6 +875,16 @@ class ConversationStore(ABC):
         :returns: A list of matching :class:`ConversationItem`
             objects ranked by relevance.
         """
+        ...
+
+    @abstractmethod
+    def search_visible_items_literal(
+        self,
+        conversation_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> list[ConversationItem]:
+        """Search one transcript by literal user-visible text."""
         ...
 
     @abstractmethod
@@ -981,6 +1061,51 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def claim_conversation_deletion(
+        self,
+        conversation_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+        stale_before: int,
+    ) -> DeletionClaimResult:
+        """Atomically claim an unlocked conversation for destructive cleanup.
+
+        A claim blocks archive-lock changes across processes. Claims older than
+        ``stale_before`` may be replaced so a process crash cannot strand a
+        session permanently.
+        """
+        ...
+
+    @abstractmethod
+    def release_conversation_deletion(self, conversation_id: str, token: str) -> bool:
+        """Release only the deletion claim owned by ``token``."""
+        ...
+
+    @abstractmethod
+    def renew_conversation_deletion(
+        self,
+        conversation_id: str,
+        token: str,
+        *,
+        claimed_at: int,
+    ) -> bool:
+        """Refresh an active claim only while ``token`` still owns it."""
+        ...
+
+    @abstractmethod
+    def set_archive_lock(
+        self,
+        conversation_id: str,
+        locked: bool,
+        *,
+        updated_at: int,
+        stale_before: int,
+    ) -> ArchiveLockWriteResult:
+        """Atomically change archive protection unless deletion is active."""
+        ...
+
+    @abstractmethod
     def delete_label(
         self,
         conversation_id: str,
@@ -1031,6 +1156,26 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_archived_facets(
+        self,
+        accessible_by: str | None = None,
+        *,
+        search_query: str | None = None,
+        search_scope: str = "title",
+        project: str | None = None,
+        host_id: str | None = None,
+        agent_name: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
+    ) -> ArchivedConversationFacets:
+        """Aggregate linked Archive facet values in the storage layer."""
+        ...
+
+    @abstractmethod
     def set_session_state(
         self,
         conversation_id: str,
@@ -1074,6 +1219,30 @@ class ConversationStore(ABC):
             sub-dict (per-model token/cost buckets), hence ``Any``.
         """
         ...
+
+    def set_provider_usage_limits(
+        self,
+        conversation_id: str,
+        snapshot: dict[str, Any] | None,
+    ) -> None:
+        """Persist the latest provider allowance snapshot for a session.
+
+        Backends that support terminal/native sessions should override this.
+        It is intentionally a first-class metadata value: serialized snapshots
+        can exceed the 256-character conversation-label limit.
+
+        :param conversation_id: Conversation to update.
+        :param snapshot: Sanitized snapshot, or ``None`` to clear it.
+        """
+        raise NotImplementedError
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist the native-harness plan; return whether the session existed."""
+        raise NotImplementedError
 
     @abstractmethod
     def set_conversation_project(
@@ -1320,6 +1489,41 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        """
+        ...
+
+    @abstractmethod
+    def get_native_subagent_reconcile_fingerprint(
+        self,
+        conversation_id: str,
+        label_keys: tuple[str, ...],
+    ) -> NativeSubagentReconcileFingerprint | None:
+        """Freeze the state needed for a read-only native child probe.
+
+        :param conversation_id: Direct child conversation to inspect.
+        :param label_keys: Identity, terminal, unverified, and failure-label
+            keys whose values and write timestamps must remain unchanged.
+        :returns: A fingerprint, or ``None`` when the child does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def reconcile_native_subagent_status(
+        self,
+        expected: NativeSubagentReconcileFingerprint,
+        *,
+        expected_parent: NativeSubagentReconcileFingerprint | None = None,
+        live_status: str | None,
+        label_updates: dict[str, str],
+    ) -> NativeSubagentReconcileWriteResult:
+        """Apply a terminal repair only while *expected* still matches.
+
+        The child comparison, optional parent runtime comparison, and writes
+        are one transaction. ``None`` preserves the frozen live status.
+        Implementations that
+        split conversations/labels and Omnigent metadata across independent
+        databases must return ``"unsupported"`` instead of weakening the
+        compare-and-set guarantee.
         """
         ...
 

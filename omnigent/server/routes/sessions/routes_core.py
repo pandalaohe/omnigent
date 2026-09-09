@@ -104,8 +104,10 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _logger,
     _managed_launch_tasks,
+    _session_todos_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -167,6 +169,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_archive_stop,
 )
 from omnigent.server.schemas import (
+    ArchivedSessionFacetsResponse,
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
     CreatedSessionResponse,
@@ -190,13 +193,15 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
-    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
-)
-from omnigent.stores.conversation_store import (
+    ARCHIVE_LOCK_LABEL_KEY,
+    DELETION_CLAIM_STALE_AFTER_S,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
+)
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
@@ -896,6 +901,56 @@ def register_core_routes(
 
         return await asyncio.to_thread(_list_union)
 
+    @router.get(
+        "/sessions/archived-facets",
+        response_model=ArchivedSessionFacetsResponse,
+    )
+    async def list_archived_session_facets(
+        request: Request,
+        response: Response,
+        search_query: str | None = Query(default=None),
+        search_scope: str = Query(default="title", pattern="^(title|content)$"),
+        project: str | None = Query(default=None),
+        host_id: str | None = Query(default=None),
+        agent_name: str | None = Query(default=None),
+        created_after: int | None = Query(default=None, ge=0),
+        created_before: int | None = Query(default=None, ge=0),
+        active_after: int | None = Query(default=None, ge=0),
+        active_before: int | None = Query(default=None, ge=0),
+        archived_after: int | None = Query(default=None, ge=0),
+        archived_before: int | None = Query(default=None, ge=0),
+    ) -> ArchivedSessionFacetsResponse:
+        """Return linked filter values for the visible archived-session set.
+
+        The candidate query applies search and date bounds once, then the three
+        facet sets are computed while excluding each facet's own current value.
+        This keeps Project/Host/Agent switchable while removing combinations
+        that cannot produce a result.
+        """
+        response.headers["Cache-Control"] = "no-store"
+        user_id = _require_user(request, auth_provider)
+        facets = await asyncio.to_thread(
+            conversation_store.list_archived_facets,
+            user_id,
+            search_query=search_query if search_query else None,
+            search_scope=search_scope,
+            project=project,
+            host_id=host_id,
+            agent_name=agent_name,
+            created_after=created_after,
+            created_before=created_before,
+            active_after=active_after,
+            active_before=active_before,
+            archived_after=archived_after,
+            archived_before=archived_before,
+        )
+        agent_names_by_id = await asyncio.to_thread(agent_store.get_names, facets.agent_ids)
+        return ArchivedSessionFacetsResponse(
+            projects=facets.projects,
+            host_ids=facets.host_ids,
+            agent_names=sorted(set(agent_names_by_id.values())),
+        )
+
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
     #
     # The per-user read-state *write* path. The *read* path is the
@@ -1062,9 +1117,23 @@ def register_core_routes(
         agent_id: str | None = Query(default=None),
         agent_name: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-        sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
+        sort_by: str = Query(
+            default="created_at",
+            pattern="^(created_at|updated_at|archived_at|title)$",
+        ),
         search_query: str | None = Query(default=None),
+        search_scope: str = Query(default="all", pattern="^(all|title|content)$"),
         include_archived: bool = Query(default=False),
+        archived_only: bool = Query(default=False),
+        host_id: str | None = Query(default=None),
+        created_after: int | None = Query(default=None, ge=0),
+        created_before: int | None = Query(default=None, ge=0),
+        updated_after: int | None = Query(default=None, ge=0),
+        updated_before: int | None = Query(default=None, ge=0),
+        active_after: int | None = Query(default=None, ge=0),
+        active_before: int | None = Query(default=None, ge=0),
+        archived_after: int | None = Query(default=None, ge=0),
+        archived_before: int | None = Query(default=None, ge=0),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
@@ -1092,14 +1161,16 @@ def register_core_routes(
             have distinct bundles. ``None`` disables the filter.
         :param order: Sort direction, ``"desc"`` (newest-first)
             or ``"asc"`` (oldest-first).
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Column to sort on: ``"created_at"``,
+            ``"updated_at"``, ``"archived_at"``, or ``"title"``.
         :param search_query: Case-insensitive substring filter on
             the session title or conversation content. ``None``
             or empty string disables the filter. A session
             matches if its title contains the query or any of
             its conversation items' text does. Powers the
             sidebar's session search.
+        :param search_scope: Limit search to ``"title"`` or ``"content"``;
+            ``"all"`` keeps the existing title/content/workspace behavior.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions
             are returned alongside active ones (the sidebar groups
@@ -1185,6 +1256,17 @@ def register_core_routes(
             shared_only_param = False
             include_archived_param = include_archived
             archived_only_param = False
+        # Keep the legacy archive parameters used by Archive Library while
+        # accepting upstream's visibility tabs. An explicit archive-only query
+        # wins over the default "all" visibility.
+        if archived_only:
+            include_archived_param = True
+            archived_only_param = True
+        if sort_by == "archived_at" and not archived_only_param:
+            raise OmnigentError(
+                "sort_by='archived_at' requires an archived-only view",
+                code=ErrorCode.INVALID_INPUT,
+            )
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -1203,8 +1285,18 @@ def register_core_routes(
             order=order,
             sort_by=sort_by,
             search_query=normalized_query,
+            search_scope=search_scope,
             include_archived=include_archived_param,
             archived_only=archived_only_param,
+            host_id=host_id,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            updated_before=updated_before,
+            active_after=active_after,
+            active_before=active_before,
+            archived_after=archived_after,
+            archived_before=archived_before,
             project=project,
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.
@@ -1224,6 +1316,9 @@ def register_core_routes(
         # The tasks table has been removed — status comes exclusively from
         # the relay-fed ``_session_status_cache``.
         unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
+        agent_template_ids = await asyncio.to_thread(
+            agent_store.get_template_ids, unique_agent_ids
+        )
         perms_by_conv: dict[str, list[SessionPermission]]
         if permission_store is not None:
             perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
@@ -1253,10 +1348,22 @@ def register_core_routes(
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
+        child_rows = (
+            await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
+            if all_child_ids
+            else {}
+        )
+        activity_unverified_child_ids = {
+            child_id
+            for child_id, child in child_rows.items()
+            if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+        }
         items: list[SessionListItem] = [
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                agent_template_ids=agent_template_ids,
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
@@ -1264,6 +1371,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                activity_unverified_child_ids=activity_unverified_child_ids,
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -1373,6 +1481,9 @@ def register_core_routes(
         if not convs:
             return []
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
+        agent_template_ids = await asyncio.to_thread(
+            agent_store.get_template_ids, unique_agent_ids
+        )
         conv_ids = [c.id for c in convs]
         agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
             asyncio.to_thread(agent_store.get_names, unique_agent_ids),
@@ -1383,10 +1494,22 @@ def register_core_routes(
             _comments_fingerprints_for(conv_ids),
         )
         pending_counts = pending_elicitations.counts_for(conv_ids)
+        all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
+        child_rows = (
+            await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
+            if all_child_ids
+            else {}
+        )
+        activity_unverified_child_ids = {
+            child_id
+            for child_id, child in child_rows.items()
+            if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+        }
         items = [
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                agent_template_ids=agent_template_ids,
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
@@ -1394,6 +1517,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                activity_unverified_child_ids=activity_unverified_child_ids,
             )
             for conv in convs
         ]
@@ -1867,7 +1991,7 @@ def register_core_routes(
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project:
+        elif body.archived is not None or body.archive_locked is not None or set_project:
             required_level = LEVEL_OWNER
         elif set_share_workspace:
             required_level = LEVEL_MANAGE
@@ -2161,6 +2285,23 @@ def register_core_routes(
                     code=ErrorCode.NOT_FOUND,
                 )
 
+        if body.archive_locked is not None:
+            _lock_now = int(time.time())
+            _lock_result = await asyncio.to_thread(
+                conversation_store.set_archive_lock,
+                session_id,
+                body.archive_locked,
+                updated_at=_lock_now,
+                stale_before=_lock_now - DELETION_CLAIM_STALE_AFTER_S,
+            )
+            if _lock_result == "not_found":
+                raise _session_not_found()
+            if _lock_result == "busy":
+                raise OmnigentError(
+                    "Session deletion is already in progress.",
+                    code=ErrorCode.CONFLICT,
+                )
+
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2330,10 +2471,16 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+        _labels_to_clear: list[str] = []
+        for _clear_key in (
+            PROJECT_LABEL_KEY,
+            pinned_label_key(user_id),
+        ):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
-                await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
+                _labels_to_clear.append(_clear_key)
+        for _clear_key in _labels_to_clear:
+            await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         # Only when the switch was forwarded: a silent PATCH writes no label,
@@ -2641,6 +2788,7 @@ def register_core_routes(
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.add("omnigent:agent-template-id")
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -3010,6 +3158,7 @@ def register_core_routes(
         _invalidate_runner_backed_snapshot_state(
             session_id, cancel_inflight=True, drop_model_options=True
         )
+        _session_todos_cache.pop(session_id, None)
 
         # Tell every connected client the binding changed so they re-derive
         # session state (presentation labels, bound agent) from a fresh

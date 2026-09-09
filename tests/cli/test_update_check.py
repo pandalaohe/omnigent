@@ -2306,6 +2306,10 @@ def test_split_vcs_url_strips_prefix_and_separates_revision() -> None:
         "https://github.com/o/omnigent.git",
         "main",
     )
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git@local/host-custom") == (
+        "https://github.com/o/omnigent.git",
+        "local/host-custom",
+    )
 
 
 def test_split_vcs_url_strips_pip_fragment() -> None:
@@ -2338,6 +2342,10 @@ def test_split_vcs_url_ssh_userinfo_is_not_a_revision() -> None:
     assert _split_vcs_url("git+ssh://git@github.com/o/omnigent.git@v1") == (
         "ssh://git@github.com/o/omnigent.git",
         "v1",
+    )
+    assert _split_vcs_url("git+ssh://git@github.com/o/omnigent.git@feature/update") == (
+        "ssh://git@github.com/o/omnigent.git",
+        "feature/update",
     )
 
 

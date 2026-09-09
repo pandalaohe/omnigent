@@ -17,12 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  WorkspacePicker,
-  isNavigablePath,
-  parentOf,
-  resolveWorkspacePath,
-} from "./WorkspacePicker";
+import { HostWorkspacePicker, isNavigablePath, parentOf } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
 import { normalizeWorkspacePath } from "./NewChatDialog";
@@ -270,7 +265,7 @@ export function SwitchHostDialog({
                     dropdownDisabled={browsing}
                   />
                   {browsing && (
-                    <WorkspacePicker
+                    <HostWorkspacePicker
                       key={browseNonce}
                       hostId={selectedHostId}
                       initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}

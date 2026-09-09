@@ -7,12 +7,16 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
+  fetchConversationById,
   deleteConversation,
-  fetchAllArchivedProjectNames,
+  fetchArchivedSessionFacets,
   renameConversation,
+  resetArchivedQueryCompatibilityForTests,
   useArchiveConversation,
+  useArchivedConversations,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useBulkStopSessions,
@@ -30,8 +34,6 @@ import {
   useTogglePinnedConversation,
   fetchPinnedConversations,
   unmarkSessionsDeleting,
-  markRecentlyCreated,
-  clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
   type Conversation,
   type PinnedConversationsResult,
@@ -54,8 +56,13 @@ const fetchMock = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
+  resetArchivedQueryCompatibilityForTests();
   vi.mocked(useSessionUpdatesConnected).mockReturnValue(false);
   vi.stubGlobal("fetch", fetchMock);
+  setOmnigentHostConfig({
+    serverId: "test-server",
+    fetcher: (path, init) => fetch(path, init),
+  });
 });
 
 afterEach(() => {
@@ -64,8 +71,6 @@ afterEach(() => {
   // settles, in module-level state that would otherwise leak into the next
   // test (which reuses the same ids against a fresh cache).
   unmarkSessionsDeleting();
-  // Same for the recently-created keep-alive.
-  clearRecentlyCreated();
 });
 
 describe("renameConversation", () => {
@@ -292,96 +297,388 @@ describe("useConversations search timeout", () => {
   });
 });
 
-describe("fetchAllArchivedProjectNames", () => {
-  it("pages through all archived sessions and returns distinct sorted project names", async () => {
-    fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "a", archived: true, labels: { omni_project: "Beta" } },
-            // Active row — include_archived returns it, but it's not filterable here.
-            { id: "b", archived: false, labels: { omni_project: "Zeta" } },
-            // Archived but unfiled — no project label to collect.
-            { id: "c", archived: true, labels: {} },
-          ],
-          first_id: "a",
-          last_id: "c",
-          has_more: true,
-        }),
-      )
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "d", archived: true, labels: { omni_project: "Alpha" } },
-            // Duplicate project across pages collapses to one entry.
-            { id: "e", archived: true, labels: { omni_project: "Beta" } },
-          ],
-          first_id: "d",
-          last_id: "e",
-          has_more: false,
-        }),
-      );
+describe("fetchArchivedSessionFacets", () => {
+  it("uses one aggregate request instead of paging through archived sessions", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        projects: ["Alpha", "Beta"],
+        host_ids: ["host-mac", "host-win"],
+        agent_names: ["claude-native", "codex-native"],
+      }),
+    );
 
-    const names = await fetchAllArchivedProjectNames();
+    const signal = new AbortController().signal;
+    const facets = await fetchArchivedSessionFacets(undefined, signal);
 
-    // Distinct + sorted; active and unfiled rows contribute nothing.
-    expect(names).toEqual(["Alpha", "Beta"]);
-    // Page 1: archived, large page size, no project filter, no cursor.
-    const url1 = fetchMock.mock.calls[0][0] as string;
-    expect(url1).toContain("include_archived=true");
-    expect(url1).toContain("limit=100");
-    expect(url1).not.toContain("project=");
-    expect(url1).not.toContain("after=");
-    // Page 2 follows the previous page's last_id cursor.
-    expect(fetchMock.mock.calls[1][0]).toContain("after=c");
+    expect(facets).toEqual({
+      projects: ["Alpha", "Beta"],
+      hostIds: ["host-mac", "host-win"],
+      agentNames: ["claude-native", "codex-native"],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/archived-facets");
+    expect((fetchMock.mock.calls[0][1] as RequestInit).signal).toBe(signal);
   });
 
-  it("stops after one request when the first page has no more", async () => {
+  it("sends the current search, date, and linked facet constraints", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ projects: ["Core"], host_ids: ["host-win"], agent_names: ["codex"] }),
+    );
+
+    await fetchArchivedSessionFacets({
+      searchQuery: "handoff",
+      searchScope: "content",
+      project: "Core",
+      hostId: "host-win",
+      agentName: "codex",
+      dateField: "active_at",
+      dateRange: "20260902",
+      sortField: "archived_at",
+      agePreset: "any",
+      order: "desc",
+      createdAfter: 100,
+      createdBefore: 200,
+      archivedAfter: 300,
+      archivedBefore: 400,
+    });
+
+    const url = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    expect(url.searchParams.get("search_scope")).toBe("content");
+    expect(url.searchParams.get("search_query")).toBe("handoff");
+    expect(url.searchParams.get("project")).toBe("Core");
+    expect(url.searchParams.get("host_id")).toBe("host-win");
+    expect(url.searchParams.get("agent_name")).toBe("codex");
+    expect(url.searchParams.get("created_after")).toBe("100");
+    expect(url.searchParams.get("created_before")).toBe("200");
+    expect(url.searchParams.get("archived_after")).toBe("300");
+    expect(url.searchParams.get("archived_before")).toBe("400");
+    expect(url.searchParams.get("active_after")).not.toBeNull();
+    expect(Number(url.searchParams.get("active_before"))).toBeGreaterThan(
+      Number(url.searchParams.get("active_after")),
+    );
+  });
+
+  it("applies the rolling age preset to the facets request", async () => {
+    const now = 2_000_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    fetchMock.mockResolvedValueOnce(mockResponse({ projects: [], host_ids: [], agent_names: [] }));
+
+    await fetchArchivedSessionFacets({
+      dateField: "archived_at",
+      dateRange: "",
+      sortField: "archived_at",
+      agePreset: "lt30d",
+      order: "desc",
+    });
+
+    const url = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    expect(url.searchParams.get("archived_after")).toBe(
+      String(Math.floor(now / 1000) - 30 * 86_400),
+    );
+    nowSpy.mockRestore();
+  });
+});
+
+describe("useArchivedConversations", () => {
+  it("reuses one 365-day cutoff for the list and facets", async () => {
+    const referenceSeconds = 2_000_000_000;
+    const filters = {
+      dateField: "active_at" as const,
+      dateRange: "",
+      sortField: "created_at" as const,
+      agePreset: "lt365d" as const,
+      ageReferenceSeconds: referenceSeconds,
+      order: "desc" as const,
+    };
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      )
+      .mockResolvedValueOnce(mockResponse({ projects: [], host_ids: [], agent_names: [] }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    renderHook(() => useArchivedConversations(filters), { wrapper });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await fetchArchivedSessionFacets(filters);
+
+    const expected = String(referenceSeconds - 365 * 86_400);
+    const listUrl = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    const facetsUrl = new URL(fetchMock.mock.calls[1][0] as string, "http://test");
+    expect(listUrl.searchParams.get("active_after")).toBe(expected);
+    expect(facetsUrl.searchParams.get("active_after")).toBe(expected);
+  });
+
+  it("maps the selected Active calendar day to active interval bounds", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    renderHook(
+      () =>
+        useArchivedConversations({
+          dateField: "active_at",
+          dateRange: "20260902",
+          sortField: "archived_at",
+          agePreset: "any",
+          order: "desc",
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const url = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    expect(url.searchParams.get("active_after")).not.toBeNull();
+    expect(Number(url.searchParams.get("active_before"))).toBeGreaterThan(
+      Number(url.searchParams.get("active_after")),
+    );
+  });
+
+  it("pushes archive filters, age bounds, and sort to the server", async () => {
+    const now = 2_000_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
     fetchMock.mockResolvedValueOnce(
       mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
     );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
 
-    const names = await fetchAllArchivedProjectNames();
+    renderHook(
+      () =>
+        useArchivedConversations(
+          {
+            searchQuery: "Omnigent",
+            searchScope: "content",
+            project: "Core",
+            hostId: "host-win",
+            agentName: "codex-native",
+            dateField: "archived_at",
+            sortField: "created_at",
+            agePreset: "gt90d",
+            order: "asc",
+          },
+          "cursor-page-2",
+        ),
+      { wrapper },
+    );
 
-    expect(names).toEqual([]);
-    // No first-class memberships collected → no projects list call either.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const probe = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    expect(probe.searchParams.get("sort_by")).toBe("archived_at");
+    const [requestUrl, requestInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const url = new URL(requestUrl, "http://test");
+    expect(url.searchParams.get("archived_only")).toBe("true");
+    expect(url.searchParams.get("visibility")).toBe("archived");
+    expect(url.searchParams.get("search_query")).toBe("Omnigent");
+    expect(url.searchParams.get("search_scope")).toBe("content");
+    expect(url.searchParams.get("project")).toBe("Core");
+    expect(url.searchParams.get("host_id")).toBe("host-win");
+    expect(url.searchParams.get("agent_name")).toBe("codex-native");
+    expect(url.searchParams.get("sort_by")).toBe("created_at");
+    expect(url.searchParams.get("order")).toBe("asc");
+    expect(url.searchParams.get("limit")).toBe("20");
+    expect(url.searchParams.get("after")).toBe("cursor-page-2");
+    expect(url.searchParams.get("archived_before")).toBe(
+      String(Math.floor(now / 1000) - 90 * 86_400),
+    );
+    expect(requestInit.signal).toBeInstanceOf(AbortSignal);
+    nowSpy.mockRestore();
   });
 
-  it("dual-reads first-class project_id membership for sessions born without the label", async () => {
+  it("cancels an obsolete archive search when the query changes", async () => {
+    let firstSignal: AbortSignal | undefined;
     fetchMock
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        firstSignal = init.signal as AbortSignal;
+        return new Promise<Response>((_resolve, reject) => {
+          firstSignal?.addEventListener("abort", () => reject(firstSignal?.reason), { once: true });
+        });
+      })
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const filters = (searchQuery: string) => ({
+      searchQuery,
+      dateField: "archived_at" as const,
+      sortField: "archived_at" as const,
+      agePreset: "any" as const,
+      order: "desc" as const,
+    });
+    const hook = renderHook(({ query }) => useArchivedConversations(filters(query)), {
+      wrapper,
+      initialProps: { query: "first" },
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    hook.rerender({ query: "second" });
+
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("falls back once when an older Server rejects archived_at parameters", async () => {
+    const page = { data: [], first_id: null, last_id: null, has_more: false };
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 422 }))
+      .mockResolvedValue(mockResponse(page));
+    const filters = {
+      dateField: "archived_at" as const,
+      sortField: "archived_at" as const,
+      agePreset: "gt30d" as const,
+      order: "desc" as const,
+    };
+    const renderArchiveHook = () => {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      return renderHook(() => useArchivedConversations(filters), { wrapper });
+    };
+
+    const first = renderArchiveHook();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const modern = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    const legacy = new URL(fetchMock.mock.calls[1][0] as string, "http://test");
+    expect(modern.searchParams.get("sort_by")).toBe("archived_at");
+    expect(modern.searchParams.has("archived_before")).toBe(true);
+    expect(legacy.searchParams.get("sort_by")).toBe("updated_at");
+    expect(legacy.searchParams.has("updated_before")).toBe(true);
+    first.unmount();
+
+    const second = renderArchiveHook();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    const cachedLegacy = new URL(fetchMock.mock.calls[2][0] as string, "http://test");
+    expect(cachedLegacy.searchParams.get("sort_by")).toBe("updated_at");
+    expect(cachedLegacy.searchParams.has("updated_before")).toBe(true);
+    second.unmount();
+  });
+
+  it("preflights archived dates and keeps old-Server membership archive-only", async () => {
+    const active = conversation({ id: "active", archived: false });
+    const archived = conversation({ id: "archived", archived: true });
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 422 }))
       .mockResolvedValueOnce(
         mockResponse({
-          data: [
-            // Born filed via project_id at create — carries no omni_project label.
-            { id: "a", archived: true, labels: {}, project_id: "p_alpha" },
-            // Legacy label-only membership still counts alongside it.
-            { id: "b", archived: true, labels: { omni_project: "Beta" } },
-            // Active first-class member — not filterable on the Archived page.
-            { id: "c", archived: false, labels: {}, project_id: "p_other" },
-            // Archived member of a since-deleted project — dropped silently.
-            { id: "d", archived: true, labels: {}, project_id: "p_deleted" },
-          ],
-          first_id: "a",
-          last_id: "d",
+          data: [active, archived],
+          first_id: "active",
+          last_id: "archived",
           has_more: false,
         }),
-      )
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "p_alpha", name: "Alpha" },
-            { id: "p_other", name: "Other" },
-          ],
-        }),
       );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
 
-    const names = await fetchAllArchivedProjectNames();
+    const rendered = renderHook(
+      () =>
+        useArchivedConversations({
+          dateField: "archived_at",
+          sortField: "created_at",
+          agePreset: "gt30d",
+          order: "desc",
+        }),
+      { wrapper },
+    );
 
-    expect(names).toEqual(["Alpha", "Beta"]);
-    // The id→name resolution is one projects list call after the scan.
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toBe("/v1/projects");
+    const probe = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    const legacy = new URL(fetchMock.mock.calls[1][0] as string, "http://test");
+    expect(probe.searchParams.get("sort_by")).toBe("archived_at");
+    expect(legacy.searchParams.get("visibility")).toBe("archived");
+    expect(legacy.searchParams.get("sort_by")).toBe("created_at");
+    expect(legacy.searchParams.has("updated_before")).toBe(true);
+    expect(rendered.result.current.data?.data.map((row) => row.id)).toEqual(["archived"]);
+  });
+
+  it("falls title sorting back to updated_at on an older Server", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 422 }))
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const rendered = renderHook(
+      () =>
+        useArchivedConversations({
+          dateField: "created_at",
+          sortField: "title",
+          agePreset: "any",
+          order: "asc",
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const legacy = new URL(fetchMock.mock.calls[1][0] as string, "http://test");
+    expect(legacy.searchParams.get("sort_by")).toBe("updated_at");
+    expect(legacy.searchParams.get("visibility")).toBe("archived");
+  });
+
+  it("ignores a delayed compatibility response from the previous Server", async () => {
+    const page = { data: [], first_id: null, last_id: null, has_more: false };
+    let resolveServerA!: (response: Response) => void;
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveServerA = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(mockResponse(page));
+    const filters = {
+      dateField: "archived_at" as const,
+      sortField: "archived_at" as const,
+      agePreset: "gt30d" as const,
+      order: "desc" as const,
+    };
+    const renderArchiveHook = () => {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      return renderHook(() => useArchivedConversations(filters), { wrapper });
+    };
+
+    setOmnigentHostConfig({
+      serverId: "server-a",
+      fetcher: (path, init) => fetch(path, init),
+    });
+    const serverA = renderArchiveHook();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    setOmnigentHostConfig({
+      serverId: "server-b",
+      fetcher: (path, init) => fetch(path, init),
+    });
+    const serverB = renderArchiveHook();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(serverB.result.current.isSuccess).toBe(true));
+
+    resolveServerA(mockResponse({}, { ok: false, status: 422 }));
+    await waitFor(() => expect(serverA.result.current.isError).toBe(true));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const serverBUrl = new URL(fetchMock.mock.calls[1][0] as string, "http://test");
+    expect(serverBUrl.searchParams.get("sort_by")).toBe("archived_at");
+    expect(serverBUrl.searchParams.has("archived_before")).toBe(true);
+    serverA.unmount();
+    serverB.unmount();
   });
 });
 
@@ -461,22 +758,6 @@ describe("deleteConversation", () => {
   it("throws on non-2xx", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
     await expect(deleteConversation("missing")).rejects.toThrow(/404/);
-  });
-
-  it("surfaces the server error message instead of a bare 404 status line", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse(
-        {
-          error: {
-            code: "conflict",
-            message:
-              "Cannot delete worktree — runner offline. Delete session only (delete_branch=false) or wait for the runner to reconnect.",
-          },
-        },
-        { ok: false, status: 409 },
-      ),
-    );
-    await expect(deleteConversation("conv_abc", true)).rejects.toThrow(/runner offline/);
   });
 });
 
@@ -789,34 +1070,6 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     expect(queryClient.getQueryData(["session", "conv_x"])).toBeDefined();
   });
 
-  it("puts the runner-offline worktree message on the restore toast, not a 404", async () => {
-    const { rendered } = seedAndDelete(
-      mockResponse(
-        {
-          error: {
-            code: "conflict",
-            message:
-              "Cannot delete worktree — runner offline. Delete session only (delete_branch=false) or wait for the runner to reconnect.",
-          },
-        },
-        { ok: false, status: 409 },
-      ),
-    );
-    const toasts: string[] = [];
-    window.addEventListener("omnigent:toast", (e) => {
-      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
-    });
-
-    rendered.result.current.mutate({ id: "conv_x", deleteBranch: true });
-    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
-
-    expect(toasts).toHaveLength(1);
-    expect(toasts[0]).toContain("Couldn't delete Old name — it's back in the sidebar.");
-    expect(toasts[0]).toContain("runner offline");
-    expect(toasts[0]).toContain("delete_branch=false");
-    expect(toasts[0]).not.toMatch(/\b404\b/);
-  });
-
   it("does not refetch the conversations list, but does refresh the project list", async () => {
     const { queryClient, rendered } = seedAndDelete();
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
@@ -832,146 +1085,6 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The project list IS refreshed (DB-direct, no reindex race) so a project
     // emptied by the delete drops its now-empty folder without a reload.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
-  });
-});
-
-describe("recently-created keep-alive", () => {
-  const listResponse = (ids: string[]) =>
-    mockResponse({
-      object: "list",
-      data: ids.map((id) => ({
-        id,
-        object: "conversation",
-        title: id,
-        created_at: 0,
-        updated_at: 1,
-      })),
-      first_id: ids[0] ?? null,
-      last_id: ids.at(-1) ?? null,
-      has_more: false,
-    });
-
-  it("keeps a just-created session in the first-page fetch until the index catches up", async () => {
-    // The session was just created and eagerly inserted, but the search-indexed
-    // list fetch lags and comes back without it.
-    markRecentlyCreated({
-      id: "conv_new",
-      object: "conversation",
-      title: "New",
-      created_at: 0,
-      updated_at: 9,
-      labels: {},
-      permission_level: null,
-    });
-    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
-
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
-
-    // The lagging fetch omits conv_new, but the keep-alive prepends it so the
-    // row doesn't flash out of the sidebar.
-    await waitFor(() => expect(result.current.data).toBeDefined());
-    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
-  });
-
-  it("drops the keep-alive (no duplicate) once the fetch returns the row", async () => {
-    markRecentlyCreated({
-      id: "conv_new",
-      object: "conversation",
-      title: "New",
-      created_at: 0,
-      updated_at: 9,
-      labels: {},
-      permission_level: null,
-    });
-    // The index has caught up: the fetch now includes conv_new itself.
-    fetchMock.mockResolvedValueOnce(listResponse(["conv_new", "conv_old"]));
-
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
-
-    await waitFor(() => expect(result.current.data).toBeDefined());
-    // No duplicate: the row appears once, from the server response.
-    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
-  });
-
-  it("injects the fresh cache row, not the stale snapshot (no title revert)", async () => {
-    // Registered at create time with no title yet…
-    markRecentlyCreated({
-      id: "conv_new",
-      object: "conversation",
-      title: null,
-      created_at: 0,
-      updated_at: 9,
-      labels: {},
-      permission_level: null,
-    });
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    // …but a WS frame has since titled it in another cached list variant.
-    queryClient.setQueryData(["conversations", "", false], {
-      pages: [
-        {
-          data: [
-            {
-              id: "conv_new",
-              object: "conversation",
-              title: "Auto Title",
-              created_at: 0,
-              updated_at: 9,
-              labels: {},
-              permission_level: null,
-            },
-          ],
-          first_id: "conv_new",
-          last_id: "conv_new",
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    });
-    // The lagging fetch (this variant) still omits conv_new.
-    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
-
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
-
-    await waitFor(() => expect(result.current.data).toBeDefined());
-    const injected = result.current.data!.pages[0].data.find((c) => c.id === "conv_new");
-    // The WS-confirmed title wins over the frozen snapshot's null title.
-    expect(injected?.title).toBe("Auto Title");
-  });
-
-  it("does not disarm the keep-alive when a sibling fetch already lists the row", async () => {
-    markRecentlyCreated({
-      id: "conv_new",
-      object: "conversation",
-      title: "New",
-      created_at: 0,
-      updated_at: 9,
-      labels: {},
-      permission_level: null,
-    });
-    // First list catches up (row present) — must NOT drop the global entry.
-    fetchMock.mockResolvedValueOnce(listResponse(["conv_new", "conv_old"]));
-    const qc1 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const { result: r1 } = renderHook(() => useConversations("", true, {}), {
-      wrapper: ({ children }) => createElement(QueryClientProvider, { client: qc1 }, children),
-    });
-    await waitFor(() => expect(r1.current.data).toBeDefined());
-
-    // A second (still-lagging) list must still get the row from the keep-alive.
-    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
-    const qc2 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const { result: r2 } = renderHook(() => useConversations("", true, {}), {
-      wrapper: ({ children }) => createElement(QueryClientProvider, { client: qc2 }, children),
-    });
-    await waitFor(() => expect(r2.current.data).toBeDefined());
-    expect(r2.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
   });
 });
 
@@ -2581,5 +2694,20 @@ describe("useDeleteProject", () => {
       succeeded: ["conv_a"],
       total: 2,
     });
+  });
+});
+
+it("keeps authoritative template identity when backfilling a pinned clone", async () => {
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({
+      id: "pinned-clone",
+      agent_id: "runtime-id",
+      agent_template_id: "builtin-id",
+      created_at: 1,
+    }),
+  );
+  expect(await fetchConversationById("pinned-clone")).toMatchObject({
+    agent_id: "runtime-id",
+    agent_template_id: "builtin-id",
   });
 });

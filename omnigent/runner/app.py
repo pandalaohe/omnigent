@@ -136,7 +136,11 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
+from omnigent.runner.native.interrupt import (
+    MarkSubagentTerminalAndWake,
+    NativeInterruptRunner,
+    native_session_has_active_work,
+)
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -364,6 +368,25 @@ async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
     return _server_version
 
 
+async def _fetch_current_session_labels(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> dict[str, str] | None:
+    """Return current Server labels, or ``None`` when they cannot be trusted."""
+    labels_path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/labels"
+    try:
+        response = await server_client.get(labels_path, timeout=1.0)
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if response.status_code != 200 or not isinstance(payload, Mapping):
+        return None
+    labels = payload.get("labels")
+    if not isinstance(labels, Mapping):
+        return None
+    return {str(key): str(value) for key, value in labels.items()}
+
+
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     """
     Log *exc* in full and return a generic detail string safe for clients.
@@ -417,7 +440,7 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 
 _NO_BODY_STATUS_CODES = {204, 304}
-_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "stopped", "killed"})
 # Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
 # that has produced NO edge at all (no running/waiting/terminal status, no
 # in-flight response) within this window never started — fail it loudly
@@ -468,6 +491,7 @@ _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 # ``sys_read_inbox`` drain writes once it has consumed that turn's result.
 SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
 SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
+SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
 # wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
@@ -1849,26 +1873,38 @@ async def _fetch_latest_assistant_text(
     server_client: httpx.AsyncClient, session_id: str
 ) -> str | None:
     """
-    Return the newest assistant message text of a session, reading newest first.
+    Return the newest assistant message text from the latest turn.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param session_id: Session to read, e.g. ``"conv_child456"``.
-    :returns: Joined text blocks of the newest assistant message (empty when
-        that message carries no text, matching live delivery), or ``None``
-        when the transcript holds no assistant message.
+    Reading newest first stops at the first non-meta user message or tool item:
+    crossing that boundary would reuse an assistant answer from an older turn.
+    Meta messages do not start a turn and are skipped.
+
+    :returns: Joined text blocks of the latest turn's newest assistant message
+        (empty when that message carries no text, matching live delivery), or
+        ``None`` when the latest turn has no assistant message.
     :raises _SubagentRecoveryReadError: When a page read fails.
     """
     params: dict[str, str] = {"limit": "100", "order": "desc"}
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
-            if item.get("type") != "message" or item.get("role") != "assistant":
+            item_type = item.get("type")
+            if item_type == "message" and item.get("is_meta") is True:
                 continue
-            return "\n".join(
-                block["text"]
-                for block in item.get("content", [])
-                if block.get("type") in {"output_text", "text"} and block.get("text")
-            )
+            if item_type == "message":
+                if item.get("role") == "assistant":
+                    return "\n".join(
+                        block["text"]
+                        for block in item.get("content", [])
+                        if block.get("type") in {"output_text", "text"} and block.get("text")
+                    )
+                if item.get("role") == "user":
+                    return None
+                continue
+            if item_type in {"function_call", "function_call_output"}:
+                return None
         if not page.get("has_more") or not page.get("last_id"):
             return None
         params["after"] = page["last_id"]
@@ -1919,6 +1955,10 @@ async def _recover_subagent_results_from_server(
             output = message if isinstance(message, str) else None
         else:
             output = await _fetch_latest_assistant_text(server_client, child_id)
+            if output is None and status == "stopped":
+                output = "Sub-agent stopped before producing a reliable final result."
+            elif output is None and status == "killed":
+                output = "Sub-agent was killed before producing a reliable final result."
         entry = register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
@@ -1979,8 +2019,13 @@ def mark_subagent_work_terminal(
         # and the error text is silently dropped. A parent may act on the false
         # success before the re-delivery arrives — that window is inherent to
         # the edge race; re-delivery is the mitigation, not a prevention.
-        if status == "failed" and entry.status == "completed":
+        if status in {"failed", "stopped", "killed"} and entry.status == "completed":
             entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            return _deliver_subagent_completion(entry)
+        if status == entry.status and output is not None and output != entry.output:
             entry.output = output
             entry.completed_at = time.time()
             entry.delivered = False
@@ -1996,7 +2041,7 @@ def mark_subagent_work_terminal(
         # already-recorded "completed"/"failed" still awaiting delivery, and a
         # trailing quiescence "completed" must not launder a recorded "failed".
         keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
-            status == "completed" and entry.status == "failed"
+            status == "completed" and entry.status in {"failed", "stopped", "killed"}
         )
         if not keep_recorded:
             entry.status = status
@@ -2439,6 +2484,8 @@ def _session_status_to_task_status(status: object) -> str | None:
         return "completed"
     if status == "failed":
         return "failed"
+    if status in ("completed", "stopped", "killed"):
+        return status
     return None
 
 
@@ -3099,10 +3146,16 @@ def create_runner_app(
         session_id: str,
         status: str,
         blocked_on: str | None = None,
+        background_task_count: int | None = None,
+        background_tasks: list[dict[str, object]] | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if background_task_count is not None:
+            event["background_task_count"] = background_task_count
+        if background_tasks is not None:
+            event["background_tasks"] = background_tasks
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -4210,7 +4263,13 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
-        status = "running" if session_id in _active_turns else "idle"
+        status = (
+            "running"
+            if session_id in _active_turns
+            else _native_pane_status.get(session_id, "idle")
+        )
+        if status in {"completed", "stopped", "killed"}:
+            status = "idle"
         return JSONResponse(
             status_code=201,
             content={
@@ -4328,7 +4387,11 @@ def create_runner_app(
                 },
             )
         has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
-        status = "running" if has_turn else "idle"
+        # Native prompt injection returns before the CLI finishes its turn.
+        # Serve the same observed status that the live stream publishes.
+        status = "running" if has_turn else _native_pane_status.get(session_id, "idle")
+        if status in {"completed", "stopped", "killed"}:
+            status = "idle"
         agent_id = _session_agent_ids.get(session_id)
         if agent_id is None:
             return JSONResponse(
@@ -4366,6 +4429,91 @@ def create_runner_app(
                 "permission_level": None,
             },
         )
+
+    @app.get("/v1/sessions/{session_id}/native_subagent_status")
+    async def get_native_subagent_status(session_id: str) -> JSONResponse:
+        """Return read-only Host evidence for this Claude-native parent's children."""
+        if process_manager is None:
+            return JSONResponse(
+                status_code=501,
+                content={
+                    "error": "not_implemented",
+                    "detail": "Native sub-agent status needs a HarnessProcessManager.",
+                },
+            )
+        harness = _session_harness_name(session_id)
+        if harness is not None and harness != "claude-native":
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "not_found",
+                    "detail": f"Session '{session_id}' is not a Claude-native parent.",
+                },
+            )
+
+        from omnigent.claude_native_status_probe import (
+            NativeSubagentProbeError,
+            probe_native_subagent_status,
+        )
+
+        # The bridge can outlive HarnessProcessManager; current Server labels
+        # fence it against a stale session binding.
+        labels = await _fetch_current_session_labels(server_client, session_id)
+        if labels is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "server_labels_unavailable",
+                    "detail": "Current Server session labels are unavailable.",
+                },
+            )
+        if labels.get("omnigent.wrapper") != "claude-code-native-ui":
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "not_found",
+                    "detail": f"Session '{session_id}' is not a Claude-native parent.",
+                },
+            )
+        bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            server_client=server_client,
+            session_id=session_id,
+            session_labels=labels,
+        )
+        try:
+            result = await asyncio.to_thread(
+                probe_native_subagent_status,
+                parent_session_id=session_id,
+                bridge_id=bridge_id,
+            )
+        except NativeSubagentProbeError as exc:
+            return JSONResponse(
+                status_code=exc.http_status,
+                content={"error": exc.code, "detail": exc.detail},
+            )
+        terminal_registry_for_probe = resource_registry.terminal_registry
+        for child in result["children"]:
+            if child["status"] != "terminal":
+                continue
+            child_id = child["server_session_id"]
+            has_independent_terminal = (
+                terminal_registry_for_probe is not None
+                and terminal_registry_for_probe.get(child_id, "claude", "main") is not None
+            )
+            if (
+                process_manager.has_session(child_id)
+                or process_manager.has_active_turn(child_id)
+                or child_id in _active_turns
+                or _native_pane_status.get(child_id) in {"running", "waiting"}
+                or has_independent_terminal
+            ):
+                # The parent evidence proves the original Task/Agent dispatch
+                # ended. It cannot terminalize a child the user later resumed
+                # as its own conversation/runtime.
+                child["status"] = "unverified"
+                child["terminal_status"] = None
+                child["reason"] = "independent_child_runtime_present"
+        return JSONResponse(status_code=200, content={**result, "bridge_id": bridge_id})
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
@@ -7056,6 +7204,9 @@ def create_runner_app(
         publish_event=_publish_event,
         mark_subagent_terminal_and_wake=_mark_subagent_terminal_and_wake,
         session_sub_agent_names=_session_sub_agent_names,
+        session_has_active_work=lambda session_id: native_session_has_active_work(
+            _native_pane_status.get(session_id), session_id in _active_turns
+        ),
         codex_bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
@@ -8662,17 +8813,56 @@ def create_runner_app(
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
-            if status in ("running", "waiting", "idle", "failed"):
-                resource_registry.note_external_session_status(conversation_id, status)
+            if isinstance(data, dict) and status in (
+                "running",
+                "waiting",
+                "idle",
+                "completed",
+                "failed",
+                "stopped",
+                "killed",
+            ):
+                raw_count = data.get("background_task_count")
+                bg_count = (
+                    raw_count
+                    if isinstance(raw_count, int)
+                    and not isinstance(raw_count, bool)
+                    and raw_count >= 0
+                    else None
+                )
+                raw_tasks = data.get("background_tasks")
+                bg_tasks: list[dict[str, object]] | None = (
+                    [
+                        {
+                            key: value
+                            for key, value in task.items()
+                            if key in {"id", "type", "status", "command", "description"}
+                            and isinstance(value, str)
+                        }
+                        for task in raw_tasks[:100]
+                        if isinstance(task, dict)
+                    ]
+                    if isinstance(raw_tasks, list)
+                    else None
+                )
+                resource_registry.note_external_session_status(
+                    conversation_id,
+                    status,
+                    background_task_count=bg_count,
+                    background_tasks=bg_tasks,
+                )
+                # These edges are already published by the server; retain them
+                # for GET/rebind without emitting a second completion edge.
+                _native_pane_status[conversation_id] = status
                 _fan_out_child_delta_to_parent(
                     conversation_id,
                     {"type": "session.status", "status": status},
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
-            if status in ("idle", "failed"):
+            if status in ("idle", "completed", "failed", "stopped", "killed"):
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
-            if status == "idle":
+            if status in ("idle", "completed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
                     status="completed",
@@ -8683,6 +8873,13 @@ def create_runner_app(
                     conversation_id,
                     status="failed",
                     output=output or "Error: native sub-agent turn failed",
+                )
+            elif status in ("stopped", "killed"):
+                delivery_ack = _mark_subagent_terminal_and_wake(
+                    conversation_id,
+                    status=status,
+                    output=output
+                    or f"Sub-agent {status} before producing a reliable final result.",
                 )
             if delivery_ack is not None:
                 is_known = (

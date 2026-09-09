@@ -86,14 +86,14 @@ def test_plan_tracker_renders_expands_updates_and_clears(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The Plan card seeds from the snapshot, expands on click, tracks a live
-    completion, and disappears when the list is cleared.
+    """The mobile Plan strip seeds, expands, tracks live updates, and clears.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
     :returns: None.
     """
     base_url, session_id = seeded_session
+    page.set_viewport_size({"width": 390, "height": 844})
     tracker = page.locator(_TRACKER)
 
     # 1. The plan exists BEFORE the page opens: the snapshot cache must seed the
@@ -104,6 +104,8 @@ def test_plan_tracker_renders_expands_updates_and_clears(
     expect(tracker).to_contain_text("Plan")
     # 1 completed of 3 total.
     expect(tracker).to_contain_text("(1/3)")
+    expect(tracker.get_by_test_id("plan-current-task")).to_have_text("Writing the tracker")
+    assert tracker.locator("summary").bounding_box()["height"] <= 32
 
     # 2. Collapsed by default: the task list is hidden until the user expands.
     in_progress = tracker.get_by_text("Write the tracker")

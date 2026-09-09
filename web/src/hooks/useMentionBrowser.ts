@@ -1,6 +1,7 @@
-import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
+import { type RefObject, useRef, useState } from "react";
 
 import type { MentionItem, MentionState } from "@/lib/composerMentions";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -37,10 +38,15 @@ export interface MentionBrowser {
   openMentionDir: (path: string) => void;
   removeMentionedItem: (index: number) => void;
   /** Handle a key event for the open menu; returns true when it consumed it. */
-  handleKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
+  handleKeyDown: (e: MentionKeyboardEvent) => boolean;
   /** Dismiss the menu (e.g. on blur). */
   dismiss: () => void;
 }
+
+export type MentionKeyboardEvent = Pick<
+  KeyboardEvent,
+  "code" | "key" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey" | "preventDefault"
+>;
 
 /**
  * Shared ``@``-file-mention controller for the in-session composer and the
@@ -121,33 +127,38 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(-1);
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+  const handleKeyDown = (e: MentionKeyboardEvent): boolean => {
     if (!mentionOpen) return false;
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
-    if (e.key === "ArrowDown") {
+    if (eventMatchesShortcutAction(e, "nextSuggestion")) {
       e.preventDefault();
       setMentionIndex((i) => (i + 1) % mentionEntries.length);
       return true;
     }
-    if (e.key === "ArrowUp") {
+    if (eventMatchesShortcutAction(e, "previousSuggestion")) {
       e.preventDefault();
       setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
       return true;
     }
     // Enter: open a folder (drill in) or attach a file. Tab: attach the
     // highlighted row as a unit — whole folder or file — without drilling.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile && active) {
+    if (
+      eventMatchesShortcutAction(e, "applySuggestion") &&
+      e.key === "Enter" &&
+      !isMobile &&
+      active
+    ) {
       e.preventDefault();
       if (active.type === "directory") openMentionDir(active.path);
       else attachMention(active.path, false);
       return true;
     }
-    if (e.key === "Tab" && active) {
+    if (eventMatchesShortcutAction(e, "applySuggestion") && active) {
       e.preventDefault();
       attachMention(active.path, active.type === "directory");
       return true;
     }
-    if (e.key === "Escape") {
+    if (eventMatchesShortcutAction(e, "dismissSuggestions")) {
       e.preventDefault();
       dismiss();
       return true;

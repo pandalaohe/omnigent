@@ -13,6 +13,7 @@ import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
+import { dispatchMobileAssistantAction } from "@/lib/mobileAssistantPreferences";
 import type { ConnectionState } from "./TerminalSession";
 import {
   TerminalView,
@@ -37,6 +38,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
+    sendSoftKey: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
   }[],
 }));
@@ -49,6 +51,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     dispose = vi.fn();
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
+    sendSoftKey = vi.fn();
     focus = vi.fn();
 
     constructor(
@@ -70,6 +73,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         dispose: this.dispose,
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
+        sendSoftKey: this.sendSoftKey,
         focus: this.focus,
       });
     }
@@ -147,6 +151,30 @@ describe("buildAttachPath", () => {
 });
 
 describe("control-mode terminal", () => {
+  it("routes a mobile assistant soft key to the active writable terminal", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() => dispatchMobileAssistantAction("arrowUp"));
+
+    expect(terminalSessionMock.instances[0]?.sendSoftKey).toHaveBeenCalledWith("arrowUp");
+  });
+
+  it("keeps routing to the terminal that owned focus before the assistant button took it", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminalInput = document.createElement("textarea");
+    terminalSessionMock.instances[0].container.appendChild(terminalInput);
+    terminalInput.focus();
+    const assistantButton = document.createElement("button");
+    document.body.appendChild(assistantButton);
+    assistantButton.focus();
+
+    act(() => dispatchMobileAssistantAction("tab", terminalInput));
+
+    expect(terminalSessionMock.instances[0]?.sendSoftKey).toHaveBeenCalledWith("tab");
+    assistantButton.remove();
+  });
+
   it("disables clipboard bridging for read-only attaches", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));

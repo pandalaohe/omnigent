@@ -8,6 +8,7 @@ import {
   JumpToTopButton,
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
+  ScrollToBottomOnSessionOpen,
 } from "./ChatPage";
 
 const stickContext = vi.hoisted(() => ({
@@ -24,6 +25,89 @@ vi.mock("use-stick-to-bottom", () => ({
 }));
 
 const originalLoadMoreHistory = useChatStore.getState().loadMoreHistory;
+
+describe("ScrollToBottomOnSessionOpen", () => {
+  beforeEach(() => {
+    stickContext.scrollToBottom.mockReset();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        callback(performance.now());
+        return 1;
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("scrolls each newly selected session to the bottom when enabled", () => {
+    const openedConversationIdRef = { current: null as string | null };
+    const { rerender } = render(
+      <ScrollToBottomOnSessionOpen
+        conversationId="conv_a"
+        enabled
+        openedConversationIdRef={openedConversationIdRef}
+      />,
+    );
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(2);
+    expect(stickContext.scrollToBottom).toHaveBeenLastCalledWith("instant");
+
+    rerender(
+      <ScrollToBottomOnSessionOpen
+        conversationId="conv_b"
+        enabled
+        openedConversationIdRef={openedConversationIdRef}
+      />,
+    );
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(4);
+
+    rerender(
+      <ScrollToBottomOnSessionOpen
+        conversationId={null}
+        enabled
+        openedConversationIdRef={openedConversationIdRef}
+      />,
+    );
+    rerender(
+      <ScrollToBottomOnSessionOpen
+        conversationId="conv_b"
+        enabled
+        openedConversationIdRef={openedConversationIdRef}
+      />,
+    );
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(6);
+  });
+
+  it("preserves the current transcript position when disabled", () => {
+    render(<ScrollToBottomOnSessionOpen conversationId="conv_a" enabled={false} />);
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+  });
+
+  it("does not scroll again when the same session's Chat surface remounts", () => {
+    const openedConversationIdRef = { current: null as string | null };
+    const first = render(
+      <ScrollToBottomOnSessionOpen
+        conversationId="conv_a"
+        enabled
+        openedConversationIdRef={openedConversationIdRef}
+      />,
+    );
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(2);
+    first.unmount();
+
+    render(
+      <ScrollToBottomOnSessionOpen
+        conversationId="conv_a"
+        enabled
+        openedConversationIdRef={openedConversationIdRef}
+      />,
+    );
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(2);
+  });
+});
 
 function userBlock(id: string, text = id): UserMessageBlock {
   return {

@@ -6,9 +6,15 @@ import { isNewSessionHotkey, useNewSessionHotkey } from "./useNewSessionHotkey";
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
 
+const target = vi.hoisted(() => ({ route: "/" }));
+vi.mock("@/hooks/useNewSessionTarget", () => ({
+  useNewSessionTarget: () => ({ route: target.route }),
+}));
+
 afterEach(() => {
   cleanup();
   navigate.mockReset();
+  target.route = "/";
   document.body.innerHTML = "";
 });
 
@@ -16,9 +22,9 @@ function event(init: KeyboardEventInit): KeyboardEvent {
   return new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
 }
 
-function press(init: KeyboardEventInit, target: HTMLElement = document.body): KeyboardEvent {
+function press(init: KeyboardEventInit, targetElement: HTMLElement = document.body): KeyboardEvent {
   const e = event(init);
-  target.dispatchEvent(e);
+  targetElement.dispatchEvent(e);
   return e;
 }
 
@@ -47,6 +53,16 @@ describe("useNewSessionHotkey", () => {
 
     expect(navigate).toHaveBeenCalledWith("/");
     expect(e.defaultPrevented).toBe(true);
+  });
+
+  it("follows the selected project target", () => {
+    const { rerender } = renderHook(() => useNewSessionHotkey(true, false));
+    target.route = "/?project=Alpha%20Team";
+    rerender();
+
+    press({ key: "n", ctrlKey: true });
+
+    expect(navigate).toHaveBeenCalledWith("/?project=Alpha%20Team");
   });
 
   it("works from editable fields so the global action is focus-independent", () => {

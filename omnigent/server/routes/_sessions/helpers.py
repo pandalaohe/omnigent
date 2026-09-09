@@ -159,8 +159,10 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CURSOR_NATIVE_HARNESS,
     _DENY_SENTINEL_PREFIX,
     _ELICITATION_MODE,
+    _EXTERNAL_GOAL_STATE_VALUES,
     _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
     _FORK_HISTORY_NATIVE_HARNESSES,
+    _GOAL_STATE_LABEL_KEY,
     _HOOK_ELICITATION_ID_RE,
     _HOST_LAUNCH_RESULT_TIMEOUT_S,
     _KIMI_NATIVE_HARNESS,
@@ -185,6 +187,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _SLASH_COMMAND_TYPE,
     _STOP_RUNNER_RESULT_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
+    _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _TURN_ACTOR_LABEL,
     _UI_ADDED_AGENT_TITLE_PREFIX,
     _UPLOAD_READ_CHUNK_BYTES,
@@ -268,6 +272,11 @@ from omnigent.server.schemas import (
     SkillSummary,
     ToolOutputDeltaEvent,
 )
+from omnigent.session_lifecycle import (
+    labels_with_closed_status,
+    title_without_closed_marker,
+)
+from omnigent.session_todos import validate_session_todos
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -276,6 +285,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    ARCHIVE_LOCK_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
@@ -1226,6 +1236,7 @@ def _session_status_with_child_rollup(
     conversation_id: str,
     child_session_ids: list[str],
     db_status: str | None = None,
+    activity_unverified_child_ids: set[str] | None = None,
 ) -> Literal["idle", "running", "failed"]:
     """
     Map a session's cached status plus direct child activity to list status.
@@ -1254,11 +1265,33 @@ def _session_status_with_child_rollup(
     # the next ``Stop`` hook, so a spinner keyed off it can outlive the shells.
     # The in-chat indicator still reports them from the count.
     if any(
-        _session_status_cache.get(child_id) in ("running", "waiting")
+        child_id not in (activity_unverified_child_ids or set())
+        and _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
     ):
         return "running"
     return own_status
+
+
+def _session_background_activity_count(
+    conversation_id: str,
+    child_session_ids: list[str],
+    db_status: str | None = None,
+    activity_unverified_child_ids: set[str] | None = None,
+) -> int:
+    """Count live work that does not own the parent session's prompt."""
+    own_status = _session_status_from_cache(conversation_id, db_status)
+    shell_count = (
+        0
+        if own_status == "failed"
+        else _session_background_task_count_cache.get(conversation_id, 0)
+    )
+    child_count = sum(
+        child_id not in (activity_unverified_child_ids or set())
+        and _session_status_cache.get(child_id) in ("running", "waiting")
+        for child_id in child_session_ids
+    )
+    return shell_count + child_count
 
 
 async def _collect_descendant_conversation_ids(
@@ -1347,9 +1380,10 @@ async def _apply_liveness_to_items(
     Attach runner + host liveness to session-list items when a lookup is
     wired.
 
-    Both ``GET /v1/sessions`` and ``WS /v1/sessions/updates`` use this so
-    HTTP reconciliation preserves the same ``runner_online`` /
-    ``host_online`` fields that push frames patch into the web cache.
+    The ``WS /v1/sessions/updates`` watched-row builder uses this so pushed
+    reconciliation carries ``runner_online`` / ``host_online`` fields. The
+    paginated ``GET /v1/sessions`` path deliberately skips per-row liveness
+    queries and relies on the later watched-row stream for that enrichment.
 
     :param items: Session-list rows to annotate.
     :param liveness_lookup: Bulk liveness lookup from session id to a
@@ -1375,6 +1409,7 @@ async def _apply_liveness_to_items(
         # runner reconnects (see ``_on_runner_connect``'s pending resync).
         if not result.runner_online:
             item.pending_elicitations_count = 0
+            item.background_activity_count = 0
 
 
 def _targeted_elicitation_event(
@@ -2708,21 +2743,20 @@ def _merge_claude_permission_launch_args(
     return merged
 
 
-def _handle_external_session_todos(
+async def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,
+    conversation_store: ConversationStore,
 ) -> None:
     """
-    Cache and broadcast a todo-list update from a native forwarder.
+    Persist, cache, and broadcast a todo-list update from a native forwarder.
 
     Sent by the claude-native forwarder (from ``TodoWrite``) and the
     codex-native forwarder (from Codex plan updates); the panel is
     harness-agnostic.
 
-    Updates the in-memory ``_session_todos_cache`` so subsequent
-    ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``
-    field without a file read. Then publishes a ``session.todos`` SSE event
-    so connected web clients update their todo panel immediately.
+    Persistence makes the snapshot survive Server deployments; the in-memory
+    cache remains the live fast path. The SSE event updates connected clients.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -2737,19 +2771,18 @@ def _handle_external_session_todos(
             "external_session_todos requires data.todos to be a list",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Filter to well-formed items before caching so that malformed entries
-    # from a buggy forwarder version don't persist in the snapshot.  The
-    # same filter is applied by sse.ts on the live-event path; keeping the
-    # two in sync means the snapshot and live panel always show the same set.
-    valid_statuses = {"pending", "in_progress", "completed"}
-    validated: list[dict[str, Any]] = [
-        t
-        for t in todos
-        if isinstance(t, dict)
-        and isinstance(t.get("content"), str)
-        and t.get("status") in valid_statuses
-        and isinstance(t.get("activeForm"), str)
-    ]
+    try:
+        validated = validate_session_todos(todos)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    persisted = await asyncio.to_thread(
+        conversation_store.set_session_todos, session_id, validated
+    )
+    if not persisted:
+        # A concurrent DELETE may win after this request's access check. The
+        # missing DB row is authoritative; do not recreate process-local state
+        # or broadcast a plan for a session that no longer exists.
+        return
     _session_todos_cache[session_id] = validated
     event = SessionTodosEvent(
         type="session.todos",
@@ -2757,6 +2790,39 @@ def _handle_external_session_todos(
         todos=validated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+async def _persist_external_goal_state(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist a provider-neutral Goal marker from a native harness."""
+    raw_state = body.data.get("state")
+    if "state" not in body.data or (
+        raw_state is not None
+        and (not isinstance(raw_state, str) or raw_state not in _EXTERNAL_GOAL_STATE_VALUES)
+    ):
+        raise OmnigentError(
+            "external_goal_state requires data.state to be active, paused, or null",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    current = conv.labels.get(_GOAL_STATE_LABEL_KEY)
+    if current == raw_state:
+        return
+    if raw_state is None:
+        await asyncio.to_thread(
+            conversation_store.delete_label,
+            session_id,
+            _GOAL_STATE_LABEL_KEY,
+        )
+        return
+    await asyncio.to_thread(
+        conversation_store.set_labels,
+        session_id,
+        {_GOAL_STATE_LABEL_KEY: raw_state},
+    )
 
 
 def _publish_external_conversation_item(
@@ -3101,12 +3167,14 @@ def _parse_external_conversation_item(
             "external_conversation_item data.response_id must be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
-    # NOTE: producers that can re-post (the native transcript forwarders
-    # retry timed-out POSTs whose disposition they cannot know) send a
-    # ``data.source_id`` dedup key; the persist path derives the item's
-    # stable id from it so the append is idempotent (see
-    # ``_persist_external_conversation_item``). Items without one keep the
-    # store-assigned random id and no server-side dedup.
+    source_id = body.data.get("source_id")
+    if source_id is not None and (
+        not isinstance(source_id, str) or not source_id or len(source_id) > 1024
+    ):
+        raise OmnigentError(
+            "external item source_id must be a non-empty string up to 1024 characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
@@ -3121,6 +3189,7 @@ def _parse_external_conversation_item(
         type=item_type,
         response_id=response_id.strip(),
         data=data,
+        idempotency_key=f"external:{source_id}" if source_id is not None else None,
     )
 
 
@@ -3369,12 +3438,16 @@ def _publish_session_created(
     session_stream.publish(parent_id, event.model_dump())
 
 
+_NATIVE_REGISTRATION_ID_LABEL_KEY = "omnigent.native_registration_id"
+_MAX_NATIVE_REGISTRATION_ID_LEN = 128
+
+
 async def _persist_external_subagent_start(
     parent_id: str,
     parent_conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
-) -> str:
+) -> tuple[str, bool]:
     """
     Mint a child :class:`Conversation` row for a claude-native
     sub-agent and emit the parent's ``session.created`` SSE event.
@@ -3403,11 +3476,14 @@ async def _persist_external_subagent_start(
     :param body: The POST event body. Required ``data`` keys:
         ``subagent_id`` (Claude-side id, e.g. ``"a5c7eff..."``),
         ``agent_type`` (e.g. ``"Explore"``), ``description``
-        (free-form, used in the title), ``tool_use_id``
-        (e.g. ``"toolu_..."``).
+        (free-form, used in the title), and optional ``tool_use_id``
+        (e.g. ``"toolu_..."``) and ``registration_id`` (the creating
+        forwarder's bounded retry token) for newer forwarders.
     :param conversation_store: Store used to read existing children
         (for idempotency) and create the new row.
-    :returns: The child conversation id, e.g. ``"conv_child456"``.
+    :returns: The child conversation id and whether it predates the current
+        registration attempt. A retry carrying the same ``registration_id``
+        as the creator returns ``False`` so its first completion remains live.
     :raises OmnigentError: 400 if the payload is missing any of
         the required keys; 400 if the parent has no ``agent_id``
         (claude-native parents always carry one, so this would be
@@ -3417,6 +3493,7 @@ async def _persist_external_subagent_start(
     agent_type = body.data.get("agent_type")
     description = body.data.get("description")
     tool_use_id = body.data.get("tool_use_id")
+    registration_id = body.data.get("registration_id")
     if not isinstance(subagent_id, str) or not subagent_id:
         raise OmnigentError(
             "external_subagent_start requires non-empty data.subagent_id",
@@ -3432,11 +3509,23 @@ async def _persist_external_subagent_start(
             "external_subagent_start requires data.description (string)",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    if tool_use_id is not None and (not isinstance(tool_use_id, str) or not tool_use_id):
         raise OmnigentError(
-            "external_subagent_start requires non-empty data.tool_use_id",
+            "external_subagent_start data.tool_use_id must be a non-empty string when present",
             code=ErrorCode.INVALID_INPUT,
         )
+    if registration_id is not None:
+        if (
+            not isinstance(registration_id, str)
+            or not registration_id.strip()
+            or len(registration_id) > _MAX_NATIVE_REGISTRATION_ID_LEN
+        ):
+            raise OmnigentError(
+                "external_subagent_start data.registration_id must be a non-empty string "
+                f"up to {_MAX_NATIVE_REGISTRATION_ID_LEN} characters when present",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        registration_id = registration_id.strip()
     if parent_conv.agent_id is None:
         # claude-native parents are always created with an agent_id
         # by ``omnigent claude`` (the synthetic Claude bundle).
@@ -3461,7 +3550,11 @@ async def _persist_external_subagent_start(
         subagent_id,
     )
     if existing is not None:
-        return existing.id
+        same_registration = (
+            registration_id is not None
+            and existing.labels.get(_NATIVE_REGISTRATION_ID_LABEL_KEY) == registration_id
+        )
+        return existing.id, not same_registration
 
     # Title format mirrors omnigent-spawned children
     # (``"{tool}:{session_name}"``) so the rail's split-on-colon
@@ -3480,9 +3573,12 @@ async def _persist_external_subagent_start(
     labels = {
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
         _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY: subagent_id,
-        _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY: tool_use_id,
         _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY: description,
     }
+    if isinstance(tool_use_id, str):
+        labels[_CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY] = tool_use_id
+    if isinstance(registration_id, str):
+        labels[_NATIVE_REGISTRATION_ID_LABEL_KEY] = registration_id
 
     try:
         child = await asyncio.to_thread(
@@ -3512,17 +3608,34 @@ async def _persist_external_subagent_start(
         )
         if adopted is None:
             raise
-        await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
+        adopted_registration_id = adopted.labels.get(_NATIVE_REGISTRATION_ID_LABEL_KEY)
+        same_registration = (
+            registration_id is not None and adopted_registration_id == registration_id
+        )
+        # The collision can still be healed as an existing historical child,
+        # but the title alone does not prove this request created the row.
+        # Preserve a missing or different stored owner token so a later retry
+        # cannot reclassify old work as current merely by supplying a new id.
+        adopted_labels = (
+            labels
+            if same_registration
+            else {
+                key: value
+                for key, value in labels.items()
+                if key != _NATIVE_REGISTRATION_ID_LABEL_KEY
+            }
+        )
+        await asyncio.to_thread(conversation_store.set_labels, adopted.id, adopted_labels)
         # The POST that created this orphan died before reaching the
         # ``session.created`` publish below, so live clients (the web
         # Subagents rail) have never heard about the child — emit it now.
         # In the concurrent-race case the winner also published; a
         # duplicate event is a harmless extra cache invalidation.
         _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
-        return adopted.id
+        return adopted.id, not same_registration
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     _publish_session_created(parent_id, child.id, parent_conv.agent_id)
-    return child.id
+    return child.id, False
 
 
 def _antigravity_subagent_title(role: str, cascade_id: str) -> str:
@@ -3742,6 +3855,14 @@ def _background_task_delivery_status(
 # Cap the per-shell detail a single edge can carry, mirroring the forwarder's
 # own cap so a malformed payload can't bloat the status event server-side.
 _MAX_FORWARDED_BACKGROUND_TASKS = 100
+_MAX_FORWARDED_BACKGROUND_TASK_BYTES = 256 * 1024
+_BACKGROUND_TASK_FIELD_BYTE_LIMITS = {
+    "id": 256,
+    "type": 128,
+    "status": 128,
+    "description": 2048,
+    "command": 8192,
+}
 
 
 def _parse_background_tasks(raw: object) -> list[BackgroundTaskInfo] | None:
@@ -3760,13 +3881,33 @@ def _parse_background_tasks(raw: object) -> list[BackgroundTaskInfo] | None:
     if not isinstance(raw, list):
         return None
     parsed: list[BackgroundTaskInfo] = []
+    accepted_bytes = 0
     for entry in raw[:_MAX_FORWARDED_BACKGROUND_TASKS]:
         if not isinstance(entry, dict):
             continue
+        entry_bytes = 0
+        oversized = False
+        for field, byte_limit in _BACKGROUND_TASK_FIELD_BYTE_LIMITS.items():
+            value = entry.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, str) or len(value) > byte_limit:
+                oversized = True
+                break
+            value_bytes = len(value.encode("utf-8"))
+            if value_bytes > byte_limit:
+                oversized = True
+                break
+            entry_bytes += value_bytes
+        if oversized:
+            continue
+        if accepted_bytes + entry_bytes > _MAX_FORWARDED_BACKGROUND_TASK_BYTES:
+            break
         try:
             parsed.append(BackgroundTaskInfo.model_validate(entry))
         except ValidationError:
             continue
+        accepted_bytes += entry_bytes
     return parsed or None
 
 
@@ -3920,14 +4061,15 @@ def _merge_pending_file_blocks(
     pending_content: list[dict[str, Any]],
 ) -> NewConversationItem:
     """
-    Prepend a pending entry's file blocks onto a user-message item.
+    Restore a pending entry's ordered content onto a user-message item.
 
     The claude-native transcript mirrors a user message back as
     text-only — ``input_image`` / ``input_file`` blocks are dropped. The
-    optimistic pending-input entry still carries them (with real
-    ``file_id``s, assigned at upload), so we fold them into the durable
-    item here. Without it the image renders only on the optimistic
-    bubble and vanishes from history on the next reload.
+    optimistic pending-input entry still carries the complete ordered content
+    (with real ``file_id``s, assigned at upload), so it becomes the durable
+    item here. Without it the image renders only on the optimistic bubble and
+    vanishes from history on the next reload; restoring only its file blocks
+    would move every attachment ahead of the text.
 
     No-op when the pending entry has no file blocks, or when the item
     already carries file blocks (defensive — a future transcript that
@@ -3940,8 +4082,8 @@ def _merge_pending_file_blocks(
     :param pending_content: The drained pending entry's content blocks,
         e.g. ``[{"type": "input_image", "file_id": "file_x",
         "filename": "a.png"}, {"type": "input_text", "text": "hi"}]``.
-    :returns: A copy of *item* with the file blocks prepended, or *item*
-        unchanged when there is nothing to merge.
+    :returns: A copy of *item* with the pending ordered content restored, or
+        *item* unchanged when there is nothing to merge.
     """
     if not isinstance(item.data, MessageData):
         return item
@@ -3958,7 +4100,11 @@ def _merge_pending_file_blocks(
     )
     if already_has_files:
         return item
-    merged_data = item.data.model_copy(update={"content": [*file_blocks, *item.data.content]})
+    # The native transcript is text-only, while the drained pending entry is
+    # the only surviving record of where each attachment sat between text
+    # spans. Keep that ordered content as a unit; prepending only the files
+    # destroys the user's visual/semantic insertion order.
+    merged_data = item.data.model_copy(update={"content": list(pending_content)})
     return item.model_copy(update={"data": merged_data})
 
 
@@ -4007,16 +4153,15 @@ def _latest_assistant_text_from_store(
         session_id,
         limit=_EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
         order="desc",
-        type="message",
     )
     for item in page.data:
-        if not isinstance(item.data, MessageData):
+        if isinstance(item.data, MessageData) and item.data.is_meta:
             continue
-        if item.data.role != "assistant" or item.data.is_meta:
-            continue
-        text = _message_text(item.data.content)
-        if text is not None:
-            return text
+        if isinstance(item.data, MessageData) and item.data.role == "assistant":
+            return _message_text(item.data.content)
+        # A newer user/tool boundary proves an older assistant message was an
+        # opener or intermediate update, not this turn's terminal result.
+        return None
     return None
 
 
@@ -4162,7 +4307,7 @@ def _require_permission_mode_forward(
     return settled if isinstance(settled, str) and settled else mode
 
 
-def _publish_child_status_to_parent(session_id: str, status: str) -> None:
+def _publish_child_status_to_parent(session_id: str, status: str | None) -> None:
     """
     Mirror a status transition onto the session's parent stream.
 
@@ -4181,8 +4326,11 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
 
     :param session_id: Session whose cached status just changed,
         e.g. ``"conv_child123"``.
-    :param status: The new status, e.g. ``"running"``. Captured here rather
-        than re-read on the worker so each edge fans out its own value.
+    :param status: The new status, e.g. ``"running"``. ``None`` lets the
+        worker resolve the latest durable terminal/quarantine state, then the
+        cache or live row, after a Server restart or best-effort repair.
+        Explicit edges are captured here so a burst of transitions fans out
+        each edge's own value.
     """
     store = session_live_state.conversation_store()
     if store is None:
@@ -4193,12 +4341,23 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
         if conv is None or conv.parent_conversation_id is None:
             return
         parent_id = conv.parent_conversation_id
+        resolved_status = status
+        if resolved_status is None:
+            terminal_status = conv.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+            if terminal_status == "failed":
+                resolved_status = "failed"
+            elif terminal_status in {"completed", "stopped", "killed"}:
+                resolved_status = "idle"
+            elif conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true":
+                resolved_status = "activity_unverified"
+            else:
+                resolved_status = _session_status_cache.get(conv.id) or conv.live_status
         items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
         summary = _child_session_summary_from_conversation(
             conv,
             parent_id,
             _latest_message_preview(items_by_child.get(conv.id, [])),
-            cached_status=status,
+            cached_status=resolved_status,
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -4694,7 +4853,11 @@ def _invalidate_runner_backed_snapshot_state(
         the session (agent switch); ``False`` keeps it serving while the
         session has no runner.
     """
+    from omnigent.server.native_subagent_watchdog import disarm_native_subagent_watchdogs
     from omnigent.server.smart_routing import invalidate_runner_catalog
+
+    if cancel_inflight:
+        disarm_native_subagent_watchdogs(session_id, retire=False)
 
     # Only worth marking when there is something to keep serving: a session
     # with no cached skills already re-fetches on the next read, and marking
@@ -9149,6 +9312,12 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    if ARCHIVE_LOCK_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {ARCHIVE_LOCK_LABEL_KEY!r} is server-managed; use the "
+            "archive_locked field instead",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # The archive timestamp is stamped by the server on the archive transition
     # only; a client write would forge the retention clock, including on shared
     # sessions the caller does not own.
@@ -9556,6 +9725,8 @@ def _child_session_current_task_status_from_cached_status(status: object) -> str
         return "completed"
     if status == "failed":
         return "failed"
+    if status in ("completed", "stopped", "killed"):
+        return status
     return None
 
 
@@ -9630,13 +9801,28 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
-    if cached_status is None:
-        cached_status = _session_status_cache.get(conv.id)
+    # A structured terminal label is stronger than quarantine and transient
+    # cache/live state, including when an old conflicted row contains both.
+    durable_status = labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+    if durable_status in ("completed", "failed", "stopped", "killed"):
+        cached_status = durable_status
+    else:
+        if cached_status is None:
+            cached_status = _session_status_cache.get(conv.id)
+        if cached_status is None and conv.live_status in ("idle", "running", "waiting", "failed"):
+            cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
         busy = False
+    activity_unverified = durable_status not in ("completed", "failed", "stopped", "killed") and (
+        cached_status == "activity_unverified"
+        or labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+    )
+    if activity_unverified:
+        busy = False
+        # Durable quarantine wins after restart even if live_status is stale.
+        cached_status = "activity_unverified"
     last_task_error = _last_task_error_from_labels(labels)
     current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
     if last_task_error is not None:
@@ -9652,6 +9838,8 @@ def _child_session_summary_from_conversation(
             last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    from omnigent.server.native_subagent_watchdog import native_subagent_activity_unverified
+
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -9668,6 +9856,12 @@ def _child_session_summary_from_conversation(
         current_task_id=None,
         current_task_status=current_task_status,
         busy=busy,
+        activity_unverified=activity_unverified,
+        native_activity_unverified=(
+            busy
+            and not conv.archived
+            and native_subagent_activity_unverified(parent_session_id, conv.id)
+        ),
         labels=labels,
         last_task_error=last_task_error,
         last_message_preview=last_message_preview,
@@ -10532,6 +10726,7 @@ __all__ = [
     "_persist_external_assistant_message",
     "_persist_external_codex_approval_mode_change",
     "_persist_external_codex_collaboration_mode_change",
+    "_persist_external_goal_state",
     "_persist_external_model_change",
     "_persist_external_model_options",
     "_persist_external_permission_mode_change",
@@ -10612,6 +10807,7 @@ __all__ = [
     "_same_provider_family_impl",
     "_seed_missing_title",
     "_seed_missing_title_from_user_message",
+    "_session_background_activity_count",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
     "_set_read_state",

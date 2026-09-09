@@ -22,6 +22,7 @@ export const BUILTIN_AGENTS = new Set([
   "goose-native-ui", // Goose
   "qwen-native-ui", // Qwen Code
   "kimi-native-ui", // Kimi
+  "codex-sdk",
   "polly",
   "debby",
 ]);
@@ -69,6 +70,7 @@ export const AGENT_DISPLAY_ORDER = [
   "Antigravity",
   "Qwen Code",
   "Kimi",
+  "Codex SDK",
   "Polly",
   "Debby",
 ];
@@ -108,7 +110,11 @@ export const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]
  * @param agents - Raw catalog + discovery output (e.g. useAvailableAgents).
  */
 export function selectableSessionAgents<T extends AvailableAgent>(agents: readonly T[]): T[] {
-  return sortAgentsForDisplay(agents.filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name)));
+  return sortAgentsForDisplay(
+    agents.filter((agent) =>
+      agent.id.startsWith("ca_") ? true : !NEW_SESSION_HIDDEN_AGENTS.has(agent.name),
+    ),
+  );
 }
 
 /**

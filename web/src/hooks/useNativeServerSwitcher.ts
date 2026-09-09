@@ -5,6 +5,10 @@ import {
   setNativeServerSwitcherHidden,
   supportsNativeServerPicker,
 } from "@/lib/nativeBridge";
+import {
+  shouldHideNativeServerSwitcher,
+  type NativeMobileHeaderMode,
+} from "@/lib/sessionNavigationPreferences";
 
 /**
  * Tracks whether `surface` is the frontmost element at its own centre — i.e.
@@ -71,6 +75,29 @@ export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean
   return frontmost;
 }
 
+/** Tracks the AppShell sidebar state from its DOM contract. */
+export function useAppShellSidebarOpen(): boolean {
+  const read = () =>
+    typeof document !== "undefined" &&
+    document.querySelector('.app-shell[data-sidebar-open="true"]') !== null;
+  const [open, setOpen] = useState(read);
+
+  useEffect(() => {
+    const sync = () => setOpen(read());
+    sync();
+    if (typeof MutationObserver === "undefined") return;
+    const observer = new MutationObserver(sync);
+    observer.observe(document.body, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-sidebar-open"],
+    });
+    return () => observer.disconnect();
+  }, []);
+
+  return open;
+}
+
 /**
  * Whether the iOS shell's floating server-switcher pill should be hidden given
  * the main surface's frontmost state.
@@ -99,12 +126,21 @@ export function serverSwitcherHiddenForSurface(frontmost: boolean): boolean {
 export function useNativeServerSwitcherForMainSurface(
   surface: HTMLElement | null,
   active: boolean,
+  {
+    headerMode = "server",
+    sidebarOpen = false,
+  }: {
+    headerMode?: NativeMobileHeaderMode;
+    sidebarOpen?: boolean;
+  } = {},
 ) {
   const frontmost = useSurfaceFrontmost(surface, active);
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(frontmost));
-  }, [frontmost]);
+    setNativeServerSwitcherHidden(
+      !active || shouldHideNativeServerSwitcher({ frontmost, sidebarOpen, headerMode }),
+    );
+  }, [active, frontmost, headerMode, sidebarOpen]);
   useEffect(() => {
     if (!isIOSShell()) return;
     return () => setNativeServerSwitcherHidden(true);

@@ -31,8 +31,11 @@ vi.mock("./hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined 
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
-const indexCssSource = readFileSync("src/index.css", "utf8");
-const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8");
+const indexCssSource = readFileSync("src/index.css", "utf8").replace(/\r\n/g, "\n");
+const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8").replace(
+  /\r\n/g,
+  "\n",
+);
 const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 
 // Innermost `selector { ... }` blocks with their match indices, shared by

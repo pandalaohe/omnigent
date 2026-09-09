@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_developer_instructions_state,
     read_codex_config_model,
     read_mcp_startup,
+    resolve_codex_auto_compact_token_limit,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -46,19 +47,9 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
-from omnigent.native._native_forwarder_health import (
-    note_post_success as note_native_post_success,
-)
-from omnigent.native._native_forwarder_health import (
-    record_post_failure as record_native_post_failure,
-)
-from omnigent.native._native_post_delivery import (
-    RepostResult,
-    append_dead_letter,
-    post_may_have_been_delivered,
-    replay_dead_letters,
-)
-from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 
 _logger = logging.getLogger(__name__)
 
@@ -163,6 +154,9 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE = "external_elicitation_resolved"
 # Sessions event carrying a Codex plan mapped to the todo-list schema so the
 # web TodoPanel renders it like Claude's TodoWrite output.
 _EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
+_EXTERNAL_GOAL_STATE_TYPE = "external_goal_state"
+_CODEX_GOAL_UPDATED_METHOD = "thread/goal/updated"
+_CODEX_GOAL_CLEARED_METHOD = "thread/goal/cleared"
 # Codex AgentControl child-spawn event fields.
 _CODEX_COLLAB_AGENT_ITEM_TYPE = "collabAgentToolCall"
 _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
@@ -414,6 +408,9 @@ class _CodexForwarderState:
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
+    subagent_parent_by_thread: dict[str, str | None] = field(default_factory=dict)
+    subagent_status_by_thread: dict[str, str] = field(default_factory=dict)
+    snapshot_publisher: NativeSubagentSnapshotPublisher | None = None
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     synced_item_keys: set[str] = field(default_factory=set)
@@ -447,6 +444,8 @@ class _CodexForwarderState:
     # thread rotation), so a settled round stays settled and later items
     # can skip re-reading the bridge file for the life of the session.
     mcp_startup_settled: bool = False
+    posted_goal_state: str | None = None
+    posted_goal_state_known: bool = False
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -562,7 +561,17 @@ class _CodexForwarderState:
         :returns: None.
         """
         self.subagents_by_thread[thread_id] = session_id
+        self.subagent_parent_by_thread.setdefault(thread_id, self.parent_session_id)
+        self.subagent_status_by_thread.setdefault(thread_id, "running")
+        self.publish_child_snapshot()
         self.pending_child_threads.pop(thread_id, None)
+
+    def publish_child_snapshot(self) -> None:
+        if self.snapshot_publisher is not None and self.parent_session_id is not None:
+            self.snapshot_publisher.update(
+                self.parent_session_id,
+                _codex_native_subagent_snapshot(self),
+            )
 
     def note_parent_rotation(self, session_id: str) -> None:
         """
@@ -572,8 +581,13 @@ class _CodexForwarderState:
             ``"conv_new_parent"``.
         :returns: None.
         """
+        if self.snapshot_publisher is not None and self.parent_session_id is not None:
+            self.snapshot_publisher.update(self.parent_session_id, {}, retired=True)
         self.parent_session_id = session_id
+        self.publish_child_snapshot()
         self.pending_child_threads.clear()
+        self.posted_goal_state = None
+        self.posted_goal_state_known = False
 
     def note_pending_child_thread(
         self,
@@ -1435,6 +1449,7 @@ class _SessionUsageCoalescer:
         client: httpx.AsyncClient,
         session_id: str,
         model: str | None = None,
+        bridge_dir: Path | None = None,
     ) -> None:
         """
         Initialize the usage coalescer.
@@ -1446,13 +1461,16 @@ class _SessionUsageCoalescer:
             ``None`` and ``record()`` receives no model — without it the server
             cannot price the child's cumulative tokens. ``None`` for the parent
             coalescer, which learns its model via :meth:`record`.
+        :param bridge_dir: Native bridge directory containing the host's
+            per-session Codex config and compact-threshold catalog.
         :returns: None.
         """
         self._client = client
         self._session_id = session_id
-        self._pending: dict[str, int] = {}
-        self._last_posted: dict[str, int] = {}
+        self._pending: dict[str, int | None] = {}
+        self._last_posted: dict[str, int | None] = {}
         self._model: str | None = model
+        self._bridge_dir = bridge_dir
 
     def record(self, params: _JsonObject, model: str | None = None) -> None:
         """
@@ -1469,7 +1487,11 @@ class _SessionUsageCoalescer:
         """
         if model:
             self._model = model
-        data = _session_usage_data_from_params(params)
+        data = _session_usage_data_from_params(
+            params,
+            bridge_dir=self._bridge_dir,
+            model=self._model,
+        )
         if data is None:
             return
         self._pending.update(data)
@@ -1486,7 +1508,7 @@ class _SessionUsageCoalescer:
         data = {
             key: value
             for key, value in self._pending.items()
-            if self._last_posted.get(key) != value
+            if key not in self._last_posted or self._last_posted[key] != value
         }
         if not data:
             self._pending.clear()
@@ -1895,13 +1917,25 @@ async def supervise_forwarder(
             session_id=session_id,
             thread_id=thread_id,
             delta_coalescer=_OutputTextDeltaCoalescer(ap_client, session_id),
-            usage_coalescer=_SessionUsageCoalescer(ap_client, session_id),
+            usage_coalescer=_SessionUsageCoalescer(ap_client, session_id, bridge_dir=bridge_dir),
             elicitation_tracker=_CodexElicitationTaskTracker(),
         )
         forwarder_state = _CodexForwarderState(
             parent_session_id=session_id,
             codex_client=client,
         )
+        snapshots = NativeSubagentSnapshotPublisher(ap_client)
+        forwarder_state.snapshot_publisher = snapshots
+        try:
+            await _reconcile_codex_goal_state(
+                client,
+                ap_client,
+                session_id=session_id,
+                thread_id=thread_id,
+                forwarder_state=forwarder_state,
+            )
+        except Exception:  # noqa: BLE001 - live notifications can still recover it.
+            _logger.warning("Codex Goal startup reconciliation failed", exc_info=True)
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
@@ -1922,9 +1956,11 @@ async def supervise_forwarder(
             name="codex-native-forwarder-subscribe",
         )
         await _sleep(0)
+        await snapshots.__aenter__()
         try:
             async for event in client.iter_events():
                 try:
+                    previous_session_id = target.session_id
                     rotated = await _maybe_rotate_session_on_thread_started(
                         ap_client=ap_client,
                         target=target,
@@ -1933,6 +1969,16 @@ async def supervise_forwarder(
                         event=event,
                     )
                     if rotated:
+                        if (
+                            forwarder_state.posted_goal_state_known
+                            and forwarder_state.posted_goal_state is not None
+                        ):
+                            await _post_codex_goal_state_if_changed(
+                                ap_client,
+                                session_id=previous_session_id,
+                                goal=None,
+                                forwarder_state=forwarder_state,
+                            )
                         forwarder_state.note_parent_rotation(target.session_id)
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
@@ -1955,6 +2001,19 @@ async def supervise_forwarder(
                             ),
                             name="codex-native-forwarder-subscribe",
                         )
+                        try:
+                            await _reconcile_codex_goal_state(
+                                client,
+                                ap_client,
+                                session_id=target.session_id,
+                                thread_id=target.thread_id,
+                                forwarder_state=forwarder_state,
+                            )
+                        except Exception:  # noqa: BLE001 - notifications can recover it.
+                            _logger.warning(
+                                "Codex Goal rotation reconciliation failed",
+                                exc_info=True,
+                            )
                         continue
                     # Release the subscribe task as soon as the thread shows
                     # activity (rollout now exists), so it resumes instead of
@@ -1976,6 +2035,7 @@ async def supervise_forwarder(
                 except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
+            await snapshots.__aexit__()
             if mcp_settle_timer is not None:
                 mcp_settle_timer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -2046,7 +2106,11 @@ async def _maybe_rotate_session_on_thread_started(
     target.session_id = new_session_id
     target.thread_id = new_thread_id
     target.delta_coalescer = _OutputTextDeltaCoalescer(ap_client, new_session_id)
-    target.usage_coalescer = _SessionUsageCoalescer(ap_client, new_session_id)
+    target.usage_coalescer = _SessionUsageCoalescer(
+        ap_client,
+        new_session_id,
+        bridge_dir=bridge_dir,
+    )
     target.elicitation_tracker = _CodexElicitationTaskTracker()
     await old_delta_coalescer.close()
     await old_usage_coalescer.close()
@@ -2519,6 +2583,68 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
     return None
 
 
+def _normalized_codex_goal_state(goal: object) -> tuple[bool, str | None]:
+    """Map a Codex goal object to the two sidebar marker states."""
+    if goal is None:
+        return True, None
+    if not isinstance(goal, dict):
+        return False, None
+    status = goal.get("status")
+    if not isinstance(status, str):
+        return False, None
+    if status == "active":
+        return True, "active"
+    if status in {"paused", "blocked", "usageLimited", "budgetLimited"}:
+        return True, "paused"
+    if status == "complete":
+        return True, None
+    return False, None
+
+
+async def _post_codex_goal_state_if_changed(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    goal: object,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    observed, state = _normalized_codex_goal_state(goal)
+    if not observed or (
+        forwarder_state.posted_goal_state_known and state == forwarder_state.posted_goal_state
+    ):
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_GOAL_STATE_TYPE,
+        data={"state": state},
+    )
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_goal_state = state
+        forwarder_state.posted_goal_state_known = True
+
+
+async def _reconcile_codex_goal_state(
+    codex_client: CodexAppServerClient,
+    ap_client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Read the current goal once so resume works without waiting for a change."""
+    response = await codex_client.request("thread/goal/get", {"threadId": thread_id})
+    result = response.get("result")
+    if not isinstance(result, dict) or "goal" not in result:
+        return
+    await _post_codex_goal_state_if_changed(
+        ap_client,
+        session_id=session_id,
+        goal=result.get("goal"),
+        forwarder_state=forwarder_state,
+    )
+
+
 async def _handle_event(
     client: httpx.AsyncClient,
     *,
@@ -2604,6 +2730,39 @@ async def _handle_event(
     )
     if route_session_id is None:
         return
+    if is_child and forwarder_state is not None:
+        child_thread = _thread_id_from_params(params)
+        observed_status = None
+        if method == "turn/started":
+            observed_status = "running"
+        elif method in {"turn/completed", "turn/failed"}:
+            observed_status = (
+                "failed"
+                if method == "turn/failed"
+                or _turn_status_is_failed(params)
+                or _terminal_error_from_turn(params) is not None
+                else "idle"
+            )
+        if child_thread is not None and observed_status is not None:
+            forwarder_state.subagent_status_by_thread[child_thread] = observed_status
+            forwarder_state.publish_child_snapshot()
+    if not is_child and forwarder_state is not None:
+        if method == _CODEX_GOAL_UPDATED_METHOD and "goal" in params:
+            await _post_codex_goal_state_if_changed(
+                client,
+                session_id=route_session_id,
+                goal=params.get("goal"),
+                forwarder_state=forwarder_state,
+            )
+            return
+        if method == _CODEX_GOAL_CLEARED_METHOD:
+            await _post_codex_goal_state_if_changed(
+                client,
+                session_id=route_session_id,
+                goal=None,
+                forwarder_state=forwarder_state,
+            )
+            return
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
     # assistant-side output proves startup is over before the idle edge.
@@ -2681,6 +2840,7 @@ async def _handle_event(
             client,
             route_session_id,
             model=forwarder_state.model if forwarder_state is not None else None,
+            bridge_dir=bridge_dir,
         )
         if is_child
         else None
@@ -5196,7 +5356,18 @@ async def _post_collab_agent_statuses(
             continue
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is not None:
+            forwarder_state.subagent_status_by_thread[thread_id] = ap_status
+            forwarder_state.publish_child_snapshot()
             await _post_status(client, child_session_id, ap_status)
+
+
+def _codex_native_subagent_snapshot(state: _CodexForwarderState) -> dict[str, str]:
+    """Keep late-event mappings while excluding children of rotated parents."""
+    return {
+        child_id: state.subagent_status_by_thread.get(thread_id, "activity_unverified")
+        for thread_id, child_id in state.subagents_by_thread.items()
+        if state.subagent_parent_by_thread.get(thread_id) == state.parent_session_id
+    }
 
 
 def _omnigent_status_from_collab_state(state: _JsonObject) -> str | None:
@@ -6462,7 +6633,12 @@ async def _post_session_interrupted(
     _log_failed_session_event_post(_EXTERNAL_SESSION_INTERRUPTED_TYPE, response)
 
 
-def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | None:
+def _session_usage_data_from_params(
+    params: _JsonObject,
+    *,
+    bridge_dir: Path | None = None,
+    model: str | None = None,
+) -> dict[str, int | None] | None:
     """
     Extract Omnigent session-usage fields from a Codex usage notification.
 
@@ -6486,7 +6662,7 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
         context_window = total.get("contextWindow")
     output_tokens = total.get("outputTokens")
     cached_input_tokens = total.get("cachedInputTokens")
-    data: dict[str, int] = {}
+    data: dict[str, int | None] = {}
     if isinstance(cumulative_input_tokens, int) and cumulative_input_tokens >= 0:
         # Codex's ``tokenUsage.total`` is CUMULATIVE across the whole thread
         # (the CLI subtracts prior totals to recover per-turn deltas), so
@@ -6519,6 +6695,15 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
         data["cumulative_output_tokens"] = output_tokens
     if isinstance(context_window, int) and context_window > 0:
         data["context_window"] = context_window
+        if bridge_dir is not None and model:
+            auto_compact_token_limit = resolve_codex_auto_compact_token_limit(
+                bridge_dir,
+                model=model,
+                effective_context_window=context_window,
+            )
+            # Explicit null clears a threshold reported by the previous model,
+            # so the web immediately falls back to ordinary context usage.
+            data["auto_compact_token_limit"] = auto_compact_token_limit
     if not data:
         return None
     return data

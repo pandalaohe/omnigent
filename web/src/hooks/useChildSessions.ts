@@ -41,6 +41,10 @@ export interface ChildSessionInfo {
   last_task_error?: ChildSessionError | null;
   /** True when the latest task is in an active (queued/in_progress) state. */
   busy: boolean;
+  /** Historical running state exists, but the Host found no current activity proof. */
+  activity_unverified?: boolean;
+  /** Snapshot connectivity is uncertain; the task itself has not ended. */
+  native_activity_unverified?: boolean;
   /**
    * Single-line preview of the most recent message in the child's
    * conversation, truncated to ~150 chars with a trailing ellipsis.
@@ -76,6 +80,8 @@ interface ChildSessionWire {
   current_task_status: string | null;
   last_task_error?: ChildSessionError | null;
   busy: boolean;
+  activity_unverified?: boolean;
+  native_activity_unverified?: boolean;
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
@@ -189,6 +195,10 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     current_task_status: row.current_task_status,
     last_task_error: parseChildSessionError(row.last_task_error),
     busy: row.busy,
+    activity_unverified: row.activity_unverified ?? false,
+    ...(row.native_activity_unverified !== undefined
+      ? { native_activity_unverified: row.native_activity_unverified === true }
+      : {}),
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,

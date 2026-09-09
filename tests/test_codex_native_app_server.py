@@ -408,6 +408,7 @@ class _FakeCodexClient:
 
     hooks: list[dict[str, Any]]
     flip_on_trust: bool = True
+    cwd: str = _CWD
     requests: list[_Req] = field(default_factory=list)
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -421,7 +422,7 @@ class _FakeCodexClient:
         """
         self.requests.append(_Req(method=method, params=params))
         if method == "hooks/list":
-            return {"result": {"data": [{"cwd": _CWD, "hooks": self.hooks}]}}
+            return {"result": {"data": [{"cwd": self.cwd, "hooks": self.hooks}]}}
         if method == "config/batchWrite":
             if self.flip_on_trust:
                 written = params["edits"][0]["value"]
@@ -1258,8 +1259,9 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
 
     rendered = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert rendered.startswith("[mcp_servers.omnigent]\n")
-    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
-    assert stat.S_IMODE((codex_home / "config.toml").stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE((codex_home / "config.toml").stat().st_mode) == 0o600
     parsed = tomllib.loads(rendered)
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
@@ -1358,6 +1360,62 @@ _SPAWN_MATCHER = r".*spawn_agent"
 def _mcp_tool_approvals(codex_home: Path) -> dict[str, Any]:
     parsed = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
     return parsed["mcp_servers"]["omnigent"]["tools"]
+
+
+async def test_context_catalog_caches_bundled_host_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private bridge gets only the host Codex compact metadata."""
+    from omnigent import codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        bridge_dir,
+        tmp_path / "workspace",
+    )
+    calls: list[tuple[str, Path, float, bool]] = []
+
+    def _read(
+        codex_path: str,
+        home: Path,
+        *,
+        timeout: float,
+        bundled: bool,
+    ) -> dict[str, Any]:
+        calls.append((codex_path, home, timeout, bundled))
+        return {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "effective_context_window_percent": 95,
+                    "base_instructions": "must not be copied",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(codex_native_app_server, "read_codex_model_catalog", _read)
+
+    await server._populate_context_catalog(source_home)
+
+    assert calls == [(server.codex_path, source_home, 2.0, True)]
+    cached = json.loads((bridge_dir / "context_catalog.json").read_text(encoding="utf-8"))
+    assert cached == {
+        "models": [
+            {
+                "auto_compact_token_limit": None,
+                "context_window": 272_000,
+                "effective_context_window_percent": 95,
+                "max_context_window": None,
+                "slug": "gpt-5.6-sol",
+            }
+        ]
+    }
 
 
 def _hook_matchers(codex_home: Path, event: str) -> list[str | None]:
@@ -1513,8 +1571,9 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
         "credential-helper --token sk-sentinel-do-not-use",
     ]
     assert provider["wire_api"] == "responses"
-    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
-    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
 
 
 def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
@@ -1694,7 +1753,8 @@ def test_user_prompt_submit_carries_the_route_turn_hook(tmp_path: Path) -> None:
     commands = [h for entry in hooks["UserPromptSubmit"] for h in entry["hooks"]]
     routing = [h for h in commands if "route-turn" in h["command"]]
     assert len(routing) == 1
-    assert f"--bridge-dir {bridge_dir}" in routing[0]["command"]
+    assert "--bridge-dir" in routing[0]["command"]
+    assert str(bridge_dir) in routing[0]["command"]
     assert "--harness codex-native" in routing[0]["command"]
     assert routing[0]["timeout"] == HARNESS_HOOK_TIMEOUT_S
     # Trust is filtered by module, so route-turn must ride the policy one.
@@ -2233,7 +2293,8 @@ async def test_trust_step_covers_router_hooks_when_routing_armed(
         hooks=[
             _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
             _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
-        ]
+        ],
+        cwd=str(Path(_CWD)),
     )
 
     async def _fake_connect(self: Any) -> None:
@@ -2336,7 +2397,8 @@ async def test_trust_step_trusts_user_hooks_only_when_trust_all_enabled(
             hooks=[
                 _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
                 _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
-            ]
+            ],
+            cwd=str(Path(_CWD)),
         )
         monkeypatch.setattr(
             "omnigent.harnesses.codex_native.app_server.CodexAppServerClient.request",

@@ -29,6 +29,10 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.cli_invocation import cli_invocation
+from omnigent.codex_rate_limits import (
+    CODEX_RATE_LIMITS_REFRESH_INTERVAL_S,
+    read_codex_rate_limits_snapshot,
+)
 from omnigent.debug_logging import (
     ORIGIN_WORKSPACE_ID_ENV_VAR,
     PRIMARY_SESSION_ID_ENV_VAR,
@@ -36,12 +40,17 @@ from omnigent.debug_logging import (
 )
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
-from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.harness_availability import (
+    CODEX_CANONICAL_HARNESSES,
+    HARNESS_BINARY_MISSING,
+    HarnessAvailability,
+)
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -1021,6 +1030,9 @@ class HostProcess:
         # refresh task keeps it current.
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         self._gateway_inference: dict[str, bool] | None = None
+        # Last sanitized Codex subscription snapshot. It is kept across tunnel
+        # reconnects so the next hello can restore Server/Web state immediately.
+        self._codex_rate_limits: dict[str, Any] | None = None
         self._capabilities_initialized = False
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
@@ -2360,6 +2372,46 @@ class HostProcess:
         :returns: List_dir result frame with entries sorted by
             name plus a ``has_more`` flag for the page.
         """
+        if frame.path == "":
+            if os.name == "nt":
+                list_drives = getattr(os, "listdrives", None)
+                drives: list[str] = (
+                    cast(list[str], list_drives())
+                    if callable(list_drives)
+                    else [
+                        f"{letter}:\\"
+                        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        if os.path.isdir(f"{letter}:\\")
+                    ]
+                )
+                roots = [
+                    HostListDirEntry(
+                        name=drive,
+                        path=drive,
+                        type="directory",
+                        bytes=None,
+                        modified_at=0,
+                    )
+                    for drive in drives
+                ]
+            else:
+                roots = [
+                    HostListDirEntry(
+                        name="/",
+                        path="/",
+                        type="directory",
+                        bytes=None,
+                        modified_at=0,
+                    )
+                ]
+            return _paginate_list_dir(
+                entries=roots,
+                request_id=frame.request_id,
+                limit=frame.limit,
+                after=frame.after,
+                before=frame.before,
+            )
+
         try:
             expanded = os.path.expanduser(frame.path)
         except (TypeError, ValueError) as exc:
@@ -2490,6 +2542,24 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 error="a parent path component is not a directory",
+            )
+        except FileNotFoundError as exc:
+            # Windows reports WinError 3 / FileNotFoundError when an existing
+            # parent component is a regular file, whereas POSIX reports
+            # NotADirectoryError. Preserve the same route-level 409 contract.
+            parent = Path(expanded).parent
+            while parent != parent.parent and not parent.exists():
+                parent = parent.parent
+            if parent.exists() and not parent.is_dir():
+                return HostCreateDirResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    error="a parent path component is not a directory",
+                )
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"mkdir failed: {exc.strerror or str(exc)}",
             )
         except PermissionError:
             return HostCreateDirResultFrame(
@@ -3849,6 +3919,8 @@ class HostProcess:
             gateway_inference=self._gateway_inference,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            codex_rate_limits=self._codex_rate_limits,
+            filesystem_roots=True,
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -3874,6 +3946,9 @@ class HostProcess:
         # the server's watchdog counts as liveness, or it closes the tunnel
         # with ``4003 ping timeout``.
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        rate_limits_task = asyncio.create_task(
+            self._codex_rate_limits_loop(ws), name="host-codex-rate-limits"
+        )
         # Warm the pre-launch model listings once a server can actually ask
         # for them, so the first picker open is served from cache instead of
         # waiting on a harness probe. Cache-fresh reconnects are a no-op.
@@ -3900,6 +3975,9 @@ class HostProcess:
                     # _runner_lifecycle_lock in _dispatch_host_frame.
                     self._start_frame_task(ws, raw)
         finally:
+            rate_limits_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await rate_limits_task
             prewarm_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await prewarm_task
@@ -3953,6 +4031,40 @@ class HostProcess:
                 gateway = new_gateway
                 self._configured_harnesses = configured
                 self._gateway_inference = gateway
+
+    async def _codex_rate_limits_loop(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+    ) -> None:
+        """Refresh and publish the Host user's sanitized Codex quota windows."""
+        while True:
+            if not self._codex_rate_limits_enabled():
+                # Do not launch an advisory Codex subprocess on Hosts without a
+                # ready subscription-authenticated Codex CLI. The readiness
+                # refresh will make this eligible automatically after setup.
+                await asyncio.sleep(CODEX_RATE_LIMITS_REFRESH_INTERVAL_S)
+                continue
+            try:
+                snapshot = await read_codex_rate_limits_snapshot()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - optional telemetry must not stop refreshing
+                # Subscription auth is optional and app-server is versioned.
+                # Retain the last good snapshot; never let this advisory probe
+                # endanger Host liveness or print credential-bearing output.
+                _logger.debug("Codex rate-limit probe unavailable", exc_info=True)
+            else:
+                if snapshot is not None:
+                    self._codex_rate_limits = snapshot
+                    await ws.send(
+                        encode_host_frame(HostCodexRateLimitsFrame(codex_rate_limits=snapshot))
+                    )
+            await asyncio.sleep(CODEX_RATE_LIMITS_REFRESH_INTERVAL_S)
+
+    def _codex_rate_limits_enabled(self) -> bool:
+        """Return whether this Host has a ready Codex CLI to inspect."""
+        readiness = self._configured_harnesses or {}
+        return any(readiness.get(harness) is True for harness in CODEX_CANONICAL_HARNESSES)
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""

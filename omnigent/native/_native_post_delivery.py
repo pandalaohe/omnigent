@@ -179,6 +179,7 @@ async def post_external_session_status(
     background_task_count: int | None = None,
     background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
+    replayed: bool = False,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -188,10 +189,11 @@ async def post_external_session_status(
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param status: Session status value, e.g. ``"idle"`` or ``"failed"``.
-    :param output: Optional text attached to ``data``. On a ``"failed"`` edge
-        the server surfaces it as ``last_task_error`` so the UI shows a detail
-        instead of a bare "failed". Ignored when falsy.
+    :param status: Session status value, e.g. ``"running"``, ``"completed"``,
+        ``"failed"``, ``"stopped"``, or ``"killed"``.
+    :param output: Optional text attached to ``data``. For structured terminal
+        edges this is the correlated child result; on failure the server also
+        surfaces it as ``last_task_error``. Ignored when falsy.
     :param background_task_count: Background tasks (shells) still running at the
         edge, forwarded so the UI can show "N background tasks still running".
         ``None`` omits the field (server leaves its sticky tally untouched) — the
@@ -208,6 +210,9 @@ async def post_external_session_status(
         timer) rather than as static completed cards. ``None`` (the default)
         preserves the bare, turn-agnostic status edges (e.g. the sub-agent
         quiescence badge) that don't map to a turn.
+    :param replayed: Whether this terminal edge was restored from historical
+        cold-resume metadata. Only ``True`` is serialized; live/default edges
+        omit the field for backward compatibility.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -219,6 +224,8 @@ async def post_external_session_status(
         data["background_tasks"] = background_tasks
     if response_id is not None:
         data["response_id"] = response_id
+    if replayed:
+        data["replayed"] = True
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

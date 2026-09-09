@@ -503,14 +503,18 @@ export const BubbleView = memo(
     bubble,
     isLastAssistant = false,
     showsWorking = false,
-    actionsPersistent = false,
+    readOnly = false,
+    sessionId,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
-    actionsPersistent?: boolean;
+    /** Archive/library viewers reuse the normal bubbles without live actions. */
+    readOnly?: boolean;
+    /** Source session for attachments when rendering outside the active chat. */
+    sessionId?: string;
   }) {
-    if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
+    if (bubble.kind === "user") return <UserBubble bubble={bubble} sessionId={sessionId} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
@@ -531,14 +535,16 @@ export const BubbleView = memo(
         bubble={bubble}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
-        actionsPersistent={actionsPersistent}
+        readOnly={readOnly}
+        sessionId={sessionId}
       />
     );
   },
   (prev, next) =>
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
-    (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
+    (prev.readOnly ?? false) === (next.readOnly ?? false) &&
+    prev.sessionId === next.sessionId &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -580,19 +586,15 @@ function useCopyMessage(getText: () => string): {
   return { isCopied, handleCopy };
 }
 
-/** Pill for an attachment with no preview of its own: a non-image file, an
- *  upload still in flight, or an image block carrying nothing renderable. */
-function AttachmentChip({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
-  return (
-    <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
-      <Icon className="size-3 shrink-0" />
-      <span className="max-w-[180px] truncate">{label}</span>
-    </span>
-  );
-}
-
-function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
-  const sessionId = useChatStore((s) => s.conversationId);
+function UserBubble({
+  bubble,
+  sessionId: sourceSessionId,
+}: {
+  bubble: Extract<Bubble, { kind: "user" }>;
+  sessionId?: string;
+}) {
+  const activeSessionId = useChatStore((s) => s.conversationId);
+  const sessionId = sourceSessionId ?? activeSessionId;
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
@@ -608,6 +610,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
   // markers (no input_file block), so surface them as chips.
   const mentionedChips = extractAttachedPaths(bubble.content);
+  const keyedContent = (() => {
+    const seen = new Map<string, number>();
+    return bubble.content.map((block) => {
+      const base = JSON.stringify(block);
+      const occurrence = seen.get(base) ?? 0;
+      seen.set(base, occurrence + 1);
+      return { block, key: `${base}:${occurrence}` };
+    });
+  })();
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
@@ -662,55 +673,6 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
             }
           >
-            {/* Inline image previews — one non-wrapping strip. */}
-            {images.length > 0 && (
-              <div className="mb-1.5 flex gap-2 overflow-x-auto">
-                {keyedAttachments(
-                  images,
-                  (img) => img.file_id ?? img.image_url ?? img.filename,
-                ).map(({ key, item: img }) => {
-                  const preview = imagePreview(img);
-                  if (preview.kind === "uploaded") {
-                    return (
-                      <SessionImage
-                        key={key}
-                        path={
-                          sessionId
-                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(preview.fileId)}/content`
-                            : undefined
-                        }
-                        alt={preview.alt}
-                        // Sizing lives in SessionImage, which reserves a matching
-                        // box so the bubble's height is settled before bytes land.
-                        className="rounded-md object-contain"
-                      />
-                    );
-                  }
-                  if (preview.kind === "inline") {
-                    return (
-                      <InlineImage
-                        key={key}
-                        src={preview.src}
-                        alt={preview.alt}
-                        className="rounded-md object-contain"
-                      />
-                    );
-                  }
-                  // In-flight upload, or a block with nothing renderable on it.
-                  return <AttachmentChip key={key} icon={ImageIcon} label={preview.label} />;
-                })}
-              </div>
-            )}
-            {/* Non-image file chips */}
-            {fileChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
-                  ({ key, item: att }) => (
-                    <AttachmentChip key={key} icon={FileTextIcon} label={attachmentLabel(att)} />
-                  ),
-                )}
-              </div>
-            )}
             {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
             {mentionedChips.length > 0 && (
               <div className="mb-1.5 flex flex-wrap gap-1.5">
@@ -737,10 +699,56 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 ))}
               </div>
             )}
-            {/* Render user text as markdown, matching the assistant bubble.
-              `breaks` keeps single newlines as line breaks. Empty text renders
-              nothing rather than an empty markdown block. */}
-            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
+            {/* Preserve the authored text/attachment order after send. Adjacent
+                text is already coalesced by the composer, so each block can be
+                rendered directly without lifting uploads ahead of prose. */}
+            {keyedContent.map(({ block, key }) => {
+              if (block.type === "input_text") {
+                const visible = block.text.replace(ATTACHED_RE, "").trim();
+                return visible ? (
+                  <FilePathAwareMessageResponse key={key} breaks>
+                    {visible}
+                  </FilePathAwareMessageResponse>
+                ) : null;
+              }
+              if (block.type === "input_image") {
+                return (
+                  <div key={key} className="my-1.5 flex overflow-x-auto">
+                    {block.file_id.startsWith("pending:") ? (
+                      <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
+                        <ImageIcon className="size-3 shrink-0" />
+                        <span className="max-w-[180px] truncate">
+                          {block.filename ?? block.file_id.replace("pending:", "")}
+                        </span>
+                      </span>
+                    ) : (
+                      <SessionImage
+                        path={
+                          sessionId
+                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(block.file_id)}/content`
+                            : undefined
+                        }
+                        alt={block.filename ?? block.file_id}
+                        className="rounded-md object-contain"
+                      />
+                    )}
+                  </div>
+                );
+              }
+              if (block.type === "input_file") {
+                return (
+                  <div key={key} className="my-1.5 flex flex-wrap gap-1.5">
+                    <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
+                      <FileTextIcon className="size-3 shrink-0" />
+                      <span className="max-w-[180px] truncate">
+                        {block.filename ?? block.file_id}
+                      </span>
+                    </span>
+                  </div>
+                );
+              }
+              return null;
+            })}
           </MessageContent>
         </div>
         {/* Skip an empty row when there is neither a timestamp nor a copy
@@ -778,23 +786,28 @@ function AssistantBubble({
   bubble,
   isLastAssistant = false,
   showsWorking = false,
-  actionsPersistent = false,
+  readOnly = false,
+  sessionId,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
-  actionsPersistent?: boolean;
+  readOnly?: boolean;
+  sessionId?: string;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const conversationId = useChatStore((s) => s.conversationId);
+  const activeSessionStatus = useChatStore((s) => s.sessionStatus);
+  const activeConversationId = useChatStore((s) => s.conversationId);
+  const sessionStatus = readOnly ? "idle" : activeSessionStatus;
+  const conversationId = sessionId ?? activeConversationId;
   // A pending elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
-  const hasPendingElicitation = useChatStore((s) =>
+  const activeHasPendingElicitation = useChatStore((s) =>
     s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
   );
+  const hasPendingElicitation = readOnly ? false : activeHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
@@ -859,7 +872,7 @@ function AssistantBubble({
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
-            onRetryError={handleRetryError}
+            onRetryError={readOnly ? undefined : handleRetryError}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -893,7 +906,7 @@ function AssistantBubble({
                 {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                {!readOnly && forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
                   <MessageAction
                     tooltip="Fork from here"
                     size="icon-xxs"
@@ -955,6 +968,35 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
   }, [nonce, scrollToBottom]);
+
+  return null;
+}
+
+/** Apply the shared session-open preference after the selected transcript mounts. */
+export function ScrollToBottomOnSessionOpen({
+  conversationId,
+  enabled,
+  openedConversationIdRef,
+}: {
+  conversationId: string | null;
+  enabled: boolean;
+  openedConversationIdRef?: { current: string | null };
+}) {
+  const { scrollToBottom } = useStickToBottomContext();
+  const localOpenedConversationIdRef = useRef<string | null>(null);
+  const openedRef = openedConversationIdRef ?? localOpenedConversationIdRef;
+
+  useLayoutEffect(() => {
+    if (!conversationId) {
+      openedRef.current = null;
+      return;
+    }
+    if (conversationId === openedRef.current) return;
+    openedRef.current = conversationId;
+    if (!enabled) return;
+    scrollToBottom("instant");
+    requestAnimationFrame(() => scrollToBottom("instant"));
+  }, [conversationId, enabled, openedRef, scrollToBottom]);
 
   return null;
 }

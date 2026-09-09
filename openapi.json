@@ -170,6 +170,34 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "ArchivedSessionFacetsResponse": {
+        "description": "Compact filter values for `GET /v1/sessions/archived-facets`.",
+        "properties": {
+          "agent_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Agent Names",
+            "type": "array"
+          },
+          "host_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Host Ids",
+            "type": "array"
+          },
+          "projects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Projects",
+            "type": "array"
+          }
+        },
+        "title": "ArchivedSessionFacetsResponse",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Request body for the current-agent automatic rename endpoint.",
@@ -234,6 +262,7 @@
           "command": {
             "anyOf": [
               {
+                "maxLength": 8192,
                 "type": "string"
               },
               {
@@ -246,6 +275,7 @@
           "description": {
             "anyOf": [
               {
+                "maxLength": 2048,
                 "type": "string"
               },
               {
@@ -258,6 +288,7 @@
           "id": {
             "anyOf": [
               {
+                "maxLength": 256,
                 "type": "string"
               },
               {
@@ -270,6 +301,7 @@
           "status": {
             "anyOf": [
               {
+                "maxLength": 128,
                 "type": "string"
               },
               {
@@ -282,6 +314,7 @@
           "type": {
             "anyOf": [
               {
+                "maxLength": 128,
                 "type": "string"
               },
               {
@@ -540,6 +573,11 @@
       "ChildSessionSummary": {
         "description": "Summary of a sub-agent (child) session under a parent session.\n\nPowers `GET /v1/sessions/{id}/child_sessions`. Lets the web /\nREPL debug surface enumerate sub-agent calls spawned from a\nparent session without parsing parent `function_call_output`\nJSON handles (the legacy TUI Ctrl+O path). The endpoint is the\ncanonical \"historical truth\" source; the existing transient\n`session.created` SSE event handles live incremental updates.\n\nFields are derived from the child `Conversation` plus its\nlatest `Task` (newest by `created_at`).",
         "properties": {
+          "activity_unverified": {
+            "default": false,
+            "title": "Activity Unverified",
+            "type": "boolean"
+          },
           "agent_id": {
             "anyOf": [
               {
@@ -645,6 +683,11 @@
             ],
             "description": "Error details from the child's most recent failed run, e.g. `{\"code\": \"required_terminal_exited\", \"message\": \"...\"}`. `None` when the child has no durable failure detail. This is the typed projection of runner-owned failure labels; clients should not parse those labels directly.",
             "title": "Last Task Error"
+          },
+          "native_activity_unverified": {
+            "default": false,
+            "title": "Native Activity Unverified",
+            "type": "boolean"
           },
           "object": {
             "default": "child_session",
@@ -1037,6 +1080,21 @@
             ],
             "description": "The model used to generate the summary, e.g. `\"openai/gpt-4o\"`.",
             "title": "Model"
+          },
+          "snapshot_source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "transcript",
+                  "hook_fallback"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Source"
           },
           "summary": {
             "description": "The LLM-generated summary text covering all conversation items up through `last_item_id`, e.g. `\"User asked to analyze a dataset. Agent loaded data.csv and computed statistics.\"`.",
@@ -1492,6 +1550,99 @@
         "title": "CreatedEvent",
         "type": "object"
       },
+      "CurrentUserResponse": {
+        "description": "Authenticated identity and optional synchronized preferences.",
+        "properties": {
+          "is_admin": {
+            "title": "Is Admin",
+            "type": "boolean"
+          },
+          "preferences": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserPreferencesEnvelope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "required": [
+          "user_id",
+          "is_admin"
+        ],
+        "title": "CurrentUserResponse",
+        "type": "object"
+      },
+      "CustomAgentPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 8192,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "maxLength": 262144,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "title": "CustomAgentPatch",
+        "type": "object"
+      },
       "DailyCost": {
         "description": "One day's LLM spend for the daily timeline chart.",
         "properties": {
@@ -1510,6 +1661,36 @@
           "day"
         ],
         "title": "DailyCost",
+        "type": "object"
+      },
+      "DictationPunctuationRequest": {
+        "description": "One completed transcript that needs punctuation restoration.",
+        "properties": {
+          "text": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "DictationPunctuationRequest",
+        "type": "object"
+      },
+      "DictationPunctuationResponse": {
+        "description": "Display-ready transcript returned to the composer.",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "DictationPunctuationResponse",
         "type": "object"
       },
       "ElicitationRequestEvent": {
@@ -2490,10 +2671,46 @@
             "title": "Call Id",
             "type": "string"
           },
+          "is_async": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the native tool result represents background work that is still running.",
+            "title": "Is Async"
+          },
+          "is_error": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the native harness marked the tool result as an error. Missing on conversation items written by older versions.",
+            "title": "Is Error"
+          },
           "output": {
             "description": "The tool's string result.",
             "title": "Output",
             "type": "string"
+          },
+          "tool_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional status carried by a native harness's structured tool-result metadata, e.g. `\"running\"` or `\"completed\"`. Named separately from the conversation item's own `status` so flattening the API shape cannot overwrite it.",
+            "title": "Tool Status"
           }
         },
         "required": [
@@ -2863,6 +3080,7 @@
         "title": "IncompleteEvent",
         "type": "object"
       },
+      "JsonValue": {},
       "LaunchRunnerRequest": {
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
@@ -4455,6 +4673,10 @@
             "title": "Dictation Available",
             "type": "boolean"
           },
+          "dictation_punctuation_available": {
+            "title": "Dictation Punctuation Available",
+            "type": "boolean"
+          },
           "enabled_connections": {
             "items": {
               "type": "string"
@@ -4566,6 +4788,7 @@
           "harness_install_enabled",
           "installable_harnesses",
           "dictation_available",
+          "dictation_punctuation_available",
           "branding"
         ],
         "title": "ServerInfoResponse",
@@ -5407,6 +5630,63 @@
         "title": "SessionInterruptedPayload",
         "type": "object"
       },
+      "SessionItemsWindow": {
+        "description": "A bounded chronological item window centered on one stable item id.",
+        "properties": {
+          "anchor_id": {
+            "title": "Anchor Id",
+            "type": "string"
+          },
+          "data": {
+            "items": {},
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_newer": {
+            "default": false,
+            "title": "Has Newer",
+            "type": "boolean"
+          },
+          "has_older": {
+            "default": false,
+            "title": "Has Older",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "session.items.window",
+            "default": "session.items.window",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "anchor_id"
+        ],
+        "title": "SessionItemsWindow",
+        "type": "object"
+      },
       "SessionLabelsResponse": {
         "description": "Lightweight response body for `GET /v1/sessions/{id}/labels`.",
         "properties": {
@@ -5497,11 +5777,41 @@
             "description": "Human-readable name of the bound agent, e.g. `\"research-agent\"`. `None` when the agent row cannot be found.",
             "title": "Agent Name"
           },
+          "agent_template_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Template Id"
+          },
           "archived": {
             "default": false,
             "description": "Whether the session is archived. Archived sessions are returned by `GET /v1/sessions` only when the request passes `include_archived=true`; the sidebar groups them into a dedicated \"Archived\" section. `False` for normal sessions.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
+          "background_activity_count": {
+            "description": "Number of active direct sub-agents plus background shells owned by this session. `0` means none are known.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Background Activity Count",
+            "type": "integer"
           },
           "comments_count": {
             "default": 0,
@@ -5541,6 +5851,16 @@
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Lets the sidebar / picker render a runtime badge without a follow-up GET.",
             "title": "External Session Id"
           },
+          "foreground_status": {
+            "description": "Status of this session's own turn, excluding child-session rollup. This distinguishes a busy main turn from background-only activity while preserving `status` for compatibility.",
+            "enum": [
+              "idle",
+              "running",
+              "failed"
+            ],
+            "title": "Foreground Status",
+            "type": "string"
+          },
           "git_branch": {
             "anyOf": [
               {
@@ -5552,6 +5872,21 @@
             ],
             "description": "Git branch checked out in the session's worktree, e.g. `\"feature/login\"`. Set only when the session was created with a server-created git worktree; `None` otherwise. The Web UI uses a non-`None` value to offer the \"delete local branch\" cleanup checkbox on session delete. See designs/SESSION_GIT_WORKTREE.md.",
             "title": "Git Branch"
+          },
+          "goal_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "active",
+                  "paused"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal State"
           },
           "host_id": {
             "anyOf": [
@@ -5680,6 +6015,23 @@
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. Matches `GET /health`'s `runner_online` value. Strict: a dead runner on a live host reads `False` here (no host-relaunch optimism folded in), unlike the legacy conflated value. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
           },
+          "search_match": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionSearchMatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "search_match_count": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Search Match Count",
+            "type": "integer"
+          },
           "search_snippet": {
             "anyOf": [
               {
@@ -5757,6 +6109,8 @@
           "id",
           "agent_id",
           "status",
+          "foreground_status",
+          "background_activity_count",
           "created_at",
           "updated_at"
         ],
@@ -6281,11 +6635,46 @@
             "description": "Human-readable name of the bound agent, e.g. `\"research-agent\"`. Loaded from the agent row at snapshot-build time. `None` when the agent row cannot be found (deleted or orphaned session).",
             "title": "Agent Name"
           },
+          "agent_template_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Template Id"
+          },
           "archived": {
             "default": false,
             "description": "Whether the session is archived. Archived sessions are hidden from the default sidebar listing and surface only behind the \"Show archived\" toggle. `False` for normal sessions. Toggled via `PATCH /v1/sessions/{id}`.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
+          "auto_compact_token_limit": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Compact Token Limit"
           },
           "background_task_count": {
             "anyOf": [
@@ -6566,6 +6955,18 @@
             ],
             "title": "Project Id"
           },
+          "provider_usage_limits": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Usage Limits"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -6708,7 +7109,7 @@
             "title": "Title"
           },
           "todos": {
-            "description": "Current Claude Code todo list items for `omnigent claude` sessions, as raw dicts from Claude's todo JSON file. Each dict has `content`, `status`, and `activeForm` keys. Empty list for non-claude-native sessions or when no todos have been reported yet. Sourced from the Omnigent server's in-memory `_session_todos_cache`.",
+            "description": "Current native-harness plan items. Each dict has `content`, `status`, and `activeForm` keys. Empty when no plan has been reported. Persisted for snapshot recovery and live-cached.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -6839,6 +7240,36 @@
           "stage"
         ],
         "title": "SessionSandboxStatusEvent",
+        "type": "object"
+      },
+      "SessionSearchMatch": {
+        "description": "Stable archive-library locator for one content-search hit.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "item_id": {
+            "title": "Item Id",
+            "type": "string"
+          },
+          "response_id": {
+            "title": "Response Id",
+            "type": "string"
+          },
+          "snippet": {
+            "title": "Snippet",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "response_id",
+          "created_at",
+          "snippet"
+        ],
+        "title": "SessionSearchMatch",
         "type": "object"
       },
       "SessionSkillsEvent": {
@@ -7201,7 +7632,7 @@
             "title": "Sequence Number"
           },
           "todos": {
-            "description": "Current todo items read from Claude's todo file. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, the gerund form) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is populated by `_session_todos_cache` at snapshot build time.",
+            "description": "Current todo items read from Claude's todo file. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, the gerund form) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the persisted session snapshot's `todos` field.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -7331,6 +7762,19 @@
       "SessionUsageEvent": {
         "description": "Token-usage update from a terminal-backed integration.\n\nEmitted after an `external_session_usage` POST from an\nout-of-AP runtime (e.g. the `omnigent claude` transcript\nforwarder). Either field may be absent; clients should leave\ncached values untouched for missing fields.",
         "properties": {
+          "auto_compact_token_limit": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Auto Compact Token Limit"
+          },
           "context_tokens": {
             "anyOf": [
               {
@@ -7363,6 +7807,19 @@
             "description": "Session identifier.",
             "title": "Conversation Id",
             "type": "string"
+          },
+          "provider_usage_limits": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Provider Usage Limits"
           },
           "sequence_number": {
             "anyOf": [
@@ -7997,6 +8454,27 @@
         "title": "UpdateDefaultPolicyRequest",
         "type": "object"
       },
+      "UpdateHostRequest": {
+        "description": "Mutable user preference fields for a registered host.",
+        "properties": {
+          "default_workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Workspace"
+          }
+        },
+        "required": [
+          "default_workspace"
+        ],
+        "title": "UpdateHostRequest",
+        "type": "object"
+      },
       "UpdateProjectRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/projects/{project_id}`.\n\nAll fields optional; `None` leaves a field unchanged.",
@@ -8089,6 +8567,18 @@
             ],
             "description": "Codex-native approval mode to switch a running session to, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"` \u2014 Codex's own `/permissions` presets (the set is codex-version-dependent, so an older build may not offer every one). Only valid for sessions stamped with the codex-native wrapper label. The runner applies it by driving Codex's `/permissions` popup and confirms the switch echoed before returning, so a failure to reach the mode surfaces as an error. The confirmed mode is stored on the read-back label only (Codex owns the durable approval state), so it is not written to `terminal_launch_args`. Omitted leaves unchanged.",
             "title": "Approval Mode"
+          },
+          "archive_locked": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Protect an archived session from bulk deletion. `True` locks it, `False` unlocks it, and `None` leaves the current lock unchanged. Owner-only.",
+            "title": "Archive Locked"
           },
           "archived": {
             "anyOf": [
@@ -8514,18 +9004,39 @@
         "title": "UsageReport",
         "type": "object"
       },
-      "UserSettingsUpdate": {
-        "description": "Writable current-user settings.",
+      "UserPreferencesEnvelope": {
+        "additionalProperties": false,
+        "description": "Versioned, allowlisted cross-device preference payload.",
         "properties": {
-          "background_session_titles_enabled": {
-            "title": "Background Session Titles Enabled",
-            "type": "boolean"
+          "settings": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "propertyNames": {
+              "enum": [
+                "keyboard_shortcuts",
+                "mobile_assistant",
+                "session_navigation",
+                "context_indicator",
+                "usage_context",
+                "agent_badges"
+              ]
+            },
+            "title": "Settings",
+            "type": "object"
+          },
+          "version": {
+            "const": 1,
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
           }
         },
         "required": [
-          "background_session_titles_enabled"
+          "version",
+          "settings"
         ],
-        "title": "UserSettingsUpdate",
+        "title": "UserPreferencesEnvelope",
         "type": "object"
       },
       "ValidationError": {
@@ -8870,6 +9381,338 @@
         "summary": "Branding Logo"
       }
     },
+    "/v1/custom-agents": {
+      "get": {
+        "operationId": "list_custom_agents_v1_custom_agents_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Custom Agents V1 Custom Agents Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Custom Agents",
+        "tags": [
+          "custom-agents"
+        ]
+      },
+      "post": {
+        "operationId": "create_custom_agent_v1_custom_agents_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "source_session_id": {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "title": "Source Session Id",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source_session_id"
+                ],
+                "title": "CustomAgentImport",
+                "type": "object"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "bundle": {
+                    "format": "binary",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "bundle"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Custom Agent V1 Custom Agents Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Custom Agent",
+        "tags": [
+          "custom-agents"
+        ]
+      }
+    },
+    "/v1/custom-agents/{agent_id}": {
+      "delete": {
+        "operationId": "delete_custom_agent_v1_custom_agents__agent_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Custom Agent",
+        "tags": [
+          "custom-agents"
+        ]
+      },
+      "get": {
+        "operationId": "get_custom_agent_v1_custom_agents__agent_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Custom Agent V1 Custom Agents  Agent Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Custom Agent",
+        "tags": [
+          "custom-agents"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_custom_agent_v1_custom_agents__agent_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomAgentPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Patch Custom Agent V1 Custom Agents  Agent Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Custom Agent",
+        "tags": [
+          "custom-agents"
+        ]
+      }
+    },
+    "/v1/custom-agents/{agent_id}/contents": {
+      "get": {
+        "operationId": "get_custom_agent_contents_v1_custom_agents__agent_id__contents_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/gzip": {},
+              "application/x-tar": {}
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Custom Agent Contents",
+        "tags": [
+          "custom-agents"
+        ]
+      }
+    },
+    "/v1/dictation/punctuation": {
+      "post": {
+        "description": "Restore Chinese/English punctuation in a completed transcript.",
+        "operationId": "restore_dictation_punctuation_v1_dictation_punctuation_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DictationPunctuationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DictationPunctuationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "description": "Punctuation model busy"
+          },
+          "503": {
+            "description": "Punctuation model unavailable"
+          }
+        },
+        "summary": "Restore Dictation Punctuation",
+        "tags": [
+          "dictation"
+        ]
+      }
+    },
     "/v1/extensions": {
       "get": {
         "description": "List extensions installed and enabled when the server started.\n\nV1 treats operator installation as enablement. Installing, removing, or\nupgrading a package requires a server restart to refresh this snapshot.",
@@ -9128,6 +9971,104 @@
         "tags": [
           "hosts"
         ]
+      },
+      "patch": {
+        "description": "Set or clear user-owned preferences for one physical host.",
+        "operationId": "update_host_v1_hosts__host_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Host V1 Hosts  Host Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Host",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/codex-rate-limits": {
+      "get": {
+        "description": "Return the live Host's sanitized Codex subscription quota snapshot.",
+        "operationId": "get_host_codex_rate_limits_v1_hosts__host_id__codex_rate_limits_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Host Codex Rate Limits V1 Hosts  Host Id  Codex Rate Limits Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Codex Rate Limits",
+        "tags": [
+          "hosts"
+        ]
       }
     },
     "/v1/hosts/{host_id}/credentials/detected": {
@@ -9315,6 +10256,32 @@
             "schema": {
               "title": "Host Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          },
+          {
+            "in": "query",
+            "name": "roots",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Roots",
+              "type": "boolean"
             }
           },
           {
@@ -9911,7 +10878,7 @@
     },
     "/v1/info": {
       "get": {
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
+        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`dictation_punctuation_available`, `single_user`), the\nshort sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
         "operationId": "info_v1_info_get",
         "responses": {
           "200": {
@@ -9939,7 +10906,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentUserResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9949,6 +10918,157 @@
         "tags": [
           "system"
         ]
+      }
+    },
+    "/v1/me/preferences": {
+      "put": {
+        "description": "Initialize the caller's full preference envelope exactly once.",
+        "operationId": "initialize_user_preferences_v1_me_preferences_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "settings": {
+                    "additionalProperties": {},
+                    "propertyNames": {
+                      "enum": [
+                        "agent_badges",
+                        "context_indicator",
+                        "keyboard_shortcuts",
+                        "mobile_assistant",
+                        "session_navigation",
+                        "usage_context"
+                      ]
+                    },
+                    "type": "object"
+                  },
+                  "version": {
+                    "const": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "settings"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserPreferencesEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Initialize User Preferences"
+      }
+    },
+    "/v1/me/preferences/{namespace}": {
+      "patch": {
+        "description": "Atomically merge or remove one namespace for the current user.",
+        "operationId": "patch_user_preferences_namespace_v1_me_preferences__namespace__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "enum": [
+                "keyboard_shortcuts",
+                "mobile_assistant",
+                "session_navigation",
+                "context_indicator",
+                "usage_context",
+                "agent_badges"
+              ],
+              "title": "Namespace",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "value": {}
+                },
+                "required": [
+                  "value"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserPreferencesEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Patch User Preferences Namespace"
       }
     },
     "/v1/policies": {
@@ -10634,13 +11754,13 @@
             }
           },
           {
-            "description": "Column to sort on, `\"created_at\"` or `\"updated_at\"`.",
+            "description": "Column to sort on: `\"created_at\"`, `\"updated_at\"`, `\"archived_at\"`, or `\"title\"`.",
             "in": "query",
             "name": "sort_by",
             "required": false,
             "schema": {
               "default": "created_at",
-              "pattern": "^(created_at|updated_at)$",
+              "pattern": "^(created_at|updated_at|archived_at|title)$",
               "title": "Sort By",
               "type": "string"
             }
@@ -10663,6 +11783,18 @@
             }
           },
           {
+            "description": "Limit search to `\"title\"` or `\"content\"`; `\"all\"` keeps the existing title/content/workspace behavior.",
+            "in": "query",
+            "name": "search_scope",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|title|content)$",
+              "title": "Search Scope",
+              "type": "string"
+            }
+          },
+          {
             "description": "When `False` (default), archived sessions are omitted. When `True`, archived sessions are returned alongside active ones (the sidebar groups them into an \"Archived\" section). Powers the sidebar's \"Show archived\" toggle.",
             "in": "query",
             "name": "include_archived",
@@ -10671,6 +11803,168 @@
               "default": false,
               "title": "Include Archived",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Archived Only",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updated After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updated_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updated Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived Before"
             }
           },
           {
@@ -10766,6 +12060,217 @@
           }
         },
         "summary": "Create Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/archived-facets": {
+      "get": {
+        "description": "Return linked filter values for the visible archived-session set.\n\nThe candidate query applies search and date bounds once, then the three\nfacet sets are computed while excluding each facet's own current value.\nThis keeps Project/Host/Agent switchable while removing combinations\nthat cannot produce a result.",
+        "operationId": "list_archived_session_facets_v1_sessions_archived_facets_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "search_query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Search Query"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search_scope",
+            "required": false,
+            "schema": {
+              "default": "title",
+              "pattern": "^(title|content)$",
+              "title": "Search Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchivedSessionFacetsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Archived Session Facets",
         "tags": [
           "sessions"
         ]
@@ -11509,6 +13014,47 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/child_sessions/reconcile": {
+      "post": {
+        "description": "Verify and repair stale direct native sub-agent status metadata.\n\nThe action is owner-only and intentionally accepts no child ids. It\nfreezes every direct child, asks the already-bound runner for a\nread-only parent-transcript verdict, then applies each reliable\nterminal result through a store compare-and-set. It never launches or\nresumes a runner and never writes conversation items or parent inboxes.",
+        "operationId": "reconcile_child_sessions_v1_sessions__session_id__child_sessions_reconcile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconcile Child Sessions",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/codex_goal": {
       "delete": {
         "description": "Clear the current Codex app-server goal.\n\n**Returns:** Whether Codex removed an existing goal.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can clear the goal.",
@@ -12095,6 +13641,149 @@
           }
         },
         "summary": "List Session Items",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/items/search": {
+      "get": {
+        "description": "Search committed items inside one authorized session.",
+        "operationId": "search_session_items_v1_sessions__session_id__items_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search_query",
+            "required": true,
+            "schema": {
+              "maxLength": 500,
+              "minLength": 1,
+              "title": "Search Query",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Session Items",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/items/window": {
+      "get": {
+        "description": "Return a bounded chronological window around one committed item.",
+        "operationId": "get_session_items_window_v1_sessions__session_id__items_window_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "anchor_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Anchor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Before",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "After",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionItemsWindow"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Items Window",
         "tags": [
           "sessions"
         ]

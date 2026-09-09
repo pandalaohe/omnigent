@@ -1138,6 +1138,50 @@ describe("mark as unread", () => {
   });
 });
 
+describe("mark all as read", () => {
+  it("shows a clear mobile top action and clears every loaded unread dot in one tap", () => {
+    const second = {
+      ...CONV,
+      id: "conv_2",
+      title: "Another Session",
+      updated_at: CONV.updated_at + 10,
+    };
+    mockConversations([CONV, second]);
+    seedReadState([
+      { id: CONV.id, viewer_last_seen: CONV.updated_at - 1 },
+      { id: second.id, viewer_last_seen: second.updated_at - 1 },
+    ]);
+    renderSidebar();
+
+    expect(screen.getAllByText("(unread)")).toHaveLength(2);
+
+    const mobileAction = screen.getByTestId("mark-all-sessions-read-mobile");
+    expect(mobileAction).toHaveAccessibleName("Mark all sessions as read");
+    expect(mobileAction).toHaveTextContent("");
+    expect(mobileAction).toHaveClass("md:hidden", "size-9", "rounded-full", "p-0");
+    expect(screen.getByTestId("mark-all-sessions-read")).toHaveClass("max-md:hidden");
+
+    fireEvent.click(mobileAction);
+
+    expect(screen.queryByText("(unread)")).toBeNull();
+    expect(screen.queryByTestId("mark-all-sessions-read")).toBeNull();
+    expect(screen.queryByTestId("mark-all-sessions-read-mobile")).toBeNull();
+  });
+
+  it("keeps a needs-response state visible after its content is marked read", () => {
+    const awaiting = { ...CONV, pending_elicitations_count: 1 };
+    mockConversations([awaiting]);
+    seedReadState([{ id: awaiting.id, viewer_last_seen: awaiting.updated_at - 1 }]);
+    renderSidebar();
+
+    expect(screen.getByText("Needs response")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("mark-all-sessions-read"));
+
+    expect(screen.getByText("Needs response")).toBeInTheDocument();
+    expect(screen.queryByTestId("mark-all-sessions-read")).toBeNull();
+  });
+});
+
 describe("right-click context menu", () => {
   it("opens the fork dialog for the selected session", () => {
     renderSidebar();

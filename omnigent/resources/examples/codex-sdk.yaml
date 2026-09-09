@@ -1,0 +1,8 @@
+spec_version: 1
+name: codex-sdk
+description: Codex in chat using the host Codex login and default model.
+executor:
+  type: omnigent
+  config:
+    harness: codex
+instructions: You are a coding assistant. Help the user complete their task.

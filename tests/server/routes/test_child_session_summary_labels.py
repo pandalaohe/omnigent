@@ -11,13 +11,14 @@ strip.
 from __future__ import annotations
 
 from omnigent.entities import Conversation
+from omnigent.server.routes._sessions.common import _SUBAGENT_TERMINAL_STATUS_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import (
     _child_session_summary_from_conversation,
 )
 from omnigent.stores.conversation_store import pinned_label_key
 
 
-def _child(labels: dict[str, str]) -> Conversation:
+def _child(labels: dict[str, str], *, live_status: str | None = None) -> Conversation:
     """A minimal sub-agent conversation carrying the given labels."""
     return Conversation(
         id="conv_child",
@@ -27,6 +28,7 @@ def _child(labels: dict[str, str]) -> Conversation:
         title="tool:child-task",
         agent_id="ag_test",
         labels=labels,
+        live_status=live_status,
     )
 
 
@@ -44,3 +46,42 @@ def test_child_summary_strips_per_user_pin_keys() -> None:
     assert not any(k.startswith("omnigent.pinned") for k in summary.labels)
     # Unrelated labels are preserved.
     assert summary.labels.get("omni_project") == "Moonshot"
+
+
+def test_child_summary_cache_miss_uses_durable_running_status() -> None:
+    summary = _child_session_summary_from_conversation(
+        _child({}, live_status="running"),
+        "conv_parent",
+        None,
+        cached_status=None,
+    )
+
+    assert summary.busy is True
+    assert summary.current_task_status == "in_progress"
+
+
+def test_child_summary_explicit_idle_is_not_overridden_by_durable_running() -> None:
+    summary = _child_session_summary_from_conversation(
+        _child({}, live_status="running"),
+        "conv_parent",
+        None,
+        cached_status="idle",
+    )
+
+    assert summary.busy is False
+    assert summary.current_task_status == "completed"
+
+
+def test_child_summary_durable_terminal_precedes_live_status_on_cache_miss() -> None:
+    summary = _child_session_summary_from_conversation(
+        _child(
+            {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "completed"},
+            live_status="running",
+        ),
+        "conv_parent",
+        None,
+        cached_status=None,
+    )
+
+    assert summary.busy is False
+    assert summary.current_task_status == "completed"

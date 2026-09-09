@@ -15,7 +15,6 @@ import {
   Loader2Icon,
   FileTextIcon,
   FolderIcon,
-  ImageIcon,
   PaperclipIcon,
   PlusIcon,
   SettingsIcon,
@@ -69,9 +68,22 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { randomUUID } from "@/lib/randomUUID";
-import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import {
+  composerNewLineDisposition,
+  isComposerSendKey,
+  readSubmitWithModEnter,
+} from "@/lib/composerSendShortcutPreferences";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
+import {
+  COMPOSER_ATTACHMENT_PLACEHOLDER,
+  composerAttachments,
+  composerPartsFromProjection,
+  composerPartsToProjection,
+  composerPartsToText,
+  normalizeComposerParts,
+  replaceComposerText,
+  type ComposerDraftPart,
+} from "@/lib/composerContent";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -101,18 +113,24 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
+import { setPendingInitialPrompt } from "@/store/chatStore";
 import {
-  beginLocalConversation,
-  hydrateLocalConversation,
-  removeLocalConversation,
-  setPendingInitialPrompt,
-} from "@/store/chatStore";
+  InlineComposerEditor,
+  type InlineComposerEditorHandle,
+} from "@/components/InlineComposerEditor";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  HostWorkspacePicker,
+  basename,
+  isAbsoluteHostPath,
+  isNavigablePath,
+  parentOf,
+} from "./WorkspacePicker";
 import {
   initialPrefillState,
   prefillDone,
@@ -203,18 +221,22 @@ import {
   prefetchAvailableAgentDetails,
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
-import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
+import { readLastCreatedWorkspace, writeLastCreatedWorkspace } from "@/lib/lastCreatedWorkspace";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
-import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
+import {
+  useAppShellSidebarOpen,
+  useNativeServerSwitcherForMainSurface,
+} from "@/hooks/useNativeServerSwitcher";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
-import type { Conversation } from "@/hooks/useConversations";
+import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
@@ -229,7 +251,6 @@ import type { SessionListWireItem } from "@/lib/sessionListCache";
 import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
 import { CLIENT_CREATE_TOKEN_LABEL, newTempConversation } from "@/lib/tempConversationId";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
-import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
@@ -250,7 +271,14 @@ import {
 } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
-import { CreateAgentDialog } from "./CreateAgentDialog";
+import { AgentBadge } from "@/components/AgentBadge";
+import {
+  AGENT_TEMPLATE_LABEL,
+  customAgentBundle,
+  customAgentForPicker,
+  useCustomAgents,
+} from "@/lib/customAgentsApi";
+import { writeNewSessionTarget } from "@/lib/newSessionTarget";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
@@ -445,7 +473,7 @@ export function ConnectHostInstructions({
  * Return true when ``workspace`` is acceptable to send to the backend.
  *
  * Per designs/SESSION_WORKSPACE_SELECTION.md: only fully-absolute
- * paths (starting with ``/``) are accepted. Tilde-prefixed and
+ * POSIX or Windows paths are accepted. Tilde-prefixed and
  * relative paths are rejected because the server never expands ``~``
  * — that's the host's job, and the workspace request body must be
  * an unambiguous absolute path. Empty / whitespace-only input is
@@ -453,16 +481,16 @@ export function ConnectHostInstructions({
  * has typed something usable.
  *
  * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * @returns true when ``workspace.trimStart()`` is absolute for the target host.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  return isAbsoluteHostPath(workspace.trimStart());
 }
 
 /**
  * Normalize a host filesystem path for equality comparison.
  *
- * Trims whitespace and strips trailing slashes so ``"/repo/"`` and
+ * Trims leading whitespace and strips trailing slashes so ``"/repo/"`` and
  * ``"/repo"`` compare equal, preserving the root ``"/"``. Blank/whitespace
  * input returns ``null`` (no path), never the root. Lexical only — no ``..``
  * or symlink resolution — which suffices because the server stores canonical
@@ -472,9 +500,12 @@ export function isValidWorkspace(workspace: string): boolean {
  * @returns The normalized path, e.g. ``"/Users/me/repo"``; ``null`` for blank.
  */
 export function normalizeWorkspacePath(path: string): string | null {
-  const trimmed = path.trim();
+  const trimmed = path.trimStart();
   if (trimmed === "") return null;
-  const stripped = trimmed.replace(/\/+$/, "");
+  if (/^[A-Za-z]:[\\/]+$/.test(trimmed)) {
+    return `${trimmed.slice(0, 2)}\\`;
+  }
+  const stripped = trimmed.replace(/[\\/]+$/, "");
   // All-slashes input (e.g. "///") collapses to the root.
   return stripped === "" ? "/" : stripped;
 }
@@ -1015,9 +1046,7 @@ export function matchSkillInvocation(
 export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
   const first = entries[0];
   if (!first) return null;
-  const slash = first.path.lastIndexOf("/");
-  if (slash < 0) return null;
-  return slash === 0 ? "/" : first.path.slice(0, slash);
+  return parentOf(first.path);
 }
 
 /**
@@ -1069,9 +1098,7 @@ export function AgentHarnessPicker({
   pendingAgent,
   pendingAgentId,
   onSelectPending,
-  onCreateCustomAgent,
   sandboxSelected,
-  allowCreateCustomAgent = true,
   onOpenChange,
   dropdownModal = true,
   contentClassName,
@@ -1093,7 +1120,7 @@ export function AgentHarnessPicker({
   pendingAgent: AgentBundleInput | null;
   pendingAgentId: string;
   onSelectPending: () => void;
-  onCreateCustomAgent: () => void;
+  onCreateCustomAgent?: () => void;
   sandboxSelected: boolean;
   /** Whether to offer the "Create custom agent" action. Defaults true; an
    *  embedder that only picks an existing agent (e.g. project settings) can
@@ -1193,9 +1220,11 @@ export function AgentHarnessPicker({
         key={agent.id}
         data-testid={`new-chat-landing-agent-${agent.id}`}
         data-active={active ? "true" : undefined}
+        disabled={sandboxSelected && agent.id.startsWith("ca_")}
         onSelect={() => onSelectAgent(agent)}
         className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
       >
+        <AgentBadge agentId={agent.id} />
         {renderRowInner(agent, true)}
         {renderBadge(agent)}
       </DropdownMenuItem>
@@ -1236,30 +1265,7 @@ export function AgentHarnessPicker({
     [agentEntries],
   );
 
-  // Existing custom / pending agents fold into a "Custom agents" submenu so a
-  // long roster doesn't crowd the recommended picks. When there are none, the
-  // submenu would hold only the create action — which is a poor place to
-  // discover it — so we surface "Create custom agent" as a top-level row
-  // instead (see below). The submenu therefore renders only when there is at
-  // least one custom / pending agent to group.
-  const hasCustomAgents = customEntries.length > 0 || pendingAgent != null;
-  // "Create custom agent" is reachable on any non-sandbox target (a managed
-  // sandbox has no create path for an uploaded bundle), unless the embedder
-  // opts out (it has no create flow to route the action to).
-  const canCreateAgent = !sandboxSelected && allowCreateCustomAgent;
-  const createAgentItem = canCreateAgent ? (
-    <DropdownMenuItem
-      data-testid="new-chat-landing-create-agent"
-      onSelect={onCreateCustomAgent}
-      className="text-muted-foreground"
-    >
-      <PlusIcon className="size-3.5" />
-      Create custom agent
-    </DropdownMenuItem>
-  ) : null;
-  const hasCustomGroup = hasCustomAgents;
-  // Shared body for the custom-agents submenu (desktop flyout + mobile page):
-  // the custom agents, the pending upload, and the create action.
+  const hasCustomGroup = customEntries.length > 0 || pendingAgent != null;
   const customAgentsBody = (
     <>
       {customEntries.map(renderEntry)}
@@ -1276,12 +1282,6 @@ export function AgentHarnessPicker({
             <span className="truncate text-sm text-muted-foreground/70">Custom</span>
           </div>
         </DropdownMenuItem>
-      )}
-      {canCreateAgent && (
-        <>
-          <DropdownMenuSeparator />
-          {createAgentItem}
-        </>
       )}
     </>
   );
@@ -1330,6 +1330,7 @@ export function AgentHarnessPicker({
             triggerClassName,
           )}
         >
+          <AgentBadge agentId={autoHarnessActive ? null : effectiveAgentId} />
           <span
             className={cn("max-w-[12rem] truncate text-ui text-foreground", triggerLabelClassName)}
           >
@@ -1445,45 +1446,42 @@ export function AgentHarnessPicker({
                 <DropdownMenuSeparator />
               </>
             )}
-            {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
-            <PickerSectionHeader>Agents</PickerSectionHeader>
-            {bundleEntries.map(renderEntry)}
-            {/* Existing custom agents fold into a "Custom agents" submenu (with
-            the pending upload and the create action). With no custom agents the
-            submenu would hold only "Create custom agent", so we surface that as
-            a top-level row instead — otherwise creation is invisible on a fresh
-            server. A managed sandbox has no create path, so neither appears. */}
-            {hasCustomGroup &&
-              (isMobile ? (
-                // Touch: drill into a "Custom agents" page in place (with Back).
-                <DropdownMenuItem
-                  data-testid="new-chat-landing-custom-agents"
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    setMobilePage("custom");
-                  }}
-                  className="items-center"
-                >
-                  <span className="flex-1">Custom agents</span>
-                  <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
-                </DropdownMenuItem>
-              ) : (
-                // Desktop: hover flyout submenu.
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger
+            {bundleEntries.length > 0 && (
+              <>
+                <PickerSectionHeader>Built-in agents</PickerSectionHeader>
+                {bundleEntries.map(renderEntry)}
+              </>
+            )}
+            {hasCustomGroup && (
+              <>
+                <DropdownMenuSeparator />
+                {isMobile ? (
+                  <DropdownMenuItem
                     data-testid="new-chat-landing-custom-agents"
-                    className="cursor-pointer items-center"
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      setMobilePage("custom");
+                    }}
+                    className="items-center"
                   >
                     <span className="flex-1">Custom agents</span>
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto">
-                    {customAgentsBody}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-              ))}
-            {/* No custom agents to group: surface the create action directly so
-            it stays discoverable instead of hiding behind an empty submenu. */}
-            {!hasCustomGroup && createAgentItem}
+                    <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
+                  </DropdownMenuItem>
+                ) : (
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger
+                      data-testid="new-chat-landing-custom-agents"
+                      className="cursor-pointer items-center"
+                    >
+                      <span className="flex-1">Custom agents</span>
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto">
+                      {customAgentsBody}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                )}
+              </>
+            )}
           </>
         )}
       </DropdownMenuContent>
@@ -2353,9 +2351,11 @@ export function NewChatLandingScreen() {
   // Pin the configured project agent into discovery so the recency-bounded
   // session scan (or its same-name dedup) can't drop or id-swap it out of
   // the picker — the config must seed the agent the project actually pinned.
-  const { data: agents } = useAvailableAgents({
+  const { data: serverAgents } = useAvailableAgents({
     pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
   });
+  const customCatalog = useCustomAgents();
+  const agents = serverAgents;
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
   const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
@@ -2369,7 +2369,16 @@ export function NewChatLandingScreen() {
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
 
-  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
+  const agentList = useMemo(
+    () =>
+      selectableSessionAgents([
+        ...(agents ?? []).filter(
+          (agent) => !agent.templateId || agent.id === prefillConfig?.agentId,
+        ),
+        ...(customCatalog.data ?? []).map(customAgentForPicker),
+      ]),
+    [agents, customCatalog.data, prefillConfig?.agentId],
+  );
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -2391,16 +2400,20 @@ export function NewChatLandingScreen() {
   // here and the picker switches to a virtual "pending" agent entry. On
   // form submit, handleCreate detects the pending bundle, builds the
   // tar.gz, and uses multipart POST instead of the normal JSON path.
-  const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [pendingAgent, setPendingAgent] = useState<AgentBundleInput | null>(null);
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
 
-  // Surface element backing the iOS native server switcher overlay, which
-  // the in-session view shows too — the picker stays reachable while starting
-  // a new session. The hook hides it whenever the sidebar covers the surface.
+  // Surface element backing the iOS native server switcher overlay. In title
+  // mode the top row stays clear on every main surface, including this landing
+  // screen; opening the sidebar moves the switcher there just like ChatPage.
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherForMainSurface(landingSurface, true);
+  const { nativeMobileHeaderMode } = useSessionNavigationPreferences();
+  const sidebarOpen = useAppShellSidebarOpen();
+  useNativeServerSwitcherForMainSurface(landingSurface, true, {
+    headerMode: nativeMobileHeaderMode,
+    sidebarOpen,
+  });
 
   // Draft restore is project-scoped: the user's text and attachments always
   // come back, but agent/host/workspace slots parked under another project's
@@ -2431,40 +2444,67 @@ export function NewChatLandingScreen() {
           prefilledBranch: "",
         };
 
-  const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [composerParts, setComposerParts] = useState<ComposerDraftPart[]>(() =>
+    composerPartsFromProjection(restoredDraft?.message ?? "", restoredDraft?.files ?? []),
+  );
+  const composerPartsRef = useRef(composerParts);
+  composerPartsRef.current = composerParts;
+  const message = composerPartsToProjection(composerParts);
+  const files = composerAttachments(composerParts);
+  const filesRef = useRef(files);
+  filesRef.current = files;
+  const inlineEditorRef = useRef<InlineComposerEditorHandle>(null);
+  const replaceComposerParts = useCallback((next: readonly ComposerDraftPart[]) => {
+    const normalized = normalizeComposerParts(next);
+    composerPartsRef.current = normalized;
+    setComposerParts(normalized);
+    inlineEditorRef.current?.setParts(normalized);
+  }, []);
+  const setMessage = useCallback(
+    (next: string) => {
+      const nextParts =
+        filesRef.current.length > 0 && !next.includes(COMPOSER_ATTACHMENT_PLACEHOLDER)
+          ? replaceComposerText(composerPartsRef.current, next)
+          : composerPartsFromProjection(next, filesRef.current);
+      replaceComposerParts(nextParts);
+    },
+    [replaceComposerParts],
+  );
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  if (textareaRef.current === null) {
+    textareaRef.current = {
+      get selectionStart() {
+        return inlineEditorRef.current?.getSelection().start ?? 0;
+      },
+      get selectionEnd() {
+        return inlineEditorRef.current?.getSelection().end ?? 0;
+      },
+      setSelectionRange(start: number, end: number) {
+        inlineEditorRef.current?.setSelection(start, end);
+      },
+      focus() {
+        inlineEditorRef.current?.focus();
+      },
+      scrollTop: 0,
+      scrollLeft: 0,
+    } as HTMLTextAreaElement;
+  }
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(message, setMessage, textareaRef);
   const isComposingRef = useRef(false);
-  // maxRows 9 = 180px of 20px lines, matching the composer's 200px
-  // border-box max (180px content + 16px top / 4px bottom padding).
-  useAutoGrowTextarea(textareaRef, message, 9);
-
-  // Attachments for the first message — same affordances as the in-session
-  // composer (paperclip + paste); carried to ChatPage via the pending
-  // initial prompt and sent with the auto-dispatched first turn.
-  const [files, setFiles] = useState<File[]>(() => restoredDraft?.files ?? []);
+  // Attachments for the first message live inline with text and are carried to
+  // ChatPage in the same visual order for the auto-dispatched first turn.
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Reject unsupported types (only images, PDF, and text/code) and oversized
-  // files here, before the session exists. Without this the upload only fails
-  // after the session is created and navigated into, where the first turn's
-  // 415 strands the typed message in a session the user never wanted.
   const addFiles = (incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
-    if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
-    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-  };
-  const removeFile = (index: number) => {
-    setFiles((prev) => prev.filter((_, i) => i !== index));
-    setAttachmentError(null);
+    inlineEditorRef.current?.insertFiles(incoming);
   };
 
-  // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
-  // the landing surface attaches here. Declared after ``landingSurface``.
+  // Files dropped elsewhere on the landing still insert at the editor's last
+  // caret. Drops inside the editor are consumed there at the exact pointer position.
   const isDragActive = useFileDropTarget(landingSurface, addFiles);
 
   // Gates the sandbox host option: only servers whose sandbox
@@ -2817,6 +2857,10 @@ export function NewChatLandingScreen() {
   }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
+  const lastCreatedWorkspace = useMemo(
+    () => readLastCreatedWorkspace(selectedHostId),
+    [selectedHostId],
+  );
   const { addRecentHarness } = useRecentHarnesses();
 
   const allHosts = hosts ?? [];
@@ -3007,7 +3051,8 @@ export function NewChatLandingScreen() {
   // the working-directory field is pre-filled and the user can send in one
   // click. Derived from the same home listing the picker uses (entries carry
   // absolute paths); only fetched when there's no recent to fall back to.
-  const needsHomeFallback = selectedHostId !== null && recent.length === 0;
+  const needsHomeFallback =
+    selectedHostId !== null && lastCreatedWorkspace === null && recent.length === 0;
   const { data: homeListing, isPlaceholderData: homeListingIsPlaceholder } = useHostFilesystem(
     selectedHostId,
     needsHomeFallback ? "" : null,
@@ -3040,7 +3085,10 @@ export function NewChatLandingScreen() {
   // The path the once-per-host auto-seed WOULD land on: the most-recent path,
   // else the derived home. Exposed as a memo so we can probe its repo for
   // worktrees before committing to it (see the fork-fresh redirect below).
-  const autoSeedCandidate = useMemo(() => recent[0] ?? derivedHome ?? null, [recent, derivedHome]);
+  const autoSeedCandidate = useMemo(
+    () => lastCreatedWorkspace ?? recent[0] ?? derivedHome ?? null,
+    [lastCreatedWorkspace, recent, derivedHome],
+  );
   // "Fork fresh from default": when the project defines a default base branch,
   // a fresh new-chat must NOT silently continue in the last-used worktree — it
   // should fork a new branch off that default. The auto-seed can land on a
@@ -3122,7 +3170,7 @@ export function NewChatLandingScreen() {
     if (didForkFresh && seededWorkspace && branchName === "" && prefilledBranch === "") {
       // Preempt the opt-in-worktree effect so it can't also seed a branch, then
       // name one here to fork fresh off the project default. Store the ref in
-      // the raw representation that effect compares against (workspaceTrimmed).
+      // the raw representation that effect compares against (workspaceValue).
       worktreeSeededForRef.current = candidate;
       // Not tracked as a retractable auto-seed: this fork-fresh branch is driven
       // by the project's base_branch (to fork off it), independent of the
@@ -3163,7 +3211,7 @@ export function NewChatLandingScreen() {
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
         ? pickedAgentId
-        : configuredAgentUnavailable
+        : configuredAgentUnavailable || pickedAgentId?.startsWith("ca_")
           ? null
           : (agentList[0]?.id ?? null);
   const selectedAgent = useMemo(
@@ -3223,14 +3271,16 @@ export function NewChatLandingScreen() {
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
   // lives only in the modal, so an agent with just that still needs the gear.
+  // Private catalog sessions launch the saved bundle configuration.
   const selectedAgentHasKnobs =
-    supportsPermissionMode ||
-    supportsApprovalMode ||
-    supportsCursorMode ||
-    supportsAgySkipPermissions ||
-    supportsModelPicker ||
-    smartRoutingEligible ||
-    (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
+    !effectiveAgentId?.startsWith("ca_") &&
+    (supportsPermissionMode ||
+      supportsApprovalMode ||
+      supportsCursorMode ||
+      supportsAgySkipPermissions ||
+      supportsModelPicker ||
+      smartRoutingEligible ||
+      (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll));
   // Label/value pairs summarizing the selected agent's current run-config, for
   // the gear icon's hover tooltip. Mirrors the modal's per-capability rows so a
   // user can read the active settings without opening it. "Default" = an unset
@@ -3707,7 +3757,7 @@ export function NewChatLandingScreen() {
     setPickedHarness(null);
     _setCostControlMode(null);
   }, [info, smartRoutingEnabled, pickedHarness]);
-  const workspaceTrimmed = workspace.trim();
+  const workspaceValue = workspace.trimStart();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
@@ -3738,10 +3788,10 @@ export function NewChatLandingScreen() {
   // Existing git worktrees of the picked directory's repo, for the
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
-  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceValue !== "";
   const { data: hostWorktrees, isPlaceholderData: hostWorktreesArePlaceholder } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
-    worktreesEnabled ? workspaceTrimmed : null,
+    worktreesEnabled ? workspaceValue : null,
   );
   // Linked worktrees (exclude the main work tree — "starting in the main
   // repo" is just picking that directory, not selecting a worktree).
@@ -3753,10 +3803,10 @@ export function NewChatLandingScreen() {
   // the user navigated the picker straight into a worktree folder, or clicked
   // one in the list below.
   const activeWorktree = useMemo(() => {
-    const target = normalizeWorkspacePath(workspaceTrimmed);
+    const target = normalizeWorkspacePath(workspaceValue);
     if (target === null) return null;
     return linkedWorktrees.find((w) => normalizeWorkspacePath(w.path) === target) ?? null;
-  }, [linkedWorktrees, workspaceTrimmed]);
+  }, [linkedWorktrees, workspaceValue]);
   // When the workspace lands on an existing worktree, prefill the branch
   // field with its branch and remember it as the prefill. Leaving the
   // worktree clears the prefill (but not a name the user typed themselves).
@@ -3876,13 +3926,13 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
     if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
-    if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
+    if (sandboxSelected || selectedHostId === null || workspaceValue === "") return;
     if (branchName !== "" || prefilledBranch !== "") return;
-    if (worktreeSeededForRef.current === workspaceTrimmed) return;
+    if (worktreeSeededForRef.current === workspaceValue) return;
     // Need the git-ness probe for the CURRENT workspace resolved (not the
     // anti-flicker placeholder from a previous path).
     if (hostWorktreesArePlaceholder || hostWorktrees === undefined) return;
-    worktreeSeededForRef.current = workspaceTrimmed;
+    worktreeSeededForRef.current = workspaceValue;
     if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
     prefillConfig,
@@ -3890,7 +3940,7 @@ export function NewChatLandingScreen() {
     projectParam,
     sandboxSelected,
     selectedHostId,
-    workspaceTrimmed,
+    workspaceValue,
     branchName,
     prefilledBranch,
     hostWorktrees,
@@ -3985,7 +4035,7 @@ export function NewChatLandingScreen() {
   const mentionEnabled =
     isNativeTerminalAgent && !sandboxSelected && !!selectedHostId && workspaceValid;
   const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
-  const workspaceRoot = workspaceTrimmed.replace(/\/+$/, "");
+  const workspaceRoot = workspaceValue.replace(/\/+$/, "");
   // Absolute dir to list = workspace root + the drilled sub-path.
   const mentionAbsDir =
     mentionEnabled && mention
@@ -4058,8 +4108,9 @@ export function NewChatLandingScreen() {
   });
 
   const canSubmit =
-    message.trim().length > 0 &&
+    (message.trim().length > 0 || files.length > 0) &&
     selectedAgent != null &&
+    !(sandboxSelected && effectiveAgentId?.startsWith("ca_")) &&
     (sandboxSelected ? sandboxRepoValid : !!selectedHostId && workspaceValid) &&
     !creating;
 
@@ -4075,14 +4126,14 @@ export function NewChatLandingScreen() {
         ? "Please choose a host and working directory"
         : configuredAgentUnavailable && selectedAgent == null
           ? "This project's configured agent is unavailable — pick an agent to continue"
-          : message.trim().length === 0
-            ? "Enter a message to get started"
-            : null;
+          : sandboxSelected && effectiveAgentId?.startsWith("ca_")
+            ? "Custom agents require a connected computer"
+            : message.trim().length === 0 && files.length === 0
+              ? "Enter a message to get started"
+              : null;
 
   // Chip display labels.
-  const workspaceLabel = workspaceTrimmed
-    ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
-    : "Working directory";
+  const workspaceLabel = workspaceValue ? basename(workspaceValue) : "Working directory";
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
     sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
@@ -4400,6 +4451,12 @@ export function NewChatLandingScreen() {
     submittedDraftRevisionRef.current = landingDraftRevision;
     submittedRef.current = true;
     try {
+      // Read the editor snapshot at submit time. File insertion publishes its
+      // state synchronously, while React may not have rendered the new closure
+      // yet when a user picks a file and immediately presses Start.
+      const submittedParts = composerPartsRef.current;
+      const submittedProjection = composerPartsToProjection(submittedParts);
+      const submittedFiles = composerAttachments(submittedParts);
       const trimmedBranch = branchName.trim();
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting
@@ -4447,9 +4504,15 @@ export function NewChatLandingScreen() {
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const initialPrompt =
-        buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
-        sanitizeInitialPrompt(message);
+      const sanitizedProjection = sanitizeInitialPrompt(submittedProjection);
+      const promptParts = composerPartsFromProjection(sanitizedProjection, submittedFiles);
+      const mentionPreamble = buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null);
+      const orderedPromptParts = normalizeComposerParts([
+        ...(mentionPreamble ? [{ type: "text" as const, text: mentionPreamble }] : []),
+        ...promptParts,
+      ]);
+      const initialPrompt = mentionPreamble + composerPartsToText(promptParts);
+
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
       // selects which CLI bridge the runner launches — the values are the
@@ -4459,7 +4522,7 @@ export function NewChatLandingScreen() {
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
       // survives reload.
       const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
+        !effectiveAgentId?.startsWith("ca_") && agentSupportsApprovalMode && bypassSandbox
           ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
           : nativeLabels;
       // First-class project filing: a project-driven visit whose `?project=`
@@ -4468,6 +4531,7 @@ export function NewChatLandingScreen() {
       // move). A label-only folder (no first-class row yet) keeps the legacy
       // label + post-create move, which creates the project row on demand.
       const createProjectId = selectedProject !== "" ? configProjectId : null;
+      let rememberedProjectId = createProjectId;
       // Server-side default-fill: a slot still holding its untouched project-
       // config seed (per the source refs) is OMITTED so the server fills it
       // from the config. Any user interaction — even re-picking the exact
@@ -4483,7 +4547,7 @@ export function NewChatLandingScreen() {
         createProjectId !== null &&
         workspaceFromConfigRef.current &&
         prefillConfig?.workspace != null &&
-        workspaceTrimmed === prefillConfig.workspace;
+        workspaceValue === prefillConfig.workspace;
       // When filing into a project by LABEL, stamp its legacy `omni_project`
       // label at create so the session is BORN FILED. The sidebar dual-reads
       // project membership from this label OR the first-class `project_id` the
@@ -4492,33 +4556,34 @@ export function NewChatLandingScreen() {
       // "Sessions" section while the search-indexed session list catches up to
       // the move. A `project_id` create needs no label: the row is born with
       // first-class membership (and a label would go stale on project rename).
+      const inheritedLabels = selectedAgent?.templateId
+        ? { ...(baseLabels ?? {}), [AGENT_TEMPLATE_LABEL]: selectedAgent.templateId }
+        : baseLabels;
       const createLabels =
         selectedProject && createProjectId === null
-          ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
-          : baseLabels;
+          ? { ...(inheritedLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
+          : inheritedLabels;
 
       let data: { id: string };
 
-      if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
+      const customTemplate = customCatalog.data?.find((entry) => entry.id === effectiveAgentId);
+      if ((effectiveAgentId === PENDING_AGENT_ID && pendingAgent) || customTemplate) {
+        if (sandboxSelected) throw new Error("Custom agents require a connected computer.");
         // Custom agent path: build bundle client-side and use multipart POST.
         // The multipart create only stores the agent + session rows — it does
         // NOT launch a runner on the host. We must follow up with launchRunner
         // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
         // same way the fork-resume path does.
-        const bundle = await buildAgentBundle(pendingAgent);
+        const bundle = customTemplate
+          ? await customAgentBundle(customTemplate.id)
+          : await buildAgentBundle(pendingAgent!);
         const metadata: Record<string, unknown> = {};
-        // A config-seeded workspace is omitted on a `project_id` create so the
-        // server default-fills it (same field semantics as the JSON path).
-        if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
-        if (createProjectId !== null) {
-          // Atomic filing: the server sets first-class `project_id` at create.
-          metadata.project_id = createProjectId;
-        } else if (selectedProject) {
-          // Born-filed: stamp the project's `omni_project` label so a bundled
-          // session groups under its project from its first sidebar appearance,
-          // same as the JSON path (see `createLabels`).
-          metadata.labels = { [PROJECT_LABEL_KEY]: selectedProject };
-        }
+        if (workspaceValue && !workspaceFromProjectConfig) metadata.workspace = workspaceValue;
+        if (createProjectId !== null) metadata.project_id = createProjectId;
+        metadata.labels = {
+          ...(createLabels ?? {}),
+          ...(customTemplate ? { [AGENT_TEMPLATE_LABEL]: customTemplate.id } : {}),
+        };
         const bundled = await createBundledSession(
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
@@ -4531,7 +4596,7 @@ export function NewChatLandingScreen() {
         markSessionCreated(data.id, sandboxSelected ? "sandbox" : "computer");
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
-        if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
+        if (!sandboxSelected && selectedHostId && workspaceValue) {
           // Create a new worktree, bind an existing one (records the branch
           // for the sidebar + delete flow without creating anything), or
           // neither — mirrored on the `git` block.
@@ -4540,7 +4605,7 @@ export function NewChatLandingScreen() {
             : startInExistingWorktree
               ? { branchName: trimmedBranch, existingWorktree: true }
               : undefined;
-          await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
+          await launchRunner(selectedHostId, data.id, workspaceValue, gitOpts);
         }
         // Clear pending agent after successful creation.
         setPendingAgent(null);
@@ -4585,7 +4650,7 @@ export function NewChatLandingScreen() {
                   host_id: selectedHostId,
                   // Config-seeded workspace on a `project_id` create: omitted
                   // so the server default-fills it (see agent_id above).
-                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
+                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceValue }),
                   // Create a new worktree, or bind an existing one
                   // (`existing_worktree` records the branch for the sidebar +
                   // delete flow without creating anything), or neither. Always
@@ -4708,7 +4773,7 @@ export function NewChatLandingScreen() {
       // storage eagerly so an immediate Send cannot observe stale state; this
       // successful-create snapshot also covers restored drafts and every
       // harness-specific creation path.
-      if (!smartRoutingHarnessSelected) {
+      if (!smartRoutingHarnessSelected && !customTemplate) {
         const launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
           supportsPermissionMode: agentSupportsPermissionMode,
@@ -4751,7 +4816,8 @@ export function NewChatLandingScreen() {
           // File via first-class project_id; the helper resolves the picked
           // name to a project id, creating an empty project on demand when the
           // name is new or label-only.
-          await moveConversationToProject(data.id, selectedProject);
+          const moved = await moveConversationToProject(data.id, selectedProject);
+          rememberedProjectId = moved.project_id ?? rememberedProjectId;
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -4764,19 +4830,70 @@ export function NewChatLandingScreen() {
           // still shows it under the project.
         }
       }
+      if (selectedProject) {
+        // Keep the project-list cache ahead of the persisted target write. A
+        // label-only project may have been promoted by the move above, while an
+        // invalidation still exposes the old list for one render; without this
+        // small overlay the target reconciler could misread that gap as delete.
+        queryClient.setQueryData<ProjectSummary[]>(["projects"], (current = []) => {
+          const project = {
+            id: rememberedProjectId,
+            name: selectedProject,
+          };
+          const withoutMatch = current.filter(
+            (candidate) =>
+              !(
+                (rememberedProjectId !== null && candidate.id === rememberedProjectId) ||
+                candidate.name === selectedProject
+              ),
+          );
+          return [...withoutMatch, project];
+        });
+      }
+      // A successful create becomes the remembered destination for every
+      // global new-session entry point. First-class projects retain their id;
+      // a legacy name-only folder is promoted when the Sidebar next observes
+      // the project row created by the move above.
+      writeNewSessionTarget(
+        selectedProject
+          ? {
+              kind: "project",
+              projectId: rememberedProjectId,
+              projectName: selectedProject,
+            }
+          : { kind: "none" },
+      );
       // Sandbox creates have no user-picked workspace to remember.
-      if (!sandboxSelected) addRecent(workspaceTrimmed);
+      if (!sandboxSelected) {
+        writeLastCreatedWorkspace(selectedHostId, workspaceValue);
+        addRecent(workspaceValue);
+      }
       // Remember the launched harness so the picker promotes it out of "More"
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
       if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
-      // A first message matching one of the agent's bundled skills is sent as a
-      // structured `slash_command` (server resolves the skill) rather than the
-      // literal "/name". Native terminal agents keep plain text — their CLI owns
-      // slash commands.
-      const skill = isNativeTerminalAgent
-        ? null
-        : matchSkillInvocation(initialPrompt, agent?.skills ?? []);
+      // Fire-and-forget: don't block navigation on the sidebar list refresh.
+      // The background refetch (or the WS session_added push) backfills the
+      // new session's row within ~1s of landing in the chat; the chat itself
+      // loads from the session id and never reads the sidebar cache.
+      void queryClient.refetchQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
+      // A first message matching one of the agent's bundled skills is
+      // handed off as a structured invocation so ChatPage auto-sends it
+      // as a `slash_command` event (server resolves the skill) instead
+      // of plain text the agent would see as a literal "/name". Native
+      // terminal agents keep plain text — their CLI owns slash commands.
+      setPendingInitialPrompt(data.id, {
+        text: initialPrompt,
+        skill:
+          isNativeTerminalAgent || submittedFiles.length > 0
+            ? null
+            : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
+        files: submittedFiles,
+        ...(submittedFiles.length > 0 ? { composerParts: orderedPromptParts } : {}),
+      });
+      // Label the new row with the prompt until the server's seed title lands.
+      recordOptimisticTitle(data.id, initialPrompt);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
       // the freshly-opened chat. Sanitized text so recall reproduces what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
@@ -4825,6 +4942,95 @@ export function NewChatLandingScreen() {
       setCreating(false);
     }
   }
+
+  const handleLandingKeyDown = (
+    event: globalThis.KeyboardEvent,
+    selection: { start: number; end: number },
+  ): boolean => {
+    if (isImeCompositionKeyEvent({ nativeEvent: event }, isComposingRef.current)) return false;
+
+    // Touch-primary surfaces keep Enter as an editor newline.
+    if (preventsKeyboardSubmit && event.key === "Enter") return false;
+
+    const shouldSubmitFromKeyboard = isComposerSendKey(
+      {
+        key: event.key,
+        code: event.code,
+        shiftKey: event.shiftKey,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        altKey: event.altKey,
+        isComposing: event.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    const newLineDisposition = composerNewLineDisposition(
+      {
+        key: event.key,
+        code: event.code,
+        shiftKey: event.shiftKey,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        altKey: event.altKey,
+        isComposing: event.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
+
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(event)) return true;
+
+    if (slashMenuOpen && slashMenuMatches.length > 0) {
+      if (eventMatchesShortcutAction(event, "nextSuggestion")) {
+        event.preventDefault();
+        setSlashMenuIndex((index) => (index + 1) % slashMenuMatches.length);
+        return true;
+      }
+      if (eventMatchesShortcutAction(event, "previousSuggestion")) {
+        event.preventDefault();
+        setSlashMenuIndex((index) => (index <= 0 ? slashMenuMatches.length - 1 : index - 1));
+        return true;
+      }
+      if (
+        !shouldPreferSendOverCompletion &&
+        eventMatchesShortcutAction(event, "applySuggestion") &&
+        slashMenuIndex >= 0
+      ) {
+        event.preventDefault();
+        applySlashSelection(slashMenuMatches[slashMenuIndex]!);
+        return true;
+      }
+      if (eventMatchesShortcutAction(event, "dismissSuggestions")) {
+        event.preventDefault();
+        setMessage("");
+        setSlashMenuIndex(-1);
+        return true;
+      }
+    }
+    if (newLineDisposition !== "none") {
+      event.preventDefault();
+      if (newLineDisposition === "block") return true;
+      const currentParts = composerPartsRef.current;
+      const projection = composerPartsToProjection(currentParts);
+      const nextProjection = `${projection.slice(0, selection.start)}\n${projection.slice(
+        selection.end,
+      )}`;
+      replaceComposerParts(
+        composerPartsFromProjection(nextProjection, composerAttachments(currentParts)),
+      );
+      queueMicrotask(() => inlineEditorRef.current?.setSelection(selection.start + 1));
+      return true;
+    }
+    if (shouldSubmitFromKeyboard) {
+      event.preventDefault();
+      if (mentionListingPending) return true;
+      void handleCreate();
+      return true;
+    }
+    return false;
+  };
 
   const placeholderText = selectedProject
     ? `Start a new session in ${selectedProject}`
@@ -4889,7 +5095,6 @@ export function NewChatLandingScreen() {
             </h1>
           ) : null}
         </div>
-        {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <div className="relative flex w-full flex-col gap-1">
           <form
@@ -4902,7 +5107,7 @@ export function NewChatLandingScreen() {
             // dark:bg-card-solid stays opaque so dark glass --card doesn't show
             // through. Drag-over keeps its separate inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 focus-within:shadow-[var(--composer-shadow-focus)]",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -4928,147 +5133,36 @@ export function NewChatLandingScreen() {
               />
             )}
             <div className="relative overflow-hidden">
-              <textarea
-                ref={textareaRef}
-                value={message}
-                onChange={(e) => {
-                  setMessage(e.target.value);
-                  // A rejected attachment is never added, so there's no chip to
-                  // remove and nothing else would ever clear this. Left sticky it
-                  // reads as a blocker on a composer the user can actually submit.
+              <InlineComposerEditor
+                ref={inlineEditorRef}
+                initialParts={composerParts}
+                onChange={(nextParts) => {
+                  composerPartsRef.current = nextParts;
+                  setComposerParts(nextParts);
                   if (attachmentError !== null) setAttachmentError(null);
-                  // Recompute the active "@"-mention from the caret each keystroke
-                  // (native terminal agents with a workspace — ``mentionEnabled``).
-                  setMention(
-                    mentionEnabled
-                      ? detectMentionAt(
-                          e.target.value,
-                          e.target.selectionStart ?? e.target.value.length,
-                        )
-                      : null,
-                  );
+                  const projection = composerPartsToProjection(nextParts);
+                  const caret = inlineEditorRef.current?.getSelection().start ?? projection.length;
+                  setMention(mentionEnabled ? detectMentionAt(projection, caret) : null);
                 }}
-                onFocus={() => {
-                  // From here the textarea's caret is one the user placed, so
-                  // dictation inserts there instead of at the end of the draft.
-                  dictation.noteFocus();
-                }}
-                onBlur={() => {
-                  // Dismiss the mention menu when focus leaves the textarea; menu
-                  // rows preventDefault on mousedown so selecting one doesn't blur.
-                  dismissMention();
-                }}
+                onRejectedFiles={(errors) =>
+                  setAttachmentError(errors.length > 0 ? errors.join("\n") : null)
+                }
+                onFocus={() => dictation.noteFocus()}
+                onBlur={dismissMention}
                 onCompositionStart={() => {
                   isComposingRef.current = true;
                 }}
                 onCompositionEnd={() => {
                   isComposingRef.current = false;
                 }}
-                onKeyDown={(e) => {
-                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
-                    return;
-                  }
-
-                  // Touch-primary newline behavior outranks autocomplete and
-                  // desktop submit preferences. The textarea owns line insertion.
-                  if (preventsKeyboardSubmit && e.key === "Enter") {
-                    return;
-                  }
-
-                  const shouldSubmitFromKeyboard = isComposerSendKey(
-                    {
-                      key: e.key,
-                      shiftKey: e.shiftKey,
-                      metaKey: e.metaKey,
-                      ctrlKey: e.ctrlKey,
-                      altKey: e.altKey,
-                      isComposing: e.nativeEvent.isComposing,
-                    },
-                    submitWithModEnter,
-                    preventsKeyboardSubmit,
-                  );
-                  const shouldPreferSendOverCompletion =
-                    submitWithModEnter && shouldSubmitFromKeyboard;
-
-                  // "@"-mention menu navigation (shared useMentionBrowser) —
-                  // mutually exclusive with the slash menu (a token can't be both)
-                  // and takes priority over submission.
-                  if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
-
-                  // While the skills menu is open, ArrowUp/Down navigate it and
-                  // Enter/Tab complete the highlighted item — these take
-                  // priority over submission (same UX as the in-session
-                  // composer).
-                  if (slashMenuOpen && slashMenuMatches.length > 0) {
-                    if (e.key === "ArrowDown") {
-                      e.preventDefault();
-                      setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
-                      return;
-                    }
-                    if (e.key === "ArrowUp") {
-                      e.preventDefault();
-                      setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
-                      return;
-                    }
-                    if (
-                      !shouldPreferSendOverCompletion &&
-                      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
-                      slashMenuIndex >= 0
-                    ) {
-                      e.preventDefault();
-                      applySlashSelection(slashMenuMatches[slashMenuIndex]!);
-                      return;
-                    }
-                    if (e.key === "Escape") {
-                      e.preventDefault();
-                      // Dismiss the menu by clearing the draft so the user can
-                      // start fresh.
-                      setMessage("");
-                      setSlashMenuIndex(-1);
-                      return;
-                    }
-                  }
-                  if (shouldSubmitFromKeyboard) {
-                    e.preventDefault();
-                    // The mention menu is briefly closed while its listing loads;
-                    // swallow Enter so the in-progress "@dir/" token isn't sent.
-                    if (mentionListingPending) return;
-                    void handleCreate();
-                  }
-                }}
-                onPaste={(e) => {
-                  // Pasted images/files attach instead of inserting as text,
-                  // mirroring the in-session composer.
-                  const pasted = Array.from(e.clipboardData.items)
-                    .filter((item) => item.kind === "file")
-                    .map((item) => item.getAsFile())
-                    .filter((f): f is File => f !== null);
-                  if (pasted.length > 0) {
-                    e.preventDefault();
-                    addFiles(pasted);
-                  }
-                }}
-                // Suppress the native placeholder when the overlay supplies its
-                // own prompt text; aria-label preserves the accessible name.
+                onKeyDown={handleLandingKeyDown}
                 placeholder={pillSkills.length > 0 ? "" : placeholderText}
-                aria-label={placeholderText}
-                rows={1}
-                // Desktop only. This screen mounts on every arrival at "/" —
-                // including ones the user didn't make to type, like Back out of
-                // Settings — and on a phone focusing the field throws up the
-                // keyboard (and auto-zooms, per the note below) over whatever
-                // is on screen, sometimes with the sidebar drawer still open on
-                // top of it. Phones expect to be tapped before they type.
+                ariaLabel={placeholderText}
+                testId="new-chat-landing-input"
                 autoFocus={!isMobileViewport}
-                data-testid="new-chat-landing-input"
-                // Compose-pill text spec: inherited UI font at 14px/20px.
-                // (Note: sub-16px inputs make mobile Safari
-                // auto-zoom on focus — accepted tradeoff per the design.)
-                // Heights are border-box (12px top + 8px bottom padding lives
-                // inside them): max 200px = the spec's 180px of content.
-                // A 60px floor holds two 20px lines plus that padding;
-                // useAutoGrowTextarea expands from there to the unchanged cap.
-                className="block min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
+                disabled={creating}
+                className="w-full overflow-hidden leading-5 md:select-text"
+                editorClassName="min-h-[60px] max-h-[200px]"
               />
               {/* Gated on an empty draft so it reads as the placeholder.
                   pointer-events-none lets clicks fall through to focus the
@@ -5122,32 +5216,6 @@ export function NewChatLandingScreen() {
                       onClick={() => removeMentionedItem(i)}
                       className="ml-0.5 rounded-full hover:text-foreground"
                       aria-label={`Remove ${item.path}`}
-                    >
-                      <XIcon className="size-3" />
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
-            {/* File chips — shown below the textarea when files are attached. */}
-            {files.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                {files.map((file, i) => (
-                  <span
-                    key={attachmentKey(file)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    {file.type.startsWith("image/") ? (
-                      <ImageIcon className="size-3 shrink-0" />
-                    ) : (
-                      <FileTextIcon className="size-3 shrink-0" />
-                    )}
-                    <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
-                    <button
-                      type="button"
-                      onClick={() => removeFile(i)}
-                      className="ml-0.5 rounded-full hover:text-foreground"
-                      aria-label={`Remove ${file.name || "image.png"}`}
                     >
                       <XIcon className="size-3" />
                     </button>
@@ -5216,7 +5284,6 @@ export function NewChatLandingScreen() {
                     pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                     pendingAgentId={PENDING_AGENT_ID}
                     onSelectPending={handleSelectPending}
-                    onCreateCustomAgent={() => setCreateAgentOpen(true)}
                     sandboxSelected={sandboxSelected}
                     triggerTooltip={
                       smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
@@ -5744,11 +5811,9 @@ export function NewChatLandingScreen() {
                   narrow screen; desktop still gets the full width. */}
                   <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
                     {selectedHostId ? (
-                      <WorkspacePicker
+                      <HostWorkspacePicker
                         hostId={selectedHostId}
-                        initialPath={
-                          isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
-                        }
+                        initialPath={isNavigablePath(workspaceValue) ? workspaceValue : undefined}
                         onNavigate={(path) => {
                           // Browsing is an explicit choice: the create sends
                           // the workspace even if it matches the config seed.
@@ -5876,7 +5941,7 @@ export function NewChatLandingScreen() {
                               {filteredWorktrees.map((w) => {
                                 const selected =
                                   normalizeWorkspacePath(w.path) ===
-                                  normalizeWorkspacePath(workspaceTrimmed);
+                                  normalizeWorkspacePath(workspaceValue);
                                 return (
                                   <li key={w.path}>
                                     <button
@@ -6086,16 +6151,6 @@ export function NewChatLandingScreen() {
       />
 
       {/* Create custom agent dialog — opened from the agent picker dropdown. */}
-      <CreateAgentDialog
-        open={createAgentOpen}
-        onOpenChange={setCreateAgentOpen}
-        onCreate={(input) => {
-          setPendingAgent(input);
-          agentFromConfigRef.current = false;
-          setPickedAgentId(PENDING_AGENT_ID);
-          setPickedHarness(null);
-        }}
-      />
     </div>
   );
 }

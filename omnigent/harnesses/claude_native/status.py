@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 _CONTEXT_FILE = "context.json"
@@ -35,18 +36,17 @@ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | 
         no usable ``context_window`` (nothing worth recording).
     """
     context = payload.get("context_window")
-    if not isinstance(context, dict):
-        return None
-    size = context.get("context_window_size")
-    usage = context.get("current_usage")
-    if not isinstance(size, int) or size <= 0:
-        return None
-    record: dict[str, object] = {"context_window_size": size}
-    if isinstance(usage, dict):
-        record["current_usage"] = usage
-    used_pct = context.get("used_percentage")
-    if isinstance(used_pct, (int, float)):
-        record["used_percentage"] = used_pct
+    record: dict[str, object] = {}
+    if isinstance(context, dict):
+        size = context.get("context_window_size")
+        usage = context.get("current_usage")
+        if isinstance(size, int) and size > 0:
+            record["context_window_size"] = size
+            if isinstance(usage, dict):
+                record["current_usage"] = usage
+            used_pct = context.get("used_percentage")
+            if isinstance(used_pct, (int, float)):
+                record["used_percentage"] = used_pct
     # Claude Code's statusLine stdin carries a top-level ``cost`` block with
     # its own cumulative session billing; the forwarder reports it because
     # claude-native produces no ``response.completed`` cost events.
@@ -71,6 +71,43 @@ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | 
         model_id = model.strip()
     if model_id is not None:
         record["model"] = model_id
+    # Claude Code 2.1.80+ exposes plan usage on statusLine stdin. Keep only
+    # the comparable 5-hour and 7-day allowance windows; credentials and
+    # account identity never enter the bridge file or server event.
+    rate_limits = payload.get("rate_limits")
+    if isinstance(rate_limits, dict):
+        windows: list[dict[str, object]] = []
+        for key, label, aria_label, duration_mins in (
+            ("five_hour", "5h", "5 hour", 300),
+            ("seven_day", "w", "weekly", 10_080),
+        ):
+            candidate = rate_limits.get(key)
+            if not isinstance(candidate, dict):
+                continue
+            used = candidate.get("used_percentage")
+            if isinstance(used, bool) or not isinstance(used, (int, float)):
+                continue
+            if used < 0 or used > 100:
+                continue
+            window: dict[str, object] = {
+                "label": label,
+                "aria_label": aria_label,
+                "used_percent": float(used),
+                "duration_mins": duration_mins,
+            }
+            resets_at = candidate.get("resets_at")
+            if isinstance(resets_at, int) and not isinstance(resets_at, bool) and resets_at > 0:
+                window["resets_at"] = resets_at
+            windows.append(window)
+        if windows:
+            record["provider_usage_limits"] = {
+                "provider": "Claude",
+                "scope": "Claude plan",
+                "captured_at": int(time.time()),
+                "windows": windows,
+            }
+    if "context_window_size" not in record and "provider_usage_limits" not in record:
+        return None
     return record
 
 
