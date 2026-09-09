@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shlex
 import threading
 import time
 import uuid
@@ -482,6 +483,13 @@ def _build_alembic_config(db_uri: str) -> Config:
     return config
 
 
+def _quote_db_upgrade_uri(db_uri: str) -> str:
+    """Quote a database URI for the platform's supported interactive shell."""
+    if os.name == "nt":
+        return "'" + db_uri.replace("'", "''") + "'"
+    return shlex.quote(db_uri)
+
+
 def _run_migrations(engine: Engine, db_uri: str) -> None:
     """
     Bring the database schema up to head.
@@ -506,12 +514,15 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
         the revisions known to this build.
     """
     from alembic import command
+    from alembic.runtime.migration import MigrationContext
 
     from omnigent.db.db_models import ConversationBase, OmnigentBase
 
-    current = _get_current_db_revision(engine)
+    with engine.connect() as connection:
+        current_heads = tuple(MigrationContext.configure(connection).get_current_heads())
     head = _get_head_db_revision(db_uri)
-    _verify_db_revision_is_supported(db_uri, current, head)
+    for current in current_heads:
+        _verify_db_revision_is_supported(db_uri, current, head)
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
@@ -660,6 +671,51 @@ def _get_head_db_revision(db_uri: str) -> str:
     return head
 
 
+def _prepare_legacy_custom_gc_upgrade(engine: Engine) -> bool:
+    """Expose the custom branch hidden by the historical ``gc1`` collision.
+
+    The private custom line used ``gc1b2c3d4e5f`` as a merge stamp before
+    upstream assigned that same id to the managed-Host tombstone migration.
+    A database with the custom schema already contains the ``fd1`` branch, but
+    its version table has only the collided ``gc1`` row.  Add the truthful
+    ``fd1`` head so Alembic can apply upstream ``gd1`` and the new merge without
+    replaying non-idempotent custom migrations.
+
+    :returns: ``True`` when the compatibility head was inserted and migration
+        must run before normal single-head inspection.
+    """
+    inspector = inspect(engine)
+    if "alembic_version" not in inspector.get_table_names():
+        return False
+    with engine.begin() as connection:
+        rows = {
+            str(row[0])
+            for row in connection.execute(text("SELECT version_num FROM alembic_version"))
+        }
+        if rows == {"gc1b2c3d4e5f", "fd1b2c3d4e5"}:
+            return True
+        if rows != {"gc1b2c3d4e5f"}:
+            return False
+        tables = set(inspector.get_table_names())
+        if "custom_agents" not in tables:
+            return False
+        user_columns = {column["name"] for column in inspector.get_columns("users")}
+        conversation_columns = {
+            column["name"] for column in inspector.get_columns("conversations")
+        }
+        if "preferences" not in user_columns or "archived_at" not in conversation_columns:
+            return False
+        connection.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+            {"revision": "fd1b2c3d4e5"},
+        )
+    _logger.warning(
+        "Detected the legacy custom gc1 migration stamp; recorded its fd1 "
+        "schema branch before continuing the locked-upstream upgrade."
+    )
+    return True
+
+
 def _verify_db_revision_is_supported(
     db_uri: str,
     current: str | None,
@@ -708,6 +764,15 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
         not bring the database to head.
     """
     head = _get_head_db_revision(db_uri)
+    if _prepare_legacy_custom_gc_upgrade(engine):
+        _run_migrations(engine, db_uri)
+        migrated = _get_current_db_revision(engine)
+        if migrated != head:
+            raise RuntimeError(
+                "Legacy custom database migration did not reach the locked "
+                f"schema head (now {migrated!r}, expected {head!r})."
+            )
+        return
     current = _get_current_db_revision(engine)
     _verify_db_revision_is_supported(db_uri, current, head)
 
@@ -730,7 +795,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
                 f"(found revision {current!r}, expected {head!r}) "
                 f"and automatic migration failed. Take a backup of your database, then run\n"
                 f"\n"
-                f"    omnigent debug db-upgrade {db_uri!r}\n"
+                f"    omnigent debug db-upgrade {_quote_db_upgrade_uri(db_uri)}\n"
                 f"\n"
                 f"to inspect or retry the migration manually."
             ) from exc
@@ -742,7 +807,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
                 f"(started at {current!r}, now at {migrated!r}, expected {head!r}). "
                 f"Take a backup of your database, then run\n"
                 f"\n"
-                f"    omnigent debug db-upgrade {db_uri!r}\n"
+                f"    omnigent debug db-upgrade {_quote_db_upgrade_uri(db_uri)}\n"
                 f"\n"
                 f"to inspect or retry the migration manually."
             )

@@ -837,6 +837,9 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
+    # Deterministic store id for at-least-once producers. Native recovery also
+    # carries its richer source identity below; the two contracts coexist.
+    stable_id: str | None = None
     # Internal store key for a vendor transcript record. Ordinary messages
     # retain random IDs; native forwarders supply their stable source identity.
     idempotency_key: str | None = Field(default=None, exclude=True)
@@ -881,6 +884,8 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    # In-process signal that a stable-id append found the existing row.
+    deduplicated: bool = Field(default=False, exclude=True)
     replayed: bool = Field(default=False, exclude=True)
 
     def matches_native_replay(self, incoming: NewConversationItem, *, exact_source: bool) -> bool:

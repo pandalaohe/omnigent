@@ -727,6 +727,7 @@ describe("NewChatLandingScreen create flow", () => {
         text: "read the README and refactor",
         skill: null,
         files: [],
+        composerParts: [{ type: "text", text: "read the README and refactor" }],
       }),
     );
     expect(navigateMock).toHaveBeenCalledWith("/c/conv_new");
@@ -809,6 +810,7 @@ describe("NewChatLandingScreen create flow", () => {
         text: "/review-pr 123 focus on auth",
         skill: { name: "review-pr", args: "123 focus on auth" },
         files: [],
+        composerParts: [{ type: "text", text: "/review-pr 123 focus on auth" }],
       }),
     );
   });
@@ -865,6 +867,7 @@ describe("NewChatLandingScreen create flow", () => {
         text: "/typo do something",
         skill: null,
         files: [],
+        composerParts: [{ type: "text", text: "/typo do something" }],
       }),
     );
   });
@@ -897,6 +900,7 @@ describe("NewChatLandingScreen create flow", () => {
         text: "/review-pr 123",
         skill: null,
         files: [],
+        composerParts: [{ type: "text", text: "/review-pr 123" }],
       }),
     );
   });

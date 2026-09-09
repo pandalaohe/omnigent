@@ -23,7 +23,8 @@ def test_local_cli_threads_only_its_minted_binding_to_forwarder(
     binding_token: str | None,
 ) -> None:
     import omnigent.chat as chat
-    from omnigent import claude_native, codex_native
+    from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.harnesses.codex_native import main as codex_native
 
     module = claude_native if harness == "claude" else codex_native
     handle = chat.LocalServer(
@@ -109,7 +110,7 @@ async def test_runner_known_codex_launch_passes_binding_to_supervisor(
     tmp_path: Path,
     binding_token: str | None,
 ) -> None:
-    from omnigent import codex_native_forwarder
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
     from omnigent.runner.native.orchestration import _codex_forward_known_thread
 
     if binding_token is None:
@@ -143,7 +144,8 @@ def test_remote_cli_never_acquires_a_daemon_runner_binding(
     harness: str,
 ) -> None:
     import omnigent.chat as chat
-    from omnigent import claude_native, codex_native
+    from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.harnesses.codex_native import main as codex_native
 
     module = claude_native if harness == "claude" else codex_native
     expected_headers = {"Authorization": "Bearer remote-test"}

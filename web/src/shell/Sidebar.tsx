@@ -182,7 +182,7 @@ import {
   isExplicitlyUnread,
   markConversationsSeen,
   markConversationUnread,
-  useConversationReadState,
+  useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -4029,13 +4029,6 @@ function ConversationRowImpl({
   const isProvisionalLabel =
     pendingTitle === null && conversation.title == null && optimisticTitle !== undefined;
   const hasDraft = useHasSessionDraft(conversation.id);
-  // A write for another conversation leaves this primitive snapshot unchanged,
-  // so useSyncExternalStore skips the heavy row render.
-  const readState = useConversationReadState(
-    conversation.id,
-    conversation.updated_at,
-    conversation.status,
-  );
   // The dot shows when the conversation is content-unseen AND either the
   // row isn't the one you're viewing OR you explicitly marked it unread.
   // `isConversationUnseen` still gates on status, so a *running* turn never
@@ -4082,8 +4075,10 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive && !hasBackgroundActivity && !hasGoalMarker;
-  const hasTrailingIndicator =
+  const hasSessionIndicator =
     sessionState !== null || hasBackgroundActivity || hasGoalMarker || showDraftIndicator;
+  const showSharedIndicator = !isOwner;
+  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
   const compactMarkerCount =
     (sessionState !== null && sessionState.kind !== "awaiting" ? 1 : 0) +
     (hasBackgroundActivity ? 1 : 0) +
@@ -4471,6 +4466,7 @@ function ConversationRowImpl({
         <span
           className={cn(
             SESSION_STATE_SLOT_CLASS,
+            "right-1",
             unfiledWorkspace && "top-4",
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in

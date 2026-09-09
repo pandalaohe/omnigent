@@ -24,8 +24,9 @@ from urllib.error import URLError
 
 import pytest
 
-from omnigent import claude_native, claude_native_bridge, native_cost_popup
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _build_tools,
     _claude_prompt_rendered,
@@ -9895,11 +9896,13 @@ def test_inject_user_message_placeholder_paste_never_matched_does_not_raise(
     than hard-fail. No UserPromptSubmit hook is required to acknowledge
     this submission; its absence must not mark a running CLI as failed.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
 
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -9946,10 +9949,12 @@ def test_inject_user_message_whitespace_only_content_submits_blind(
     behavior.  This must not raise: the best-effort path is retained for content
     whose draft position cannot be determined.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
 
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(

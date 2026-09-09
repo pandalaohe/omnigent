@@ -3669,6 +3669,21 @@ class _SPAStaticFiles(StaticFiles):
         await super().__call__(scope, receive, send)
 
     async def get_response(self, path: str, scope: Scope) -> Response:
+        # Starlette's html-mode StaticFiles may resolve an extensionless miss
+        # to index.html instead of raising 404. API namespaces are never SPA
+        # routes, so reject them before delegating to that version-dependent
+        # fallback behavior. Real API routes have already had first chance at
+        # the outer FastAPI router before this root mount receives the request.
+        if _is_web_ui_api_fallback_path(path):
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": ErrorCode.NOT_FOUND,
+                        "message": "Not found",
+                    }
+                },
+            )
         served_path = path
         try:
             response = await super().get_response(path, scope)
@@ -3712,7 +3727,10 @@ def _is_web_ui_api_fallback_path(path: str) -> bool:
     :param path: Static mount-relative path, e.g. ``"v1/sessions/x"``.
     :returns: True for paths that should never fall back to ``index.html``.
     """
-    first_segment = path.lstrip("/").split("/", 1)[0]
+    # StaticFiles normalizes URL separators through os.path on Windows before
+    # calling get_response, so the mount-relative path arrives as
+    # ``v1\\sessions`` there. Normalize both forms before testing the prefix.
+    first_segment = path.replace("\\", "/").lstrip("/").split("/", 1)[0]
     return first_segment in _WEB_UI_API_FALLBACK_PREFIXES
 
 

@@ -96,6 +96,7 @@ from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 from omnigent.runner.identity import with_runner_binding_token
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 

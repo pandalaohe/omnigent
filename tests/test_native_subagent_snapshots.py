@@ -190,7 +190,7 @@ async def test_oversized_inventory_is_explicitly_partial() -> None:
 
 
 def test_claude_snapshot_preserves_unknown_and_explicit_terminal() -> None:
-    from omnigent.claude_native_forwarder import (
+    from omnigent.harnesses.claude_native.forwarder import (
         SubagentEntry,
         SubagentForwardState,
         _native_subagent_snapshot,
@@ -216,7 +216,7 @@ def test_claude_snapshot_preserves_unknown_and_explicit_terminal() -> None:
 
 
 def test_codex_rotation_retains_late_event_routing_without_reparenting_inventory() -> None:
-    from omnigent.codex_native_forwarder import (
+    from omnigent.harnesses.codex_native.forwarder import (
         _codex_native_subagent_snapshot,
         _CodexForwarderState,
     )

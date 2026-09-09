@@ -340,6 +340,19 @@ def resolve_oldest_for_mirrored_text(
         return _drained_input(entry)
 
 
+def restore(conversation_id: str, drained: DrainedInput) -> None:
+    """Put a compensated duplicate's drained entry back at the queue front."""
+    entry = _Entry(
+        pending_id=drained.pending_id,
+        content=copy.deepcopy(drained.content),
+        created_by=drained.created_by,
+        stable_id=drained.stable_id,
+    )
+    with _lock:
+        entries = _pending.get(conversation_id, {})
+        _pending[conversation_id] = {drained.pending_id: entry, **entries}
+
+
 def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.

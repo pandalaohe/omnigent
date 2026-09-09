@@ -14,7 +14,11 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.script import ScriptDirectory
 
-from omnigent.db.utils import _build_alembic_config, clear_engine_cache
+from omnigent.db.utils import (
+    _build_alembic_config,
+    _initialize_or_verify_schema,
+    clear_engine_cache,
+)
 
 
 def _upgrade(uri: str, engine: sa.Engine, revision: str) -> None:
@@ -34,7 +38,75 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["gc1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    assert heads == ["ge1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+
+
+def test_legacy_custom_gc_collision_upgrades_without_data_loss(tmp_path: Path) -> None:
+    """A deployed custom ``gc1`` stamp reaches ``ge1`` without replaying its schema."""
+    uri = f"sqlite:///{tmp_path / 'legacy-custom-gc.db'}"
+    engine = sa.create_engine(uri)
+
+    # Recreate the two schema branches that the historical custom ``gc1``
+    # merge represented, then collapse their truthful stamps to its collided
+    # single revision id.
+    _upgrade(uri, engine, "fd1b2c3d4e5")
+    _upgrade(uri, engine, "gb1b2c3d4e5f")
+    preference_bytes = b"preserve-custom-preferences"
+    with engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM alembic_version"))
+        conn.execute(sa.text("INSERT INTO alembic_version (version_num) VALUES ('gc1b2c3d4e5f')"))
+        conn.execute(
+            sa.text(
+                "INSERT INTO users (id, is_admin, workspace_id, preferences) "
+                "VALUES ('user_custom', 1, 0, :preferences)"
+            ),
+            {"preferences": preference_bytes},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO hosts "
+                "(workspace_id, host_id, user_id, name, status, default_workspace) "
+                "VALUES (0, 'host_custom', 'user_custom', 'Custom host', 2, "
+                "'D:/AIProgram/Projects')"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO custom_agents "
+                "(workspace_id, id, owner_id, name, harness, bundle_location, version, "
+                "created_at, updated_at) VALUES "
+                "(0, 'agent_custom', 'user_custom', 'Durable agent', 'codex', "
+                "'local://durable-agent', 3, 1, 2)"
+            )
+        )
+
+    _initialize_or_verify_schema(engine, uri)
+
+    inspector = sa.inspect(engine)
+    assert {column["name"] for column in inspector.get_columns("hosts")} >= {"deleted_at"}
+    assert {column["name"] for column in inspector.get_columns("users")} >= {
+        "preferences",
+        "background_session_titles_enabled",
+    }
+    with engine.connect() as conn:
+        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "ge1b2c3d4e5f"
+        assert (
+            conn.scalar(sa.text("SELECT preferences FROM users WHERE id = 'user_custom'"))
+            == preference_bytes
+        )
+        assert (
+            conn.scalar(
+                sa.text("SELECT default_workspace FROM hosts WHERE host_id = 'host_custom'")
+            )
+            == "D:/AIProgram/Projects"
+        )
+        assert (
+            conn.scalar(sa.text("SELECT name FROM custom_agents WHERE id = 'agent_custom'"))
+            == "Durable agent"
+        )
+
+    engine.dispose()
+    clear_engine_cache()
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:

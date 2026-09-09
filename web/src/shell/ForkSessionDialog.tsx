@@ -74,7 +74,12 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
-import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  HostWorkspacePicker,
+  isNavigablePath,
+  resolveWorkspacePath,
+  useResolvedHostHome,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,

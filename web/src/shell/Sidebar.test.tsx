@@ -173,7 +173,6 @@ import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { seedReadState } from "@/hooks/useUnseenConversations";
 import { Sidebar } from "./Sidebar";
-import * as identity from "@/lib/identity";
 
 const useConvMock = vi.mocked(useConversations);
 

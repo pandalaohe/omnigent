@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.claude_native import _claude_transcript_records_from_session_items
+from omnigent.harnesses.claude_native.main import _claude_transcript_records_from_session_items
 
 
 def _records(items):

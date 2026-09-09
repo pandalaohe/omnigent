@@ -519,7 +519,6 @@ export function ArchiveTranscriptViewer({
         ) : (
           <TurnRail
             turns={turns}
-            scroller={transcriptRef.current ? { el: transcriptRef.current } : null}
             hasMoreHistory={focusItemId === null && Boolean(historyQuery.hasNextPage)}
             loadingMoreHistory={historyQuery.isFetchingNextPage}
             onJump={jumpToTurnItem}

@@ -470,6 +470,7 @@ function mockConversations(
     workspace?: string | null;
     created_at?: number;
     goal_state?: "active" | "paused" | null;
+    provisional?: boolean;
   }[],
 ) {
   useConvMock.mockReturnValue({
@@ -488,6 +489,7 @@ function mockConversations(
             runner_id: c.runner_id ?? null,
             workspace: c.workspace ?? null,
             goal_state: c.goal_state ?? null,
+            provisional: c.provisional ?? false,
           })),
           first_id: null,
           last_id: null,

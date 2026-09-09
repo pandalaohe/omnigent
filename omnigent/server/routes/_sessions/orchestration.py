@@ -14,6 +14,7 @@ import math
 import re
 import secrets
 import time
+import uuid
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
@@ -2369,6 +2370,8 @@ async def _persist_external_conversation_item(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    permission_store: PermissionStore | None = None,
+    user_id: str | None = None,
 ) -> tuple[str, bool]:
     """Serialize mirrored input consumption with replay detection for a session."""
     lock = _external_item_locks.get(session_id)
@@ -2377,7 +2380,14 @@ async def _persist_external_conversation_item(
         _external_item_locks[session_id] = lock
     async with lock:
         return await _persist_external_conversation_item_locked(
-            session_id, conv, body, conversation_store, created_by, background_title_coordinator
+            session_id,
+            conv,
+            body,
+            conversation_store,
+            created_by,
+            background_title_coordinator,
+            permission_store,
+            user_id,
         )
 
 
@@ -2388,6 +2398,8 @@ async def _persist_external_conversation_item_locked(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    permission_store: PermissionStore | None = None,
+    user_id: str | None = None,
 ) -> tuple[str, bool]:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -2431,18 +2443,6 @@ async def _persist_external_conversation_item_locked(
         # Hydration is not new input or work: no pending-input consumption,
         # title generation, unread event, elicitation, or Runner delivery.
         return persisted.id, True
-    if item.idempotency_key is not None:
-        existing = await asyncio.to_thread(
-            conversation_store.find_idempotent_item,
-            session_id,
-            item.idempotency_key,
-        )
-        if existing is not None:
-            if not existing.matches_native_replay(item, exact_source=True):
-                raise OmnigentError("Transcript source identity changed", code=ErrorCode.CONFLICT)
-            # A forwarder restart may replay old user messages. Do not consume
-            # a new pending input, seed a title, or broadcast them as new work.
-            return existing.id, True
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -2507,12 +2507,25 @@ async def _persist_external_conversation_item_locked(
         enabled=await background_session_titles_enabled_for_user(permission_store, user_id),
     )
     try:
-        persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
+        persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
     except NativeReplayConflictError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
-    persisted = persisted_items[0]
-    if persisted.replayed:
+    persisted = persisted_items[-1]
+    if persisted.replayed or persisted.deduplicated:
+        for entry in reversed([*skipped_kiro_pending, drained]):
+            if entry is not None:
+                pending_inputs.restore(session_id, entry)
         return persisted.id, True
+    for index, skipped in enumerate(skipped_kiro_pending):
+        persisted_user = persisted_items[index * 2]
+        persisted_error = persisted_items[index * 2 + 1]
+        if not persisted_user.deduplicated:
+            _publish_input_consumed(
+                session_id,
+                persisted_user,
+                cleared_pending_id=skipped.pending_id,
+            )
+            _publish_external_conversation_item(session_id, persisted_error)
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()

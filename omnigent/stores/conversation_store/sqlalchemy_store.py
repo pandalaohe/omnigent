@@ -2447,7 +2447,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             row_values: list[dict[str, object]] = []
             batch_stable: dict[str, ConversationItem] = {}
             for item, data in zip(items, encoded_data, strict=True):
-                item_id = (
+                if item.stable_id is not None and item.stable_id in batch_stable:
+                    persisted.append(
+                        batch_stable[item.stable_id].model_copy(update={"deduplicated": True})
+                    )
+                    continue
+                item_id = item.stable_id or (
                     self._idempotent_item_id(conversation_id, item.idempotency_key)
                     if item.idempotency_key is not None
                     else generate_item_id(item.type)
@@ -2504,7 +2509,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             raise NativeReplayConflictError("Transcript source is out of order")
                         persisted.append(existing.model_copy(update={"replayed": True}))
                         continue
-                if item.idempotency_key is not None:
+                if item.idempotency_key is not None or item.stable_id is not None:
                     # The conversation lock also serializes concurrent retries.
                     # Replays retain their original ID and timestamp and must
                     # not move the conversation to the top of the session list.
@@ -2525,7 +2530,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                             raise NativeReplayConflictError("Transcript source identity changed")
                         if item.native_recovery:
                             raise NativeReplayConflictError("Transcript source is out of order")
-                        persisted.append(existing.model_copy(update={"replayed": True}))
+                        persisted.append(
+                            existing.model_copy(
+                                update={
+                                    "replayed": item.idempotency_key is not None,
+                                    "deduplicated": item.stable_id is not None,
+                                }
+                            )
+                        )
                         continue
                 position = next_pos
                 next_pos += 1

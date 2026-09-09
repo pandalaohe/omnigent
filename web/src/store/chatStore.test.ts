@@ -574,6 +574,16 @@ function seedTodos(
   sessionTodos.set(id, todos);
 }
 
+describe("temporary conversations", () => {
+  it("recognizes stale temp ids only when no live registry entry exists", () => {
+    expect(isStaleTempConvId("temp:00001111")).toBe(true);
+    conversationRegistry.acquire("temp:00001111");
+    expect(isStaleTempConvId("temp:00001111")).toBe(false);
+    expect(isStaleTempConvId("conv_real")).toBe(false);
+    expect(isStaleTempConvId(null)).toBe(false);
+  });
+});
+
 describe("test harness teardown", () => {
   it("settles a parked SSE reader, which aborting alone cannot do", async () => {
     // Guards the `afterEach` contract. The default `/stream` mock stays open (so

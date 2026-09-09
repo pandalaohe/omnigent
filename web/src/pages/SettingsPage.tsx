@@ -131,7 +131,7 @@ import {
   fetchGithubStatus,
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
-import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";

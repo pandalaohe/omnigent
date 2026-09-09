@@ -2712,6 +2712,7 @@ describe("NewChatLandingScreen", () => {
       .getAllByText(localHostDisplayName())
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
+    if (!hostItem) throw new Error("Host menu item was not rendered");
     expect(
       sandboxOption.compareDocumentPosition(hostItem) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();

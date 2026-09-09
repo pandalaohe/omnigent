@@ -396,6 +396,8 @@ class SqlUser(OmnigentBase):
     :param last_login_at: Unix epoch seconds of the most recent
         successful ``/auth/login`` (accounts mode). ``NULL`` until
         the first login.
+    :param background_session_titles_enabled: Typed Server-side preference;
+        ``NULL`` and ``True`` enable automatic titles, ``False`` opts out.
     :param preferences: Versioned JSON envelope for cross-device user
         preferences. ``NULL`` means the user has never initialized synced
         preferences; an envelope with empty ``settings`` means they explicitly
@@ -417,9 +419,17 @@ class SqlUser(OmnigentBase):
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    background_session_titles_enabled: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
     # Opaque JSON, never SQL-filtered. Compression keeps shortcut/button
     # payloads compact without leaking persistence details into API callers.
-    preferences: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    preferences: Mapped[str | None] = mapped_column(
+        CompressedText,
+        nullable=True,
+        deferred=True,
+    )
 
 
 class SqlAccountToken(OmnigentBase):

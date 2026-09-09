@@ -5635,7 +5635,7 @@ async def test_nonempty_unconvertible_history_refuses_blank_launch(
 
 def test_resume_cursor_preserved_or_reseeded_at_eof(tmp_path: Path) -> None:
     """Valid cursor survives; stale fingerprint is replaced with EOF."""
-    from omnigent import claude_native_forwarder
+    from omnigent.harnesses.claude_native import forwarder as claude_native_forwarder
 
     transcript = tmp_path / "sid.jsonl"
     transcript.write_bytes(b'{"type":"user"}\n')

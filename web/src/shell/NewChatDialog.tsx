@@ -68,6 +68,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { randomUUID } from "@/lib/randomUUID";
 import {
   composerNewLineDisposition,
   isComposerSendKey,
@@ -113,7 +114,12 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
-import { setPendingInitialPrompt } from "@/store/chatStore";
+import {
+  beginLocalConversation,
+  hydrateLocalConversation,
+  removeLocalConversation,
+  setPendingInitialPrompt,
+} from "@/store/chatStore";
 import {
   InlineComposerEditor,
   type InlineComposerEditorHandle,
@@ -4512,6 +4518,10 @@ export function NewChatLandingScreen() {
         ...promptParts,
       ]);
       const initialPrompt = mentionPreamble + composerPartsToText(promptParts);
+      const skill =
+        isNativeTerminalAgent || submittedFiles.length > 0
+          ? null
+          : matchSkillInvocation(initialPrompt, agent?.skills ?? []);
 
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
@@ -4613,7 +4623,12 @@ export function NewChatLandingScreen() {
         // Normal path: bind to an existing registered agent.
         const provisional = newTempConversation();
         try {
-          localConv = beginLocalConversation(initialPrompt, files, provisional);
+          localConv = beginLocalConversation(
+            initialPrompt,
+            submittedFiles,
+            provisional,
+            orderedPromptParts,
+          );
           if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
         } catch {
           /* non-fatal: the response still opens the server session */
@@ -4878,20 +4893,6 @@ export function NewChatLandingScreen() {
       // loads from the session id and never reads the sidebar cache.
       void queryClient.refetchQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
-      // A first message matching one of the agent's bundled skills is
-      // handed off as a structured invocation so ChatPage auto-sends it
-      // as a `slash_command` event (server resolves the skill) instead
-      // of plain text the agent would see as a literal "/name". Native
-      // terminal agents keep plain text — their CLI owns slash commands.
-      setPendingInitialPrompt(data.id, {
-        text: initialPrompt,
-        skill:
-          isNativeTerminalAgent || submittedFiles.length > 0
-            ? null
-            : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
-        files: submittedFiles,
-        ...(submittedFiles.length > 0 ? { composerParts: orderedPromptParts } : {}),
-      });
       // Label the new row with the prompt until the server's seed title lands.
       recordOptimisticTitle(data.id, initialPrompt);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
@@ -4914,11 +4915,12 @@ export function NewChatLandingScreen() {
           data.id,
           effectiveAgentId,
           initialPrompt,
-          files,
+          submittedFiles,
           localConv.pendingMsgTempId,
           skill,
           navigate,
           () => window.location.pathname.endsWith(tempRouteSuffix),
+          orderedPromptParts,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
       } else {
@@ -4926,7 +4928,12 @@ export function NewChatLandingScreen() {
         // Label the row, stash the first message for ChatPage to send, navigate.
         recordOptimisticTitle(data.id, initialPrompt);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
-        setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        setPendingInitialPrompt(data.id, {
+          text: initialPrompt,
+          skill,
+          files: submittedFiles,
+          composerParts: orderedPromptParts,
+        });
         if (onScreenRef.current && window.location.href === createLocation) {
           navigate(`/c/${data.id}`);
         }

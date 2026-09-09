@@ -106,7 +106,9 @@ function harness({ client, conversation = CONVERSATION, showMenu = true }: Harne
             conversation={conversation}
             currentProject={null}
             canShare={false}
+            canFork={false}
             onShare={() => {}}
+            onFork={() => {}}
           />
         )}
         <NavigateElsewhere />

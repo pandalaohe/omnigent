@@ -33,9 +33,11 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.codex_model_vocabulary import codex_spawn_model
-from omnigent.codex_native_bridge import write_codex_context_catalog, write_policy_hook_config
-from omnigent.codex_native_process_registry import (
+from omnigent.harnesses.codex_native.bridge import (
+    write_codex_context_catalog,
+    write_policy_hook_config,
+)
+from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
     codex_native_session_tag_cmdline_arg,
@@ -82,6 +84,8 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _CONTEXT_CATALOG_TIMEOUT_SECONDS = 2.0
+_MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
+_MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20

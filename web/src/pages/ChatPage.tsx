@@ -3104,7 +3104,12 @@ function ComposerImpl({
     });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
-    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
+      // The user's newer draft wins, so the failed send was consumed without
+      // restoring it. Do not let its stable id leak into that newer message.
+      useChatStore.setState({ pendingRetryStableId: null });
+      return;
+    }
     dirtyRef.current = true;
     const recovered =
       failedSendDraft.composerParts ??

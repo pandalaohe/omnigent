@@ -17,7 +17,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { HostWorkspacePicker, isNavigablePath, parentOf } from "./WorkspacePicker";
+import {
+  HostWorkspacePicker,
+  isNavigablePath,
+  parentOf,
+  resolveWorkspacePath,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
 import { normalizeWorkspacePath } from "./NewChatDialog";

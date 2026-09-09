@@ -119,7 +119,7 @@ function TranscriptImpl({
   agentsError,
   sandboxLaunching,
   terminalFirst,
-  conversationId,
+  conversationId: selectedConversationId,
   scrollToBottomOnSessionOpen,
   openedConversationIdRef,
   spacerMeasureRef,
@@ -333,7 +333,7 @@ function TranscriptImpl({
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSessionOpen
-              conversationId={conversationId}
+              conversationId={selectedConversationId}
               enabled={scrollToBottomOnSessionOpen}
               openedConversationIdRef={openedConversationIdRef}
             />

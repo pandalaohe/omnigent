@@ -272,10 +272,6 @@ from omnigent.server.schemas import (
     SkillSummary,
     ToolOutputDeltaEvent,
 )
-from omnigent.session_lifecycle import (
-    labels_with_closed_status,
-    title_without_closed_marker,
-)
 from omnigent.session_todos import validate_session_todos
 from omnigent.spec.types import (
     AgentSpec,
@@ -3169,10 +3165,10 @@ def _parse_external_conversation_item(
         )
     source_id = body.data.get("source_id")
     if source_id is not None and (
-        not isinstance(source_id, str) or not source_id or len(source_id) > 1024
+        not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256
     ):
         raise OmnigentError(
-            "external item source_id must be a non-empty string up to 1024 characters",
+            "external item source_id must be a non-empty string up to 256 characters",
             code=ErrorCode.INVALID_INPUT,
         )
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
@@ -3189,7 +3185,7 @@ def _parse_external_conversation_item(
         type=item_type,
         response_id=response_id.strip(),
         data=data,
-        idempotency_key=f"external:{source_id}" if source_id is not None else None,
+        idempotency_key=f"external:{source_id.strip()}" if source_id is not None else None,
     )
 
 

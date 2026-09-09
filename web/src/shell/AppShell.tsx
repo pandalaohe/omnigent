@@ -460,7 +460,7 @@ export function AppShell() {
       conversationsData?.pages.flatMap((p) => p.data).find((c) => c.id === serverConversationId) ??
       null
     );
-  }, [conversationId, conversationsData]);
+  }, [serverConversationId, conversationsData]);
   const goalFrameState = showGoalSessionMarkers ? (activeConv?.goal_state ?? null) : null;
   // Single-conversation snapshot (shared cache with chatStore.bindStream).
   // For sub-agent (child) sessions the sidebar list omits the row, so this
@@ -2123,7 +2123,7 @@ export function AppShell() {
               push panels below sit outside the group. */}
                 {serverConversationId && workspacePanelVisible && (
                   <WorkspacePanel
-                    conversationId={conversationId}
+                    conversationId={serverConversationId}
                     archiveInitialProject={headerProjectName}
                     archiveInitialHostId={livenessRow?.host_id}
                     width={inlinePanelWidth}

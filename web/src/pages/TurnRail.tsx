@@ -33,12 +33,16 @@ export function TurnRail({
   turns,
   hasMoreHistory,
   loadingMoreHistory,
+  ensureItemVisible,
+  activeTurnId = null,
   onJump,
   onLoadMoreHistory,
 }: {
   turns: readonly Turn[];
   hasMoreHistory: boolean;
   loadingMoreHistory: boolean;
+  ensureItemVisible?: (id: string) => boolean;
+  activeTurnId?: string | null;
   onJump?: (itemId: string) => void;
   onLoadMoreHistory?: () => void;
 }) {
@@ -290,7 +294,9 @@ export function TurnRail({
               // so tabbing away doesn't leave the preview stranded on-screen.
               onBlur={() => setHoveredId((cur) => (cur === turn.itemId ? null : cur))}
               onClick={() =>
-                onJump ? onJump(turn.itemId) : scrollToUserMessage(turn.itemId, flashUserMessage)
+                onJump
+                  ? onJump(turn.itemId)
+                  : scrollToUserMessage(turn.itemId, flashUserMessage, ensureItemVisible)
               }
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
               // Full-pitch hit area (h-2.5, no gap between ticks) so clicking

@@ -43,12 +43,17 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
-from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
-from omnigent.claude_native_status import sync_raw_status_context
-from omnigent.entities.session_resources import terminal_resource_id
-from omnigent.model_metadata import concrete_reported_model
+from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.harnesses.claude_native.status import sync_raw_status_context
+from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
+from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native._native_post_delivery import (
+    append_dead_letter,
+    post_external_session_status,
+    post_may_have_been_delivered,
+)
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
-from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 _FORWARDER_STATE_FILE = "transcript_forwarder.json"
 _HOOK_STATE_FILE = "hook_forwarder.json"
@@ -437,6 +442,7 @@ class SubagentEntry:
 
     subagent_id: str
     child_conversation_id: str
+    parent_subagent_id: str | None = None
     tool_use_id: str | None = None
     byte_offset: int = 0
     seen_source_ids: tuple[str, ...] = ()
@@ -1392,6 +1398,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
             child_conversation_id=child_id,
+            parent_subagent_id=parent_subagent_id,
             tool_use_id=tool_use_id,
             byte_offset=byte_offset,
             seen_source_ids=tuple(seen_source_ids),
@@ -1434,6 +1441,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
         "subagents": {
             entry.subagent_id: {
                 "child_conversation_id": entry.child_conversation_id,
+                "parent_subagent_id": entry.parent_subagent_id,
                 "tool_use_id": entry.tool_use_id,
                 "byte_offset": entry.byte_offset,
                 "seen_source_ids": list(entry.seen_source_ids),
@@ -1863,6 +1871,69 @@ async def _prepare_legacy_subagent_terminal_recovery(
     return updated
 
 
+def _tool_use_ids_in_transcript(
+    transcript_path: Path,
+    *,
+    include_sidechains: bool,
+) -> set[str]:
+    """Return sub-agent spawn tool-use ids owned by one transcript."""
+    try:
+        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return set()
+    tool_use_ids: set[str] = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("isSidechain") is True and not include_sidechains:
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
+                continue
+            tool_use_id = block.get("id")
+            if isinstance(tool_use_id, str) and tool_use_id:
+                tool_use_ids.add(tool_use_id)
+    return tool_use_ids
+
+
+def _subagent_parents_by_tool_use(
+    transcript_path: Path,
+    subagents_dir: Path,
+) -> dict[str, str | None]:
+    """Correlate Claude spawn tool ids to their immediate transcript owner."""
+    owners: dict[str, str | None] = {}
+    ambiguous: set[str] = set()
+    transcript_owners: list[tuple[Path, str | None]] = [(transcript_path, None)]
+    transcript_owners.extend(
+        (path, _subagent_id_from_meta_path(path))
+        for path in sorted(subagents_dir.glob("agent-*.jsonl"))
+    )
+    for path, owner_id in transcript_owners:
+        for tool_use_id in _tool_use_ids_in_transcript(
+            path,
+            include_sidechains=owner_id is not None,
+        ):
+            if tool_use_id in owners and owners[tool_use_id] != owner_id:
+                ambiguous.add(tool_use_id)
+            else:
+                owners[tool_use_id] = owner_id
+    for tool_use_id in ambiguous:
+        owners.pop(tool_use_id, None)
+    return owners
+
+
 async def _forward_available_subagents(
     *,
     client: httpx.AsyncClient,
@@ -1937,59 +2008,35 @@ async def _forward_available_subagents(
     )
 
     # ── Register newly-appeared sub-agents ──────────────
-    # ``glob`` is sync; offload to a thread so we don't stat the
-    # filesystem on the event loop.
     meta_paths = await asyncio.to_thread(lambda: sorted(subagents_dir.glob(_SUBAGENT_META_GLOB)))
-    for meta_path in meta_paths:
-        # ``agent-<id>.meta.json`` → ``<id>``
-        subagent_id = meta_path.stem.removeprefix("agent-").removesuffix(".meta")
-        if subagent_id in updated.subagents:
-            continue
-        retry_key = f"subagent_start:{subagent_id}"
-        if start_retry_tracker.retry_delay_s(retry_key) is not None:
-            continue
+    candidate_meta_paths = [
+        path
+        for path in meta_paths
+        if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
+        and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
+    ]
+    parents_by_tool_use = (
+        await asyncio.to_thread(
+            _subagent_parents_by_tool_use,
+            transcript_path,
+            subagents_dir,
+        )
+        if candidate_meta_paths
+        else {}
+    )
+    pending: list[tuple[Path, dict[str, str], str | None]] = []
+    for meta_path in candidate_meta_paths:
         meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
         if meta is None:
             continue
-        registration_watermarks = updated.pending_registration_watermarks.get(subagent_id)
-        if registration_watermarks is None:
-            child_watermark, parent_watermark = await asyncio.gather(
-                asyncio.to_thread(
-                    _freeze_complete_transcript_offset,
-                    subagents_dir / f"agent-{subagent_id}.jsonl",
-                    agent_name=agent_name,
-                    include_sidechains=True,
-                ),
-                asyncio.to_thread(
-                    _freeze_complete_transcript_offset,
-                    transcript_path,
-                    agent_name=agent_name,
-                    include_sidechains=False,
-                ),
-            )
-            registration_watermarks = (
-                child_watermark,
-                parent_watermark,
-                uuid.uuid4().hex,
-            )
-            updated = replace(
-                updated,
-                pending_registration_watermarks={
-                    **updated.pending_registration_watermarks,
-                    subagent_id: registration_watermarks,
-                },
-            )
-            await _write_subagent_forward_state_async(bridge_dir, updated)
-        _child_watermark, _parent_watermark, registration_id = registration_watermarks
-        try:
-            start_result = await _post_external_subagent_start(
-                client,
-                parent_session_id=parent_session_id,
-                subagent_id=subagent_id,
-                agent_type=meta["agentType"],
-                description=meta["description"],
-                tool_use_id=meta["toolUseId"],
-                registration_id=registration_id,
+        tool_use_id = meta["toolUseId"]
+        if tool_use_id not in parents_by_tool_use:
+            _logger.debug(
+                "Deferring claude-native sub-agent with no resolved parent; "
+                "parent_session=%s subagent_id=%s tool_use_id=%s",
+                parent_session_id,
+                _subagent_id_from_meta_path(meta_path),
+                tool_use_id,
             )
             continue
         pending.append((meta_path, meta, parents_by_tool_use[tool_use_id]))
@@ -2008,45 +2055,71 @@ async def _forward_available_subagents(
                     deferred.append((meta_path, meta, parent_subagent_id))
                     continue
                 if not parent_entry.child_conversation_id:
-                    # The parent was parked (registration exhausted its retries),
-                    # so its conversation will never exist and this child can never
-                    # attach. Park the child too rather than re-resolving it every
-                    # tick; the empty child id filters it out of the tail loops.
                     if subagent_id not in updated.subagents:
-                        # No dead letter: the child can't be replayed anywhere
-                        # correct — its parent conversation never existed, and a
-                        # replay would re-post it under the root session and
-                        # flatten the hierarchy. The WARNING is the recovery signal.
                         _logger.warning(
-                            "Parking claude-native sub-agent whose parent was "
-                            "dropped; parent_session=%s subagent_id=%s "
-                            "parent_subagent_id=%s",
+                            "Parking claude-native sub-agent whose parent was dropped; "
+                            "parent_session=%s subagent_id=%s parent_subagent_id=%s",
                             parent_session_id,
                             subagent_id,
                             parent_subagent_id,
                         )
-                        updated = SubagentForwardState(
+                        updated = replace(
+                            updated,
                             subagents={
                                 **updated.subagents,
                                 subagent_id: SubagentEntry(
                                     subagent_id=subagent_id,
                                     child_conversation_id="",
                                     parent_subagent_id=parent_subagent_id,
+                                    tool_use_id=meta["toolUseId"],
                                 ),
-                            }
+                            },
                         )
                         await _write_subagent_forward_state_async(bridge_dir, updated)
                         made_progress = True
                     continue
                 immediate_parent_session_id = parent_entry.child_conversation_id
+
+            registration_watermarks = updated.pending_registration_watermarks.get(subagent_id)
+            if registration_watermarks is None:
+                child_watermark = await asyncio.to_thread(
+                    _freeze_complete_transcript_offset,
+                    subagents_dir / f"agent-{subagent_id}.jsonl",
+                    agent_name=agent_name,
+                    include_sidechains=True,
+                )
+                parent_watermark = updated.parent_byte_offset
+                if parent_subagent_id is None:
+                    parent_watermark = await asyncio.to_thread(
+                        _freeze_complete_transcript_offset,
+                        transcript_path,
+                        agent_name=agent_name,
+                        include_sidechains=False,
+                    )
+                registration_watermarks = (
+                    child_watermark,
+                    parent_watermark,
+                    uuid.uuid4().hex,
+                )
+                updated = replace(
+                    updated,
+                    pending_registration_watermarks={
+                        **updated.pending_registration_watermarks,
+                        subagent_id: registration_watermarks,
+                    },
+                )
+                await _write_subagent_forward_state_async(bridge_dir, updated)
+            child_watermark, parent_watermark, registration_id = registration_watermarks
+
             try:
-                child_id = await _post_external_subagent_start(
+                start_result = await _post_external_subagent_start(
                     client,
                     parent_session_id=immediate_parent_session_id,
                     subagent_id=subagent_id,
                     agent_type=meta["agentType"],
                     description=meta["description"],
                     tool_use_id=meta["toolUseId"],
+                    registration_id=registration_id,
                 )
             except httpx.HTTPError as exc:
                 decision = start_retry_tracker.record_failure(retry_key, exc)
@@ -2068,23 +2141,30 @@ async def _forward_available_subagents(
                             "agent_type": meta["agentType"],
                             "description": meta["description"],
                             "tool_use_id": meta["toolUseId"],
+                            "registration_id": registration_id,
                             "parent_subagent_id": parent_subagent_id,
                         },
                         reason="permanent HTTP failure after retries",
                         delivered_ambiguous=False,
                         http_status=_http_status_for_log(exc),
                     )
-                    updated = SubagentForwardState(
+                    pending_watermarks = dict(updated.pending_registration_watermarks)
+                    pending_watermarks.pop(subagent_id, None)
+                    updated = replace(
+                        updated,
                         subagents={
                             **updated.subagents,
                             subagent_id: SubagentEntry(
                                 subagent_id=subagent_id,
                                 child_conversation_id="",
                                 parent_subagent_id=parent_subagent_id,
+                                tool_use_id=meta["toolUseId"],
                             ),
-                        }
+                        },
+                        pending_registration_watermarks=pending_watermarks,
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
+                    made_progress = True
                     continue
                 _logger.warning(
                     "Failed to register claude-native sub-agent; parent_session=%s "
@@ -2099,81 +2179,45 @@ async def _forward_available_subagents(
                     exc_info=True,
                     extra={"session_id": immediate_parent_session_id},
                 )
-                # Dead-letter the dropped payload for recovery (#1120; replay #1579).
-                append_dead_letter(
-                    bridge_dir,
-                    session_id=parent_session_id,
-                    event_type="external_subagent_start",
-                    payload={
-                        "subagent_id": subagent_id,
-                        "agent_type": meta["agentType"],
-                        "description": meta["description"],
-                        "tool_use_id": meta["toolUseId"],
-                        "registration_id": registration_id,
-                    },
-                    reason="permanent HTTP failure after retries",
-                    # Claude only dead-letters permanent 4xx (it retries
-                    # transient failures forever), so the server proved it
-                    # rejected the item: never ambiguous, never replayable (#1579).
-                    delivered_ambiguous=False,
-                    http_status=_http_status_for_log(exc),
-                )
-                # Park this sub-agent: insert a sentinel entry so we
-                # don't keep retrying. ``child_conversation_id=""``
-                # is filtered out by the tail / status loops below.
-                updated = replace(
-                    updated,
-                    subagents={
-                        **updated.subagents,
-                        subagent_id: SubagentEntry(
-                            subagent_id=subagent_id,
-                            child_conversation_id="",
-                            tool_use_id=meta["toolUseId"],
-                        ),
-                    },
-                    pending_registration_watermarks={
-                        key: value
-                        for key, value in updated.pending_registration_watermarks.items()
-                        if key != subagent_id
-                    },
-                )
-                await _write_subagent_forward_state_async(bridge_dir, updated)
                 continue
+
             start_retry_tracker.clear(retry_key)
-            updated = SubagentForwardState(
+            pending_watermarks = dict(updated.pending_registration_watermarks)
+            pending_watermarks.pop(subagent_id, None)
+            updated = replace(
+                updated,
                 subagents={
                     **updated.subagents,
                     subagent_id: SubagentEntry(
                         subagent_id=subagent_id,
-                        child_conversation_id=child_id,
+                        child_conversation_id=start_result.child_session_id,
                         parent_subagent_id=parent_subagent_id,
+                        tool_use_id=meta["toolUseId"],
+                        recovery_watermark=(child_watermark if start_result.existing else None),
+                        parent_recovery_watermark=(
+                            parent_watermark
+                            if parent_subagent_id is None
+                            and start_result.existing
+                            and parent_watermark > updated.parent_byte_offset
+                            else None
+                        ),
                     ),
-                }
+                },
+                pending_registration_watermarks=pending_watermarks,
             )
-            continue
-        start_retry_tracker.clear(retry_key)
-        child_watermark, parent_watermark, _registration_id = registration_watermarks
-        pending_registration_watermarks = dict(updated.pending_registration_watermarks)
-        pending_registration_watermarks.pop(subagent_id, None)
-        updated = replace(
-            updated,
-            subagents={
-                **updated.subagents,
-                subagent_id: SubagentEntry(
-                    subagent_id=subagent_id,
-                    child_conversation_id=start_result.child_session_id,
-                    tool_use_id=meta["toolUseId"],
-                    recovery_watermark=(child_watermark if start_result.existing else None),
-                    parent_recovery_watermark=(
-                        parent_watermark
-                        if start_result.existing and parent_watermark > updated.parent_byte_offset
-                        else None
-                    ),
-                ),
-            },
-            pending_registration_watermarks=pending_registration_watermarks,
-        )
-        await _write_subagent_forward_state_async(bridge_dir, updated)
+            await _write_subagent_forward_state_async(bridge_dir, updated)
+            made_progress = True
+
+        if not made_progress:
+            if deferred:
+                _logger.debug(
+                    "Deferring claude-native sub-agents whose parent is not yet "
+                    "registered; parent_session=%s pending=%s",
+                    parent_session_id,
+                    [_subagent_id_from_meta_path(path) for path, _, _ in deferred],
+                )
+            break
+        pending = deferred
 
     parent_state_before_scan = updated
     # Older durable rows predate ``tool_use_id``. Recover it from the still-
@@ -3592,7 +3636,6 @@ def prepare_transcript_forward_state_for_resume(
     ):
         validated = _validated_transcript_state(
             state,
-            bridge_dir=bridge_dir,
             session_id=session_id,
         )
         if validated == state:

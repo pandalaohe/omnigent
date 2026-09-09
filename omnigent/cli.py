@@ -97,8 +97,6 @@ from omnigent.process_logging import (
     env_truthy,
     process_log_dir_reference,
 )
-from omnigent.server_url import ServerUrl
-from omnigent.server_url import org_id_from_url as _org_id_from_url
 from omnigent.update_check import (
     _build_upgrade_suggestion,
     _find_repo_root,
@@ -109,6 +107,9 @@ from omnigent.update_check import (
     _split_vcs_url,
     _uv_tool_receipt_path,
 )
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.server_url import ServerUrl
+from omnigent.util.server_url import org_id_from_url as _org_id_from_url
 
 if TYPE_CHECKING:
     import socket

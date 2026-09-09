@@ -17,7 +17,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  HostWorkspacePicker,
+  isNavigablePath,
+  resolveWorkspacePath,
+  useResolvedHostHome,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { HostLabel } from "./HostLabel";

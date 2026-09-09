@@ -160,6 +160,165 @@ export interface SendOptions {
   onConversationCreated?: (conversationId: string) => void;
   /** Exact visual composer order. Omitted by legacy text/files callers. */
   composerParts?: ComposerDraftPart[];
+  stableId?: string;
+  reusePendingTempId?: string;
+  pinnedConversationId?: string;
+}
+
+function makeConvRow(id: string, provisional = false): Conversation {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    id,
+    object: "conversation",
+    title: null,
+    created_at: now,
+    updated_at: now,
+    labels: {},
+    permission_level: null,
+    ...(provisional ? { provisional: true } : {}),
+  };
+}
+
+function upsertConvRow(row: Conversation, removeId?: string): void {
+  if (queryClient === null) return;
+  const rowMap = new Map([[row.id, row]]);
+  const removeSet = removeId ? new Set([removeId]) : null;
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    if (!data) continue;
+    const base = removeSet ? (removeIdsFromPages(data, removeSet).data ?? data) : data;
+    const { data: next } = insertNewRowsIntoPages(
+      base,
+      rowMap,
+      filtersFromConversationQueryKey(key),
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+function rekeyConvRow(tempId: string, realId: string, text: string): void {
+  if (queryClient === null) return;
+  const realConv = makeConvRow(realId);
+  recordOptimisticTitle(realId, text);
+  markRecentlyCreated(realConv);
+  upsertConvRow(realConv, tempId);
+}
+
+function removeConvRow(tempId: string): void {
+  if (queryClient === null) return;
+  const tempIds = new Set([tempId]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = removeIdsFromPages(data, tempIds);
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+function pendingComposerContent(
+  text: string,
+  files: readonly File[],
+  composerParts?: readonly ComposerDraftPart[],
+): MessageContentBlock[] {
+  const parts = composerParts ?? legacyComposerParts(text, files);
+  return parts.flatMap((part): MessageContentBlock[] => {
+    if (part.type === "text") {
+      return part.text ? [{ type: "input_text", text: part.text }] : [];
+    }
+    const filename = part.file.name || "image.png";
+    const fileId = `${PENDING_FILE_PREFIX}${attachmentKey(part.file)}`;
+    return [
+      part.file.type.startsWith("image/")
+        ? { type: "input_image", file_id: fileId, filename }
+        : { type: "input_file", file_id: fileId, filename },
+    ];
+  });
+}
+
+export function beginLocalConversation(
+  text: string,
+  files: File[] | undefined,
+  provisional = newTempConversation(),
+  composerParts?: readonly ComposerDraftPart[],
+): { tempConvId: string; pendingMsgTempId: string; createToken: string } | null {
+  if (queryClient === null) return null;
+  const { id: tempConvId, token: createToken } = provisional;
+  pendingSeq += 1;
+  const pendingMsgTempId = `pend_${pendingSeq}`;
+
+  recordOptimisticTitle(tempConvId, text);
+  upsertConvRow(makeConvRow(tempConvId, true));
+  const selfAuthor = getCurrentAuthorId();
+  const bubble: PendingUserMessage = {
+    tempId: pendingMsgTempId,
+    content: pendingComposerContent(text, files ?? [], composerParts),
+    createdAtS: Math.floor(Date.now() / 1000),
+    ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+  };
+
+  const entry = conversationRegistry.acquire(tempConvId);
+  entry.setState({
+    pendingUserMessages: [bubble],
+    loadingConversation: false,
+    status: "streaming",
+  });
+  useChatStore.setState({ conversationId: tempConvId });
+  conversationRegistry.setActive(tempConvId);
+  mirrorActiveEntry();
+  return { tempConvId, pendingMsgTempId, createToken };
+}
+
+export function hydrateLocalConversation(
+  tempConvId: string,
+  realId: string,
+  agentId: string,
+  text: string,
+  files: File[] | undefined,
+  pendingMsgTempId: string,
+  skill: { name: string; args: string } | null,
+  navigate: (to: string, opts?: { replace?: boolean }) => void,
+  isStillViewing: () => boolean = () => true,
+  composerParts?: ComposerDraftPart[],
+): void {
+  conversationRegistry.rekey(tempConvId, realId);
+  rekeyConvRow(tempConvId, realId, text);
+
+  const stillViewing = useChatStore.getState().conversationId === tempConvId && isStillViewing();
+  if (stillViewing) {
+    useChatStore.setState({ conversationId: realId });
+    conversationRegistry.setActive(realId);
+    mirrorActiveEntry();
+    navigate(`/c/${realId}`, { replace: true });
+  }
+
+  const store = useChatStore.getState();
+  if (skill !== null) {
+    setterFor(realId)((state) => ({
+      pendingUserMessages: state.pendingUserMessages.filter(
+        (message) => message.tempId !== pendingMsgTempId,
+      ),
+      status: "idle",
+      sendLatchedAt: null,
+    }));
+    void store.sendSlashCommand(skill.name, skill.args, agentId, {
+      pinnedConversationId: realId,
+    });
+    return;
+  }
+  void store.send(text, agentId, files, {
+    pinnedConversationId: realId,
+    reusePendingTempId: pendingMsgTempId,
+    composerParts,
+  });
+}
+
+export function removeLocalConversation(tempConvId: string): boolean {
+  const wasViewing = useChatStore.getState().conversationId === tempConvId;
+  removeConvRow(tempConvId);
+  if (wasViewing) void useChatStore.getState().switchTo(null);
+  conversationRegistry.release(tempConvId);
+  return wasViewing;
 }
 
 /**
@@ -464,8 +623,10 @@ export interface ConversationState {
     conversationId: string;
     text: string;
     files: File[];
+    stableId?: string;
     composerParts?: ComposerDraftPart[];
   } | null;
+  pendingRetryStableId: string | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1693,8 +1854,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // response (separate TCP connections; either can resolve first).
     // FIFO promotion in the consumed handler matches this pending
     // entry to the eventual server item id.
-    pendingSeq += 1;
-    const tempId = `pend_${pendingSeq}`;
+    const reuseTempId = opts?.reusePendingTempId ?? null;
+    let tempId: string;
+    if (reuseTempId !== null) {
+      tempId = reuseTempId;
+    } else {
+      pendingSeq += 1;
+      tempId = `pend_${pendingSeq}`;
+    }
     const orderedParts = opts?.composerParts ?? legacyComposerParts(text, files ?? []);
     const content: MessageContentBlock[] = orderedParts.flatMap<MessageContentBlock>((part) => {
       if (part.type === "text") {
@@ -1852,6 +2019,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             conversationId: draftSessionId,
             text,
             files: files ?? [],
+            stableId,
             ...(opts?.composerParts ? { composerParts: opts.composerParts } : {}),
           },
         });

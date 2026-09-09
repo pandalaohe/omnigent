@@ -1114,9 +1114,6 @@
                 "type": "integer"
               },
               {
-                "type": "string"
-              },
-              {
                 "type": "null"
               }
             ],
@@ -9037,6 +9034,20 @@
           "settings"
         ],
         "title": "UserPreferencesEnvelope",
+        "type": "object"
+      },
+      "UserSettingsUpdate": {
+        "description": "Writable current-user settings.",
+        "properties": {
+          "background_session_titles_enabled": {
+            "title": "Background Session Titles Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "background_session_titles_enabled"
+        ],
+        "title": "UserSettingsUpdate",
         "type": "object"
       },
       "ValidationError": {

@@ -93,7 +93,7 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     validate_claude_hook_interpreter_compatibility,
 )
-from omnigent.claude_native_forwarder import (
+from omnigent.harnesses.claude_native.forwarder import (
     prepare_transcript_forward_state_for_resume,
     reset_transcript_forward_state,
     supervise_forwarder,
@@ -4990,7 +4990,7 @@ async def _ensure_local_claude_resume_transcript(
     """
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
         return ClaudeResumeTranscriptResolution(None, reused_local=False, synthesized=False)
-    from omnigent.claude_native_bridge import bridge_dir_for_conversation_id
+    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_conversation_id
 
     current = workspace
     target_dir = _claude_project_dir_for_cwd(current)
@@ -5398,7 +5398,14 @@ def _claude_transcript_records_from_session_items(
     tool_parent_by_call_id: dict[str, str] = {}
     tool_names_by_call_id: dict[str, str] = {}
     terminal_tasks: dict[str, _JsonObject] = {}
+    previous_item: _JsonObject | None = None
     for index, item in enumerate(items):
+        if previous_item is not None and _transcript_items_equal_ignoring_envelope(
+            item,
+            previous_item,
+        ):
+            continue
+        previous_item = item
         call_id = item.get("call_id")
         if item.get("type") == "function_call" and isinstance(call_id, str):
             name = item.get("name")
@@ -6706,11 +6713,16 @@ def _install_attach_signal_handlers(
         resize_tasks.add(task)
         task.add_done_callback(resize_tasks.discard)
 
-    for sig, handler in {
-        signal.SIGWINCH: _resize,
-        signal.SIGTERM: lambda: _request_stop(signal.SIGTERM),
-        signal.SIGHUP: lambda: _request_stop(signal.SIGHUP),
-    }.items():
+    handlers: dict[signal.Signals, Callable[[], None]] = {}
+    resize_signal = getattr(signal, "SIGWINCH", None)
+    if resize_signal is not None:
+        handlers[resize_signal] = _resize
+    for signal_name in ("SIGTERM", "SIGHUP"):
+        stop_signal = getattr(signal, signal_name, None)
+        if stop_signal is not None:
+            handlers[stop_signal] = lambda sig=stop_signal: _request_stop(sig)
+
+    for sig, handler in handlers.items():
         previous[sig] = cast(_SignalHandler, signal.getsignal(sig))
         try:
             loop.add_signal_handler(sig, handler)

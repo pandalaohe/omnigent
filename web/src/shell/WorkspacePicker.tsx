@@ -200,6 +200,21 @@ export function isNavigablePath(path: string): boolean {
   return isAbsoluteHostPath(trimmed) || trimmed === "~" || trimmed.startsWith("~/");
 }
 
+export function useResolvedHostHome(hostId: string | null): string | null {
+  const { data, isPlaceholderData } = useHostFilesystem(hostId, hostId === null ? null : "");
+  const first = data && !isPlaceholderData ? data.entries[0] : undefined;
+  return first ? parentOf(first.path) : null;
+}
+
+export function resolveWorkspacePath(value: string, home: string | null): string | null {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("/")) {
+    const stripped = trimmed.replace(/\/+$/, "");
+    return stripped === "" ? "/" : stripped;
+  }
+  return normalizeTypedPath(trimmed, home);
+}
+
 /**
  * Icon button in the picker header, with a styled hover tooltip.
  *

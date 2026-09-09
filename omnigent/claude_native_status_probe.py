@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     read_active_session_id,
     read_bridge_id,
@@ -21,7 +21,7 @@ from omnigent.claude_native_bridge import (
     read_transcript_items_from_offset,
     read_transcript_path,
 )
-from omnigent.claude_native_forwarder import (
+from omnigent.harnesses.claude_native.forwarder import (
     _read_subagent_forward_state,
     _read_subagent_meta,
     _structured_terminal_evidence,

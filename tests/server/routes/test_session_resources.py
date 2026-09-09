@@ -4351,7 +4351,7 @@ async def test_kiro_skipped_entries_persist_before_the_matched_item() -> None:
     )
 
     try:
-        item_id = await _persist_external_conversation_item(
+        item_id, replayed = await _persist_external_conversation_item(
             sid,
             conv,
             body,
@@ -4372,6 +4372,7 @@ async def test_kiro_skipped_entries_persist_before_the_matched_item() -> None:
         assert second_user.data.content == [{"type": "input_text", "text": "second failed"}]
         assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
         assert item_id == matched_user.id
+        assert replayed is False
         assert pending_inputs.snapshot_for(sid) == []
     finally:
         pending_inputs.reset_for_tests()

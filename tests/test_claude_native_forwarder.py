@@ -23,9 +23,9 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-import omnigent.claude_native as claude_native
-import omnigent.claude_native_forwarder as forwarder
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import forwarder
+from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
@@ -8528,11 +8528,13 @@ async def test_compact_summary_first_claims_generation_from_artifact(tmp_path: P
     transcript = tmp_path / "session.jsonl"
     _write_compaction_transcript(transcript)
     with patch(
-        "omnigent.claude_native_forwarder.read_transcript_path",
+        "omnigent.harnesses.claude_native.forwarder.read_transcript_path",
         return_value=transcript,
     ):
         persist = _persist_mock()
-        with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        with patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+        ):
             handled = await _handle_compact_summary_item(
                 AsyncMock(),
                 session_id="conv-summary-first",
@@ -8685,7 +8687,9 @@ async def test_hook_ack_waits_for_summary_durability(tmp_path: Path) -> None:
         now=10.0,
     )
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         assert not await _maybe_persist_compaction_fallback(
             AsyncMock(),
             session_id="conv-hook-first",
@@ -8723,7 +8727,9 @@ async def test_fallback_is_superseded_once_by_durable_summary(tmp_path: Path) ->
         now=10.0,
     )
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         assert await _maybe_persist_compaction_fallback(
             AsyncMock(),
             session_id="conv-supersede",
@@ -8782,7 +8788,7 @@ async def test_fallback_sdk_read_does_not_block_event_loop(tmp_path: Path) -> No
     persist = _persist_mock()
     with (
         patch(
-            "omnigent.claude_native_forwarder.read_claude_session_id",
+            "omnigent.harnesses.claude_native.forwarder.read_claude_session_id",
             return_value="claude-1",
         ),
         patch(
@@ -8790,7 +8796,7 @@ async def test_fallback_sdk_read_does_not_block_event_loop(tmp_path: Path) -> No
             side_effect=blocking_session_read,
         ),
         patch(
-            "omnigent.claude_native_forwarder._persist_native_compaction_item",
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
             persist,
         ),
     ):
@@ -8851,7 +8857,7 @@ async def test_transcript_summary_wins_during_threaded_fallback_read(
     persist = _persist_mock()
     with (
         patch(
-            "omnigent.claude_native_forwarder.read_claude_session_id",
+            "omnigent.harnesses.claude_native.forwarder.read_claude_session_id",
             return_value="claude-1",
         ),
         patch(
@@ -8859,7 +8865,7 @@ async def test_transcript_summary_wins_during_threaded_fallback_read(
             side_effect=blocking_session_read,
         ),
         patch(
-            "omnigent.claude_native_forwarder._persist_native_compaction_item",
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
             persist,
         ),
     ):
@@ -8912,7 +8918,9 @@ async def test_concurrent_duplicate_summary_callbacks_persist_once(tmp_path: Pat
         await release.wait()
 
     persist = AsyncMock(side_effect=persist_once)
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         callbacks = [
             asyncio.create_task(
                 _handle_compact_summary_item(
@@ -9157,7 +9165,7 @@ async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> 
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()  # no _note_precompact — no pending token
-    from omnigent.claude_native_forwarder import _write_compaction_state
+    from omnigent.harnesses.claude_native.forwarder import _write_compaction_state
 
     _write_compaction_state(
         bridge_dir,
@@ -9204,7 +9212,9 @@ async def test_ambiguous_authoritative_boundary_post_holds_cursor(tmp_path: Path
 
     ambiguous = AsyncMock(side_effect=httpx.ReadError("connection dropped mid-response"))
 
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ambiguous):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", ambiguous
+    ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_ambiguous",
@@ -9424,8 +9434,13 @@ async def test_precompact_miss_is_claimed_from_authoritative_summary(tmp_path: P
 
     persist = _persist_mock()
     with (
-        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist),
-        patch("omnigent.claude_native_forwarder.read_transcript_path", return_value=transcript),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+        ),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder.read_transcript_path",
+            return_value=transcript,
+        ),
     ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
@@ -9441,7 +9456,9 @@ async def test_precompact_miss_is_claimed_from_authoritative_summary(tmp_path: P
     assert forwarder._compaction_skip_stats.expected_skip == 0
 
     # Re-reading the same summary is deterministic replay.
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_miss",
@@ -9602,7 +9619,9 @@ async def test_standalone_hook_fallback_failure_retries_without_replaying_hook(
             )
 
     # Poll 1: the hook only acknowledges and advances.
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
+    ):
         after_ack = await _run_once(start_state)
     assert failing.await_count == 0
     assert after_ack.event_cursor > start_state.event_cursor
@@ -9613,7 +9632,9 @@ async def test_standalone_hook_fallback_failure_retries_without_replaying_hook(
 
     # The first fallback attempt fails and does not consume the generation.
     with (
-        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
+        ),
         pytest.raises(httpx.HTTPStatusError),
     ):
         await _maybe_persist_compaction_fallback(
@@ -9626,7 +9647,7 @@ async def test_standalone_hook_fallback_failure_retries_without_replaying_hook(
 
     # A later poll retries and records exactly one marked fallback.
     ok = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ok):
+    with patch("omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", ok):
         assert await _maybe_persist_compaction_fallback(
             AsyncMock(),
             session_id="conv_p22",

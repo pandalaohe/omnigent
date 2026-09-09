@@ -6804,7 +6804,7 @@ async def _auto_create_claude_terminal(
     resume_prefix_bytes: int | None = None
     resume_state_prepared = False
     if server_client is not None and session_external_id is not None:
-        from omnigent.claude_native import (
+        from omnigent.harnesses.claude_native.main import (
             _ensure_local_claude_resume_transcript,
             _prepare_cold_resume_forward_state,
         )
@@ -7723,7 +7723,7 @@ async def _claude_native_bridge_id_for_session(
     :param session_labels: Labels supplied by the initialization envelope.
         ``None`` selects the legacy labels callback.
     :returns: Opaque bridge id from
-        ``omnigent.claude_native.bridge_id`` when present, otherwise
+        ``omnigent.harnesses.claude_native.main.bridge_id`` when present, otherwise
         *session_id* for legacy single-session bridges.
     """
     from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY

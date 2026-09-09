@@ -56,7 +56,6 @@ import {
   ELICITATION_RESPONSE_PREFIX,
   imagePreview,
   isTextBlock,
-  keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -503,12 +502,14 @@ export const BubbleView = memo(
     bubble,
     isLastAssistant = false,
     showsWorking = false,
+    actionsPersistent = false,
     readOnly = false,
     sessionId,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
+    actionsPersistent?: boolean;
     /** Archive/library viewers reuse the normal bubbles without live actions. */
     readOnly?: boolean;
     /** Source session for attachments when rendering outside the active chat. */
@@ -535,6 +536,7 @@ export const BubbleView = memo(
         bubble={bubble}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
+        actionsPersistent={actionsPersistent}
         readOnly={readOnly}
         sessionId={sessionId}
       />
@@ -543,6 +545,7 @@ export const BubbleView = memo(
   (prev, next) =>
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
+    (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
     (prev.readOnly ?? false) === (next.readOnly ?? false) &&
     prev.sessionId === next.sessionId &&
     bubblesEqual(prev.bubble, next.bubble),
@@ -584,6 +587,15 @@ function useCopyMessage(getText: () => string): {
   }, [getText, isCopied, isMobile]);
 
   return { isCopied, handleCopy };
+}
+
+function AttachmentChip({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
+  return (
+    <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
+      <Icon className="size-3 shrink-0" />
+      <span className="max-w-[180px] truncate">{label}</span>
+    </span>
+  );
 }
 
 function UserBubble({
@@ -712,25 +724,27 @@ function UserBubble({
                 ) : null;
               }
               if (block.type === "input_image") {
+                const preview = imagePreview(block);
                 return (
                   <div key={key} className="my-1.5 flex overflow-x-auto">
-                    {block.file_id.startsWith("pending:") ? (
-                      <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
-                        <ImageIcon className="size-3 shrink-0" />
-                        <span className="max-w-[180px] truncate">
-                          {block.filename ?? block.file_id.replace("pending:", "")}
-                        </span>
-                      </span>
-                    ) : (
+                    {preview.kind === "uploaded" ? (
                       <SessionImage
                         path={
                           sessionId
-                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(block.file_id)}/content`
+                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(preview.fileId)}/content`
                             : undefined
                         }
-                        alt={block.filename ?? block.file_id}
+                        alt={preview.alt}
                         className="rounded-md object-contain"
                       />
+                    ) : preview.kind === "inline" ? (
+                      <InlineImage
+                        src={preview.src}
+                        alt={preview.alt}
+                        className="rounded-md object-contain"
+                      />
+                    ) : (
+                      <AttachmentChip icon={ImageIcon} label={preview.label} />
                     )}
                   </div>
                 );
@@ -738,12 +752,7 @@ function UserBubble({
               if (block.type === "input_file") {
                 return (
                   <div key={key} className="my-1.5 flex flex-wrap gap-1.5">
-                    <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
-                      <FileTextIcon className="size-3 shrink-0" />
-                      <span className="max-w-[180px] truncate">
-                        {block.filename ?? block.file_id}
-                      </span>
-                    </span>
+                    <AttachmentChip icon={FileTextIcon} label={attachmentLabel(block)} />
                   </div>
                 );
               }
@@ -786,12 +795,14 @@ function AssistantBubble({
   bubble,
   isLastAssistant = false,
   showsWorking = false,
+  actionsPersistent = false,
   readOnly = false,
   sessionId,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
+  actionsPersistent?: boolean;
   readOnly?: boolean;
   sessionId?: string;
 }) {

@@ -42,6 +42,8 @@ const mocks = vi.hoisted(() => ({
   agentNames: [] as string[],
   hosts: [] as { host_id: string; name: string }[],
   archivedFilters: undefined as Record<string, unknown> | undefined,
+  getUserSettings: vi.fn(),
+  updateUserSettings: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({

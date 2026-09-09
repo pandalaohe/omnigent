@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
   showToast: vi.fn(),
+  fork: vi.fn(),
 }));
 
 vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));

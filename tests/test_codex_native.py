@@ -17,14 +17,9 @@ import pytest
 import tomllib
 import yaml
 
-from omnigent import (
-    codex_native,
-    codex_native_app_server,
-    codex_native_bridge,
-    codex_native_forwarder,
-)
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native import main as codex_native
 from omnigent.harnesses.codex_native.bridge import (

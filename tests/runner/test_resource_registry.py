@@ -646,7 +646,7 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_delayed_stop_rechecks_unchanged_busy_status_file(tmp_path: Path) -> None:
     """A late Stop must not hide the next turn until Claude rewrites its file."""
-    from omnigent.claude_native_status_file import SessionStatusPoller
+    from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
     session_id = "conv_late_stop"
     _, statuses, _, fake_pollers, registry = await _observe_native_with_fake_poller(

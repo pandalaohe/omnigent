@@ -407,7 +407,7 @@ async def test_claude_interrupt_rechecks_idle_after_bridge_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A terminal edge during bridge lookup closes the last injection race."""
-    import omnigent.claude_native_bridge as claude_bridge
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
     from omnigent.runner.native import interrupt as interrupt_mod
     from omnigent.runner.native.interrupt import native_session_has_active_work
 

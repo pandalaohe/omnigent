@@ -7,7 +7,7 @@
 //      but a late-arriving listing (home resolving) must NOT clobber
 //      what the user is typing.
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -123,6 +123,36 @@ interface FakeListing {
 function result(value: FakeListing): ReturnType<typeof useHostFilesystem> {
   return value as unknown as ReturnType<typeof useHostFilesystem>;
 }
+
+describe("workspace path resolution", () => {
+  it("resolves tilde and preserves absolute paths", () => {
+    expect(resolveWorkspacePath("~/git/omnigent", "/Users/alice")).toBe(
+      "/Users/alice/git/omnigent",
+    );
+    expect(resolveWorkspacePath("  /a//b/  ", null)).toBe("/a//b");
+    expect(resolveWorkspacePath("~/git/omnigent", null)).toBeNull();
+  });
+
+  it("derives the host home only from a settled listing", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("git", "/Users/alice/git")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    expect(renderHook(() => useResolvedHostHome("host_1")).result.current).toBe("/Users/alice");
+
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("git", "/Users/alice/git")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: true,
+      }),
+    );
+    expect(renderHook(() => useResolvedHostHome("host_1")).result.current).toBeNull();
+  });
+});
 
 describe("parentOf", () => {
   it("returns null at the home view (empty path)", () => {

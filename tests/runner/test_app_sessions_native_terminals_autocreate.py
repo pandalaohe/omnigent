@@ -1782,12 +1782,12 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         """Record the resume id and return a transcript resolution."""
         del client, session_id, workspace
         synth_calls.append(external_session_id)
-        from omnigent.claude_native import ClaudeResumeTranscriptResolution
+        from omnigent.harnesses.claude_native.main import ClaudeResumeTranscriptResolution
 
         transcript = tmp_path / f"{external_session_id}.jsonl"
         transcript.write_text('{"type":"user","message":{"content":"fixture"}}\n')
         if reuse_local:
-            from omnigent.claude_native_forwarder import (
+            from omnigent.harnesses.claude_native.forwarder import (
                 TranscriptForwardState,
                 _jsonl_cursor_fingerprint,
                 _write_forward_state,
@@ -1911,7 +1911,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         assert synth_calls == [snapshot_external_id]
 
     if snapshot_external_id is not None and reuse_local:
-        from omnigent.claude_native_forwarder import _read_forward_state
+        from omnigent.harnesses.claude_native.forwarder import _read_forward_state
 
         saved = _read_forward_state(
             claude_native_bridge.bridge_dir_for_conversation_id("5cdbea97a2fb0c659bc09605401e2bb2")
@@ -1965,7 +1965,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     ) -> Any:
         del client, session_id, workspace
         synth_calls.append(external_session_id)
-        from omnigent.claude_native import ClaudeResumeTranscriptResolution
+        from omnigent.harnesses.claude_native.main import ClaudeResumeTranscriptResolution
 
         transcript = tmp_path / f"{external_session_id}.jsonl"
         transcript.write_text('{"type":"user","message":{"content":"fixture"}}\n')

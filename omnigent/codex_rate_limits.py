@@ -18,7 +18,7 @@ from omnigent._platform import resolve_cli_binary
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import clean_agent_env
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 CODEX_RATE_LIMITS_REFRESH_INTERVAL_S = 300.0
 CODEX_RATE_LIMITS_HARD_TTL_S = 3600

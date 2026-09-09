@@ -53,7 +53,11 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 vi.mock("./WorkspacePicker", async (importActual) => ({
   ...(await importActual<typeof WorkspacePickerModule>()),
   HostWorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
-    <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
+    <button
+      type="button"
+      data-testid="mock-pick-workspace"
+      onClick={() => onSelect("/Users/a/git/omnigent")}
+    >
       pick
     </button>
   ),
@@ -976,9 +980,9 @@ describe("ForkSessionDialog", () => {
       fireEvent.change(input, { target: { value: "~/git/omnigent" } });
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
 
-      // Enter commits the typed path and opens the tree browser at it.
-      fireEvent.keyDown(input, { key: "Enter" });
-      expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
+      // The folder button opens the tree browser for a non-absolute draft.
+      fireEvent.click(screen.getByTestId("workspace-browse-toggle"));
+      expect(await screen.findByTestId("mock-pick-workspace")).toBeInTheDocument();
 
       // "Select" commits the browser's absolute path into the form.
       fireEvent.click(screen.getByTestId("mock-pick-workspace"));

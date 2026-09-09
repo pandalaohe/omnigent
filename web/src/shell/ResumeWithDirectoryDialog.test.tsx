@@ -38,7 +38,17 @@ vi.mock("./WorkspacePathField", () => ({
 }));
 vi.mock("./WorkspacePicker", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkspacePickerModule>()),
-  HostWorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
+  HostWorkspacePicker: ({ onSelect }: { onSelect: (path: string) => void }) => (
+    <div data-testid="mock-workspace-picker">
+      <button
+        type="button"
+        data-testid="mock-pick-workspace"
+        onClick={() => onSelect("/Users/alice/git/omnigent")}
+      >
+        pick
+      </button>
+    </div>
+  ),
   isNavigablePath: () => false,
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));

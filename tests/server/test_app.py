@@ -129,6 +129,7 @@ def test_well_known_prefix_is_not_spa_fallback() -> None:
     """
     assert server_app._is_web_ui_api_fallback_path(".well-known/omnigent.json")
     assert server_app._is_web_ui_api_fallback_path(".well-known/anything-else")
+    assert server_app._is_web_ui_api_fallback_path(r"v1\sessions\missing")
     # Sanity: a real client route still falls through to index.html.
     assert not server_app._is_web_ui_api_fallback_path("c/conv_abc123")
 

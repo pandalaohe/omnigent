@@ -6806,3 +6806,128 @@ def test_visible_item_search_filters_legacy_hidden_rows_before_limit(
     results = conversation_store.search_visible_items_literal(conv.id, "needle", limit=2)
 
     assert [item.id for item in results] == [persisted[1].id, persisted[2].id]
+
+
+# ── Idempotent append (stable_id) ─────────────────────
+
+
+def test_append_with_stable_id_is_idempotent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    stable = "ab" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    [first] = conversation_store.append(conv.id, [item])
+    [second] = conversation_store.append(conv.id, [item])
+    assert first.id == second.id == stable
+    assert first.deduplicated is False
+    assert second.deduplicated is True
+    assert [stored.id for stored in conversation_store.list_items(conv.id).data] == [stable]
+
+
+def test_append_without_stable_id_still_duplicates(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+    [first] = conversation_store.append(conv.id, [item])
+    [second] = conversation_store.append(conv.id, [item])
+    assert first.id != second.id
+    assert second.deduplicated is False
+
+
+def test_append_dedupe_does_not_burn_a_position(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    duplicate = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "one"}]),
+        stable_id="cd" * 16,
+    )
+    conversation_store.append(conv.id, [duplicate])
+    fresh = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(
+            role="assistant",
+            content=[{"type": "output_text", "text": "two"}],
+            agent="worker",
+        ),
+    )
+    [got_duplicate, got_fresh] = conversation_store.append(conv.id, [duplicate, fresh])
+    assert got_duplicate.deduplicated is True
+    assert got_fresh.deduplicated is False
+    assert len(conversation_store.list_items(conv.id).data) == 2
+
+
+def test_pure_dedupe_append_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="ef" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+    before = conversation_store.get_conversation(conv.id)
+    assert before is not None
+    conversation_store.append(conv.id, [item])
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == before.updated_at
+
+
+def test_same_stable_id_twice_in_one_batch_inserts_once(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="0a" * 16,
+    )
+    [first, second] = conversation_store.append(conv.id, [item, item])
+    assert first.id == second.id
+    assert first.deduplicated is False
+    assert second.deduplicated is True
+    assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="1b" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    [first, second] = conversation_store.append(conv.id, [item, item])
+    assert first.deduplicated is True
+    assert second.deduplicated is True
+    assert first.id == second.id
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == 1000
+    assert len(conversation_store.list_items(conv.id).data) == 1
