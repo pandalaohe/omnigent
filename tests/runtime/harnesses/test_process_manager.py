@@ -1628,7 +1628,7 @@ async def test_release_keeps_unconfirmed_process_registered_for_retry(
         process=process,  # type: ignore[arg-type]
         client=_Client(),  # type: ignore[arg-type]
         endpoint=endpoint,  # type: ignore[arg-type]
-        harness="openai-agents",
+        harness="codex",
     )
     conversation_id = "conv_stuck_release"
     manager._entries[conversation_id] = entry
@@ -1690,7 +1690,7 @@ async def test_failed_retention_close_keeps_activity_token_retryable(
         process=_Process(),  # type: ignore[arg-type]
         client=object(),  # type: ignore[arg-type]
         endpoint=object(),  # type: ignore[arg-type]
-        harness="openai-agents",
+        harness="codex",
     )
     entry.last_used_at = time.monotonic() - 120
     manager = HarnessProcessManager(tmp_parent=short_tmp_parent)

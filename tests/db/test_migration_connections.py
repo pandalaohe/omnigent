@@ -38,11 +38,11 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["ge1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    assert heads == ["ff1b2c3d4e5"], f"expected a single head, got {heads!r}"
 
 
 def test_legacy_custom_gc_collision_upgrades_without_data_loss(tmp_path: Path) -> None:
-    """A deployed custom ``gc1`` stamp reaches ``ge1`` without replaying its schema."""
+    """A deployed custom ``gc1`` stamp reaches ``ff1`` through the repaired merge."""
     uri = f"sqlite:///{tmp_path / 'legacy-custom-gc.db'}"
     engine = sa.create_engine(uri)
 
@@ -83,13 +83,24 @@ def test_legacy_custom_gc_collision_upgrades_without_data_loss(tmp_path: Path) -
     _initialize_or_verify_schema(engine, uri)
 
     inspector = sa.inspect(engine)
-    assert {column["name"] for column in inspector.get_columns("hosts")} >= {"deleted_at"}
+    assert {column["name"] for column in inspector.get_columns("hosts")} >= {
+        "deleted_at",
+        "cli_retention_policy",
+        "cli_retention_revision",
+        "cli_retention_claim_token",
+    }
+    assert {column["name"] for column in inspector.get_columns("conversations")} >= {
+        "archive_revision",
+        "archive_close_requested_revision",
+        "archive_close_completed_revision",
+    }
+    assert "cli_release_intents" in inspector.get_table_names()
     assert {column["name"] for column in inspector.get_columns("users")} >= {
         "preferences",
         "background_session_titles_enabled",
     }
     with engine.connect() as conn:
-        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "ge1b2c3d4e5f"
+        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "ff1b2c3d4e5"
         assert (
             conn.scalar(sa.text("SELECT preferences FROM users WHERE id = 'user_custom'"))
             == preference_bytes

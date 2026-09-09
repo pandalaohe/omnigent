@@ -1890,8 +1890,12 @@ async def test_host_cli_retention_policy_requires_complete_replacement_fields(
 async def test_live_host_cli_retention_write_routes_to_tunnel_owner(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A live Host policy mutation must execute on its tunnel-owning replica."""
+    from omnigent.server.routes import _host_launch
+
+    monkeypatch.setattr(_host_launch, "_deployment_is_sharded", lambda: True)
     owner_app, owner_registry, _owner_store, _owner_conversations = host_api_app
     _comm = await _connect_host(owner_app, owner_registry)
 

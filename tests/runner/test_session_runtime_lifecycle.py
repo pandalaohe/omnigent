@@ -131,7 +131,10 @@ async def test_late_codex_forwarder_closes_only_its_app_server(
     session_id = "a1b2c3d4e5f61234567890abcdef0123"
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://server.test")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
-    monkeypatch.setattr("omnigent.codex_native_forwarder.supervise_forwarder", _forwarder)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.forwarder.supervise_forwarder",
+        _forwarder,
+    )
     native_runtime._AUTO_CODEX_APP_SERVERS[session_id] = new  # type: ignore[assignment]
     try:
         await orchestration._codex_forward_known_thread(
