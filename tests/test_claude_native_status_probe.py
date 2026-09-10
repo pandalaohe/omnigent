@@ -191,6 +191,46 @@ def test_probe_keeps_uncertain_child_unverified(
     assert child["reason"] == reason
 
 
+def test_probe_recovers_queued_completion_past_forwarder_cursor_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir, transcript_path = _build_probe_fixture(
+        tmp_path, monkeypatch, with_terminal_evidence=False
+    )
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "attachment",
+                    "uuid": "queued-completion",
+                    "attachment": {
+                        "type": "queued_command",
+                        "commandMode": "task-notification",
+                        "prompt": (
+                            "<task-notification><task-id>child-native</task-id>"
+                            "<tool-use-id>toolu_current</tool-use-id><status>completed</status>"
+                            "<result>Done</result></task-notification>"
+                        ),
+                    },
+                }
+            )
+            + "\n"
+        )
+    state_path = bridge_dir / "subagent_forwarder.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(parent_byte_offset=transcript_path.stat().st_size, terminal_recovery_version=1)
+    _write_json(state_path, state)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    result = probe.probe_native_subagent_status(
+        parent_session_id="parent-current", bridge_id="bridge-current"
+    )
+
+    assert result["children"][0]["terminal_status"] == "completed"
+    assert result["children"][0]["reason"] == "structured_parent_terminal_evidence"
+    assert {path: path.read_bytes() for path in before} == before
+
+
 def test_probe_rejects_bridge_bound_to_another_parent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
