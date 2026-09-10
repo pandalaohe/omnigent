@@ -272,7 +272,7 @@ async def test_partial_parent_record_retries_after_it_becomes_complete(tmp_path:
         return httpx.Response(200, json={})
 
     recovered = await _run_once(bridge_dir, transcript_path, httpx.MockTransport(record))
-    assert recovered.terminal_recovery_version == 1
+    assert recovered.terminal_recovery_version == 2
     assert posted[0]["data"]["status"] == "completed"
 
 

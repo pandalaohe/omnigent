@@ -595,10 +595,15 @@ class TranscriptRecordItems:
     ``next_byte_offset`` is safe to persist only after every item in
     ``items`` has been accepted by the server. Records that produce no visible
     items are included so a forwarder can advance past them without rescanning.
+    ``timestamp`` is the record's top-level ``timestamp`` string (ISO-8601,
+    e.g. ``"2026-09-10T13:23:13.274Z"``), or ``None`` when the record carries
+    none. The sub-agent forwarder uses it to order a SendMessage resume
+    record against the parent notification that set the terminal state.
     """
 
     next_byte_offset: int
     items: tuple[ClaudeTranscriptItem, ...]
+    timestamp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -608,6 +613,8 @@ class ClaudeTaskNotification:
     Claude records background Task/Agent completion as a synthetic ``user``
     message. Only fields needed for correlation and safe delivery are kept;
     paths and the raw control-message envelope are deliberately excluded.
+    ``timestamp`` is the enclosing record's top-level ``timestamp`` string,
+    or ``None`` when unavailable (rebuilt/queued evidence without a record).
     """
 
     task_id: str
@@ -615,6 +622,7 @@ class ClaudeTaskNotification:
     status: str | None = None
     result: str | None = None
     replayed: bool = False
+    timestamp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2795,6 +2803,7 @@ def read_transcript_items_since_with_position(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
+                timestamp=_record_timestamp(entry),
             )
         )
     items = _dedupe_compact_noop_echo(items)
@@ -2803,6 +2812,7 @@ def read_transcript_items_since_with_position(
         TranscriptRecordItems(
             next_byte_offset=record.next_byte_offset,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+            timestamp=record.timestamp,
         )
         for record in record_items
     ]
@@ -2932,6 +2942,7 @@ def read_transcript_items_from_offset(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
+                timestamp=_record_timestamp(entry),
             )
         )
     items = _dedupe_compact_noop_echo(items)
@@ -2940,6 +2951,7 @@ def read_transcript_items_from_offset(
         TranscriptRecordItems(
             next_byte_offset=record.next_byte_offset,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+            timestamp=record.timestamp,
         )
         for record in record_items
     ]
@@ -6894,7 +6906,31 @@ def _task_notification_field(text: str, field: str) -> str | None:
     return value or None
 
 
-def _task_notification_from_text(text: str) -> ClaudeTaskNotification | None:
+def _record_timestamp(entry: _JsonObject) -> str | None:
+    """Return the record's top-level ``timestamp`` string, if it carries one."""
+    timestamp = entry.get("timestamp")
+    return timestamp if isinstance(timestamp, str) and timestamp else None
+
+
+def _is_coordinator_resume_entry(entry: _JsonObject) -> bool:
+    """Return True for a SendMessage resume record written to a child transcript.
+
+    The original spawn prompt is ``{"type":"user","isMeta":null/absent,...}``;
+    a coordinator SendMessage resume is ``{"type":"user","isMeta":true,
+    "origin":{"kind":"coordinator"},...}``. Both carry a string user message,
+    but only the resume must surface as a conversation item: the spawn prompt
+    predates every terminal notification for the child, while the resume
+    postdates the completion it reopens.
+    """
+    if entry.get("isMeta") is not True:
+        return False
+    origin = entry.get("origin")
+    return isinstance(origin, dict) and origin.get("kind") == "coordinator"
+
+
+def _task_notification_from_text(
+    text: str, *, timestamp: str | None = None
+) -> ClaudeTaskNotification | None:
     """Parse safe correlation/result fields from a Claude task notification."""
     if not _is_task_notification_text(text):
         return None
@@ -6906,10 +6942,13 @@ def _task_notification_from_text(text: str) -> ClaudeTaskNotification | None:
         tool_use_id=_task_notification_field(text, "tool-use-id"),
         status=_task_notification_field(text, "status"),
         result=_task_notification_field(text, "result"),
+        timestamp=timestamp,
     )
 
 
-def _omnigent_task_notification(raw: object) -> ClaudeTaskNotification | None:
+def _omnigent_task_notification(
+    raw: object, *, timestamp: str | None = None
+) -> ClaudeTaskNotification | None:
     """Parse one terminal notification preserved by an Omnigent transcript rebuild."""
     if not isinstance(raw, dict):
         return None
@@ -6928,6 +6967,7 @@ def _omnigent_task_notification(raw: object) -> ClaudeTaskNotification | None:
         status=status,
         result=result,
         replayed=True,
+        timestamp=timestamp,
     )
 
 
@@ -6979,6 +7019,7 @@ def _omnigent_tool_result_notification(entry: _JsonObject) -> ClaudeTaskNotifica
         status=status,
         result=_tool_result_output(entry, block),
         replayed=True,
+        timestamp=_record_timestamp(entry),
     )
 
 
@@ -6993,12 +7034,15 @@ def _queued_task_notification_from_entry(entry: _JsonObject) -> ClaudeTaskNotifi
     ):
         return None
     prompt = attachment.get("prompt")
-    return _task_notification_from_text(prompt) if isinstance(prompt, str) else None
+    if not isinstance(prompt, str):
+        return None
+    return _task_notification_from_text(prompt, timestamp=_record_timestamp(entry))
 
 
 def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotification]:
     """Extract task notifications without retaining their private path fields."""
     notifications: list[ClaudeTaskNotification] = []
+    record_timestamp = _record_timestamp(entry)
     message = entry.get("message")
     if isinstance(message, dict) and message.get("role") == "user":
         content = message.get("content")
@@ -7014,13 +7058,17 @@ def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotific
                 and isinstance((text := block.get("text")), str)
             )
         notifications.extend(
-            parsed for text in texts if (parsed := _task_notification_from_text(text))
+            parsed
+            for text in texts
+            if (parsed := _task_notification_from_text(text, timestamp=record_timestamp))
         )
 
     preserved = entry.get("omnigentTaskNotifications")
     if isinstance(preserved, list):
         notifications.extend(
-            parsed for raw in preserved if (parsed := _omnigent_task_notification(raw))
+            parsed
+            for raw in preserved
+            if (parsed := _omnigent_task_notification(raw, timestamp=record_timestamp))
         )
     rebuilt = _omnigent_tool_result_notification(entry)
     if rebuilt is not None:
@@ -7190,6 +7238,54 @@ def _terminal_command_items_from_content(
     return items
 
 
+def _coordinator_resume_items_from_entry(
+    entry: _JsonObject,
+    *,
+    line_number: int,
+    record_offset: int | None,
+    current_response_id: str | None,
+) -> tuple[str | None, list[ClaudeTranscriptItem]]:
+    """Surface a coordinator SendMessage resume as one ``is_meta`` user item.
+
+    The resume record (``isMeta=true``, ``origin.kind == "coordinator"``)
+    carries the coordinator's prompt as a plain string message. It is stamped
+    ``is_meta: True`` so it stays distinguishable from the original spawn
+    prompt (which parses without the flag); the sub-agent forwarder treats
+    either shape as a resume candidate and decides by record timestamp
+    order. Task-notification text is never a resume prompt.
+    """
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    fallback_response_id = _response_id_from_source(source_key)
+    texts: list[str] = []
+    if isinstance(content, str):
+        if content:
+            texts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    texts.append(text)
+    texts = [text for text in texts if not _is_task_notification_text(text)]
+    if not texts:
+        return current_response_id, []
+    item = ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, "message"),
+        item_type="message",
+        data={
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": text} for text in texts],
+        },
+        response_id=fallback_response_id,
+    )
+    return None, [item]
+
+
 def _user_transcript_items_from_entry(
     entry: _JsonObject,
     *,
@@ -7213,9 +7309,20 @@ def _user_transcript_items_from_entry(
         items.
     """
     # ``isMeta=true`` carries CLI scaffolding like
-    # ``<local-command-caveat>``; no user-visible content.
-    if entry.get("isMeta") is True:
+    # ``<local-command-caveat>``; no user-visible content. The one exception
+    # is a coordinator SendMessage resume (``origin.kind == "coordinator"``):
+    # that is a real prompt delivered to the child and must surface so the
+    # sub-agent forwarder can reopen the child's terminal state by record
+    # timestamp order.
+    if entry.get("isMeta") is True and not _is_coordinator_resume_entry(entry):
         return current_response_id, []
+    if _is_coordinator_resume_entry(entry):
+        return _coordinator_resume_items_from_entry(
+            entry,
+            line_number=line_number,
+            record_offset=record_offset,
+            current_response_id=current_response_id,
+        )
     message = entry["message"]
     content = message.get("content") if isinstance(message, dict) else None
     source_key = _transcript_source_key(entry, line_number, record_offset)

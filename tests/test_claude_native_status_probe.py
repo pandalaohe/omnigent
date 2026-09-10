@@ -327,3 +327,40 @@ def test_probe_rejects_forwarder_registration_change_during_child_correlation(
 
     assert caught.value.http_status == 409
     assert caught.value.code == "native_parent_identity_changed"
+
+
+def test_probe_reports_terminal_from_task_id_evidence_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed completion (same task id, new tool-use id) still proves terminal."""
+    _bridge_dir, transcript_path = _build_probe_fixture(
+        tmp_path, monkeypatch, with_terminal_evidence=False
+    )
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "resumed-completion",
+                    "message": {
+                        "role": "user",
+                        "content": (
+                            "<task-notification><task-id>child-native</task-id>"
+                            "<tool-use-id>toolu_sendmessage_b</tool-use-id>"
+                            "<status>completed</status>"
+                            "<result>Done</result></task-notification>"
+                        ),
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    result = probe.probe_native_subagent_status(
+        parent_session_id="parent-current", bridge_id="bridge-current"
+    )
+
+    child = result["children"][0]
+    assert child["status"] == "terminal"
+    assert child["terminal_status"] == "completed"
+    assert child["reason"] == "structured_parent_terminal_evidence"

@@ -1472,15 +1472,18 @@ def test_session_serializer_agent_terminal_round_trips_once(
         agent_name="claude-native-ui",
     )
 
-    assert result.task_notifications == (
-        claude_native_bridge.ClaudeTaskNotification(
-            task_id="task-1",
-            tool_use_id="task-1",
-            status="completed",
-            result="historical result",
-            replayed=True,
-        ),
+    (notification,) = result.task_notifications
+    assert notification == claude_native_bridge.ClaudeTaskNotification(
+        task_id="task-1",
+        tool_use_id="task-1",
+        status="completed",
+        result="historical result",
+        replayed=True,
+        timestamp=notification.timestamp,
     )
+    # Rebuilt serializer records carry a timestamp, which the notification keeps
+    # so resume prompts can be ordered against it.
+    assert notification.timestamp
 
 
 @pytest.mark.parametrize(
@@ -2865,6 +2868,135 @@ def test_read_transcript_items_since_drops_cli_builtin_slash_commands(
         "agent": "claude-native-ui",
         "content": [{"type": "output_text", "text": "Done."}],
     }
+
+
+def test_coordinator_sendmessage_resume_surfaces_as_meta_user_item(tmp_path: Path) -> None:
+    """A SendMessage resume record parses; the spawn prompt stays unflagged."""
+    from omnigent.harnesses.claude_native.bridge import (
+        read_transcript_items_from_offset,
+    )
+
+    transcript_path = tmp_path / "agent-resume1.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "isMeta": None,
+                        "isSidechain": True,
+                        "uuid": "spawn-prompt",
+                        "timestamp": "2026-09-10T13:21:51.088Z",
+                        "message": {"role": "user", "content": "Inspect the host."},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "isMeta": True,
+                        "isSidechain": True,
+                        "origin": {"kind": "coordinator"},
+                        "agentId": "a17316763c337191b",
+                        "promptId": "prompt-resume",
+                        "uuid": "sendmessage-resume",
+                        "timestamp": "2026-09-10T13:23:13.274Z",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "The coordinator sent a message while you were working:\n"
+                                "Resume where you stopped."
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "isMeta": True,
+                        "uuid": "caveat",
+                        "timestamp": "2026-09-10T13:23:14.000Z",
+                        "message": {
+                            "role": "user",
+                            "content": "<local-command-caveat>Caveat</local-command-caveat>",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        include_sidechains=True,
+    )
+
+    assert [record.timestamp for record in result.record_items] == [
+        "2026-09-10T13:21:51.088Z",
+        "2026-09-10T13:23:13.274Z",
+        "2026-09-10T13:23:14.000Z",
+    ]
+    assert [item.data.get("role") for item in result.items] == ["user", "user"]
+    assert result.items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "Inspect the host."}],
+    }
+    assert result.items[1].data["role"] == "user"
+    assert result.items[1].data["is_meta"] is True
+    assert result.items[1].data["content"] == [
+        {
+            "type": "input_text",
+            "text": (
+                "The coordinator sent a message while you were working:\nResume where you stopped."
+            ),
+        }
+    ]
+
+
+def test_task_notification_carries_record_timestamp(tmp_path: Path) -> None:
+    """Parent completion records expose their timestamp for resume ordering."""
+    from omnigent.harnesses.claude_native.bridge import (
+        read_transcript_items_from_offset,
+    )
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "notification-completed",
+                "timestamp": "2026-09-10T13:26:05.710Z",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>\n"
+                        "<task-id>resume1</task-id>\n"
+                        "<tool-use-id>toolu_b</tool-use-id>\n"
+                        "<status>completed</status>\n"
+                        "<result>done</result>\n"
+                        "</task-notification>"
+                    ),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+
+    (notification,) = result.task_notifications
+    assert notification.task_id == "resume1"
+    assert notification.timestamp == "2026-09-10T13:26:05.710Z"
 
 
 @pytest.mark.parametrize(

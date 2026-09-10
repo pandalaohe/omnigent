@@ -240,12 +240,22 @@ def probe_native_subagent_status(
             reason = "missing_tool_use_id"
         elif meta is None:
             reason = "missing_or_invalid_meta"
-        elif meta_tool_use_id != entry.tool_use_id:
-            reason = "tool_use_id_mismatch"
         else:
-            observed = terminal_evidence.get(entry.tool_use_id)
+            # A resumed sub-agent completes under the same task id with a
+            # new tool-use id, so the task id — the state key — is the
+            # stable lookup and the spawn tool-use id is the legacy
+            # fallback. A task-id hit is never blocked by a tool-use-id
+            # mismatch; the mismatch is only reported when neither key
+            # yields evidence.
+            observed = terminal_evidence.get(entry.subagent_id)
+            if observed is None and meta_tool_use_id == entry.tool_use_id:
+                observed = terminal_evidence.get(entry.tool_use_id)
             if observed is None:
-                reason = "no_structured_terminal_evidence"
+                reason = (
+                    "tool_use_id_mismatch"
+                    if meta_tool_use_id != entry.tool_use_id
+                    else "no_structured_terminal_evidence"
+                )
             else:
                 terminal_status = cast(NativeSubagentTerminalStatus, observed[0])
                 reason = "structured_parent_terminal_evidence"

@@ -546,6 +546,11 @@ class SubagentEntry:
     :param terminal_output: Result carried by the correlated Task notification.
     :param terminal_replayed: Whether the terminal notification was restored
         from Omnigent's cold-resume metadata rather than emitted live by Claude.
+    :param terminal_observed_at: Top-level ``timestamp`` of the parent record
+        whose notification set the terminal state. A newly delivered child
+        user prompt reopens the entry only when its own record timestamp is
+        strictly later, so the original spawn prompt (which predates every
+        notification) can never reopen it.
     :param recovery_watermark: Frozen complete-record EOF for a child already
         known by the Server. While set, the prefix is reconciled as history and
         cannot produce live activity.
@@ -571,6 +576,7 @@ class SubagentEntry:
     terminal_status: str | None = None
     terminal_output: str | None = None
     terminal_replayed: bool = False
+    terminal_observed_at: str | None = None
     activity_unverified: bool = False
     status_reconcile_pending: bool = False
     recovery_watermark: int | None = None
@@ -601,14 +607,16 @@ class SubagentForwardState:
         before their child registered, keyed by Claude task id (the
         ``subagent_id``). Rows written before the task-id correlation
         may still be keyed by ``tool_use_id``; the drain path accepts
-        both.
+        both. Each row is ``(status, output, replayed, observed_at)`` where
+        ``observed_at`` is the notifying record's top-level ``timestamp``
+        (``None`` for rows written before timestamps were persisted).
     """
 
     subagents: dict[str, SubagentEntry]
     parent_byte_offset: int = 0
     parent_line_cursor: int = 0
     pending_registration_watermarks: dict[str, tuple[int, int, str]] = field(default_factory=dict)
-    pending_terminal_notifications: dict[str, tuple[str, str | None, bool]] = field(
+    pending_terminal_notifications: dict[str, tuple[str, str | None, bool, str | None]] = field(
         default_factory=dict
     )
     terminal_recovery_version: int = 2
@@ -622,6 +630,7 @@ class _PendingSubagentItem:
     item: ClaudeTranscriptItem
     checkpoint_after: int | None = None
     drop_reason: str | None = None
+    record_timestamp: str | None = None
 
 
 @dataclass
@@ -1624,10 +1633,10 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
                     if isinstance(registration_id, str) and registration_id
                     else uuid.uuid4().hex,
                 )
-    pending_terminal_notifications: dict[str, tuple[str, str | None, bool]] = {}
+    pending_terminal_notifications: dict[str, tuple[str, str | None, bool, str | None]] = {}
     if isinstance(pending_raw, dict):
-        for tool_use_id, row in pending_raw.items():
-            if not isinstance(tool_use_id, str) or not isinstance(row, dict):
+        for pending_key, row in pending_raw.items():
+            if not isinstance(pending_key, str) or not isinstance(row, dict):
                 continue
             status = row.get("status")
             output = row.get("output")
@@ -1638,7 +1647,17 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
                 output = None
             if not isinstance(replayed, bool):
                 replayed = False
-            pending_terminal_notifications[tool_use_id] = (status, output, replayed)
+            # Rows written before timestamp persistence are 3-tuples without
+            # this field; they drain but never override an existing terminal.
+            observed_at = row.get("observed_at", row.get("timestamp"))
+            if observed_at is not None and not isinstance(observed_at, str):
+                observed_at = None
+            pending_terminal_notifications[pending_key] = (
+                status,
+                output,
+                replayed,
+                observed_at,
+            )
     entries: dict[str, SubagentEntry] = {}
     for subagent_id, row in subagents_raw.items():
         if not isinstance(subagent_id, str) or not isinstance(row, dict):
@@ -1654,6 +1673,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         terminal_status = row.get("terminal_status")
         terminal_output = row.get("terminal_output")
         terminal_replayed = row.get("terminal_replayed", False)
+        terminal_observed_at = row.get("terminal_observed_at")
         activity_unverified = row.get("activity_unverified", False)
         status_reconcile_pending = row.get("status_reconcile_pending", False)
         recovery_watermark = row.get("recovery_watermark")
@@ -1688,6 +1708,8 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             terminal_output = None
         if not isinstance(terminal_replayed, bool):
             terminal_replayed = False
+        if terminal_observed_at is not None and not isinstance(terminal_observed_at, str):
+            terminal_observed_at = None
         if not isinstance(activity_unverified, bool):
             activity_unverified = False
         if not isinstance(status_reconcile_pending, bool):
@@ -1721,6 +1743,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             terminal_status=terminal_status,
             terminal_output=terminal_output,
             terminal_replayed=terminal_replayed,
+            terminal_observed_at=terminal_observed_at,
             activity_unverified=activity_unverified,
             status_reconcile_pending=status_reconcile_pending,
             recovery_watermark=recovery_watermark,
@@ -1765,6 +1788,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "terminal_status": entry.terminal_status,
                 "terminal_output": entry.terminal_output,
                 "terminal_replayed": entry.terminal_replayed,
+                "terminal_observed_at": entry.terminal_observed_at,
                 "activity_unverified": entry.activity_unverified,
                 "status_reconcile_pending": entry.status_reconcile_pending,
                 "recovery_watermark": entry.recovery_watermark,
@@ -1787,8 +1811,13 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
             )
         },
         "pending_terminal_notifications": {
-            tool_use_id: {"status": status, "output": output, "replayed": replayed}
-            for tool_use_id, (status, output, replayed) in (
+            pending_key: {
+                "status": status,
+                "output": output,
+                "replayed": replayed,
+                "observed_at": observed_at,
+            }
+            for pending_key, (status, output, replayed, observed_at) in (
                 state.pending_terminal_notifications.items()
             )
         },
@@ -2149,7 +2178,10 @@ def _pending_items_from_records(
     for record in result.record_items:
         unseen = [item for item in record.items if item.source_id not in seen]
         if unseen:
-            pending.extend(_PendingSubagentItem(item=item) for item in unseen)
+            pending.extend(
+                _PendingSubagentItem(item=item, record_timestamp=record.timestamp)
+                for item in unseen
+            )
             pending[-1] = replace(pending[-1], checkpoint_after=record.next_byte_offset)
         elif pending:
             pending[-1] = replace(pending[-1], checkpoint_after=record.next_byte_offset)
@@ -2237,14 +2269,13 @@ async def _forward_one_subagent(
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability,
-    freshly_notified: frozenset[str] = frozenset(),
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches.
 
-    :param freshly_notified: Sub-agent ids whose terminal state was set from
-        a parent notification consumed in the current poll. A user prompt
-        delivered in the same poll predates that completion, so it must not
-        reopen the entry; a prompt delivered in a later poll reopens it.
+    A newly delivered user prompt whose record timestamp is strictly newer
+    than the notification that set the terminal state reopens the entry
+    (``SendMessage`` resume) inside the same batch checkpoint that advances
+    the cursor, so a checkpoint interruption can never lose the reopen.
     """
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
     if not jsonl_path.exists():
@@ -2288,7 +2319,6 @@ async def _forward_one_subagent(
     batches = await asyncio.to_thread(_partition_subagent_batches, pending)
     now = time.time()
     had_item = False
-    delivered_items: list[ClaudeTranscriptItem] = []
     for batch in batches:
         retry_key = f"subagent_batch:{entry.child_conversation_id}:{batch[0].item.source_id}"
         item_retry_keys = [
@@ -2306,6 +2336,7 @@ async def _forward_one_subagent(
         completed_items: list[_PendingSubagentItem] = []
         delivered = False
         stop_after_batch = False
+        batch_resume_ts: str | None = None
         if drop_reason is not None:
             item = batch[0].item
             _logger.error(
@@ -2414,10 +2445,10 @@ async def _forward_one_subagent(
                     retry_individually = True
                 else:
                     completed_items.extend(batch)
-                    delivered_items.extend(
-                        pending_item.item
-                        for pending_item, is_new in zip(batch, accepted, strict=True)
-                        if is_new
+                    batch_resume_ts = _resume_record_timestamp_after(
+                        batch,
+                        accepted,
+                        terminal_observed_at=new_entry.terminal_observed_at,
                     )
                     delivered = any(accepted)
                     item_retry_tracker.clear(retry_key)
@@ -2484,8 +2515,16 @@ async def _forward_one_subagent(
                     )
                 else:
                     item_retry_tracker.clear(item_retry_key)
-                    if is_new_item:
-                        delivered_items.append(item)
+                    if is_new_item and _is_user_resume_item(item):
+                        record_timestamp = pending_item.record_timestamp
+                        observed_at = new_entry.terminal_observed_at
+                        if (
+                            record_timestamp is not None
+                            and observed_at is not None
+                            and record_timestamp > observed_at
+                            and (batch_resume_ts is None or record_timestamp > batch_resume_ts)
+                        ):
+                            batch_resume_ts = record_timestamp
                     delivered = delivered or is_new_item
                 completed_items.append(pending_item)
         had_item = had_item or delivered
@@ -2498,6 +2537,15 @@ async def _forward_one_subagent(
             for pending_item in completed_items
             if pending_item.checkpoint_after is not None
         ]
+        # A SendMessage resume reopens the entry in the same checkpoint that
+        # advances past its record: the old completion no longer describes
+        # the child, so drop the terminal truth and the posted terminal
+        # status and the publish below re-posts ``running``. The next
+        # completion notification for the same task id settles it again.
+        reopen = (
+            batch_resume_ts is not None
+            and new_entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES
+        )
         new_entry = replace(
             new_entry,
             byte_offset=max(completed_offsets, default=new_entry.byte_offset),
@@ -2509,35 +2557,20 @@ async def _forward_one_subagent(
                 else new_entry.quiet_terminal_output
             ),
             activity_unverified=False if delivered else new_entry.activity_unverified,
+            terminal_status=None if reopen else new_entry.terminal_status,
+            terminal_output=None if reopen else new_entry.terminal_output,
+            terminal_replayed=False if reopen else new_entry.terminal_replayed,
+            terminal_observed_at=None if reopen else new_entry.terminal_observed_at,
+            last_status=None if reopen else new_entry.last_status,
             status_reconcile_pending=(
                 True
-                if delivered and new_entry.activity_unverified
+                if reopen or (delivered and new_entry.activity_unverified)
                 else new_entry.status_reconcile_pending
             ),
         )
         await checkpoint.put(new_entry)
         if stop_after_batch:
             break
-
-    if (
-        new_entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES
-        and new_entry.subagent_id not in freshly_notified
-        and any(_is_user_resume_item(item) for item in delivered_items)
-    ):
-        # The user sent the stopped child another message (SendMessage
-        # resume): the old completion no longer describes it. Drop the
-        # terminal truth and the posted terminal status so the publish
-        # below re-posts ``running``; the next completion notification for
-        # the same task id sets the terminal state again.
-        new_entry = replace(
-            new_entry,
-            terminal_status=None,
-            terminal_output=None,
-            terminal_replayed=False,
-            last_status=None,
-            status_reconcile_pending=True,
-        )
-        await checkpoint.put(new_entry)
 
     await _publish_subagent_status(
         client=client,
@@ -2611,24 +2644,53 @@ async def _post_external_recovery_item(
 
 
 def _is_user_resume_item(item: ClaudeTranscriptItem) -> bool:
-    """Return True only for a user-typed prompt delivered to a stopped child.
+    """Return True for a user prompt shape that may resume a stopped child.
 
-    A ``SendMessage`` resume appends a plain user-role message to the child's
-    transcript; that — and only that — reopens a terminal entry. Assistant
-    records and tool results written just before the completion notification
-    can legitimately be forwarded after it and must not reopen. ``is_meta``
-    user bubbles (CLI scaffolding, tool-use-id-less notification prose) and
-    ``function_call_output`` tool results are not resume prompts either.
+    Both the original spawn prompt and a coordinator SendMessage resume parse
+    as a user-role message with an ``input_text`` block — with or without the
+    ``is_meta`` flag — so shape alone cannot tell them apart. The caller
+    decides by record timestamp order (the resume record is newer than the
+    notification that set the terminal state; the spawn prompt is older).
+    Assistant records, tool results (``function_call_output``), and compact
+    summary/noop markers are never resume prompts.
     """
     if item.item_type != "message" or item.is_compact_summary or item.is_compact_noop:
         return False
-    if item.data.get("role") != "user" or item.data.get("is_meta") is True:
+    if item.data.get("role") != "user":
         return False
     content = item.data.get("content")
     return isinstance(content, list) and any(
-        isinstance(block, dict) and block.get("type") == "input_text"
-        for block in content
+        isinstance(block, dict) and block.get("type") == "input_text" for block in content
     )
+
+
+def _resume_record_timestamp_after(
+    batch: Sequence[_PendingSubagentItem],
+    accepted: Sequence[bool],
+    *,
+    terminal_observed_at: str | None,
+) -> str | None:
+    """Return the newest resume-candidate timestamp newer than the terminal.
+
+    Only newly delivered (``is_new``) user prompt items count, and only when
+    both their record timestamp and the terminal observation timestamp are
+    known and strictly ordered. Returns ``None`` when nothing in this batch
+    reopens the entry.
+    """
+    if terminal_observed_at is None:
+        return None
+    newest: str | None = None
+    for pending_item, is_new in zip(batch, accepted, strict=True):
+        if not is_new or not _is_user_resume_item(pending_item.item):
+            continue
+        record_timestamp = pending_item.record_timestamp
+        if (
+            record_timestamp is not None
+            and record_timestamp > terminal_observed_at
+            and (newest is None or record_timestamp > newest)
+        ):
+            newest = record_timestamp
+    return newest
 
 
 def _subagent_quiet_terminal_output(item: ClaudeTranscriptItem) -> str | None:
@@ -2659,7 +2721,7 @@ def _subagent_quiet_terminal_output(item: ClaudeTranscriptItem) -> str | None:
 
 def _structured_terminal_evidence(
     result: TranscriptReadResult,
-) -> dict[str, tuple[str, str | None]]:
+) -> dict[str, tuple[str, str | None, str | None]]:
     """Return terminal Agent/Task outcomes from one frozen transcript read.
 
     Historical prose, a quiet file, and an ordinary tool result are not
@@ -2672,14 +2734,16 @@ def _structured_terminal_evidence(
     the same ``<task-id>`` but a new ``<tool-use-id>``, so the entry key
     (``subagent_id`` == task id) is the stable lookup and the spawn
     ``tool_use_id`` is the legacy fallback. Call-output evidence stays keyed
-    by its call id (the spawn tool-use id).
+    by its call id (the spawn tool-use id). Each outcome is
+    ``(status, result, observed_at)`` where ``observed_at`` is the notifying
+    record's top-level ``timestamp`` (``None`` when the record carries none).
     """
-    evidence: dict[str, tuple[str, str | None]] = {}
+    evidence: dict[str, tuple[str, str | None, str | None]] = {}
     for notification in result.task_notifications:
         status = notification.status
         if not (isinstance(status, str) and status in _SUBAGENT_TERMINAL_STATUSES):
             continue
-        outcome = (status, notification.result)
+        outcome = (status, notification.result, notification.timestamp)
         if notification.task_id:
             evidence[notification.task_id] = outcome
         if notification.tool_use_id is not None:
@@ -2709,6 +2773,7 @@ def _structured_terminal_evidence(
         evidence[call_id] = (
             status,
             raw_output if isinstance(raw_output, str) and raw_output else None,
+            None,
         )
     return evidence
 
@@ -2781,20 +2846,40 @@ async def _prepare_legacy_subagent_terminal_recovery(
     evidence = _structured_terminal_evidence(historical)
     entries: dict[str, SubagentEntry] = {}
     for subagent_id, entry in updated.subagents.items():
-        if entry.terminal_status is not None or entry.last_status not in {"running", "waiting"}:
-            entries[subagent_id] = entry
-            continue
         terminal = evidence.get(subagent_id)
         if terminal is None and entry.tool_use_id is not None:
             terminal = evidence.get(entry.tool_use_id)
+        # Only legacy candidates are classified: a live entry that never
+        # posted (no terminal, last_status None) is settled by the live
+        # notification path below with replayed=False, not by this pass.
+        if entry.terminal_status not in _SUBAGENT_TERMINAL_STATUSES and entry.last_status not in {
+            "running",
+            "waiting",
+        }:
+            entries[subagent_id] = entry
+            continue
         if terminal is not None:
-            status, output = terminal
+            status, output, observed_at = terminal
             entries[subagent_id] = replace(
                 entry,
                 terminal_status=status,
                 terminal_output=output,
                 terminal_replayed=True,
+                terminal_observed_at=observed_at,
                 activity_unverified=False,
+                status_reconcile_pending=True,
+            )
+        elif entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES:
+            entries[subagent_id] = replace(
+                entry,
+                terminal_replayed=True,
+                activity_unverified=False,
+                status_reconcile_pending=True,
+            )
+        elif entry.last_status in {"running", "waiting"}:
+            entries[subagent_id] = replace(
+                entry,
+                activity_unverified=True,
                 status_reconcile_pending=True,
             )
         else:
@@ -2922,6 +3007,16 @@ async def _publish_subagent_status(
     elif entry.last_status in _SUBAGENT_TERMINAL_STATUSES:
         desired_status = None
     elif had_item:
+        desired_status = "running"
+    elif (
+        entry.terminal_status is None
+        and entry.last_status is None
+        and entry.status_reconcile_pending
+        and not entry.activity_unverified
+    ):
+        # A reopened entry must re-post ``running`` even when this poll
+        # delivered no new child items, so a failed ``running`` POST is
+        # retried under the existing tracker backoff instead of stalling.
         desired_status = "running"
     if desired_status is not None and (
         desired_status != entry.last_status or entry.status_reconcile_pending
@@ -3387,7 +3482,7 @@ async def _forward_available_subagents(
         )
     pending_notifications = dict(updated.pending_terminal_notifications)
     entries = dict(updated.subagents)
-    freshly_notified: set[str] = set()
+    applied_live: set[str] = set()
     for notification in () if parent_result is None else parent_result.task_notifications:
         status = notification.status
         if not (isinstance(status, str) and status in _SUBAGENT_TERMINAL_STATUSES):
@@ -3420,6 +3515,7 @@ async def _forward_available_subagents(
             status,
             notification.result,
             notification.replayed or replayed_for_child,
+            notification.timestamp,
         )
         if target_entry is not None and target_id is not None:
             entries[target_id] = replace(
@@ -3430,27 +3526,48 @@ async def _forward_available_subagents(
                 # notification from the frozen prefix with replayed=True;
                 # re-reading it live must not clear that flag.
                 terminal_replayed=target_entry.terminal_replayed or outcome[2],
+                terminal_observed_at=outcome[3],
                 activity_unverified=False,
             )
-            freshly_notified.add(target_id)
+            applied_live.add(target_id)
         else:
             park_key = notification.task_id or notification.tool_use_id
             if park_key is not None:
                 pending_notifications[park_key] = outcome
     for subagent_id, entry in entries.items():
         # New rows park under the task id; rows written before the
-        # task-id correlation park under the spawn tool-use id.
-        notification = pending_notifications.pop(subagent_id, None)
-        if notification is None and entry.tool_use_id is not None:
-            notification = pending_notifications.pop(entry.tool_use_id, None)
-        if notification is None:
+        # task-id correlation park under the spawn tool-use id. Both keys
+        # are popped every time so a stale legacy row can never fire on a
+        # later poll; when both exist the task-id row wins.
+        task_row = pending_notifications.pop(subagent_id, None)
+        legacy_row = (
+            pending_notifications.pop(entry.tool_use_id, None)
+            if entry.tool_use_id is not None and entry.tool_use_id != subagent_id
+            else None
+        )
+        notification = task_row if task_row is not None else legacy_row
+        if notification is None or subagent_id in applied_live:
             continue
-        terminal_status, terminal_output, terminal_replayed = notification
+        if len(notification) == 3:
+            terminal_status, terminal_output, terminal_replayed = notification
+            observed_at: str | None = None
+        else:
+            terminal_status, terminal_output, terminal_replayed, observed_at = notification
+        if entry.terminal_status is not None:
+            # A parked row only overrides a settled terminal when it is
+            # provably newer; a row without a timestamp never does.
+            if (
+                observed_at is None
+                or entry.terminal_observed_at is None
+                or observed_at <= entry.terminal_observed_at
+            ):
+                continue
         entries[subagent_id] = replace(
             entry,
             terminal_status=terminal_status,
             terminal_output=terminal_output,
             terminal_replayed=terminal_replayed,
+            terminal_observed_at=observed_at,
             activity_unverified=False,
         )
     updated = replace(
@@ -3498,7 +3615,6 @@ async def _forward_available_subagents(
                 item_retry_tracker=item_retry_tracker,
                 status_retry_tracker=status_retry_tracker,
                 batch_capability=batch_capability,
-                freshly_notified=frozenset(freshly_notified),
             )
 
     entries = list(updated.subagents.values())
