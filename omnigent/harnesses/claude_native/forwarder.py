@@ -597,6 +597,11 @@ class SubagentForwardState:
         in the parent transcript.
     :param parent_line_cursor: Matching legacy line cursor for diagnostics and
         cursor migration.
+    :param pending_terminal_notifications: Terminal Task notifications seen
+        before their child registered, keyed by Claude task id (the
+        ``subagent_id``). Rows written before the task-id correlation
+        may still be keyed by ``tool_use_id``; the drain path accepts
+        both.
     """
 
     subagents: dict[str, SubagentEntry]
@@ -606,7 +611,7 @@ class SubagentForwardState:
     pending_terminal_notifications: dict[str, tuple[str, str | None, bool]] = field(
         default_factory=dict
     )
-    terminal_recovery_version: int = 1
+    terminal_recovery_version: int = 2
     legacy_terminal_recovery_watermark: int | None = None
 
 
@@ -1730,7 +1735,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         pending_registration_watermarks=pending_registration_watermarks,
         pending_terminal_notifications=pending_terminal_notifications,
         terminal_recovery_version=(
-            terminal_recovery_version if entries else max(terminal_recovery_version, 1)
+            terminal_recovery_version if entries else max(terminal_recovery_version, 2)
         ),
         legacy_terminal_recovery_watermark=legacy_terminal_recovery_watermark,
     )
@@ -2232,8 +2237,15 @@ async def _forward_one_subagent(
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability,
+    freshly_notified: frozenset[str] = frozenset(),
 ) -> None:
-    """Drain one child's transcript in ordered, byte-capped batches."""
+    """Drain one child's transcript in ordered, byte-capped batches.
+
+    :param freshly_notified: Sub-agent ids whose terminal state was set from
+        a parent notification consumed in the current poll. A user prompt
+        delivered in the same poll predates that completion, so it must not
+        reopen the entry; a prompt delivered in a later poll reopens it.
+    """
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
     if not jsonl_path.exists():
         await _publish_subagent_status(
@@ -2276,6 +2288,7 @@ async def _forward_one_subagent(
     batches = await asyncio.to_thread(_partition_subagent_batches, pending)
     now = time.time()
     had_item = False
+    delivered_items: list[ClaudeTranscriptItem] = []
     for batch in batches:
         retry_key = f"subagent_batch:{entry.child_conversation_id}:{batch[0].item.source_id}"
         item_retry_keys = [
@@ -2401,6 +2414,11 @@ async def _forward_one_subagent(
                     retry_individually = True
                 else:
                     completed_items.extend(batch)
+                    delivered_items.extend(
+                        pending_item.item
+                        for pending_item, is_new in zip(batch, accepted, strict=True)
+                        if is_new
+                    )
                     delivered = any(accepted)
                     item_retry_tracker.clear(retry_key)
         if retry_individually and drop_reason is None:
@@ -2466,6 +2484,8 @@ async def _forward_one_subagent(
                     )
                 else:
                     item_retry_tracker.clear(item_retry_key)
+                    if is_new_item:
+                        delivered_items.append(item)
                     delivered = delivered or is_new_item
                 completed_items.append(pending_item)
         had_item = had_item or delivered
@@ -2498,6 +2518,26 @@ async def _forward_one_subagent(
         await checkpoint.put(new_entry)
         if stop_after_batch:
             break
+
+    if (
+        new_entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES
+        and new_entry.subagent_id not in freshly_notified
+        and any(_is_user_resume_item(item) for item in delivered_items)
+    ):
+        # The user sent the stopped child another message (SendMessage
+        # resume): the old completion no longer describes it. Drop the
+        # terminal truth and the posted terminal status so the publish
+        # below re-posts ``running``; the next completion notification for
+        # the same task id sets the terminal state again.
+        new_entry = replace(
+            new_entry,
+            terminal_status=None,
+            terminal_output=None,
+            terminal_replayed=False,
+            last_status=None,
+            status_reconcile_pending=True,
+        )
+        await checkpoint.put(new_entry)
 
     await _publish_subagent_status(
         client=client,
@@ -2570,6 +2610,27 @@ async def _post_external_recovery_item(
     return item_id
 
 
+def _is_user_resume_item(item: ClaudeTranscriptItem) -> bool:
+    """Return True only for a user-typed prompt delivered to a stopped child.
+
+    A ``SendMessage`` resume appends a plain user-role message to the child's
+    transcript; that — and only that — reopens a terminal entry. Assistant
+    records and tool results written just before the completion notification
+    can legitimately be forwarded after it and must not reopen. ``is_meta``
+    user bubbles (CLI scaffolding, tool-use-id-less notification prose) and
+    ``function_call_output`` tool results are not resume prompts either.
+    """
+    if item.item_type != "message" or item.is_compact_summary or item.is_compact_noop:
+        return False
+    if item.data.get("role") != "user" or item.data.get("is_meta") is True:
+        return False
+    content = item.data.get("content")
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "input_text"
+        for block in content
+    )
+
+
 def _subagent_quiet_terminal_output(item: ClaudeTranscriptItem) -> str | None:
     """Return final-answer text only when this item is terminal-shaped.
 
@@ -2605,19 +2666,24 @@ def _structured_terminal_evidence(
     lifecycle evidence.  The only accepted sources are bridge-parsed native
     task notifications or a correlated Agent/Task call plus output carrying an
     explicit terminal ``tool_status``.
+
+    Notifications are indexed by Claude task id as well as by tool-use id:
+    resuming a sub-agent with ``SendMessage`` emits the next completion with
+    the same ``<task-id>`` but a new ``<tool-use-id>``, so the entry key
+    (``subagent_id`` == task id) is the stable lookup and the spawn
+    ``tool_use_id`` is the legacy fallback. Call-output evidence stays keyed
+    by its call id (the spawn tool-use id).
     """
     evidence: dict[str, tuple[str, str | None]] = {}
     for notification in result.task_notifications:
         status = notification.status
-        if (
-            notification.tool_use_id is not None
-            and isinstance(status, str)
-            and status in _SUBAGENT_TERMINAL_STATUSES
-        ):
-            evidence[notification.tool_use_id] = (
-                status,
-                notification.result,
-            )
+        if not (isinstance(status, str) and status in _SUBAGENT_TERMINAL_STATUSES):
+            continue
+        outcome = (status, notification.result)
+        if notification.task_id:
+            evidence[notification.task_id] = outcome
+        if notification.tool_use_id is not None:
+            evidence[notification.tool_use_id] = outcome
 
     agent_calls = {
         call_id
@@ -2661,8 +2727,14 @@ async def _prepare_legacy_subagent_terminal_recovery(
     Host restart without duplicating the old prompt or restarting a child.
     Delivery acknowledgement remains per entry, so a failed status POST is
     retried independently of the completed scan.
+
+    Version 2 heals states the version-1 pass left stuck: the v1 lookup keyed
+    terminal evidence only by the spawn ``tool_use_id``, so a child resumed
+    via ``SendMessage`` — whose completion reuses the task id with a new
+    tool-use id — stayed ``running`` forever. The v2 pass re-freezes the
+    parent transcript and re-applies evidence keyed by task id first.
     """
-    if state.terminal_recovery_version >= 1:
+    if state.terminal_recovery_version >= 2:
         return state
     try:
         transcript_size = transcript_path.stat().st_size
@@ -2670,17 +2742,16 @@ async def _prepare_legacy_subagent_terminal_recovery(
             handle.read(1)
     except OSError:
         return state
-    watermark = state.legacy_terminal_recovery_watermark
     updated = state
-    froze_now = watermark is None or (watermark == 0 and transcript_size > 0)
-    if froze_now:
-        watermark = await asyncio.to_thread(
-            _freeze_complete_transcript_offset,
-            transcript_path,
-            agent_name=agent_name,
-            include_sidechains=False,
-        )
-    if froze_now and watermark < transcript_size:
+    # The v1 pass (if it ran) consumed its watermark; always re-freeze at the
+    # current end so a notification written after v1 is inside the scan.
+    watermark = await asyncio.to_thread(
+        _freeze_complete_transcript_offset,
+        transcript_path,
+        agent_name=agent_name,
+        include_sidechains=False,
+    )
+    if watermark < transcript_size:
         # A trailing record is incomplete. Do not burn the one-time migration
         # while Claude is still writing the terminal evidence it may contain.
         return replace(updated, legacy_terminal_recovery_watermark=None)
@@ -2710,7 +2781,12 @@ async def _prepare_legacy_subagent_terminal_recovery(
     evidence = _structured_terminal_evidence(historical)
     entries: dict[str, SubagentEntry] = {}
     for subagent_id, entry in updated.subagents.items():
-        terminal = evidence.get(entry.tool_use_id) if entry.tool_use_id is not None else None
+        if entry.terminal_status is not None or entry.last_status not in {"running", "waiting"}:
+            entries[subagent_id] = entry
+            continue
+        terminal = evidence.get(subagent_id)
+        if terminal is None and entry.tool_use_id is not None:
+            terminal = evidence.get(entry.tool_use_id)
         if terminal is not None:
             status, output = terminal
             entries[subagent_id] = replace(
@@ -2721,25 +2797,12 @@ async def _prepare_legacy_subagent_terminal_recovery(
                 activity_unverified=False,
                 status_reconcile_pending=True,
             )
-        elif entry.terminal_status in _SUBAGENT_TERMINAL_STATUSES:
-            entries[subagent_id] = replace(
-                entry,
-                terminal_replayed=True,
-                activity_unverified=False,
-                status_reconcile_pending=True,
-            )
-        elif entry.last_status in {"running", "waiting"}:
-            entries[subagent_id] = replace(
-                entry,
-                activity_unverified=True,
-                status_reconcile_pending=True,
-            )
         else:
             entries[subagent_id] = entry
     updated = replace(
         updated,
         subagents=entries,
-        terminal_recovery_version=1,
+        terminal_recovery_version=2,
         legacy_terminal_recovery_watermark=None,
     )
     await _write_subagent_forward_state_async(bridge_dir, updated)
@@ -3323,53 +3386,78 @@ async def _forward_available_subagents(
             end_offset=parent_recovery,
         )
     pending_notifications = dict(updated.pending_terminal_notifications)
+    entries = dict(updated.subagents)
+    freshly_notified: set[str] = set()
     for notification in () if parent_result is None else parent_result.task_notifications:
         status = notification.status
-        if (
-            notification.tool_use_id is not None
-            and isinstance(status, str)
-            and status in _SUBAGENT_TERMINAL_STATUSES
-        ):
-            matching_entry = next(
+        if not (isinstance(status, str) and status in _SUBAGENT_TERMINAL_STATUSES):
+            continue
+        # A resumed sub-agent keeps its task id but completes under a new
+        # tool-use id (SendMessage), so the task id — the state key — wins
+        # over tool-use-id equality. Notifications for children that have
+        # not registered yet are parked keyed by task id and drained when
+        # the child's meta file appears.
+        target_id: str | None = None
+        if notification.task_id in entries:
+            target_id = notification.task_id
+        elif notification.tool_use_id is not None:
+            target_id = next(
                 (
-                    entry
-                    for entry in updated.subagents.values()
-                    if entry.tool_use_id == notification.tool_use_id
+                    subagent_id
+                    for subagent_id, candidate in entries.items()
+                    if candidate.tool_use_id == notification.tool_use_id
                 ),
                 None,
             )
-            replayed_for_child = (
-                parent_recovery is not None
-                and matching_entry is not None
-                and matching_entry.parent_recovery_watermark is not None
-                and matching_entry.parent_recovery_watermark >= parent_recovery
-            )
-            pending_notifications[notification.tool_use_id] = (
-                status,
-                notification.result,
-                notification.replayed or replayed_for_child,
-            )
-    if pending_notifications:
-        entries = dict(updated.subagents)
-        for subagent_id, entry in entries.items():
-            if entry.tool_use_id is None:
-                continue
-            notification = pending_notifications.pop(entry.tool_use_id, None)
-            if notification is None:
-                continue
-            terminal_status, terminal_output, terminal_replayed = notification
-            entries[subagent_id] = replace(
-                entry,
-                terminal_status=terminal_status,
-                terminal_output=terminal_output,
-                terminal_replayed=terminal_replayed,
+        target_entry = entries.get(target_id) if target_id is not None else None
+        replayed_for_child = (
+            parent_recovery is not None
+            and target_entry is not None
+            and target_entry.parent_recovery_watermark is not None
+            and target_entry.parent_recovery_watermark >= parent_recovery
+        )
+        outcome = (
+            status,
+            notification.result,
+            notification.replayed or replayed_for_child,
+        )
+        if target_entry is not None and target_id is not None:
+            entries[target_id] = replace(
+                target_entry,
+                terminal_status=outcome[0],
+                terminal_output=outcome[1],
+                # The recovery pass above may have applied this same
+                # notification from the frozen prefix with replayed=True;
+                # re-reading it live must not clear that flag.
+                terminal_replayed=target_entry.terminal_replayed or outcome[2],
                 activity_unverified=False,
             )
-        updated = replace(
-            updated,
-            subagents=entries,
-            pending_terminal_notifications=pending_notifications,
+            freshly_notified.add(target_id)
+        else:
+            park_key = notification.task_id or notification.tool_use_id
+            if park_key is not None:
+                pending_notifications[park_key] = outcome
+    for subagent_id, entry in entries.items():
+        # New rows park under the task id; rows written before the
+        # task-id correlation park under the spawn tool-use id.
+        notification = pending_notifications.pop(subagent_id, None)
+        if notification is None and entry.tool_use_id is not None:
+            notification = pending_notifications.pop(entry.tool_use_id, None)
+        if notification is None:
+            continue
+        terminal_status, terminal_output, terminal_replayed = notification
+        entries[subagent_id] = replace(
+            entry,
+            terminal_status=terminal_status,
+            terminal_output=terminal_output,
+            terminal_replayed=terminal_replayed,
+            activity_unverified=False,
         )
+    updated = replace(
+        updated,
+        subagents=entries,
+        pending_terminal_notifications=pending_notifications,
+    )
     if parent_result is not None and (
         parent_result.byte_offset != updated.parent_byte_offset
         or parent_result.line_cursor != updated.parent_line_cursor
@@ -3410,6 +3498,7 @@ async def _forward_available_subagents(
                 item_retry_tracker=item_retry_tracker,
                 status_retry_tracker=status_retry_tracker,
                 batch_capability=batch_capability,
+                freshly_notified=frozenset(freshly_notified),
             )
 
     entries = list(updated.subagents.values())
