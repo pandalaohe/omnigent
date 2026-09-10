@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { terminalTextareaEdit } from "./terminalTextareaEdit";
+import { normalizeTerminalTextareaSelection, terminalTextareaEdit } from "./terminalTextareaEdit";
 
 it.each([
   ["", 0, "()", 1, false, "()\x1b[D"],
@@ -15,4 +15,16 @@ it.each([
       application,
     ),
   ).toBe(expected);
+});
+
+it("normalizes only an insertion with a stale collapsed caret", () => {
+  const before = { value: "a", selectionStart: 1, selectionEnd: 1 };
+  const after = { value: "a()", selectionStart: 1, selectionEnd: 1 };
+  expect(normalizeTerminalTextareaSelection(before, after, "()")).toEqual({
+    ...after,
+    selectionStart: 3,
+    selectionEnd: 3,
+  });
+  const selected = { ...after, selectionEnd: 3 };
+  expect(normalizeTerminalTextareaSelection(before, selected, "()")).toBe(selected);
 });

@@ -672,14 +672,17 @@ export class TerminalSession {
       { signal },
     );
 
-    this.imeInput = new TerminalImeInput(this.term);
-    this.dataDispose = this.term.onData((d) => {
+    const sendInput = (d: string) => {
       onInput?.();
       // Stamp before the readyState guard so clipboard trust still reflects
       // local input during a momentary WebSocket hiccup.
       this.lastUserInputAt = performance.now();
       if (this.ws.readyState !== WebSocket.OPEN) return;
       this.ws.send(INPUT_ENCODER.encode(d));
+    };
+    this.imeInput = new TerminalImeInput(this.term);
+    this.dataDispose = this.term.onData((d) => {
+      if (!this.imeInput.consumeData(d)) sendInput(d);
     });
 
     this.term.attachCustomKeyEventHandler((e) => {
@@ -692,6 +695,7 @@ export class TerminalSession {
       // the CSI-u sequence once, on keydown.
       if (e.type === "keydown") {
         e.preventDefault();
+        if (!this.imeInput.beforeSoftKey()) return false;
         onInput?.();
         this.lastUserInputAt = performance.now();
         if (this.ws.readyState === WebSocket.OPEN) {
