@@ -31,7 +31,7 @@ export class TerminalImeInput {
   /** Keyboard-driven input remains owned by xterm. */
   handleKeyEvent(event: KeyboardEvent): boolean {
     if (!this.enabled) return true;
-    if (this.composing || event.isComposing) return false;
+    if (this.composing || event.isComposing) return true;
     if (event.type === "keydown") this.nativeKey = true;
     else if (event.type === "keyup") this.nativeKey = false;
     return true;

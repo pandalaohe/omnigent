@@ -833,6 +833,15 @@ describe("TerminalSession", () => {
       expect(sent()).toEqual(["你", "！", "！"]);
     });
 
+    it("preserves xterm finalization when Enter precedes compositionend", async () => {
+      composition("start");
+      setText("你", 1);
+      composition("update", "你");
+      await vi.advanceTimersByTimeAsync(0);
+      key("keydown", "Enter", 13);
+      expect(sent()).toEqual(["你", "\r"]);
+    });
+
     it("honors disabled input and removes its listener on disposal", () => {
       const term = (session as unknown as { term: Terminal }).term;
       term.options.disableStdin = true;
