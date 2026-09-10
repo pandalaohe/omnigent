@@ -25,6 +25,8 @@ const mobileMenu = {
   onOpenArchive: () => undefined,
   onOpenShells: () => undefined,
   onOpenSubagents: () => undefined,
+  githubPanelOpen: false,
+  onOpenGithub: () => undefined,
   onOpenMainExecutionLog: () => undefined,
 };
 

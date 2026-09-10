@@ -1,18 +1,8 @@
-"""Browser e2e for the Archived settings view's project filter.
+"""API-backed project filtering and pagination in Settings and Archive Library.
 
-Settings → Archived (``/settings/archived``) lists archived sessions and —
-when any archived session carries a project label — offers a **Project**
-picker that narrows the list server-side (``GET /v1/sessions?project=``).
-The picker's option set comes from a dedicated archived-only scan
-(``useArchivedProjectNames``), so a project whose sessions are *all*
-archived still appears even though ``GET /v1/sessions/projects`` omits it.
-
-These drive the real chain the ``SettingsPage`` unit tests mock out: seed
-archived sessions across projects over the REST API, load the view, and
-assert the picker options, the server-filtered list, the "All projects"
-reset, and the ``Load more`` pager against the live server. All seeded
-titles and project names carry a uuid suffix so the assertions are immune
-to other tests' sessions on the shared server.
+Archived-only facets include projects absent from the active sidebar. Both
+custom entry points replace bounded pages and navigate back without losing
+the selected project. Synthetic sessions are removed after each test.
 """
 
 from __future__ import annotations
@@ -22,16 +12,14 @@ import json
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.conftest import _build_hello_world_bundle, open_right_rail
 
 # Reserved label key that stores project membership (see
 # ``sqlalchemy_store.list_projects`` and ``web/src/lib/sessionListCache.ts``).
 _PROJECT_LABEL_KEY = "omni_project"
-
-# Server page size for ``GET /v1/sessions`` (see ``fetchConversationsPage``).
-_PAGE_SIZE = 30
 
 
 def _seed_archived_session(base_url: str, *, title: str, project: str | None) -> str:
@@ -79,16 +67,11 @@ def _delete_sessions(base_url: str, session_ids: list[str]) -> None:
 def _pick_project(page: Page, option_name: str) -> None:
     """Open the Project picker and select an option.
 
-    :param option_name: A project name (matched via its
-        ``archived-project-option-<name>`` testid) or the literal
-        ``"All projects"`` reset option (matched by role, since the reset
-        item carries no per-project testid).
+    :param option_name: A project name or the literal ``"All projects"``
+        reset option, matched by its accessible name.
     """
-    page.get_by_test_id("archived-project-filter").click()
-    if option_name == "All projects":
-        option = page.get_by_role("option", name="All projects", exact=True)
-    else:
-        option = page.get_by_test_id(f"archived-project-option-{option_name}")
+    page.get_by_role("combobox", name="Filter archived sessions by project").click()
+    option = page.get_by_role("option", name=option_name, exact=True)
     expect(option).to_be_visible()
     option.click()
 
@@ -131,10 +114,10 @@ def test_archived_project_filter_narrows_and_resets(
             expect(rows.filter(has_text=title)).to_have_count(1)
 
         # Both all-archived projects are offered as options.
-        page.get_by_test_id("archived-project-filter").click()
-        expect(page.get_by_test_id(f"archived-project-option-{proj_a}")).to_be_visible()
-        expect(page.get_by_test_id(f"archived-project-option-{proj_b}")).to_be_visible()
-        page.get_by_test_id(f"archived-project-option-{proj_a}").click()
+        page.get_by_role("combobox", name="Filter archived sessions by project").click()
+        expect(page.get_by_role("option", name=proj_a, exact=True)).to_be_visible()
+        expect(page.get_by_role("option", name=proj_b, exact=True)).to_be_visible()
+        page.get_by_role("option", name=proj_a, exact=True).click()
 
         # Filtered to A: exactly A's rows; B's row is gone.
         expect(rows.filter(has_text=titles["a1"])).to_have_count(1)
@@ -156,21 +139,18 @@ def test_archived_project_filter_narrows_and_resets(
         _delete_sessions(live_server, session_ids)
 
 
-def test_archived_project_filter_load_more_pages_through(
+@pytest.mark.parametrize("mode", ["settings", "library"])
+def test_archived_project_filter_paginates(
     page: Page,
-    live_server: str,
+    seeded_session: tuple[str, str],
+    mode: str,
 ) -> None:
-    """ "Load more" pages a project-filtered archived list past the page size.
-
-    Seeds one page worth of archived sessions plus two extra in a single
-    project, filters to it (scoping the server query to just these rows, so
-    the pagination is deterministic on a shared server), and asserts the
-    first page renders with a visible ``Load more`` that fetches the rest
-    and then disappears.
-    """
+    """Settings and the Archive Library page forward and back within a project."""
+    live_server, active_session_id = seeded_session
+    page_size = 20
     uniq = uuid.uuid4().hex[:6]
     project = f"E2E Paged {uniq}"
-    total = _PAGE_SIZE + 2
+    total = page_size + 2
     session_ids: list[str] = []
     try:
         for i in range(total):
@@ -182,16 +162,30 @@ def test_archived_project_filter_load_more_pages_through(
                 )
             )
 
-        page.goto(f"{live_server}/settings/archived")
-        _pick_project(page, project)
-
-        rows = page.get_by_test_id("archived-row")
-        expect(rows).to_have_count(_PAGE_SIZE)
-        load_more = page.get_by_test_id("archived-load-more")
-        expect(load_more).to_be_visible()
-
-        load_more.click()
-        expect(rows).to_have_count(total)
-        expect(load_more).to_have_count(0)
+        if mode == "library":
+            page.goto(f"{live_server}/c/{active_session_id}")
+            open_right_rail(page)
+            page.get_by_role("tab", name="Archive Library", exact=True).click()
+            page.get_by_role("combobox", name="Filter archived sessions by project").click()
+            page.get_by_role("option", name=project, exact=True).click()
+            library = page.get_by_test_id("archive-library-rail")
+            rows = library.get_by_role("option").filter(has_text="e2e-archpage-")
+            expect(rows).to_have_count(page_size)
+            library.get_by_role("button", name="Next", exact=True).click()
+            expect(rows).to_have_count(2)
+            expect(library.get_by_role("button", name="Next", exact=True)).to_be_disabled()
+            library.get_by_role("button", name="Previous", exact=True).click()
+            expect(rows).to_have_count(page_size)
+        else:
+            page.goto(f"{live_server}/settings/archived")
+            _pick_project(page, project)
+            rows = page.get_by_test_id("archived-row")
+            expect(rows).to_have_count(page_size)
+            next_page = page.get_by_test_id("archived-page-next")
+            next_page.click()
+            expect(rows).to_have_count(2)
+            expect(next_page).to_be_disabled()
+            page.get_by_test_id("archived-page-previous").click()
+            expect(rows).to_have_count(page_size)
     finally:
         _delete_sessions(live_server, session_ids)

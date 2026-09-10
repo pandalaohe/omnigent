@@ -1513,6 +1513,7 @@ def _build_upgrade_suggestion(
     extra_overrides: tuple[str, ...] = (),
     target_version: str | None = None,
     target_vcs_url: str | None = None,
+    force_uv_tool_install: bool = False,
 ) -> _UpgradeSuggestion:
     """Build the right upgrade command for the user's install shape.
 
@@ -1533,6 +1534,8 @@ def _build_upgrade_suggestion(
         recorded at install time, so a registry install can be moved onto a
         git source (how ``--nightly`` hops onto a tag). Takes precedence
         over ``info.vcs_url``.
+    :param force_uv_tool_install: Replace owned uv tool entrypoints during
+        a managed reinstall; package-only reinstalls do not replace stale launchers.
     :returns: A :class:`_UpgradeSuggestion` whose ``command`` is the
         line printed in the nag panel and whose ``runnable`` flag
         tells the caller whether the line is an actual invocation
@@ -1542,6 +1545,7 @@ def _build_upgrade_suggestion(
     installer = info.detected_installer or info.installer
     pre = _PRERELEASE_FLAG.get(installer or "", "") if allow_prerelease else ""
     extras = sorted(set(info.extras) | set(extra_overrides))
+    uv_force = " --force" if force_uv_tool_install else ""
 
     source_url = target_vcs_url or info.vcs_url
     if source_url:
@@ -1555,7 +1559,8 @@ def _build_upgrade_suggestion(
         if installer == "uv":
             return _UpgradeSuggestion(
                 command=(
-                    f"uv tool install --reinstall{_uv_python_pin()} {vcs_url_with_extras}{pre}"
+                    f"uv tool install{uv_force} --reinstall{_uv_python_pin()} "
+                    f"{vcs_url_with_extras}{pre}"
                 ),
                 runnable=True,
             )
@@ -1599,7 +1604,9 @@ def _build_upgrade_suggestion(
             # version), not extras. Reinstall with the full PEP 508 spec
             # to preserve the extras the user originally requested.
             return _UpgradeSuggestion(
-                command=f"uv tool install --reinstall{_uv_python_pin()} {registry_spec}{pre}",
+                command=(
+                    f"uv tool install{uv_force} --reinstall{_uv_python_pin()} {registry_spec}{pre}"
+                ),
                 runnable=True,
             )
         return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}{pre}", runnable=True)

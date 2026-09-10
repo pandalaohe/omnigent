@@ -715,7 +715,7 @@ function UserBubble({
                 text is already coalesced by the composer, so each block can be
                 rendered directly without lifting uploads ahead of prose. */}
             {keyedContent.map(({ block, key }) => {
-              if (block.type === "input_text") {
+              if (isTextBlock(block)) {
                 const visible = block.text.replace(ATTACHED_RE, "").trim();
                 return visible ? (
                   <FilePathAwareMessageResponse key={key} breaks>
@@ -846,6 +846,7 @@ function AssistantBubble({
     isLastAssistant,
     hasPendingElicitation,
     showsWorking,
+    defaultExpanded: bubble.defaultExpanded,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -883,6 +884,7 @@ function AssistantBubble({
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
+            defaultExpanded={bubble.defaultExpanded}
             onRetryError={readOnly ? undefined : handleRetryError}
           />
         </MessageContent>

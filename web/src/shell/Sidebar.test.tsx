@@ -1837,6 +1837,56 @@ describe("Sidebar visibility filter (server-side mine/shared split)", () => {
 // "Sessions" list into a folder under the "Projects" group (rendered between
 // Pinned and Sessions). The project list comes from useProjects() (mocked here).
 describe("Sidebar project sections", () => {
+  it("refreshes an unfiled row when only its workspace changes", () => {
+    projectsMock.push("Alpha");
+    const session = conv("conv_unfiled", "Claude Code", { workspace: "/work/before" });
+    mockConversations([session]);
+    renderSidebar(true, "/c/conv_unfiled");
+    expect(screen.getByTestId("session-workspace-detail")).toHaveAccessibleName(
+      "Working directory: /work/before",
+    );
+    mockConversations([{ ...session, workspace: "/work/after" }]);
+    fireEvent.click(screen.getByRole("button", { name: "Use Alpha for new sessions" }));
+    expect(screen.getByTestId("session-workspace-detail")).toHaveAccessibleName(
+      "Working directory: /work/after",
+    );
+  });
+
+  it("does not write its composer scope back after another tab selects a target", () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([]);
+    renderSidebar(true, "/?project=Alpha");
+    const beta = JSON.stringify({ kind: "project", projectId: "p_Beta", projectName: "Beta" });
+    localStorage.setItem(NEW_SESSION_TARGET_STORAGE_KEY, beta);
+    fireEvent(
+      window,
+      new StorageEvent("storage", { key: NEW_SESSION_TARGET_STORAGE_KEY, newValue: beta }),
+    );
+    expect(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY)).toBe(beta);
+    expect(screen.getByRole("button", { name: "Use Alpha for new sessions" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it.each(["ctrlKey", "metaKey", "shiftKey"])(
+    "preserves the current composer on %s project-link clicks",
+    (modifier) => {
+      projectsMock.push("Alpha", "Beta");
+      mockConversations([]);
+      renderSidebar(true, "/?project=Alpha");
+      const link = screen.getAllByRole("link", { name: "New session in Beta" })[0]!;
+      fireEvent.click(link, { [modifier]: true });
+      expect(screen.getByRole("button", { name: "Use Alpha for new sessions" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      expect(
+        JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null").projectName,
+      ).toBe("Alpha");
+    },
+  );
+
   it("preserves the selected project when opening settings", () => {
     mockConversations([]);
     projectsMock.push("Alpha");

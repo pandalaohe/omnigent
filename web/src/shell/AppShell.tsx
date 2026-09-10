@@ -80,7 +80,6 @@ import {
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { useGithubInfo } from "@/hooks/useGithub";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -104,6 +103,7 @@ import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
+import { GithubPanel } from "./GithubPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
 import { isMobileViewport, Sidebar } from "./Sidebar";
@@ -396,6 +396,7 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
+  const [githubPanelOpen, setGithubPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
@@ -780,15 +781,6 @@ export function AppShell() {
     enabled: canBrowseWorkspace,
   });
   const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
-  // The GitHub tab needs a git checkout on disk: hide it once the session's
-  // GitHub info resolves to "not a git repo" — that panel is a dead end. Other
-  // unavailable reasons keep the tab: `host_outdated` renders an actionable
-  // "update your host" prompt, and `no_os_env` is already covered by the Files
-  // gate. While the info is still loading the tab stays, matching the Files
-  // gate's no-flash default. Shares ChatPage's status-line query cache, so no
-  // extra fetch.
-  const githubInfoQuery = useGithubInfo(serverConversationId);
-  const showGithubTab = showFilesPanel && githubInfoQuery.data?.reason !== "not_a_git_repo";
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -799,11 +791,9 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab: workspace gate plus the resolved GitHub info — a
-        // non-git workspace hides the tab instead of opening a dead-end
-        // panel. The panel still renders the "gh not installed" /
-        // "not signed in" / "update your host" states for a real checkout.
-        github: showGithubTab,
+        // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
+        // other unavailable reasons are shown as empty states in the panel.
+        github: showFilesPanel,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
         // older desktop build predates the `browser*` bridge — both hide the
@@ -820,7 +810,7 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel, showGithubTab],
+    [showFilesPanel],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1012,6 +1002,7 @@ export function AppShell() {
     setArchivePanelOpen(false);
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
+    setGithubPanelOpen(false);
     setFilesPanelShowHidden(true);
     // Drop shell interaction state carried from the outgoing session: a
     // still-armed create ref would otherwise auto-focus an unrelated shell in
@@ -1542,6 +1533,7 @@ export function AppShell() {
     setArchivePanelOpen(false); // close mobile archive drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setPanelInitialKey(key);
   }
 
@@ -1659,8 +1651,10 @@ export function AppShell() {
     clearFileViewerUrl();
     setPanelInitialKey(null); // close terminals panel
     setFilesPanelOpen(false); // close files drawer
+    setArchivePanelOpen(false); // close mobile archive drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setExecutionLogsKey(key);
   }
 
@@ -1671,8 +1665,10 @@ export function AppShell() {
     clearFileViewerUrl();
     setPanelInitialKey(null); // close terminals panel
     setExecutionLogsKey(null); // close execution-logs panel
+    setArchivePanelOpen(false); // close mobile archive drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setFilesDrawerFlatView(flatView);
     setFilesPanelOpen(true);
   }
@@ -1688,6 +1684,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setArchivePanelOpen(false); // close mobile archive drawer
     setSubagentsPanelOpen(true);
   }
@@ -1703,8 +1700,24 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setArchivePanelOpen(false); // close mobile archive drawer
     setShellsPanelOpen(true);
+  }
+
+  // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
+  // (matches the desktop rail's GitHub tab; the panel handles all states —
+  // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
+  function openGithubPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
+    setArchivePanelOpen(false); // close mobile archive drawer
+    setGithubPanelOpen(true);
   }
 
   function openArchivePanel() {
@@ -1715,6 +1728,7 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
+    setGithubPanelOpen(false);
     setArchivePanelOpen(true);
   }
 
@@ -2069,6 +2083,7 @@ export function AppShell() {
                       archivePanelOpen,
                       subagentsPanelOpen,
                       shellsPanelOpen,
+                      githubPanelOpen,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2086,6 +2101,7 @@ export function AppShell() {
                       onOpenArchive: openArchivePanel,
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
+                      onOpenGithub: openGithubPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -2255,6 +2271,16 @@ export function AppShell() {
                     // the "+ New shell" create row.
                     showNewShell
                   />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && showFilesPanel && (
+                <MobilePanelDrawer
+                  open={githubPanelOpen}
+                  title="GitHub"
+                  onClose={() => setGithubPanelOpen(false)}
+                  testId="github-panel-drawer"
+                >
+                  <GithubPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}

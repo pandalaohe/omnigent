@@ -1617,6 +1617,16 @@ def test_build_upgrade_suggestion_vcs_preserves_extras() -> None:
     )
 
 
+def test_build_upgrade_suggestion_can_replace_owned_uv_entrypoints() -> None:
+    """An explicit tool reinstall keeps the pinned source and extras while replacing launchers."""
+    target = "git+https://github.com/example-org/omnigent.git@" + "a" * 40
+    info = _make_info("uv", extras=("all",))
+    assert _build_upgrade_suggestion(
+        info, target_vcs_url=target, force_uv_tool_install=True
+    ).command == f"uv tool install --force --reinstall{_UV_PY} {target}#egg=omnigent[all]"
+    assert "--force" not in _build_upgrade_suggestion(info, target_vcs_url=target).command
+
+
 def test_build_upgrade_suggestion_pip_still_forms_command() -> None:
     """pip commands are still generated; ``omni upgrade`` refuses to run them."""
     assert (

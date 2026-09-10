@@ -1,7 +1,7 @@
 """add Host CLI retention policy
 
 Revision ID: fe1b2c3d4e5
-Revises: ge1b2c3d4e5f
+Revises: a09c20260909
 Create Date: 2026-09-08 00:00:00.000000
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "fe1b2c3d4e5"
-down_revision: str | None = "ge1b2c3d4e5f"
+down_revision: str | None = "a09c20260909"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

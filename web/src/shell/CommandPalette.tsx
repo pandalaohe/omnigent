@@ -9,11 +9,12 @@
 //     Capped to a few recent sessions while the query is empty (see
 //     IDLE_SESSION_LIMIT) so Actions stays visible without scrolling; typing
 //     lifts the cap.
-//   • Actions — static app commands (new chat, navigate, toggle panels).
+//   • Actions — app commands (targeted/per-project new session, navigation,
+//     panel toggles).
 //     Filtered client-side against the live query.
 //
 // cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
-// sessions, and we filter the (tiny, static) action list ourselves so both
+// sessions, and we filter the action list ourselves so both
 // groups react to the same input.
 
 import type React from "react";
@@ -29,7 +30,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
-import { useConversations } from "@/hooks/useConversations";
+import { useConversations, useProjects } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNewSessionTarget } from "@/hooks/useNewSessionTarget";
 import { cn } from "@/lib/utils";
@@ -106,7 +107,8 @@ export function CommandPalette({
   onToggleRightSidebar,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
-  const { route: newSessionTargetRoute, target: newSessionTarget } = useNewSessionTarget();
+  const { data: projects = [] } = useProjects();
+  const { route: newSessionTargetRoute, target: newSessionTarget } = useNewSessionTarget(projects);
   const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
@@ -138,6 +140,20 @@ export function CommandPalette({
         keywords: ["compose", "start", "new session"],
         run: () => navigate(newSessionTargetRoute),
       },
+      ...projects
+        .filter(
+          (project) =>
+            newSessionTarget.kind !== "project" ||
+            (project.id !== newSessionTarget.projectId &&
+              project.name !== newSessionTarget.projectName),
+        )
+        .map((project) => ({
+          id: `new-session-project:${project.id ?? project.name}`,
+          label: `New session in ${project.name}`,
+          icon: SquarePenIcon,
+          keywords: ["compose", "start", "new session", "project"],
+          run: () => navigate(`/?project=${encodeURIComponent(project.name)}`),
+        })),
       {
         id: "go-inbox",
         label: "Go to Inbox",
@@ -174,7 +190,14 @@ export function CommandPalette({
         run: onToggleRightSidebar,
       },
     ],
-    [navigate, newSessionTarget, newSessionTargetRoute, onToggleLeftSidebar, onToggleRightSidebar],
+    [
+      navigate,
+      newSessionTarget,
+      newSessionTargetRoute,
+      onToggleLeftSidebar,
+      onToggleRightSidebar,
+      projects,
+    ],
   );
 
   const filteredActions = useMemo(() => {

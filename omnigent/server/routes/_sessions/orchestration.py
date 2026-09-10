@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import re
@@ -58,6 +59,12 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    classify_launch_refusal as _classify_launch_refusal,
+)
+from omnigent.host.frames import (
+    workspace_missing_message as _workspace_missing_message,
+)
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
@@ -72,6 +79,11 @@ from omnigent.policies.types import (
 from omnigent.provider_usage_limits import (
     parse_provider_usage_limits_snapshot_json,
     validate_provider_usage_limits_snapshot,
+)
+from omnigent.runner.mcp_execution_registry import (
+    MCP_OPERATION_ID_PARAM,
+    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
@@ -116,6 +128,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_session_titles_enabled,
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
@@ -298,6 +311,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_declared_subagent,
     _require_external_status_forward,
     _resolve_harness,
+    _resolve_harness_async,
     _resolve_llm_model,
     _resolve_subagent_spec,
     _resource_event_item_from_sse,
@@ -346,7 +360,6 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
     SkillSummary,
 )
-from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -358,6 +371,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    NativeRecoveryItemSkipped,
     NativeReplayConflictError,
     pinned_label_key,
 )
@@ -375,6 +389,28 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+
+
+def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
+    """
+    Digest one elicitation's request params for tombstone matching.
+
+    Harness elicitation ids can recur for DIFFERENT questions (e.g. the
+    codex id derives from a JSON-RPC request id that a later request may
+    reuse), so a verdict tombstone written against a possibly-zombie
+    waiter carries this digest and a re-park adopts it only for the same
+    logical question.
+
+    :param params: The elicitation's request params.
+    :returns: A sha256 hex digest of the canonicalized params, e.g.
+        ``"9f86d081..."``.
+    """
+    canonical = json.dumps(
+        params.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 async def _publish_and_wait_for_harness_elicitation(
@@ -442,11 +478,13 @@ async def _publish_and_wait_for_harness_elicitation(
     # ``serverRequest/resolved`` notification. Raced below so the wait
     # ends promptly without relying on the web verdict or on disconnect
     # detection (unreliable behind the Databricks Apps proxy).
+    request_fingerprint = _harness_elicitation_request_fingerprint(params)
     parked = _ParkedHarnessElicitation(
         session_id=session_id,
         tool_name=tool_name,
         tool_input=tool_input,
         resolved_elsewhere=asyncio.Event(),
+        request_fingerprint=request_fingerprint,
     )
     _harness_elicitation_registry[elicitation_id] = future
     _harness_elicitation_owners[elicitation_id] = session_id
@@ -459,7 +497,9 @@ async def _publish_and_wait_for_harness_elicitation(
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
     try:
-        tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
+        tombstone = _consume_pre_resolved_harness_elicitation(
+            session_id, elicitation_id, request_fingerprint
+        )
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
             return tombstone.result
@@ -2244,15 +2284,40 @@ async def _resolve_elicitation(
         if _harness_elicitation_owners.get(elicitation_id) == session_id:
             result_payload = {k: v for k, v in data.items() if k != "elicitation_id"}
             try:
-                harness_future.set_result(
-                    ElicitationResult.model_validate(result_payload),
-                )
+                verdict_result = ElicitationResult.model_validate(result_payload)
             except ValidationError:
                 _logger.warning(
                     "Invalid approval payload for %r",
                     elicitation_id,
                     exc_info=True,
                 )
+            else:
+                harness_future.set_result(verdict_result)
+                # The waiter may be a zombie: a proxy can sever the
+                # long-poll client-side while holding the backend
+                # connection open, so the verdict set above is written to
+                # a connection nobody reads and disconnect detection never
+                # fires. Tombstone the verdict too, so a re-park of the
+                # same stable id adopts it instead of re-asking; a verdict
+                # that WAS delivered leaves a tombstone that ages out
+                # unconsumed (session-checked, TTL-pruned). The parked
+                # waiter's request fingerprint rides along so a LATER,
+                # different question reusing the id can't inherit it.
+                _parked_for_fingerprint = _harness_parked_elicitations.get(elicitation_id)
+                _prune_pre_resolved_harness_elicitations()
+                _harness_pre_resolved_elicitations[elicitation_id] = (
+                    _PreResolvedHarnessElicitation(
+                        session_id=session_id,
+                        created_at=time.time(),
+                        result=verdict_result,
+                        request_fingerprint=(
+                            _parked_for_fingerprint.request_fingerprint
+                            if _parked_for_fingerprint is not None
+                            else None
+                        ),
+                    )
+                )
+                _prune_pre_resolved_harness_elicitations()
     elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
@@ -2263,11 +2328,25 @@ async def _resolve_elicitation(
         except ValidationError:
             pre_resolved = None
         if pre_resolved is not None:
+            # The pending index still holds the answered prompt (the
+            # resolved fan-out below drains it), so fingerprint the
+            # tombstone with the question's params: a later, different
+            # question that reuses this id must not inherit the verdict.
+            gap_fingerprint: str | None = None
+            pending_entry = pending_elicitations.lookup(elicitation_id)
+            if pending_entry is not None and pending_entry[0] == session_id:
+                try:
+                    gap_fingerprint = _harness_elicitation_request_fingerprint(
+                        ElicitationRequestParams.model_validate(pending_entry[1].get("params"))
+                    )
+                except ValidationError:
+                    gap_fingerprint = None
             _prune_pre_resolved_harness_elicitations()
             _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
                 session_id=session_id,
                 created_at=time.time(),
                 result=pre_resolved,
+                request_fingerprint=gap_fingerprint,
             )
             _prune_pre_resolved_harness_elicitations()
     # Wake a currently-parked long-poll via resolved_elsewhere, not only its
@@ -2624,9 +2703,8 @@ async def _persist_external_conversation_item(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-    permission_store: PermissionStore | None = None,
-    user_id: str | None = None,
-) -> tuple[str, bool]:
+    enabled: bool = True,
+) -> tuple[str | None, bool]:
     """Serialize mirrored input consumption with replay detection for a session."""
     lock = _external_item_locks.get(session_id)
     if lock is None:
@@ -2640,8 +2718,7 @@ async def _persist_external_conversation_item(
             conversation_store,
             created_by,
             background_title_coordinator,
-            permission_store,
-            user_id,
+            enabled=enabled,
         )
 
 
@@ -2652,9 +2729,8 @@ async def _persist_external_conversation_item_locked(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-    permission_store: PermissionStore | None = None,
-    user_id: str | None = None,
-) -> tuple[str, bool]:
+    enabled: bool = True,
+) -> tuple[str | None, bool]:
     """
     Persist and broadcast a conversation item produced outside AP.
 
@@ -2673,7 +2749,8 @@ async def _persist_external_conversation_item_locked(
         directly in the native terminal (no pending-input entry exists
         for those). ``None`` in single-user / unauthenticated mode —
         no label is stamped in that case.
-    :returns: Store-assigned item id and whether this was a replay.
+    :returns: Store-assigned item id and whether this was a replay. An omitted
+        legacy reasoning item returns ``(None, True)`` without changing history.
     """
     item = _parse_external_conversation_item(body)
     if "recovery_after" in body.data:
@@ -2692,6 +2769,8 @@ async def _persist_external_conversation_item_locked(
             persisted = (
                 await asyncio.to_thread(conversation_store.append, session_id, [historical])
             )[0]
+        except NativeRecoveryItemSkipped:
+            return None, True
         except NativeReplayConflictError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         # Hydration is not new input or work: no pending-input consumption,
@@ -2758,7 +2837,7 @@ async def _persist_external_conversation_item_locked(
         coordinator=background_title_coordinator,
         conversation=conv,
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
-        enabled=await background_session_titles_enabled_for_user(permission_store, user_id),
+        enabled=enabled and (drained is None or drained.background_titles_enabled),
     )
     try:
         persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
@@ -2782,7 +2861,7 @@ async def _persist_external_conversation_item_locked(
             _publish_external_conversation_item(session_id, persisted_error)
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
-        pending_background_title.schedule()
+        pending_background_title.schedule(expected_seed_title=conv.title)
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -3878,34 +3957,42 @@ async def ensure_runner_connected(
             # Record the refusal message in runner_exit_reports so the
             # runner_failed_to_start error surfaces the actionable cause
             # rather than the generic "may have failed to start" fallback.
-            _fatal_refusal = launch_attempt.error_code in (
-                _HARNESS_NOT_CONFIGURED_ERROR_CODE,
-                _WORKSPACE_MISSING_ERROR_CODE,
+            _refusal_code = _classify_launch_refusal(
+                launch_attempt.error_code,
+                launch_attempt.error,
+                conv.workspace,
             )
-            if _fatal_refusal and raise_host_refusal:
-                error_code = (
-                    ErrorCode.HARNESS_NOT_CONFIGURED
-                    if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
-                    else ErrorCode.WORKSPACE_MISSING
-                )
+            if _refusal_code == _WORKSPACE_MISSING_ERROR_CODE:
+                # Rebuild from the authorized session row: the host's own
+                # text is untrusted and may carry log tails or secrets.
+                # Harness refusals keep the host's text by design: it is a
+                # deterministic setup hint, not runner output.
+                _refusal_message = _workspace_missing_message(conv.workspace)
+            else:
+                _refusal_message = launch_attempt.error or ""
+            if _refusal_code is not None and raise_host_refusal:
                 raise OmnigentError(
-                    launch_attempt.error
+                    _refusal_message
                     or (
                         "The session harness is not configured on this host."
-                        if error_code == ErrorCode.HARNESS_NOT_CONFIGURED
+                        if _refusal_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
                         else "The session workspace no longer exists on the host."
                     ),
-                    code=error_code,
+                    code=(
+                        ErrorCode.HARNESS_NOT_CONFIGURED
+                        if _refusal_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
+                        else ErrorCode.WORKSPACE_MISSING
+                    ),
                 )
-            if _fatal_refusal and launch_attempt.error is not None:
+            if _refusal_code is not None and _refusal_message:
                 _rer = getattr(app_state, "runner_exit_reports", None)
                 if _rer is not None:
                     _rer.record(
                         launch_attempt.runner_id,
-                        launch_attempt.error,
-                        owner=None,
+                        _refusal_message,
+                        owner=host_conn.owner,
                     )
-            if not _fatal_refusal:
+            if _refusal_code is None:
                 relaunched_runner_id = launch_attempt.runner_id
         elif await _maybe_relaunch_managed_sandbox(
             session_id=session_id,
@@ -4488,7 +4575,7 @@ async def _ensure_native_terminal_ready(
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
     """
-    display_name, _, harness = _native_terminal_runtime(conv)
+    display_name, _, harness = await asyncio.to_thread(_native_terminal_runtime, conv)
     terminal_name = _native_terminal_name_for_harness(harness)
     try:
         resp = await runner_client.post(
@@ -4628,54 +4715,53 @@ async def _persist_host_launch_failure_turn(
     runner_router: RunnerRouter | None,
     *,
     created_by: str | None,
+    host_error_code: str,
 ) -> str:
     """
     Persist a consumed user message and a host-launch failure error.
 
     Used when a message arrives for a host-bound session whose runner is
-    dead and the host *refuses* to relaunch because the agent's harness
-    isn't configured there (the daemon's structured
-    ``harness_not_configured`` reply). The message is the real
-    runner-start attempt, so — exactly like a native terminal that can't
-    boot (:func:`_persist_native_terminal_failure`) — the server records
-    the user's message (so the input is consumed, not silently dropped)
-    and a sibling ``type="error"`` item carrying the host's message
-    (which names the fix, ``omnigent setup``), then publishes the same
-    live error/status events the web renders as an error banner. The host
-    binding is left intact so a later message relaunches once the user has
-    run setup.
+    dead and the host deterministically refuses the relaunch. The message
+    is the real runner-start attempt, so — exactly like a native terminal
+    that can't boot (:func:`_persist_native_terminal_failure`) — the server
+    records the user's message (so the input is consumed, not silently
+    dropped) and a sibling ``type="error"`` item carrying the host's
+    reason, then publishes the same live error/status events the web
+    renders as an error banner. The host binding is left intact so a
+    later message can relaunch after remediation.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conv: Conversation row for the session.
     :param body: Original user message event.
     :param conversation_store: Store used for the durable append.
-    :param host_error: The host's human-readable refusal, e.g.
-        ``"harness 'codex' is not configured on host 'laptop' — run
-        `omnigent setup` ..."``. ``None`` falls back to a generic
-        ``omnigent setup`` pointer so the banner is never empty.
+    :param host_error: The refusal text to surface. Workspace refusals must
+        pass the server-rebuilt message (see
+        :func:`~omnigent.host.frames.workspace_missing_message`); harness
+        refusals pass the host's own text, which is a deterministic setup
+        hint rather than runner output.
     :param runner_router: Router used to resolve a sub-agent's runner for
         the parent-wake forward, or ``None`` in in-process / test setups.
     :param created_by: Authenticated posting actor, e.g.
         ``"alice@example.com"``; ``None`` in single-user mode.
+    :param host_error_code: Allowlisted structured host failure category.
     :returns: Store-assigned id of the consumed user message item.
     """
+    if host_error_code not in {
+        _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+        _WORKSPACE_MISSING_ERROR_CODE,
+    }:
+        raise ValueError(f"unsafe host launch error code: {host_error_code!r}")
+    fallback_message = (
+        "the agent's harness is not configured on the selected host — "
+        f"run `{cli_invocation()} setup`"
+        if host_error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
+        else "The session workspace no longer exists on the selected host."
+    )
     error = ErrorData(
         source="execution",
-        # Stable classifier mirroring the host's wire error code, so the
-        # web can special-case the banner if it ever wants to.
-        code="harness_not_configured",
-        message=(
-            host_error
-            if host_error
-            # Defensive fallback: the daemon always sends a message with
-            # the code, but the banner must stay actionable if a
-            # third-party host omits it.
-            else (
-                f"the agent's harness is not configured on the selected host — "
-                f"run `{cli_invocation()} setup`"
-            )
-        ),
+        code=host_error_code,
+        message=host_error if host_error else fallback_message,
     )
     turn_id = generate_task_id()
     user_item = _build_new_item(body, turn_id, created_by=created_by)
@@ -4696,7 +4782,7 @@ async def _persist_host_launch_failure_turn(
         _publish_error_event(session_id, error)
     _publish_terminal_pending(session_id, False)
     _publish_status(session_id, "failed", ErrorDetail(code=error.code, message=error.message))
-    # A host-launched sub-agent that can't configure must wake its parent,
+    # A host-launched sub-agent that cannot start must wake its parent,
     # the same way a boot failure does — no-ops for top-level sessions.
     await _forward_native_subagent_terminal_failure(session_id, conv, error, runner_router)
     return consumed.id
@@ -4839,8 +4925,13 @@ async def _forward_native_terminal_message(
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
-    display_name, _, harness = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
+    display_name, _, harness = await asyncio.to_thread(_native_terminal_runtime, conv)
+    event = await asyncio.to_thread(
+        _build_native_terminal_message_event,
+        conv,
+        body,
+        model_override=model_override,
+    )
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
         display_name,
@@ -5194,7 +5285,7 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
-def _native_pane_harness(conv: Conversation) -> str | None:
+async def _native_pane_harness(conv: Conversation) -> str | None:
     """The native harness a pane actually runs, past the ``"auto"`` sentinel.
 
     A forced-auto child keeps ``harness_override="auto"`` until its first
@@ -5207,10 +5298,10 @@ def _native_pane_harness(conv: Conversation) -> str | None:
     :returns: The canonical native harness, e.g. ``"claude-native"``, or
         ``None`` when it cannot be resolved.
     """
-    harness = _resolve_harness(conv)
+    harness = await _resolve_harness_async(conv)
     if harness is not None and harness != "auto":
         return harness
-    native = _native_coding_agent_for_session(conv)
+    native = await asyncio.to_thread(_native_coding_agent_for_session, conv)
     return native.harness if native is not None else harness
 
 
@@ -5705,7 +5796,7 @@ async def _forward_event_to_runner(
                 # brain's claude family and a claude worker the codex family;
                 # under an auto parent it dropped the restriction entirely, so
                 # a pi child could be handed a codex verdict it then ran pi on.
-                _child_harness = _resolve_harness(conv)
+                _child_harness = await _resolve_harness_async(conv)
                 _child_pinned = _child_harness is not None and _child_harness != "auto"
                 _child_family = harness_family(_child_harness) if _child_pinned else None
                 # A single-harness candidate set is the honest offer for a
@@ -5777,7 +5868,7 @@ async def _forward_event_to_runner(
                 # Top-level sessions: model-only routing (harness already fixed by spec).
                 from omnigent.server.smart_routing import route_turn_or_decline
 
-                _harness = _resolve_harness(conv)
+                _harness = await _resolve_harness_async(conv)
                 # A turn cannot change harness, so only this session's own
                 # family has to be gateway-backed for the workspace router.
                 _turn_backed = _gateway_backed(
@@ -5956,13 +6047,14 @@ async def _forward_event_to_runner(
                 and _bare_model_id(_attempted_override) != _bare_model_id(_routed_model)
                 else None
             )
+            _decision_harness = _routed_harness or await _resolve_harness_async(conv)
             _decision_id = await _emit_server_routing_decision(
                 session_id,
                 conversation_store,
                 _routed_model,
                 _verdict,
                 scope=_decision_scope,
-                harness=_routed_harness or _resolve_harness(conv),
+                harness=_decision_harness,
                 attempted_override=_overridden,
             )
             if not _route_failed:
@@ -5983,7 +6075,7 @@ async def _forward_event_to_runner(
                     _verdict,
                     agent=agent_name or "",
                     scope=_decision_scope,
-                    harness=_routed_harness or _resolve_harness(conv),
+                    harness=_decision_harness,
                     decision_id=_decision_id,
                     attempted_override=_overridden,
                 )
@@ -6163,6 +6255,7 @@ async def _dispatch_session_event_to_runner_impl(
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
+    background_titles_enabled: bool = True,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -6239,11 +6332,11 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
-    if body.type == "message" and _is_native_terminal_session(conv):
+    if body.type == "message" and await asyncio.to_thread(_is_native_terminal_session, conv):
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
-        _build_native_terminal_message_event(conv, body)
+        await asyncio.to_thread(_build_native_terminal_message_event, conv, body)
         ensure_outcome = (
             _NativeTerminalEnsureOutcome(error=None)
             if native_terminal_ready
@@ -6285,7 +6378,11 @@ async def _dispatch_session_event_to_runner_impl(
         )
         pending_id: str | None = (
             pending_inputs.record(
-                session_id, content, created_by=created_by, stable_id=web_stable_id
+                session_id,
+                content,
+                created_by=created_by,
+                stable_id=web_stable_id,
+                background_titles_enabled=background_titles_enabled,
             )
             if isinstance(content, list) and content
             else None
@@ -6327,15 +6424,18 @@ async def _dispatch_session_event_to_runner_impl(
         ):
             from omnigent.server.smart_routing import route_turn_or_decline
 
-            _harness = _native_pane_harness(conv)
+            _harness = await _native_pane_harness(conv)
             _user_text = _extract_user_text_for_routing(body)
             # Cross-family spawns belong to auto-harness sessions: a pinned
             # session's children stay in its family (the rule the in-harness
             # spawn gate applies via ``candidate_models(cross_harness=False)``).
             # This pane already runs another family's CLI, so the parent's
             # family has no candidate for it and nothing is routed.
-            _native_out_of_family = _out_of_family_spawn_notice(
-                conv, _native_parent_conv, _harness
+            _native_out_of_family = await asyncio.to_thread(
+                _out_of_family_spawn_notice,
+                conv,
+                _native_parent_conv,
+                _harness,
             )
             if _user_text and _native_out_of_family is not None:
                 _native_routed_model, _native_verdict = _unavailable_routing_card(
@@ -6431,13 +6531,14 @@ async def _dispatch_session_event_to_runner_impl(
         if _native_routed_model is not None and _native_verdict is not None:
             if _native_applied_model is None and not _native_route_failed:
                 _native_verdict = _unapplied_routed_verdict(_native_routed_model, _native_verdict)
+            _native_decision_harness = await _resolve_harness_async(conv)
             _native_decision_id = await _emit_server_routing_decision(
                 session_id,
                 conversation_store,
                 _native_routed_model,
                 _native_verdict,
                 scope=_native_scope,
-                harness=_resolve_harness(conv),
+                harness=_native_decision_harness,
             )
             if not _native_route_failed:
                 # The label is the route-once gate, so a failed call must not
@@ -6454,7 +6555,7 @@ async def _dispatch_session_event_to_runner_impl(
                     _native_verdict,
                     agent=agent_name or "",
                     scope=_native_scope,
-                    harness=_resolve_harness(conv),
+                    harness=_native_decision_harness,
                     decision_id=_native_decision_id,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
@@ -7150,7 +7251,8 @@ async def _relay_runner_stream_once(
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
                         # subtree roll-up below sees the new totals.
-                        _accumulate_session_usage(
+                        await asyncio.to_thread(
+                            _accumulate_session_usage,
                             event.get("response", {}),
                             session_id,
                             conversation_store,
@@ -8922,8 +9024,9 @@ async def _create_session_from_existing_agent(
         # rather than created and declined afterwards. Auto parents are
         # unaffected (the router owns their family) and so is a parent that
         # routes no spawns — neither resolves the child's harness at all.
-        if _pinned_spawn_family(_parent_for_routing) is not None:
-            _reject_out_of_family_child(
+        if await asyncio.to_thread(_pinned_spawn_family, _parent_for_routing) is not None:
+            await asyncio.to_thread(
+                _reject_out_of_family_child,
                 _parent_for_routing,
                 await asyncio.to_thread(
                     _create_resolved_harness, agent, body.harness_override, agent_cache
@@ -9071,7 +9174,8 @@ async def _create_session_from_existing_agent(
     # opt-ins only, never the headless worker default bypass.
     sub_spec: AgentSpec | None = None
     if body.sub_agent_name:
-        sub_spec = _resolve_subagent_spec(
+        sub_spec = await asyncio.to_thread(
+            _resolve_subagent_spec,
             agent=agent,
             sub_agent_name=body.sub_agent_name,
             agent_cache=agent_cache,
@@ -9262,7 +9366,8 @@ async def _create_session_from_existing_agent(
         body.sub_agent_name is None
         and body.host_id is not None
         and (
-            _repl_labels := _repl_terminal_ui_labels(
+            _repl_labels := await asyncio.to_thread(
+                _repl_terminal_ui_labels,
                 agent=agent,
                 agent_cache=agent_cache,
                 harness_override=harness_override,
@@ -9383,7 +9488,8 @@ async def _create_session_from_existing_agent(
             elif conv.harness_override:
                 _tel_harness = conv.harness_override
             elif agent_cache is not None:
-                _tel_loaded = agent_cache.load(
+                _tel_loaded = await asyncio.to_thread(
+                    agent_cache.load,
                     agent.id,
                     agent.bundle_location,
                     expand_env=agent.session_id is None,
@@ -9445,9 +9551,7 @@ async def _create_session_from_existing_agent(
                     coordinator=background_title_coordinator,
                     conversation=conv,
                     event=item,
-                    enabled=await background_session_titles_enabled_for_user(
-                        permission_store, user_id
-                    ),
+                    enabled=background_session_titles_enabled(request.headers),
                 )
                 await _dispatch_session_event_to_runner(
                     conv.id,
@@ -9461,9 +9565,10 @@ async def _create_session_from_existing_agent(
                     created_by=_attribution_user(user_id),
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
+                    background_titles_enabled=background_session_titles_enabled(request.headers),
                 )
                 if pending_background_title is not None:
-                    pending_background_title.schedule()
+                    pending_background_title.schedule(expected_seed_title=conv.title)
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was
     # built, so a fresh read is what keeps the create response current.
@@ -9691,7 +9796,23 @@ async def _handle_mcp_tools_call(
     arguments: dict[str, Any] = params.get("arguments") or {}
     request_state_str: str | None = params.get("requestState")
     input_responses: dict[str, Any] = params.get("inputResponses") or {}
+    operation_id_value = params.get(MCP_OPERATION_ID_PARAM)
+    if operation_id_value is not None and not (
+        isinstance(operation_id_value, str) and 1 <= len(operation_id_value) <= 128
+    ):
+        return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
+    operation_id = cast("str | None", operation_id_value)
     is_retry = request_state_str is not None
+
+    def _runner_execute_body(
+        execute_params: dict[str, Any],
+        *,
+        step: str,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        if operation_id is not None:
+            body["_omnigent_operation"] = {"id": operation_id, "step": step}
+        return body
 
     _logger.debug(
         "MCP tools/call: session=%r tool=%r is_retry=%r",
@@ -9922,16 +10043,25 @@ async def _handle_mcp_tools_call(
 
         exec_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",
-            json={
-                "method": "tools/call",
-                "params": {"name": namespaced_name, "arguments": arguments},
-            },
+            json=_runner_execute_body(
+                {"name": namespaced_name, "arguments": arguments},
+                step="initial",
+            ),
             # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
             timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
         )
         exec_resp.raise_for_status()
         exec_data = exec_resp.json()
+    except ConnectionError as exc:
+        _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
+        if operation_id is not None:
+            return _mcp_error_response(
+                rpc_id,
+                RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+            )
+        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
     except Exception as exc:  # noqa: BLE001
         _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
         return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
@@ -9987,19 +10117,28 @@ async def _handle_mcp_tools_call(
         try:
             retry_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
-                json={
-                    "method": "tools/call",
-                    "params": {
+                json=_runner_execute_body(
+                    {
                         "name": namespaced_name,
                         "arguments": arguments,
                         "inputResponses": elicitation_responses,
                         "requestState": mcp_request_state,
                     },
-                },
+                    step="elicitation-response",
+                ),
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
             )
             retry_resp.raise_for_status()
             exec_data = retry_resp.json()
+        except ConnectionError as exc:
+            _logger.warning("Runner MCP retry detached: %s", exc, exc_info=True)
+            if operation_id is not None:
+                return _mcp_error_response(
+                    rpc_id,
+                    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+                )
+            return _mcp_error_response(rpc_id, -32000, "Runner MCP retry failed.")
         except Exception as exc:  # noqa: BLE001
             _logger.warning("Runner MCP retry failed: %s", exc, exc_info=True)
             return _mcp_error_response(rpc_id, -32000, "Runner MCP retry failed.")
@@ -10493,7 +10632,13 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
-    return _build_session_response(
+    pending_elicitation_events = await asyncio.to_thread(
+        _pending_elicitation_snapshot_for_session,
+        conv_store,
+        conv,
+    )
+    return await asyncio.to_thread(
+        _build_session_response,
         conv,
         items,
         status,
@@ -10510,11 +10655,7 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        pending_elicitation_events=await asyncio.to_thread(
-            _pending_elicitation_snapshot_for_session,
-            conv_store,
-            conv,
-        ),
+        pending_elicitation_events=pending_elicitation_events,
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
         agent_store=agent_store,

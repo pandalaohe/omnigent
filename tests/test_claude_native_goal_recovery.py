@@ -7,8 +7,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from omnigent import claude_native_bridge as bridge
-from omnigent import claude_native_forwarder as forwarder
+from omnigent.harnesses.claude_native import bridge, forwarder
 
 
 def _append(path: Path, record: dict[str, object], *, complete: bool = True) -> None:
@@ -290,7 +289,7 @@ async def test_goal_recovery_scans_once_until_file_generation_changes(tmp_path: 
     dedupe = forwarder._ForwardDedupeState()
 
     with patch(
-        "omnigent.claude_native_forwarder.read_latest_transcript_goal_state",
+        "omnigent.harnesses.claude_native.forwarder.read_latest_transcript_goal_state",
         wraps=bridge.read_latest_transcript_goal_state,
     ) as scan:
         await forwarder._recover_goal_state_from_transcript(

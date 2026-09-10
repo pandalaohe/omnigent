@@ -103,13 +103,14 @@ export function parentOf(absolutePath: string): string | null {
 /**
  * Normalize a path the user typed into the path input.
  *
- * Trims whitespace, expands a leading ``~`` against the resolved
+ * Strips leading whitespace, expands a leading ``~`` against the resolved
  * home directory, collapses runs of slashes, and drops a trailing
  * slash (except on the root ``"/"``). Returns ``null`` for empty
  * or invalid inputs (which the caller treats as "ignore — keep
  * the current path"). The picker never turns a typed path into
  * the empty string; "go home" is its own gesture (clicking the
- * Home breadcrumb).
+ * Home breadcrumb). Legal trailing whitespace is preserved on POSIX
+ * paths; Windows keeps its existing portable cleanup.
  *
  * Tilde-only (``"~"``) and ``"~/foo"`` are expanded to
  * ``home`` and ``home + "/foo"`` respectively. If ``home`` is
@@ -118,35 +119,35 @@ export function parentOf(absolutePath: string): string | null {
  * place. Bare ``~user`` form is not supported.
  *
  * @param input Whatever the user typed, e.g.
- *   ``"  /Users//corey/  "`` or ``"~/projects"``.
+ *   ``"  /Users//corey/"`` or ``"~/projects"``.
  * @param home Resolved absolute path of the host's home dir, or
  *   ``null`` if not yet known.
  * @returns Cleaned absolute path (e.g. ``"/Users/corey"``) or
  *   ``null`` when the input isn't usable.
  */
 export function normalizeTypedPath(input: string, home: string | null = null): string | null {
-  const trimmed = input.trim();
-  if (trimmed === "") {
+  const leftTrimmed = input.trimStart();
+  if (leftTrimmed === "") {
     return null;
   }
   let absolute: string;
-  if (trimmed === "~") {
+  if (leftTrimmed === "~") {
     // Bare tilde — go home if we know where that is.
     if (home === null) return null;
     absolute = home;
-  } else if (trimmed.startsWith("~/")) {
+  } else if (leftTrimmed.startsWith("~/")) {
     // ~/foo → <home>/foo. Reject when home isn't resolved yet.
     if (home === null) return null;
-    absolute = `${home}/${trimmed.slice(2)}`;
-  } else if (trimmed.startsWith("/") || isWindowsPath(trimmed)) {
-    absolute = trimmed;
+    absolute = `${home}/${leftTrimmed.slice(2)}`;
+  } else if (leftTrimmed.startsWith("/") || isWindowsPath(leftTrimmed)) {
+    absolute = leftTrimmed;
   } else {
     // Relative paths and ~user forms are not supported — the host
     // endpoint requires absolute paths.
     return null;
   }
   if (isWindowsPath(absolute)) {
-    const canonical = absolute.replace(/\//g, "\\");
+    const canonical = absolute.trimEnd().replace(/\//g, "\\");
     if (canonical.startsWith("\\\\")) {
       const tail = canonical.slice(2).replace(/\\+/g, "\\").replace(/\\$/, "");
       return `\\\\${tail}`;
@@ -196,8 +197,8 @@ export function basename(absolutePath: string): string {
  * @returns Whether the picker can navigate to it.
  */
 export function isNavigablePath(path: string): boolean {
-  const trimmed = path.trim();
-  return isAbsoluteHostPath(trimmed) || trimmed === "~" || trimmed.startsWith("~/");
+  const leftTrimmed = path.trimStart();
+  return isAbsoluteHostPath(leftTrimmed) || leftTrimmed === "~" || leftTrimmed.startsWith("~/");
 }
 
 export function useResolvedHostHome(hostId: string | null): string | null {
@@ -207,12 +208,12 @@ export function useResolvedHostHome(hostId: string | null): string | null {
 }
 
 export function resolveWorkspacePath(value: string, home: string | null): string | null {
-  const trimmed = value.trim();
-  if (trimmed.startsWith("/")) {
-    const stripped = trimmed.replace(/\/+$/, "");
+  const leftTrimmed = value.trimStart();
+  if (leftTrimmed.startsWith("/")) {
+    const stripped = leftTrimmed.replace(/\/+$/, "");
     return stripped === "" ? "/" : stripped;
   }
-  return normalizeTypedPath(trimmed, home);
+  return normalizeTypedPath(leftTrimmed, home);
 }
 
 /**

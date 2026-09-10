@@ -79,6 +79,26 @@ class AgentCache:
                 if entry.users == 0:
                     self._mutation_locks.pop(agent_id, None)
 
+    def _cache_path(self, agent_id: str, *, suffix: str = "") -> Path:
+        """Return a direct child of the cache root for an agent id."""
+        component = os.path.basename(agent_id)
+        if (
+            not component
+            or component in {".", ".."}
+            or component != agent_id
+            or "\\" in component
+            or "\x00" in component
+        ):
+            raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
+        cache_root = self._cache_dir.resolve(strict=False)
+        normalized_path = os.path.normpath(cache_root / f"{component}{suffix}")
+        if not normalized_path.startswith(os.path.join(cache_root, "")):
+            raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
+        path = Path(normalized_path)
+        if path.parent != cache_root or path.resolve(strict=False) != path:
+            raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
+        return path
+
     def load(
         self,
         agent_id: str,
@@ -110,7 +130,7 @@ class AgentCache:
         :returns: A LoadedAgent with the parsed spec and the
             on-disk working directory.
         """
-        workdir = self._cache_dir / agent_id
+        workdir = self._cache_path(agent_id)
 
         # Serialize cache reads with mutations so a caller cannot observe a
         # spec while its workdir is being replaced or evicted.
@@ -165,7 +185,7 @@ class AgentCache:
             directory.
         """
         with self._mutation_lock_for(agent_id):
-            workdir = self._cache_dir / agent_id
+            workdir = self._cache_path(agent_id)
             staging_dir = self._reserve_swap_path(agent_id, "staging")
             backup_dir: Path | None = None
 
@@ -221,7 +241,7 @@ class AgentCache:
             e.g. ``"ag_abc123"``.
         """
         with self._mutation_lock_for(agent_id):
-            workdir = self._cache_dir / agent_id
+            workdir = self._cache_path(agent_id)
             tombstone_dir: Path | None = None
             if workdir.is_dir():
                 tombstone_dir = self._reserve_swap_path(agent_id, "evicted")

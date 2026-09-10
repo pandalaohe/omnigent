@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import claude_native_forwarder as forwarder
+from omnigent.harnesses.claude_native import forwarder
 
 
 def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:

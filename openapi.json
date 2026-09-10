@@ -3250,6 +3250,17 @@
             "title": "Force",
             "type": "boolean"
           },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
           "items": {
             "items": {
               "$ref": "#/components/schemas/ImportItemInput"
@@ -9445,20 +9456,6 @@
           "settings"
         ],
         "title": "UserPreferencesEnvelope",
-        "type": "object"
-      },
-      "UserSettingsUpdate": {
-        "description": "Writable current-user settings.",
-        "properties": {
-          "background_session_titles_enabled": {
-            "title": "Background Session Titles Enabled",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "background_session_titles_enabled"
-        ],
-        "title": "UserSettingsUpdate",
         "type": "object"
       },
       "ValidationError": {
@@ -16920,74 +16917,6 @@
         "summary": "Get Usage",
         "tags": [
           "usage"
-        ]
-      }
-    },
-    "/v1/user-settings": {
-      "get": {
-        "operationId": "get_user_settings_v1_user_settings_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": {
-                    "type": "boolean"
-                  },
-                  "title": "Response Get User Settings V1 User Settings Get",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Get User Settings",
-        "tags": [
-          "user_settings"
-        ]
-      },
-      "put": {
-        "operationId": "update_user_settings_v1_user_settings_put",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UserSettingsUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": {
-                    "type": "boolean"
-                  },
-                  "title": "Response Update User Settings V1 User Settings Put",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Update User Settings",
-        "tags": [
-          "user_settings"
         ]
       }
     }

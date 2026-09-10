@@ -1,6 +1,6 @@
 """Merge the durable custom schema with the locked upstream schema.
 
-Revision ID: ge1b2c3d4e5f
+Revision ID: a09c20260909
 Revises: fd1b2c3d4e5, gd1b2c3d4e5f
 Create Date: 2026-09-09 00:00:00.000000
 
@@ -18,7 +18,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "ge1b2c3d4e5f"
+revision: str = "a09c20260909"
 down_revision: tuple[str, str] = ("fd1b2c3d4e5", "gd1b2c3d4e5f")
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

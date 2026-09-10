@@ -56,6 +56,8 @@ const mobileMenu = {
   onOpenArchive: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
+  githubPanelOpen: false,
+  onOpenGithub: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
@@ -574,16 +576,16 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(toggle).toHaveClass("size-10");
   });
 
-  it("insets the pill's leading edge for the Chat/Terminal track", () => {
+  it("insets both pill edges around the switcher and trailing kebab", () => {
     // The track paints its own background to its edge, so with the pill's
-    // zero padding it sat flush against the border while an icon-only
-    // neighbour cleared it by the slack in its 40px box. The inset is
+    // zero padding it sat flush against the leading border, while the expanded
+    // kebab sat flush against the trailing border. The inset is
     // conditional: a lone kebab must stay the 40px circle asserted above.
     isMobileMock.mockReturnValue(true);
     renderHeaderWithSession(makeTerminalFirstCtx());
 
     const cluster = screen.getByTestId("view-mode-toggle").parentElement;
-    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:pl-1.5");
+    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:px-1.5");
     // The guard keys off the track's own data-slot, so it has to be present.
     expect(screen.getByTestId("view-mode-toggle")).toHaveAttribute("data-slot", "view-mode-toggle");
   });
@@ -790,7 +792,15 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
+    // textContent includes it but it's invisible; the labels are what matters.
+    const svgTitleText = (el: Element) =>
+      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
+    expect(
+      screen
+        .getAllByRole("menuitem")
+        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
+    ).toEqual([
       "Pin",
       "Rename",
       "Mark as unread",
@@ -798,6 +808,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Files",
       "Archived sessions",
       "Changes",
+      "GitHub",
       "Agents1",
       "Archive this session",
       "Delete",

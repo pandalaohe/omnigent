@@ -132,6 +132,12 @@ import {
   fetchGithubStatus,
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
+import {
+  beginDatabricksConnect,
+  disconnectDatabricks,
+  fetchDatabricksStatus,
+  type DatabricksConnectionStatus,
+} from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -265,7 +271,10 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
-import { getUserSettings, updateUserSettings } from "@/lib/userSettingsApi";
+import {
+  readBackgroundSessionTitlesEnabled,
+  writeBackgroundSessionTitlesEnabled,
+} from "@/lib/backgroundSessionTitlesPreferences";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -1106,6 +1115,7 @@ function GithubMark({ className }: { className?: string }) {
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
   github: GithubIntegrationControl,
+  databricks: DatabricksIntegrationControl,
 };
 
 /**
@@ -1292,6 +1302,131 @@ function AlwaysUseWorktreeControl() {
 }
 
 /**
+ * Connect / disconnect a Databricks workspace. Once connected, a managed
+ * sandbox launched by this user reaches the Databricks AI Gateway (MCP + model
+ * serving) as them, using their per-user OAuth token. Databricks is
+ * multi-workspace, so the user supplies their workspace URL. The connect action
+ * is a full-page redirect to the workspace OAuth consent; on return the callback
+ * lands here with ``?databricks=connected|error``.
+ */
+function DatabricksIntegrationControl() {
+  const [status, setStatus] = useState<DatabricksConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<"connected" | "error" | null>(null);
+  const [workspace, setWorkspace] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchDatabricksStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("databricks");
+    if (outcome === "connected" || outcome === "error") {
+      setNotice(outcome);
+      params.delete("databricks");
+      const qs = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${qs ? `?${qs}` : ""}`);
+    }
+  }, [refresh]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectDatabricks();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+
+  // Feature not configured on this server: render nothing (like a build without it).
+  if (status !== "loading" && status !== null && !status.enabled) {
+    return null;
+  }
+  if (status === "loading") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (status === null) {
+    return <p className="text-sm text-muted-foreground">Databricks status is unavailable.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {notice === "connected" && (
+        <div
+          role="status"
+          className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-sm"
+        >
+          Databricks workspace connected.
+        </div>
+      )}
+      {notice === "error" && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          Couldn't connect your Databricks workspace. Please try again.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">Databricks</span>
+          <span className="text-sm text-muted-foreground">
+            {status.connected && status.workspace_host
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
+              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="databricks-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <>
+              <Input
+                type="text"
+                inputMode="url"
+                placeholder="workspace-host.cloud.databricks.com"
+                className="h-9 w-64"
+                value={workspace}
+                onChange={(e) => setWorkspace(e.target.value)}
+                data-testid="databricks-workspace"
+              />
+              <Button
+                size="sm"
+                className="h-9"
+                disabled={busy || workspace.trim() === ""}
+                data-testid="databricks-connect"
+                onClick={() => beginDatabricksConnect(workspace.trim(), returnTo)}
+              >
+                Connect Databricks
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Opt-in dispatch for messages sent while the agent is working.
  */
 function AlwaysSteerControl() {
@@ -1358,35 +1493,14 @@ function ComposerSendShortcutControl() {
 }
 
 function BackgroundSessionTitlesControl() {
-  const [enabled, setEnabled] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
   const labelId = useId();
   const descriptionId = useId();
 
-  useEffect(() => {
-    let cancelled = false;
-    void getUserSettings()
-      .then((settings) => {
-        if (!cancelled) setEnabled(settings.backgroundSessionTitlesEnabled);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeBackgroundSessionTitlesEnabled(next);
   }, []);
-
-  const toggle = useCallback(
-    (next: boolean) => {
-      const previous = enabled;
-      setEnabled(next);
-      setSaving(true);
-      void updateUserSettings({ backgroundSessionTitlesEnabled: next })
-        .then((settings) => setEnabled(settings.backgroundSessionTitlesEnabled))
-        .catch(() => setEnabled(previous))
-        .finally(() => setSaving(false));
-    },
-    [enabled],
-  );
 
   return (
     <div className="flex items-start justify-between gap-6">
@@ -1403,7 +1517,6 @@ function BackgroundSessionTitlesControl() {
         aria-labelledby={labelId}
         aria-describedby={descriptionId}
         checked={enabled}
-        disabled={saving}
         onCheckedChange={toggle}
         data-testid="background-session-titles-toggle"
         className="mt-0.5 shrink-0"

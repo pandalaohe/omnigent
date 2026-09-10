@@ -19,8 +19,10 @@ vi.mock("@/hooks/useNewSessionTarget", () => ({
 }));
 
 const useConversations = vi.fn();
+const useProjects = vi.fn();
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
+  useProjects: (...args: unknown[]) => useProjects(...args),
 }));
 
 function conv(
@@ -34,6 +36,10 @@ function conv(
 
 function setSessions(sessions: ReturnType<typeof conv>[], isFetching = false) {
   useConversations.mockReturnValue({ data: { pages: [{ data: sessions }] }, isFetching });
+}
+
+function setProjects(projects: { id: string | null; name: string }[]) {
+  useProjects.mockReturnValue({ data: projects });
 }
 
 /** Find a session row by its full label text even when the highlighter has
@@ -57,7 +63,9 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
 beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
+  useProjects.mockReset();
   setSessions([]);
+  setProjects([]);
   newSessionTarget.route = "/";
   newSessionTarget.target = { kind: "none" };
 });
@@ -333,6 +341,35 @@ describe("CommandPalette — actions", () => {
     fireEvent.click(screen.getByText("New session in Alpha Team"));
 
     expect(navigate).toHaveBeenCalledWith("/?project=Alpha%20Team");
+  });
+
+  it("lists explicit actions for other projects without duplicating the selected target", () => {
+    setProjects([
+      { id: "prj_alpha", name: "Alpha Team" },
+      { id: null, name: "Documentation" },
+    ]);
+    newSessionTarget.route = "/?project=Alpha%20Team";
+    newSessionTarget.target = {
+      kind: "project",
+      projectId: "prj_alpha",
+      projectName: "Alpha Team",
+    };
+
+    renderPalette();
+
+    expect(screen.getAllByText("New session in Alpha Team")).toHaveLength(1);
+    expect(screen.getByText("New session in Documentation")).toBeTruthy();
+  });
+
+  it("URL-encodes an explicitly selected project name", () => {
+    setProjects([{ id: "prj_rnd", name: "R&D / Q3 + launch" }]);
+    const onOpenChange = vi.fn();
+    renderPalette({ onOpenChange });
+
+    fireEvent.click(screen.getByText("New session in R&D / Q3 + launch"));
+
+    expect(navigate).toHaveBeenCalledWith("/?project=R%26D%20%2F%20Q3%20%2B%20launch");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("runs a navigation action and closes the palette", () => {

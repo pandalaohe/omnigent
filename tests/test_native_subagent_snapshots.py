@@ -215,6 +215,83 @@ def test_claude_snapshot_preserves_unknown_and_explicit_terminal() -> None:
     assert _native_subagent_snapshot(state) == {"a": "activity_unverified", "b": "stopped"}
 
 
+@pytest.mark.asyncio
+async def test_claude_nested_snapshots_post_only_immediate_children() -> None:
+    from omnigent.harnesses.claude_native import forwarder
+
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "root-child": forwarder.SubagentEntry(
+                subagent_id="root-child",
+                child_conversation_id="conv_root_child",
+                last_status="running",
+            ),
+            "nested-child": forwarder.SubagentEntry(
+                subagent_id="nested-child",
+                child_conversation_id="conv_nested_child",
+                parent_subagent_id="root-child",
+                last_status="waiting",
+            ),
+            "grandchild": forwarder.SubagentEntry(
+                subagent_id="grandchild",
+                child_conversation_id="conv_grandchild",
+                parent_subagent_id="nested-child",
+                terminal_status="completed",
+            ),
+        }
+    )
+    grouped = forwarder._native_subagent_snapshots_by_parent("conv_root", state)
+    assert grouped == {
+        "conv_root": {"conv_root_child": "running"},
+        "conv_root_child": {"conv_nested_child": "waiting"},
+        "conv_nested_child": {"conv_grandchild": "completed"},
+    }
+
+    posts: list[tuple[str, dict]] = []
+    posted = asyncio.Event()
+    retired = asyncio.Event()
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        posts.append((request.url.path, json.loads(request.content)["data"]))
+        if sum(not data["retired"] for _, data in posts) == len(grouped):
+            posted.set()
+        if sum(data["retired"] for _, data in posts) == len(grouped):
+            retired.set()
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(transport)
+    ) as client:
+        async with NativeSubagentSnapshotPublisher(client, heartbeat_s=0.005) as publisher:
+            for parent_id, children in grouped.items():
+                publisher.update(parent_id, children)
+            await asyncio.wait_for(posted.wait(), 1)
+            parent_ids = set(grouped)
+            forwarder._retire_native_subagent_snapshots(
+                publisher,
+                root_parent_id="conv_root",
+                parent_ids=parent_ids,
+            )
+            await asyncio.wait_for(retired.wait(), 1)
+            assert parent_ids == set()
+
+    by_parent = {
+        path.removeprefix("/v1/sessions/").removesuffix("/events"): data["children"]
+        for path, data in posts
+        if not data["retired"]
+    }
+    assert by_parent == {
+        "conv_root": [{"session_id": "conv_root_child", "status": "running"}],
+        "conv_root_child": [{"session_id": "conv_nested_child", "status": "waiting"}],
+        "conv_nested_child": [{"session_id": "conv_grandchild", "status": "completed"}],
+    }
+    assert {
+        path.removeprefix("/v1/sessions/").removesuffix("/events")
+        for path, data in posts
+        if data["retired"]
+    } == set(grouped)
+
+
 def test_codex_rotation_retains_late_event_routing_without_reparenting_inventory() -> None:
     from omnigent.harnesses.codex_native.forwarder import (
         _codex_native_subagent_snapshot,

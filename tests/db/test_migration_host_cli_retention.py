@@ -10,7 +10,7 @@ from alembic import command
 
 from omnigent.db.utils import _build_alembic_config, _create_engine
 
-_PREVIOUS = "ge1b2c3d4e5f"
+_PREVIOUS = "a09c20260909"
 _MIGRATION = "fe1b2c3d4e5"
 
 

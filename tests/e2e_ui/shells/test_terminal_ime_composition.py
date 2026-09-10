@@ -248,3 +248,34 @@ def test_inbound_output_leaves_preedit_intact(
     expect(composition_view).to_have_class(re.compile(r"\bactive\b"))
     expect(composition_view).to_have_text(COMPOSED_TEXT)
     expect(terminal_view).to_have_attribute("data-state", "connected")
+
+
+def test_touch_composition_finalizes_when_enter_precedes_compositionend(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """The mobile adapter lets xterm finalize preedit on a non-composing Enter."""
+    page.add_init_script("Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 1 });")
+    base_url, session_id = terminal_session
+    sent, _received = _capture_attach_frames(page)
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+    terminal_view = _connected_terminal(page)
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+    _begin_composition(textarea, "中文")
+    page.wait_for_timeout(100)
+    expect(terminal_view.locator(".composition-view")).to_have_text("中文")
+    textarea.evaluate(
+        """ta => {
+          for (const type of ['keydown', 'keyup']) {
+            ta.dispatchEvent(new KeyboardEvent(type, {
+              key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+              isComposing: false, bubbles: true, cancelable: true
+            }));
+          }
+        }"""
+    )
+    assert _wait_for_sent_bytes(page, sent, "中文\r".encode(), timeout_s=5), (
+        "Enter before compositionend did not deliver the committed text and newline"
+    )
+    assert b"".join(sent).count("中文".encode()) == 1

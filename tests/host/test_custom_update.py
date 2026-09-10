@@ -54,13 +54,16 @@ def _managed_uv_tool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli_module, "_preflight_custom_host_supervisor", lambda: None)
 
 
+@pytest.mark.parametrize("is_windows", [False, True])
 def test_custom_update_dry_run_targets_fork_channel_and_preserves_extras(
     monkeypatch: pytest.MonkeyPatch,
+    is_windows: bool,
 ) -> None:
     import omnigent.cli as cli_module
 
     old = "a" * 40
     new = "b" * 40
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", is_windows)
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
     monkeypatch.setattr(cli_module, "_remote_git_head", lambda _url: new, raising=False)
@@ -72,6 +75,7 @@ def test_custom_update_dry_run_targets_fork_channel_and_preserves_extras(
     assert "@local/host-custom" not in result.output
     assert "#egg=omnigent[all]" in result.output
     assert "Would run:" in result.output
+    assert ("uv tool install --force --reinstall" in result.output) is is_windows
 
 
 def test_custom_update_restarts_supervisor_after_install_failure(
@@ -500,11 +504,6 @@ def test_windows_custom_update_schedules_detached_helper(
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
     monkeypatch.setattr(cli_module, "_remote_git_head", lambda _url: new)
-    monkeypatch.setattr(
-        cli_module,
-        "_build_upgrade_suggestion",
-        lambda *_a, **_k: SimpleNamespace(command="uv fake", runnable=True),
-    )
     monkeypatch.setattr(cli_module, "_load_existing_host_id", lambda: "host-1")
     monkeypatch.setattr(cli_module, "_drain_custom_host_sessions", lambda *_a, **_k: None)
     monkeypatch.setattr(cli_module, "_custom_host_records", lambda _host_id: [])
@@ -526,7 +525,9 @@ def test_windows_custom_update_schedules_detached_helper(
     result = CliRunner().invoke(cli, ["host", "update", "custom"])
 
     assert result.exit_code == 0, result.output
-    assert launched == ["uv fake"]
+    assert len(launched) == 1
+    assert launched[0].startswith("uv tool install --force --reinstall")
+    assert f"@{new}#egg=omnigent[all]" in launched[0]
     assert direct_installs == []
     assert "detached helper pid 321" in result.output
 

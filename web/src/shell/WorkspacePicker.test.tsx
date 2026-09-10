@@ -129,7 +129,8 @@ describe("workspace path resolution", () => {
     expect(resolveWorkspacePath("~/git/omnigent", "/Users/alice")).toBe(
       "/Users/alice/git/omnigent",
     );
-    expect(resolveWorkspacePath("  /a//b/  ", null)).toBe("/a//b");
+    expect(resolveWorkspacePath("  /a//b/", null)).toBe("/a//b");
+    expect(resolveWorkspacePath("  /a//b  ", null)).toBe("/a//b  ");
     expect(resolveWorkspacePath("~/git/omnigent", null)).toBeNull();
   });
 
@@ -197,10 +198,10 @@ describe("normalizeTypedPath", () => {
     expect(normalizeTypedPath("/Users/corey/projects")).toBe("/Users/corey/projects");
   });
 
-  it("trims whitespace", () => {
-    // Clipboard pastes pick up surrounding spaces; without
-    // trimming, "  /Users  " would fail the leading-slash check.
-    expect(normalizeTypedPath("  /Users/corey  ")).toBe("/Users/corey");
+  it("ignores leading whitespace and preserves legal trailing whitespace", () => {
+    // Leading whitespace cannot start an absolute path, while trailing
+    // whitespace can be path data on POSIX hosts.
+    expect(normalizeTypedPath("  /Users/corey  ")).toBe("/Users/corey  ");
   });
 
   it("collapses runs of slashes", () => {
@@ -284,6 +285,10 @@ describe("isNavigablePath", () => {
     "accepts Windows absolute path %s",
     (path) => expect(isNavigablePath(path)).toBe(true),
   );
+
+  it("accepts an absolute path with legal trailing whitespace", () => {
+    expect(isNavigablePath("  /Users/me/trailing-space ")).toBe(true);
+  });
 });
 
 describe("basename", () => {
@@ -601,6 +606,18 @@ describe("WorkspacePicker live selection (onNavigate)", () => {
     // Clicking a folder navigates into it AND reports it as the new value.
     fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
     expect(onNavigate).toHaveBeenLastCalledWith("/x/src");
+  });
+
+  it("reports a typed absolute directory with legal trailing whitespace unchanged", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+
+    fireEvent.change(screen.getByTestId("workspace-picker-path-input"), {
+      target: { value: "  /x/trailing-space " },
+    });
+    fireEvent.keyDown(screen.getByTestId("workspace-picker-path-input"), { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/trailing-space ");
   });
 
   it("hides the Select button when onSelect is not supplied", () => {

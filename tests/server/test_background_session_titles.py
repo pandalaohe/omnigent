@@ -8,11 +8,13 @@ import pytest
 
 from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.server.background_session_titles import (
+    BACKGROUND_SESSION_TITLES_HEADER,
     BACKGROUND_TITLE_MAX_CHARS,
     CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
     RunnerBackgroundTitleGenerator,
+    background_session_titles_enabled,
     normalize_background_title,
     prepare_background_session_title,
 )
@@ -72,6 +74,21 @@ async def test_prepare_background_title_skips_when_user_setting_is_disabled(db_u
     assert pending is None
 
 
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({}, True),
+        ({BACKGROUND_SESSION_TITLES_HEADER: "on"}, True),
+        ({BACKGROUND_SESSION_TITLES_HEADER: "off"}, False),
+    ],
+)
+async def test_background_session_titles_enabled_defaults_on(
+    headers: dict[str, str],
+    expected: bool,
+) -> None:
+    assert background_session_titles_enabled(headers) is expected
+
+
 async def test_prepare_background_title_from_message(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     agent_id = uuid.uuid4().hex
@@ -102,10 +119,9 @@ async def test_prepare_background_title_from_message(db_uri: str) -> None:
         prompt="please investigate the authentication timeout",
         agent_id=agent_id,
     )
-    assert pending.expected_seed_title == "please investigate the authentication timeout"
 
 
-async def test_prepare_background_title_from_slash_command(db_uri: str) -> None:
+async def test_slash_command_background_title_uses_persisted_seed(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conversation = store.create_conversation(kind="default")
 
@@ -123,7 +139,12 @@ async def test_prepare_background_title_from_slash_command(db_uri: str) -> None:
 
     assert pending is not None
     assert pending.request.prompt == "/grill-me review this plan"
-    assert pending.expected_seed_title == "/grill-me review this plan"
+    persisted = store.update_conversation(conversation.id, title="grill-me review this plan")
+    assert persisted is not None
+    pending.schedule(expected_seed_title=persisted.title)
+    await pending.coordinator.wait_for_idle()
+
+    assert store.get_conversation(conversation.id).title == "Review migration plan"
 
 
 @pytest.mark.parametrize("excluded_session", ["titled", "child"])

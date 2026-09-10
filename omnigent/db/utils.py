@@ -518,6 +518,7 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
 
     from omnigent.db.db_models import ConversationBase, OmnigentBase
 
+    _prepare_legacy_custom_upgrade(engine)
     with engine.connect() as connection:
         current_heads = tuple(MigrationContext.configure(connection).get_current_heads())
     head = _get_head_db_revision(db_uri)
@@ -671,8 +672,8 @@ def _get_head_db_revision(db_uri: str) -> str:
     return head
 
 
-def _prepare_legacy_custom_gc_upgrade(engine: Engine) -> bool:
-    """Expose the custom branch hidden by the historical ``gc1`` collision.
+def _prepare_legacy_custom_upgrade(engine: Engine) -> bool:
+    """Expose custom branches hidden by historical migration-id collisions.
 
     The private custom line used ``gc1b2c3d4e5f`` as a merge stamp before
     upstream assigned that same id to the managed-Host tombstone migration.
@@ -694,7 +695,7 @@ def _prepare_legacy_custom_gc_upgrade(engine: Engine) -> bool:
         }
         if rows == {"gc1b2c3d4e5f", "fd1b2c3d4e5"}:
             return True
-        if rows != {"gc1b2c3d4e5f"}:
+        if rows not in ({"gc1b2c3d4e5f"}, {"ge1b2c3d4e5f"}):
             return False
         tables = set(inspector.get_table_names())
         if "custom_agents" not in tables:
@@ -705,6 +706,18 @@ def _prepare_legacy_custom_gc_upgrade(engine: Engine) -> bool:
         }
         if "preferences" not in user_columns or "archived_at" not in conversation_columns:
             return False
+        if rows == {"ge1b2c3d4e5f"}:
+            # Upstream ge1 drops this column; its presence identifies the old
+            # custom merge without reinterpreting an upstream database stamp.
+            if "background_session_titles_enabled" not in user_columns:
+                return False
+            connection.execute(
+                text(
+                    "UPDATE alembic_version SET version_num = :revision WHERE version_num = :old"
+                ),
+                {"revision": "a09c20260909", "old": "ge1b2c3d4e5f"},
+            )
+            return True
         connection.execute(
             text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
             {"revision": "fd1b2c3d4e5"},
@@ -764,7 +777,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
         not bring the database to head.
     """
     head = _get_head_db_revision(db_uri)
-    if _prepare_legacy_custom_gc_upgrade(engine):
+    if _prepare_legacy_custom_upgrade(engine):
         _run_migrations(engine, db_uri)
         migrated = _get_current_db_revision(engine)
         if migrated != head:

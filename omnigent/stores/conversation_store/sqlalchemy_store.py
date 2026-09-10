@@ -8,6 +8,7 @@ import logging
 from typing import Any, Protocol, cast
 
 from sqlalchemy import (
+    JSON,
     ColumnElement,
     LargeBinary,
     Select,
@@ -23,7 +24,8 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
+from sqlalchemy import cast as sql_cast
+from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -81,10 +83,7 @@ from omnigent.entities import (
     parse_item_data,
 )
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.session_import.models import (
-    IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
-    IMPORT_SOURCE_LABEL_KEY,
-)
+from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
@@ -105,6 +104,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     DeletionClaimResult,
+    NativeRecoveryItemSkipped,
     NativeReplayConflictError,
     NativeSubagentReconcileFingerprint,
     NativeSubagentReconcileWriteResult,
@@ -299,6 +299,7 @@ def _to_conversation(
             else None
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
+        runner_last_seen=meta.runner_last_seen if meta else None,
         project_id=meta.project_id if meta else None,
     )
 
@@ -630,23 +631,73 @@ def _literal_like_pattern(value: str) -> str:
     return f"%{escaped}%"
 
 
-def _visible_search_match_predicate(pattern: str) -> Any:
-    """Match searchable user-visible rows, including pre-fix stored data."""
+def _legacy_hidden_message_blocks(dialect_name: str) -> Any:
+    """Use the renderer's per-input-block rule for historical prompt messages."""
     data = SqlConversationItem.data
-    legacy_task_notification = and_(
-        *(data.like(f"%{marker}%") for marker in CLAUDE_TASK_NOTIFICATION_MARKERS),
+    if _supports_fts5(dialect_name):
+        blocks = func.json_each(data, "$.content").table_valued("value")
+        block_type = func.json_extract(blocks.c.value, "$.type")
+        block_text = func.json_extract(blocks.c.value, "$.text")
+    elif dialect_name == "postgresql":
+        blocks = func.json_array_elements(sql_cast(data, JSON)["content"]).table_valued("value")
+        block_type = func.json_extract_path_text(blocks.c.value, "type")
+        block_text = func.json_extract_path_text(blocks.c.value, "text")
+    else:
+        blocks = func.json_table(
+            func.coalesce(func.nullif(data, ""), "{}"),
+            literal_column(
+                "'$.content[*]' COLUMNS (block_type VARCHAR(32) PATH '$.type', "
+                "block_text TEXT PATH '$.text')"
+            ),
+        ).table_valued("block_type", "block_text")
+        block_type = blocks.c.block_type
+        block_text = blocks.c.block_text.collate("utf8mb4_bin")
+    whitespace = (
+        " \t\n\r\v\f\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+        "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+    )
+    trimmed = (
+        func.regexp_replace(block_text, f"^[{whitespace}]+", "")
+        if dialect_name == "mysql"
+        else func.ltrim(block_text, whitespace)
+    )
+    contains = func.strpos if dialect_name == "postgresql" else func.instr
+    prefix = CLAUDE_TASK_NOTIFICATION_MARKERS[0]
+    hidden = or_(
+        func.substr(block_text, 1, len(CLAUDE_COMPACTION_SUMMARY_PREFIX))
+        == CLAUDE_COMPACTION_SUMMARY_PREFIX,
+        and_(
+            func.substr(trimmed, 1, len(prefix)) == prefix,
+            *(contains(block_text, marker) > 0 for marker in CLAUDE_TASK_NOTIFICATION_MARKERS[1:]),
+        ),
+    )
+    return (
+        select(1)
+        .select_from(blocks)
+        .where(block_type == "input_text", hidden)
+        .correlate(SqlConversationItem)
+        .exists()
+    )
+
+
+def _visible_search_match_predicate(pattern: str, dialect_name: str) -> Any:
+    """Exclude legacy hidden messages before applying the result limit."""
+    data = SqlConversationItem.data
+    text_match = (
+        SqlConversationItem.search_text.like(pattern, escape="\\")
+        if dialect_name == "mysql"
+        else SqlConversationItem.search_text.ilike(pattern, escape="\\")
     )
     return and_(
-        SqlConversationItem.search_text.ilike(pattern, escape="\\"),
+        text_match,
         or_(
             SqlConversationItem.type != encode_item_type("message"),
             and_(
-                # ``append`` serializes with json.dumps' stable ``": "`` spacing.
-                # Future hidden messages persist an empty search_text; these
-                # gates keep older indexed rows from surfacing after an upgrade.
                 data.not_like('%"is_meta": true%'),
-                data.not_like(f'%"text": "{CLAUDE_COMPACTION_SUMMARY_PREFIX}%'),
-                ~legacy_task_notification,
+                or_(
+                    data.not_like('%"role": "user"%'),
+                    ~_legacy_hidden_message_blocks(dialect_name),
+                ),
             ),
         ),
     )
@@ -695,7 +746,7 @@ def _fetch_search_matches(
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        _visible_search_match_predicate(pattern),
+        _visible_search_match_predicate(pattern, session.get_bind().dialect.name),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -1191,38 +1242,32 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = self._get_meta(conversation_id)
             return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
 
-    def find_imported_conversation(
+    def find_conversation_by_external_session_id(
         self,
-        source: str,
         external_session_id: str,
     ) -> Conversation | None:
-        """Find the original conversation carrying an import provenance pair."""
-        source_label = aliased(SqlConversationLabel)
-        external_label = aliased(SqlConversationLabel)
-        with self._conv_session("select_imported_conversation") as session:
-            conversation_id = session.execute(
-                select(SqlConversation.id)
-                .join(
-                    source_label,
-                    (source_label.workspace_id == SqlConversation.workspace_id)
-                    & (source_label.conversation_id == SqlConversation.id),
-                )
-                .join(
-                    external_label,
-                    (external_label.workspace_id == SqlConversation.workspace_id)
-                    & (external_label.conversation_id == SqlConversation.id),
-                )
-                .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    source_label.key == IMPORT_SOURCE_LABEL_KEY,
-                    source_label.value == source,
-                    external_label.key == IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
-                    external_label.value == external_session_id,
-                )
-                .order_by(SqlConversation.created_at, SqlConversation.id)
-                .limit(1)
-            ).scalar_one_or_none()
-        return self.get_conversation(conversation_id) if conversation_id is not None else None
+        """Find an existing conversation wrapping one external (harness) session id.
+
+        Matches the ``external_session_id`` column, which both an imported
+        transcript and a natively-run session populate, so an import dedupes
+        against a prior import and against a native run of the same underlying
+        session alike. Returns the earliest-created match when more than one row
+        carries the id (the historical duplicate a fixed dedup should collapse).
+        """
+        with self._session("select_conversation_by_external_session_id") as session:
+            ids = list(
+                session.execute(
+                    select(SqlConversationMetadata.id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.external_session_id == external_session_id,
+                    )
+                ).scalars()
+            )
+        matches = sorted(
+            (c for c in (self.get_conversation(cid) for cid in ids) if c is not None),
+            key=lambda c: (c.created_at, c.id),
+        )
+        return matches[0] if matches else None
 
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """
@@ -2356,7 +2401,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == conversation_id,
-                        _visible_search_match_predicate(_literal_like_pattern(query)),
+                        _visible_search_match_predicate(
+                            _literal_like_pattern(query), self._conv_engine.dialect.name
+                        ),
                     )
                     .order_by(SqlConversationItem.position.asc(), SqlConversationItem.id.asc())
                     .limit(limit)
@@ -2730,10 +2777,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                         existing = _to_item(
                             historical, self._decode_item_data_batch([historical.data])[0]
                         )
-                        if not existing.matches_native_replay(
-                            item, exact_source=historical.id == item_id
-                        ):
-                            raise NativeReplayConflictError("Historical transcript prefix differs")
                         source_row = session.execute(
                             select(SqlConversationItem.id).where(
                                 SqlConversationItem.workspace_id == workspace_id,
@@ -2743,6 +2786,29 @@ class SqlAlchemyConversationStore(ConversationStore):
                         ).scalar_one_or_none()
                         if source_row is not None and source_row != historical.id:
                             raise NativeReplayConflictError("Transcript source is out of order")
+                        if not existing.matches_native_replay(
+                            item, exact_source=historical.id == item_id
+                        ):
+                            if (
+                                item.type == "reasoning"
+                                and existing.type != "reasoning"
+                                and source_row is None
+                            ):
+                                prior_reasoning = session.execute(
+                                    select(SqlConversationItem.id)
+                                    .where(
+                                        SqlConversationItem.workspace_id == workspace_id,
+                                        SqlConversationItem.conversation_id == conversation_id,
+                                        SqlConversationItem.position <= after_position,
+                                        SqlConversationItem.type == encode_item_type("reasoning"),
+                                    )
+                                    .limit(1)
+                                ).scalar_one_or_none()
+                                if prior_reasoning is None:
+                                    # Old Claude projections omitted thinking. Do not insert it
+                                    # into the existing prefix or advance the stored cursor.
+                                    raise NativeRecoveryItemSkipped
+                            raise NativeReplayConflictError("Historical transcript prefix differs")
                         persisted.append(existing.model_copy(update={"replayed": True}))
                         continue
                 if item.idempotency_key is not None or item.stable_id is not None:
@@ -3081,7 +3147,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == workspace_id,
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        _visible_search_match_predicate(pattern),
+                        _visible_search_match_predicate(pattern, self._conv_engine.dialect.name),
                     )
                     .correlate(SqlConversation)
                     .exists()
@@ -3595,7 +3661,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        _visible_search_match_predicate(pattern),
+                        _visible_search_match_predicate(pattern, self._conv_engine.dialect.name),
                     )
                     .exists()
                 )
@@ -4235,6 +4301,33 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(live_status=encode_session_live_status(status))
             )
+
+    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
+        """Settle a stale running row with one conditional update."""
+        with self._session("settle_orphaned_live_status") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id.is_not(None),
+                        SqlConversationMetadata.live_status.in_(
+                            [
+                                encode_session_live_status("running"),
+                                encode_session_live_status("waiting"),
+                            ]
+                        ),
+                        or_(
+                            SqlConversationMetadata.runner_last_seen.is_(None),
+                            SqlConversationMetadata.runner_last_seen < stale_before,
+                        ),
+                    )
+                    .values(live_status=encode_session_live_status("idle"))
+                ),
+            )
+            return result.rowcount == 1
 
     def get_native_subagent_reconcile_fingerprint(
         self,

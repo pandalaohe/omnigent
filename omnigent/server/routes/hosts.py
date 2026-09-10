@@ -33,14 +33,17 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostInstallHarnessFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
     HostStoreSecretFrame,
+    classify_launch_refusal,
     encode_host_frame,
     optional_str_bool_map,
+    workspace_missing_message,
 )
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
@@ -1361,7 +1364,12 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
-            if result.get("error_code") == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            refusal_code = classify_launch_refusal(
+                result.get("error_code"),
+                result.get("error"),
+                workspace,
+            )
+            if refusal_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action
                 # (`omnigent setup` on the host machine). Surface the
@@ -1369,6 +1377,13 @@ def create_hosts_router(
                 raise OmnigentError(
                     f"host failed to launch runner: {result.get('error')}",
                     code=ErrorCode.HARNESS_NOT_CONFIGURED,
+                )
+            if refusal_code == WORKSPACE_MISSING_ERROR_CODE:
+                # Rebuild the message from the authorized, canonical
+                # workspace rather than reflecting arbitrary host output.
+                raise OmnigentError(
+                    f"host failed to launch runner: {workspace_missing_message(workspace)}",
+                    code=ErrorCode.WORKSPACE_MISSING,
                 )
             raise HTTPException(
                 status_code=502,
@@ -1422,6 +1437,7 @@ def create_hosts_router(
             limit=limit,
             after=after,
             before=before,
+            require_filesystem_roots=roots,
         )
 
     @router.get("/hosts/{host_id}/filesystem/{path:path}")
@@ -1481,6 +1497,7 @@ def create_hosts_router(
         limit: int,
         after: str | None,
         before: str | None,
+        require_filesystem_roots: bool = False,
     ) -> dict[str, Any]:
         """
         Shared implementation for the filesystem endpoints.
@@ -1520,6 +1537,11 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        if require_filesystem_roots and not conn.hello.filesystem_roots:
+            raise HTTPException(
+                status_code=409,
+                detail="host does not support filesystem root enumeration",
+            )
 
         result = await _proxy_list_dir(
             host_registry=host_registry,

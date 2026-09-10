@@ -1,7 +1,8 @@
 """E2E: the home composer prefills from a project's stored ``config``.
 
-Visiting ``/?project=<name>`` seeds the new-session composer from that project's
-stored defaults (``web/src/shell/projectPrefill.ts`` +
+Choosing ``New session in <name>`` from the command palette navigates to
+``/?project=<name>`` and seeds the composer from that project's stored defaults
+(``web/src/shell/projectPrefill.ts`` +
 ``web/src/shell/NewChatDialog.tsx``): host, working directory, and agent all
 come from ``config``, silently falling back to the generic defaults for any
 field the config leaves unset. This replaced the old newest-session inference —
@@ -122,7 +123,7 @@ def _project_config_body() -> str:
 
 
 def test_composer_prefills_from_project_config(seeded_session: tuple[str, str]) -> None:
-    """A ``?project=`` visit seeds host / workspace / agent from stored config.
+    """The project command seeds host / workspace / agent from stored config.
 
     The pinned agent (``ag_pinned_e2e``) and workspace (``/work/configured-repo``)
     come from ``config`` — NOT from the default-ranked Claude Code or a recent
@@ -192,7 +193,14 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
             await page.route(_SESSIONS_RE, handle_sessions)
             await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
-            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
+            await page.goto(f"{base_url}/c/{session_id}")
+            await page.get_by_placeholder("Send a message…").wait_for(
+                state="visible", timeout=30_000
+            )
+            await page.keyboard.press("ControlOrMeta+k")
+            palette = page.get_by_role("dialog")
+            await expect(palette).to_be_visible(timeout=10_000)
+            await palette.get_by_text(f"New session in {_PROJECT_NAME}", exact=True).click()
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
@@ -719,6 +727,75 @@ async def _route_composer_stubs(
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
     await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+
+def test_typed_picker_preserves_posix_trailing_space_in_create(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A legal trailing space survives the rendered picker and create request."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_typed_picker_trailing_space(base_url, session_id))
+
+
+async def _drive_typed_picker_trailing_space(base_url: str, session_id: str) -> None:
+    exact_workspace = "/work/trailing-space "
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _route_composer_stubs(
+                page,
+                config_body=_plain_config_body(),
+                create_bodies=create_bodies,
+                session_id=session_id,
+            )
+
+            async def handle_filesystem(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "name": "child",
+                                    "path": f"{exact_workspace}/child",
+                                    "type": "directory",
+                                    "bytes": None,
+                                    "modified_at": 0,
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    ),
+                )
+
+            # Registered after the broad host route so the picker receives a
+            # real rendered listing for its exact typed directory.
+            await page.route("**/v1/hosts/*/filesystem*", handle_filesystem)
+            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
+            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            path_input = page.get_by_test_id("workspace-picker-path-input")
+            await path_input.fill(f"  {exact_workspace}")
+            await path_input.press("Enter")
+            await expect(path_input).to_have_value(exact_workspace)
+
+            await page.get_by_test_id("new-chat-landing-input").fill("keep the exact cwd")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == exact_workspace, body
+        finally:
+            await browser.close()
 
 
 def test_global_default_seeds_worktree_when_project_unset(

@@ -712,6 +712,9 @@ async def test_list_filesystem_query_preserves_windows_path_and_roots(
 ) -> None:
     """The no-path route transports native Windows paths and root requests exactly."""
     app, _registry, _comm, replies, _drain = fs_setup
+    connection = _registry.get(_HOST_ID)
+    assert connection is not None
+    connection.hello.filesystem_roots = True
     replies["D:\\AIProgram\\Projects"] = {"entries": [], "has_more": False}
     replies[""] = {"entries": [], "has_more": False}
 
@@ -790,3 +793,50 @@ async def test_list_filesystem_windows_drive_path_is_not_posixified(
     assert resp.status_code == 200, resp.text
     names = [entry["name"] for entry in resp.json()["data"]]
     assert names == ["src"]
+
+
+async def test_list_filesystem_roots_forwards_empty_path(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """The roots query sends the Host's explicit root-enumeration sentinel."""
+    app, registry, _comm, replies, _drain = fs_setup
+    connection = registry.get(_HOST_ID)
+    assert connection is not None
+    connection.hello.filesystem_roots = True
+    replies[""] = {"entries": [], "has_more": False}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/filesystem",
+            params={"roots": "true"},
+        )
+
+    assert response.status_code == 200
+
+
+async def test_list_filesystem_roots_rejects_legacy_host(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An old Host must not interpret the empty roots sentinel as its CWD."""
+    app, _registry, _comm, _replies, _drain = fs_setup
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/filesystem",
+            params={"roots": "true"},
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "host does not support filesystem root enumeration"}

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
+from sqlalchemy.dialects import mysql, postgresql
 
 from omnigent.db.db_models import SqlConversationItem, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
@@ -26,6 +28,8 @@ from omnigent.session_import import (
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
+    _literal_like_pattern,
+    _visible_search_match_predicate,
 )
 from omnigent.stores.host_store import HostStore
 
@@ -4083,6 +4087,44 @@ def test_set_external_session_id_same_value_is_idempotent(
     assert fetched.external_session_id == "sid-1"
 
 
+def test_find_conversation_by_external_session_id_matches_column_without_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The lookup keys off the metadata column, so a native run (no import
+    labels) is found — this is what lets an import dedupe against it."""
+    conv = conversation_store.create_conversation(title="native run")
+    conversation_store.set_external_session_id(conv.id, "sid-native")
+
+    found = conversation_store.find_conversation_by_external_session_id("sid-native")
+    assert found is not None
+    assert found.id == conv.id
+    assert conversation_store.find_conversation_by_external_session_id("sid-absent") is None
+
+
+def test_find_conversation_by_external_session_id_returns_earliest(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When duplicates already exist for one id, the earliest-created wins.
+
+    ``created_at`` is integer seconds, so the two rows would otherwise tie and
+    fall back to the (random) id order; pin distinct stamps to assert the
+    created_at ordering itself.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    first = conversation_store.create_conversation(title="first")
+    conversation_store.set_external_session_id(first.id, "sid-dupe")
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    second = conversation_store.create_conversation(title="second")
+    conversation_store.set_external_session_id(second.id, "sid-dupe")
+
+    found = conversation_store.find_conversation_by_external_session_id("sid-dupe")
+    assert found is not None
+    assert found.id == first.id
+
+
 def test_set_external_session_id_rejects_overwrite_with_different_value(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -6931,3 +6973,137 @@ def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
     assert after is not None
     assert after.updated_at == 1000
     assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+@pytest.mark.parametrize("query", ['release OR "rollback', "%", "_", r"C:\Users", "NEEDLE"])
+def test_archive_search_matches_literal_visible_text(
+    conversation_store: SqlAlchemyConversationStore, query: str
+) -> None:
+    """Archive list locators and transcript search agree across SQL dialects."""
+    conv = conversation_store.create_conversation(title="Archive fixture")
+    items = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index}",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": value}]),
+            )
+            for index, value in enumerate((f"before {query.lower()} after", "unrelated text"))
+        ],
+    )
+    conversation_store.update_conversation(conv.id, archived=True)
+
+    matches = conversation_store.search_visible_items_literal(conv.id, query)
+    assert [item.id for item in matches] == [items[0].id]
+    page = conversation_store.list_conversations(
+        search_query=query, search_scope="content", archived_only=True, kind=None
+    )
+    assert [row.id for row in page.data] == [conv.id]
+    assert page.data[0].search_item_id == items[0].id
+    assert page.data[0].search_match_count == 1
+
+
+@pytest.mark.parametrize(
+    "hidden_text,is_meta,prefix",
+    [
+        ("needle internal", True, ""),
+        ("This session is being continued from a previous conversation needle", False, ""),
+        ("<task-notification><task-id>needle</task-id></task-notification>", False, ""),
+        ("\n<task-notification><task-id>needle</task-id></task-notification>", False, ""),
+        ("\t<task-notification><task-id>needle</task-id></task-notification>", False, ""),
+        ("\u00a0<task-notification><task-id>needle</task-id></task-notification>", False, ""),
+        ("<task-notification><task-id>needle</task-id></task-notification>", False, "ordinary"),
+    ],
+)
+def test_archive_search_excludes_legacy_hidden_rows_before_limit(
+    conversation_store: SqlAlchemyConversationStore, hidden_text: str, is_meta: bool, prefix: str
+) -> None:
+    conv = conversation_store.create_conversation()
+    items = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index}",
+                data=MessageData(
+                    role="user",
+                    is_meta=is_meta if index == 0 else False,
+                    content=(
+                        [{"type": "input_text", "text": prefix}] if index == 0 and prefix else []
+                    )
+                    + [{"type": "input_text", "text": value}],
+                ),
+            )
+            for index, value in enumerate((hidden_text, "needle visible"))
+        ],
+    )
+    with conversation_store._conv_session("seed_legacy_search_text") as session:
+        hidden = session.get(
+            SqlConversationItem,
+            (current_workspace_id(), conv.id, items[0].id, items[0].created_at),
+        )
+        assert hidden is not None
+        assert hidden.search_text == ""
+        hidden.search_text = f"{prefix} {hidden_text}" if prefix else hidden_text
+    conversation_store.update_conversation(conv.id, archived=True)
+    matches = conversation_store.search_visible_items_literal(conv.id, "needle", limit=1)
+    assert [item.id for item in matches] == [items[1].id]
+    page = conversation_store.list_conversations(
+        search_query="needle", search_scope="content", archived_only=True, kind=None
+    )
+    assert page.data[0].search_item_id == items[1].id
+    assert page.data[0].search_match_count == 1
+
+
+@pytest.mark.parametrize(
+    "dialect_name,dialect,operator",
+    [("mysql", mysql.dialect(), " LIKE "), ("postgresql", postgresql.dialect(), " ILIKE ")],
+)
+def test_archive_search_uses_native_case_insensitive_operator(
+    dialect_name: str, dialect: Any, operator: str
+) -> None:
+    pattern = _literal_like_pattern(r"C:\Users_100%")
+    statement = select(SqlConversationItem.id).where(
+        _visible_search_match_predicate(pattern, dialect_name)
+    )
+    compiled = statement.compile(dialect=dialect)
+    assert operator in str(compiled)
+    assert "lower(conversation_items.search_text)" not in str(compiled).lower()
+    assert pattern in compiled.params.values()
+
+
+@pytest.mark.parametrize(
+    "role,message",
+    [
+        ("user", "Explain <task-notification><task-id>needle</task-id></task-notification>"),
+        ("assistant", "This session is being continued from a previous conversation needle"),
+        ("user", "<TASK-NOTIFICATION><task-id>needle</task-id></TASK-NOTIFICATION>"),
+    ],
+)
+def test_archive_search_keeps_visible_notification_discussions(
+    conversation_store: SqlAlchemyConversationStore, role: str, message: str
+) -> None:
+    conv = conversation_store.create_conversation()
+    [item] = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_visible",
+                data=MessageData(
+                    role=role,
+                    agent="archive-test-agent" if role == "assistant" else None,
+                    content=[
+                        {
+                            "type": "input_text" if role == "user" else "output_text",
+                            "text": message,
+                        }
+                    ],
+                ),
+            )
+        ],
+    )
+    assert [
+        match.id for match in conversation_store.search_visible_items_literal(conv.id, "needle")
+    ] == [item.id]

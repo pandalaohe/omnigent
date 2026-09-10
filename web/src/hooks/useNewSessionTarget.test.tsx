@@ -12,6 +12,18 @@ beforeEach(() => localStorage.clear());
 afterEach(cleanup);
 
 describe("useNewSessionTarget", () => {
+  it("keeps the stored project route while the project list is loading", () => {
+    writeNewSessionTarget({
+      kind: "project",
+      projectId: "prj_alpha",
+      projectName: "Alpha",
+    });
+
+    const { result } = renderHook(() => useNewSessionTarget(undefined));
+
+    expect(result.current.route).toBe("/?project=Alpha");
+  });
+
   it("updates a renamed project and clears a deleted target for every subscriber", async () => {
     writeNewSessionTarget({ kind: "project", projectId: "prj_alpha", projectName: "Old name" });
     const { result, rerender } = renderHook(({ projects }) => useNewSessionTarget(projects), {

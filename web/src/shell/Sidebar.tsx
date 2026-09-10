@@ -234,6 +234,17 @@ import { getEmbedRoot } from "../lib/host";
 const SESSION_STATE_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute top-1/2 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
+function isPlainNavigationClick(event: MouseEvent<HTMLAnchorElement>): boolean {
+  return (
+    !event.defaultPrevented &&
+    event.button === 0 &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey
+  );
+}
+
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
 // from the right edge — lining up vertically with the desktop kebab and the
@@ -809,22 +820,27 @@ function SidebarImpl({
     newSessionProjectName,
   } = useActiveNavItem();
   const onNewSessionComposer = isNewChatPage || newSessionProjectName !== null;
-  const pendingComposerTargetRef = useRef<string | null | undefined>(undefined);
+  const syncedComposerTargetRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
-    if (!onNewSessionComposer || newSessionProjects === undefined) return;
-    const pendingTarget = pendingComposerTargetRef.current;
-    if (pendingTarget !== undefined) {
-      if (pendingTarget !== newSessionProjectName) return;
-      pendingComposerTargetRef.current = undefined;
+    if (!onNewSessionComposer) {
+      syncedComposerTargetRef.current = undefined;
+      return;
     }
+    if (newSessionProjects === undefined) return;
+    const project = newSessionProjects.find(
+      (candidate) => candidate.name === newSessionProjectName,
+    );
+    if (newSessionProjectName !== null && !project) return;
+    // Sync each resolved URL scope once. Another tab may select a different
+    // target; repeatedly reasserting this tab's URL would ping-pong storage.
+    const scope = JSON.stringify([newSessionProjectName, project?.id ?? null]);
+    if (syncedComposerTargetRef.current === scope) return;
+    syncedComposerTargetRef.current = scope;
     if (newSessionProjectName === null) {
       if (newSessionTarget.kind !== "none") selectNoProjectNewSessionTarget();
       return;
     }
-    const project = newSessionProjects.find(
-      (candidate) => candidate.name === newSessionProjectName,
-    );
     if (!project) return;
     if (
       newSessionTarget.kind === "project" &&
@@ -845,7 +861,6 @@ function SidebarImpl({
 
   const selectProjectTarget = useCallback(
     (project: { id: string | null; name: string }) => {
-      if (onNewSessionComposer) pendingComposerTargetRef.current = project.name;
       selectProjectNewSessionTarget(project);
       if (!onNewSessionComposer) return;
       navigate(
@@ -859,7 +874,6 @@ function SidebarImpl({
     [navigate, onNewSessionComposer, selectProjectNewSessionTarget],
   );
   const selectNoProjectTarget = useCallback(() => {
-    if (onNewSessionComposer) pendingComposerTargetRef.current = null;
     selectNoProjectNewSessionTarget();
     if (!onNewSessionComposer) return;
     navigate("/");
@@ -1647,7 +1661,7 @@ function ProjectFolder({
                 className="font-medium text-primary underline-offset-4 hover:underline"
                 onClick={(e) => {
                   e.stopPropagation();
-                  onSelectNewSessionTarget();
+                  if (isPlainNavigationClick(e)) onSelectNewSessionTarget();
                   onRowClick(e);
                 }}
               >
@@ -3990,7 +4004,7 @@ function ConversationRowImpl({
   const firstClassProjectName =
     conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
   const currentProject = firstClassProjectName ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
-  const unfiledWorkspace = currentProject === null ? conversation.workspace?.trim() : "";
+  const unfiledWorkspace = currentProject === null ? conversation.workspace : "";
   // Pinned sessions are lifted OUT of their project folder into the flat
   // "Pinned" section, so the row no longer shows which project it belongs to.
   // For those rows only, surface the project in a hover flyout. Non-pinned
@@ -4843,6 +4857,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "updated_at",
   "git_branch",
   "host_id",
+  "workspace",
   "runner_id",
   "project_id",
   "owner",
@@ -4969,7 +4984,7 @@ function ProjectFolderActions({
                 // Keep the click off the folder's collapse toggle, then run the
                 // shared nav handler (closes the sidebar overlay on mobile).
                 e.stopPropagation();
-                onSelectTarget();
+                if (isPlainNavigationClick(e)) onSelectTarget();
                 onNavigate(e);
               }}
             >
@@ -5018,7 +5033,7 @@ function ProjectFolderMenuItems({
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
             e.stopPropagation();
-            onSelectTarget();
+            if (isPlainNavigationClick(e)) onSelectTarget();
             onNavigate(e);
           }}
         >

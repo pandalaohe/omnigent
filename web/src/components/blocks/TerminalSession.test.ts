@@ -235,6 +235,15 @@ describe("terminalKeyEventPayload", () => {
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
   });
+
+  it("does not synthesize Shift+Enter while an IME owns the key event", () => {
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, isComposing: true })),
+    ).toBeNull();
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, keyCode: 229 })),
+    ).toBeNull();
+  });
 });
 
 describe("terminalSoftKeyPayload", () => {
@@ -940,5 +949,458 @@ describe("TerminalSession", () => {
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
     session.dispose();
+  });
+
+  describe("mobile IME input", () => {
+    function enableTouchInput(): () => void {
+      if ("maxTouchPoints" in navigator) {
+        const spy = vi.spyOn(navigator, "maxTouchPoints", "get").mockReturnValue(1);
+        return () => spy.mockRestore();
+      }
+
+      Object.defineProperty(navigator, "maxTouchPoints", {
+        configurable: true,
+        value: 1,
+      });
+      return () => {
+        Reflect.deleteProperty(navigator, "maxTouchPoints");
+      };
+    }
+
+    function terminalTextarea(container: HTMLElement): HTMLTextAreaElement {
+      const textarea = container.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      if (!textarea) throw new Error("xterm helper textarea was not mounted");
+      return textarea;
+    }
+
+    function processKey(type: "keydown" | "keyup"): KeyboardEvent {
+      return new KeyboardEvent(type, {
+        key: "Process",
+        keyCode: 229,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      });
+    }
+
+    function setTextareaState(
+      textarea: HTMLTextAreaElement,
+      value: string,
+      selectionStart: number,
+      selectionEnd = selectionStart,
+    ): void {
+      textarea.value = value;
+      textarea.setSelectionRange(selectionStart, selectionEnd);
+    }
+
+    function inputEvent(inputType: string, data: string, composed = true): InputEvent {
+      return new InputEvent("input", {
+        inputType,
+        data,
+        bubbles: true,
+        cancelable: true,
+        composed,
+      });
+    }
+
+    function sentInput(socket: FakeWebSocket): string[] {
+      const decoder = new TextDecoder();
+      return socket.sent
+        .filter((frame): frame is Uint8Array => typeof frame !== "string")
+        .map((frame) => decoder.decode(frame));
+    }
+
+    describe("native input semantics", () => {
+      let session: TerminalSession;
+      let socket: FakeWebSocket;
+      let textarea: HTMLTextAreaElement;
+      let restoreTouchInput: () => void;
+
+      beforeEach(() => {
+        vi.useFakeTimers();
+        restoreTouchInput = enableTouchInput();
+        const fixture = makeSession();
+        ({ session, socket } = fixture);
+        textarea = terminalTextarea(fixture.container);
+        socket.open();
+        socket.sent = [];
+      });
+
+      afterEach(() => {
+        session.dispose();
+        restoreTouchInput();
+        vi.useRealTimers();
+      });
+
+      function key(type: "keydown" | "keyup", value = "Process", keyCode = 229): void {
+        textarea.dispatchEvent(
+          new KeyboardEvent(type, {
+            key: value,
+            keyCode,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }
+
+      function setText(value: string, cursor: number, end = cursor): void {
+        textarea.value = value;
+        textarea.setSelectionRange(cursor, end);
+      }
+
+      function input(value: string, cursor: number, data: string, inputType = "insertText"): void {
+        setText(value, cursor);
+        textarea.dispatchEvent(
+          new InputEvent("input", { inputType, data, bubbles: true, composed: true }),
+        );
+      }
+
+      function composition(type: "start" | "update" | "end", data = ""): void {
+        textarea.dispatchEvent(new CompositionEvent(`composition${type}`, { data, bubbles: true }));
+      }
+
+      function sent(): string[] {
+        return socket.sent
+          .filter((frame): frame is Uint8Array => typeof frame !== "string")
+          .map((frame) => new TextDecoder().decode(frame));
+      }
+
+      it("preserves xterm finalization when Enter precedes compositionend", async () => {
+        composition("start");
+        setText("你", 1);
+        composition("update", "你");
+        await vi.advanceTimersByTimeAsync(0);
+        key("keydown", "Enter", 13);
+        expect(sent()).toEqual(["你", "\r"]);
+      });
+
+      it("honors disabled input and removes its listener on disposal", () => {
+        const term = (session as unknown as { term: Terminal }).term;
+        term.options.disableStdin = true;
+        input("！", 1, "！");
+        expect(sent()).toEqual([]);
+        term.options.disableStdin = false;
+        session.dispose();
+        input("！！", 2, "！");
+        expect(sent()).toEqual([]);
+      });
+
+      it("ignores an unchanged replacement and cancels unfinished edits on disposal", async () => {
+        setText("abc", 1, 3);
+        key("keydown");
+        input("abc", 3, "bc", "insertReplacementText");
+        key("keyup");
+        await vi.advanceTimersByTimeAsync(80);
+        expect(sent()).toEqual([]);
+        key("keydown");
+        input("abc。", 4, "。");
+        session.dispose();
+        await vi.advanceTimersByTimeAsync(80);
+        expect(sent()).toEqual([]);
+      });
+    });
+
+    it("reconciles auto-pairs and a following Chinese composition", async () => {
+      vi.useFakeTimers();
+      const restoreTouchInput = enableTouchInput();
+      const { container, session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.sent = [];
+        const textarea = terminalTextarea(container);
+
+        textarea.dispatchEvent(processKey("keydown"));
+        setTextareaState(textarea, "()", 1);
+        textarea.dispatchEvent(inputEvent("insertText", "("));
+        textarea.dispatchEvent(processKey("keyup"));
+
+        expect(sentInput(socket)).toEqual([`()\x1b[D`]);
+
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionstart", {
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        setTextareaState(textarea, "(ni)", 3);
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionupdate", {
+            data: "ni",
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(80);
+        expect(sentInput(socket)).toEqual([`()\x1b[D`]);
+
+        setTextareaState(textarea, "(你)", 2);
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionend", {
+            data: "你",
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        textarea.dispatchEvent(inputEvent("insertCompositionText", "你"));
+        await vi.advanceTimersByTimeAsync(80);
+
+        expect(sentInput(socket)).toEqual([`()\x1b[D`, "你"]);
+      } finally {
+        session.dispose();
+        restoreTouchInput();
+        vi.useRealTimers();
+      }
+    });
+
+    it.each(["key", "composition"])(
+      "commits a pending %s edit before blur clears the textarea",
+      async (kind) => {
+        vi.useFakeTimers();
+        const restoreTouchInput = enableTouchInput();
+        const { container, session, socket } = makeSession();
+        try {
+          socket.open();
+          socket.sent = [];
+          const textarea = terminalTextarea(container);
+          setTextareaState(textarea, "abc", 3);
+          textarea.dispatchEvent(
+            kind === "key"
+              ? processKey("keydown")
+              : new CompositionEvent("compositionstart", { bubbles: true }),
+          );
+          setTextareaState(textarea, "abc，", 4);
+          if (kind === "composition") {
+            textarea.dispatchEvent(
+              new CompositionEvent("compositionend", { data: "，", bubbles: true }),
+            );
+          }
+          textarea.dispatchEvent(
+            inputEvent(kind === "key" ? "insertText" : "insertCompositionText", "，"),
+          );
+          textarea.blur();
+          await vi.advanceTimersByTimeAsync(80);
+          expect(sentInput(socket)).toEqual(["，"]);
+        } finally {
+          session.dispose();
+          restoreTouchInput();
+          vi.useRealTimers();
+        }
+      },
+    );
+
+    it("reconciles a selected Unicode tail replacement", async () => {
+      vi.useFakeTimers();
+      const restoreTouchInput = enableTouchInput();
+      const { container, session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.sent = [];
+        const textarea = terminalTextarea(container);
+
+        textarea.dispatchEvent(processKey("keydown"));
+        setTextareaState(textarea, "A😀B", 4);
+        textarea.dispatchEvent(inputEvent("insertText", "A😀B"));
+        textarea.dispatchEvent(processKey("keyup"));
+        expect(sentInput(socket)).toEqual(["A😀B"]);
+
+        socket.sent = [];
+        setTextareaState(textarea, "A😀B", 1, 4);
+        textarea.dispatchEvent(
+          new InputEvent("beforeinput", {
+            inputType: "insertReplacementText",
+            data: "你",
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+          }),
+        );
+        setTextareaState(textarea, "A你", 2);
+        textarea.dispatchEvent(inputEvent("insertReplacementText", "你"));
+        await vi.advanceTimersByTimeAsync(80);
+
+        expect(sentInput(socket)).toEqual(["\x7f\x7f你"]);
+      } finally {
+        session.dispose();
+        restoreTouchInput();
+        vi.useRealTimers();
+      }
+    });
+
+    it("sends a completed composition before an immediate Enter", async () => {
+      vi.useFakeTimers();
+      const restoreTouchInput = enableTouchInput();
+      const { container, session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.sent = [];
+        const textarea = terminalTextarea(container);
+
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionstart", {
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        setTextareaState(textarea, "ni", 2);
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionupdate", {
+            data: "ni",
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+
+        setTextareaState(textarea, "你", 1);
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionend", {
+            data: "你",
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        textarea.dispatchEvent(inputEvent("insertCompositionText", "你"));
+        textarea.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Enter",
+            code: "Enter",
+            keyCode: 13,
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+          }),
+        );
+        textarea.dispatchEvent(
+          new KeyboardEvent("keyup", {
+            key: "Enter",
+            code: "Enter",
+            keyCode: 13,
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(80);
+
+        expect(sentInput(socket)).toEqual(["你", "\r"]);
+      } finally {
+        session.dispose();
+        restoreTouchInput();
+        vi.useRealTimers();
+      }
+    });
+
+    it("ignores a late 229 key after compositionend", async () => {
+      vi.useFakeTimers();
+      const restoreTouchInput = enableTouchInput();
+      const { container, session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.sent = [];
+        const textarea = terminalTextarea(container);
+
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionstart", {
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        setTextareaState(textarea, "ni", 2);
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionupdate", {
+            data: "ni",
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+
+        setTextareaState(textarea, "你", 1);
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionend", {
+            data: "你",
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        textarea.dispatchEvent(inputEvent("insertCompositionText", "你"));
+        textarea.dispatchEvent(processKey("keydown"));
+        textarea.dispatchEvent(processKey("keyup"));
+        await vi.advanceTimersByTimeAsync(80);
+
+        expect(sentInput(socket)).toEqual(["你"]);
+      } finally {
+        session.dispose();
+        restoreTouchInput();
+        vi.useRealTimers();
+      }
+    });
+
+    it("commits a 229 edit after 80ms when keyup is missing", async () => {
+      vi.useFakeTimers();
+      const restoreTouchInput = enableTouchInput();
+      const { container, session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.sent = [];
+        const textarea = terminalTextarea(container);
+
+        textarea.dispatchEvent(processKey("keydown"));
+        setTextareaState(textarea, "，", 1);
+        textarea.dispatchEvent(inputEvent("insertText", "，"));
+
+        await vi.advanceTimersByTimeAsync(79);
+        expect(sentInput(socket)).toEqual([]);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(sentInput(socket)).toEqual(["，"]);
+      } finally {
+        session.dispose();
+        restoreTouchInput();
+        vi.useRealTimers();
+      }
+    });
+
+    it("cancels a pending 229 commit when the session is disposed", async () => {
+      vi.useFakeTimers();
+      const restoreTouchInput = enableTouchInput();
+      const { container, session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.sent = [];
+        const textarea = terminalTextarea(container);
+
+        textarea.dispatchEvent(processKey("keydown"));
+        setTextareaState(textarea, "。", 1);
+        textarea.dispatchEvent(inputEvent("insertText", "。"));
+        session.dispose();
+        await vi.advanceTimersByTimeAsync(80);
+
+        expect(sentInput(socket)).toEqual([]);
+      } finally {
+        session.dispose();
+        restoreTouchInput();
+        vi.useRealTimers();
+      }
+    });
+
+    it("sends every repeated input-only punctuation mark exactly once", () => {
+      const restoreTouchInput = enableTouchInput();
+      const { container, session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.sent = [];
+        const textarea = terminalTextarea(container);
+
+        setTextareaState(textarea, "！", 1);
+        textarea.dispatchEvent(inputEvent("insertText", "！"));
+        setTextareaState(textarea, "！！", 2);
+        textarea.dispatchEvent(inputEvent("insertText", "！"));
+
+        expect(sentInput(socket)).toEqual(["！", "！"]);
+      } finally {
+        session.dispose();
+        restoreTouchInput();
+      }
+    });
   });
 });
