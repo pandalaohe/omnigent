@@ -897,5 +897,53 @@ describe("TerminalSession", () => {
       textarea.blur();
       expect(sent()).toEqual(["，", "。"]);
     });
+    it("keeps preedit local and commits Chinese inside a pair once", async () => {
+      key("keydown");
+      input("()", 1, "(");
+      key("keyup");
+      composition("start");
+      setText("(ni)", 3);
+      composition("update", "ni");
+      input("(ni)", 3, "ni", "insertCompositionText");
+      await vi.advanceTimersByTimeAsync(20);
+      expect(textarea.parentElement!.querySelector(".composition-view")).toHaveTextContent("ni");
+      expect(sent()).toEqual([`()\x1b[D`]);
+      input("(你)", 2, "你", "insertCompositionText");
+      composition("end", "你");
+      await vi.advanceTimersByTimeAsync(80);
+      expect(sent()).toEqual([`()\x1b[D`, "你"]);
+    });
+
+    it.each(["Enter", "Process"])("settles composition before a following %s", async (nextKey) => {
+      composition("start");
+      setText("你", 1);
+      composition("end", "你");
+      input("你", 1, "你", "insertCompositionText");
+      key("keydown", nextKey, nextKey === "Enter" ? 13 : 229);
+      key("keyup", nextKey, nextKey === "Enter" ? 13 : 229);
+      await vi.advanceTimersByTimeAsync(80);
+      expect(sent()).toEqual(nextKey === "Enter" ? ["你", "\r"] : ["你"]);
+    });
+
+    it("settles committed composition before native paste", async () => {
+      composition("start");
+      setText("你", 1);
+      composition("end", "你");
+      input("你", 1, "你", "insertCompositionText");
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { getData: () => "paste" } });
+      textarea.dispatchEvent(paste);
+      await vi.advanceTimersByTimeAsync(80);
+      expect(sent()).toEqual(["你", "paste"]);
+    });
+
+    it.each([true, false])("handles blur with committed=%s composition", async (committed) => {
+      composition("start");
+      setText("你", 1);
+      if (committed) composition("end", "你");
+      textarea.blur();
+      await vi.advanceTimersByTimeAsync(80);
+      expect(sent()).toEqual(committed ? ["你"] : []);
+    });
   });
 });
