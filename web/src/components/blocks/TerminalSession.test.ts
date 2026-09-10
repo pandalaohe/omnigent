@@ -760,4 +760,97 @@ describe("TerminalSession", () => {
     expect(observer.observed).toContain(container);
     session.dispose();
   });
+
+  describe("mobile IME input", () => {
+    let session: TerminalSession;
+    let socket: FakeWebSocket;
+    let textarea: HTMLTextAreaElement;
+    let originalTouchPoints: PropertyDescriptor | undefined;
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      originalTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+      Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+      const fixture = makeSession();
+      ({ session, socket } = fixture);
+      textarea = fixture.container.querySelector<HTMLTextAreaElement>("textarea")!;
+      socket.open();
+      socket.sent = [];
+    });
+
+    afterEach(() => {
+      session.dispose();
+      vi.useRealTimers();
+      if (originalTouchPoints)
+        Object.defineProperty(navigator, "maxTouchPoints", originalTouchPoints);
+      else Reflect.deleteProperty(navigator, "maxTouchPoints");
+    });
+
+    function key(type: "keydown" | "keyup", value = "Process", keyCode = 229): void {
+      textarea.dispatchEvent(
+        new KeyboardEvent(type, {
+          key: value,
+          keyCode,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    }
+
+    function setText(value: string, cursor: number, end = cursor): void {
+      textarea.value = value;
+      textarea.setSelectionRange(cursor, end);
+    }
+
+    function input(value: string, cursor: number, data: string, inputType = "insertText"): void {
+      setText(value, cursor);
+      textarea.dispatchEvent(
+        new InputEvent("input", { inputType, data, bubbles: true, composed: true }),
+      );
+    }
+
+    function composition(type: "start" | "update" | "end", data = ""): void {
+      textarea.dispatchEvent(new CompositionEvent(`composition${type}`, { data, bubbles: true }));
+    }
+
+    function sent(): string[] {
+      return socket.sent
+        .filter((frame): frame is Uint8Array => typeof frame !== "string")
+        .map((frame) => new TextDecoder().decode(frame));
+    }
+
+    it("keeps input-only punctuation after composition with no keyup", async () => {
+      key("keydown");
+      composition("start");
+      setText("ni", 2);
+      composition("update", "ni");
+      setText("你", 1);
+      composition("end", "你");
+      input("你", 1, "你", "insertCompositionText");
+      await vi.advanceTimersByTimeAsync(80);
+      input("你！", 2, "！");
+      input("你！！", 3, "！");
+      expect(sent()).toEqual(["你", "！", "！"]);
+    });
+
+    it("preserves xterm finalization when Enter precedes compositionend", async () => {
+      composition("start");
+      setText("你", 1);
+      composition("update", "你");
+      await vi.advanceTimersByTimeAsync(0);
+      key("keydown", "Enter", 13);
+      expect(sent()).toEqual(["你", "\r"]);
+    });
+
+    it("honors disabled input and removes its listener on disposal", () => {
+      const term = (session as unknown as { term: Terminal }).term;
+      term.options.disableStdin = true;
+      input("！", 1, "！");
+      expect(sent()).toEqual([]);
+      term.options.disableStdin = false;
+      session.dispose();
+      input("！！", 2, "！");
+      expect(sent()).toEqual([]);
+    });
+  });
 });
