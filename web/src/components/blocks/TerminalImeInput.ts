@@ -79,6 +79,7 @@ export class TerminalImeInput {
       event.type === "keydown" &&
       event.key === "Enter" &&
       !event.isComposing &&
+      !event.altKey &&
       event.keyCode !== 229
     ) {
       if (this.pending) this.pending.after = this.snapshot();
