@@ -29,6 +29,7 @@ from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
+    ClaudeTaskNotification,
     ClaudeTranscriptItem,
     TranscriptReadResult,
     TranscriptRecordItems,
@@ -6541,6 +6542,609 @@ async def test_subagent_reopened_running_post_retried_without_new_items(
     assert status_posts == [{"status": "running"}]
     assert retried.subagents["retryrun1"].last_status == "running"
     assert retried.subagents["retryrun1"].status_reconcile_pending is False
+
+
+async def test_subagent_task_notification_prose_does_not_reopen_terminal(
+    tmp_path: Path,
+) -> None:
+    """Tool-use-id-less notification prose is scaffolding, not a resume."""
+    t1 = "2026-09-10T13:22:05.710Z"
+    t2 = "2026-09-10T13:23:13.274Z"
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    child_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="prose1",
+        agent_type="Explore",
+        description="nested prose",
+        tool_use_id="toolu_prose",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "prose1": forwarder.SubagentEntry(
+                subagent_id="prose1",
+                child_conversation_id="conv_child_prose",
+                tool_use_id="toolu_prose",
+                byte_offset=child_jsonl.stat().st_size,
+                terminal_status="completed",
+                terminal_output="first completion",
+                terminal_replayed=False,
+                terminal_observed_at=t1,
+                last_status="completed",
+            )
+        }
+    )
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            status_posts.append(body["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=_legacy_event_transport(handler), base_url="http://ap"
+    ) as client:
+        with child_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "isSidechain": True,
+                        "type": "user",
+                        "uuid": "nested-prose",
+                        "timestamp": t2,
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<task-notification>\n"
+                                "<task-id>nested-task</task-id>\n"
+                                "<status>completed</status>\n"
+                                "<result>nested done</result>\n"
+                                "</task-notification>"
+                            ),
+                        },
+                    }
+                )
+                + "\n"
+            )
+        result = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert status_posts == []
+    assert result.subagents["prose1"].terminal_status == "completed"
+    assert result.subagents["prose1"].last_status == "completed"
+
+
+async def test_subagent_plain_newer_user_prompt_reopens_terminal(
+    tmp_path: Path,
+) -> None:
+    """A non-meta user prompt newer than the terminal reopens (non-coordinator path)."""
+    t1 = "2026-09-10T13:22:05.710Z"
+    t2 = "2026-09-10T13:23:13.274Z"
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    child_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="plain1",
+        agent_type="Explore",
+        description="plain follow-up",
+        tool_use_id="toolu_plain",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "plain1": forwarder.SubagentEntry(
+                subagent_id="plain1",
+                child_conversation_id="conv_child_plain",
+                tool_use_id="toolu_plain",
+                byte_offset=child_jsonl.stat().st_size,
+                terminal_status="completed",
+                terminal_output="first completion",
+                terminal_replayed=False,
+                terminal_observed_at=t1,
+                last_status="completed",
+            )
+        }
+    )
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            status_posts.append(body["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=_legacy_event_transport(handler), base_url="http://ap"
+    ) as client:
+        with child_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    _child_prompt_record(
+                        uuid="follow-up",
+                        text="Also check the second host.",
+                        timestamp=t2,
+                    )
+                )
+                + "\n"
+            )
+        result = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert status_posts == [{"status": "running"}]
+    assert result.subagents["plain1"].terminal_status is None
+    assert result.subagents["plain1"].last_status == "running"
+
+
+def test_call_output_evidence_keeps_notification_timestamp() -> None:
+    """A rebuilt result must not clobber a timestamped notification entry."""
+    notification = ClaudeTaskNotification(
+        task_id="ev1",
+        tool_use_id="toolu_ev",
+        status="completed",
+        result="notified result",
+        replayed=False,
+        timestamp="2026-09-10T13:22:05.710Z",
+    )
+    result = TranscriptReadResult(
+        byte_offset=0,
+        line_cursor=0,
+        current_response_id=None,
+        items=[
+            ClaudeTranscriptItem(
+                source_id="call",
+                item_type="function_call",
+                data={"name": "Agent", "call_id": "toolu_ev"},
+                response_id="resp",
+            ),
+            ClaudeTranscriptItem(
+                source_id="output",
+                item_type="function_call_output",
+                data={
+                    "call_id": "toolu_ev",
+                    "output": "rebuilt result",
+                    "tool_status": "completed",
+                },
+                response_id="resp",
+            ),
+        ],
+        task_notifications=(notification,),
+    )
+
+    evidence = forwarder._structured_terminal_evidence(result)
+
+    assert evidence["toolu_ev"] == (
+        "completed",
+        "notified result",
+        "2026-09-10T13:22:05.710Z",
+    )
+    assert evidence["ev1"] == (
+        "completed",
+        "notified result",
+        "2026-09-10T13:22:05.710Z",
+    )
+
+
+async def test_subagent_v2_recovery_keeps_notification_timestamp_for_resume(
+    tmp_path: Path,
+) -> None:
+    """Recovery persists observed_at despite a same-key rebuilt result."""
+    t1 = "2026-09-10T13:22:05.710Z"
+    t2 = "2026-09-10T13:23:13.274Z"
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "spawn-call",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_ev2",
+                                    "name": "Agent",
+                                    "input": {"description": "historical"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "spawn-result",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_ev2",
+                                    "content": "historical result",
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                        "toolUseResult": {
+                            "status": "completed",
+                            "isAsync": True,
+                            "isError": False,
+                        },
+                    }
+                ),
+                json.dumps(
+                    _task_notification_record(
+                        task_id="ev2",
+                        tool_use_id="toolu_ev2",
+                        status="completed",
+                        result="notified result",
+                        timestamp=t1,
+                    )
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="ev2",
+        agent_type="Explore",
+        description="evidence precedence",
+        tool_use_id="toolu_ev2",
+    )
+    parent_size = transcript_path.stat().st_size
+    parent_lines = transcript_path.read_text(encoding="utf-8").count("\n")
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "ev2": forwarder.SubagentEntry(
+                subagent_id="ev2",
+                child_conversation_id="conv_child_ev2",
+                tool_use_id="toolu_ev2",
+                last_status="running",
+            )
+        },
+        parent_byte_offset=parent_size,
+        parent_line_cursor=parent_lines,
+        terminal_recovery_version=1,
+    )
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            status_posts.append(body["data"])
+        return httpx.Response(202, json={})
+
+    trackers = {
+        "start_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+        "item_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+        "status_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+    }
+    async with httpx.AsyncClient(
+        transport=_legacy_event_transport(handler), base_url="http://ap"
+    ) as client:
+        recovered = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            **trackers,
+        )
+        assert recovered.subagents["ev2"].terminal_status == "completed"
+        assert recovered.subagents["ev2"].terminal_observed_at == t1
+        child_jsonl = (
+            transcript_path.parent / transcript_path.stem / "subagents" / "agent-ev2.jsonl"
+        )
+        with child_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    _child_resume_record(
+                        uuid="sendmessage-resume",
+                        text=(
+                            "The coordinator sent a message while you were working:\n"
+                            "Resume where you stopped."
+                        ),
+                        timestamp=t2,
+                    )
+                )
+                + "\n"
+            )
+        reopened = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=recovered,
+            agent_name="claude-native-ui",
+            **trackers,
+        )
+
+    assert status_posts[0] == {
+        "status": "completed",
+        "output": "notified result",
+        "replayed": True,
+    }
+    assert status_posts[-1] == {"status": "running"}
+    assert reopened.subagents["ev2"].terminal_status is None
+    assert reopened.subagents["ev2"].last_status == "running"
+
+
+async def test_subagent_resume_equal_instant_different_precision_does_not_reopen(
+    tmp_path: Path,
+) -> None:
+    """The same instant in µs precision is not newer than its ms stamp."""
+    t1 = "2026-09-10T13:26:05.710Z"
+    t2 = "2026-09-10T13:26:05.710000Z"
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    child_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="prec1",
+        agent_type="Explore",
+        description="precision tie",
+        tool_use_id="toolu_prec",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "prec1": forwarder.SubagentEntry(
+                subagent_id="prec1",
+                child_conversation_id="conv_child_prec",
+                tool_use_id="toolu_prec",
+                byte_offset=child_jsonl.stat().st_size,
+                terminal_status="completed",
+                terminal_output="first completion",
+                terminal_replayed=False,
+                terminal_observed_at=t1,
+                last_status="completed",
+            )
+        }
+    )
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            status_posts.append(body["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=_legacy_event_transport(handler), base_url="http://ap"
+    ) as client:
+        with child_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    _child_resume_record(
+                        uuid="sendmessage-resume",
+                        text=(
+                            "The coordinator sent a message while you were working:\n"
+                            "Resume where you stopped."
+                        ),
+                        timestamp=t2,
+                    )
+                )
+                + "\n"
+            )
+        result = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert status_posts == []
+    assert result.subagents["prec1"].terminal_status == "completed"
+    assert result.subagents["prec1"].last_status == "completed"
+
+
+async def test_subagent_resume_submillisecond_precision_reopens(
+    tmp_path: Path,
+) -> None:
+    """A strictly later instant reopens even without millisecond precision."""
+    cases = [
+        ("2026-09-10T13:26:05.710Z", "2026-09-10T13:26:05.710999Z"),
+        ("2026-09-10T13:26:05Z", "2026-09-10T13:26:05.001Z"),
+    ]
+    for index, (observed_at, resume_at) in enumerate(cases):
+        subagent_id = f"subms{index}"
+        bridge_dir = tmp_path / f"bridge-{index}"
+        transcript_path = tmp_path / f"session-{index}.jsonl"
+        transcript_path.write_text("", encoding="utf-8")
+        child_jsonl = _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id=subagent_id,
+            agent_type="Explore",
+            description="sub-millisecond resume",
+            tool_use_id="toolu_subms",
+        )
+        state = forwarder.SubagentForwardState(
+            subagents={
+                subagent_id: forwarder.SubagentEntry(
+                    subagent_id=subagent_id,
+                    child_conversation_id=f"conv_child_{subagent_id}",
+                    tool_use_id="toolu_subms",
+                    byte_offset=child_jsonl.stat().st_size,
+                    terminal_status="completed",
+                    terminal_output="first completion",
+                    terminal_replayed=False,
+                    terminal_observed_at=observed_at,
+                    last_status="completed",
+                )
+            }
+        )
+        status_posts: list[dict[str, Any]] = []
+
+        def handler(
+            request: httpx.Request, _posts: list[dict[str, Any]] = status_posts
+        ) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            if body.get("type") == "external_session_status":
+                _posts.append(body["data"])
+            return httpx.Response(202, json={})
+
+        async with httpx.AsyncClient(
+            transport=_legacy_event_transport(handler), base_url="http://ap"
+        ) as client:
+            with child_jsonl.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        _child_resume_record(
+                            uuid="sendmessage-resume",
+                            text=(
+                                "The coordinator sent a message while you were working:\n"
+                                "Resume where you stopped."
+                            ),
+                            timestamp=resume_at,
+                        )
+                    )
+                    + "\n"
+                )
+            result = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            )
+
+        assert status_posts == [{"status": "running"}]
+        assert result.subagents[subagent_id].terminal_status is None
+        assert result.subagents[subagent_id].last_status == "running"
+
+
+async def test_subagent_garbage_timestamp_never_reorders(
+    tmp_path: Path,
+) -> None:
+    """Unparsable timestamps are unknown: no reopen, no parked override."""
+    t1 = "2026-09-10T13:22:05.710Z"
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    child_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="garb1",
+        agent_type="Explore",
+        description="garbage timestamps",
+        tool_use_id="toolu_garb",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "garb1": forwarder.SubagentEntry(
+                subagent_id="garb1",
+                child_conversation_id="conv_child_garb",
+                tool_use_id="toolu_garb",
+                byte_offset=child_jsonl.stat().st_size,
+                terminal_status="completed",
+                terminal_output="settled",
+                terminal_replayed=False,
+                terminal_observed_at=t1,
+                last_status="completed",
+            )
+        },
+        pending_terminal_notifications={
+            "garb1": ("failed", "garbage override", False, "not-a-timestamp"),
+        },
+    )
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_session_status":
+            status_posts.append(body["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=_legacy_event_transport(handler), base_url="http://ap"
+    ) as client:
+        with child_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    _child_resume_record(
+                        uuid="sendmessage-resume",
+                        text=(
+                            "The coordinator sent a message while you were working:\n"
+                            "Resume where you stopped."
+                        ),
+                        timestamp="also-not-a-timestamp",
+                    )
+                )
+                + "\n"
+            )
+        result = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert status_posts == []
+    assert result.pending_terminal_notifications == {}
+    assert result.subagents["garb1"].terminal_status == "completed"
+    assert result.subagents["garb1"].terminal_output == "settled"
+    assert result.subagents["garb1"].last_status == "completed"
+
+
+def test_parse_record_timestamp_precision_shapes() -> None:
+    """The timestamp parser normalises every stamp shape Claude emits."""
+    from datetime import datetime, timezone
+
+    parse = forwarder._parse_record_timestamp
+    assert parse(None) is None
+    assert parse("") is None
+    assert parse("not-a-timestamp") is None
+    assert parse("2026-09-10T13:26:05.710Z") == datetime(
+        2026, 9, 10, 13, 26, 5, 710000, tzinfo=timezone.utc
+    )
+    assert parse("2026-09-10T13:26:05.710000Z") == parse("2026-09-10T13:26:05.710Z")
+    assert parse("2026-09-10T13:26:05Z") == datetime(2026, 9, 10, 13, 26, 5, tzinfo=timezone.utc)
+    assert parse("2026-09-10T13:26:05.710+00:00") == parse("2026-09-10T13:26:05.710Z")
+    assert forwarder._record_timestamp_is_newer(
+        "2026-09-10T13:26:05.710999Z", "2026-09-10T13:26:05.710Z"
+    )
+    assert not forwarder._record_timestamp_is_newer(
+        "2026-09-10T13:26:05.710000Z", "2026-09-10T13:26:05.710Z"
+    )
+    assert not forwarder._record_timestamp_is_newer("garbage", "2026-09-10T13:26:05.710Z")
+    assert not forwarder._record_timestamp_is_newer("2026-09-10T13:26:05.710Z", None)
 
 
 async def test_subagent_trailing_assistant_item_does_not_reopen_terminal(

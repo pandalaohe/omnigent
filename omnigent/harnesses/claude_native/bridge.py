@@ -578,6 +578,13 @@ class ClaudeTranscriptItem:
         source=compact`` completion signal follows; the forwarder uses this
         flag to dismiss the stranded "Compacting…" spinner. Never rendered
         as a bubble. Defaults to ``False``.
+    :param is_coordinator_resume: ``True`` only when this item was parsed
+        from a coordinator SendMessage resume record (``isMeta=true`` with
+        ``origin.kind == "coordinator"``). A bridge-local marker in the same
+        pattern as ``is_compact_summary`` — never part of the server
+        payload — so the sub-agent forwarder can tell a real resume prompt
+        apart from other ``is_meta`` user bubbles such as tool-use-id-less
+        task-notification prose. Defaults to ``False``.
     """
 
     source_id: str
@@ -586,6 +593,7 @@ class ClaudeTranscriptItem:
     response_id: str
     is_compact_summary: bool = False
     is_compact_noop: bool = False
+    is_coordinator_resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -7282,6 +7290,7 @@ def _coordinator_resume_items_from_entry(
             "content": [{"type": "input_text", "text": text} for text in texts],
         },
         response_id=fallback_response_id,
+        is_coordinator_resume=True,
     )
     return None, [item]
 

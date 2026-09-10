@@ -14,6 +14,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -2517,13 +2518,12 @@ async def _forward_one_subagent(
                     item_retry_tracker.clear(item_retry_key)
                     if is_new_item and _is_user_resume_item(item):
                         record_timestamp = pending_item.record_timestamp
-                        observed_at = new_entry.terminal_observed_at
-                        if (
-                            record_timestamp is not None
-                            and observed_at is not None
-                            and record_timestamp > observed_at
-                            and (batch_resume_ts is None or record_timestamp > batch_resume_ts)
-                        ):
+                        baseline = (
+                            batch_resume_ts
+                            if batch_resume_ts is not None
+                            else new_entry.terminal_observed_at
+                        )
+                        if _record_timestamp_is_newer(record_timestamp, baseline):
                             batch_resume_ts = record_timestamp
                     delivered = delivered or is_new_item
                 completed_items.append(pending_item)
@@ -2646,21 +2646,60 @@ async def _post_external_recovery_item(
 def _is_user_resume_item(item: ClaudeTranscriptItem) -> bool:
     """Return True for a user prompt shape that may resume a stopped child.
 
-    Both the original spawn prompt and a coordinator SendMessage resume parse
-    as a user-role message with an ``input_text`` block — with or without the
-    ``is_meta`` flag — so shape alone cannot tell them apart. The caller
-    decides by record timestamp order (the resume record is newer than the
-    notification that set the terminal state; the spawn prompt is older).
+    A plain (non-meta) user prompt and a coordinator SendMessage resume
+    (``is_coordinator_resume``) both count; the caller decides by record
+    timestamp order. Any other ``is_meta`` user bubble — e.g. a child's own
+    task-notification prose without a tool-use-id — is CLI scaffolding, not
+    a resume prompt, and never counts regardless of its timestamp.
     Assistant records, tool results (``function_call_output``), and compact
-    summary/noop markers are never resume prompts.
+    summary/noop markers are never resume prompts either.
     """
     if item.item_type != "message" or item.is_compact_summary or item.is_compact_noop:
         return False
     if item.data.get("role") != "user":
         return False
+    if item.data.get("is_meta") is True and not item.is_coordinator_resume:
+        return False
     content = item.data.get("content")
     return isinstance(content, list) and any(
         isinstance(block, dict) and block.get("type") == "input_text" for block in content
+    )
+
+
+def _parse_record_timestamp(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 record timestamp into an aware UTC datetime.
+
+    Native records use millisecond ``...SS.mmmZ`` stamps while rebuilt
+    records use ``datetime.isoformat`` (microseconds, or no fraction when
+    the microsecond is zero), so raw strings are NOT lexicographically
+    comparable (``"05.710Z" > "05.710000Z"`` for the same instant).
+    Returns ``None`` for missing or unparsable values; callers treat that
+    as unknown and never reorder on it. Persisted strings stay raw.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _record_timestamp_is_newer(candidate: str | None, baseline: str | None) -> bool:
+    """Return True only when both timestamps parse and candidate is later."""
+    if candidate is None or baseline is None:
+        return False
+    parsed_candidate = _parse_record_timestamp(candidate)
+    parsed_baseline = _parse_record_timestamp(baseline)
+    return (
+        parsed_candidate is not None
+        and parsed_baseline is not None
+        and parsed_candidate > parsed_baseline
     )
 
 
@@ -2673,9 +2712,10 @@ def _resume_record_timestamp_after(
     """Return the newest resume-candidate timestamp newer than the terminal.
 
     Only newly delivered (``is_new``) user prompt items count, and only when
-    both their record timestamp and the terminal observation timestamp are
-    known and strictly ordered. Returns ``None`` when nothing in this batch
-    reopens the entry.
+    both their record timestamp and the terminal observation timestamp parse
+    as ISO-8601 and are strictly ordered (raw strings are not comparable
+    across millisecond/microsecond precisions). Returns ``None`` when nothing
+    in this batch reopens the entry.
     """
     if terminal_observed_at is None:
         return None
@@ -2684,11 +2724,8 @@ def _resume_record_timestamp_after(
         if not is_new or not _is_user_resume_item(pending_item.item):
             continue
         record_timestamp = pending_item.record_timestamp
-        if (
-            record_timestamp is not None
-            and record_timestamp > terminal_observed_at
-            and (newest is None or record_timestamp > newest)
-        ):
+        baseline = newest if newest is not None else terminal_observed_at
+        if _record_timestamp_is_newer(record_timestamp, baseline):
             newest = record_timestamp
     return newest
 
@@ -2770,6 +2807,13 @@ def _structured_terminal_evidence(
         ):
             continue
         raw_output = item.data.get("output")
+        # The spawn tool-use id doubles as the Agent call id, so a rebuilt
+        # result can share its key with a timestamped notification entry. The
+        # notification's timestamp orders later resumes and must survive: only
+        # fill absent keys or entries without one.
+        existing = evidence.get(call_id)
+        if existing is not None and existing[2] is not None:
+            continue
         evidence[call_id] = (
             status,
             raw_output if isinstance(raw_output, str) and raw_output else None,
@@ -3554,13 +3598,10 @@ async def _forward_available_subagents(
         else:
             terminal_status, terminal_output, terminal_replayed, observed_at = notification
         if entry.terminal_status is not None:
-            # A parked row only overrides a settled terminal when it is
-            # provably newer; a row without a timestamp never does.
-            if (
-                observed_at is None
-                or entry.terminal_observed_at is None
-                or observed_at <= entry.terminal_observed_at
-            ):
+            # A parked row only overrides a settled terminal when it parses
+            # as provably newer; a missing or unparsable timestamp never
+            # does (raw strings are not comparable across precisions).
+            if not _record_timestamp_is_newer(observed_at, entry.terminal_observed_at):
                 continue
         entries[subagent_id] = replace(
             entry,

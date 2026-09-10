@@ -2945,8 +2945,10 @@ def test_coordinator_sendmessage_resume_surfaces_as_meta_user_item(tmp_path: Pat
         "role": "user",
         "content": [{"type": "input_text", "text": "Inspect the host."}],
     }
+    assert result.items[0].is_coordinator_resume is False
     assert result.items[1].data["role"] == "user"
     assert result.items[1].data["is_meta"] is True
+    assert result.items[1].is_coordinator_resume is True
     assert result.items[1].data["content"] == [
         {
             "type": "input_text",
