@@ -852,5 +852,50 @@ describe("TerminalSession", () => {
       input("！！", 2, "！");
       expect(sent()).toEqual([]);
     });
+
+    it("reconciles a pair at its caret and a selected Unicode replacement", async () => {
+      key("keydown");
+      input("()", 1, "(");
+      key("keyup");
+      expect(sent()).toEqual([`()\x1b[D`]);
+      setText("A😀B", 1, 4);
+      textarea.dispatchEvent(
+        new InputEvent("beforeinput", {
+          inputType: "insertReplacementText",
+          data: "你",
+          bubbles: true,
+        }),
+      );
+      input("A你", 2, "你", "insertReplacementText");
+      await vi.advanceTimersByTimeAsync(80);
+      expect(sent().at(-1)).toBe("\x7f\x7f你");
+    });
+
+    it("ignores an unchanged replacement and cancels unfinished edits on disposal", async () => {
+      setText("abc", 1, 3);
+      key("keydown");
+      input("abc", 3, "bc", "insertReplacementText");
+      key("keyup");
+      await vi.advanceTimersByTimeAsync(80);
+      expect(sent()).toEqual([]);
+      key("keydown");
+      input("abc。", 4, "。");
+      session.dispose();
+      await vi.advanceTimersByTimeAsync(80);
+      expect(sent()).toEqual([]);
+    });
+
+    it("commits when keyup is missing, and before blur clears the textarea", async () => {
+      key("keydown");
+      input("，", 1, "，");
+      await vi.advanceTimersByTimeAsync(79);
+      expect(sent()).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sent()).toEqual(["，"]);
+      key("keydown");
+      input("，。", 2, "。");
+      textarea.blur();
+      expect(sent()).toEqual(["，", "。"]);
+    });
   });
 });
