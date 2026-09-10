@@ -10381,6 +10381,8 @@ async def _tick_subagents(
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": f"item-{i}"} for i, _ in enumerate(body)])
         if body.get("type") == "external_subagent_start":
             sid = body["data"]["subagent_id"]
             return httpx.Response(202, json={"queued": False, "child_session_id": f"conv_{sid}"})
@@ -10538,3 +10540,93 @@ async def test_subagent_registration_stores_tool_use_id_for_nested(
 
     assert state.subagents["root-child"].tool_use_id == "toolu_root"
     assert state.subagents["nested-child"].tool_use_id == "toolu_nested"
+
+
+def _child_text_row(uuid: str, text: str) -> dict[str, Any]:
+    """Build one assistant text row for a child transcript."""
+    return {
+        "isSidechain": True,
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def _backdate_all(state: forwarder.SubagentForwardState) -> forwarder.SubagentForwardState:
+    """Move every entry's activity timestamp into the quiet past."""
+    old = time.time() - 60.0
+    return replace(
+        state,
+        subagents={
+            sid: replace(entry, last_activity_ts=old) for sid, entry in state.subagents.items()
+        },
+    )
+
+
+async def test_root_child_stays_running_until_evidence(tmp_path: Path) -> None:
+    """A quiet root child posts nothing until its Task evidence arrives."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    child_jsonl.write_text(json.dumps(_child_text_row("r1", "work")) + "\n", encoding="utf-8")
+    events: list[dict[str, Any]] = []
+    state = await _tick_subagents(tmp_path, [], events)
+    assert [e["status"] for e in events] == ["running"]
+    state = await _tick_subagents(tmp_path, [], events, _backdate_all(state))
+    assert [e["status"] for e in events] == ["running"]
+    rows = [_terminal_row("a-worker", "toolu_B", "completed")]
+    state = await _tick_subagents(tmp_path, rows, events, state)
+    assert [e["status"] for e in events] == ["running", "idle"]
+    state = await _tick_subagents(tmp_path, [], events, state)
+    assert [e["status"] for e in events] == ["running", "idle"]
+    assert state.subagents["a-worker"].last_status == "idle"
+
+
+async def test_nested_child_keeps_quiescence_idle(tmp_path: Path) -> None:
+    """A quiet nested child still goes idle without evidence."""
+    transcript_path = tmp_path / "session.jsonl"
+    root_jsonl = _seed_worker(transcript_path, "root-child", "toolu_root")
+    nested_jsonl = _seed_worker(transcript_path, "nested-child", "toolu_nested", root_jsonl)
+    nested_jsonl.write_text(json.dumps(_child_text_row("n1", "work")) + "\n", encoding="utf-8")
+    first: list[dict[str, Any]] = []
+    state = await _tick_subagents(tmp_path, [], first)
+    assert [e["status"] for e in first].count("running") == 2
+    events: list[dict[str, Any]] = []
+    state = await _tick_subagents(tmp_path, [], events, _backdate_all(state))
+
+    assert events == [{"status": "idle"}]
+
+
+@pytest.mark.parametrize(
+    ("delivery_error", "tool_use_id", "event"),
+    [
+        (
+            forwarder._SUBAGENT_DROPPED_ITEM_REASON,
+            "toolu_A",
+            {"status": "failed", "output": forwarder._SUBAGENT_DROPPED_ITEM_REASON},
+        ),
+        (None, None, {"status": "idle"}),
+    ],
+)
+async def test_quiescence_edge_for_ungated_children(
+    tmp_path: Path, delivery_error: str | None, tool_use_id: str | None, event: dict[str, Any]
+) -> None:
+    """Delivery errors and id-less entries keep today's quiescence edge."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    child_jsonl.write_text(json.dumps(_child_text_row("r1", "work")) + "\n", encoding="utf-8")
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "a-worker": forwarder.SubagentEntry(
+                subagent_id="a-worker",
+                child_conversation_id="conv_a-worker",
+                tool_use_id=tool_use_id,
+                byte_offset=child_jsonl.stat().st_size,
+                last_activity_ts=time.time() - 60.0,
+                delivery_error=delivery_error,
+            )
+        }
+    )
+    events: list[dict[str, Any]] = []
+    await _tick_subagents(tmp_path, [], events, state)
+
+    assert events == [event]
