@@ -12,7 +12,7 @@ import os
 import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -23,6 +23,7 @@ from omnigent.harnesses.claude_native.bridge import (
     OBSERVER_HOOK_STDERR_FILE,
     ClaudeHookRecord,
     ClaudeMessageDelta,
+    ClaudeTaskNotification,
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptReadResult,
@@ -93,6 +94,18 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # flickering the badge. Phase B will replace this with an authoritative
 # hook signal and drop the heuristic.
 _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+
+# Authoritative stop vocabulary mapped to its ``external_session_status``.
+# The task id survives a resume; the spawn tool-use id is the fallback key.
+_SUBAGENT_TERMINAL_STATUS_POSTS: dict[str, str] = {
+    "completed": "idle",
+    "failed": "failed",
+    "stopped": "failed",
+    "killed": "failed",
+}
+
+# Output of a failed edge that carries no result text.
+_SUBAGENT_FAILED_NO_RESULT_OUTPUT = "Sub-agent ended without reporting a result."
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -533,6 +546,10 @@ class SubagentEntry:
         means no status has been posted yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. Its quiescence edge is ``failed`` instead of ``idle``.
+    :param tool_use_id: Spawn tool-call id (``None`` when unknown).
+    :param terminal_status: Authoritative stop status (``None`` pending evidence).
+    :param terminal_output: Result text from that evidence.
+    :param terminal_observed_at: Notifying record's ``timestamp``.
     """
 
     subagent_id: str
@@ -543,6 +560,10 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    tool_use_id: str | None = None
+    terminal_status: str | None = None
+    terminal_output: str | None = None
+    terminal_observed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -559,9 +580,17 @@ class SubagentForwardState:
         per-sub-agent entry. New sub-agents discovered on disk are
         inserted here after the Omnigent server returns a child
         Conversation id.
+    :param parent_byte_offset: Parent bytes scanned for task evidence.
+    :param parent_line_cursor: Complete parent records scanned.
+    :param pending_terminal_notifications: Terminal evidence keyed by task id.
     """
 
     subagents: dict[str, SubagentEntry]
+    parent_byte_offset: int = 0
+    parent_line_cursor: int = 0
+    pending_terminal_notifications: dict[str, tuple[str, str | None, str | None]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -596,8 +625,9 @@ class _SubagentStateCheckpoint:
     async def put(self, entry: SubagentEntry) -> None:
         """Merge and durably write one child cursor without losing peers."""
         async with self._lock:
-            self._state = SubagentForwardState(
-                subagents={**self._state.subagents, entry.subagent_id: entry}
+            self._state = replace(
+                self._state,
+                subagents={**self._state.subagents, entry.subagent_id: entry},
             )
             await _write_subagent_forward_state_async(self._bridge_dir, self._state)
 
@@ -1451,8 +1481,49 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
+            tool_use_id=(
+                row.get("tool_use_id") if isinstance(row.get("tool_use_id"), str) else None
+            ),
+            terminal_status=(
+                row.get("terminal_status") if isinstance(row.get("terminal_status"), str) else None
+            ),
+            terminal_output=(
+                row.get("terminal_output") if isinstance(row.get("terminal_output"), str) else None
+            ),
+            terminal_observed_at=(
+                row.get("terminal_observed_at")
+                if isinstance(row.get("terminal_observed_at"), str)
+                else None
+            ),
         )
-    return SubagentForwardState(subagents=entries)
+    parent_byte_offset = raw.get("parent_byte_offset", 0)
+    if not isinstance(parent_byte_offset, int) or parent_byte_offset < 0:
+        parent_byte_offset = 0
+    parent_line_cursor = raw.get("parent_line_cursor", 0)
+    if not isinstance(parent_line_cursor, int) or parent_line_cursor < 0:
+        parent_line_cursor = 0
+    pending: dict[str, tuple[str, str | None, str | None]] = {}
+    pending_raw = raw.get("pending_terminal_notifications", {})
+    if isinstance(pending_raw, dict):
+        for task_id, notification_row in pending_raw.items():
+            if not isinstance(task_id, str) or not (
+                isinstance(notification_row, list) and len(notification_row) == 3
+            ):
+                continue
+            status, output, observed_at = notification_row
+            if not isinstance(status, str):
+                continue
+            if (output is not None and not isinstance(output, str)) or (
+                observed_at is not None and not isinstance(observed_at, str)
+            ):
+                continue
+            pending[task_id] = (status, output, observed_at)
+    return SubagentForwardState(
+        subagents=entries,
+        parent_byte_offset=parent_byte_offset,
+        parent_line_cursor=parent_line_cursor,
+        pending_terminal_notifications=pending,
+    )
 
 
 def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState) -> None:
@@ -1474,8 +1545,22 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "tool_use_id": entry.tool_use_id,
+                "terminal_status": entry.terminal_status,
+                "terminal_output": entry.terminal_output,
+                "terminal_observed_at": entry.terminal_observed_at,
             }
             for entry in state.subagents.values()
+        },
+        "parent_byte_offset": state.parent_byte_offset,
+        "parent_line_cursor": state.parent_line_cursor,
+        "pending_terminal_notifications": {
+            task_id: [status, output, observed_at]
+            for task_id, (
+                status,
+                output,
+                observed_at,
+            ) in state.pending_terminal_notifications.items()
         },
         "updated_at": time.time(),
     }
@@ -2129,6 +2214,17 @@ async def _forward_one_subagent(
         and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
     ):
         desired_status = "failed" if new_entry.delivery_error else "idle"
+    # Authoritative parent evidence overrides the quiescence guess; a
+    # failed POST retries next tick since ``last_status`` moves on success.
+    desired_output: str | None = None
+    terminal_post = _SUBAGENT_TERMINAL_STATUS_POSTS.get(new_entry.terminal_status or "")
+    if terminal_post is not None:
+        desired_status = terminal_post
+        desired_output = new_entry.terminal_output or (
+            _SUBAGENT_FAILED_NO_RESULT_OUTPUT if terminal_post == "failed" else None
+        )
+    elif desired_status == "failed":
+        desired_output = new_entry.delivery_error
     if desired_status is None or desired_status == new_entry.last_status:
         return
     retry_key = f"subagent_status:{entry.child_conversation_id}"
@@ -2139,7 +2235,7 @@ async def _forward_one_subagent(
             client,
             session_id=entry.child_conversation_id,
             status=desired_status,
-            output=new_entry.delivery_error if desired_status == "failed" else None,
+            output=desired_output,
         )
     except httpx.HTTPError as exc:
         decision = status_retry_tracker.record_failure(retry_key, exc)
@@ -2242,6 +2338,52 @@ def _subagent_parents_by_tool_use(
     for tool_use_id in ambiguous:
         owners.pop(tool_use_id, None)
     return owners
+
+
+def _with_entry(state: SubagentForwardState, entry: SubagentEntry) -> SubagentForwardState:
+    """Return state with one entry inserted, preserving cursor/parked rows."""
+    return replace(state, subagents={**state.subagents, entry.subagent_id: entry})
+
+
+def _apply_terminal_notification(
+    state: SubagentForwardState,
+    notification: ClaudeTaskNotification,
+) -> SubagentForwardState:
+    """Fold terminal evidence into an entry (task id, then tool-use id) or park it."""
+    status = notification.status
+    if status not in _SUBAGENT_TERMINAL_STATUS_POSTS:
+        return state
+    entry = state.subagents.get(notification.task_id or "")
+    if entry is None and notification.tool_use_id is not None:
+        for candidate in state.subagents.values():
+            if candidate.tool_use_id == notification.tool_use_id:
+                entry = candidate
+                break
+    if entry is not None:
+        return _with_entry(
+            state,
+            replace(
+                entry,
+                terminal_status=status,
+                terminal_output=notification.result,
+                terminal_observed_at=notification.timestamp,
+            ),
+        )
+    key = notification.task_id or notification.tool_use_id
+    if key is None:
+        return state
+    current = state.pending_terminal_notifications.get(key)
+    candidate = notification.timestamp
+    baseline = current[2] if current is not None else None
+    if baseline is not None and candidate is not None and candidate < baseline:
+        return state
+    return replace(
+        state,
+        pending_terminal_notifications={
+            **state.pending_terminal_notifications,
+            key: (status, notification.result, candidate),
+        },
+    )
 
 
 async def _forward_available_subagents(
@@ -2367,15 +2509,13 @@ async def _forward_available_subagents(
                             subagent_id,
                             parent_subagent_id,
                         )
-                        updated = SubagentForwardState(
-                            subagents={
-                                **updated.subagents,
-                                subagent_id: SubagentEntry(
-                                    subagent_id=subagent_id,
-                                    child_conversation_id="",
-                                    parent_subagent_id=parent_subagent_id,
-                                ),
-                            }
+                        updated = _with_entry(
+                            updated,
+                            SubagentEntry(
+                                subagent_id=subagent_id,
+                                child_conversation_id="",
+                                parent_subagent_id=parent_subagent_id,
+                            ),
                         )
                         await _write_subagent_forward_state_async(bridge_dir, updated)
                         made_progress = True
@@ -2416,15 +2556,13 @@ async def _forward_available_subagents(
                         delivered_ambiguous=False,
                         http_status=_http_status_for_log(exc),
                     )
-                    updated = SubagentForwardState(
-                        subagents={
-                            **updated.subagents,
-                            subagent_id: SubagentEntry(
-                                subagent_id=subagent_id,
-                                child_conversation_id="",
-                                parent_subagent_id=parent_subagent_id,
-                            ),
-                        }
+                    updated = _with_entry(
+                        updated,
+                        SubagentEntry(
+                            subagent_id=subagent_id,
+                            child_conversation_id="",
+                            parent_subagent_id=parent_subagent_id,
+                        ),
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
@@ -2443,16 +2581,26 @@ async def _forward_available_subagents(
                 )
                 continue
             start_retry_tracker.clear(retry_key)
-            updated = SubagentForwardState(
-                subagents={
-                    **updated.subagents,
-                    subagent_id: SubagentEntry(
-                        subagent_id=subagent_id,
-                        child_conversation_id=child_id,
-                        parent_subagent_id=parent_subagent_id,
-                    ),
-                }
+            entry = SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id=child_id,
+                parent_subagent_id=parent_subagent_id,
+                tool_use_id=meta["toolUseId"],
             )
+            pending_rows = updated.pending_terminal_notifications
+            parked_key = subagent_id if subagent_id in pending_rows else meta["toolUseId"]
+            parked = pending_rows.get(parked_key)
+            if parked is not None:
+                entry = replace(
+                    entry,
+                    terminal_status=parked[0],
+                    terminal_output=parked[1],
+                    terminal_observed_at=parked[2],
+                )
+                remaining = dict(pending_rows)
+                del remaining[parked_key]
+                updated = replace(updated, pending_terminal_notifications=remaining)
+            updated = _with_entry(updated, entry)
             await _write_subagent_forward_state_async(bridge_dir, updated)
             made_progress = True
         if not made_progress:
@@ -2468,6 +2616,27 @@ async def _forward_available_subagents(
                 )
             break
         pending = deferred
+
+    # ── Drain parent task evidence ────────────────────────
+    # Notifications apply by task id, then spawn tool-use id, else park.
+    parent_result = await asyncio.to_thread(
+        read_transcript_items_from_offset,
+        transcript_path,
+        updated.parent_byte_offset,
+        start_line=updated.parent_line_cursor,
+        agent_name=agent_name,
+        include_sidechains=False,
+    )
+    pre_drain = updated
+    for notification in parent_result.task_notifications:
+        updated = _apply_terminal_notification(updated, notification)
+    updated = replace(
+        updated,
+        parent_byte_offset=parent_result.byte_offset,
+        parent_line_cursor=parent_result.line_cursor,
+    )
+    if updated != pre_drain:
+        await _write_subagent_forward_state_async(bridge_dir, updated)
 
     checkpoint = _SubagentStateCheckpoint(bridge_dir, updated)
     semaphore = asyncio.Semaphore(_SUBAGENT_FORWARD_CONCURRENCY)
