@@ -46,7 +46,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPException
@@ -7047,6 +7047,38 @@ def _queued_task_notification_from_entry(entry: _JsonObject) -> ClaudeTaskNotifi
     return _task_notification_from_text(prompt, timestamp=_record_timestamp(entry))
 
 
+def _tool_result_task_notification(entry: _JsonObject) -> ClaudeTaskNotification | None:
+    """Parse a foreground Agent result whose ``toolUseResult`` stopped."""
+    tool_use_result = entry.get("toolUseResult")
+    if not isinstance(tool_use_result, dict):
+        return None
+    status = tool_use_result.get("status")
+    if not isinstance(status, str) or status not in _TERMINAL_BACKGROUND_TASK_STATUSES:
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    agent_id = tool_use_result.get("agentId")
+    task_id = agent_id if isinstance(agent_id, str) and agent_id else None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id")
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            continue
+        return ClaudeTaskNotification(
+            task_id=task_id or tool_use_id,
+            tool_use_id=tool_use_id,
+            status=status,
+            result=_tool_result_output(entry, block),
+            timestamp=_record_timestamp(entry),
+        )
+    return None
+
+
 def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotification]:
     """Extract task notifications without retaining their private path fields."""
     notifications: list[ClaudeTaskNotification] = []
@@ -7078,9 +7110,11 @@ def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotific
             for raw in preserved
             if (parsed := _omnigent_task_notification(raw, timestamp=record_timestamp))
         )
-    rebuilt = _omnigent_tool_result_notification(entry)
-    if rebuilt is not None:
-        notifications.append(rebuilt)
+    tool_result = _omnigent_tool_result_notification(entry) or _tool_result_task_notification(
+        entry
+    )
+    if tool_result is not None:
+        notifications.append(tool_result)
     queued = _queued_task_notification_from_entry(entry)
     if queued is not None:
         notifications.append(queued)
@@ -7090,17 +7124,14 @@ def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotific
 def _dedupe_task_notifications(
     notifications: list[ClaudeTaskNotification],
 ) -> tuple[ClaudeTaskNotification, ...]:
-    """Collapse replayed terminal evidence keyed by its stable tool-use id."""
-    deduped: list[ClaudeTaskNotification] = []
-    seen_tool_use_ids: set[str] = set()
+    """Preserve native run order; reconstructed snapshots may repeat one tool result."""
+    deduped: dict[ClaudeTaskNotification, ClaudeTaskNotification] = {}
     for notification in notifications:
-        tool_use_id = notification.tool_use_id
-        if tool_use_id is not None:
-            if tool_use_id in seen_tool_use_ids:
-                continue
-            seen_tool_use_ids.add(tool_use_id)
-        deduped.append(notification)
-    return tuple(deduped)
+        # Rebuilt tool-result and compaction metadata timestamp their envelopes
+        # separately. They still represent the same historical call outcome.
+        key = replace(notification, timestamp=None) if notification.replayed else notification
+        deduped.setdefault(key, notification)
+    return tuple(deduped.values())
 
 
 def _task_notification_item_data(notification: ClaudeTaskNotification) -> _JsonObject:

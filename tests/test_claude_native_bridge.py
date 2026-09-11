@@ -1459,6 +1459,8 @@ def test_session_serializer_agent_terminal_round_trips_once(
         cwd=tmp_path,
         bridge_dir=tmp_path,
     )
+    for index, record in enumerate(records):
+        record["timestamp"] = f"2026-09-10T13:20:{index:02d}Z"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
         "".join(json.dumps(record) + "\n" for record in records),
