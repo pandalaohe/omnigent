@@ -980,11 +980,14 @@ def register_events_routes(
                 code=ErrorCode.CONFLICT,
             )
         if body.type == _RETRY_SESSION_TYPE:
-            return await _retry_session_single_flight(
-                request=request,
-                session_id=session_id,
-                conversation_store=conversation_store,
-                runner_router=runner_router,
+            return cast(
+                dict[str, bool | str | None],
+                await _retry_session_single_flight(
+                    request=request,
+                    session_id=session_id,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router,
+                ),
             )
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so

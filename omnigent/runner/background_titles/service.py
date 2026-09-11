@@ -124,7 +124,7 @@ class BackgroundTitleProcessManager(Protocol):
         conversation_id: str,
         *,
         only_if_idle_cutoff: float | None = None,
-    ) -> None:
+    ) -> bool | None:
         pass
 
 
