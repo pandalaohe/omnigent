@@ -222,6 +222,7 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 # can tighten the budget.
 _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
+_NATIVE_TERMINAL_RECOVERY_TIMEOUT_S = 60.0
 
 # Settle delay between keystrokes when driving Codex's /permissions popup. The
 # slash-command menu, the popup, and the Full Access confirm sub-dialog are each
@@ -5822,9 +5823,7 @@ def create_runner_app(
             return
         await _ensure_native_terminal_for_turn(conv_id, "claude-native")
         if terminal_registry.get(conv_id, terminal_name, "main") is None:
-            # The ensure swallows its own failures, so an unregistered pane here
-            # means nothing was created and nothing is booting. Waiting cannot
-            # help; let the injection fail fast as it did before.
+            # Nothing was registered, so waiting for the pane cannot help.
             return
         deadline = time.monotonic() + _CLAUDE_PANE_READY_TIMEOUT_S
         while True:
@@ -7901,7 +7900,7 @@ def create_runner_app(
             and name not in _spec_names
         )
 
-        await _ensure_native_terminal_for_turn(conv, harness_name)
+        await _ensure_native_terminal_for_turn(conv, harness_name, lifecycle_locked=True)
 
         startup_envelope = _fresh_session_init_envelope(conv)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
@@ -8074,6 +8073,22 @@ def create_runner_app(
                 server_client=server_client,
                 optional_labels=startup_labels,
             )
+
+        if dispatch is None:
+            try:
+                await _ensure_native_terminal_for_turn(
+                    conv_id, harness_name, lifecycle_locked=True
+                )
+            except (RuntimeError, OSError, httpx.HTTPError) as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "native_terminal_recovery_failed",
+                        "detail": _client_safe_error_detail(
+                            exc, context="native terminal recovery"
+                        ),
+                    },
+                )
 
         agent_version = (
             dispatch.agent_version if dispatch else cast(int | None, body.get("agent_version"))
@@ -9830,7 +9845,9 @@ def create_runner_app(
             content=session_resource_view_to_dict(resource_view),
         )
 
-    async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
+    async def _ensure_native_terminal_for_turn(
+        conv_id: str, harness_name: str | None, *, lifecycle_locked: bool = False
+    ) -> None:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
 
         The native-pane idle reaper may reclaim an idle pane while a session sits
@@ -9840,7 +9857,9 @@ def create_runner_app(
         into a dead tmux target and lose the message. This re-ensures the pane
         first. Idempotent: a no-op when the harness is not a native CLI harness or
         the pane is already live. Reuses ``create_session_terminal``'s
-        ``ensure_native_terminal`` path. Healing restores a live pane, not the
+        ``ensure_native_terminal`` path. Turn setup already holds the lifecycle
+        lock and must use the internal creation entry without acquiring it again.
+        Healing restores a live pane, not the
         CLI's in-context history: a harness that records a resumable chat id may
         relaunch with its own ``--resume``, but continuity is best-effort, and a
         harness without one (kimi — exempt from the reaper, so this only fires
@@ -9902,26 +9921,32 @@ def create_runner_app(
             extra={"session_id": conv_id},
         )
         try:
-            resp = await create_session_terminal(
-                conv_id,
-                cast(
-                    Request,
-                    _BodyRequest(
-                        {
-                            "terminal": terminal_name,
-                            "session_key": "main",
-                            "ensure_native_terminal": True,
-                        }
-                    ),
-                ),
+            create_terminal = (
+                _create_session_terminal_locked if lifecycle_locked else create_session_terminal
             )
+            async with asyncio.timeout(_NATIVE_TERMINAL_RECOVERY_TIMEOUT_S):
+                resp = await create_terminal(
+                    conv_id,
+                    cast(
+                        Request,
+                        _BodyRequest(
+                            {
+                                "terminal": terminal_name,
+                                "session_key": "main",
+                                "ensure_native_terminal": True,
+                            }
+                        ),
+                    ),
+                )
+        except TimeoutError as exc:
+            raise RuntimeError("Native terminal recovery timed out") from exc
         except Exception:
             _logger.exception(
                 "native pane self-heal failed for conv=%s",
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            return
+            raise
         status = getattr(resp, "status_code", 200)
         if status >= 400:
             _logger.warning(
@@ -9931,6 +9956,7 @@ def create_runner_app(
                 terminal_name,
                 extra={"session_id": conv_id},
             )
+            raise RuntimeError(f"Native terminal recovery failed (status {status})")
 
     @app.get("/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
     async def get_session_terminal(
