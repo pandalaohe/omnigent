@@ -1469,6 +1469,7 @@ export function useStopSession() {
     mutationFn: (id: string) => stopSession(id),
     onSuccess: (_data, id) => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ["session", id] });
     },
   });

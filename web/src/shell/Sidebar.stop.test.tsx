@@ -6,10 +6,11 @@
 // ConversationRow in Sidebar.tsx.
 
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -20,6 +21,12 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 const mocks = vi.hoisted(() => ({
   stop: { mutate: vi.fn(), reset: vi.fn(), isPending: false, isError: false },
   runnerOnline: vi.fn<(id: string | undefined) => boolean | undefined>(() => undefined),
+  retry: vi.fn(),
+}));
+
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  retrySession: mocks.retry,
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -117,10 +124,16 @@ function renderSidebar() {
       <TooltipProvider>
         <MemoryRouter initialEntries={["/"]}>
           <Sidebar open={true} onClose={vi.fn()} />
+          <LocationProbe />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
   );
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="location">{location.pathname + location.search}</output>;
 }
 
 /** Open the row's action dropdown (Radix opens on pointerdown, not click). */
@@ -134,6 +147,8 @@ beforeEach(() => {
   mocks.stop.isPending = false;
   mocks.runnerOnline.mockReset();
   mocks.runnerOnline.mockReturnValue(undefined);
+  mocks.retry.mockReset();
+  mocks.retry.mockResolvedValue({ recovered: true });
 });
 
 afterEach(() => {
@@ -214,6 +229,79 @@ describe("sidebar Stop session item", () => {
     renderSidebar();
     openKebab();
     expect(screen.queryByTestId("stop-conversation")).toBeNull();
+    expect(screen.getByTestId("resume-conversation")).toBeInTheDocument();
+  });
+
+  it("resumes from the same menu without sending a message", async () => {
+    mocks.runnerOnline.mockReturnValue(false);
+    mockConversations([HOST_SPAWNED]);
+    renderSidebar();
+    openKebab();
+    fireEvent.click(screen.getByTestId("resume-conversation"));
+    await waitFor(() => expect(mocks.retry).toHaveBeenCalledWith("conv_1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_1?view=terminal"),
+    );
+    expect(mocks.retry).toHaveBeenCalledTimes(1);
+    expect(mocks.stop.mutate).not.toHaveBeenCalled();
+  });
+
+  it("reports failed recovery and keeps the session available for retry", async () => {
+    mocks.runnerOnline.mockReturnValue(false);
+    mocks.retry.mockRejectedValue(new Error("Host is offline"));
+    const notices: string[] = [];
+    const listener = (event: Event) => notices.push((event as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", listener);
+    try {
+      mockConversations([HOST_SPAWNED]);
+      renderSidebar();
+      openKebab();
+      fireEvent.click(screen.getByTestId("resume-conversation"));
+      await waitFor(() =>
+        expect(notices).toContain("Couldn't resume the session: Host is offline"),
+      );
+      expect(screen.getByTestId("location")).toHaveTextContent("/");
+      openKebab();
+      expect(screen.getByTestId("resume-conversation")).not.toHaveAttribute("data-disabled");
+    } finally {
+      window.removeEventListener("omnigent:toast", listener);
+    }
+  });
+
+  it("disables duplicate resume requests while recovery is pending", async () => {
+    mocks.runnerOnline.mockReturnValue(false);
+    mocks.retry.mockReturnValue(new Promise(() => {}));
+    mockConversations([HOST_SPAWNED]);
+    renderSidebar();
+    openKebab();
+    fireEvent.click(screen.getByTestId("resume-conversation"));
+    await waitFor(() => expect(mocks.retry).toHaveBeenCalledTimes(1));
+    openKebab();
+    expect(screen.getByTestId("resume-conversation")).toHaveAttribute("data-disabled");
+    expect(screen.getByTestId("resume-conversation")).toHaveTextContent("Resuming…");
+  });
+
+  it("does not offer resume without a host", () => {
+    mocks.runnerOnline.mockReturnValue(false);
+    mockConversations([{ ...HOST_SPAWNED, host_id: undefined }]);
+    renderSidebar();
+    openKebab();
+    expect(screen.queryByTestId("resume-conversation")).toBeNull();
+  });
+
+  it("disables resume for non-owners", () => {
+    mocks.runnerOnline.mockReturnValue(false);
+    mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com" }]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    openKebab();
+    expect(screen.getByTestId("resume-conversation")).toHaveAttribute("data-disabled");
+    expect(mocks.retry).not.toHaveBeenCalled();
   });
 
   it("is disabled for non-owners even on a stoppable session", () => {

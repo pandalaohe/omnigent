@@ -49,6 +49,7 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlayIcon,
   PlusIcon,
   SearchIcon,
   Settings2Icon,
@@ -76,7 +77,7 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
@@ -168,6 +169,7 @@ import {
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
+import { retrySession } from "@/lib/sessionsApi";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -3453,6 +3455,9 @@ function ConversationMenuItems({
   sharingOff,
   isSingleUser,
   canStop,
+  canResume,
+  resumePending,
+  onResume,
   canMarkUnread,
   currentProject,
   onTogglePinned,
@@ -3481,6 +3486,9 @@ function ConversationMenuItems({
   // with), rather than disabling it like sharingOff does.
   isSingleUser: boolean;
   canStop: boolean;
+  canResume: boolean;
+  resumePending: boolean;
+  onResume: () => void;
   // Whether "Mark as unread" applies: any row not already showing the
   // unread dot (the active thread and running sessions included).
   canMarkUnread: boolean;
@@ -3681,10 +3689,29 @@ function ConversationMenuItems({
             </C.SubContent>
           </C.Sub>
         ))}
-      {/* Stop / Archive / Delete are grouped at the bottom, below a
+      {/* Stop / Resume / Archive / Delete are grouped at the bottom, below a
           divider: lifecycle-ending actions separated from the everyday
           ones above. */}
       <C.Separator />
+      {canResume && (
+        <C.Item
+          data-testid="resume-conversation"
+          disabled={!isOwner || resumePending}
+          onSelect={() => {
+            setMenuOpen(false);
+            onResume();
+          }}
+        >
+          {resumePending ? (
+            <Loader2Icon className="size-3.5 animate-spin" />
+          ) : (
+            <PlayIcon className="size-3.5" />
+          )}
+          <span title={!isOwner ? "Only the session owner can resume this session" : undefined}>
+            {resumePending ? "Resuming…" : "Resume session"}
+          </span>
+        </C.Item>
+      )}
       {/* Stop session — only on stoppable sessions whose runner isn't
         already known-offline (canStop). Owner-gated like Delete:
         non-owners see it disabled with an explanatory tooltip. */}
@@ -3914,6 +3941,7 @@ function ConversationRowImpl({
 }) {
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   // A client-only `temp:` row (navigate-first create window): no server session
   // yet, so per-row mutations are disabled until it's rekeyed to the real id —
   // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
@@ -3939,6 +3967,19 @@ function ConversationRowImpl({
   // through here — the server stops the session itself once the archived
   // flag commits, so a hidden session never keeps a runner alive.
   const stopSession = useStopSession();
+  const resumeSession = useMutation({
+    mutationFn: async () => {
+      const result = await retrySession(conversation.id);
+      if (!result.recovered) throw new Error("No recovery was performed; refresh and try again");
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["session", conversation.id] });
+      navigate(`/c/${conversation.id}?view=terminal`);
+    },
+    onError: (error) => showToast(`Couldn't resume the session: ${error.message}`),
+  });
   const isArchived = conversation.archived === true;
   const [isEditing, setIsEditing] = useState(false);
   // Hold the list's sort order while this row's rename input is open — the
@@ -3985,8 +4026,8 @@ function ConversationRowImpl({
   const isSingleUser = isSingleUserMode(serverInfo);
   // Gates the kebab's "Stop session" item. `false` = runner known-offline
   // (already stopped — hide the destructive control); `undefined` = not yet
-  // observed, don't block. Non-sticky Stop: no "Resume" affordance — the
-  // next message relaunches the runner on a live host.
+  // observed, don't block. A stopped host-bound session offers Resume in the
+  // same menu, without sending another message.
   const runnerOnline = useSessionRunnerOnline(conversation.id);
   const canStop =
     isSessionStoppable({
@@ -3994,6 +4035,7 @@ function ConversationRowImpl({
       hostId: conversation.host_id,
       runnerId: conversation.runner_id,
     }) && runnerOnline !== false;
+  const canResume = !isArchived && Boolean(conversation.host_id) && runnerOnline === false;
 
   // The session's current project NAME, or null when unfiled — drives the
   // kebab submenu label ("Add to project" vs "Move session") and the pinned
@@ -4247,6 +4289,9 @@ function ConversationRowImpl({
     sharingOff,
     isSingleUser,
     canStop,
+    canResume,
+    resumePending: resumeSession.isPending,
+    onResume: () => resumeSession.mutate(),
     canMarkUnread,
     currentProject,
     onTogglePinned,
@@ -4276,23 +4321,21 @@ function ConversationRowImpl({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
-        // Mobile drops the pin + kebab (see the trailing controls below), so it
-        // reserves only what the badge needs — the same width desktop uses at
-        // rest, before hover reveals the controls.
+        // Narrow rows reserve a separate slot for the always-visible menu.
         !selectionMode &&
           (sessionState?.kind === "awaiting"
             ? hasBackgroundActivity && hasGoalMarker
-              ? "pr-[10.25rem]"
+              ? "pr-[10.25rem] max-md:pr-[12.5rem]"
               : hasBackgroundActivity || hasGoalMarker
-                ? "pr-[8.75rem]"
-                : "pr-29"
+                ? "pr-[8.75rem] max-md:pr-44"
+                : "pr-29 max-md:pr-38"
             : compactMarkerCount >= 3
-              ? "pr-17"
+              ? "pr-17 max-md:pr-26"
               : compactMarkerCount === 2
-                ? "pr-12"
+                ? "pr-12 max-md:pr-21"
                 : hasTrailingIndicator
-                  ? "pr-8"
-                  : "pr-2"),
+                  ? "pr-8 max-md:pr-17"
+                  : "pr-2 max-md:pr-11"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -4480,7 +4523,7 @@ function ConversationRowImpl({
         <span
           className={cn(
             SESSION_STATE_SLOT_CLASS,
-            "right-1",
+            "right-1 max-md:right-10",
             unfiledWorkspace && "top-4",
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in
@@ -4519,7 +4562,7 @@ function ConversationRowImpl({
           title="Shared with you"
           className={cn(
             "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
-            hasSessionIndicator ? "right-8" : "right-1",
+            hasSessionIndicator ? "right-8 max-md:right-17" : "right-1 max-md:right-10",
           )}
         >
           <UsersIcon className="size-3.5" aria-hidden="true" />
@@ -4631,14 +4674,10 @@ function ConversationRowImpl({
                 size="icon-xs"
                 aria-label="Conversation actions"
                 data-testid="conversation-actions"
-                // Desktop-only: the chat page's own header menu covers these
-                // per-session actions on mobile, so the row kebab is dropped
-                // there. From `md` up it stays hidden until hover / keyboard
-                // focus, with `aria-expanded` keeping it surfaced while the menu
-                // is open so the trigger doesn't vanish under the cursor.
+                // Keep lifecycle actions reachable on touch-sized screens.
                 className={cn(
                   "text-muted-foreground transition-opacity",
-                  "hidden md:inline-flex",
+                  "inline-flex size-8 md:size-6",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}

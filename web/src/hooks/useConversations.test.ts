@@ -1755,7 +1755,7 @@ describe("fetchPinnedConversations filter-honored detection", () => {
 });
 
 describe("useStopSession invalidation", () => {
-  it("invalidates the conversations list AND the per-session snapshot", async () => {
+  it("refreshes flat and project rows plus the stopped session snapshot", async () => {
     // The endpoint answers POST /v1/sessions/{id}/events → {queued:false}.
     fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
     const queryClient = new QueryClient({
@@ -1771,6 +1771,7 @@ describe("useStopSession invalidation", () => {
 
     // The list refresh keeps the sidebar badge current.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
     // The snapshot refresh is what keeps the header's Stop gate correct:
     // the header merges snapshot fields OVER the list row, so a snapshot
     // left stale at the pre-stop state would clobber the now-stopped
