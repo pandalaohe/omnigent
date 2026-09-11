@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -600,6 +601,7 @@ class _PendingSubagentItem:
     item: ClaudeTranscriptItem
     checkpoint_after: int | None = None
     drop_reason: str | None = None
+    record_timestamp: str | None = None
 
 
 @dataclass
@@ -1881,7 +1883,10 @@ def _pending_items_from_records(
     for record in result.record_items:
         unseen = [item for item in record.items if item.source_id not in seen]
         if unseen:
-            pending.extend(_PendingSubagentItem(item=item) for item in unseen)
+            pending.extend(
+                _PendingSubagentItem(item=item, record_timestamp=record.timestamp)
+                for item in unseen
+            )
             pending[-1] = replace(pending[-1], checkpoint_after=record.next_byte_offset)
         elif pending:
             pending[-1] = replace(pending[-1], checkpoint_after=record.next_byte_offset)
@@ -2016,6 +2021,7 @@ async def _forward_one_subagent(
             break
         drop_reason = batch[0].drop_reason if len(batch) == 1 else None
         completed_items: list[_PendingSubagentItem] = []
+        delivered_now: list[_PendingSubagentItem] = []
         delivered = False
         stop_after_batch = False
         if drop_reason is not None:
@@ -2119,6 +2125,7 @@ async def _forward_one_subagent(
                     retry_individually = True
             else:
                 completed_items.extend(batch)
+                delivered_now.extend(batch)
                 delivered = True
                 item_retry_tracker.clear(retry_key)
         if retry_individually and drop_reason is None:
@@ -2182,6 +2189,7 @@ async def _forward_one_subagent(
                     )
                 else:
                     item_retry_tracker.clear(item_retry_key)
+                    delivered_now.append(pending_item)
                     delivered = True
                 completed_items.append(pending_item)
         had_item = had_item or delivered
@@ -2194,6 +2202,22 @@ async def _forward_one_subagent(
             for pending_item in completed_items
             if pending_item.checkpoint_after is not None
         ]
+        if entry.terminal_status is not None and entry.terminal_observed_at is not None:
+            terminal_ts = entry.terminal_observed_at
+            for delivered_item in delivered_now:
+                if not _is_user_resume_item(delivered_item.item):
+                    continue
+                if not _record_timestamp_is_newer(delivered_item.record_timestamp, terminal_ts):
+                    continue
+                # A newer user prompt reopens the child; this same
+                # checkpoint carries the cursor advance and reopen.
+                new_entry = replace(
+                    new_entry,
+                    terminal_status=None,
+                    terminal_output=None,
+                    terminal_observed_at=None,
+                )
+                break
         new_entry = replace(
             new_entry,
             byte_offset=max(completed_offsets, default=new_entry.byte_offset),
@@ -2207,6 +2231,15 @@ async def _forward_one_subagent(
     delivery_pending = any(item.item.source_id not in seen for item in pending)
     desired_status: str | None = None
     if had_item:
+        desired_status = "running"
+    elif (
+        new_entry.delivery_error is None
+        and new_entry.terminal_status is None
+        and new_entry.last_status in ("idle", "failed")
+        and new_entry.last_activity_ts is not None
+        and now - new_entry.last_activity_ts <= _SUBAGENT_IDLE_QUIESCENCE_S
+    ):
+        # A reopened child retries its running POST while activity is fresh.
         desired_status = "running"
     elif (
         not delivery_pending
@@ -2351,6 +2384,51 @@ def _subagent_parents_by_tool_use(
 def _with_entry(state: SubagentForwardState, entry: SubagentEntry) -> SubagentForwardState:
     """Return state with one entry inserted, preserving cursor/parked rows."""
     return replace(state, subagents={**state.subagents, entry.subagent_id: entry})
+
+
+def _parse_record_timestamp(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 record timestamp into an aware UTC datetime.
+
+    Raw strings are never compared: precisions vary, so this
+    normalizes to UTC first. ``None`` when unparsable.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _record_timestamp_is_newer(candidate: str | None, baseline: str | None) -> bool:
+    """Return True only when both timestamps parse and candidate is later."""
+    if candidate is None or baseline is None:
+        return False
+    parsed = (_parse_record_timestamp(candidate), _parse_record_timestamp(baseline))
+    return parsed[0] is not None and parsed[1] is not None and parsed[0] > parsed[1]
+
+
+def _is_user_resume_item(item: ClaudeTranscriptItem) -> bool:
+    """Return True for a delivered user prompt that may resume a stopped child."""
+    if (
+        item.item_type != "message"
+        or item.is_compact_summary
+        or item.is_compact_noop
+        or item.data.get("role") != "user"
+    ):
+        return False
+    if item.data.get("is_meta") is True and not item.is_coordinator_resume:
+        return False
+    content = item.data.get("content")
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "input_text" for block in content
+    )
 
 
 def _apply_terminal_notification(

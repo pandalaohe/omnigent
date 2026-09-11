@@ -10424,3 +10424,25 @@ def test_line_reader_parses_task_notifications(tmp_path: Path) -> None:
     assert len(result.task_notifications) == 1
     assert result.task_notifications[0].task_id == "a815d"
     assert result.task_notifications[0].timestamp == _TASK_NOTIFICATION_TS
+
+
+def test_offset_reader_surfaces_coordinator_resume(tmp_path: Path) -> None:
+    """A coordinator resume record surfaces as one flagged user message."""
+    entry = {
+        "type": "user",
+        "isMeta": True,
+        "uuid": "resume-1",
+        "timestamp": _TASK_NOTIFICATION_TS,
+        "origin": {"kind": "coordinator"},
+        "message": {"role": "user", "content": "The coordinator sent a message: Keep going."},
+    }
+    result = _read_notifications(tmp_path, [entry])
+
+    assert len(result.items) == 1
+    item = result.items[0]
+    assert item.is_coordinator_resume is True
+    assert item.data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "The coordinator sent a message: Keep going."}],
+    }
+    assert result.record_items[0].timestamp == _TASK_NOTIFICATION_TS

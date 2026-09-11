@@ -578,6 +578,11 @@ class ClaudeTranscriptItem:
         source=compact`` completion signal follows; the forwarder uses this
         flag to dismiss the stranded "Compacting…" spinner. Never rendered
         as a bubble. Defaults to ``False``.
+    :param is_coordinator_resume: ``True`` when this item was parsed
+        from a coordinator SendMessage resume record (``isMeta`` with
+        ``origin.kind == "coordinator"``) — a real user-visible prompt
+        the child must show, and the signal that reopens a finished
+        sub-agent. Never sent to the server; defaults to ``False``.
     """
 
     source_id: str
@@ -586,6 +591,7 @@ class ClaudeTranscriptItem:
     response_id: str
     is_compact_summary: bool = False
     is_compact_noop: bool = False
+    is_coordinator_resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -595,10 +601,12 @@ class TranscriptRecordItems:
     ``next_byte_offset`` is safe to persist only after every item in
     ``items`` has been accepted by the server. Records that produce no visible
     items are included so a forwarder can advance past them without rescanning.
+    ``timestamp`` is the record's ``timestamp``, ordering resumes vs evidence.
     """
 
     next_byte_offset: int
     items: tuple[ClaudeTranscriptItem, ...]
+    timestamp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2731,6 +2739,7 @@ def read_transcript_items_since_with_position(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
+                timestamp=_record_timestamp(entry),
             )
         )
     items = _dedupe_compact_noop_echo(items)
@@ -2739,6 +2748,7 @@ def read_transcript_items_since_with_position(
         TranscriptRecordItems(
             next_byte_offset=record.next_byte_offset,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+            timestamp=record.timestamp,
         )
         for record in record_items
     ]
@@ -2855,6 +2865,7 @@ def read_transcript_items_from_offset(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
+                timestamp=_record_timestamp(entry),
             )
         )
     items = _dedupe_compact_noop_echo(items)
@@ -2863,6 +2874,7 @@ def read_transcript_items_from_offset(
         TranscriptRecordItems(
             next_byte_offset=record.next_byte_offset,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+            timestamp=record.timestamp,
         )
         for record in record_items
     ]
@@ -6805,6 +6817,55 @@ def _record_timestamp(entry: _JsonObject) -> str | None:
     return timestamp if isinstance(timestamp, str) and timestamp else None
 
 
+def _is_coordinator_resume_entry(entry: _JsonObject) -> bool:
+    """Return True for a coordinator SendMessage resume in a child transcript."""
+    origin = entry.get("origin")
+    return (
+        entry.get("isMeta") is True
+        and isinstance(origin, dict)
+        and origin.get("kind") == "coordinator"
+    )
+
+
+def _coordinator_resume_items_from_entry(
+    entry: _JsonObject,
+    *,
+    line_number: int,
+    record_offset: int | None,
+    current_response_id: str | None,
+) -> tuple[str | None, list[ClaudeTranscriptItem]]:
+    """Surface a coordinator resume record as one flagged user message."""
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [
+            text
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance((text := block.get("text")), str)
+        ]
+    else:
+        texts = []
+    if not (texts := [text for text in texts if text]):
+        return current_response_id, []
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    return None, [
+        ClaudeTranscriptItem(
+            source_id=_source_id(source_key, 0, "message"),
+            item_type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": text} for text in texts],
+            },
+            response_id=_response_id_from_source(source_key),
+            is_coordinator_resume=True,
+        )
+    ]
+
+
 def _capped_notification_result(value: object) -> str | None:
     """Return *value* capped for notification retention, if it is usable text."""
     if not isinstance(value, str) or not value:
@@ -7069,8 +7130,16 @@ def _user_transcript_items_from_entry(
         items.
     """
     # ``isMeta=true`` carries CLI scaffolding like
-    # ``<local-command-caveat>``; no user-visible content.
+    # ``<local-command-caveat>``; no user-visible content — except a
+    # coordinator resume, which is a real prompt the child must show.
     if entry.get("isMeta") is True:
+        if _is_coordinator_resume_entry(entry):
+            return _coordinator_resume_items_from_entry(
+                entry,
+                line_number=line_number,
+                record_offset=record_offset,
+                current_response_id=current_response_id,
+            )
         return current_response_id, []
     message = entry["message"]
     content = message.get("content") if isinstance(message, dict) else None
