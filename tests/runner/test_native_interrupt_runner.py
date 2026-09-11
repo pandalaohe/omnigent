@@ -269,11 +269,30 @@ async def test_codex_and_pi_stop_route_to_interrupt(
 
 
 @pytest.mark.asyncio
-async def test_codex_interrupt_noop_when_no_bridge_state() -> None:
-    """codex interrupt returns 204 when there is no live bridge state."""
+async def test_codex_interrupt_defers_to_runner_when_no_bridge_state() -> None:
+    """A missing native bridge must not suppress cancellation of runner setup."""
     runner, _ = _make_runner()  # default codex_bridge_state returns None
     resp = await runner.interrupt("codex-native", "conv_cx")
-    assert isinstance(resp, Response) and resp.status_code == 204
+    assert resp is None
+
+
+@pytest.mark.asyncio
+async def test_codex_interrupt_defers_to_runner_before_first_native_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+    from tests.runner.helpers import NullServerClient
+
+    async def idle_bridge(*args, **kwargs):
+        return SimpleNamespace(active_turn_id=None)
+
+    monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _id: tmp_path)
+    monkeypatch.setattr(bridge, "cancel_pending_mcp_startup", lambda _path: [])
+    runner, captured = _make_runner(
+        server_client=NullServerClient(), codex_bridge_state_for_session=idle_bridge
+    )
+    assert await runner.interrupt("codex-native", "conv_cx") is None
+    assert captured["published"] == []
 
 
 @pytest.mark.asyncio

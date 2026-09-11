@@ -562,7 +562,7 @@ class NativeInterruptRunner:
             )
         return Response(status_code=204)
 
-    async def _codex_interrupt(self, conv_id: str) -> Response:
+    async def _codex_interrupt(self, conv_id: str) -> Response | None:
         from omnigent.harnesses.codex_native.app_server import client_for_transport
         from omnigent.harnesses.codex_native.bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -573,7 +573,7 @@ class NativeInterruptRunner:
 
         state = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
-            return Response(status_code=204)
+            return None
         labels = await _session_labels_for_runner_spawn(
             server_client=self._server_client,
             session_id=conv_id,
@@ -584,10 +584,11 @@ class NativeInterruptRunner:
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)
         if state.active_turn_id is None and not pending_mcp:
             self._logger.info(
-                "Codex-native interrupt skipped for %s: no active turn or MCP startup.",
+                "Codex-native interrupt defers to runner cancellation for %s: "
+                "no active turn or MCP startup.",
                 conv_id,
             )
-            return Response(status_code=204)
+            return None
         if pending_mcp:
             self._logger.info(
                 "Codex-native interrupt for %s cancels MCP startup: %s",

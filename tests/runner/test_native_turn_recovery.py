@@ -138,3 +138,55 @@ async def test_terminal_recovery_failure_settles_the_turn(
         assert sid not in app.state.active_turns
         assert not app.state.cli_runtime_lifecycle.lock_for(sid).locked()
         assert not hc.posted_bodies
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+async def test_codex_startup_can_be_cancelled_before_native_turn_exists(
+    event_type: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sid = "b1b2c3d4e5f61234567890abcdef0123"
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridge")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def create_terminal(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return JSONResponse({"id": "terminal_codex_main"})
+
+    monkeypatch.setattr("omnigent.runner.app._ensure_native_terminal", create_terminal)
+    spec = AgentSpec(
+        spec_version=1, name="test", executor=ExecutorSpec(config={"harness": "codex-native"})
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),
+        spec_resolver=AsyncMock(return_value=spec),
+        server_client=NullServerClient(),
+        terminal_registry=TerminalRegistry(),
+    )
+    message = {
+        "type": "message",
+        "agent_id": "test-agent",
+        "harness_override": "codex-native",
+        "content": [{"type": "input_text", "text": "continue"}],
+    }
+    async with _runner_client(app) as client:
+        try:
+            assert (
+                await client.post(f"/v1/sessions/{sid}/events", json=message)
+            ).status_code == 202
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            response = await client.post(f"/v1/sessions/{sid}/events", json={"type": event_type})
+            assert response.status_code == 204
+            assert sid not in app.state.active_turns
+            assert not app.state.cli_runtime_lifecycle.lock_for(sid).locked()
+            entered.clear()
+            assert (
+                await client.post(f"/v1/sessions/{sid}/events", json=message)
+            ).status_code == 202
+            await asyncio.wait_for(entered.wait(), timeout=2)
+        finally:
+            for task in list(app.state.active_turns.values()):
+                if isinstance(task, asyncio.Task):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
