@@ -19,6 +19,9 @@ edit/read access to.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -257,7 +260,7 @@ def test_project_filter_dual_reads_label_and_entity(db_uri: str) -> None:
 # ── Multi-user mode (header auth) — ownership boundary ───────────────────
 
 
-def _multi_user_app(db_uri: str) -> FastAPI:
+def _multi_user_app(db_uri: str, conversation_db_uri: str | None = None) -> FastAPI:
     """Build a header-auth app mounting sessions + projects at ``/v1``."""
     app = FastAPI()
 
@@ -273,7 +276,7 @@ def _multi_user_app(db_uri: str) -> FastAPI:
     project_store = SqlAlchemyProjectStore(db_uri)
     app.include_router(
         create_sessions_router(
-            conversation_store=SqlAlchemyConversationStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri, conversation_db_uri),
             agent_store=SqlAlchemyAgentStore(db_uri),
             auth_provider=auth,
             permission_store=SqlAlchemyPermissionStore(db_uri),
@@ -299,6 +302,78 @@ def _seed_owned_session(db_uri: str, owner: str, title: str = "s") -> str:
 
 def _hdr(user: str) -> dict[str, str]:
     return {"X-Forwarded-Email": user}
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_archive_project_filter_matches_facets_for_authenticated_viewer(
+    db_uri: str, tmp_path: Path, split_database: bool
+) -> None:
+    """Archive resolves the viewer's project without turning access into ownership."""
+    _ensure_agent(db_uri)
+    conversation_db_uri = f"sqlite:///{tmp_path}/conversations.db" if split_database else None
+    store = SqlAlchemyConversationStore(db_uri, conversation_db_uri)
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in (ALICE, BOB):
+        perms.ensure_user(user)
+    projects = SqlAlchemyProjectStore(db_uri)
+    alice_project = projects.create("a" * 32, "Work", ALICE)
+    bob_project = projects.create("b" * 32, "Work", BOB)
+    ids = {}
+    for title, owner, project_id, label, host, archived, shared in [
+        ("filed", ALICE, alice_project.id, None, "1" * 32, True, False),
+        ("other-host", ALICE, alice_project.id, None, "2" * 32, True, False),
+        ("legacy", ALICE, None, "Work", "1" * 32, True, False),
+        ("active", ALICE, alice_project.id, None, "1" * 32, False, False),
+        ("other-project", ALICE, None, "Other", "1" * 32, True, False),
+        ("foreign-project", BOB, bob_project.id, None, "1" * 32, True, True),
+        ("shared-legacy", BOB, None, "Work", "1" * 32, True, True),
+        ("private", BOB, None, "Work", "1" * 32, True, False),
+    ]:
+        conv = store.create_conversation(title=title, agent_id=AGENT_ID)
+        ids[title] = conv.id
+        perms.grant(owner, conv.id, LEVEL_OWNER)
+        if shared:
+            perms.grant(ALICE, conv.id, LEVEL_EDIT)
+        if project_id:
+            store.set_conversation_project(conv.id, project_id)
+        if label:
+            store.set_labels(conv.id, {"omni_project": label})
+        store.set_host_id(conv.id, host, workspace=f"/work/{title}")
+        store.update_conversation(conv.id, archived=archived)
+
+    with TestClient(_multi_user_app(db_uri, conversation_db_uri)) as client:
+        facets = client.get(
+            "/v1/sessions/archived-facets", params={"host_id": "1" * 32}, headers=_hdr(ALICE)
+        )
+        assert facets.status_code == 200
+        assert "Work" in facets.json()["projects"]
+
+        # Both Archive entry points send visibility and archived_only together;
+        # each archive selector also remains supported on its own.
+        for archive_params in [
+            {"visibility": "archived", "archived_only": "true"},
+            {"visibility": "archived"},
+            {"archived_only": "true"},
+        ]:
+            params = {**archive_params, "project": "Work", "host_id": "1" * 32}
+            response = client.get("/v1/sessions", params=params, headers=_hdr(ALICE))
+            assert response.status_code == 200
+            expected = {ids["filed"], ids["legacy"]}
+            if "visibility" in archive_params:
+                expected.add(ids["shared-legacy"])
+            assert {row["id"] for row in response.json()["data"]} == expected
+
+        project_only = client.get(
+            "/v1/sessions",
+            params={"visibility": "archived", "project": "Work"},
+            headers=_hdr(ALICE),
+        )
+        assert {row["id"] for row in project_only.json()["data"]} == {
+            ids["filed"],
+            ids["other-host"],
+            ids["legacy"],
+            ids["shared-legacy"],
+        }
 
 
 def test_owner_can_file_own_session_into_own_project(db_uri: str) -> None:

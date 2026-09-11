@@ -3405,12 +3405,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             archived rows alongside non-archived ones.
         :param project: Filter by project NAME, dual-reading both storage
             paths. A non-empty string returns sessions that EITHER have a
-            first-class membership (``metadata.project_id`` → ``owned_by``'s
+            first-class membership (``metadata.project_id`` → the caller's
             project of this name) OR carry the legacy ``omni_project`` label
             with this value. ``""`` returns sessions with NEITHER (unfiled).
             ``None`` disables the filter. The name→id resolution is scoped to
-            ``owned_by`` (projects are owner-private), so pass ``owned_by``
-            alongside a specific name for the first-class half to resolve.
+            ``owned_by`` when set, otherwise ``accessible_by`` (projects are
+            owner-private). With neither set it resolves no-auth projects.
         :param pinned: When ``True``, restrict to sessions ``pinned_owner`` has
             pinned (their per-user ``omnigent.pinned.<user>`` label — the
             sidebar's Pinned section). ``False`` (default) disables the filter.
@@ -3709,9 +3709,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversation.id.not_in(label_filed),
                     )
                 else:
-                    # Resolve the owner's project of this name → its member ids
-                    # (one join). No such project yields an empty match, so the
-                    # filter collapses to the label match alone (v1 behaviour).
+                    # Archive is access-scoped; resolve the viewer's project
+                    # without requiring an owner-only session filter.
+                    project_owner = owned_by if owned_by is not None else accessible_by
                     member_stmt = (
                         select(SqlConversationMetadata.id)
                         .join(
@@ -3721,7 +3721,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         .where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
                             SqlProject.workspace_id == current_workspace_id(),
-                            SqlProject.user_id == owned_by,
+                            SqlProject.user_id == project_owner,
                             SqlProject.name == project,
                         )
                     )
