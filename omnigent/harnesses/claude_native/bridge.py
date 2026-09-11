@@ -698,7 +698,11 @@ def _goal_state_from_transcript_entry(entry: _JsonObject) -> tuple[bool, str | N
         entry.get("type") == "attachment"
         and isinstance(attachment, dict)
         and attachment.get("type") == "goal_status"
-        and attachment.get("sentinel") is True
+        # Claude's completion attachment omits the activation sentinel.
+        and (
+            attachment.get("sentinel") is True
+            or ("sentinel" not in attachment and attachment.get("met") is True)
+        )
         and isinstance(attachment.get("met"), bool)
         and isinstance(attachment.get("condition"), str)
     ):

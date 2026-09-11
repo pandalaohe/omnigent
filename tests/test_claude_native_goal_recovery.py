@@ -22,7 +22,7 @@ def _goal_status(condition: str, *, met: bool) -> dict[str, object]:
         "attachment": {
             "type": "goal_status",
             "met": met,
-            "sentinel": True,
+            **({} if met else {"sentinel": True}),
             "condition": condition,
         },
     }
@@ -40,6 +40,31 @@ def test_goal_snapshot_uses_latest_complete_structured_event(tmp_path: Path) -> 
     assert snapshot.goal_state_observed is True
     assert snapshot.latest_goal_state is None
     assert snapshot.byte_offset < transcript.stat().st_size
+
+
+@pytest.mark.parametrize("sentinel", [None, True])
+def test_goal_completion_clears_incremental_and_recovered_state(
+    tmp_path: Path, sentinel: bool | None
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    _append(transcript, _goal_status("ship", met=False))
+    active_end = transcript.stat().st_size
+    completion = _goal_status("ship", met=True)
+    attachment = completion["attachment"]
+    assert isinstance(attachment, dict)
+    if sentinel is not None:
+        attachment["sentinel"] = sentinel
+    _append(transcript, completion)
+
+    incremental = bridge.read_transcript_items_from_offset(
+        transcript, active_end, start_line=1, agent_name="claude-native-ui"
+    )
+    recovered = bridge.read_latest_transcript_goal_state(transcript)
+
+    assert incremental.goal_state_observed is True
+    assert incremental.latest_goal_state is None
+    assert recovered.goal_state_observed is True
+    assert recovered.latest_goal_state is None
 
 
 @pytest.mark.parametrize(
@@ -96,6 +121,10 @@ def test_goal_snapshot_uses_latest_complete_structured_event(tmp_path: Path) -> 
             "message": {"role": "user", "content": "Goal set: ship"},
         },
         {"type": "user", "message": {"role": "user", "content": "Goal set: ship"}},
+        {
+            "type": "user",
+            "attachment": {"type": "goal_status", "met": True, "condition": "ship"},
+        },
     ],
 )
 def test_goal_snapshot_ignores_non_authoritative_records(
