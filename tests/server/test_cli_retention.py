@@ -1,5 +1,6 @@
 """Server coordination for Host-scoped idle CLI pools."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -440,6 +441,52 @@ async def test_malformed_or_stale_runner_snapshot_is_unknown_not_family_runtime(
         "unsupported": 0,
         "unknown": 4,
     }
+
+
+@pytest.mark.asyncio
+async def test_cancelled_host_loop_still_tears_down_when_lease_release_fails() -> None:
+    entered_lease = asyncio.Event()
+    reconcile_entries = 0
+    release_calls = 0
+
+    class _HostStore:
+        def claim_cli_retention(self, host_id, token, *, claimed_at, stale_before):
+            assert host_id == "host-a"
+            return True
+
+        def renew_cli_retention(self, host_id, token, *, claimed_at):
+            return True
+
+        def release_cli_retention(self, host_id, token):
+            nonlocal release_calls
+            release_calls += 1
+            if release_calls == 1:
+                raise RuntimeError("database unavailable")
+            return True
+
+    coordinator = CliRetentionCoordinator(
+        host_store=_HostStore(),
+        conversation_store=SimpleNamespace(),
+        runner_router=SimpleNamespace(),
+        scan_interval_seconds=0,
+    )
+
+    async def _parked_reconcile(host_id: str):
+        nonlocal reconcile_entries
+        reconcile_entries += 1
+        async with coordinator.lease_for_host(host_id):
+            entered_lease.set()
+            await asyncio.sleep(3600)
+
+    coordinator.reconcile_host_once = _parked_reconcile  # type: ignore[method-assign]
+    coordinator.trigger("host-a")
+    await asyncio.wait_for(entered_lease.wait(), timeout=5)
+    task = next(iter(coordinator._tasks.values()))
+    await asyncio.wait_for(coordinator.shutdown(), timeout=5)
+
+    assert release_calls >= 1
+    assert reconcile_entries == 1
+    assert task.cancelled()
 
 
 @pytest.mark.asyncio

@@ -157,13 +157,23 @@ class CliRetentionCoordinator:
                 heartbeat.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await heartbeat
-                await asyncio.shield(
-                    asyncio.to_thread(
-                        self._host_store.release_cli_retention,
-                        host_id,
-                        token,
+                try:
+                    await asyncio.shield(
+                        asyncio.to_thread(
+                            self._host_store.release_cli_retention,
+                            host_id,
+                            token,
+                        )
                     )
-                )
+                except Exception:
+                    # Best-effort: a stale claim lapses via claim_cli_retention's
+                    # stale_before predicate, so this must not replace the body's
+                    # exception — least of all a propagating CancelledError.
+                    _logger.warning(
+                        "Could not release CLI retention claim for Host %s",
+                        host_id,
+                        exc_info=True,
+                    )
 
     def trigger(self, host_id: str) -> None:
         """Start one retained reconciliation loop in the caller's workspace context."""
