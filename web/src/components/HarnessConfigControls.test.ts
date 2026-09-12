@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { defaultModelLabel, nativeModelLabel } from "./HarnessConfigControls";
+// Upstream's own label semantics (show the provider model id), tested at the
+// module that holds them. HarnessConfigControls re-points to this branch's
+// advertised-name form while the composer redesign is deferred.
+import { defaultModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
 
 describe("nativeModelLabel", () => {
   it.each([

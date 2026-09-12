@@ -1,6 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
@@ -12,9 +11,18 @@ import { HeaderConversationMenu } from "./HeaderConversationMenu";
 const mocks = vi.hoisted(() => ({
   fetch: vi.fn(),
   showToast: vi.fn(),
+  showArchiveUndoToast: vi.fn(),
 }));
 
 vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
+
+// The success confirmation is the Undo pill, which lives on module state plus
+// the app-level Toaster and so cannot render inside this harness. Its own
+// rendering and Undo wiring are covered by archiveUndoToast.test.tsx; this test
+// owns the PATCH contract, so it asserts the pill was fired for this row.
+vi.mock("./archiveUndoToast", () => ({
+  showArchiveUndoToast: mocks.showArchiveUndoToast,
+}));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => true }));
 
@@ -218,11 +226,10 @@ describe("HeaderConversationMenu archive integration", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
-      expect(mocks.showToast).toHaveBeenCalledOnce();
+      expect(mocks.showArchiveUndoToast).toHaveBeenCalledOnce();
     });
-    const toast = mocks.showToast.mock.calls[0][0] as ReactNode;
-    const toastView = render(<MemoryRouter>{toast}</MemoryRouter>);
-    expect(toastView.container).toHaveTextContent("Session archived. View it in Settings");
+    const [, undoRows] = mocks.showArchiveUndoToast.mock.calls[0] as [unknown, Conversation[]];
+    expect(undoRows.map((row) => row.id)).toEqual(["conv-1"]);
   });
 
   it("stays on the session and restores its cache row when the PATCH fails", async () => {

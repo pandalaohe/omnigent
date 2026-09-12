@@ -24,10 +24,18 @@ const mocks = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
   showToast: vi.fn(),
+  showArchiveUndoToast: vi.fn(),
   fork: vi.fn(),
 }));
 
 vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
+
+// The post-archive confirmation is upstream's Undo pill, driven by module state
+// plus the app-level Toaster. Its own rendering is covered by
+// archiveUndoToast.test.tsx; here we only assert the menu fires it.
+vi.mock("./archiveUndoToast", () => ({
+  showArchiveUndoToast: mocks.showArchiveUndoToast,
+}));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
@@ -41,7 +49,11 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     useTogglePinnedConversation: () => ({ mutate: mocks.togglePinned }),
     useRenameConversation: () => ({ mutate: mocks.rename, isPending: false }),
     useMoveToProject: () => ({ mutate: mocks.moveToProject }),
-    useArchiveConversation: () => ({ mutateAsync: mocks.archive, isPending: false }),
+    useArchiveConversation: () => ({
+      mutate: mocks.archive,
+      mutateAsync: mocks.archive,
+      isPending: false,
+    }),
     useStopAndDeleteConversation: () => ({
       mutate: mocks.deleteConversation,
       isPending: false,
@@ -199,7 +211,7 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
     await waitFor(() => {
       expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
-      expect(mocks.showToast).toHaveBeenCalledOnce();
+      expect(mocks.showArchiveUndoToast).toHaveBeenCalledOnce();
     });
 
     view.unmount();
@@ -222,7 +234,7 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
     await waitFor(() => {
       expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
-      expect(mocks.showToast).toHaveBeenCalledOnce();
+      expect(mocks.showArchiveUndoToast).toHaveBeenCalledOnce();
     });
   });
 

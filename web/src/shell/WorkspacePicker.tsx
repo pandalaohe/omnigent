@@ -795,7 +795,10 @@ export function WorkspacePicker({
             spellCheck={false}
             autoCapitalize="off"
             autoCorrect="off"
-            aria-label="Current folder path"
+            // The address bar is exact-path-only here (it never narrows the
+            // listing), so the label says what Enter does rather than just
+            // naming the field.
+            aria-label="Folder path. Type an absolute path and press Enter to open it."
             tabIndex={pathEditing ? 0 : -1}
             className={`min-w-0 w-full rounded-md bg-muted/60 px-2 py-1 text-base font-medium text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:ring-2 focus:ring-ring ${
               pathEditing ? "block" : "sr-only"
