@@ -1629,6 +1629,12 @@ describe("Sidebar failed session indicator", () => {
   });
 });
 
+// Our project header keeps the collapsed markers on the "use this project"
+// button; the chevron toggle beside it only owns `aria-expanded`.
+function projectMarkers(project: string): HTMLElement {
+  return screen.getByRole("button", { name: `Use ${project} for new sessions` });
+}
+
 describe("Sidebar idle latest-message error", () => {
   beforeEach(() => {
     vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
@@ -1673,7 +1679,9 @@ describe("Sidebar idle latest-message error", () => {
     ]);
     renderSidebar();
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    await within(header).findByRole("img", { name: "Latest message is an error" });
+    await within(projectMarkers("Customer X")).findByRole("img", {
+      name: "Latest message is an error",
+    });
     fireEvent.click(header);
     const row = screen.getByRole("link", { name: "conv_idle_error" }).closest("li")!;
     expect(
@@ -2717,15 +2725,14 @@ describe("Sidebar collapsed project marker", () => {
 
     const header = screen.getByRole("button", { name: /^Customer X/ });
     expect(header).toHaveAttribute("aria-expanded", "false");
-    expect(within(header).getByRole("img", { name: "Latest message is an error" })).toHaveAttribute(
-      "data-state",
-      "error",
-    );
+    expect(
+      within(projectMarkers("Customer X")).getByRole("img", { name: "Latest message is an error" }),
+    ).toHaveAttribute("data-state", "error");
 
     fireEvent.click(header);
 
     expect(header).toHaveAttribute("aria-expanded", "true");
-    expect(within(header).queryByTestId("session-state-badge")).toBeNull();
+    expect(within(projectMarkers("Customer X")).queryByTestId("session-state-badge")).toBeNull();
     const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
     expect(
       within(row).getByRole("img", { name: "Latest message is an error" }),
@@ -2754,12 +2761,14 @@ describe("Sidebar collapsed project marker", () => {
       ]);
       renderSidebar();
 
-      const header = screen.getByRole("button", { name: /^Customer X/ });
-      expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
-        "data-state",
-        "running",
-      );
-      expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+      expect(
+        within(projectMarkers("Customer X")).getByTestId("session-state-badge"),
+      ).toHaveAttribute("data-state", "running");
+      expect(
+        within(projectMarkers("Customer X")).queryByRole("img", {
+          name: "Latest message is an error",
+        }),
+      ).toBeNull();
     },
   );
 
@@ -2777,14 +2786,13 @@ describe("Sidebar collapsed project marker", () => {
     useChatStore.setState({ conversationId: "conv_error", ...startup });
     renderSidebar();
 
-    const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+    expect(within(projectMarkers("Customer X")).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
       "starting",
     );
 
     act(() => useChatStore.setState({ status: "idle", terminalPending: false }));
-    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+    expect(within(projectMarkers("Customer X")).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
       "error",
     );
@@ -2808,15 +2816,18 @@ describe("Sidebar collapsed project marker", () => {
     ]);
     renderSidebar();
 
-    const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+    expect(within(projectMarkers("Customer X")).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
       "awaiting",
     );
     expect(
-      within(header).getByRole("img", { name: "2 approval prompts waiting" }),
+      within(projectMarkers("Customer X")).getByRole("img", { name: "2 approval prompts waiting" }),
     ).toBeInTheDocument();
-    expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+    expect(
+      within(projectMarkers("Customer X")).queryByRole("img", {
+        name: "Latest message is an error",
+      }),
+    ).toBeNull();
   });
 
   it("shows the row's session-state badge on a collapsed project", () => {

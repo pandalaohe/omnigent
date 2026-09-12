@@ -121,7 +121,10 @@ def test_docker_entrypoint_runs_the_schema_initializer(
 
     engine = _Engine()
     calls: list[tuple[object, str]] = []
-    monkeypatch.setattr("sqlalchemy.create_engine", lambda _url: engine)
+    # The engine seam is ``omnigent.db.utils._create_engine``, not SQLAlchemy's
+    # own factory: startup builds the engine there so a Postgres URI resolves
+    # its driver in one place.
+    monkeypatch.setattr(db_utils, "_create_engine", lambda _url: engine)
     monkeypatch.setattr(
         db_utils,
         "_initialize_or_verify_schema",
@@ -132,6 +135,8 @@ def test_docker_entrypoint_runs_the_schema_initializer(
 
     assert calls == [(engine, "postgresql+psycopg://example/omnigent")]
     assert engine.disposed is True
+
+
 def test_run_migrations_uses_central_schema_initializer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -26,15 +26,17 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     """Widen the timestamp and add reaper traversal indexes."""
     inspector = sa.inspect(op.get_bind())
-    deleted_at_type = next(
-        column["type"]
-        for column in inspector.get_columns("hosts")
-        if column["name"] == "deleted_at"
-    )
+    host_columns = {column["name"]: column["type"] for column in inspector.get_columns("hosts")}
     existing_indexes = {index["name"] for index in inspector.get_indexes("hosts")}
 
     with op.batch_alter_table("hosts") as batch_op:
-        if not isinstance(deleted_at_type, sa.BigInteger):
+        # A deployment whose merge revision collided with this lineage's
+        # ``gc1b2c3d4e5f`` never ran the step that creates the column, and the
+        # repair that covers that case can be ordered after this one, so create
+        # it at the widened type rather than widening what is not there.
+        if "deleted_at" not in host_columns:
+            batch_op.add_column(sa.Column("deleted_at", sa.BigInteger(), nullable=True))
+        elif not isinstance(host_columns["deleted_at"], sa.BigInteger):
             batch_op.alter_column(
                 "deleted_at",
                 existing_type=sa.Integer(),
