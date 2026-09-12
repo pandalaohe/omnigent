@@ -1352,7 +1352,10 @@ def register_events_routes(
                 # shape the backstop below can settle (bound stale runner +
                 # running cache edge + still-running/waiting row, which its
                 # conditional store UPDATE requires); anything else confirmed
-                # gone has no backstop row to settle it, so settle it here.
+                # gone has no backstop row to settle it, so settle it here. A
+                # persisted failed row is terminal and is never settled here:
+                # the sticky guard in _publish_status only covers the cache,
+                # so publishing idle would still erase the row's failure.
                 stop_connectivity = await asyncio.to_thread(
                     conversation_store.get_session_connectivity, [session_id]
                 )
@@ -1374,7 +1377,11 @@ def register_events_routes(
                     )
                     == "running"
                 )
-                if not stop_runner_fresh and not stop_backstop_handles:
+                if (
+                    not stop_runner_fresh
+                    and not stop_backstop_handles
+                    and (stop_conv is None or stop_conv.live_status != "failed")
+                ):
                     _publish_status(
                         session_id,
                         "idle",

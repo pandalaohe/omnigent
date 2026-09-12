@@ -2,14 +2,12 @@
 
 Regression tests for the rescue-vs-backstop split in
 ``POST /v1/sessions/{id}/events`` (``stop_session``): the rescue must settle
-every confirmed-gone shape the backstop's conditional store UPDATE cannot
-(cache "running" but the persisted row already idle), while still deferring
-the exact settleable shape to the backstop and leaving a fresh runner alone.
+the confirmed-gone shape the backstop's conditional store UPDATE cannot
+(cache "running" but the persisted row already idle), while never erasing a
+persisted terminal failure.
 """
 
 from __future__ import annotations
-
-import time
 
 import httpx
 import pytest_asyncio
@@ -22,10 +20,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 
 
-def _seed_session(
-    db_uri: str, *, live_status: str, runner_fresh: bool
-) -> str:
-    """Seed one session with a bound runner and the given live status."""
+def _seed_session(db_uri: str, *, live_status: str) -> str:
+    """Seed one session with a bound stale runner and the given live status."""
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     agent_id = generate_agent_id()
@@ -38,8 +34,7 @@ def _seed_session(
     runner_id = f"runner_{conv.id}"
     assert conv_store.set_runner_id(conv.id, runner_id)
     conv_store.set_session_live_status(conv.id, live_status)
-    if runner_fresh:
-        conv_store.touch_runner_liveness([runner_id], int(time.time()))
+    # Leave runner_last_seen unset so the runner reads confirmed-gone.
     _session_status_cache.pop(conv.id, None)
     return conv.id
 
@@ -62,7 +57,7 @@ async def test_stop_settles_stale_cache_when_row_already_idle(
     The backstop's conditional UPDATE matches zero rows here, so the rescue
     must settle it directly instead of deferring.
     """
-    session_id = _seed_session(db_uri, live_status="idle", runner_fresh=False)
+    session_id = _seed_session(db_uri, live_status="idle")
     _session_status_cache[session_id] = "running"
 
     resp = await client.post(
@@ -73,31 +68,25 @@ async def test_stop_settles_stale_cache_when_row_already_idle(
     assert _session_status_cache.get(session_id) == "idle"
 
 
-async def test_stop_settles_running_row_with_stale_runner(
+async def test_stop_leaves_failed_row_with_stale_runner(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """The deferred (backstop-settleable) shape still settles end to end."""
-    session_id = _seed_session(db_uri, live_status="running", runner_fresh=False)
+    """A persisted failure is terminal: stop must not settle it to idle.
+
+    The sticky guard in _publish_status only covers the cache, so the rescue
+    must not publish idle over a failed row (which would erase it via
+    persist_live_status).
+    """
+    session_id = _seed_session(db_uri, live_status="failed")
+    _session_status_cache[session_id] = "running"
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "stop_session", "data": {}},
     )
     assert 200 <= resp.status_code < 300
-    assert _session_status_cache.get(session_id) == "idle"
-
-
-async def test_stop_leaves_running_row_with_fresh_runner(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """A stop that can't reach a still-fresh runner must not force idle."""
-    session_id = _seed_session(db_uri, live_status="running", runner_fresh=True)
-
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "stop_session", "data": {}},
-    )
-    assert 200 <= resp.status_code < 300
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.live_status == "failed"
     assert _session_status_cache.get(session_id) != "idle"
