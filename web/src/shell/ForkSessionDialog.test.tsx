@@ -259,7 +259,12 @@ describe("ForkSessionDialog", () => {
     // the source's agent.
     // A non-native (SDK) source with no agent switch renders no run-config
     // section, so the config arg is an empty object (no run overrides sent).
-    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", "My clone", undefined, undefined, {});
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: "My clone",
+      agentId: undefined,
+      upToResponseId: undefined,
+      config: {},
+    });
     // Session list refreshed so the fork shows in the sidebar, then navigated.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     // A fork inherits the source's project, so the project-folder lists must
@@ -306,7 +311,12 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     // The 4th arg is the truncation point — undefined here would mean the
     // dialog dropped it and the fork silently copied the full history.
-    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, "resp_cut", {});
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: undefined,
+      upToResponseId: "resp_cut",
+      config: {},
+    });
   });
 
   it("omits the title (server derives it) when the field is cleared", async () => {
@@ -323,7 +333,12 @@ describe("ForkSessionDialog", () => {
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     // Whitespace-only → undefined so the server applies "Fork of <title>".
-    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined, {});
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: undefined,
+      upToResponseId: undefined,
+      config: {},
+    });
   });
 
   it("pressing Enter in the title input submits the fork", async () => {
@@ -557,13 +572,12 @@ describe("ForkSessionDialog", () => {
     // it emits `{}` — the server inherits/resets per its own family rule
     // rather than the dialog racing the async model catalog and sending an
     // explicit "default" that would clear the source's model.
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      undefined,
-      "ag_claude_native",
-      undefined,
-      {},
-    );
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: "ag_claude_native",
+      upToResponseId: undefined,
+      config: {},
+    });
   });
 
   it("emits only the run-config fields the user actually changed", async () => {
@@ -585,13 +599,12 @@ describe("ForkSessionDialog", () => {
     fireEvent.click(screen.getByTestId("fork-session-submit"));
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      undefined,
-      "ag_claude_native",
-      undefined,
-      { terminalLaunchArgs: ["--permission-mode", "plan"] },
-    );
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: "ag_claude_native",
+      upToResponseId: undefined,
+      config: { terminalLaunchArgs: ["--permission-mode", "plan"] },
+    });
   });
 
   it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
@@ -614,16 +627,15 @@ describe("ForkSessionDialog", () => {
     fireEvent.click(screen.getByTestId("fork-session-submit"));
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      undefined,
-      "ag_codex_native",
-      undefined,
-      {
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: "ag_codex_native",
+      upToResponseId: undefined,
+      config: {
         terminalLaunchArgs: [],
         codexBypassSandbox: true,
       },
-    );
+    });
   });
 
   it("labels the keep-current option with the source agent's name, not generic text", () => {
@@ -729,7 +741,12 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
       // Name left blank (optional) → undefined so the server derives it.
       // Coding SDK source, no agent switch → no run-config section, empty config.
-      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined, {});
+      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+        title: undefined,
+        agentId: undefined,
+        upToResponseId: undefined,
+        config: {},
+      });
       // Navigation happens even though the launch promise is still pending.
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
       // The launch was kicked off (in the background) on the prefilled host/dir.

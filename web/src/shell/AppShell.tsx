@@ -21,6 +21,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
+import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
@@ -238,6 +239,7 @@ export function AppShell() {
   // of the raw route id so none of them fetch `/v1/sessions/temp:*` during the
   // create window (or on a stale temp reload, before ChatPage redirects).
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
+  const pendingConversation = conversationId != null && serverConversationId == null;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() => {
     if (!conversationId) return "files";
@@ -439,7 +441,13 @@ export function AppShell() {
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
-  const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true);
+  // Restrict the observer to the fields AppShell actually reads: the 30s
+  // refetchInterval otherwise re-renders this whole shell on every background
+  // `isFetching`/`dataUpdatedAt` flap even when the list is unchanged.
+  const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true, {
+    notifyOnChangeProps: ["data", "isLoading"],
+  });
+  const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
   // the active conversation id, which suppresses the notification/badge for
@@ -457,12 +465,16 @@ export function AppShell() {
   useSeedReadState(allConversations);
   const activeConv = useMemo(() => {
     if (!serverConversationId) return null;
-    return (
-      conversationsData?.pages.flatMap((p) => p.data).find((c) => c.id === serverConversationId) ??
-      null
-    );
-  }, [serverConversationId, conversationsData]);
+    return allConversations?.find((c) => c.id === serverConversationId) ?? null;
+  }, [serverConversationId, allConversations]);
   const goalFrameState = showGoalSessionMarkers ? (activeConv?.goal_state ?? null) : null;
+  // A temporary row is display-only: it can supply optimistic breadcrumb
+  // text, but must not participate in permissions, actions, or server hooks.
+  const provisionalConv = useMemo(() => {
+    if (!conversationId || !isTempConvId(conversationId)) return null;
+    const row = allConversations?.find((c) => c.id === conversationId);
+    return row?.provisional === true ? row : null;
+  }, [conversationId, allConversations]);
   // Single-conversation snapshot (shared cache with chatStore.bindStream).
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
@@ -503,7 +515,10 @@ export function AppShell() {
   // snapshot carries ``omnigent.ui``/``omnigent.wrapper`` — without
   // this merge an added claude-native agent loses its terminal-first
   // toggle. Snapshot wins on conflict; spreading undefined is a no-op.
-  const sessionLabels = { ...activeConv?.labels, ...activeSession?.labels };
+  const sessionLabels = useMemo(
+    () => ({ ...activeConv?.labels, ...activeSession?.labels }),
+    [activeConv?.labels, activeSession?.labels],
+  );
   const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
   // Native-CLI wrapper of either family. Keys harness behavior gates
@@ -540,11 +555,14 @@ export function AppShell() {
   // the snapshot, so a parent outside the loaded window shows no folder.
   const { session: parentSession } = useSession(activeSession?.parentSessionId);
   const { data: projectSummaries } = useProjects();
-  const breadcrumbConv = isChildSession ? parentConv : activeConv;
+  const breadcrumbConv = isChildSession ? parentConv : (activeConv ?? provisionalConv);
   const headerConversationTitle =
     breadcrumbConv?.title ||
     (isChildSession ? parentSession?.title : activeSession?.title) ||
     (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ||
+    (isTempConvId(conversationId)
+      ? (optimisticConversationTitle ?? UNTITLED_CONVERSATION_LABEL)
+      : null) ||
     (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
   const headerProjectSummary =
     breadcrumbConv?.project_id != null
@@ -579,6 +597,10 @@ export function AppShell() {
       created_at: activeSession.createdAt,
       updated_at: activeSession.createdAt,
       labels: activeSession.labels ?? {},
+      // The snapshot is the only archived-flag carrier here: an archived
+      // session is absent from the sidebar list, so without this the header
+      // menu would offer "Archive" on an already-archived session.
+      archived: activeSession.archived ?? false,
       permission_level: activeSession.permissionLevel,
       runner_id: activeSession.runnerId ?? null,
       host_id: activeSession.hostId ?? null,
@@ -628,7 +650,8 @@ export function AppShell() {
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
   // Agent tools/policies exist to show.
-  const hasAgentInfo = !!conversationId && agentHasInfo(boundAgent, conversationId);
+  const hasAgentInfo =
+    serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
   // Whether the mobile three-dot menu has any entry to offer.
   const hasHeaderMenu = canShare || hasAgentInfo;
   // The live snapshot is authoritative; the sidebar row is only a fallback
@@ -1911,7 +1934,7 @@ export function AppShell() {
     [canClone],
   );
   const workspacePanelVisible = Boolean(
-    serverConversationId &&
+    conversationId &&
     hasRailContent &&
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
@@ -2074,6 +2097,7 @@ export function AppShell() {
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
+                    pending={pendingConversation}
                     mobileMenu={{
                       fileViewerOpen,
                       panelOpen,
@@ -2109,6 +2133,7 @@ export function AppShell() {
                 <main
                   className="relative flex min-h-0 min-w-0 flex-1 flex-col"
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
+                  data-session-id={conversationId}
                 >
                   <Outlet />
                 </main>
@@ -2137,9 +2162,10 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {serverConversationId && workspacePanelVisible && (
+                {conversationId && workspacePanelVisible && (
                   <WorkspacePanel
-                    conversationId={serverConversationId}
+                    conversationId={conversationId}
+                    pending={pendingConversation}
                     archiveInitialProject={headerProjectName}
                     archiveInitialHostId={livenessRow?.host_id}
                     width={inlinePanelWidth}

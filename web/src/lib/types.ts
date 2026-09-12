@@ -290,6 +290,12 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /**
+   * Whether the session is archived. Carried on the snapshot because it is
+   * the only carrier for a session opened directly by URL — the default
+   * sidebar list excludes archived rows. `false`/absent for active sessions.
+   */
+  archived?: boolean;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -308,8 +314,6 @@ export interface Session {
   updatedAt?: number;
   /** Stable timestamp of the current transition into the archive. */
   archivedAt?: number | null;
-  /** Whether the snapshot currently belongs to the archive. */
-  archived?: boolean;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string

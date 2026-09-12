@@ -8,6 +8,7 @@ import {
 } from "react";
 import {
   ArchiveIcon,
+  ArchiveRestoreIcon,
   ChevronLeftIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -41,6 +42,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   PINNED_LABEL_KEY,
   type Conversation,
@@ -54,9 +56,9 @@ import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { Link, useLocation, useNavigate } from "@/lib/routing";
+import { useLocation, useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
-import { showToast } from "@/components/ui/toast";
+import { showArchiveUndoToast } from "./archiveUndoToast";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -82,21 +84,6 @@ interface HeaderConversationMenuProps {
   workspaceItems?: ReactNode;
 }
 
-function ArchivedToast() {
-  return (
-    <span>
-      Session archived. View it in{" "}
-      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
-        Settings
-      </Link>
-    </span>
-  );
-}
-
-function showArchivedToast() {
-  showToast(<ArchivedToast />);
-}
-
 export function HeaderConversationMenu({
   conversation,
   currentProject,
@@ -113,6 +100,7 @@ export function HeaderConversationMenu({
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
   const location = useLocation();
+  const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
@@ -133,6 +121,7 @@ export function HeaderConversationMenu({
   const currentLocationRef = useRef(location);
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isArchived = conversation.archived === true;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
@@ -206,6 +195,12 @@ export function HeaderConversationMenu({
     if (archiveRequestRef.current || archive.isPending) return;
 
     closeMenu();
+    if (isArchived) {
+      // Unarchiving keeps the user on the session — no redirect home and no
+      // Undo toast (mirrors the sidebar row's Unarchive).
+      archive.mutate({ id: conversation.id, archived: false });
+      return;
+    }
     archiveRequestRef.current = true;
     setArchivePending(true);
     const requestedConversationId = conversation.id;
@@ -237,7 +232,9 @@ export function HeaderConversationMenu({
       return;
     }
 
-    showArchivedToast();
+    // The Undo toast is driven by module state + the app-level Toaster, so it
+    // survives this menu unmounting.
+    showArchiveUndoToast(queryClient, [conversation]);
     navigate("/", { replace: true });
   };
 
@@ -361,8 +358,12 @@ export function HeaderConversationMenu({
         disabled={archivePending || archive.isPending}
         onSelect={archiveConversation}
       >
-        <ArchiveIcon className="size-3.5" />
-        {isMobile ? "Archive this session" : "Archive"}
+        {isArchived ? (
+          <ArchiveRestoreIcon className="size-3.5" />
+        ) : (
+          <ArchiveIcon className="size-3.5" />
+        )}
+        {isArchived ? "Unarchive" : isMobile ? "Archive this session" : "Archive"}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"

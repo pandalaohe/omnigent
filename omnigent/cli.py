@@ -2856,10 +2856,15 @@ def _find_daemon_record(target: str) -> _HostDaemonRecord | None:
     Find a daemon record by target.
 
     :param target: Normalized daemon target, e.g. ``"local"``.
-    :returns: Matching daemon record, or ``None``.
+    :returns: Matching daemon record, including a pre-canonicalization record,
+        or ``None``.
     """
-    for record in _list_daemon_records():
+    records = _list_daemon_records()
+    for record in records:
         if record.target == target:
+            return record
+    for record in records:
+        if _normalize_daemon_target(record.target) == target:
             return record
     return None
 
@@ -3000,7 +3005,7 @@ class _DaemonReuseDecision:
     config_changed: bool
 
 
-def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
+def _daemon_owner_is_live(record: _HostDaemonRecord) -> bool:
     """Whether the daemon that wrote *record* is still alive.
 
     A held record flock is a definitive live owner (the kernel drops it on
@@ -3012,11 +3017,11 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     process is. Reaping therefore requires a free lock and a dead-or-foreign
     PID.
 
-    :param record: Existing daemon record for *target*.
-    :param target: Normalized daemon target, e.g. ``"local"``.
+    :param record: Existing daemon record whose original target identifies the
+        lock path held by its owner.
     :returns: ``True`` if the daemon should be treated as alive.
     """
-    if _record_flock_is_held(_daemon_record_path(target)) is True:
+    if _record_flock_is_held(_daemon_record_path(record.target)) is True:
         return True
     return _pid_is_recorded_daemon(record)
 
@@ -3050,7 +3055,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     existing = _find_daemon_record(target)
     if existing is None:
         return _DaemonReuseDecision(reuse=False, config_changed=False)
-    if not _daemon_owner_is_live(existing, target):
+    if not _daemon_owner_is_live(existing):
         _delete_daemon_record(existing)
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
@@ -3159,7 +3164,7 @@ def _wait_for_daemon_claim(
     deadline = time.monotonic() + timeout_s
     while True:
         record = _find_daemon_record(target)
-        if record is not None and _daemon_owner_is_live(record, target):
+        if record is not None and _daemon_owner_is_live(record):
             return record
         if time.monotonic() >= deadline:
             return None
@@ -3254,7 +3259,7 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     """
     existing = _find_daemon_record(record.target)
     if existing is not None and existing.pid != record.pid:
-        if _daemon_owner_is_live(existing, record.target):
+        if _daemon_owner_is_live(existing):
             return existing
         # Dead, or alive but not our daemon (pid recycled after a reboot):
         # the record is stale, not a conflict — prune it and start normally.
@@ -3270,14 +3275,14 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+            and _daemon_owner_is_live(local_record)
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and not _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+            and not _daemon_owner_is_live(local_record)
         ):
             _delete_daemon_record(local_record)
     return None
@@ -4221,11 +4226,6 @@ def server(
     import uvicorn
     import uvicorn.server
 
-    from omnigent.runner.transports.ws_tunnel.limits import (
-        RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-        TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-    )
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider
     from omnigent.server.server_config import (
@@ -4239,6 +4239,7 @@ def server(
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     cfg = _load_config(config_path)
     title_server_config = cfg
@@ -4564,10 +4565,10 @@ def server(
         host=host,
         port=port,
         log_config=_server_uvicorn_log_config(server_log_path),
-        ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        # Server side of the runner/host tunnels' protocol keepalive, aligned
-        # to the 90 s app-level budget instead of uvicorn's 20 s default that
-        # drops a busy-but-healthy tunnel with 1011 — issue #1116.
+        # Tunnel frame cap + protocol keepalive (30 s/90 s, not uvicorn's 20 s
+        # default that drops a busy-but-healthy tunnel with 1011 — issue #1116).
+        # Shared with the hosted launchers via ``uvicorn_tunnel_kwargs`` so they
+        # cannot drift from ``omnigent server``.
         #
         # uvicorn's ws_ping_* is server-global (no per-route override), so this
         # 30 s/90 s budget also applies to the app's other WebSocket routes —
@@ -4582,8 +4583,7 @@ def server(
         # longer), bounded and eventually reaped, not a leak or correctness
         # change. The tunnels are the sockets that actually need the looser
         # budget (issue #1116).
-        ws_ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-        ws_ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+        **uvicorn_tunnel_kwargs(),
         timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     try:

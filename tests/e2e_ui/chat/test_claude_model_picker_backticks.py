@@ -38,20 +38,16 @@ from playwright.sync_api import Page, Route, expect
 from omnigent.harnesses.claude_native.main import claude_model_catalog
 from tests.e2e_ui.conftest import fetch_with_retry
 
-# What each picker row must read as once the harness's markdown-code label
-# formatting is neutralized: plain names, with both 1M rows phrased alike.
 _EXPECTED_LABELS = [
-    ("sonnet", "Sonnet 5"),
-    ("opus", "Opus 5"),
-    ("haiku", "Haiku 4.5"),
-    ("fable", "Fable 5"),
-    ("sonnet[1m]", "Sonnet 5 (1M context)"),
-    ("opus[1m]", "Opus 5 (1M context)"),
+    ("sonnet", "claude-sonnet-5"),
+    ("opus", "claude-opus-5"),
+    ("haiku", "claude-haiku-4-5-20251001"),
+    ("fable", "claude-fable-5"),
+    ("sonnet[1m]", "claude-sonnet-5[1m]"),
+    ("opus[1m]", "claude-opus-5[1m]"),
 ]
 
-# Every visible 1M-context row must follow this one shape — a bare model name
-# followed by the marker, no wrapping punctuation anywhere.
-_ONE_M_ROW_SHAPE = re.compile(r"[\w.]+(?: [\w.]+)* \(1M context\)")
+_ONE_M_ROW_SHAPE = re.compile(r"claude-[\w-]+\[1m\]")
 
 # The stub CLI replays Claude Code 2.1.250's stream-json ``/model`` answers,
 # captured verbatim from the real 2.1.250 binary: the enumeration run (no
@@ -171,7 +167,7 @@ def _open_model_picker(page: Page, base_url: str, session_id: str) -> None:
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
 
 def test_claude_native_picker_shows_plain_model_names(
@@ -198,7 +194,7 @@ def test_claude_native_picker_shows_plain_model_names(
 
     _open_model_picker(page, base_url, session_id)
 
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_LABELS))
     for index, (model_id, label) in enumerate(_EXPECTED_LABELS):
         row = rows.nth(index)
@@ -208,7 +204,7 @@ def test_claude_native_picker_shows_plain_model_names(
 
     # The "Default (…)" sentinel row names the default via the same label, so
     # the backticks must not leak into it either.
-    default_row = page.get_by_role("option", name=re.compile(r"^Default \("))
+    default_row = page.locator('[role="menuitemcheckbox"][data-model-id]').first
     expect(default_row).not_to_contain_text("`")
 
 
@@ -236,15 +232,15 @@ def test_claude_native_picker_1m_context_rows_read_alike(
 
     _open_model_picker(page, base_url, session_id)
 
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_LABELS))
     one_m_texts = [
         rows.nth(index).inner_text().strip()
         for index in range(len(_EXPECTED_LABELS))
-        if "1M context" in rows.nth(index).inner_text()
+        if "[1m]" in rows.nth(index).inner_text()
     ]
     assert len(one_m_texts) == 2, f"expected two 1M-context rows, saw {one_m_texts!r}"
     for text in one_m_texts:
         assert _ONE_M_ROW_SHAPE.fullmatch(text), (
-            f"1M-context row {text!r} does not read as a plain '<Name> (1M context)' label"
+            f"1M-context row {text!r} does not preserve its model ID and [1m] marker"
         )

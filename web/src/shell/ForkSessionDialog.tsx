@@ -1031,13 +1031,12 @@ export function ForkSessionForm({
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
       // value; an empty object (non-native target) sends no run overrides.
-      const fork = await forkSession(
-        sourceSessionId,
-        trimmed === "" ? undefined : trimmed,
-        switching ? agentChoice : undefined,
-        upToResponseId ?? undefined,
-        runConfig,
-      );
+      const fork = await forkSession(sourceSessionId, {
+        title: trimmed === "" ? undefined : trimmed,
+        agentId: switching ? agentChoice : undefined,
+        upToResponseId: upToResponseId ?? undefined,
+        config: runConfig,
+      });
       // Coding fork: launch the runner in the BACKGROUND, then navigate
       // into the (already-created, unbound) clone immediately — awaiting the
       // launch would block the modal for a worktree create (up to minutes)

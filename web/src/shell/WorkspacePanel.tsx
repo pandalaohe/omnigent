@@ -37,6 +37,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
@@ -569,6 +570,8 @@ interface WorkspacePanelProps {
   /** Project and Host from the active session seed the Archive Library filters. */
   archiveInitialProject?: string | null;
   archiveInitialHostId?: string | null;
+  /** Show inert panel chrome while the server session id is still pending. */
+  pending?: boolean;
   /** Current rail width (px), driven by the resize handle. */
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
@@ -683,6 +686,7 @@ function WorkspacePanelImpl({
   conversationId,
   archiveInitialProject,
   archiveInitialHostId,
+  pending = false,
   width,
   handleProps,
   inert,
@@ -752,6 +756,25 @@ function WorkspacePanelImpl({
     },
     [terminals],
   );
+  const showOpenTabs =
+    !pending &&
+    (openFiles.length > 0 ||
+      openTerminals.length > 0 ||
+      (showBrowserTab && browsers.tabs.length > 0));
+  const showEmptyNewTab =
+    !pending &&
+    openFiles.length === 0 &&
+    openTerminals.length === 0 &&
+    (!showBrowserTab || browsers.tabs.length === 0);
+  const effectiveHandleProps = pending
+    ? {
+        ...handleProps,
+        onMouseDown: undefined,
+        onKeyDown: undefined,
+        "aria-disabled": true,
+        tabIndex: -1,
+      }
+    : handleProps;
   return (
     <aside
       aria-label="Workspace"
@@ -791,8 +814,11 @@ function WorkspacePanelImpl({
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
       {!maximized && (
         <div
-          {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          {...effectiveHandleProps}
+          className={cn(
+            "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
+            pending && "cursor-default hover:bg-transparent active:bg-transparent",
+          )}
         />
       )}
       {/* Tab strip, in display order Files · Changes · Agents.
@@ -822,11 +848,13 @@ function WorkspacePanelImpl({
           // content slot below): a sticky selection whose terminal is gone shows
           // the fallback nav view, so its nav tab must highlight, not "__tab__".
           value={
-            selectedFilePath !== null ||
-            (browserSelected && browsers.selected !== null) ||
-            (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
-              ? "__tab__"
-              : rightRailTab
+            pending
+              ? "__pending__"
+              : selectedFilePath !== null ||
+                  (browserSelected && browsers.selected !== null) ||
+                  (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
+                ? "__tab__"
+                : rightRailTab
           }
           onValueChange={(value) => {
             if (value === "browser") browsers.select(null);
@@ -835,11 +863,12 @@ function WorkspacePanelImpl({
           componentId="chat.right_rail.tabs"
         >
           <TabsList variant="pill" className="gap-1">
-            {showFilesPanel && (
+            {(pending || showFilesPanel) && (
               <WorkspaceTabTooltip label="Files">
                 <TabsTrigger
                   value="files"
                   aria-label="Files"
+                  disabled={pending}
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
                   <FolderTreeIcon />
@@ -847,11 +876,12 @@ function WorkspacePanelImpl({
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
-            {showFilesPanel && (
+            {(pending || showFilesPanel) && (
               <WorkspaceTabTooltip label="Changes">
                 <TabsTrigger
                   value="changes"
                   aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
+                  disabled={pending}
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
                   <FileDiffIcon />
@@ -860,11 +890,12 @@ function WorkspacePanelImpl({
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
-            {showGithubTab && (
+            {(pending || showGithubTab) && (
               <WorkspaceTabTooltip label="GitHub">
                 <TabsTrigger
                   value="github"
                   aria-label="GitHub"
+                  disabled={pending}
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
                   <GithubMono size={16} />
@@ -875,6 +906,7 @@ function WorkspacePanelImpl({
             <WorkspaceTabTooltip label="Agents">
               <TabsTrigger
                 value="subagents"
+                disabled={pending}
                 aria-label={
                   subagentsWorking > 0
                     ? `Agents ${subagentsWorking}/${agentCount}`
@@ -910,6 +942,7 @@ function WorkspacePanelImpl({
                 <TabsTrigger
                   value="browser"
                   aria-label="Browser"
+                  disabled={pending}
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
                   <GlobeIcon />
@@ -923,9 +956,7 @@ function WorkspacePanelImpl({
                 Pinned (outside the scrolling file-tabs region), so it stays put
                 at every rail width while the tabs scroll past it. */}
         <div aria-hidden className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong" />
-        {(openFiles.length > 0 ||
-          openTerminals.length > 0 ||
-          (showBrowserTab && browsers.tabs.length > 0)) && (
+        {showOpenTabs && (
           <>
             {/* Open-tabs region (file tabs + shell tabs) — the horizontal
                 scroller. It sizes to its content and shrinks+scrolls only when
@@ -1010,18 +1041,16 @@ function WorkspacePanelImpl({
             after the nav tabs (next to Shells); once tabs exist it moves into
             the open-tabs region to trail the last tab (see above). Self-gates
             to nothing when the agent has no terminal access. */}
-        {openFiles.length === 0 &&
-          openTerminals.length === 0 &&
-          (!showBrowserTab || browsers.tabs.length === 0) && (
-            <NewTabMenu
-              conversationId={conversationId}
-              onOpenBrowser={addBrowser}
-              onOpenTerminal={openTerminalTab}
-              onCreateStart={onShellCreateStart}
-              onCreateError={onShellCreateFailed}
-              liveness={liveness}
-            />
-          )}
+        {showEmptyNewTab && (
+          <NewTabMenu
+            conversationId={conversationId}
+            onOpenBrowser={addBrowser}
+            onOpenTerminal={openTerminalTab}
+            onCreateStart={onShellCreateStart}
+            onCreateError={onShellCreateFailed}
+            liveness={liveness}
+          />
+        )}
         {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
             which absorbs the free space before it. When open tabs exist their
             ≥500px flex-1 region absorbs the space instead, so the button still
@@ -1036,6 +1065,7 @@ function WorkspacePanelImpl({
             aria-label={maximized ? "Exit full screen" : "Full screen"}
             aria-pressed={maximized}
             onClick={onToggleMaximized}
+            disabled={pending}
             size="icon-xs"
             className="flex size-6"
           >
@@ -1048,7 +1078,12 @@ function WorkspacePanelImpl({
           (tree vs changed-only list); Subagents lists the root's children +
           a "main" link back to the parent. */}
       <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
+        {pending ? (
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+            <Spinner />
+            <span className="text-ui">Starting workspace…</span>
+          </div>
+        ) : selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
           // Show the selected shell's xterm only while its terminal is actually
           // present. The selection is sticky (AppShell never prunes it off the
           // list), so during a transient terminals-list churn this falls back to

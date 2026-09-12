@@ -28,6 +28,7 @@ from omnigent.harnesses.claude_native import forwarder
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    BtwOverlay,
     ClaudeMessageDelta,
     ClaudeTaskNotification,
     ClaudeTranscriptItem,
@@ -3292,22 +3293,23 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Path) -> None:
+async def test_forwarder_retries_user_item_on_ambiguous_post_failure(tmp_path: Path) -> None:
     """
-    An ambiguous POST failure skips the item instead of re-posting it.
+    An ambiguous POST failure holds the cursor and re-posts the item.
 
     A user message typed while Claude is busy round-trips through the
     transcript and is POSTed as an ``external_conversation_item``. If
-    that POST's response is lost (e.g. a read timeout AFTER the server
-    appended the item and published ``session.input.consumed``), the
-    server has already committed it — and external items are not deduped
-    server-side. Retrying would append a second copy and re-publish the
-    consume event, producing a duplicate user bubble in the web UI.
-    The forwarder must instead treat the item as delivered:
-    mark it handled, advance the byte cursor, and never re-POST it.
+    that POST's response is lost (e.g. a read timeout on a flaky
+    forwarder->server hop), the forwarder cannot know whether the server
+    committed the item. Skipping it would silently lose the message from
+    the conversation store whenever the server had NOT committed it —
+    the web view then misses a message the terminal still shows. The
+    POST carries a ``source_id`` idempotency key the server dedupes on,
+    so re-posting a committed item is a no-op: the forwarder must retry.
 
-    A failure here (the item POSTed twice across two polls) is exactly
-    the duplicate-user-message regression this guards against.
+    A failure here (the item marked handled after one ambiguous failure,
+    never re-posted) is exactly the lost-user-message regression this
+    guards against.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -3333,20 +3335,25 @@ async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Pat
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         """
-        Record the POST, then fail the item POST with a read timeout.
+        Fail the first item POST with a read timeout, then succeed.
 
-        The timeout stands in for "server committed, response lost" —
-        the ambiguous case where a blind retry duplicates.
+        The timeout stands in for "request sent, response lost" — the
+        ambiguous case where the server may or may not have committed
+        the item.
 
         :param request: Outbound HTTP request from the forwarder.
-        :returns: HTTP response (never reached for the item POST).
-        :raises httpx.ReadTimeout: For every ``external_conversation_item``
-            POST, simulating a lost response.
+        :returns: HTTP response for every POST after the first item POST.
+        :raises httpx.ReadTimeout: For the first
+            ``external_conversation_item`` POST, simulating a lost
+            response.
         """
         payload = json.loads(request.content.decode("utf-8"))
         assert isinstance(payload, dict)
         requests.append(payload)
-        if payload["type"] == "external_conversation_item":
+        first_item_post = payload["type"] == "external_conversation_item" and (
+            sum(1 for r in requests if r["type"] == "external_conversation_item") == 1
+        )
+        if first_item_post:
             raise httpx.ReadTimeout("response lost", request=request)
         return httpx.Response(202, json={})
 
@@ -3373,18 +3380,25 @@ async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Pat
         )
 
     item_posts = [r for r in requests if r["type"] == "external_conversation_item"]
-    # The item was POSTed exactly once. If the ambiguous-failure skip
-    # were missing, the second poll would re-read offset 0 and POST it
-    # again (len 2) — the duplicate user bubble.
-    assert len(item_posts) == 1
-    # No "failed" status: unlike a permanent 4xx rejection, an ambiguous
-    # failure most likely succeeded, so we must not flag the turn failed.
+    # Re-POSTed on the second poll (2 attempts): the ambiguous failure
+    # must not mark the item handled — skipping it would lose the user
+    # message from the conversation store when the server had not
+    # committed it.
+    assert len(item_posts) == 2
+    # Every attempt carries the same server-side idempotency key, so the
+    # retry is a no-op when the first POST WAS committed — no duplicate
+    # user bubble.
+    source_ids = {post["data"]["source_id"] for post in item_posts}
+    assert source_ids == {"user-msg-1:0:message"}
+    # No "failed" status: unlike a permanent 4xx rejection, a transient
+    # failure is retried, so we must not flag the turn failed.
     assert all(r["type"] != "external_session_status" for r in requests)
-    # Cursor advanced past the item and it is recorded as handled, so it
-    # is not re-read on subsequent polls.
-    assert first.byte_offset == transcript_path.stat().st_size
-    assert first.seen_source_ids == ("user-msg-1:0:message",)
+    # First poll held the cursor (nothing handled); the successful retry
+    # advanced it past the item and recorded it as handled.
+    assert first.byte_offset == 0
+    assert first.seen_source_ids == ()
     assert second.byte_offset == transcript_path.stat().st_size
+    assert second.seen_source_ids == ("user-msg-1:0:message",)
 
 
 @pytest.mark.asyncio
@@ -3395,8 +3409,7 @@ async def test_forwarder_retries_user_item_on_connect_error(tmp_path: Path) -> N
     A connection-refused error proves the request never reached the
     server, so the item was not committed. Dropping it would silently
     lose a user message. The forwarder must hold the cursor and re-POST
-    on the next poll — the complement to the ambiguous-skip behavior, so
-    the duplicate fix does not turn into a message-loss bug.
+    on the next poll.
 
     A failure here (item marked handled / cursor advanced after a
     connect error) would mean a user message is silently lost whenever
@@ -3824,7 +3837,10 @@ async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status_model", [None, "system.ai.claude-opus-4-8[1m]"])
+async def test_forwarder_reports_the_launch_model_then_a_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status_model: str | None
+) -> None:
     """
     EVERY observation posts, verbatim: the first is the launch report.
 
@@ -3835,6 +3851,8 @@ async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) 
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
+    status = {"model": status_model}
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _: status)
 
     def _assistant(uuid: str, model: str, text: str) -> str:
         """
@@ -3892,12 +3910,14 @@ async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) 
         )
         # The first observation IS the launch report — posted verbatim.
         launch_posts = [r for r in requests if r["type"] == "external_model_change"]
-        assert [p["data"] for p in launch_posts] == [{"model": "claude-opus-4-8"}]
-        assert dedupe.posted_model == "claude-opus-4-8"
+        expected_model = status_model or "claude-opus-4-8"
+        assert [p["data"] for p in launch_posts] == [{"model": expected_model}]
+        assert dedupe.posted_model == expected_model
 
         # User switches model inside the terminal.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_assistant("a2", "claude-sonnet-5", "switched") + "\n")
+        status["model"] = "claude-sonnet-5" if status_model else None
         requests.clear()
         await forwarder._forward_available_items(
             client=client,
@@ -4172,34 +4192,17 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_forwarder_mirrors_in_pane_permission_mode_switch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_relay_permission_mode_mirrors_switch_and_dedupes() -> None:
     """
     Both the launch mode and a later shift+tab reach the session label.
 
-    Claude Code emits no event on a mode change, so the pane footer is polled.
-    The launch mode is posted as well: a manual-mode session has no mode label
-    and no launch flag, so skipping it would leave the web picker with nothing
-    to render. Repeat polls of an unchanged footer stay quiet.
+    Claude Code emits no event on a mode change, so the pane footer is
+    mirrored. The launch mode is posted as well: a manual-mode session has no
+    mode label and no launch flag, so skipping it would leave the web picker
+    with nothing to render. An unchanged footer stays quiet, and a footerless
+    (``None``) read must not post a reversal.
     """
-    bridge_dir = tmp_path / "bridge"
-    pane_mode: str | None = "default"
-    reads = 0
-
-    def _fake_read(_bridge_dir: Path) -> str | None:
-        """Serve the pane's current mode, counting each capture."""
-        nonlocal reads
-        reads += 1
-        return pane_mode
-
-    monkeypatch.setattr(forwarder, "read_permission_mode", _fake_read)
-    # Reads are throttled off a monotonic deadline; zero the interval so each
-    # call in this test performs a capture instead of returning early.
-    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
     dedupe = forwarder._ForwardDedupeState()
-
     posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
@@ -4210,61 +4213,51 @@ async def test_forwarder_mirrors_in_pane_permission_mode_switch(
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
 
-        async def _poll() -> None:
-            """Run one permission-mode mirror pass."""
-            await forwarder._forward_permission_mode_from_pane(
-                client=client,
+        async def _relay(mode: str | None) -> None:
+            """Run one permission-mode relay pass for the given pane mode."""
+            await forwarder._relay_permission_mode(
+                client,
                 session_id="conv_abc",
-                bridge_dir=bridge_dir,
+                mode=mode,
                 dedupe=dedupe,
             )
 
-        # Poll 1: the launch mode is posted, so the picker has a mode to show.
-        await _poll()
+        # The launch mode is posted, so the picker has a mode to show.
+        await _relay("default")
         assert [p["type"] for p in posts] == ["external_permission_mode_change"]
         assert posts[0]["data"] == {"permission_mode": "default"}
         assert dedupe.posted_permission_mode == "default"
 
-        # Poll 2: unchanged footer is a no-op, not a repeat POST.
-        await _poll()
+        # Unchanged footer is a no-op, not a repeat POST.
+        await _relay("default")
         assert len(posts) == 1
 
-        # Poll 3: the user presses shift+tab into auto mode.
-        pane_mode = "auto"
-        await _poll()
+        # The user presses shift+tab into auto mode.
+        await _relay("auto")
         assert posts[-1]["data"] == {"permission_mode": "auto"}
         assert dedupe.posted_permission_mode == "auto"
 
-        # Poll 4: still auto — the switch isn't re-posted every poll.
-        await _poll()
+        # Still auto — the switch isn't re-posted every poll.
+        await _relay("auto")
         assert len(posts) == 2
 
         # A footerless pane reads as unknown and must not post a reversal.
-        pane_mode = None
-        await _poll()
+        await _relay(None)
         assert len(posts) == 2
         assert dedupe.posted_permission_mode == "auto"
-    assert reads == 5
 
 
 @pytest.mark.asyncio
-async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_relay_permission_mode_posts_manual_launch_mode() -> None:
     """
     A manual-mode launch publishes a mode, keeping the picker reachable.
 
     Manual is the default, and launching into it writes no
     ``--permission-mode`` arg and no mode label, leaving the pane footer as the
-    only source. The first poll must post it: with no mode stored the web
+    only source. The first relay must post it: with no mode stored the web
     picker hides itself, and manual becomes a state no one can switch out of.
     """
-    bridge_dir = tmp_path / "bridge"
-    monkeypatch.setattr(forwarder, "read_permission_mode", lambda _bridge_dir: "default")
-    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
     dedupe = forwarder._ForwardDedupeState()
-
     posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
@@ -4274,10 +4267,10 @@ async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await forwarder._forward_permission_mode_from_pane(
-            client=client,
+        await forwarder._relay_permission_mode(
+            client,
             session_id="conv_abc",
-            bridge_dir=bridge_dir,
+            mode="default",
             dedupe=dedupe,
         )
 
@@ -4288,10 +4281,7 @@ async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_retries_permission_mode_post_after_transient_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_relay_permission_mode_retries_after_transient_failure() -> None:
     """
     A failed mode POST is retried, so the switch isn't silently dropped.
 
@@ -4299,16 +4289,7 @@ async def test_forwarder_retries_permission_mode_post_after_transient_failure(
     advanced the baseline, the web picker would stay stale until the user
     switched modes again.
     """
-    pane_mode = "default"
-
-    def _fake_read(_bridge_dir: Path) -> str | None:
-        """Serve the pane's current mode."""
-        return pane_mode
-
-    monkeypatch.setattr(forwarder, "read_permission_mode", _fake_read)
-    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
     dedupe = forwarder._ForwardDedupeState()
-
     posts: list[dict[str, Any]] = []
     fail_modes = {"plan"}
 
@@ -4325,65 +4306,29 @@ async def test_forwarder_retries_permission_mode_post_after_transient_failure(
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
 
-        async def _poll() -> None:
-            """Run one permission-mode mirror pass."""
-            await forwarder._forward_permission_mode_from_pane(
-                client=client,
+        async def _relay(mode: str | None) -> None:
+            """Run one permission-mode relay pass for the given pane mode."""
+            await forwarder._relay_permission_mode(
+                client,
                 session_id="conv_abc",
-                bridge_dir=tmp_path / "bridge",
+                mode=mode,
                 dedupe=dedupe,
             )
 
-        await _poll()  # the launch mode lands
+        await _relay("default")  # the launch mode lands
         assert dedupe.posted_permission_mode == "default"
 
-        pane_mode = "plan"
-        await _poll()
+        await _relay("plan")
         assert len(posts) == 2
         assert dedupe.posted_permission_mode == "default"  # NOT advanced — POST failed
 
-        await _poll()
+        await _relay("plan")
         assert [p["data"] for p in posts] == [
             {"permission_mode": "default"},
             {"permission_mode": "plan"},
             {"permission_mode": "plan"},
         ]
         assert dedupe.posted_permission_mode == "plan"  # now committed
-
-
-@pytest.mark.asyncio
-async def test_forwarder_throttles_permission_mode_pane_reads(tmp_path: Path) -> None:
-    """
-    Pane reads are spaced by the throttle, not run on every poll.
-
-    Unlike the file-backed model mirror sharing this loop, each read spawns a
-    ``tmux capture-pane`` subprocess. The poll loop is far tighter than the
-    throttle, so an unthrottled read would spawn processes continuously for a
-    signal that only changes when a human presses shift+tab.
-    """
-    reads = 0
-
-    def _fake_read(_bridge_dir: Path) -> str | None:
-        """Count captures; the mode itself is irrelevant here."""
-        nonlocal reads
-        reads += 1
-        return "default"
-
-    with patch.object(forwarder, "read_permission_mode", _fake_read):
-        dedupe = forwarder._ForwardDedupeState()
-        transport = httpx.MockTransport(lambda _req: httpx.Response(202, json={}))
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            for _ in range(5):
-                await forwarder._forward_permission_mode_from_pane(
-                    client=client,
-                    session_id="conv_abc",
-                    bridge_dir=tmp_path / "bridge",
-                    dedupe=dedupe,
-                )
-
-    # Five back-to-back polls inside one throttle window capture once.
-    assert reads == 1
-    assert dedupe.permission_mode_next_read > 0.0
 
 
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(
@@ -13724,6 +13669,8 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
         return await real_ensure(*args, **kwargs)
 
     monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_on_first_call)
+    monkeypatch.setattr(forwarder._logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(forwarder._logger, "propagate", False)
 
     with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder"):
         task = asyncio.create_task(
@@ -13965,3 +13912,164 @@ async def test_batched_child_items_preserve_replay_and_terminal_truth(
         assert result.subagents["batch-child"].last_activity_ts is None
     else:
         assert statuses == [{"status": "running"}]
+# ── /btw side-chat overlay relay ───────────────────────────────────
+
+
+def _btw_recording_client_calls() -> tuple[list[dict[str, Any]], httpx.MockTransport]:
+    """
+    Build a MockTransport that records POST bodies for /btw relay tests.
+
+    :returns: The shared ``calls`` list and the transport to hand an
+        ``httpx.AsyncClient``.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record each POST body and return a benign success."""
+        calls.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"queued": False, "item_id": "item_x"})
+
+    return calls, httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_relays_after_stability_then_dedupes() -> None:
+    """
+    A settled /btw overlay relays ONE transient side-chat event.
+
+    The first read only records the exchange as pending (torn-capture
+    guard); the second (same exchange) posts the transient
+    ``external_btw_sidechat`` event; the third is deduped and posts nothing.
+    """
+    overlay = BtwOverlay(question="/btw is this ok?", answer="Yes, all good.", truncated=False)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(3):
+            await forwarder._relay_btw_overlay(
+                client,
+                session_id="conv1",
+                overlay=overlay,
+                dedupe=dedupe,
+            )
+
+    assert len(calls) == 1
+    (body,) = calls
+    assert body["type"] == "external_btw_sidechat"
+    assert body["data"]["question"] == "/btw is this ok?"
+    assert body["data"]["answer"] == "Yes, all good."
+    assert body["data"]["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_relays_truncated_flag() -> None:
+    """A clipped overlay relays the visible answer with truncated=True."""
+    overlay = BtwOverlay(question="/btw big", answer="line1\nline2", truncated=True)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(2):
+            await forwarder._relay_btw_overlay(
+                client,
+                session_id="conv1",
+                overlay=overlay,
+                dedupe=dedupe,
+            )
+
+    assert len(calls) == 1
+    assert calls[0]["data"]["answer"] == "line1\nline2"
+    assert calls[0]["data"]["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_no_overlay_is_noop() -> None:
+    """No visible overlay posts nothing and clears any pending key."""
+    dedupe = forwarder._ForwardDedupeState()
+    dedupe.btw_pending_key = "stale"
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._relay_btw_overlay(
+            client,
+            session_id="conv1",
+            overlay=None,
+            dedupe=dedupe,
+        )
+
+    assert calls == []
+    assert dedupe.btw_pending_key is None
+
+
+@pytest.mark.asyncio
+async def test_forward_pane_signals_captures_once_and_relays_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    One throttled capture feeds both the permission-mode and /btw relays.
+
+    Back-to-back polls inside one throttle window capture the pane exactly
+    once (the shared-capture win), and the single snapshot's mode + settled
+    overlay both reach the wire (the overlay after its two-read stability
+    guard).
+    """
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    overlay = BtwOverlay(question="/btw ok?", answer="Yes.", truncated=False)
+    reads = 0
+
+    def _fake_signals(_bridge_dir: Path) -> PaneSignals:
+        """Serve one snapshot carrying both signals, counting captures."""
+        nonlocal reads
+        reads += 1
+        return PaneSignals(permission_mode="auto", btw_overlay=overlay)
+
+    monkeypatch.setattr(forwarder, "read_pane_signals", _fake_signals)
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(3):
+            await forwarder._forward_pane_signals(
+                client,
+                session_id="conv1",
+                bridge_dir=tmp_path,
+                dedupe=dedupe,
+            )
+
+    types = [c["type"] for c in calls]
+    assert types.count("external_permission_mode_change") == 1
+    assert types.count("external_btw_sidechat") == 1
+    assert dedupe.posted_permission_mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_forward_pane_signals_throttles_capture(tmp_path: Path) -> None:
+    """Back-to-back polls inside one throttle window capture the pane once."""
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    reads = 0
+
+    def _fake_signals(_bridge_dir: Path) -> PaneSignals:
+        """Count captures; the signals themselves are irrelevant here."""
+        nonlocal reads
+        reads += 1
+        return PaneSignals()
+
+    with patch.object(forwarder, "read_pane_signals", _fake_signals):
+        dedupe = forwarder._ForwardDedupeState()
+        transport = httpx.MockTransport(lambda _req: httpx.Response(202, json={}))
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+            for _ in range(5):
+                await forwarder._forward_pane_signals(
+                    client,
+                    session_id="conv1",
+                    bridge_dir=tmp_path,
+                    dedupe=dedupe,
+                )
+
+    assert reads == 1
+    assert dedupe.pane_next_read > 0.0

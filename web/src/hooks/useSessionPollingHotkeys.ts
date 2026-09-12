@@ -69,7 +69,9 @@ export function choosePolledConversation(
 export interface SessionPollingHotkeysOptions {
   activeId: string | undefined;
   getConversations: () => Promise<Conversation[]>;
-  onArchive: (id: string) => Promise<unknown>;
+  // The whole row, not just its id: the post-archive Undo pill re-injects the
+  // archived rows into the sidebar, so the caller needs them in hand.
+  onArchive: (conversation: Conversation) => Promise<unknown>;
   isUnread?: (conversation: Conversation) => boolean;
   canArchive?: (conversation: Conversation) => boolean;
 }
@@ -183,7 +185,7 @@ export function useSessionPollingHotkeys(options: SessionPollingHotkeysOptions):
         // silently disable the archive hotkey on that session.
         const active = allRows.find((row) => row.id === operation.activeId);
         if (!active || operation.canArchive?.(active) === false) return;
-        await operation.onArchive(active.id);
+        await operation.onArchive(active);
         if (latest.current.activeId === operation.activeId) {
           navigate(target ? `/c/${target.id}` : "/", { replace: true });
         }
