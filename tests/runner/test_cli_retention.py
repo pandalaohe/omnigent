@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from omnigent.runner import create_runner_app
+from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -379,3 +380,127 @@ async def test_runner_rejects_reset_older_than_observed_policy() -> None:
     assert stale.json()["status"] == "stale_policy"
     assert session_id in reaper.managed
     assert session_id in pm.managed_for_retention
+
+
+class _AbsentHarnessProcessManager(_FakeProcessManager):
+    """ProcessManager stub whose resident harness died before the release."""
+
+    async def release_if_retention_idle(
+        self,
+        conversation_id: str,
+        *,
+        idle_threshold_s: float,
+        expected_activity_token: str,
+    ) -> str:
+        self.retention_releases.append(
+            (conversation_id, idle_threshold_s, expected_activity_token)
+        )
+        self.managed_for_retention.discard(conversation_id)
+        return "absent"
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_release_cleans_up_when_harness_died_first() -> None:
+    """An "absent" harness release still runs the session-level cleanup tail.
+
+    The harness died between snapshot and release
+    (``release_if_retention_idle`` -> ``"absent"``), so there is no
+    subprocess left to close — but the forwarder, relay, codex
+    app-server teardown, bridge dirs, router and spawn family are
+    session-level pieces no reaper covers, and the lifecycle must not
+    keep reporting a dead runtime as live.
+    """
+    pm = _AbsentHarnessProcessManager(_ScriptedHarnessClient([]))
+    pm.retention_snapshot_result = {
+        "present": True,
+        "supported": True,
+        "family": "codex",
+        "busy": False,
+        "eligible": True,
+        "idle_seconds": 120.0,
+        "activity_token": "0:123.0",
+    }
+    app = create_runner_app(process_manager=pm, server_client=NullServerClient())  # type: ignore[arg-type]
+    app.state.native_pane_reaper = None
+    session_id = "a91b2c3d4e5f61234567890abcdef012"
+
+    async with _runner_client(app) as client:
+        snapshot = await client.get(
+            f"/v1/sessions/{session_id}/cli-retention",
+            params={
+                "idle_threshold_seconds": 60,
+                "host_id": "host-a",
+                "policy_revision": 11,
+            },
+        )
+        released = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/release",
+            json={
+                "reason": "idle_pool_overflow",
+                "idle_threshold_seconds": 60,
+                "expected_activity_token": "harness:0:123.0",
+                "runtime_generation": snapshot.json()["runtime_generation"],
+                "host_id": "host-a",
+                "policy_revision": 11,
+            },
+        )
+
+    assert released.status_code == 200
+    assert released.json()["status"] == "released"
+    assert pm.released == [session_id]
+    assert app.state.cli_runtime_lifecycle.phase(session_id) == "absent"
+
+
+async def _never_busy(pane: PaneRef) -> bool:
+    del pane
+    return False
+
+
+async def _never_reap(pane: PaneRef) -> None:
+    del pane
+    raise AssertionError("absent pane must not be reaped")
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_release_cleans_up_when_pane_vanished_first() -> None:
+    """An "absent" pane release still runs cleanup and retires reaper state.
+
+    The pane was closed between snapshot and release
+    (``release_if_idle`` -> ``"absent"``). The session-level cleanup
+    tail must still run, the lifecycle must not keep reporting the
+    runtime as live, and the reaper must drop its management and idle
+    clock entries for the gone pane.
+    """
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(process_manager=pm, server_client=NullServerClient())  # type: ignore[arg-type]
+    reaper = NativePaneReaper(
+        list_native_panes=lambda: [],
+        is_busy=_never_busy,
+        reap=_never_reap,
+    )
+    app.state.native_pane_reaper = reaper
+    session_id = "a92b2c3d4e5f61234567890abcdef012"
+    reaper.manage(session_id)
+    reaper.note_activity(session_id)
+    lifecycle = app.state.cli_runtime_lifecycle
+    lifecycle.observe_policy(session_id, host_id="host-a", revision=3)
+
+    async with _runner_client(app) as client:
+        released = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/release",
+            json={
+                "reason": "idle_pool_overflow",
+                "idle_threshold_seconds": 60,
+                "expected_activity_token": "pane:stale-token",
+                "runtime_generation": lifecycle.runtime_token(session_id),
+                "host_id": "host-a",
+                "policy_revision": 3,
+            },
+        )
+
+    assert released.status_code == 200
+    assert released.json()["status"] == "released"
+    assert pm.released == [session_id]
+    assert lifecycle.phase(session_id) == "absent"
+    assert session_id not in reaper._managed_conversations
+    assert session_id not in reaper._last_busy_at

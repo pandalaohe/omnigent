@@ -235,6 +235,11 @@ class NativePaneReaper:
         """Release one still-eligible pane selected from a prior snapshot."""
         pane = self._pane_for_conversation(conversation_id)
         if pane is None:
+            # No pane to tear down, but the management and clock entries
+            # still retire: a pane that vanished between selection and
+            # release must read gone, not retained, like release_now.
+            self._managed_conversations.discard(conversation_id)
+            self._last_busy_at.pop(conversation_id, None)
             return "absent"
         now = time.monotonic()
         if await self._is_busy(pane):

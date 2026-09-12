@@ -12729,7 +12729,12 @@ def create_runner_app(
                     status_code=400,
                     content={"error": "invalid_input", "detail": "unknown idle release token"},
                 )
-            if release_status != "released":
+            # An already-gone harness/pane still owns the cleanup tail:
+            # the forwarder, relay, exited-handle close, app-server
+            # teardown, bridge dirs, router and spawn family are
+            # session-level pieces no reaper covers, and staying marked
+            # present would report a dead runtime as live.
+            if release_status not in {"released", "absent"}:
                 _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
                 status_code = 409 if release_status in {"busy", "stale", "not_eligible"} else 200
                 return JSONResponse(
