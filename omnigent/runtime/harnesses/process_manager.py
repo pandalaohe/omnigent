@@ -1548,7 +1548,33 @@ class HarnessProcessManager:
                         await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
                     except Exception:
                         _logger.exception("harness subprocess did not exit during teardown")
-            closed = entry.process.returncode is not None
+            pid_reaped = False
+            if entry.process.returncode is None:
+                # A zygote-forked harness learns its exit code from a
+                # background poll task; once that poller is cancelled,
+                # wait() keeps returning its fallback code without ever
+                # recording returncode, so the gate below would misread a
+                # dead process as live on every retry. The pid itself is
+                # the remaining ground truth — the same probe the poll
+                # loop uses when the zygote dies. A live pid stays
+                # registered for retry; only a gone pid reaches
+                # transport/endpoint cleanup. (The code is recorded by
+                # whoever owns the handle — the poll loop for the shim,
+                # the transport for a real child — so this path tracks a
+                # flag instead of assigning returncode through the
+                # ``Process``-shaped union.)
+                pid = getattr(entry.process, "pid", None)
+                alive = True
+                if pid is not None:
+                    with contextlib.suppress(Exception):
+                        alive = await asyncio.to_thread(_proc.process_alive, pid)
+                if not alive:
+                    # Prompt for a real zombie (reaped by wait) and
+                    # immediate for the shim (cancelled poller); the probe
+                    # above — not this return — is the proof of exit.
+                    await entry.process.wait()
+                    pid_reaped = True
+            closed = entry.process.returncode is not None or pid_reaped
             if closed:
                 with contextlib.suppress(Exception):
                     close_subprocess_transport(entry.process)

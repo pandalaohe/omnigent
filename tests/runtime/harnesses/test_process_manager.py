@@ -1716,6 +1716,128 @@ async def test_failed_retention_close_keeps_activity_token_retryable(
     assert manager._retention_activity_token("conv_retry", entry) == activity_token
 
 
+async def test_release_reaps_zygote_harness_with_cancelled_exit_poller(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled zygote exit-poller must not strand its entry forever.
+
+    ``ZygoteHarnessProc.wait()`` suppresses the poller's
+    ``CancelledError`` and returns its fallback code WITHOUT recording
+    ``returncode``. Once the graceful wait's cancellation lands in the
+    poller, every later ``wait()`` returns the fallback the same way —
+    so the return-code teardown gate reads a dead process as live,
+    ``release`` restores the entry, and socket/endpoint cleanup stays
+    unreachable no matter how often release is retried.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    process = _CancelledPollerZygoteProc()
+    endpoint = _CleanupCountingEndpoint()
+    entry = _SubprocessEntry(
+        process=process,  # type: ignore[arg-type]
+        client=_NoopHarnessClient(),  # type: ignore[arg-type]
+        endpoint=endpoint,  # type: ignore[arg-type]
+        harness="codex",
+    )
+    conversation_id = "conv_cancelled_poller"
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._entries[conversation_id] = entry
+    monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.02)
+    monkeypatch.setattr(pm_mod._proc, "terminate_tree", lambda _process: None)
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", lambda _process: None)
+    # The harness pid is gone: the process has actually exited.
+    monkeypatch.setattr(pm_mod._proc, "process_alive", lambda _pid: False)
+
+    assert await manager.release(conversation_id) is True
+    assert conversation_id not in manager._entries
+    assert endpoint.cleanup_calls == 1
+
+    # A second release must not find a re-registered entry.
+    assert await manager.release(conversation_id) is True
+    assert conversation_id not in manager._entries
+
+
+async def test_release_keeps_live_zygote_harness_with_cancelled_poller_registered(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled poller alone must not tear down a live harness process.
+
+    The pid probe is what distinguishes "poller gone AND process dead"
+    (reapable) from "poller gone but process alive" (retry later) —
+    recording the fallback code unconditionally would kill a live
+    process.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    process = _CancelledPollerZygoteProc()
+    endpoint = _CleanupCountingEndpoint()
+    entry = _SubprocessEntry(
+        process=process,  # type: ignore[arg-type]
+        client=_NoopHarnessClient(),  # type: ignore[arg-type]
+        endpoint=endpoint,  # type: ignore[arg-type]
+        harness="codex",
+    )
+    conversation_id = "conv_cancelled_poller_live"
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._entries[conversation_id] = entry
+    monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.02)
+    monkeypatch.setattr(pm_mod._proc, "terminate_tree", lambda _process: None)
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", lambda _process: None)
+    monkeypatch.setattr(pm_mod._proc, "process_alive", lambda _pid: True)
+
+    assert await manager.release(conversation_id) is False
+    assert manager._entries[conversation_id] is entry
+    assert endpoint.cleanup_calls == 0
+
+
+class _CancelledPollerZygoteProc:
+    """``ZygoteHarnessProc`` stand-in whose exit-poller was cancelled.
+
+    ``wait()`` is faithful to the real shim: the poller's
+    ``CancelledError`` is suppressed and the fallback code is returned
+    WITHOUT recording ``returncode``.
+    """
+
+    def __init__(self) -> None:
+        self.pid: int | None = 987654321
+        self.returncode: int | None = None
+        # close_subprocess_transport(proc) getattrs this; None is handled.
+        self._transport = None
+
+        async def _parked() -> None:
+            await asyncio.Event().wait()
+
+        self._poll_task: asyncio.Task[None] = asyncio.ensure_future(_parked())
+        self._poll_task.cancel()
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+    async def wait(self) -> int:
+        if self._poll_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
+        return 254
+
+
+class _NoopHarnessClient:
+    async def aclose(self) -> None:
+        return None
+
+
+class _CleanupCountingEndpoint:
+    def __init__(self) -> None:
+        self.cleanup_calls = 0
+
+    def cleanup(self) -> None:
+        self.cleanup_calls += 1
+
+
 async def test_shutdown_during_spawn_leaves_no_live_process(
     manager: HarnessProcessManager,
     monkeypatch: pytest.MonkeyPatch,
