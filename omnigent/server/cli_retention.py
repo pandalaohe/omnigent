@@ -297,6 +297,9 @@ class CliRetentionCoordinator:
         unavailable: list[str] = []
         for conversation in conversations:
             if not conversation.runner_id:
+                # No runner to command, but the CLI may still be live and
+                # retention-managed, so report it instead of dropping it.
+                unavailable.append(conversation.id)
                 continue
             try:
                 if lease is not None:
@@ -468,12 +471,14 @@ class CliRetentionCoordinator:
             lambda: {"idle": 0, "active": 0, "below_threshold": 0, "total": 0}
         )
         bound_count = 0
+        unbound_count = 0
         supported_count = 0
         absent_count = 0
         unsupported_count = 0
         unknown_count = 0
         for conversation in conversations:
             if not conversation.runner_id:
+                unbound_count += 1
                 continue
             bound_count += 1
             try:
@@ -600,6 +605,7 @@ class CliRetentionCoordinator:
         application = {
             "status": application_status,
             "bound": bound_count,
+            "unbound": unbound_count,
             "supported": supported_count,
             "absent": absent_count,
             "unsupported": unsupported_count,

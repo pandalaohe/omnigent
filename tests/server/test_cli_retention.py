@@ -348,6 +348,86 @@ async def test_reset_host_reports_reachable_and_unavailable_sessions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reset_host_reports_unbound_sessions_as_unavailable() -> None:
+    conversations = [
+        SimpleNamespace(id="reset-ok", runner_id="runner-ok", host_id="host-a"),
+        SimpleNamespace(id="unbound-empty", runner_id="", host_id="host-a"),
+        SimpleNamespace(id="unbound-none", runner_id=None, host_id="host-a"),
+    ]
+
+    class _ConversationStore:
+        def list_conversations(self, **kwargs):
+            assert kwargs["include_archived"] is True
+            return PagedList(data=conversations)
+
+    async def _fail_if_called(*args, **kwargs):
+        raise AssertionError("unbound sessions have no runner to command")
+
+    class _Client:
+        async def post(self, url, *, json, timeout):
+            assert url.endswith("/reset-ok/cli-retention/reset")
+            return SimpleNamespace(status_code=200)
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            if not conversation.runner_id:
+                return SimpleNamespace(
+                    client=SimpleNamespace(post=_fail_if_called),
+                    runner_id=conversation.runner_id,
+                )
+            return SimpleNamespace(client=_Client(), runner_id=conversation.runner_id)
+
+    coordinator = CliRetentionCoordinator(
+        host_store=SimpleNamespace(),
+        conversation_store=_ConversationStore(),
+        runner_router=_Router(),
+    )
+
+    result = await coordinator.reset_host_under_lease("host-a", policy_revision=8)
+
+    assert result["reset"] == ["reset-ok"]
+    assert result["unavailable"] == ["unbound-empty", "unbound-none"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_counts_unbound_sessions_separately() -> None:
+    conversations = [
+        SimpleNamespace(id="unbound", runner_id="", host_id="host-a"),
+    ]
+
+    class _HostStore:
+        def get_host(self, host_id):
+            assert host_id == "host-a"
+            return SimpleNamespace(
+                cli_retention_revision=0,
+                cli_retention_policy=CliRetentionPolicy(),
+            )
+
+    class _ConversationStore:
+        def list_conversations(self, **kwargs):
+            return PagedList(data=conversations)
+
+        def list_child_conversation_ids_by_parent(self, parent_ids):
+            return {parent_id: [] for parent_id in parent_ids}
+
+        def get_conversations(self, conversation_ids):
+            assert conversation_ids == []
+            return {}
+
+    coordinator = CliRetentionCoordinator(
+        host_store=_HostStore(),
+        conversation_store=_ConversationStore(),
+        runner_router=SimpleNamespace(),
+    )
+
+    result = await coordinator.reconcile_host_once("host-a")
+
+    assert result["families"] == {}
+    assert result["application"]["bound"] == 0
+    assert result["application"]["unbound"] == 1
+
+
+@pytest.mark.asyncio
 async def test_malformed_or_stale_runner_snapshot_is_unknown_not_family_runtime() -> None:
     conversations = [
         SimpleNamespace(id="stale", runner_id="runner-stale", host_id="host-a"),
@@ -436,6 +516,7 @@ async def test_malformed_or_stale_runner_snapshot_is_unknown_not_family_runtime(
     assert result["application"] == {
         "status": "unknown",
         "bound": 4,
+        "unbound": 0,
         "supported": 0,
         "absent": 0,
         "unsupported": 0,
