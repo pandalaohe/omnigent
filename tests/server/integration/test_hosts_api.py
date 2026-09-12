@@ -1869,6 +1869,86 @@ async def test_host_cli_retention_reset_reports_runtime_transition_status(
     assert reset.json()["runtime"]["unavailable"] == unavailable_sessions
 
 
+async def test_host_cli_retention_reset_lost_lease_after_commit_is_not_retryable(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lease lost after the reset commit still cleans up and stays 200."""
+    from types import SimpleNamespace
+
+    from omnigent.server.cli_retention import (
+        CliRetentionCoordinator,
+        CliRetentionHostLease,
+        CliRetentionHostLeaseLost,
+    )
+
+    app, registry, host_store, conv_store = host_api_app
+    _comm = await _connect_host(app, registry)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        configured = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={
+                "expected_revision": 0,
+                "policy": {
+                    "version": 1,
+                    "idle_threshold_minutes": 60,
+                    "max_idle_clis": 10,
+                    "close_on_archive": True,
+                },
+            },
+        )
+    assert configured.status_code == 200
+
+    cancels: list[str] = []
+
+    class _IntentStore:
+        def cancel_pending_idle_for_host(self, host_id):
+            cancels.append(host_id)
+            return 1
+
+    coordinator = CliRetentionCoordinator(
+        host_store=host_store,
+        conversation_store=conv_store,
+        runner_router=SimpleNamespace(),
+        intent_store=_IntentStore(),
+    )
+    reset_app = FastAPI()
+    reset_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            cli_retention_coordinator=coordinator,
+        ),
+        prefix="/v1",
+    )
+
+    calls = 0
+    original_ensure_owned = CliRetentionHostLease.ensure_owned
+
+    async def _lose_lease_after_commit(self):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise CliRetentionHostLeaseLost(self.host_id)
+        return await original_ensure_owned(self)
+
+    monkeypatch.setattr(CliRetentionHostLease, "ensure_owned", _lose_lease_after_commit)
+    async with AsyncClient(
+        transport=ASGITransport(app=reset_app), base_url="http://test"
+    ) as client:
+        reset = await client.request(
+            "DELETE",
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={"expected_revision": 1},
+        )
+
+    assert reset.status_code == 200
+    assert reset.json()["configured"] is False
+    assert reset.json()["revision"] == 2
+    assert _HOST_ID in cancels
+
+
 @pytest.mark.parametrize(
     "policy",
     [

@@ -288,10 +288,12 @@ class CliRetentionCoordinator:
     ) -> dict[str, Any]:
         """Release pool ownership on every reachable session for safe downgrade."""
         key = (current_workspace_id(), host_id)
-        if lease is not None:
-            await lease.ensure_owned()
+        # cancel_pending_idle_for_host needs no lease: run it before the lease
+        # check so a lost lease cannot silently skip it.
         if self._intent_store is not None:
             await asyncio.to_thread(self._intent_store.cancel_pending_idle_for_host, host_id)
+        if lease is not None:
+            await lease.ensure_owned()
         conversations = await self._host_conversations(host_id, include_archived=True)
         reset: list[str] = []
         unavailable: list[str] = []

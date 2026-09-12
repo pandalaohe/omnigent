@@ -1024,11 +1024,28 @@ def create_hosts_router(
                         expected_claim_token=lease.token,
                     )
                     if updated is not None:
-                        await cli_retention_coordinator.reset_host_under_lease(
-                            host_id,
-                            policy_revision=updated.cli_retention_revision,
-                            lease=lease,
-                        )
+                        try:
+                            await cli_retention_coordinator.reset_host_under_lease(
+                                host_id,
+                                policy_revision=updated.cli_retention_revision,
+                                lease=lease,
+                            )
+                        except CliRetentionHostLeaseLost:
+                            # The policy reset above already committed, so a 409
+                            # "retry" is dishonest: the CAS consumed the
+                            # revision. The lease is gone because the host row
+                            # is gone, leaving nothing to fence — finish
+                            # best-effort and report the outcome honestly.
+                            _logger.warning(
+                                "CLI retention lease lost after policy reset for Host %s; completing cleanup best-effort",
+                                host_id,
+                                exc_info=True,
+                            )
+                            await cli_retention_coordinator.reset_host_under_lease(
+                                host_id,
+                                policy_revision=updated.cli_retention_revision,
+                                lease=None,
+                            )
         except HostCliRetentionRevisionConflictError as exc:
             raise HTTPException(status_code=409, detail="CLI retention policy changed") from exc
         except (CliRetentionHostLeaseBusy, CliRetentionHostLeaseLost) as exc:

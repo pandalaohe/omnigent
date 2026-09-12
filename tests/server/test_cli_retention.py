@@ -9,6 +9,7 @@ from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.entities.pagination import PagedList
 from omnigent.server.cli_retention import (
     CliRetentionCoordinator,
+    CliRetentionHostLeaseLost,
     IdleCliSnapshot,
     select_idle_cli_overflow,
 )
@@ -723,3 +724,31 @@ async def test_active_archive_close_intent_blocks_work_after_quick_unarchive() -
         assert await _archive_blocks_external_user_work(request, conv, SimpleNamespace()) is True
     finally:
         _archive_close_intents.discard(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_reset_host_under_lease_cancels_pending_idle_before_lease_check() -> None:
+    cancels: list[str] = []
+
+    class _IntentStore:
+        def cancel_pending_idle_for_host(self, host_id):
+            cancels.append(host_id)
+            return 1
+
+    class _LostLease:
+        async def ensure_owned(self):
+            raise CliRetentionHostLeaseLost("host-a")
+
+    coordinator = CliRetentionCoordinator(
+        host_store=SimpleNamespace(),
+        conversation_store=SimpleNamespace(),
+        runner_router=SimpleNamespace(),
+        intent_store=_IntentStore(),
+    )
+
+    with pytest.raises(CliRetentionHostLeaseLost):
+        await coordinator.reset_host_under_lease(
+            "host-a", policy_revision=8, lease=_LostLease()
+        )
+
+    assert cancels == ["host-a"]
