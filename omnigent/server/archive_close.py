@@ -538,10 +538,6 @@ class ArchiveCloseCoordinator:
             runner_id=intent.runner_id,
         )
         if intent.reason == "archive":
-            if intent.host_id is not None and self._host_store is not None:
-                host = await asyncio.to_thread(self._host_store.get_host, intent.host_id)
-                if host is None:
-                    return "completed"
             from omnigent.server.routes._sessions.orchestration import _archive_stop_one
 
             stop_host_runner = False
@@ -568,7 +564,16 @@ class ArchiveCloseCoordinator:
                 archive_revision=intent.archive_revision,
                 stop_host_runner=stop_host_runner,
             )
-            return "completed" if closed else "runner_or_host_unavailable"
+            if closed:
+                return "completed"
+            if intent.host_id is not None and self._host_store is not None:
+                host = await asyncio.to_thread(self._host_store.get_host, intent.host_id)
+                if host is None:
+                    # The host row is gone so no one will ever acknowledge this
+                    # stop, and the attempt we just made is the evidence that it
+                    # could not be delivered.
+                    return "completed"
+            return "runner_or_host_unavailable"
 
         if intent.host_id is None or intent.policy_revision is None:
             return "cancelled"

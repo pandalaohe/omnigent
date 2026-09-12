@@ -759,7 +759,10 @@ async def _archive_stop_one(
                 timeout=10.0,
             )
             released = response.status_code < 400 or response.status_code == 404
-        elif conversation.runner_id is None or conversation.host_id is None:
+        elif conversation.runner_id is None or not stop_host_runner:
+            # Nothing addressable of this target's own is left: it either never had a
+            # runner, or it does not own this binding's teardown. The last target on
+            # the runner still has to prove the runner is gone.
             released = True
     except Exception:  # noqa: BLE001 - Host stop remains the captured-binding fallback.
         _logger.debug(

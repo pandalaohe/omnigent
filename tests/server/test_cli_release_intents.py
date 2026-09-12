@@ -951,12 +951,71 @@ async def test_archive_execute_intent_completes_when_host_row_deleted(
     )
 
     from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import common as _sessions_common
 
-    stop_outcome = AsyncMock(return_value="acked")
-    with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_outcome):
-        assert await coordinator._execute_intent(intent) == "completed"
-    stop_outcome.assert_not_awaited()
-    assert client.posts == []
+    stop_outcome = AsyncMock(return_value="unavailable")
+    try:
+        with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_outcome):
+            assert await coordinator._execute_intent(intent) == "completed"
+    finally:
+        _sessions_common._intentional_stop_sessions.discard(intent.target_session_id)
+    stop_outcome.assert_awaited_once()
+    assert len(client.posts) == 1
+
+    # A live tunnel is still used when the host row is gone: an ack completes.
+    stop_acked = AsyncMock(return_value="acked")
+    try:
+        with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_acked):
+            assert await coordinator._execute_intent(intent) == "completed"
+    finally:
+        _sessions_common._intentional_stop_sessions.discard(intent.target_session_id)
+    stop_acked.assert_awaited_once()
+    assert len(client.posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_gone_runner_completes_non_owner_without_host_stop(
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._sessions import common as _sessions_common
+
+    host_id = "a4b2c3d4e5f61234567890abcdef0123"
+    runner_id = "b4b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation()
+    child = conversations.create_conversation(parent_conversation_id=root.id)
+    for conversation, workspace in ((root, "C:\\root"), (child, "C:\\child")):
+        conversations.set_host_id(conversation.id, host_id, workspace=workspace)
+        conversations.set_runner_id(conversation.id, runner_id)
+    archived = conversations.update_conversation(root.id, archived=True, close_cli_on_archive=True)
+    assert archived is not None
+    intents = CliReleaseIntentStore(db_uri)
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_UnconnectedRunnerRouter(),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    stop_outcome = AsyncMock(return_value="unknown_runner")
+    try:
+        with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_outcome):
+            coordinator.trigger(root.id)
+            await coordinator.wait_for_idle()
+    finally:
+        _sessions_common._intentional_stop_sessions.discard(root.id)
+        _sessions_common._intentional_stop_sessions.discard(child.id)
+
+    stop_outcome.assert_awaited_once()
+    assert intents.archive_targets_complete(root.id, archived.archive_revision)
+    assert intents.list_due(now=2_147_483_647) == []
+    settled = conversations.get_conversation(root.id)
+    assert settled is not None
+    assert settled.archive_close_completed_revision == settled.archive_revision == 1
 
 
 @pytest.mark.asyncio
