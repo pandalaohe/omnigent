@@ -30,6 +30,15 @@ class _Registry:
         return None
 
 
+class _LiveRegistry:
+    def __init__(self, host_id: str) -> None:
+        self._host_id = host_id
+        self.connection = object()
+
+    def get(self, host_id: str):
+        return self.connection if host_id == self._host_id else None
+
+
 class _Response:
     def __init__(self, payload: dict[str, object] | None = None) -> None:
         self.status_code = 200
@@ -941,11 +950,20 @@ async def test_archive_execute_intent_completes_when_host_row_deleted(
     assert intent.host_id == host_id
     hosts = HostStore(db_uri)
     client = _RunnerClient()
-    coordinator = ArchiveCloseCoordinator(
+    router = _RunnerRouter(client, online=True)
+    coordinator_no_tunnel = ArchiveCloseCoordinator(
         conversation_store=conversations,
         host_store=hosts,
         host_registry=_Registry(),
-        runner_router=_RunnerRouter(client, online=True),
+        runner_router=router,
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+    coordinator_live = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=hosts,
+        host_registry=_LiveRegistry(host_id),
+        runner_router=router,
         intent_store=intents,
         scan_interval_seconds=3600,
     )
@@ -953,24 +971,37 @@ async def test_archive_execute_intent_completes_when_host_row_deleted(
     from omnigent.server.routes import sessions as sessions_facade
     from omnigent.server.routes._sessions import common as _sessions_common
 
-    stop_outcome = AsyncMock(return_value="unavailable")
+    stop_unavailable = AsyncMock(return_value="unavailable")
     try:
-        with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_outcome):
-            assert await coordinator._execute_intent(intent) == "completed"
+        with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_unavailable):
+            assert await coordinator_no_tunnel._execute_intent(intent) == "completed"
     finally:
         _sessions_common._intentional_stop_sessions.discard(intent.target_session_id)
-    stop_outcome.assert_awaited_once()
+    stop_unavailable.assert_awaited_once()
     assert len(client.posts) == 1
+
+    # A live tunnel may still deliver the stop, so an ack timeout (or any
+    # other non-unknown failure) must be retried, not completed.
+    stop_unavailable_live = AsyncMock(return_value="unavailable")
+    try:
+        with patch.object(
+            sessions_facade, "_stop_session_host_runner_outcome", stop_unavailable_live
+        ):
+            assert await coordinator_live._execute_intent(intent) == "runner_or_host_unavailable"
+    finally:
+        _sessions_common._intentional_stop_sessions.discard(intent.target_session_id)
+    stop_unavailable_live.assert_awaited_once()
+    assert len(client.posts) == 2
 
     # A live tunnel is still used when the host row is gone: an ack completes.
     stop_acked = AsyncMock(return_value="acked")
     try:
         with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_acked):
-            assert await coordinator._execute_intent(intent) == "completed"
+            assert await coordinator_live._execute_intent(intent) == "completed"
     finally:
         _sessions_common._intentional_stop_sessions.discard(intent.target_session_id)
     stop_acked.assert_awaited_once()
-    assert len(client.posts) == 2
+    assert len(client.posts) == 3
 
 
 @pytest.mark.asyncio

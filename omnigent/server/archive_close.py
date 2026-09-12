@@ -568,10 +568,11 @@ class ArchiveCloseCoordinator:
                 return "completed"
             if intent.host_id is not None and self._host_store is not None:
                 host = await asyncio.to_thread(self._host_store.get_host, intent.host_id)
-                if host is None:
-                    # The host row is gone so no one will ever acknowledge this
-                    # stop, and the attempt we just made is the evidence that it
-                    # could not be delivered.
+                if host is None and (
+                    self._host_registry is None or self._host_registry.get(intent.host_id) is None
+                ):
+                    # The host row is gone and no tunnel can carry the stop, so
+                    # nothing will ever acknowledge it.
                     return "completed"
             return "runner_or_host_unavailable"
 
