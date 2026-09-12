@@ -6472,14 +6472,14 @@ async def _stop_session_via_runner_impl(
     return True
 
 
-async def _stop_session_host_runner(
+async def _stop_session_host_runner_outcome(
     session_id: str,
     host_id: str,
     runner_id: str,
     host_registry: Any,
     *,
     expect_already_stopped: bool = False,
-) -> bool:
+) -> str:
     """
     Terminate the host-launched runner backing a host-spawned session.
 
@@ -6520,14 +6520,15 @@ async def _stop_session_host_runner(
         instead of warning, for callers that race another reaper for the same
         runner (the relaunch belt: see
         :func:`_spawn_superseded_runner_stop`). Delivery failures still warn.
-    :returns: ``True`` when the stop was delivered and acknowledged (the
-        runner is exiting, so a tunnel drop is expected); ``False`` on any
-        best-effort early-out (no host registry, host offline/replaced,
-        ack timeout, or host-reported failure) where the runner may keep
+    :returns: ``"acked"`` when the stop was delivered and acknowledged (the
+        runner is exiting, so a tunnel drop is expected); ``"unknown_runner"``
+        when the host reports the runner is already gone; ``"unavailable"`` on
+        any best-effort early-out (no host registry, host offline/replaced,
+        ack timeout, or other host-reported failure) where the runner may keep
         running and no tunnel drop will follow.
     """
     if host_registry is None:
-        return False
+        return "unavailable"
     conn = host_registry.get(host_id)
     if conn is None:
         _logger.warning(
@@ -6539,7 +6540,7 @@ async def _stop_session_host_runner(
             host_id,
             extra={"session_id": session_id},
         )
-        return False
+        return "unavailable"
     from omnigent.host.frames import HostStopRunnerFrame, encode_host_frame
 
     request_id = secrets.token_hex(8)
@@ -6559,7 +6560,7 @@ async def _stop_session_host_runner(
             host_id,
             extra={"session_id": session_id},
         )
-        return False
+        return "unavailable"
     try:
         result = await asyncio.wait_for(
             future,
@@ -6574,7 +6575,7 @@ async def _stop_session_host_runner(
             session_id,
             extra={"session_id": session_id},
         )
-        return False
+        return "unavailable"
     if result.get("status") == "failed":
         # An unknown runner means someone already reaped it. Expected for the
         # relaunch belt, which the host's own supersession normally beats, so
@@ -6587,8 +6588,55 @@ async def _stop_session_host_runner(
             result.get("error"),
             extra={"session_id": session_id},
         )
-        return False
-    return True
+        if (result.get("error") or "").startswith("unknown runner"):
+            return "unknown_runner"
+        return "unavailable"
+    return "acked"
+
+
+async def _stop_session_host_runner(
+    session_id: str,
+    host_id: str,
+    runner_id: str,
+    host_registry: Any,
+    *,
+    expect_already_stopped: bool = False,
+) -> bool:
+    """
+    Terminate the host-launched runner backing a host-spawned session.
+
+    Thin bool wrapper over :func:`_stop_session_host_runner_outcome` for the
+    existing callers: only a host-acknowledged stop counts as delivered.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param host_id: Owning host identifier from the session row, e.g.
+        ``"host_a1b2c3d4..."``.
+    :param runner_id: Runner bound to the session, e.g.
+        ``"runner_token_abc123..."``.
+    :param host_registry: The :class:`HostRegistry` tracking live host
+        tunnels on this replica, or ``None`` when host support is not wired
+        (in-process / test setups without a host tunnel).
+    :param expect_already_stopped: Log a host-reported ``failed`` at debug
+        instead of warning, for callers that race another reaper for the same
+        runner (the relaunch belt: see
+        :func:`_spawn_superseded_runner_stop`). Delivery failures still warn.
+    :returns: ``True`` when the stop was delivered and acknowledged (the
+        runner is exiting, so a tunnel drop is expected); ``False`` on any
+        best-effort early-out (no host registry, host offline/replaced,
+        ack timeout, or host-reported failure) where the runner may keep
+        running and no tunnel drop will follow.
+    """
+    return (
+        await _stop_session_host_runner_outcome(
+            session_id,
+            host_id,
+            runner_id,
+            host_registry,
+            expect_already_stopped=expect_already_stopped,
+        )
+        == "acked"
+    )
 
 
 def _build_new_item(
@@ -10914,6 +10962,7 @@ __all__ = [
     "_spec_config_flag_explicitly_disabled",
     "_spec_harness",
     "_stop_session_host_runner",
+    "_stop_session_host_runner_outcome",
     "_stop_session_via_runner",
     "_stored_file_to_resource",
     "_stream_live_events",

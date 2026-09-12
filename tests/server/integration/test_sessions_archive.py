@@ -302,14 +302,14 @@ async def test_archive_tears_down_host_spawned_runner(
     )
     conv_store.set_runner_id(session_id, "b1b2c3d4e5f61234567890abcdef0123")
 
-    mock_teardown = AsyncMock(return_value=True)
+    mock_teardown = AsyncMock(return_value="acked")
     _sessions_common._session_status_cache[session_id] = "running"
     try:
         with (
             patch.object(
                 _sessions_orchestration, "_stop_session_via_runner", AsyncMock(return_value=True)
             ),
-            patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown),
+            patch.object(_sessions_facade, "_stop_session_host_runner_outcome", mock_teardown),
         ):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",

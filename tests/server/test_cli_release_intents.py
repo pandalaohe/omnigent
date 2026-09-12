@@ -64,6 +64,16 @@ class _RunnerRouter:
         return SimpleNamespace(runner_id=conversation.runner_id, client=self.client)
 
 
+class _UnconnectedRunnerRouter:
+    """Router with no reachable runner: lookups fail like a gone runner."""
+
+    def runner_is_online(self, _runner_id: str) -> bool:
+        return False
+
+    def client_for_session_resources(self, _session_id: str, *, conversation=None):
+        raise LookupError("no runner connected")
+
+
 def test_archive_transition_and_close_request_are_atomic(
     db_uri: str,
 ) -> None:
@@ -358,11 +368,11 @@ async def test_shared_runner_stops_only_after_every_target_cli_released(
         intent_store=intents,
         scan_interval_seconds=3600,
     )
-    stop_runner = AsyncMock(return_value=True)
+    stop_runner = AsyncMock(return_value="acked")
 
     from omnigent.server.routes import sessions as sessions_facade
 
-    with patch.object(sessions_facade, "_stop_session_host_runner", stop_runner):
+    with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_runner):
         assert await coordinator._execute_intent(first) == "completed"
         stop_runner.assert_not_awaited()
         assert intents.claim(first.id, "first", claimed_at=100, stale_before=0)
@@ -841,3 +851,281 @@ async def test_conversation_delete_removes_release_intents_for_its_subtree(
     assert len(intents.list_due(now=2_147_483_647)) == 2
     assert await conversations.delete_conversation(root.id)
     assert intents.list_due(now=2_147_483_647) == []
+
+
+@pytest.mark.asyncio
+async def test_archive_intent_completes_when_host_binding_is_none_and_runner_disconnected(
+    db_uri: str,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation(runner_id="b1b2c3d4e5f61234567890abcdef0123")
+    archived = conversations.update_conversation(root.id, archived=True, close_cli_on_archive=True)
+    assert archived is not None
+    intents = CliReleaseIntentStore(db_uri)
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_UnconnectedRunnerRouter(),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+    coordinator.trigger(root.id)
+    await coordinator.wait_for_idle()
+
+    settled = conversations.get_conversation(root.id)
+    assert settled is not None
+    assert settled.archive_close_completed_revision == settled.archive_revision == 1
+    assert intents.list_due(now=2_147_483_647) == []
+
+
+@pytest.mark.asyncio
+async def test_archive_intent_completes_when_host_reports_unknown_runner(
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._sessions import common as _sessions_common
+
+    host_id = "c2b2c3d4e5f61234567890abcdef0123"
+    runner_id = "d2b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation()
+    conversations.set_host_id(root.id, host_id, workspace="C:\\root")
+    conversations.set_runner_id(root.id, runner_id)
+    archived = conversations.update_conversation(root.id, archived=True, close_cli_on_archive=True)
+    assert archived is not None
+    intents = CliReleaseIntentStore(db_uri)
+    client = _RunnerClient()
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_RunnerRouter(client, online=True),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    stop_outcome = AsyncMock(return_value="unknown_runner")
+    try:
+        with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_outcome):
+            coordinator.trigger(root.id)
+            await coordinator.wait_for_idle()
+    finally:
+        _sessions_common._intentional_stop_sessions.discard(root.id)
+
+    stop_outcome.assert_awaited_once()
+    assert root.id not in _sessions_common._intentional_stop_sessions
+    settled = conversations.get_conversation(root.id)
+    assert settled is not None
+    assert settled.archive_close_completed_revision == settled.archive_revision == 1
+    assert intents.list_due(now=2_147_483_647) == []
+
+
+@pytest.mark.asyncio
+async def test_archive_execute_intent_completes_when_host_row_deleted(
+    db_uri: str,
+) -> None:
+    host_id = "e2b2c3d4e5f61234567890abcdef0123"
+    runner_id = "f2b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation()
+    conversations.set_host_id(root.id, host_id, workspace="C:\\root")
+    conversations.set_runner_id(root.id, runner_id)
+    archived = conversations.update_conversation(root.id, archived=True, close_cli_on_archive=True)
+    assert archived is not None
+    bound = conversations.get_conversation(root.id)
+    assert bound is not None
+    intents = CliReleaseIntentStore(db_uri)
+    (intent,) = intents.ensure_archive_targets(root.id, archived.archive_revision, [bound])
+    assert intent.host_id == host_id
+    hosts = HostStore(db_uri)
+    client = _RunnerClient()
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=hosts,
+        host_registry=_Registry(),
+        runner_router=_RunnerRouter(client, online=True),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    stop_outcome = AsyncMock(return_value="acked")
+    with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_outcome):
+        assert await coordinator._execute_intent(intent) == "completed"
+    stop_outcome.assert_not_awaited()
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_archive_intent_backs_off_while_host_offline(db_uri: str) -> None:
+    from sqlalchemy import update as sa_update
+
+    from omnigent.db.db_models import SqlCliReleaseIntent
+    from omnigent.db.utils import get_or_create_conversation_engine
+
+    host_id = "a2b2c3d4e5f61234567890abcdef0123"
+    runner_id = "b2b2c3d4e5f61234567890abcdef0123"
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(host_id, "host", "local")
+    hosts.set_offline(host_id)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation()
+    conversations.set_host_id(root.id, host_id, workspace="C:\\root")
+    conversations.set_runner_id(root.id, runner_id)
+    archived = conversations.update_conversation(root.id, archived=True, close_cli_on_archive=True)
+    assert archived is not None
+    intents = CliReleaseIntentStore(db_uri)
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=hosts,
+        host_registry=_Registry(),
+        runner_router=_UnconnectedRunnerRouter(),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+    coordinator.trigger(root.id)
+    await coordinator.wait_for_idle()
+
+    pending = intents.list_due(now=2_147_483_647)
+    assert len(pending) == 1
+    first = pending[0]
+    assert first.status == "pending"
+    assert first.last_error == "runner_or_host_unavailable"
+    settled = conversations.get_conversation(root.id)
+    assert settled is not None
+    assert settled.archive_close_completed_revision is None
+
+    engine = get_or_create_conversation_engine(db_uri)
+    with engine.begin() as conn:
+        conn.execute(
+            sa_update(SqlCliReleaseIntent)
+            .where(
+                SqlCliReleaseIntent.workspace_id == current_workspace_id(),
+                SqlCliReleaseIntent.id == first.id,
+            )
+            .values(created_at=first.created_at - 3600)
+        )
+    aged = intents.list_due(now=2_147_483_647)[0]
+    await coordinator._process_intent((current_workspace_id(), aged.id), aged)
+    await coordinator.wait_for_idle()
+
+    later = intents.list_due(now=2_147_483_647)
+    assert len(later) == 1
+    assert later[0].status == "pending"
+    assert later[0].next_attempt_at > first.next_attempt_at
+
+
+@pytest.mark.asyncio
+async def test_process_intent_advances_root_without_global_pending_sweep(
+    db_uri: str,
+) -> None:
+    runner_id = "c3b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation(runner_id=runner_id)
+    child = conversations.create_conversation(
+        parent_conversation_id=root.id,
+        runner_id=runner_id,
+    )
+    archived = conversations.update_conversation(root.id, archived=True, close_cli_on_archive=True)
+    assert archived is not None
+    bound_root = conversations.get_conversation(root.id)
+    bound_child = conversations.get_conversation(child.id)
+    assert bound_root is not None and bound_child is not None
+    intents = CliReleaseIntentStore(db_uri)
+    made = intents.ensure_archive_targets(
+        root.id, archived.archive_revision, [bound_root, bound_child]
+    )
+    assert len(made) == 2
+    client = _RunnerClient()
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_RunnerRouter(client, online=True),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+    pending_sweeps = 0
+    list_pending = conversations.list_pending_archive_closes
+
+    def _counting_pending(**kwargs):
+        nonlocal pending_sweeps
+        pending_sweeps += 1
+        return list_pending(**kwargs)
+
+    conversations.list_pending_archive_closes = _counting_pending  # type: ignore[method-assign]
+    scoped_triggers: list[str] = []
+    trigger_next = coordinator._trigger_next_root_target
+
+    def _counting_scoped(root_session_id: str) -> None:
+        scoped_triggers.append(root_session_id)
+        trigger_next(root_session_id)
+
+    coordinator._trigger_next_root_target = _counting_scoped  # type: ignore[method-assign]
+    try:
+        await coordinator._process_intent((current_workspace_id(), made[0].id), made[0])
+        await coordinator.wait_for_idle()
+    finally:
+        conversations.list_pending_archive_closes = list_pending  # type: ignore[method-assign]
+
+    assert pending_sweeps == 0
+    assert scoped_triggers == [root.id, root.id]
+    assert intents.list_due(now=2_147_483_647) == []
+    settled = conversations.get_conversation(root.id)
+    assert settled is not None
+    assert settled.archive_close_completed_revision == settled.archive_revision == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_intent_completes_when_runner_acks_stop(db_uri: str) -> None:
+    from omnigent.server.routes._sessions import common as _sessions_common
+
+    host_id = "d3b2c3d4e5f61234567890abcdef0123"
+    runner_id = "e3b2c3d4e5f61234567890abcdef0123"
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(host_id, "host", "local")
+    hosts.set_offline(host_id)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation()
+    conversations.set_host_id(root.id, host_id, workspace="C:\\root")
+    conversations.set_runner_id(root.id, runner_id)
+    archived = conversations.update_conversation(root.id, archived=True, close_cli_on_archive=True)
+    assert archived is not None
+    intents = CliReleaseIntentStore(db_uri)
+    client = _RunnerClient()
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=hosts,
+        host_registry=_Registry(),
+        runner_router=_RunnerRouter(client, online=True),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    stop_outcome = AsyncMock(return_value="acked")
+    try:
+        with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_outcome):
+            coordinator.trigger(root.id)
+            await coordinator.wait_for_idle()
+    finally:
+        _sessions_common._intentional_stop_sessions.discard(root.id)
+
+    stop_outcome.assert_awaited_once()
+    settled = conversations.get_conversation(root.id)
+    assert settled is not None
+    assert settled.archive_close_completed_revision == settled.archive_revision == 1
+    assert client.posts == [
+        (
+            f"/v1/sessions/{root.id}/cli-retention/release",
+            {
+                "reason": "archive",
+                "archive_scope_id": root.id,
+                "archive_revision": 1,
+            },
+        )
+    ]

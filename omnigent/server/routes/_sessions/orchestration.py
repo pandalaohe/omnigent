@@ -759,7 +759,7 @@ async def _archive_stop_one(
                 timeout=10.0,
             )
             released = response.status_code < 400 or response.status_code == 404
-        elif conversation.runner_id is None:
+        elif conversation.runner_id is None or conversation.host_id is None:
             released = True
     except Exception:  # noqa: BLE001 - Host stop remains the captured-binding fallback.
         _logger.debug(
@@ -776,28 +776,30 @@ async def _archive_stop_one(
     ):
         _intentional_stop_sessions.add(target_id)
         try:
-            stopped = await _facade._stop_session_host_runner(
+            outcome = await _facade._stop_session_host_runner_outcome(
                 target_id,
                 conversation.host_id,
                 conversation.runner_id,
                 host_registry,
             )
         except Exception:  # noqa: BLE001 - retry remains durable when release also failed.
-            stopped = False
+            outcome = "unavailable"
             _logger.debug(
                 "Archive target Host runner stop failed for %s",
                 target_id,
                 exc_info=True,
                 extra={"session_id": target_id},
             )
-        if not stopped:
+        if outcome != "acked":
             _intentional_stop_sessions.discard(target_id)
         # The last target on this Host Runner owns its teardown. A successful
         # per-session release is not enough to complete the durable intent if
-        # the dedicated runner could not be stopped; keep retrying until the
-        # Host acknowledges the stop (or a later worker proves the binding is
-        # gone by another means).
-        return stopped
+        # the dedicated runner could not be stopped; keep retrying only while
+        # the host may still know the runner. A runner the host reports as
+        # unknown is already reaped, so the intent completes without an ack.
+        # INVARIANT: a runner the host still knows is never reported released
+        # without an ack.
+        return outcome in {"acked", "unknown_runner"}
     return released
 
 

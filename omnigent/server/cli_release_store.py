@@ -41,6 +41,7 @@ class CliReleaseIntent:
     claimed_at: int | None
     next_attempt_at: int
     last_error: str | None
+    created_at: int
 
 
 def _to_intent(row: SqlCliReleaseIntent) -> CliReleaseIntent:
@@ -62,6 +63,7 @@ def _to_intent(row: SqlCliReleaseIntent) -> CliReleaseIntent:
         claimed_at=row.claimed_at,
         next_attempt_at=row.next_attempt_at,
         last_error=row.last_error,
+        created_at=row.created_at,
     )
 
 
@@ -165,6 +167,24 @@ class CliReleaseIntentStore:
                     SqlCliReleaseIntent.workspace_id == current_workspace_id(),
                     SqlCliReleaseIntent.status.in_(("pending", "claimed")),
                     SqlCliReleaseIntent.next_attempt_at <= now,
+                )
+                .order_by(SqlCliReleaseIntent.next_attempt_at, SqlCliReleaseIntent.id)
+                .limit(limit)
+            ).all()
+            return [_to_intent(row) for row in rows]
+
+    def list_due_for_root(
+        self, root_session_id: str, *, now: int, limit: int = 1
+    ) -> list[CliReleaseIntent]:
+        with self._session("list_due_for_root") as session:
+            rows = session.scalars(
+                select(SqlCliReleaseIntent)
+                .where(
+                    SqlCliReleaseIntent.workspace_id == current_workspace_id(),
+                    SqlCliReleaseIntent.status.in_(("pending", "claimed")),
+                    SqlCliReleaseIntent.next_attempt_at <= now,
+                    SqlCliReleaseIntent.root_session_id == root_session_id,
+                    SqlCliReleaseIntent.reason == "archive",
                 )
                 .order_by(SqlCliReleaseIntent.next_attempt_at, SqlCliReleaseIntent.id)
                 .limit(limit)

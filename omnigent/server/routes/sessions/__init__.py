@@ -517,6 +517,7 @@ from omnigent.server.routes._sessions.helpers import (
     _spec_config_flag_explicitly_disabled as _spec_config_flag_explicitly_disabled,
     _spec_harness as _spec_harness,
     _stop_session_host_runner as _stop_session_host_runner,
+    _stop_session_host_runner_outcome as _stop_session_host_runner_outcome,
     _stored_file_to_resource as _stored_file_to_resource,
     _stream_live_events as _stream_live_events,
     _structured_ask_user_question as _structured_ask_user_question,

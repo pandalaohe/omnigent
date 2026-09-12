@@ -19,6 +19,13 @@ _logger = logging.getLogger(__name__)
 _INTENT_CLAIM_STALE_AFTER_S = 15 * 60
 _INTENT_HEARTBEAT_S = 60
 _RETRY_DELAY_S = 15
+_RETRY_MAX_DELAY_S = 3600
+
+
+def _retry_delay_seconds(intent: CliReleaseIntent, now: int) -> int:
+    """Grow the retry gap with the intent's own age: clamp(age/4, 15 s, 1 h)."""
+    age = max(0, now - intent.created_at)
+    return max(_RETRY_DELAY_S, min(_RETRY_MAX_DELAY_S, age // 4))
 
 
 class ArchiveCloseCoordinator:
@@ -107,6 +114,18 @@ class ArchiveCloseCoordinator:
                 continue
             if runner_id is not None and intent.runner_id != runner_id:
                 continue
+            self._trigger_intent(intent)
+
+    def _trigger_next_root_target(self, root_session_id: str) -> None:
+        """Schedule at most one due archive target for one root (O(1) work)."""
+        try:
+            intents = self._intent_store.list_due_for_root(
+                root_session_id, now=int(time.time()), limit=1
+            )
+        except Exception:  # noqa: BLE001 - periodic retry is the recovery boundary.
+            _logger.warning("Could not list pending CLI release work", exc_info=True)
+            return
+        for intent in intents:
             self._trigger_intent(intent)
 
     def _retain_task(
@@ -247,8 +266,9 @@ class ArchiveCloseCoordinator:
         )
         _archive_close_intents.discard(root_id)
         initial_tasks: list[asyncio.Task[None]] = []
+        now = int(time.time())
         for intent in intents:
-            if intent.status in {"pending", "claimed"}:
+            if intent.status in {"pending", "claimed"} and intent.next_attempt_at <= now:
                 task = self._trigger_intent(intent)
                 if task is not None:
                     initial_tasks.append(task)
@@ -447,7 +467,8 @@ class ArchiveCloseCoordinator:
                     intent.id,
                     claim_token,
                     error=outcome,
-                    next_attempt_at=int(time.time()) + _RETRY_DELAY_S,
+                    next_attempt_at=int(time.time())
+                    + _retry_delay_seconds(intent, int(time.time())),
                 )
             if not mutated:
                 raise asyncio.CancelledError
@@ -481,7 +502,7 @@ class ArchiveCloseCoordinator:
                 intent.id,
                 claim_token,
                 error=type(exc).__name__,
-                next_attempt_at=int(time.time()) + _RETRY_DELAY_S,
+                next_attempt_at=int(time.time()) + _retry_delay_seconds(intent, int(time.time())),
             )
         finally:
             heartbeat.cancel()
@@ -500,9 +521,8 @@ class ArchiveCloseCoordinator:
                 )
                 _archive_close_intents.discard(intent.root_session_id)
 
-        # Root targets serialize on the durable root lease. Schedule the next
-        # due target immediately instead of waiting for the periodic sweep.
-        self.trigger_pending()
+        if intent.reason == "archive":
+            self._trigger_next_root_target(intent.root_session_id)
 
     async def _execute_intent(self, intent: CliReleaseIntent) -> str:
         target = await asyncio.to_thread(
@@ -518,6 +538,10 @@ class ArchiveCloseCoordinator:
             runner_id=intent.runner_id,
         )
         if intent.reason == "archive":
+            if intent.host_id is not None and self._host_store is not None:
+                host = await asyncio.to_thread(self._host_store.get_host, intent.host_id)
+                if host is None:
+                    return "completed"
             from omnigent.server.routes._sessions.orchestration import _archive_stop_one
 
             stop_host_runner = False

@@ -1549,12 +1549,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .limit(limit)
                 )
             )
-        rows: list[Conversation] = []
-        for conversation_id in ids:
-            conversation = self.get_conversation(conversation_id)
-            if conversation is not None:
-                rows.append(conversation)
-        return rows
+        by_id = self.get_conversations(list(ids))
+        return [by_id[conversation_id] for conversation_id in ids if conversation_id in by_id]
 
     def pending_archive_close_workspaces(self) -> set[int]:
         """Find every tenant partition with restart-recoverable archive work."""
