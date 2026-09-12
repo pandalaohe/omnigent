@@ -1316,7 +1316,6 @@ def register_events_routes(
                 raise
             native_watchdog.disarm(session_id, retire=True)
             stop_conv = None
-            stop_conn = None
             if not stop_delivered:
                 # No runner resolved: the process is already gone, but its last
                 # running/waiting edge can remain cached and persisted forever.
@@ -1349,34 +1348,33 @@ def register_events_routes(
                     )
                 # Only claim idle when the runner is confirmed gone: a fresh
                 # stamp may still be executing on another replica or be
-                # mid-reconnect, and a still-running row with a bound stale
-                # runner belongs to the conditional backstop below (its
-                # store-side transition loses to a fresher stamp and marks
-                # the scheduled run failed). An unbound running/waiting edge
-                # has no backstop row to settle it, so settle it here.
+                # mid-reconnect, so publish nothing for it. Defer exactly the
+                # shape the backstop below can settle (bound stale runner +
+                # running cache edge + still-running/waiting row, which its
+                # conditional store UPDATE requires); anything else confirmed
+                # gone has no backstop row to settle it, so settle it here.
                 stop_connectivity = await asyncio.to_thread(
                     conversation_store.get_session_connectivity, [session_id]
                 )
                 stop_conn = stop_connectivity.get(session_id)
-                stop_runner_gone = (
-                    stop_conn is None
-                    or stop_conn.runner_id is None
-                    or not runner_seen_is_fresh(stop_conn.runner_last_seen)
+                stop_runner_fresh = (
+                    stop_conn is not None
+                    and stop_conn.runner_id is not None
+                    and runner_seen_is_fresh(stop_conn.runner_last_seen)
                 )
-                stop_status_running = (
-                    _session_status_from_cache(
+                stop_backstop_handles = (
+                    stop_conn is not None
+                    and stop_conn.runner_id is not None
+                    and not stop_runner_fresh
+                    and stop_conv is not None
+                    and stop_conv.live_status in ("running", "waiting")
+                    and _session_status_from_cache(
                         session_id,
                         stop_conv.live_status if stop_conv is not None else None,
                     )
                     == "running"
                 )
-                stop_backstop_handles = (
-                    stop_conn is not None
-                    and stop_conn.runner_id is not None
-                    and not runner_seen_is_fresh(stop_conn.runner_last_seen)
-                    and stop_status_running
-                )
-                if stop_runner_gone and not stop_backstop_handles:
+                if not stop_runner_fresh and not stop_backstop_handles:
                     _publish_status(
                         session_id,
                         "idle",
@@ -1439,6 +1437,11 @@ def register_events_routes(
                 # be delivered) AND ``runner_last_seen`` stale past the TTL,
                 # so a runner merely mid-reconnect — or alive on another
                 # replica — inside the grace window is left untouched.
+                # Re-read: the host teardown above can clear the liveness stamp, so the rescue snapshot is stale.
+                stop_connectivity = await asyncio.to_thread(
+                    conversation_store.get_session_connectivity, [session_id]
+                )
+                stop_conn = stop_connectivity.get(session_id)
                 if (
                     stop_conn is not None
                     and stop_conn.runner_id is not None
