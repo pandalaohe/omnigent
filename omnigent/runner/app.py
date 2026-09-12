@@ -6742,7 +6742,11 @@ def create_runner_app(
                 _begin_turn_slot(conv_id)
                 _publish_turn_status(conv_id, "running")
                 _turn_task = asyncio.create_task(
-                    _run_turn_bg(compact_body, conv_id),
+                    _run_turn_bg(
+                        compact_body,
+                        conv_id,
+                        _cli_runtime_lifecycle.runtime_token(conv_id),
+                    ),
                     name=f"compact-{conv_id}",
                 )
                 _active_turns[conv_id] = _turn_task
