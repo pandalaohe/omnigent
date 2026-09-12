@@ -4883,7 +4883,7 @@ async def _codex_discover_thread_and_forward(
         current_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
         leftover_app_server = owned_app_server
         if current_app_server is owned_app_server:
-            _AUTO_CODEX_APP_SERVERS.pop(session_id)
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         with contextlib.suppress(Exception):
             await event_client.close()
         if leftover_app_server is not None:
@@ -4947,7 +4947,7 @@ async def _codex_forward_known_thread(
         current_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
         leftover_app_server = owned_app_server
         if current_app_server is owned_app_server:
-            _AUTO_CODEX_APP_SERVERS.pop(session_id)
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()
