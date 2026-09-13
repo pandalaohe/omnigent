@@ -218,6 +218,162 @@ describe("resolveIdentity", () => {
     expect(serverB).toHaveBeenCalledOnce();
   });
 
+  it("discards a lookup from before a round trip back to the same Server", async () => {
+    let resolveServerA1!: (response: Response) => void;
+    const serverA1 = vi.fn().mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveServerA1 = resolve;
+      }),
+    );
+    const serverB = vi
+      .fn()
+      .mockResolvedValue(
+        mockJsonResponse({ user_id: "bob", preferences: { version: 1, settings: {} } }),
+      );
+    const serverA2 = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        user_id: "alice",
+        is_admin: true,
+        preferences: { version: 1, settings: {} },
+      }),
+    );
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA1 });
+    const { resolveIdentity, getCurrentUserId, getCurrentIsAdmin } = await import("./identity");
+
+    const staleResolution = resolveIdentity();
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    expect(await resolveIdentity()).toBe("bob");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA2 });
+    expect(await resolveIdentity()).toBe("alice");
+    resolveServerA1(
+      mockJsonResponse({
+        user_id: "mallory",
+        is_admin: false,
+        preferences: { version: 1, settings: { context_indicator: "compact" } },
+      }),
+    );
+
+    expect(await staleResolution).toBeNull();
+    expect(getCurrentUserId()).toBe("alice");
+    expect(getCurrentIsAdmin()).toBe(true);
+    // The stale lookup's preference body must not hydrate the current Server.
+    expect(localStorage.getItem("omnigent:context-indicator-mode")).toBeNull();
+  });
+
+  it("starts a new lookup when returning to a Server whose lookup was discarded", async () => {
+    let resolveServerA1!: (response: Response) => void;
+    const serverA1 = vi.fn().mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveServerA1 = resolve;
+      }),
+    );
+    const serverB = vi
+      .fn()
+      .mockResolvedValue(
+        mockJsonResponse({ user_id: "bob", preferences: { version: 1, settings: {} } }),
+      );
+    const serverA2 = vi
+      .fn()
+      .mockResolvedValue(
+        mockJsonResponse({ user_id: "alice", preferences: { version: 1, settings: {} } }),
+      );
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA1 });
+    const { resolveIdentity } = await import("./identity");
+
+    const staleResolution = resolveIdentity();
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    resolveServerA1(mockJsonResponse({ user_id: "alice", preferences: null }));
+    expect(await staleResolution).toBeNull();
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA2 });
+    expect(await resolveIdentity()).toBe("alice");
+    expect(serverA2).toHaveBeenCalledOnce();
+  });
+
+  it("drops the cached user and header after switching Servers without resolving", async () => {
+    const serverA = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        user_id: "alice",
+        is_admin: true,
+        preferences: { version: 1, settings: {} },
+      }),
+    );
+    const serverB = vi.fn().mockResolvedValue(mockJsonResponse({}));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, getCurrentUserId, getCurrentIsAdmin, authenticatedFetch } =
+      await import("./identity");
+
+    expect(await resolveIdentity()).toBe("alice");
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+
+    expect(getCurrentUserId()).toBeNull();
+    expect(getCurrentIsAdmin()).toBe(false);
+    await authenticatedFetch("/v1/sessions");
+    const init = serverB.mock.calls[0][1] as RequestInit;
+    const headers = new Headers(init.headers);
+    expect(headers.has("X-Forwarded-Email")).toBe(false);
+  });
+
+  it("keeps the identity when the same Server config is installed again", async () => {
+    vi.useFakeTimers();
+    const serverA = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        user_id: "alice",
+        is_admin: true,
+        preferences: { version: 1, settings: {} },
+      }),
+    );
+    const anotherFetcher = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "bob" }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, getCurrentUserId, getCurrentIsAdmin } = await import("./identity");
+    const { queueUserPreferencePatch, resetUserPreferencesSyncForTests } =
+      await import("./userPreferencesSync");
+
+    expect(await resolveIdentity()).toBe("alice");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: anotherFetcher });
+
+    expect(getCurrentUserId()).toBe("alice");
+    expect(getCurrentIsAdmin()).toBe(true);
+    expect(await resolveIdentity()).toBe("alice");
+    expect(serverA).toHaveBeenCalledOnce();
+    expect(anotherFetcher.mock.calls.filter(([path]) => path === "/v1/me")).toHaveLength(0);
+    // Preference sync stays active: a queued patch still sends after the reinstall.
+    queueUserPreferencePatch("context_indicator", "compact");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(anotherFetcher).toHaveBeenCalledWith(
+      "/v1/me/preferences/context_indicator",
+      expect.anything(),
+    );
+    resetUserPreferencesSyncForTests();
+  });
+
+  it("starts a new identity lookup for each config install without a Server identity", async () => {
+    const fetcherA = vi
+      .fn()
+      .mockResolvedValue(
+        mockJsonResponse({ user_id: "alice", preferences: { version: 1, settings: {} } }),
+      );
+    const fetcherB = vi
+      .fn()
+      .mockResolvedValue(
+        mockJsonResponse({ user_id: "bob", preferences: { version: 1, settings: {} } }),
+      );
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ fetcher: fetcherA });
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+
+    expect(await resolveIdentity()).toBe("alice");
+    setOmnigentHostConfig({ fetcher: fetcherB });
+
+    expect(getCurrentUserId()).toBeNull();
+    expect(await resolveIdentity()).toBe("bob");
+    expect(fetcherA).toHaveBeenCalledOnce();
+    expect(fetcherB).toHaveBeenCalledOnce();
+  });
+
   it("returns null when the server responds with user_id: null", async () => {
     // Server signals "no auth provider configured" with user_id: null.
     // Resolution should still complete (not throw) so the app can
@@ -345,6 +501,148 @@ describe("authenticatedFetch", () => {
     const init = fetchMock.mock.calls[1][1] as RequestInit;
     expect(init.method).toBe("DELETE");
     expect(init.signal).toBe(controller.signal);
+  });
+
+  it("does not retry a wrong-replica request on a Server selected after dispatch", async () => {
+    let releaseRunners!: (res: Response) => void;
+    const runnersPending = new Promise<Response>((resolve) => {
+      releaseRunners = resolve;
+    });
+    const serverA = vi.fn((path: string) => {
+      if (path === "/v1/me") return Promise.resolve(mockJsonResponse({ user_id: "alice" }));
+      if (path === "/v1/hosts/host-a/runners") return runnersPending;
+      return Promise.resolve(mockJsonResponse({}));
+    });
+    const serverB = vi.fn((path: string, init?: RequestInit) => {
+      void init;
+      return Promise.resolve(mockJsonResponse(path === "/v1/me" ? { user_id: "bob" } : {}));
+    });
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, authenticatedFetch } = await import("./identity");
+
+    expect(await resolveIdentity()).toBe("alice");
+    const pending = authenticatedFetch("/v1/hosts/host-a/runners", { method: "POST" });
+    await vi.waitFor(() =>
+      expect(serverA).toHaveBeenCalledWith("/v1/hosts/host-a/runners", expect.anything()),
+    );
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    expect(await resolveIdentity()).toBe("bob");
+    releaseRunners({
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      json: async () => ({ error: { code: "wrong_replica" } }),
+      clone: function () {
+        return this;
+      },
+    } as unknown as Response);
+
+    const res = await pending;
+    expect(res.status).toBe(400);
+    expect(serverB.mock.calls.map((call) => call[0])).toEqual(["/v1/me"]);
+    for (const call of serverB.mock.calls) {
+      const headers = new Headers(call[1]?.headers);
+      expect(headers.get("X-Forwarded-Email")).not.toBe("alice");
+    }
+  });
+
+  it("keeps the header decision from the start of a request that waits for its session host", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { setSessionHostResolver, resolveIdentity, authenticatedFetch } =
+      await import("./identity");
+
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let releaseSecond!: () => void;
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const resolver = vi.fn((sessionId: string) => {
+      if (sessionId === "sess-wait-unresolved") return firstGate;
+      return secondGate;
+    });
+    setSessionHostResolver(resolver);
+
+    const fetcher = vi.fn((path: string, init?: RequestInit) => {
+      void init;
+      if (path === "/v1/me") return Promise.resolve(mockJsonResponse({ user_id: "alice" }));
+      return Promise.resolve(mockJsonResponse({}));
+    });
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher });
+
+    const pendingUnresolved = authenticatedFetch(
+      "/v1/sessions/sess-wait-unresolved/resources/terminals",
+    );
+    await vi.waitFor(() => expect(resolver).toHaveBeenCalledWith("sess-wait-unresolved"));
+    expect(await resolveIdentity()).toBe("alice");
+    releaseFirst();
+    await pendingUnresolved;
+
+    const unresolvedCall = fetcher.mock.calls.find(([path]) => path !== "/v1/me");
+    expect(unresolvedCall).toBeDefined();
+    expect(new Headers((unresolvedCall![1] as RequestInit).headers).has("X-Forwarded-Email")).toBe(
+      false,
+    );
+
+    const pendingResolved = authenticatedFetch(
+      "/v1/sessions/sess-wait-resolved/resources/terminals",
+    );
+    await vi.waitFor(() => expect(resolver).toHaveBeenCalledWith("sess-wait-resolved"));
+    releaseSecond();
+    await pendingResolved;
+
+    const resolvedCalls = fetcher.mock.calls.filter(
+      ([path]) => path === "/v1/sessions/sess-wait-resolved/resources/terminals",
+    );
+    expect(resolvedCalls).toHaveLength(1);
+    expect(new Headers((resolvedCalls[0][1] as RequestInit).headers).get("X-Forwarded-Email")).toBe(
+      "alice",
+    );
+  });
+
+  it("drops the stamped user when the Server changes while the session host resolves", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { setSessionHostResolver, resolveIdentity, authenticatedFetch } =
+      await import("./identity");
+
+    let releaseResolve!: () => void;
+    const resolveGate = new Promise<void>((resolve) => {
+      releaseResolve = resolve;
+    });
+    const resolver = vi.fn().mockReturnValue(resolveGate);
+    setSessionHostResolver(resolver);
+
+    const serverA = vi.fn((path: string, init?: RequestInit) => {
+      void init;
+      if (path === "/v1/me") return Promise.resolve(mockJsonResponse({ user_id: "alice" }));
+      return Promise.resolve(mockJsonResponse({}));
+    });
+    const serverB = vi.fn((path: string, init?: RequestInit) => {
+      void init;
+      if (path === "/v1/me") return Promise.resolve(mockJsonResponse({ user_id: "bob" }));
+      return Promise.resolve(mockJsonResponse({}));
+    });
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    expect(await resolveIdentity()).toBe("alice");
+
+    const pending = authenticatedFetch("/v1/sessions/sess-switch/resources/terminals");
+    await vi.waitFor(() => expect(resolver).toHaveBeenCalledWith("sess-switch"));
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    expect(await resolveIdentity()).toBe("bob");
+    releaseResolve();
+    await pending;
+
+    const allCalls = [...serverA.mock.calls, ...serverB.mock.calls];
+    const sessionCalls = allCalls.filter(
+      ([path]) => path === "/v1/sessions/sess-switch/resources/terminals",
+    );
+    expect(sessionCalls).toHaveLength(1);
+    const headers = new Headers((sessionCalls[0][1] as RequestInit).headers);
+    expect(headers.has("X-Forwarded-Email")).toBe(false);
+    expect(headers.get("X-Forwarded-Email")).not.toBe("alice");
   });
 
   describe("slice-key routing (host sharding)", () => {
@@ -621,6 +919,37 @@ describe("login redirect", () => {
 
     await resolveIdentity();
 
+    expect(isLoginRedirectPending()).toBe(false);
+    expect(hrefWrites).toEqual([]);
+  });
+
+  it("discards a stale 401 from before a round trip back to the same Server", async () => {
+    let resolveServerA1!: (response: Response) => void;
+    const serverA1 = vi.fn().mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveServerA1 = resolve;
+      }),
+    );
+    const serverB = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "bob" }));
+    const serverA2 = vi
+      .fn()
+      .mockResolvedValue(mockJsonResponse({ user_id: "alice", is_admin: true }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA1 });
+    const { resolveIdentity, getCurrentUserId, isLoginRedirectPending } =
+      await import("./identity");
+
+    const staleResolution = resolveIdentity();
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    expect(await resolveIdentity()).toBe("bob");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA2 });
+    expect(await resolveIdentity()).toBe("alice");
+    resolveServerA1(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+
+    expect(await staleResolution).toBeNull();
+    expect(getCurrentUserId()).toBe("alice");
     expect(isLoginRedirectPending()).toBe(false);
     expect(hrefWrites).toEqual([]);
   });
