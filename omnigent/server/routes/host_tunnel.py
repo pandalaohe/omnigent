@@ -29,6 +29,8 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    HostAssignmentPrepareResultFrame,
+    HostAssignmentReleaseResultFrame,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
@@ -711,6 +713,32 @@ async def _receive_loop(
                         "status": frame.status,
                         "worktrees": frame.worktrees,
                         "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostAssignmentPrepareResultFrame):
+            prepare_future = conn.pending_assignment_prepares.pop(frame.request_id, None)
+            if prepare_future is not None and not prepare_future.done():
+                prepare_future.set_result(
+                    {
+                        "status": frame.status,
+                        "directories": frame.directories,
+                        "error_code": frame.error_code,
+                        "error": frame.error,
+                        "repository_name": frame.repository_name,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostAssignmentReleaseResultFrame):
+            release_future = conn.pending_assignment_releases.pop(frame.request_id, None)
+            if release_future is not None and not release_future.done():
+                release_future.set_result(
+                    {
+                        "status": frame.status,
+                        "removed": frame.removed,
+                        "failures": frame.failures,
                     }
                 )
             continue

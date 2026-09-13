@@ -52,11 +52,15 @@ from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HarnessAvailability,
 )
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, assignment_workspace
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostAssignmentPrepareFrame,
+    HostAssignmentPrepareResultFrame,
+    HostAssignmentReleaseFrame,
+    HostAssignmentReleaseResultFrame,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -3363,6 +3367,74 @@ class HostProcess:
             ],
         )
 
+    async def _handle_assignment_prepare(
+        self,
+        frame: HostAssignmentPrepareFrame,
+    ) -> HostAssignmentPrepareResultFrame:
+        """Handle a ``host.assignment_prepare`` request from the server.
+
+        Runs the blocking git work in a worker thread so the tunnel
+        loop keeps servicing pings.
+
+        :param frame: The assignment-prepare request frame.
+        :returns: Result frame with the repository → directory map on
+            success, or ``status: "failed"`` with a stable error code.
+            An unexpected exception still answers ``"failed"`` with a
+            message, never silence.
+        """
+        try:
+            # Pause the orphan reaper while git runs — see
+            # _handle_create_worktree above and _reap_orphans_once.
+            with self._host_subprocess_op():
+                result = await asyncio.to_thread(
+                    assignment_workspace.prepare,
+                    frame.repositories,
+                    frame.assignment_id,
+                )
+        except Exception as exc:
+            _logger.exception("Assignment prepare crashed for %s", frame.assignment_id)
+            return HostAssignmentPrepareResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"assignment prepare crashed: {exc}",
+            )
+        result.request_id = frame.request_id
+        return result
+
+    async def _handle_assignment_release(
+        self,
+        frame: HostAssignmentReleaseFrame,
+    ) -> HostAssignmentReleaseResultFrame:
+        """Handle a ``host.assignment_release`` request from the server.
+
+        Runs the blocking git work in a worker thread.
+
+        :param frame: The assignment-release request frame.
+        :returns: Result frame with ``status: "ok"`` when every
+            worktree is gone, otherwise ``"partial"``. An unexpected
+            exception still answers ``"partial"`` with a message,
+            never silence.
+        """
+        try:
+            # Pause the orphan reaper while git runs — see
+            # _handle_create_worktree above and _reap_orphans_once.
+            with self._host_subprocess_op():
+                result = await asyncio.to_thread(
+                    assignment_workspace.release,
+                    frame.repositories,
+                    frame.assignment_id,
+                )
+        except Exception as exc:
+            _logger.exception("Assignment release crashed for %s", frame.assignment_id)
+            message = f"assignment release crashed: {exc}"
+            return HostAssignmentReleaseResultFrame(
+                request_id=frame.request_id,
+                status="partial",
+                failures={entry.repository_name: message for entry in frame.repositories},
+            )
+        result.request_id = frame.request_id
+        return result
+
     async def _probe_configured_harnesses(
         self,
         *,
@@ -4035,6 +4107,7 @@ class HostProcess:
             installation_id=_tel_install_id,
             codex_rate_limits=self._codex_rate_limits,
             filesystem_roots=True,
+            assignments=True,
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -4331,6 +4404,10 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostAssignmentPrepareFrame):
+            await ws.send(encode_host_frame(await self._handle_assignment_prepare(frame)))
+        elif isinstance(frame, HostAssignmentReleaseFrame):
+            await ws.send(encode_host_frame(await self._handle_assignment_release(frame)))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.

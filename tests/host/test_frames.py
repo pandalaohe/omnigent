@@ -9,6 +9,12 @@ import pytest
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostAssignmentPrepareFrame,
+    HostAssignmentPrepareRepository,
+    HostAssignmentPrepareResultFrame,
+    HostAssignmentReleaseFrame,
+    HostAssignmentReleaseRepository,
+    HostAssignmentReleaseResultFrame,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -1844,3 +1850,145 @@ def test_hello_frame_filesystem_roots_requires_boolean() -> None:
                 }
             )
         )
+
+
+def test_hello_frame_assignments_round_trip() -> None:
+    """The assignments capability survives encode → decode."""
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="laptop",
+        assignments=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.assignments is True
+
+
+def test_hello_frame_omitted_assignments_is_legacy_false() -> None:
+    """An older host that omits the capability never receives prepare frames."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "older-host",
+                "runners": [],
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.assignments is False
+
+
+def test_hello_frame_assignments_requires_boolean() -> None:
+    """Capability metadata must fail closed instead of coercing strings."""
+    with pytest.raises(ValueError, match="assignments"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.hello",
+                    "version": "0.1.0",
+                    "frame_protocol_version": 1,
+                    "name": "invalid-host",
+                    "runners": [],
+                    "assignments": "true",
+                }
+            )
+        )
+
+
+def _prepare_entry() -> HostAssignmentPrepareRepository:
+    """Build one fully-populated prepare repository entry."""
+    return HostAssignmentPrepareRepository(
+        repository_name="root",
+        source_directory="/Users/alice/myrepo",
+        remote_url="git@github.com:acme/myrepo.git",
+        input_ref="refs/omnigent/assignments/asg_abc/input/root",
+        input_commit="a" * 40,
+        context_manifest_path=".agents/project/manifest.json",
+        manifest_digest="sha256:" + "0" * 64,
+    )
+
+
+def test_assignment_prepare_frame_round_trip() -> None:
+    """A prepare request survives encode → decode with every entry field."""
+    original = HostAssignmentPrepareFrame(
+        request_id="req_ap_1",
+        assignment_id="asg_abc",
+        repositories=[_prepare_entry()],
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostAssignmentPrepareFrame)
+    assert decoded == original
+
+
+def test_assignment_prepare_frame_missing_entry_field_raises() -> None:
+    """A prepare entry missing input_commit is rejected, not defaulted."""
+    encoded = encode_host_frame(
+        HostAssignmentPrepareFrame(
+            request_id="req_ap_2", assignment_id="asg_abc", repositories=[_prepare_entry()]
+        )
+    )
+    msg = json.loads(encoded)
+    del msg["repositories"][0]["input_commit"]
+    with pytest.raises(ValueError, match="input_commit"):
+        decode_host_frame(json.dumps(msg))
+
+
+def test_assignment_prepare_result_frame_round_trip() -> None:
+    """An ok prepare result carries the repository → directory map."""
+    original = HostAssignmentPrepareResultFrame(
+        request_id="req_ap_1",
+        status="ok",
+        directories={"root": "/Users/alice/myrepo/.omnigent/worktrees/asg_abc/root"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostAssignmentPrepareResultFrame)
+    assert decoded == original
+
+
+def test_assignment_prepare_result_frame_failure_round_trip() -> None:
+    """A failed prepare result carries its code, message and repository."""
+    original = HostAssignmentPrepareResultFrame(
+        request_id="req_ap_1",
+        status="failed",
+        error_code="context_missing",
+        error="required context missing: root:AGENTS.md",
+        repository_name="root",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostAssignmentPrepareResultFrame)
+    assert decoded.directories == {}
+    assert decoded.error_code == "context_missing"
+    assert decoded.repository_name == "root"
+
+
+def test_assignment_release_frame_round_trip() -> None:
+    """A release request survives encode → decode."""
+    original = HostAssignmentReleaseFrame(
+        request_id="req_ar_1",
+        assignment_id="asg_abc",
+        repositories=[
+            HostAssignmentReleaseRepository(
+                repository_name="root", source_directory="/Users/alice/myrepo"
+            )
+        ],
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostAssignmentReleaseFrame)
+    assert decoded == original
+
+
+def test_assignment_release_result_frame_round_trip() -> None:
+    """A partial release result carries removed names and per-repo failures."""
+    original = HostAssignmentReleaseResultFrame(
+        request_id="req_ar_1",
+        status="partial",
+        removed=["docs"],
+        failures={"root": "worktree contains uncommitted changes"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostAssignmentReleaseResultFrame)
+    assert decoded == original

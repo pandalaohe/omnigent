@@ -32,6 +32,12 @@ from omnigent.host.connect import (
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostAssignmentPrepareFrame,
+    HostAssignmentPrepareRepository,
+    HostAssignmentPrepareResultFrame,
+    HostAssignmentReleaseFrame,
+    HostAssignmentReleaseRepository,
+    HostAssignmentReleaseResultFrame,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -6202,6 +6208,8 @@ def test_handle_list_dir_empty_path_returns_posix_root(monkeypatch) -> None:
 
     assert result.status == "ok"
     assert [(entry.name, entry.path) for entry in result.entries] == [("/", "/")]
+
+
 @pytest.mark.parametrize("action", ["attach", "remove"])
 async def test_github_pr_update_reports_lock_contention_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
@@ -6240,3 +6248,168 @@ async def test_github_pr_update_reports_lock_contention_on_host(
     assert registry.path.read_bytes() == before
     assert host._handle_fs_write(frame).status == "ok"
     assert (target in {entry.url for entry in registry.list()}) == (action == "attach")
+
+
+# ── host.assignment_prepare / host.assignment_release dispatch ──
+
+
+def _prepare_frame() -> HostAssignmentPrepareFrame:
+    """Build a prepare request with one repository entry."""
+    return HostAssignmentPrepareFrame(
+        request_id="req_ap_9",
+        assignment_id="asg_x",
+        repositories=[
+            HostAssignmentPrepareRepository(
+                repository_name="root",
+                source_directory="/Users/alice/myrepo",
+                remote_url="git@github.com:acme/myrepo.git",
+                input_ref="refs/omnigent/assignments/asg_x/input/root",
+                input_commit="a" * 40,
+                context_manifest_path=".agents/project/manifest.json",
+                manifest_digest="sha256:" + "0" * 64,
+            )
+        ],
+    )
+
+
+def _release_frame() -> HostAssignmentReleaseFrame:
+    """Build a release request with one repository entry."""
+    return HostAssignmentReleaseFrame(
+        request_id="req_ar_9",
+        assignment_id="asg_x",
+        repositories=[
+            HostAssignmentReleaseRepository(
+                repository_name="root", source_directory="/Users/alice/myrepo"
+            )
+        ],
+    )
+
+
+async def test_dispatch_assignment_prepare_replies_with_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prepare dispatch branch answers with the workspace result frame."""
+    from omnigent.host import assignment_workspace
+
+    host = _make_host_process()
+    seen: dict[str, object] = {}
+
+    def _fake_prepare(
+        repositories: object, assignment_id: str
+    ) -> HostAssignmentPrepareResultFrame:
+        seen["repositories"] = repositories
+        seen["assignment_id"] = assignment_id
+        return HostAssignmentPrepareResultFrame(
+            request_id="",
+            status="ok",
+            directories={"root": "/Users/alice/myrepo/.omnigent/worktrees/asg_x/root"},
+        )
+
+    monkeypatch.setattr(assignment_workspace, "prepare", _fake_prepare)
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(ws, _prepare_frame())  # type: ignore[arg-type]
+
+    assert seen["assignment_id"] == "asg_x"
+    assert len(ws.sent) == 1
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostAssignmentPrepareResultFrame)
+    assert result.request_id == "req_ap_9"
+    assert result.status == "ok"
+    assert result.directories == {"root": "/Users/alice/myrepo/.omnigent/worktrees/asg_x/root"}
+    assert host._owned_subprocess_ops == 0
+    _cleanup_host(host)
+
+
+async def test_dispatch_assignment_prepare_crash_still_answers_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected prepare exception answers failed, never silence."""
+    from omnigent.host import assignment_workspace
+
+    host = _make_host_process()
+
+    def _boom(repositories: object, assignment_id: str) -> HostAssignmentPrepareResultFrame:
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(assignment_workspace, "prepare", _boom)
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(ws, _prepare_frame())  # type: ignore[arg-type]
+
+    assert len(ws.sent) == 1
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostAssignmentPrepareResultFrame)
+    assert result.request_id == "req_ap_9"
+    assert result.status == "failed"
+    assert "disk on fire" in (result.error or "")
+    _cleanup_host(host)
+
+
+async def test_dispatch_assignment_release_replies_with_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The release dispatch branch answers with the release result frame."""
+    from omnigent.host import assignment_workspace
+
+    host = _make_host_process()
+
+    def _fake_release(
+        repositories: object, assignment_id: str
+    ) -> HostAssignmentReleaseResultFrame:
+        assert assignment_id == "asg_x"
+        return HostAssignmentReleaseResultFrame(
+            request_id="", status="partial", removed=[], failures={"root": "dirty"}
+        )
+
+    monkeypatch.setattr(assignment_workspace, "release", _fake_release)
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(ws, _release_frame())  # type: ignore[arg-type]
+
+    assert len(ws.sent) == 1
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostAssignmentReleaseResultFrame)
+    assert result.request_id == "req_ar_9"
+    assert result.status == "partial"
+    assert result.failures == {"root": "dirty"}
+    assert host._owned_subprocess_ops == 0
+    _cleanup_host(host)
+
+
+async def test_dispatch_assignment_release_crash_still_answers_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected release exception answers partial, never silence."""
+    from omnigent.host import assignment_workspace
+
+    host = _make_host_process()
+
+    def _boom(repositories: object, assignment_id: str) -> HostAssignmentReleaseResultFrame:
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(assignment_workspace, "release", _boom)
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(ws, _release_frame())  # type: ignore[arg-type]
+
+    assert len(ws.sent) == 1
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostAssignmentReleaseResultFrame)
+    assert result.request_id == "req_ar_9"
+    assert result.status == "partial"
+    assert "disk on fire" in result.failures.get("root", "")
+    _cleanup_host(host)
+
+
+async def test_hello_advertises_assignments_capability() -> None:
+    """The daemon hello sets ``assignments`` so the server may send prepare frames."""
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.assignments is True

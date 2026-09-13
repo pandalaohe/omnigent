@@ -259,6 +259,15 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param pending_assignment_prepares: Per-``request_id`` futures for
+        in-flight ``host.assignment_prepare`` requests. Resolved when
+        the host sends ``host.assignment_prepare_result``. Values
+        carry ``status``, ``directories``, ``error_code``, ``error``
+        and ``repository_name``.
+    :param pending_assignment_releases: Per-``request_id`` futures for
+        in-flight ``host.assignment_release`` requests. Resolved when
+        the host sends ``host.assignment_release_result``. Values
+        carry ``status``, ``removed`` and ``failures``.
     """
 
     workspace_id: int
@@ -313,6 +322,12 @@ class HostConnection:
         default_factory=dict,
     )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_assignment_prepares: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_assignment_releases: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     # Import streams one session per frame, so the tunnel pushes each onto a

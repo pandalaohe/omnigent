@@ -109,6 +109,10 @@ class HostFrameKind(str, Enum):
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
     LIST_WORKTREES = "host.list_worktrees"
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
+    ASSIGNMENT_PREPARE = "host.assignment_prepare"
+    ASSIGNMENT_PREPARE_RESULT = "host.assignment_prepare_result"
+    ASSIGNMENT_RELEASE = "host.assignment_release"
+    ASSIGNMENT_RELEASE_RESULT = "host.assignment_release_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
@@ -173,6 +177,7 @@ class HostHelloFrame:
     installation_id: str | None = None
     codex_rate_limits: _JsonObject | None = None
     filesystem_roots: bool = False
+    assignments: bool = False
 
 
 @dataclass
@@ -648,6 +653,136 @@ class HostListWorktreesResultFrame:
 
 
 @dataclass
+class HostAssignmentPrepareRepository:
+    """One repository the host must prepare for an assignment.
+
+    :param repository_name: Registered repository name, e.g. ``"root"``.
+    :param source_directory: Host-local working copy to fetch from, e.g.
+        ``"/Users/alice/myrepo"``. The coordinator resolves this from the
+        host binding; the host never invents it.
+    :param remote_url: Shared remote to fetch the input ref from, e.g.
+        ``"git@github.com:acme/myrepo.git"``.
+    :param input_ref: Fully-qualified input ref, e.g.
+        ``"refs/omnigent/assignments/<id>/input/root"``.
+    :param input_commit: Pinned commit the ref must resolve to (40-char sha).
+    :param context_manifest_path: Repo-relative manifest path, e.g.
+        ``".agents/project/manifest.json"``.
+    :param manifest_digest: Pinned digest, ``"sha256:"`` + 64 hex chars
+        (see :func:`omnigent.project_context.manifest_digest`).
+    """
+
+    repository_name: str
+    source_directory: str
+    remote_url: str
+    input_ref: str
+    input_commit: str
+    context_manifest_path: str
+    manifest_digest: str
+
+
+@dataclass
+class HostAssignmentPrepareFrame:
+    """Server → host: prepare isolated worktrees for an assignment.
+
+    The host fetches each input ref by explicit refspec, verifies the
+    pinned commit, checks the manifest, and adds one detached worktree
+    per repository under
+    ``<source>/.omnigent/worktrees/<assignment_id>/<repository_name>``.
+
+    :param request_id: Correlates the result, e.g. ``"req_ap_1"``.
+    :param assignment_id: Assignment being prepared, e.g. ``"asg_abc"``.
+    :param repositories: One entry per repository, in dispatch order.
+    """
+
+    request_id: str
+    assignment_id: str
+    repositories: list[HostAssignmentPrepareRepository] = field(default_factory=list)
+
+
+@dataclass
+class HostAssignmentPrepareResultFrame:
+    """Host → server: outcome of an assignment-prepare request.
+
+    :param request_id: Correlates to the
+        :class:`HostAssignmentPrepareFrame`, e.g. ``"req_ap_1"``.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param directories: Repository name → absolute worktree path, e.g.
+        ``{"root": "/Users/alice/myrepo/.omnigent/worktrees/asg_abc/root"}``.
+        Populated on ``"ok"`` only.
+    :param error_code: Machine-readable failure category on ``"failed"``,
+        ``None`` on success. Stable values:
+
+        * ``"source_invalid"`` — not a git working copy.
+        * ``"fetch_failed"`` — the explicit-refspec fetch failed.
+        * ``"commit_mismatch"`` — the ref does not resolve to the commit.
+        * ``"manifest_missing"`` — no manifest blob at the commit.
+        * ``"manifest_invalid"`` — the blob is not a valid manifest.
+        * ``"manifest_digest_mismatch"`` — the blob hashes differently.
+        * ``"context_missing"`` — a manifest-required path is absent.
+        * ``"worktree_failed"`` — the worktree could not be added.
+    :param error: Human-readable failure detail, e.g.
+        ``"required context missing: root:AGENTS.md"``. ``None`` on success.
+    :param repository_name: Repository the failure concerns, e.g.
+        ``"root"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    directories: dict[str, str] = field(default_factory=dict)
+    error_code: str | None = None
+    error: str | None = None
+    repository_name: str | None = None
+
+
+@dataclass
+class HostAssignmentReleaseRepository:
+    """One repository whose assignment worktree the host must remove.
+
+    :param repository_name: Registered repository name, e.g. ``"root"``.
+    :param source_directory: Host-local working copy holding the
+        worktree, e.g. ``"/Users/alice/myrepo"``.
+    """
+
+    repository_name: str
+    source_directory: str
+
+
+@dataclass
+class HostAssignmentReleaseFrame:
+    """Server → host: remove an assignment's worktrees.
+
+    :param request_id: Correlates the result, e.g. ``"req_ar_1"``.
+    :param assignment_id: Assignment being released, e.g. ``"asg_abc"``.
+    :param repositories: One entry per repository, in dispatch order.
+    """
+
+    request_id: str
+    assignment_id: str
+    repositories: list[HostAssignmentReleaseRepository] = field(default_factory=list)
+
+
+@dataclass
+class HostAssignmentReleaseResultFrame:
+    """Host → server: outcome of an assignment-release request.
+
+    :param request_id: Correlates to the
+        :class:`HostAssignmentReleaseFrame`, e.g. ``"req_ar_1"``.
+    :param status: ``"ok"`` when every worktree was removed (a missing
+        worktree counts as removed), ``"partial"`` otherwise. Removal
+        never uses ``--force``: leftover uncommitted changes are reported
+        in ``failures``, never discarded.
+    :param removed: Repository names whose worktrees are gone.
+    :param failures: Repository name → reason it is still present, e.g.
+        ``{"root": "worktree contains modified files"}``.
+    """
+
+    request_id: str
+    status: str
+    removed: list[str] = field(default_factory=list)
+    failures: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class HostCreateDirFrame:
     """Server → host: create a new directory on the host.
 
@@ -1072,6 +1207,10 @@ HostFrame = (
     | HostRemoveWorktreeResultFrame
     | HostListWorktreesFrame
     | HostListWorktreesResultFrame
+    | HostAssignmentPrepareFrame
+    | HostAssignmentPrepareResultFrame
+    | HostAssignmentReleaseFrame
+    | HostAssignmentReleaseResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
     | HostInstallHarnessFrame
@@ -1143,6 +1282,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "codex_rate_limits": frame.codex_rate_limits,
                 "filesystem_roots": frame.filesystem_roots,
+                "assignments": frame.assignments,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1340,6 +1480,63 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "worktrees": frame.worktrees,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostAssignmentPrepareFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.ASSIGNMENT_PREPARE.value,
+                "request_id": frame.request_id,
+                "assignment_id": frame.assignment_id,
+                "repositories": [
+                    {
+                        "repository_name": entry.repository_name,
+                        "source_directory": entry.source_directory,
+                        "remote_url": entry.remote_url,
+                        "input_ref": entry.input_ref,
+                        "input_commit": entry.input_commit,
+                        "context_manifest_path": entry.context_manifest_path,
+                        "manifest_digest": entry.manifest_digest,
+                    }
+                    for entry in frame.repositories
+                ],
+            }
+        )
+    if isinstance(frame, HostAssignmentPrepareResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.ASSIGNMENT_PREPARE_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "directories": dict(frame.directories),
+                "error_code": frame.error_code,
+                "error": frame.error,
+                "repository_name": frame.repository_name,
+            }
+        )
+    if isinstance(frame, HostAssignmentReleaseFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.ASSIGNMENT_RELEASE.value,
+                "request_id": frame.request_id,
+                "assignment_id": frame.assignment_id,
+                "repositories": [
+                    {
+                        "repository_name": entry.repository_name,
+                        "source_directory": entry.source_directory,
+                    }
+                    for entry in frame.repositories
+                ],
+            }
+        )
+    if isinstance(frame, HostAssignmentReleaseResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.ASSIGNMENT_RELEASE_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "removed": list(frame.removed),
+                "failures": dict(frame.failures),
             }
         )
     if isinstance(frame, HostCreateDirFrame):
@@ -1624,6 +1821,14 @@ def _decode_known_host_frame(
             return _decode_list_worktrees(msg)
         case HostFrameKind.LIST_WORKTREES_RESULT:
             return _decode_list_worktrees_result(msg)
+        case HostFrameKind.ASSIGNMENT_PREPARE:
+            return _decode_assignment_prepare(msg)
+        case HostFrameKind.ASSIGNMENT_PREPARE_RESULT:
+            return _decode_assignment_prepare_result(msg)
+        case HostFrameKind.ASSIGNMENT_RELEASE:
+            return _decode_assignment_release(msg)
+        case HostFrameKind.ASSIGNMENT_RELEASE_RESULT:
+            return _decode_assignment_release_result(msg)
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
@@ -1685,6 +1890,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         filesystem_roots=(
             _required_bool(msg, "filesystem_roots") if "filesystem_roots" in msg else False
         ),
+        assignments=(_required_bool(msg, "assignments") if "assignments" in msg else False),
     )
 
 
@@ -2005,6 +2211,102 @@ def _decode_list_worktrees_result(
         status=_required_str(msg, "status"),
         worktrees=raw,
         error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_assignment_prepare(msg: _JsonObject) -> HostAssignmentPrepareFrame:
+    """Decode a host.assignment_prepare request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.assignment_prepare frame.
+    """
+    raw = msg.get("repositories", [])
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        raise ValueError("frame field must be a list of JSON objects: 'repositories'")
+    return HostAssignmentPrepareFrame(
+        request_id=_required_str(msg, "request_id"),
+        assignment_id=_required_str(msg, "assignment_id"),
+        repositories=[_decode_assignment_prepare_repository(item) for item in raw],
+    )
+
+
+def _decode_assignment_prepare_repository(raw: _JsonObject) -> HostAssignmentPrepareRepository:
+    """Decode one repository entry of a host.assignment_prepare frame."""
+    return HostAssignmentPrepareRepository(
+        repository_name=_required_str(raw, "repository_name"),
+        source_directory=_required_str(raw, "source_directory"),
+        remote_url=_required_str(raw, "remote_url"),
+        input_ref=_required_str(raw, "input_ref"),
+        input_commit=_required_str(raw, "input_commit"),
+        context_manifest_path=_required_str(raw, "context_manifest_path"),
+        manifest_digest=_required_str(raw, "manifest_digest"),
+    )
+
+
+def _decode_assignment_prepare_result(msg: _JsonObject) -> HostAssignmentPrepareResultFrame:
+    """Decode a host.assignment_prepare_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.assignment_prepare_result frame.
+    """
+    directories = msg.get("directories", {})
+    if not isinstance(directories, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in directories.items()
+    ):
+        raise ValueError("frame field must be an object of strings: 'directories'")
+    return HostAssignmentPrepareResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        directories=dict(directories),
+        error_code=_optional_nullable_str(msg, "error_code"),
+        error=_optional_nullable_str(msg, "error"),
+        repository_name=_optional_nullable_str(msg, "repository_name"),
+    )
+
+
+def _decode_assignment_release(msg: _JsonObject) -> HostAssignmentReleaseFrame:
+    """Decode a host.assignment_release request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.assignment_release frame.
+    """
+    raw = msg.get("repositories", [])
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        raise ValueError("frame field must be a list of JSON objects: 'repositories'")
+    return HostAssignmentReleaseFrame(
+        request_id=_required_str(msg, "request_id"),
+        assignment_id=_required_str(msg, "assignment_id"),
+        repositories=[_decode_assignment_release_repository(item) for item in raw],
+    )
+
+
+def _decode_assignment_release_repository(raw: _JsonObject) -> HostAssignmentReleaseRepository:
+    """Decode one repository entry of a host.assignment_release frame."""
+    return HostAssignmentReleaseRepository(
+        repository_name=_required_str(raw, "repository_name"),
+        source_directory=_required_str(raw, "source_directory"),
+    )
+
+
+def _decode_assignment_release_result(msg: _JsonObject) -> HostAssignmentReleaseResultFrame:
+    """Decode a host.assignment_release_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.assignment_release_result frame.
+    """
+    removed = msg.get("removed", [])
+    if not isinstance(removed, list) or not all(isinstance(item, str) for item in removed):
+        raise ValueError("frame field must be a list of strings: 'removed'")
+    failures = msg.get("failures", {})
+    if not isinstance(failures, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in failures.items()
+    ):
+        raise ValueError("frame field must be an object of strings: 'failures'")
+    return HostAssignmentReleaseResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        removed=list(removed),
+        failures=dict(failures),
     )
 
 
