@@ -57,6 +57,7 @@ class ProjectRepositoryStore(ABC):
         :param context_manifest_path: Repo-relative path of the
             project-context manifest.
         :returns: The inserted or updated :class:`ProjectRepository`.
+        :raises OmnigentError: ``NOT_FOUND`` when ``project_id`` is unknown.
         """
         ...
 
@@ -99,5 +100,8 @@ class ProjectRepositoryStore(ABC):
 
         :param repository_id: Opaque repository identifier.
         :returns: ``True`` if removed; ``False`` if not found.
+        :raises OmnigentError: ``CONFLICT`` when a binding still
+            references the repository; ``NOT_FOUND`` when its project
+            is gone.
         """
         ...

@@ -94,6 +94,9 @@ from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.project_collaboration import (
+    create_project_collaboration_router,
+)
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
@@ -139,6 +142,8 @@ from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
+from omnigent.stores.project_repository_store import ProjectRepositoryStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -1150,6 +1155,8 @@ def create_app(
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
     project_store: ProjectStore | None = None,
+    project_repository_store: ProjectRepositoryStore | None = None,
+    project_host_binding_store: ProjectHostBindingStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1206,6 +1213,12 @@ def create_app(
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
+    :param project_repository_store: Store for a project's registered
+        repositories. Mounts the collaboration router only together with
+        ``project_store`` and ``project_host_binding_store``.
+    :param project_host_binding_store: Store for a project's per-host
+        directory bindings. Mounts the collaboration router only together
+        with ``project_store`` and ``project_repository_store``.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -3170,6 +3183,28 @@ def create_app(
             create_projects_router(
                 project_store=project_store,
                 auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["projects"],
+        )
+    # Cross-host collaboration configuration (enable switch, registered
+    # repositories, per-host bindings). Mounted only when the project store
+    # and both config stores are wired; each handler additionally gates on
+    # Feature.PROJECT_ASSIGNMENTS so the surface stays dark until opted in.
+    if (
+        project_store is not None
+        and project_repository_store is not None
+        and project_host_binding_store is not None
+    ):
+        app.include_router(
+            create_project_collaboration_router(
+                project_store,
+                project_repository_store,
+                project_host_binding_store,
+                auth_provider=auth_provider,
+                host_store=host_store,
+                host_registry=host_registry,
+                feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",
             tags=["projects"],

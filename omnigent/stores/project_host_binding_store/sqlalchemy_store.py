@@ -7,7 +7,12 @@ import uuid
 from sqlalchemy import asc, select
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlProject, SqlProjectHostBinding, current_workspace_id
+from omnigent.db.db_models import (
+    SqlProject,
+    SqlProjectHostBinding,
+    SqlProjectRepository,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -141,18 +146,33 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
         workspace: str,
         is_primary: bool = False,
         enabled: bool = True,
+        path_verified_at: int | None = None,
     ) -> ProjectHostBinding:
         """Register a binding or revise it, bumping ``revision`` on change.
 
         A requested primary is rejected when another binding is already
         primary for the ``(project, host)`` pair; the existing primary is
-        never silently cleared.
+        never silently cleared. A lone verification-timestamp refresh
+        stamps ``path_verified_at`` without bumping ``revision``.
         """
 
         def write(session: Session) -> ProjectHostBinding:
             # Project row first, binding row second: one lock order per
             # project, so concurrent writers serialize instead of racing.
             _lock_project(session, project_id=project_id)
+            # Same SqlProject row the repository store locks, so a racing
+            # repository delete serializes against this check, not past it.
+            repository = session.execute(
+                select(SqlProjectRepository.id)
+                .where(SqlProjectRepository.workspace_id == current_workspace_id())
+                .where(SqlProjectRepository.id == repository_id)
+                .where(SqlProjectRepository.project_id == project_id)
+            ).first()
+            if repository is None:
+                raise OmnigentError(
+                    f"unknown repository {repository_id!r} on project {project_id}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             stmt = (
                 select(SqlProjectHostBinding)
                 .where(SqlProjectHostBinding.workspace_id == current_workspace_id())
@@ -177,7 +197,7 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
                     workspace=workspace,
                     enabled=enabled,
                     revision=1,
-                    path_verified_at=None,
+                    path_verified_at=path_verified_at,
                     created_at=now,
                     updated_at=None,
                 )
@@ -192,23 +212,69 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
                 )
             ):
                 raise DuplicatePrimaryBindingError(project_id, host_id)
-            if (
+            core_same = (
                 row.is_primary == is_primary
                 and row.repository_id == repository_id
                 and row.workspace == workspace
                 and row.enabled == enabled
-            ):
+            )
+            verified_same = path_verified_at is None or row.path_verified_at == path_verified_at
+            if core_same and verified_same:
                 return _to_entity(row)
-            row.is_primary = is_primary
-            row.repository_id = repository_id
-            row.workspace = workspace
-            row.enabled = enabled
-            row.revision += 1
+            if not core_same:
+                row.is_primary = is_primary
+                row.repository_id = repository_id
+                row.workspace = workspace
+                row.enabled = enabled
+                row.revision += 1
+            if path_verified_at is not None:
+                row.path_verified_at = path_verified_at
             row.updated_at = now_epoch()
             session.flush()
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "upsert_binding", write)
+
+    def record_verification(
+        self,
+        binding_id: str,
+        *,
+        expected_revision: int,
+        workspace: str,
+        path_verified_at: int,
+    ) -> ProjectHostBinding | None:
+        """Stamp a verification; ``None`` when the row moved under the caller."""
+
+        def write(session: Session) -> ProjectHostBinding | None:
+            row = session.get(SqlProjectHostBinding, (current_workspace_id(), binding_id))
+            if row is None:
+                return None
+            # Same SqlProject row the repository store locks, so a racing
+            # delete or upsert serializes against this check, not past it.
+            _lock_project(session, project_id=row.project_id)
+            row = (
+                session.execute(
+                    select(SqlProjectHostBinding)
+                    .where(SqlProjectHostBinding.workspace_id == current_workspace_id())
+                    .where(SqlProjectHostBinding.id == binding_id)
+                    .execution_options(populate_existing=True)
+                )
+                .scalars()
+                .first()
+            )
+            if row is None or row.revision != expected_revision:
+                return None
+            if row.workspace == workspace and row.path_verified_at == path_verified_at:
+                return _to_entity(row)
+            if row.workspace != workspace:
+                row.workspace = workspace
+                row.revision += 1
+            row.path_verified_at = path_verified_at
+            row.updated_at = now_epoch()
+            session.flush()
+            return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "record_binding_verification", write)
 
     def get(self, binding_id: str) -> ProjectHostBinding | None:
         """Return a binding by id, or ``None`` if not found."""
@@ -217,6 +283,21 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             if row is None:
                 return None
             return _to_entity(row)
+
+    def get_by_name(
+        self, *, project_id: str, host_id: str, name: str
+    ) -> ProjectHostBinding | None:
+        """Return one host's binding by name, or ``None`` if not found."""
+        with self._session("select_binding_by_name") as session:
+            stmt = (
+                select(SqlProjectHostBinding)
+                .where(SqlProjectHostBinding.workspace_id == current_workspace_id())
+                .where(SqlProjectHostBinding.project_id == project_id)
+                .where(SqlProjectHostBinding.host_id == host_id)
+                .where(SqlProjectHostBinding.name == name)
+            )
+            row = session.execute(stmt).scalars().first()
+            return _to_entity(row) if row is not None else None
 
     def list_by_project(self, project_id: str) -> list[ProjectHostBinding]:
         """List a project's bindings ordered by ``created_at ASC, id ASC``."""

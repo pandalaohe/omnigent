@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import asc, select
+from sqlalchemy import asc, func, select
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlProject, SqlProjectRepository, current_workspace_id
+from omnigent.db.db_models import (
+    SqlProject,
+    SqlProjectHostBinding,
+    SqlProjectRepository,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -181,13 +186,28 @@ class SqlAlchemyProjectRepositoryStore(ProjectRepositoryStore):
             return [_to_entity(r) for r in rows]
 
     def delete(self, repository_id: str) -> bool:
-        """Delete a registered repository. Idempotent; ``False`` if not found."""
+        """Delete a repository; ``CONFLICT`` while a binding references it."""
 
         def write(session: Session) -> bool:
             row = session.get(SqlProjectRepository, (current_workspace_id(), repository_id))
             if row is None:
                 return False
+            # Same SqlProject row the binding store locks, so a racing
+            # binding upsert serializes against this count, not past it.
             _lock_project(session, project_id=row.project_id)
+            referencing = session.execute(
+                select(func.count())
+                .select_from(SqlProjectHostBinding)
+                .where(SqlProjectHostBinding.workspace_id == current_workspace_id())
+                .where(SqlProjectHostBinding.project_id == row.project_id)
+                .where(SqlProjectHostBinding.repository_id == row.id)
+            ).scalar_one()
+            if referencing > 0:
+                raise OmnigentError(
+                    f"repository {row.name!r} is still referenced by "
+                    f"{referencing} binding(s) and cannot be deleted",
+                    code=ErrorCode.CONFLICT,
+                )
             session.delete(row)
             return True
 

@@ -65,6 +65,7 @@ class ProjectHostBindingStore(ABC):
         workspace: str,
         is_primary: bool = False,
         enabled: bool = True,
+        path_verified_at: int | None = None,
     ) -> ProjectHostBinding:
         """
         Register a binding or revise it.
@@ -74,6 +75,11 @@ class ProjectHostBindingStore(ABC):
         is updated and bumped to ``revision + 1``; an identical row is
         returned unchanged (no bump).
 
+        A verification timestamp refreshes ``path_verified_at`` (and
+        ``updated_at``) without bumping ``revision`` when nothing else
+        changed, so a periodic re-verify does not invalidate snapshots
+        pinned against the binding's revision.
+
         :param project_id: The project the binding belongs to.
         :param host_id: The bound host.
         :param name: Binding name; ``primary`` is the conventional value.
@@ -82,9 +88,42 @@ class ProjectHostBindingStore(ABC):
         :param workspace: Absolute path as the host canonicalised it.
         :param is_primary: Whether this is the host's primary binding.
         :param enabled: Whether the binding is eligible at claim time.
+        :param path_verified_at: Unix epoch seconds of a successful
+            ``host.stat`` to stamp, or ``None`` to leave the stamp alone.
         :returns: The inserted or updated :class:`ProjectHostBinding`.
         :raises DuplicatePrimaryBindingError: If ``is_primary`` is true and
             another binding is already primary for this ``(project, host)``.
+        :raises OmnigentError: ``INVALID_INPUT`` when ``repository_id``
+            names no repository of ``project_id``.
+        """
+        ...
+
+    @abstractmethod
+    def record_verification(
+        self,
+        binding_id: str,
+        *,
+        expected_revision: int,
+        workspace: str,
+        path_verified_at: int,
+    ) -> ProjectHostBinding | None:
+        """
+        Stamp a verification without overwriting concurrent changes.
+
+        Loads the row by id under the project lock; ``None`` when it is
+        gone or its ``revision`` no longer equals ``expected_revision``.
+        A moved canonical path is stored and bumps ``revision``; an
+        unchanged path only refreshes ``path_verified_at``.
+
+        :param binding_id: Opaque binding identifier.
+        :param expected_revision: The ``revision`` the caller read before
+            the host round trip; a mismatch means another writer moved
+            first.
+        :param workspace: Canonical path the host just returned.
+        :param path_verified_at: Unix epoch seconds of the successful
+            ``host.stat`` to stamp.
+        :returns: The refreshed :class:`ProjectHostBinding`, or ``None``
+            when the row is gone or changed under the caller.
         """
         ...
 
@@ -94,6 +133,20 @@ class ProjectHostBindingStore(ABC):
         Return a binding by id, or ``None`` if not found.
 
         :param binding_id: Opaque binding identifier.
+        :returns: The :class:`ProjectHostBinding` if found, else ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def get_by_name(
+        self, *, project_id: str, host_id: str, name: str
+    ) -> ProjectHostBinding | None:
+        """
+        Return one host's binding by name, or ``None`` if not found.
+
+        :param project_id: The project the binding belongs to.
+        :param host_id: The bound host.
+        :param name: The binding name.
         :returns: The :class:`ProjectHostBinding` if found, else ``None``.
         """
         ...

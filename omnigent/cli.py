@@ -4274,6 +4274,12 @@ def server(
 
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
+        SqlAlchemyProjectHostBindingStore,
+    )
+    from omnigent.stores.project_repository_store.sqlalchemy_store import (
+        SqlAlchemyProjectRepositoryStore,
+    )
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
@@ -4287,6 +4293,8 @@ def server(
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
+    project_repository_store = SqlAlchemyProjectRepositoryStore(db_uri)
+    project_host_binding_store = SqlAlchemyProjectHostBindingStore(db_uri)
     user_preferences_store = SqlAlchemyUserPreferencesStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
@@ -4474,6 +4482,8 @@ def server(
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
         project_store=project_store,
+        project_repository_store=project_repository_store,
+        project_host_binding_store=project_host_binding_store,
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,
@@ -9370,8 +9380,7 @@ def _custom_host_records(host_id: str) -> list[_HostDaemonRecord]:
     return [
         record
         for record in _list_daemon_records()
-        if (record.host_id or fallback_host_id) == host_id
-        and _daemon_owner_is_live(record)
+        if (record.host_id or fallback_host_id) == host_id and _daemon_owner_is_live(record)
     ]
 
 
