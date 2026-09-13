@@ -119,9 +119,12 @@ _TERMINAL_EXIT_OUTPUT_MAX_CHARS = 4000
 # ``close_terminal`` collapses every non-``"closed"`` outcome to ``False``,
 # which is why the reaper needs the detailed form: an already-absent pane
 # still owns session-level pieces that must retire, while a pane owned by a
-# newer generation must be left alone.
+# newer generation must be left alone. ``"closing"`` covers the window where
+# a concurrent ``TerminalRegistry.close`` popped the instance but has not
+# settled the await yet: the pane is invisible to the listing while still
+# alive, so absence must not be read as gone.
 TerminalCloseOutcome = Literal[
-    "closed", "generation_changed", "absent", "no_registry", "close_failed"
+    "closed", "generation_changed", "absent", "no_registry", "close_failed", "closing"
 ]
 
 
@@ -1601,7 +1604,10 @@ class SessionResourceRegistry:
             exists any more; ``"no_registry"`` when no terminal registry
             is configured; ``"close_failed"`` when the entry is still
             present but the inner close did not take effect (e.g. it
-            timed out and the instance was restored for retry).
+            timed out and the instance was restored for retry);
+            ``"closing"`` when a concurrent close popped the instance but
+            has not settled yet — the pane may still be alive, so the
+            caller must not treat it as gone.
         """
         if self._terminal_registry is None:
             return "no_registry"
@@ -1636,7 +1642,13 @@ class SessionResourceRegistry:
                     if expected_instance is not None and current.instance is not expected_instance:
                         return "generation_changed"
                     return "close_failed"
+                if self._terminal_registry.is_close_in_flight(
+                    session_id, entry.terminal_name, entry.session_key
+                ):
+                    return "closing"
                 return "absent"
+        if self._terminal_registry.is_close_in_flight_for_terminal(session_id, terminal_id):
+            return "closing"
         return "absent"
 
     async def close_terminal(

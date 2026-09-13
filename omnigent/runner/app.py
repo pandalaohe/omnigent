@@ -12501,15 +12501,30 @@ def create_runner_app(
                 raise RuntimeError("native pane generation changed before retention release")
             if outcome == "close_failed":
                 raise RuntimeError("native pane close failed before retention release")
-            # ``closed`` and ``absent`` both retire the session-level pieces:
-            # an already-gone pane has no successor owning them, so skipping
-            # the app-server teardown would leak it and skipping the event
-            # would leave the UI showing a live terminal. ``no_registry`` is
-            # likewise successor-free (no registry can hold a newer pane),
-            # and the reaper is only installed when a registry exists, so it
-            # is unreachable in production. Only ``generation_changed`` (and
-            # a failed close of the still-present pane) must NOT tear down,
-            # because a live successor owns the session.
+            if outcome == "closing":
+                # Another closer popped this terminal but has not settled
+                # its await yet: the pane may still be alive and the
+                # closer owns the session pieces. Tear down nothing,
+                # publish nothing, raise nothing — the reaper sees the
+                # pane again on its next pass.
+                _logger.info(
+                    "native pane close in flight for conversation %s; "
+                    "leaving session pieces to its owner",
+                    pane.conversation_id,
+                )
+                return
+            # Four-way split: ``closed`` and ``absent`` both retire the
+            # session-level pieces — an already-gone pane has no successor
+            # owning them, so skipping the app-server teardown would leak
+            # it and skipping the event would leave the UI showing a live
+            # terminal. ``no_registry`` is likewise successor-free (no
+            # registry can hold a newer pane), and the reaper is only
+            # installed when a registry exists, so it is unreachable in
+            # production. ``generation_changed`` (and a failed close of
+            # the still-present pane) raise above without tearing down,
+            # because a live successor owns the session. ``closing``
+            # returns above without tearing down, because another closer
+            # owns the terminal right now.
             await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
             _publish_terminal_deleted_event(
                 conversation_id=pane.conversation_id,
