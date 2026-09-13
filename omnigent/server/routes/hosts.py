@@ -1095,13 +1095,12 @@ def create_hosts_router(
                                 # An ordinary shutdown cancellation, not a
                                 # lease loss: it must keep propagating.
                                 raise
-                            # This cancellation was issued by our own lease
-                            # heartbeat (_renew_host_claim cancels the owner
-                            # task after marking the lease lost), so absorbing
-                            # it is legitimate — the lease.lost guard above is
-                            # what distinguishes it from a shutdown. Clear the
-                            # delivered cancel before awaiting anything else,
-                            # or the next await re-raises immediately.
+                            # lease.lost set means the cancel is from our own
+                            # _renew_host_claim (lost.set() then owner cancel),
+                            # not a shutdown. The awaits below run either way;
+                            # uncancel so this task does not return with
+                            # cancelling() > 0 for an enclosing timeout,
+                            # TaskGroup, or the ASGI server to treat as cancelled.
                             task = asyncio.current_task()
                             if task is not None:
                                 task.uncancel()
