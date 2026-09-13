@@ -256,6 +256,8 @@ let identityPromise: Promise<string | null> | null = null;
 // switches Servers never reuses the previous Server's user. Without an identity
 // every host config install starts a new connection.
 let identityConnectionId: string | null = null;
+// Bumped on every Server change, so a lookup or header from before an A->B->A round trip is never taken for the current one.
+let identityEpoch = 0;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
 // path per provider — "/login" for accounts, "/auth/login" for OIDC.
@@ -277,6 +279,10 @@ function currentIdentityConnectionId(): string {
 
 function identityMatchesCurrentConnection(): boolean {
   return identityConnectionId === currentIdentityConnectionId();
+}
+
+function identityIsCurrent(epoch: number, connectionId: string): boolean {
+  return epoch === identityEpoch && connectionId === currentIdentityConnectionId();
 }
 
 /**
@@ -336,6 +342,7 @@ export async function resolveIdentity(): Promise<string | null> {
   const connectionId = currentIdentityConnectionId();
   if (identityConnectionId !== connectionId) {
     identityConnectionId = connectionId;
+    identityEpoch += 1;
     identityResolved = false;
     identityPromise = null;
     currentUserId = null;
@@ -344,12 +351,17 @@ export async function resolveIdentity(): Promise<string | null> {
   }
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
+  const epoch = identityEpoch;
+  // A lookup whose connection was replaced writes nothing. If no newer lookup
+  // replaced it, the next resolve starts a fresh lookup instead of reusing this null.
+  const discardStale = (): null => {
+    if (epoch === identityEpoch) identityPromise = null;
+    return null;
+  };
   identityPromise = (async () => {
     try {
       const res = await hostFetch("/v1/me");
-      if (connectionId !== currentIdentityConnectionId()) {
-        return null;
-      }
+      if (!identityIsCurrent(epoch, connectionId)) return discardStale();
       if (res.status === 401) {
         // OIDC / accounts mode: server requires authentication.
         // Redirect to the login URL provided in the response body —
@@ -360,11 +372,7 @@ export async function resolveIdentity(): Promise<string | null> {
             user_id: null;
             login_url?: string;
           };
-          if (
-            identityConnectionId !== connectionId ||
-            connectionId !== currentIdentityConnectionId()
-          )
-            return null;
+          if (!identityIsCurrent(epoch, connectionId)) return discardStale();
           if (data.login_url) {
             serverLoginUrl = data.login_url;
             if (!isOnLoginPath()) {
@@ -381,22 +389,16 @@ export async function resolveIdentity(): Promise<string | null> {
           user_id: string | null;
           is_admin?: boolean;
         };
-        if (identityConnectionId !== connectionId || connectionId !== currentIdentityConnectionId())
-          return null;
+        if (!identityIsCurrent(epoch, connectionId)) return discardStale();
         currentUserId = data.user_id;
         currentIsAdmin = data.is_admin ?? false;
       }
     } catch {
       // Server unreachable — leave as null.
     }
-    const connectionIsCurrent =
-      identityConnectionId === connectionId && connectionId === currentIdentityConnectionId();
-    if (connectionIsCurrent) identityResolved = true;
-    else if (identityConnectionId === connectionId) {
-      currentUserId = null;
-      currentIsAdmin = false;
-    }
-    return connectionIsCurrent ? currentUserId : null;
+    if (!identityIsCurrent(epoch, connectionId)) return discardStale();
+    identityResolved = true;
+    return currentUserId;
   })();
   return identityPromise;
 }
@@ -460,6 +462,18 @@ export async function authenticatedFetch(
   init?: RequestInit,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
+  const stampEpoch = identityEpoch;
+  const stampConnectionId = currentIdentityConnectionId();
+  let stampedUser = false;
+  if (
+    identityMatchesCurrentConnection() &&
+    currentUserId &&
+    currentUserId !== RESERVED_USER_LOCAL &&
+    !headers.has("X-Forwarded-Email")
+  ) {
+    headers.set("X-Forwarded-Email", currentUserId);
+    stampedUser = true;
+  }
   // Pin host- and session-scoped requests to the replica holding that host's
   // runner tunnel (key = host_id). Derived centrally so no call site has to
   // thread it; a caller that set the header explicitly wins, and non-host-scoped
@@ -512,21 +526,18 @@ export async function authenticatedFetch(
       stampedSliceKey = true;
     }
   }
+  // The session host resolve above can span a Server switch; never send the
+  // previous Server's user to the new one.
+  if (stampedUser && !identityIsCurrent(stampEpoch, stampConnectionId)) {
+    headers.delete("X-Forwarded-Email");
+  }
+  const dispatchConnectionId = currentIdentityConnectionId();
   // Bypass the browser HTTP cache for all API calls. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
   // (pending_elicitations) that changes between fetches without any
   // URL change. Without no-store the browser may serve a stale
   // cached response — e.g. one captured before an elicitation was
   // published — causing the ApprovalCard to vanish on navigate-back.
-  if (
-    identityMatchesCurrentConnection() &&
-    currentUserId &&
-    currentUserId !== RESERVED_USER_LOCAL &&
-    !headers.has("X-Forwarded-Email")
-  ) {
-    headers.set("X-Forwarded-Email", currentUserId);
-  }
-  const dispatchConnectionId = currentIdentityConnectionId();
   let res = await hostFetch(url, {
     ...init,
     headers,
