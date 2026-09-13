@@ -115,6 +115,16 @@ _TERMINAL_EXIT_OUTPUT_MAX_LINES = 40
 _TERMINAL_EXIT_OUTPUT_MAX_CHARS = 4000
 
 
+# Precise outcome of :meth:`SessionResourceRegistry.close_terminal_detailed`.
+# ``close_terminal`` collapses every non-``"closed"`` outcome to ``False``,
+# which is why the reaper needs the detailed form: an already-absent pane
+# still owns session-level pieces that must retire, while a pane owned by a
+# newer generation must be left alone.
+TerminalCloseOutcome = Literal[
+    "closed", "generation_changed", "absent", "no_registry", "close_failed"
+]
+
+
 class TerminalLifecycle(Enum):
     """Session-lifecycle relationship for a terminal resource."""
 
@@ -1572,6 +1582,63 @@ class SessionResourceRegistry:
                 )
             )
 
+    async def close_terminal_detailed(
+        self,
+        session_id: str,
+        terminal_id: str,
+        *,
+        expected_instance: TerminalInstance | None = None,
+    ) -> TerminalCloseOutcome:
+        """Close a terminal resource by id, reporting the precise outcome.
+
+        :param session_id: Session/conversation identifier.
+        :param terminal_id: Opaque terminal resource id.
+        :param expected_instance: When given, close only if this exact
+            instance still occupies the key.
+        :returns: ``"closed"`` when a terminal was closed;
+            ``"generation_changed"`` when a different (newer) instance now
+            owns the key; ``"absent"`` when no terminal with that id
+            exists any more; ``"no_registry"`` when no terminal registry
+            is configured; ``"close_failed"`` when the entry is still
+            present but the inner close did not take effect (e.g. it
+            timed out and the instance was restored for retry).
+        """
+        if self._terminal_registry is None:
+            return "no_registry"
+
+        for entry in self._terminal_registry.list_for_conversation(
+            session_id,
+        ):
+            if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
+                if expected_instance is not None and entry.instance is not expected_instance:
+                    return "generation_changed"
+                closed = await self._terminal_registry.close(
+                    session_id,
+                    entry.terminal_name,
+                    entry.session_key,
+                    expected=expected_instance,
+                )
+                if closed:
+                    with self._lock:
+                        self._terminal_roles.pop((session_id, terminal_id), None)
+                        self._terminal_lifecycles.pop((session_id, terminal_id), None)
+                    return "closed"
+                # The inner close refused without closing. Re-read the key
+                # instead of guessing: a lost race reads as the state it
+                # actually landed in, and only a still-present same
+                # generation reads as a failed close.
+                for current in self._terminal_registry.list_for_conversation(session_id):
+                    if (
+                        terminal_resource_id(current.terminal_name, current.session_key)
+                        != terminal_id
+                    ):
+                        continue
+                    if expected_instance is not None and current.instance is not expected_instance:
+                        return "generation_changed"
+                    return "close_failed"
+                return "absent"
+        return "absent"
+
     async def close_terminal(
         self,
         session_id: str,
@@ -1585,27 +1652,12 @@ class SessionResourceRegistry:
         :param terminal_id: Opaque terminal resource id.
         :returns: ``True`` if a terminal was closed.
         """
-        if self._terminal_registry is None:
-            return False
-
-        for entry in self._terminal_registry.list_for_conversation(
+        outcome = await self.close_terminal_detailed(
             session_id,
-        ):
-            if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
-                if expected_instance is not None and entry.instance is not expected_instance:
-                    return False
-                closed = await self._terminal_registry.close(
-                    session_id,
-                    entry.terminal_name,
-                    entry.session_key,
-                    expected=expected_instance,
-                )
-                if closed:
-                    with self._lock:
-                        self._terminal_roles.pop((session_id, terminal_id), None)
-                        self._terminal_lifecycles.pop((session_id, terminal_id), None)
-                return closed
-        return False
+            terminal_id,
+            expected_instance=expected_instance,
+        )
+        return outcome == "closed"
 
     async def transfer_terminal(
         self,
