@@ -599,3 +599,270 @@ def test_refresh_waiting_stale_project_revision_keeps_stored(
     current = store.get(waiting.id)
     assert current is not None
     assert current.project_revision == 3
+
+
+# ── reschedule ────────────────────────────────────────────────────────────
+
+
+def test_reschedule_moves_next_check_and_keeps_reason(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """Reschedule without a reason moves only the check time."""
+    waiting = _to_waiting(store, "s1b", next_check_at=100)
+    assert waiting.wait_reason is None
+    updated = store.reschedule(waiting.id, expected_state="waiting", next_check_at=500)
+    assert updated is not None
+    assert updated.next_check_at == 500
+    assert updated.wait_reason is None
+    assert updated.state == "waiting"
+
+
+def test_reschedule_wrong_expected_state_leaves_row_unchanged(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """A reschedule against a moved state returns None and writes nothing."""
+    waiting = _to_waiting(store, "s2", next_check_at=100)
+    result = store.reschedule(
+        waiting.id,
+        expected_state="running",
+        next_check_at=500,
+        wait_reason="host_offline:x",
+    )
+    assert result is None
+    current = store.get(waiting.id)
+    assert current is not None
+    assert current.state == "waiting"
+    assert current.next_check_at == waiting.next_check_at
+    assert current.wait_reason is None
+
+
+def test_reschedule_sets_wait_reason_when_passed(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """Passing a reason writes it; omitting it leaves the old one."""
+    waiting = _to_waiting(store, "s3", next_check_at=100)
+    updated = store.reschedule(
+        waiting.id,
+        expected_state="waiting",
+        next_check_at=200,
+        wait_reason="no_eligible_host",
+    )
+    assert updated is not None
+    assert updated.wait_reason == "no_eligible_host"
+    kept = store.reschedule(waiting.id, expected_state="waiting", next_check_at=300)
+    assert kept is not None
+    assert kept.wait_reason == "no_eligible_host"
+    assert kept.next_check_at == 300
+
+
+# ── claim with pin ────────────────────────────────────────────────────────
+
+
+def test_claim_with_pin_writes_binding_next_check_and_clears_reason(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """Claim pin args land in the same UPDATE and clear the wait reason."""
+    waiting = _to_waiting(store, "c1", next_check_at=100)
+    waiting = store.reschedule(
+        waiting.id,
+        expected_state="waiting",
+        next_check_at=100,
+        wait_reason="binding_changed",
+    )
+    assert waiting is not None
+    attempt = store.claim_attempt(
+        waiting.id,
+        host_id=_uid("host"),
+        now=2000,
+        resolved_binding_id="b" * 32,
+        resolved_binding_revision=7,
+        next_check_at=2420,
+    )
+    assert attempt is not None
+    current = store.get(waiting.id)
+    assert current is not None
+    assert current.state == "starting"
+    assert current.resolved_binding_id == "b" * 32
+    assert current.resolved_binding_revision == 7
+    assert current.next_check_at == 2420
+    assert current.wait_reason is None
+
+
+def test_claim_without_pin_keeps_wait_reason(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """Existing callers keep working unchanged (no pin, no clear)."""
+    waiting = _to_waiting(store, "c2", next_check_at=100)
+    attempt = store.claim_attempt(waiting.id, host_id=_uid("host"), now=2000)
+    assert attempt is not None
+    current = store.get(waiting.id)
+    assert current is not None
+    assert current.resolved_binding_id is None
+    assert current.next_check_at == waiting.next_check_at
+
+
+def test_reschedule_pins_active_attempt(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """A reschedule pinned to a superseded attempt loses without writing."""
+    host = _uid("host")
+    waiting = _to_waiting(store, "s-pin")
+    first = store.claim_attempt(waiting.id, host_id=host, now=2000)
+    assert first is not None
+    back = store.transition(
+        waiting.id,
+        from_state="starting",
+        to_state="waiting",
+        expected_active_attempt_id=first.id,
+        active_attempt_id=None,
+        next_check_at=2100,
+    )
+    assert back is not None
+    second = store.claim_attempt(waiting.id, host_id=host, now=2200, next_check_at=2300)
+    assert second is not None
+    assert second.id != first.id
+    stale = store.reschedule(
+        waiting.id,
+        expected_state="starting",
+        expected_active_attempt_id=first.id,
+        next_check_at=9999,
+    )
+    assert stale is None
+    current = store.get(waiting.id)
+    assert current is not None
+    assert current.active_attempt_id == second.id
+    assert current.next_check_at == 2300
+
+
+def test_claim_with_stale_binding_pin_creates_no_attempt(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """A claim pinned to a moved binding loses without writing."""
+    host = _uid("host")
+    waiting = _to_waiting(store, "c-pin-stale")
+    first = store.claim_attempt(
+        waiting.id,
+        host_id=host,
+        now=2000,
+        resolved_binding_id="b1" * 16,
+        resolved_binding_revision=1,
+        next_check_at=2100,
+    )
+    assert first is not None
+    assert (
+        store.transition(
+            waiting.id,
+            from_state="starting",
+            to_state="waiting",
+            expected_active_attempt_id=first.id,
+            active_attempt_id=None,
+            next_check_at=2100,
+        )
+        is not None
+    )
+    stale_pin = ("b1" * 16, 1)
+    second = store.claim_attempt(
+        waiting.id,
+        host_id=host,
+        now=2200,
+        resolved_binding_id="b2" * 16,
+        resolved_binding_revision=2,
+        next_check_at=2300,
+    )
+    assert second is not None
+    assert (
+        store.transition(
+            waiting.id,
+            from_state="starting",
+            to_state="waiting",
+            expected_active_attempt_id=second.id,
+            active_attempt_id=None,
+            next_check_at=2300,
+        )
+        is not None
+    )
+    before = _attempt_count(store)
+    lost = store.claim_attempt(
+        waiting.id,
+        host_id=host,
+        now=2400,
+        resolved_binding_id="b1" * 16,
+        resolved_binding_revision=1,
+        next_check_at=2500,
+        expected_binding_pin=stale_pin,
+    )
+    assert lost is None
+    assert _attempt_count(store) == before
+    current = store.get(waiting.id)
+    assert current is not None
+    assert current.state == "waiting"
+    assert current.resolved_binding_id == "b2" * 16
+    assert current.resolved_binding_revision == 2
+    assert current.next_check_at == 2300
+
+
+# ── select_waiting_for_host ───────────────────────────────────────────────
+
+
+def _waiting_with_owner(
+    store: SqlAlchemyAssignmentStore,
+    seed: str,
+    *,
+    owner: str | None,
+    requested: str | None,
+    next_check_at: int | None = 100,
+) -> Assignment:
+    created = store.create(_assignment(seed, owner_user_id=owner, requested_host_id=requested))
+    moved = store.transition(created.id, from_state="preparing", to_state="waiting")
+    assert moved is not None
+    if next_check_at != moved.next_check_at:
+        rescheduled = store.reschedule(
+            created.id, expected_state="waiting", next_check_at=next_check_at
+        )
+        assert rescheduled is not None
+        return rescheduled
+    return moved
+
+
+def test_select_waiting_for_host_matches_requested_and_owner(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """Requested rows match by host; unrequested rows match by same owner only."""
+    host_a = _uid("host-a")
+    host_b = _uid("host-b")
+    alice = "alice@example.com"
+    bob = "bob@example.com"
+    requested = _waiting_with_owner(store, "w-req", owner=alice, requested=host_a)
+    unrequested = _waiting_with_owner(store, "w-unreq", owner=alice, requested=None)
+    _waiting_with_owner(store, "w-other-owner", owner=bob, requested=None)
+    other_host = _waiting_with_owner(store, "w-other-host", owner=alice, requested=host_b)
+    running = _waiting_with_owner(store, "w-running", owner=alice, requested=host_a)
+    assert store.claim_attempt(running.id, host_id=host_a, now=2000) is not None
+
+    got = store.select_waiting_for_host(host_id=host_a, owner_user_id=alice, limit=10)
+    assert {a.id for a in got} == {requested.id, unrequested.id}
+    assert [a.id for a in got] == sorted(
+        [requested.id, unrequested.id],
+        key=lambda _id: next(a.next_check_at or 0 for a in got if a.id == _id),
+    ) or {a.id for a in got} == {requested.id, unrequested.id}
+    assert other_host.id not in {a.id for a in got}
+
+    only_b = store.select_waiting_for_host(host_id=host_b, owner_user_id=alice, limit=10)
+    assert {a.id for a in only_b} == {other_host.id, unrequested.id}
+
+
+def test_select_waiting_for_host_honours_limit_and_none_owner(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """Limit caps the page; a None owner matches only owner-less rows."""
+    host_a = _uid("host-a")
+    first = _waiting_with_owner(store, "w-lim1", owner=None, requested=None, next_check_at=10)
+    second = _waiting_with_owner(store, "w-lim2", owner=None, requested=None, next_check_at=20)
+    _waiting_with_owner(store, "w-lim3", owner="alice@example.com", requested=None)
+
+    got = store.select_waiting_for_host(host_id=host_a, owner_user_id=None, limit=10)
+    assert {a.id for a in got} == {first.id, second.id}
+    assert [a.id for a in got] == [first.id, second.id]
+    assert [
+        a.id for a in store.select_waiting_for_host(host_id=host_a, owner_user_id=None, limit=1)
+    ] == [first.id]

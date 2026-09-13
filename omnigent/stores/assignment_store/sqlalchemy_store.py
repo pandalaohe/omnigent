@@ -7,7 +7,7 @@ import json
 import uuid
 from typing import Any, cast
 
-from sqlalchemy import asc, func, or_, select, update
+from sqlalchemy import and_, asc, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -445,8 +445,58 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
 
         return run_write_transaction(self._session_immediate, "transition_assignment", write)
 
+    def reschedule(
+        self,
+        assignment_id: str,
+        *,
+        expected_state: str,
+        next_check_at: int | None,
+        wait_reason: Any = _UNSET,
+        expected_active_attempt_id: Any = _UNSET,
+    ) -> Assignment | None:
+        """Stamp the next check without changing state, conditionally."""
+
+        def write(session: Session) -> Assignment | None:
+            wid = current_workspace_id()
+            values: dict[str, Any] = {
+                "next_check_at": next_check_at,
+                "updated_at": now_epoch(),
+            }
+            if wait_reason is not _UNSET:
+                values["wait_reason"] = wait_reason
+            stmt = update(SqlAssignment).where(
+                SqlAssignment.workspace_id == wid,
+                SqlAssignment.id == assignment_id,
+                SqlAssignment.state == expected_state,
+            )
+            if expected_active_attempt_id is not _UNSET:
+                if expected_active_attempt_id is None:
+                    stmt = stmt.where(SqlAssignment.active_attempt_id.is_(None))
+                else:
+                    stmt = stmt.where(
+                        SqlAssignment.active_attempt_id == expected_active_attempt_id
+                    )
+            result = cast(
+                "CursorResult[Any]",
+                session.execute(stmt.values(**values)),
+            )
+            if not result.rowcount:
+                return None
+            row = session.get(SqlAssignment, (wid, assignment_id))
+            return _assignment_to_entity(row) if row is not None else None
+
+        return run_write_transaction(self._session_immediate, "reschedule_assignment", write)
+
     def claim_attempt(
-        self, assignment_id: str, *, host_id: str, now: int
+        self,
+        assignment_id: str,
+        *,
+        host_id: str,
+        now: int,
+        resolved_binding_id: Any = _UNSET,
+        resolved_binding_revision: Any = _UNSET,
+        next_check_at: Any = _UNSET,
+        expected_binding_pin: Any = _UNSET,
     ) -> AssignmentAttempt | None:
         """Claim the next attempt number single-flight.
 
@@ -454,33 +504,56 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
         ``resolved_host_id`` and binds the new attempt id; the attempt row
         is inserted only when exactly one row changed, so two racing
         claimants produce one attempt. A row pinned to another host stays
-        unclaimable — no substitute destination may execute it.
+        unclaimable — no substitute destination may execute it. Passed
+        binding pin / ``next_check_at`` values are written in the same
+        UPDATE, which also clears ``wait_reason``. A passed
+        ``expected_binding_pin`` requires the stored pin to still equal it.
         """
         attempt_id = uuid.uuid4().hex
 
         def write(session: Session) -> AssignmentAttempt | None:
             wid = current_workspace_id()
+            values: dict[str, Any] = {
+                "state": AssignmentState.STARTING.value,
+                "active_attempt_id": attempt_id,
+                "resolved_host_id": host_id,
+                "updated_at": now,
+            }
+            pinned = False
+            if resolved_binding_id is not _UNSET:
+                values["resolved_binding_id"] = resolved_binding_id
+                pinned = True
+            if resolved_binding_revision is not _UNSET:
+                values["resolved_binding_revision"] = resolved_binding_revision
+                pinned = True
+            if next_check_at is not _UNSET:
+                values["next_check_at"] = next_check_at
+                pinned = True
+            if pinned:
+                values["wait_reason"] = None
+            stmt = update(SqlAssignment).where(
+                SqlAssignment.workspace_id == wid,
+                SqlAssignment.id == assignment_id,
+                SqlAssignment.state == AssignmentState.WAITING.value,
+                SqlAssignment.active_attempt_id.is_(None),
+                or_(
+                    SqlAssignment.resolved_host_id.is_(None),
+                    SqlAssignment.resolved_host_id == host_id,
+                ),
+            )
+            if expected_binding_pin is not _UNSET:
+                if expected_binding_pin is None:
+                    stmt = stmt.where(SqlAssignment.resolved_binding_id.is_(None))
+                else:
+                    pin_id, pin_rev = expected_binding_pin
+                    stmt = stmt.where(SqlAssignment.resolved_binding_id == pin_id)
+                    if pin_rev is None:
+                        stmt = stmt.where(SqlAssignment.resolved_binding_revision.is_(None))
+                    else:
+                        stmt = stmt.where(SqlAssignment.resolved_binding_revision == pin_rev)
             result = cast(
                 "CursorResult[Any]",
-                session.execute(
-                    update(SqlAssignment)
-                    .where(
-                        SqlAssignment.workspace_id == wid,
-                        SqlAssignment.id == assignment_id,
-                        SqlAssignment.state == AssignmentState.WAITING.value,
-                        SqlAssignment.active_attempt_id.is_(None),
-                        or_(
-                            SqlAssignment.resolved_host_id.is_(None),
-                            SqlAssignment.resolved_host_id == host_id,
-                        ),
-                    )
-                    .values(
-                        state=AssignmentState.STARTING.value,
-                        active_attempt_id=attempt_id,
-                        resolved_host_id=host_id,
-                        updated_at=now,
-                    )
-                ),
+                session.execute(stmt.values(**values)),
             )
             if not result.rowcount:
                 return None
@@ -686,6 +759,34 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
                 .where(SqlAssignment.resolved_host_id == host_id)
                 .where(SqlAssignment.state.in_(sorted(NON_TERMINAL_STATES)))
                 .order_by(asc(SqlAssignment.created_at), asc(SqlAssignment.id))
+                .limit(limit)
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_assignment_to_entity(r) for r in rows]
+
+    def select_waiting_for_host(
+        self, *, host_id: str, owner_user_id: str | None, limit: int
+    ) -> builtins.list[Assignment]:
+        """Select waiting rows one host may claim, in one statement."""
+        with self._session("select_waiting_assignments_for_host") as session:
+            if owner_user_id is None:
+                owner_predicate = SqlAssignment.owner_user_id.is_(None)
+            else:
+                owner_predicate = SqlAssignment.owner_user_id == owner_user_id
+            stmt = (
+                select(SqlAssignment)
+                .where(SqlAssignment.workspace_id == current_workspace_id())
+                .where(SqlAssignment.state == AssignmentState.WAITING.value)
+                .where(
+                    or_(
+                        SqlAssignment.requested_host_id == host_id,
+                        and_(
+                            SqlAssignment.requested_host_id.is_(None),
+                            owner_predicate,
+                        ),
+                    )
+                )
+                .order_by(asc(SqlAssignment.next_check_at), asc(SqlAssignment.id))
                 .limit(limit)
             )
             rows = session.execute(stmt).scalars().all()

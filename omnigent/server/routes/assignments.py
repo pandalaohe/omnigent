@@ -867,6 +867,9 @@ def create_assignments_router(
                 AssignmentState.PREPARING.value,
                 AssignmentState.WAITING.value,
             )
+            coordinator = getattr(request.app.state, "assignment_coordinator", None)
+            if coordinator is not None:
+                coordinator.trigger(assignment_id)
             return _assignment_to_response(updated)
         landed = {name: commit for name, commit in observed.items() if name in advertised}
         updated = await _transition_or_raise(
@@ -950,6 +953,9 @@ def create_assignments_router(
         )
         if updated is None:
             await _raise_lost_race(assignment_store, assignment_id, "refreshing")
+        coordinator = getattr(request.app.state, "assignment_coordinator", None)
+        if coordinator is not None:
+            coordinator.trigger(assignment_id)
         return _assignment_to_response(updated)
 
     @router.get("/assignments")
@@ -1245,6 +1251,10 @@ def create_assignments_router(
             AssignmentState.INTERRUPTED.value,
             to_state,
         )
+        if to_state == AssignmentState.WAITING.value:
+            coordinator = getattr(request.app.state, "assignment_coordinator", None)
+            if coordinator is not None:
+                coordinator.trigger(assignment_id)
         return _assignment_to_response(updated)
 
     @router.post("/assignments/{assignment_id}/complete")

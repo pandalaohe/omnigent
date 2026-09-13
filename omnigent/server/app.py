@@ -1486,6 +1486,37 @@ def create_app(
         set_runner_router(runner_router)
         await archive_close_coordinator.start()
 
+        from omnigent.server.feature_flags import Feature
+
+        assignment_coordinator = None
+        if (
+            resolved_feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS)
+            and assignment_store is not None
+            and project_store is not None
+            and project_repository_store is not None
+            and project_host_binding_store is not None
+            and host_store is not None
+        ):
+            from omnigent.server.assignments import AssignmentCoordinator
+
+            assignment_coordinator = AssignmentCoordinator(
+                assignment_store=assignment_store,
+                project_store=project_store,
+                repository_store=project_repository_store,
+                binding_store=project_host_binding_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                runner_router=runner_router,
+                tunnel_registry=tunnel_registry,
+                runner_exit_reports=runner_exit_reports,
+                file_store=file_store,
+                artifact_store=artifact_store,
+            )
+            await assignment_coordinator.start()
+        app_inst.state.assignment_coordinator = assignment_coordinator
+
         # Wake a blocked sub-agent's immediate parent: hooks
         # ``pending_elicitations.record_publish`` to post a ``[System: …]``
         # notice to the parent's ``/events``. Uninstalled at teardown so a
@@ -1664,6 +1695,8 @@ def create_app(
             if cli_retention_coordinator is not None:
                 await cli_retention_coordinator.shutdown()
             await archive_close_coordinator.shutdown()
+            if assignment_coordinator is not None:
+                await assignment_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
@@ -1690,6 +1723,7 @@ def create_app(
     app.state.runner_router = runner_router
     app.state.cli_retention_coordinator = cli_retention_coordinator
     app.state.archive_close_coordinator = archive_close_coordinator
+    app.state.assignment_coordinator = None
     app.state.cli_release_intent_store = cli_release_intent_store
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
@@ -3619,6 +3653,9 @@ def create_app(
             if cli_retention_coordinator is not None:
                 cli_retention_coordinator.trigger(_host_id)
             archive_close_coordinator.trigger_pending(host_id=_host_id)
+            coordinator = getattr(app.state, "assignment_coordinator", None)
+            if coordinator is not None and host_registry.get(_host_id) is not None:
+                coordinator.trigger_host(_host_id)
 
         app.include_router(
             create_host_tunnel_router(

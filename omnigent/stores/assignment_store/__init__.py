@@ -196,7 +196,15 @@ class AssignmentStore(ABC):
 
     @abstractmethod
     def claim_attempt(
-        self, assignment_id: str, *, host_id: str, now: int
+        self,
+        assignment_id: str,
+        *,
+        host_id: str,
+        now: int,
+        resolved_binding_id: Any = _UNSET,
+        resolved_binding_revision: Any = _UNSET,
+        next_check_at: Any = _UNSET,
+        expected_binding_pin: Any = _UNSET,
     ) -> AssignmentAttempt | None:
         """
         Claim the next attempt number single-flight.
@@ -206,14 +214,62 @@ class AssignmentStore(ABC):
         AND active_attempt_id IS NULL AND (resolved_host_id IS NULL OR
         resolved_host_id = <host>)``; only when exactly one row changed, the
         attempt row (``number`` = previous max + 1, ``active``) is inserted.
-        A row pinned to another host is not claimable.
+        A row pinned to another host is not claimable. When any of
+        ``resolved_binding_id``, ``resolved_binding_revision`` or
+        ``next_check_at`` is passed it is written in the same UPDATE, which
+        also clears ``wait_reason``. When ``expected_binding_pin`` is passed,
+        the claim also requires the stored pin to still equal it: ``None``
+        requires ``resolved_binding_id IS NULL``; a ``(binding_id,
+        revision)`` tuple requires both columns to still equal it.
 
         :param assignment_id: The waiting assignment to claim.
         :param host_id: The host the attempt will run on.
         :param now: Unix epoch seconds stamped on the rows.
+        :param resolved_binding_id: Binding snapshot to pin, or omitted.
+        :param resolved_binding_revision: Binding revision to pin, or omitted.
+        :param next_check_at: Next coordinator check to stamp, or omitted.
+        :param expected_binding_pin: Pinned binding the caller read; ``None``
+            pins no binding, a tuple pins that binding and revision. Omitted
+            pins nothing.
         :returns: The new :class:`AssignmentAttempt`, or ``None`` when the
             row is not claimable (missing, not ``waiting``, already
-            claimed, pinned to another host) — with no attempt row inserted.
+            claimed, pinned to another host, or the binding pin moved) —
+            with no attempt row inserted.
+        """
+        ...
+
+    @abstractmethod
+    def reschedule(
+        self,
+        assignment_id: str,
+        *,
+        expected_state: str,
+        next_check_at: int | None,
+        wait_reason: Any = _UNSET,
+        expected_active_attempt_id: Any = _UNSET,
+    ) -> Assignment | None:
+        """
+        Stamp the next coordinator check without changing state.
+
+        A conditional write, not a transition: ``UPDATE ... WHERE
+        workspace_id, id, state = expected_state`` setting
+        ``next_check_at`` and ``updated_at``. ``wait_reason`` is written
+        only when passed, so other states can move ``next_check_at``
+        without touching it. When ``expected_active_attempt_id`` is passed
+        (including ``None``), the write also requires ``active_attempt_id``
+        to still equal it.
+
+        :param assignment_id: The assignment to reschedule.
+        :param expected_state: The state the caller last saw; a concurrent
+            move makes this return ``None``.
+        :param next_check_at: Next coordinator check to stamp, or ``None``.
+        :param wait_reason: New visible reason, or omitted to leave it.
+        :param expected_active_attempt_id: Pinned attempt the caller
+            validated; ``None`` pins no active attempt. Omitted pins
+            nothing.
+        :returns: The updated :class:`Assignment`, or ``None`` when the row
+            is missing, no longer in ``expected_state``, or the pinned
+            attempt changed.
         """
         ...
 
@@ -340,6 +396,28 @@ class AssignmentStore(ABC):
         :param limit: Maximum rows to return.
         :returns: :class:`Assignment` instances with
             ``resolved_host_id == host_id``.
+        """
+        ...
+
+    @abstractmethod
+    def select_waiting_for_host(
+        self, *, host_id: str, owner_user_id: str | None, limit: int
+    ) -> builtins.list[Assignment]:
+        """
+        Return waiting rows one host may claim, in one query.
+
+        ``state = 'waiting' AND (requested_host_id = :host OR
+        (requested_host_id IS NULL AND owner_user_id = :owner))`` (``IS
+        NULL`` when the owner is ``None``), ordered by ``next_check_at``,
+        ``id``, at most ``limit``. Served by the ``(workspace_id, state,
+        ...)`` prefix of ``ix_assignments_due`` — no new index.
+
+        :param host_id: The host that just connected.
+        :param owner_user_id: The connection owner's user, or ``None`` in
+            single-user mode; matches only unrequested rows of the same
+            owner.
+        :param limit: Maximum rows to return.
+        :returns: Due-claimable :class:`Assignment` instances.
         """
         ...
 
