@@ -2,7 +2,7 @@
 
 Covers the opt-in surface of cross-host project collaboration: the
 per-project enable switch, the registered repositories, and the per-host
-directory bindings (see the cross-host project handoff design §2.2).
+directory bindings.
 Assignment dispatch and lifecycle live on a separate router; this module
 only configures where assignments may run.
 
