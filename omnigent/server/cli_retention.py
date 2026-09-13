@@ -23,6 +23,13 @@ _logger = logging.getLogger(__name__)
 # same shape as a genuinely complete enumeration. A truncated pass restarts
 # from the beginning; the bound keeps a churn-heavy host from looping forever.
 _HOST_ENUM_MAX_PASSES = 3
+# The reset fan-out runs inside the DELETE request handler, so it must not
+# grow with the host's session count: at most this many reset POSTs are in
+# flight at once, and the whole pass stops issuing new ones after the overall
+# deadline. In-flight requests still settle; whatever was never attempted is
+# reported as not attempted, never as reset or failed.
+_RESET_MAX_CONCURRENCY = 8
+_RESET_OVERALL_DEADLINE_S = 60.0
 
 
 class CliRetentionHostLeaseBusy(RuntimeError):
@@ -318,37 +325,66 @@ class CliRetentionCoordinator:
         conversations = enumeration.conversations
         reset: list[str] = []
         unavailable: list[str] = []
+        not_attempted: list[str] = []
         for conversation in conversations:
             if not conversation.runner_id:
                 # No runner to command, but the CLI may still be live and
                 # retention-managed, so report it instead of dropping it.
                 unavailable.append(conversation.id)
-                continue
-            try:
-                if lease is not None:
-                    await lease.ensure_owned()
-                routed = self._runner_router.client_for_session_resources(
-                    conversation.id, conversation=conversation
-                )
-                response = await routed.client.post(
-                    f"/v1/sessions/{conversation.id}/cli-retention/reset",
-                    json={
-                        "host_id": host_id,
-                        "policy_revision": policy_revision,
-                    },
-                    timeout=10.0,
-                )
-                if response.status_code < 400:
-                    reset.append(conversation.id)
-                else:
-                    unavailable.append(conversation.id)
-            except Exception:  # noqa: BLE001 - offline sessions retry legacy on reconnect.
+        bound = [conversation for conversation in conversations if conversation.runner_id]
+        stop = asyncio.Event()
+        deadline = time.monotonic() + _RESET_OVERALL_DEADLINE_S
+        semaphore = asyncio.Semaphore(_RESET_MAX_CONCURRENCY)
+
+        async def _reset_one(conversation: Any) -> str:
+            """Reset one runner-bound conversation; returns ok/failed/unattempted."""
+            if stop.is_set() or time.monotonic() >= deadline:
+                return "unattempted"
+            async with semaphore:
+                if stop.is_set() or time.monotonic() >= deadline:
+                    return "unattempted"
+                try:
+                    if lease is not None:
+                        await lease.ensure_owned()
+                except CliRetentionHostLeaseLost:
+                    # Fencing stays: a lost lease stops further external
+                    # commands. This conversation keeps today's
+                    # tried-and-failed accounting; the rest go unattempted.
+                    stop.set()
+                    return "failed"
+                except Exception:  # noqa: BLE001 - a bad lease check fails this one only.
+                    return "failed"
+                if stop.is_set():
+                    return "unattempted"
+                try:
+                    routed = self._runner_router.client_for_session_resources(
+                        conversation.id, conversation=conversation
+                    )
+                    response = await routed.client.post(
+                        f"/v1/sessions/{conversation.id}/cli-retention/reset",
+                        json={
+                            "host_id": host_id,
+                            "policy_revision": policy_revision,
+                        },
+                        timeout=10.0,
+                    )
+                except Exception:  # noqa: BLE001 - offline sessions retry legacy on reconnect.
+                    return "failed"
+                return "ok" if response.status_code < 400 else "failed"
+
+        for conversation, outcome in zip(bound, await asyncio.gather(*(_reset_one(conversation) for conversation in bound))):
+            if outcome == "ok":
+                reset.append(conversation.id)
+            elif outcome == "failed":
                 unavailable.append(conversation.id)
+            else:
+                not_attempted.append(conversation.id)
         result = {
             "configured": False,
             "policy_revision": policy_revision,
             "reset": reset,
             "unavailable": unavailable,
+            "not_attempted": not_attempted,
             "incomplete": enumeration.incomplete,
             "observed_at": int(time.time()),
         }

@@ -1,12 +1,17 @@
 """Regression tests for the Host CLI-retention reset path (fixes 1-3)."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from omnigent.entities.pagination import PagedList
-from omnigent.server.cli_retention import CliRetentionCoordinator
+from omnigent.server import cli_retention as cli_retention_module
+from omnigent.server.cli_retention import (
+    CliRetentionCoordinator,
+    CliRetentionHostLeaseLost,
+)
 
 
 def _conv(conversation_id: str, runner_id: str | None = None) -> SimpleNamespace:
@@ -145,3 +150,153 @@ async def test_host_enumeration_truncated_past_bound_reports_incomplete() -> Non
     # existence check per truncated pass. No exception escapes.
     assert store.list_calls == 6
     assert len(store.get_calls) == 3
+
+
+class _SinglePageStore:
+    """One complete page plus a get_conversation that always hits."""
+
+    def __init__(self, conversations: list[SimpleNamespace]) -> None:
+        self._conversations = list(conversations)
+
+    def list_conversations(self, **kwargs):
+        data = self._conversations
+        return PagedList(
+            data=data,
+            first_id=data[0].id if data else None,
+            last_id=data[-1].id if data else None,
+            has_more=False,
+        )
+
+    def get_conversation(self, conversation_id: str):
+        for conversation in self._conversations:
+            if conversation.id == conversation_id:
+                return conversation
+        return None
+
+
+@pytest.mark.asyncio
+async def test_reset_pass_over_deadline_reports_unattempted_not_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_retention_module, "_RESET_OVERALL_DEADLINE_S", 0.05)
+    ids = [f"s-{index:02d}" for index in range(20)]
+    store = _SinglePageStore([_conv(conversation_id) for conversation_id in ids])
+
+    class _SlowClient:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+
+        async def post(self, url, *, json, timeout):
+            del json, timeout
+            self.started.append(url)
+            await asyncio.sleep(0.5)
+            return SimpleNamespace(status_code=200)
+
+    clients = {conversation_id: _SlowClient() for conversation_id in ids}
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            return SimpleNamespace(
+                client=clients[session_id], runner_id=conversation.runner_id
+            )
+
+    coordinator = CliRetentionCoordinator(
+        host_store=SimpleNamespace(),
+        conversation_store=store,
+        runner_router=_Router(),
+    )
+
+    started_at = time.monotonic()
+    result = await coordinator.reset_host_under_lease("host-a", policy_revision=8)
+    elapsed = time.monotonic() - started_at
+
+    # Only the first concurrency window gets issued before the deadline; the
+    # rest are never attempted — reported as such, not as reset, not as failed.
+    assert result["reset"] == ids[: cli_retention_module._RESET_MAX_CONCURRENCY]
+    assert result["unavailable"] == []
+    assert result["not_attempted"] == ids[cli_retention_module._RESET_MAX_CONCURRENCY :]
+    assert set(result["reset"]) | set(result["not_attempted"]) == set(ids)
+    # Prompt: in-flight requests settle but nothing new is issued.
+    assert elapsed < 5.0
+
+
+@pytest.mark.asyncio
+async def test_reset_pass_isolation_one_failure_does_not_abort_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_retention_module, "_RESET_OVERALL_DEADLINE_S", 60.0
+    )
+    ids = ["ok-1", "boom", "ok-2"]
+    store = _SinglePageStore([_conv(conversation_id) for conversation_id in ids])
+
+    class _Client:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+
+        async def post(self, url, *, json, timeout):
+            del url, json, timeout
+            if self.session_id == "boom":
+                raise RuntimeError("runner exploded")
+            return SimpleNamespace(status_code=200)
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            return SimpleNamespace(
+                client=_Client(session_id), runner_id=conversation.runner_id
+            )
+
+    coordinator = CliRetentionCoordinator(
+        host_store=SimpleNamespace(),
+        conversation_store=store,
+        runner_router=_Router(),
+    )
+
+    result = await coordinator.reset_host_under_lease("host-a", policy_revision=8)
+
+    assert result["reset"] == ["ok-1", "ok-2"]
+    assert result["unavailable"] == ["boom"]
+    assert result["not_attempted"] == []
+
+
+@pytest.mark.asyncio
+async def test_reset_pass_keeps_lease_fencing_before_external_commands() -> None:
+    store = _SinglePageStore([_conv("guarded")])
+    posts: list[str] = []
+
+    class _Client:
+        async def post(self, url, *, json, timeout):
+            del json, timeout
+            posts.append(url)
+            return SimpleNamespace(status_code=200)
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            return SimpleNamespace(client=_Client(), runner_id=conversation.runner_id)
+
+    calls = 0
+
+    class _LosingLease:
+        async def ensure_owned(self) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise CliRetentionHostLeaseLost("host-a")
+
+    coordinator = CliRetentionCoordinator(
+        host_store=SimpleNamespace(),
+        conversation_store=store,
+        runner_router=_Router(),
+    )
+
+    result = await coordinator.reset_host_under_lease(
+        "host-a", policy_revision=8, lease=_LosingLease()
+    )
+
+    # The pre-enumeration check owns the lease; the in-loop check loses it, so
+    # no POST is ever issued and the conversation keeps failed accounting.
+    assert calls == 2
+    assert posts == []
+    assert result["reset"] == []
+    assert result["unavailable"] == ["guarded"]
+    assert result["not_attempted"] == []
