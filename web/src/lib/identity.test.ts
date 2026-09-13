@@ -161,6 +161,41 @@ describe("resolveIdentity", () => {
     expect(headers.has("X-Forwarded-Email")).toBe(false);
   });
 
+  it("keeps the identity when the same Server config is installed again", async () => {
+    const serverA = vi
+      .fn()
+      .mockResolvedValue(mockJsonResponse({ user_id: "alice", is_admin: true }));
+    const anotherFetcher = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "bob" }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, getCurrentUserId, getCurrentIsAdmin } = await import("./identity");
+
+    expect(await resolveIdentity()).toBe("alice");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: anotherFetcher });
+
+    expect(getCurrentUserId()).toBe("alice");
+    expect(getCurrentIsAdmin()).toBe(true);
+    expect(await resolveIdentity()).toBe("alice");
+    expect(serverA).toHaveBeenCalledOnce();
+    expect(anotherFetcher).not.toHaveBeenCalled();
+  });
+
+  it("starts a new identity lookup for each config install without a Server identity", async () => {
+    const fetcherA = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "alice" }));
+    const fetcherB = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "bob" }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ fetcher: fetcherA });
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+
+    expect(await resolveIdentity()).toBe("alice");
+    setOmnigentHostConfig({ fetcher: fetcherB });
+
+    expect(getCurrentUserId()).toBeNull();
+    expect(await resolveIdentity()).toBe("bob");
+    expect(fetcherA).toHaveBeenCalledOnce();
+    expect(fetcherB).toHaveBeenCalledOnce();
+  });
+
   it("returns null when the server responds with user_id: null", async () => {
     // Server signals "no auth provider configured" with user_id: null.
     // Resolution should still complete (not throw) so the app can
@@ -288,6 +323,50 @@ describe("authenticatedFetch", () => {
     const init = fetchMock.mock.calls[1][1] as RequestInit;
     expect(init.method).toBe("DELETE");
     expect(init.signal).toBe(controller.signal);
+  });
+
+  it("does not retry a wrong-replica request on a Server selected after dispatch", async () => {
+    let releaseRunners!: (res: Response) => void;
+    const runnersPending = new Promise<Response>((resolve) => {
+      releaseRunners = resolve;
+    });
+    const serverA = vi.fn((path: string) => {
+      if (path === "/v1/me") return Promise.resolve(mockJsonResponse({ user_id: "alice" }));
+      if (path === "/v1/hosts/host-a/runners") return runnersPending;
+      return Promise.resolve(mockJsonResponse({}));
+    });
+    const serverB = vi.fn((path: string, init?: RequestInit) => {
+      void init;
+      return Promise.resolve(mockJsonResponse(path === "/v1/me" ? { user_id: "bob" } : {}));
+    });
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, authenticatedFetch } = await import("./identity");
+
+    expect(await resolveIdentity()).toBe("alice");
+    const pending = authenticatedFetch("/v1/hosts/host-a/runners", { method: "POST" });
+    await vi.waitFor(() =>
+      expect(serverA).toHaveBeenCalledWith("/v1/hosts/host-a/runners", expect.anything()),
+    );
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    expect(await resolveIdentity()).toBe("bob");
+    releaseRunners({
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      json: async () => ({ error: { code: "wrong_replica" } }),
+      clone: function () {
+        return this;
+      },
+    } as unknown as Response);
+
+    const res = await pending;
+    expect(res.status).toBe(400);
+    expect(serverB.mock.calls.map((call) => call[0])).toEqual(["/v1/me"]);
+    for (const call of serverB.mock.calls) {
+      const headers = new Headers(call[1]?.headers);
+      expect(headers.get("X-Forwarded-Email")).not.toBe("alice");
+    }
   });
 
   describe("slice-key routing (host sharding)", () => {

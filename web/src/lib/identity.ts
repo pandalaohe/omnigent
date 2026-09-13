@@ -252,9 +252,9 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
 let currentIsAdmin = false;
 let identityResolved = false;
 let identityPromise: Promise<string | null> | null = null;
-// The cached identity belongs to one Server connection (Server identity plus
-// host config generation), so an embedded host that switches Servers never
-// reuses the previous Server's user.
+// The cached identity belongs to one Server identity, so an embedded host that
+// switches Servers never reuses the previous Server's user. Without an identity
+// every host config install starts a new connection.
 let identityConnectionId: string | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
@@ -271,7 +271,8 @@ let serverLoginUrl: string | null = null;
 let loginRedirectPending = false;
 
 function currentIdentityConnectionId(): string {
-  return `${getOmnigentServerIdentity() ?? "__default__"}:${getOmnigentHostGeneration()}`;
+  const serverIdentity = getOmnigentServerIdentity();
+  return serverIdentity ?? `__unidentified__:${getOmnigentHostGeneration()}`;
 }
 
 function identityMatchesCurrentConnection(): boolean {
@@ -459,14 +460,6 @@ export async function authenticatedFetch(
   init?: RequestInit,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
-  if (
-    identityMatchesCurrentConnection() &&
-    currentUserId &&
-    currentUserId !== RESERVED_USER_LOCAL &&
-    !headers.has("X-Forwarded-Email")
-  ) {
-    headers.set("X-Forwarded-Email", currentUserId);
-  }
   // Pin host- and session-scoped requests to the replica holding that host's
   // runner tunnel (key = host_id). Derived centrally so no call site has to
   // thread it; a caller that set the header explicitly wins, and non-host-scoped
@@ -525,6 +518,15 @@ export async function authenticatedFetch(
   // URL change. Without no-store the browser may serve a stale
   // cached response — e.g. one captured before an elicitation was
   // published — causing the ApprovalCard to vanish on navigate-back.
+  if (
+    identityMatchesCurrentConnection() &&
+    currentUserId &&
+    currentUserId !== RESERVED_USER_LOCAL &&
+    !headers.has("X-Forwarded-Email")
+  ) {
+    headers.set("X-Forwarded-Email", currentUserId);
+  }
+  const dispatchConnectionId = currentIdentityConnectionId();
   let res = await hostFetch(url, {
     ...init,
     headers,
@@ -538,6 +540,9 @@ export async function authenticatedFetch(
   // back). Only when WE stamped the key; a genuinely-offline runner returns
   // runner_unavailable and is not re-addressed here.
   if (stampedSliceKey && (await _isWrongReplica(res))) {
+    // A retry after a Server switch would reach the new Server with the old
+    // request, so it is skipped.
+    if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
     // Fresh Headers for the retry — mutating the first request's `headers`
     // object in place would also clear the key on the already-sent request
     // (callers/tests hold it by reference).
