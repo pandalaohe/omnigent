@@ -12,6 +12,7 @@ from omnigent.server.cli_retention import (
     CliRetentionCoordinator,
     CliRetentionHostLeaseLost,
 )
+from omnigent.server.routes.hosts import _reset_completion_status
 
 
 def _conv(conversation_id: str, runner_id: str | None = None) -> SimpleNamespace:
@@ -99,8 +100,12 @@ async def test_host_enumeration_recovers_when_cursor_row_deleted_between_pages()
 
     assert result["incomplete"] is False
     # c-0499 was genuinely observed on the first page before its deletion, so
-    # it stays in the recovered set; the tail past it is re-enumerated.
-    assert sorted(result["reset"]) == sorted(ids)
+    # it stays in the recovered set; the tail past it is re-enumerated. The
+    # id list is a bounded sample; the count carries the full set.
+    assert result["reset_count"] == len(ids)
+    assert len(result["reset"]) == cli_retention_module._RESET_ID_SAMPLE_CAP
+    assert result["unavailable"] == []
+    assert result["unbound_count"] == 0
     # The healthy path issues no existence check; only the anomalous empty
     # page triggers the single get_conversation call.
     assert store.get_calls == ["c-0499"]
@@ -300,3 +305,124 @@ async def test_reset_pass_keeps_lease_fencing_before_external_commands() -> None
     assert result["reset"] == []
     assert result["unavailable"] == ["guarded"]
     assert result["not_attempted"] == []
+
+
+@pytest.mark.asyncio
+async def test_reset_with_mostly_runnerless_host_returns_counts_not_id_lists() -> None:
+    historical = [f"hist-{index:04d}" for index in range(300)]
+    conversations = [_conv("live-ok")] + [
+        SimpleNamespace(id=conversation_id, runner_id=None, host_id="host-a")
+        for conversation_id in historical
+    ]
+    store = _SinglePageStore(conversations)
+
+    class _Client:
+        async def post(self, url, *, json, timeout):
+            del url, json, timeout
+            return SimpleNamespace(status_code=200)
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            return SimpleNamespace(client=_Client(), runner_id=conversation.runner_id)
+
+    coordinator = CliRetentionCoordinator(
+        host_store=SimpleNamespace(),
+        conversation_store=store,
+        runner_router=_Router(),
+    )
+
+    result = await coordinator.reset_host_under_lease("host-a", policy_revision=8)
+
+    assert result["reset"] == ["live-ok"]
+    assert result["reset_count"] == 1
+    assert result["unbound_count"] == 300
+    assert len(result["unbound_sample"]) == cli_retention_module._RESET_ID_SAMPLE_CAP
+    assert result["unavailable"] == []
+    assert result["not_attempted"] == []
+    # The runner-less population alone must not force partial/pending.
+    assert _reset_completion_status(result) == "legacy"
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        # Runner-bound failure is a real incompleteness.
+        (
+            {
+                "reset": ["ok"],
+                "reset_count": 1,
+                "unavailable": ["bad"],
+                "unavailable_count": 1,
+                "unbound_count": 0,
+                "not_attempted": [],
+                "not_attempted_count": 0,
+                "incomplete": False,
+            },
+            "partial",
+        ),
+        (
+            {
+                "reset": [],
+                "reset_count": 0,
+                "unavailable": ["bad"],
+                "unavailable_count": 1,
+                "unbound_count": 0,
+                "not_attempted": [],
+                "not_attempted_count": 0,
+                "incomplete": False,
+            },
+            "pending",
+        ),
+        # Never attempted is distinct from failed and also incomplete.
+        (
+            {
+                "reset": ["ok"],
+                "reset_count": 1,
+                "unavailable": [],
+                "unavailable_count": 0,
+                "unbound_count": 0,
+                "not_attempted": ["slow"],
+                "not_attempted_count": 1,
+                "incomplete": False,
+            },
+            "partial",
+        ),
+        # A truncated enumeration never reports a completed reset.
+        (
+            {
+                "reset": ["ok"],
+                "reset_count": 1,
+                "unavailable": [],
+                "unavailable_count": 0,
+                "unbound_count": 5000,
+                "not_attempted": [],
+                "not_attempted_count": 0,
+                "incomplete": True,
+            },
+            "partial",
+        ),
+        (
+            {
+                "reset": [],
+                "reset_count": 0,
+                "unavailable": [],
+                "unavailable_count": 0,
+                "unbound_count": 0,
+                "not_attempted": [],
+                "not_attempted_count": 0,
+                "incomplete": True,
+            },
+            "pending",
+        ),
+        # Legacy snapshots without count keys keep the pre-split meaning.
+        ({"reset": ["ok"], "unavailable": ["old"]}, "partial"),
+        ({"reset": [], "unavailable": ["old"]}, "pending"),
+        ({"reset": ["ok"], "unavailable": []}, "legacy"),
+        ({"reset": [], "unavailable": []}, "legacy"),
+        ({"reset": None, "unavailable": []}, "pending"),
+    ],
+)
+def test_reset_completion_status_mapping(
+    result: dict, expected: str
+) -> None:
+    assert _reset_completion_status(result) == expected

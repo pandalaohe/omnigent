@@ -515,6 +515,16 @@ class CliRetentionRuntime(BaseModel):
     released: list[str] | None = None
     reset: list[str] | None = None
     unavailable: list[str] | None = None
+    # Reset id lists above are bounded samples (see _RESET_ID_SAMPLE_CAP);
+    # the counts carry the totals. ``unbound_*`` isolates the no-runner
+    # historical population, which alone never fails a reset.
+    reset_count: int | None = Field(default=None, ge=0)
+    unavailable_count: int | None = Field(default=None, ge=0)
+    unbound_count: int | None = Field(default=None, ge=0)
+    unbound_sample: list[str] | None = None
+    not_attempted: list[str] | None = None
+    not_attempted_count: int | None = Field(default=None, ge=0)
+    incomplete: bool | None = None
     lease: Literal["busy"] | None = None
 
 
@@ -646,6 +656,41 @@ async def _resolve_agent_harness(
         return None
     loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
     return canonicalize_harness(loaded.spec.executor.harness_kind)
+
+
+def _reset_completion_status(runtime: dict[str, Any]) -> str:
+    """Map a stored reset result to the legacy-branch application status.
+
+    ``reset``/``unavailable`` are bounded id samples for wire compatibility;
+    the ``*_count`` keys carry the totals and ``unbound_count`` isolates the
+    large no-runner historical population, which alone never fails a reset.
+    Only a runner-bound failure, an unattempted reset, or an incomplete
+    enumeration forces ``"partial"``/``"pending"``. Snapshots predating the
+    count keys fall back to sample lengths, preserving the pre-split meaning
+    where ``unavailable`` merged both populations.
+    """
+    reset = runtime.get("reset")
+    unavailable = runtime.get("unavailable")
+    if not isinstance(reset, list) or not isinstance(unavailable, list):
+        return "pending"
+
+    def _count(value: Any, fallback: int) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) else fallback
+
+    reset_count = _count(runtime.get("reset_count"), len(reset))
+    failed_count = _count(runtime.get("unavailable_count"), len(unavailable))
+    not_attempted = runtime.get("not_attempted")
+    not_attempted_count = _count(
+        runtime.get("not_attempted_count"),
+        len(not_attempted) if isinstance(not_attempted, list) else 0,
+    )
+    if (
+        failed_count > 0
+        or not_attempted_count > 0
+        or runtime.get("incomplete") is True
+    ):
+        return "partial" if reset_count > 0 else "pending"
+    return "legacy"
 
 
 def create_hosts_router(
@@ -851,15 +896,8 @@ def create_hosts_router(
             elif runtime is None or runtime.get("policy_revision") != host.cli_retention_revision:
                 application_status = "pending"
             else:
-                reset = runtime.get("reset")
-                unavailable = runtime.get("unavailable")
                 observed_at = runtime.get("observed_at")
-                if not isinstance(reset, list) or not isinstance(unavailable, list):
-                    application_status = "pending"
-                elif unavailable:
-                    application_status = "partial" if reset else "pending"
-                else:
-                    application_status = "legacy"
+                application_status = _reset_completion_status(runtime)
             application = {
                 "status": application_status,
                 "policy_revision": host.cli_retention_revision,

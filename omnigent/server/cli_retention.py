@@ -30,6 +30,10 @@ _HOST_ENUM_MAX_PASSES = 3
 # reported as not attempted, never as reset or failed.
 _RESET_MAX_CONCURRENCY = 8
 _RESET_OVERALL_DEADLINE_S = 60.0
+# The enumeration includes archived conversations, so a host with thousands of
+# historical sessions must not come back as thousands of ids. Result lists are
+# bounded samples; the *_count keys carry the totals.
+_RESET_ID_SAMPLE_CAP = 20
 
 
 class CliRetentionHostLeaseBusy(RuntimeError):
@@ -324,13 +328,15 @@ class CliRetentionCoordinator:
         enumeration = await self._host_conversations(host_id, include_archived=True)
         conversations = enumeration.conversations
         reset: list[str] = []
-        unavailable: list[str] = []
+        failed: list[str] = []
+        unbound: list[str] = []
         not_attempted: list[str] = []
         for conversation in conversations:
             if not conversation.runner_id:
-                # No runner to command, but the CLI may still be live and
-                # retention-managed, so report it instead of dropping it.
-                unavailable.append(conversation.id)
+                # No runner to command, so there is nothing to reset. This is
+                # the large historical population: counted, never listed in
+                # full, and never by itself a failed reset.
+                unbound.append(conversation.id)
         bound = [conversation for conversation in conversations if conversation.runner_id]
         stop = asyncio.Event()
         deadline = time.monotonic() + _RESET_OVERALL_DEADLINE_S
@@ -376,15 +382,20 @@ class CliRetentionCoordinator:
             if outcome == "ok":
                 reset.append(conversation.id)
             elif outcome == "failed":
-                unavailable.append(conversation.id)
+                failed.append(conversation.id)
             else:
                 not_attempted.append(conversation.id)
         result = {
             "configured": False,
             "policy_revision": policy_revision,
-            "reset": reset,
-            "unavailable": unavailable,
-            "not_attempted": not_attempted,
+            "reset": reset[:_RESET_ID_SAMPLE_CAP],
+            "reset_count": len(reset),
+            "unavailable": failed[:_RESET_ID_SAMPLE_CAP],
+            "unavailable_count": len(failed),
+            "unbound_count": len(unbound),
+            "unbound_sample": unbound[:_RESET_ID_SAMPLE_CAP],
+            "not_attempted": not_attempted[:_RESET_ID_SAMPLE_CAP],
+            "not_attempted_count": len(not_attempted),
             "incomplete": enumeration.incomplete,
             "observed_at": int(time.time()),
         }

@@ -349,7 +349,7 @@ async def test_reset_host_reports_reachable_and_unavailable_sessions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reset_host_reports_unbound_sessions_as_unavailable() -> None:
+async def test_reset_host_reports_unbound_sessions_as_unbound_not_unavailable() -> None:
     conversations = [
         SimpleNamespace(id="reset-ok", runner_id="runner-ok", host_id="host-a"),
         SimpleNamespace(id="unbound-empty", runner_id="", host_id="host-a"),
@@ -387,7 +387,11 @@ async def test_reset_host_reports_unbound_sessions_as_unavailable() -> None:
     result = await coordinator.reset_host_under_lease("host-a", policy_revision=8)
 
     assert result["reset"] == ["reset-ok"]
-    assert result["unavailable"] == ["unbound-empty", "unbound-none"]
+    assert result["reset_count"] == 1
+    assert result["unavailable"] == []
+    assert result["unavailable_count"] == 0
+    assert result["unbound_count"] == 2
+    assert result["unbound_sample"] == ["unbound-empty", "unbound-none"]
 
 
 @pytest.mark.asyncio
