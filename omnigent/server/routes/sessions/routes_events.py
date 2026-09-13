@@ -251,6 +251,7 @@ from omnigent.session_event_batch import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S,
     DELETION_CLAIM_HEARTBEAT_INTERVAL_S,
     DELETION_CLAIM_STALE_AFTER_S,
     RUNNER_LIVENESS_TTL_S,
@@ -342,9 +343,41 @@ async def _archive_blocks_external_user_work(
     scopes = await conversation_archive_lineage(conv, conversation_store)
     if any(_archive_close_in_progress(scope.id) for scope in scopes):
         return True
-    for scope in scopes:
+    for index, scope in enumerate(scopes):
         if getattr(scope, "archive_close_claimed", False):
-            return True
+            archive_revision = getattr(scope, "archive_revision", 0)
+            requested = getattr(scope, "archive_close_requested_revision", None)
+            completed = getattr(scope, "archive_close_completed_revision", None)
+            request_no_longer_current = (
+                not scope.archived
+                or requested is None
+                or requested != archive_revision
+                or (requested is not None and completed == requested)
+            )
+            if request_no_longer_current:
+                # Safe because the store refuses a still-current request and
+                # refuses a lease renewed by a live worker; only a dead
+                # holder's stale token can be dropped here.
+                now = int(time.time())
+                cleared = await asyncio.to_thread(
+                    conversation_store.clear_stale_archive_close_claim,
+                    scope.id,
+                    stale_before=now - ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S,
+                )
+                if cleared:
+                    refreshed = await asyncio.to_thread(
+                        conversation_store.get_conversation, scope.id
+                    )
+                    if refreshed is None:
+                        continue
+                    scopes[index] = refreshed
+                    scope = refreshed
+                    if getattr(scope, "archive_close_claimed", False):
+                        return True
+                else:
+                    return True
+            else:
+                return True
         archive_revision = getattr(scope, "archive_revision", 0)
         if (
             scope.archived
