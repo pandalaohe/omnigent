@@ -1,12 +1,15 @@
 """Server coordination for Host-scoped idle CLI pools."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
 
 from omnigent.cli_retention import CliRetentionPolicy
+from omnigent.db.db_models import current_workspace_id
 from omnigent.entities.pagination import PagedList
+from omnigent.server.app import _reconnect_host_action
 from omnigent.server.cli_retention import (
     CliRetentionCoordinator,
     CliRetentionHostLeaseLost,
@@ -751,8 +754,130 @@ async def test_reset_host_under_lease_cancels_pending_idle_before_lease_check() 
     )
 
     with pytest.raises(CliRetentionHostLeaseLost):
-        await coordinator.reset_host_under_lease(
-            "host-a", policy_revision=8, lease=_LostLease()
-        )
+        await coordinator.reset_host_under_lease("host-a", policy_revision=8, lease=_LostLease())
 
     assert cancels == ["host-a"]
+
+
+def test_reconnect_host_action_distinguishes_deleted_row() -> None:
+    """A deleted Host row classifies distinctly from the live branches."""
+    assert _reconnect_host_action(None) == "host_deleted"
+    assert _reconnect_host_action(SimpleNamespace(cli_retention_policy=None)) == "reset"
+    assert (
+        _reconnect_host_action(
+            SimpleNamespace(cli_retention_policy=CliRetentionPolicy(close_on_archive=False))
+        )
+        == "trigger"
+    )
+
+
+def test_known_policy_revision_needs_a_recorded_revision() -> None:
+    coordinator = CliRetentionCoordinator(
+        host_store=SimpleNamespace(),
+        conversation_store=SimpleNamespace(),
+        runner_router=SimpleNamespace(),
+    )
+    key = (current_workspace_id(), "host-gone")
+
+    assert coordinator.known_policy_revision("host-gone") is None
+
+    coordinator._last_results[key] = {"configured": False, "families": {}, "released": []}
+    assert coordinator.known_policy_revision("host-gone") is None
+
+    coordinator._last_results[key] = {"policy_revision": True}
+    assert coordinator.known_policy_revision("host-gone") is None
+
+    coordinator._last_results[key] = {"policy_revision": -1}
+    assert coordinator.known_policy_revision("host-gone") is None
+
+    coordinator._last_results[key] = {"policy_revision": 7}
+    assert coordinator.known_policy_revision("host-gone") == 7
+
+
+def _deleted_host_coordinator(posts: list, *, seed_revision: int | None):
+    """Coordinator whose Host row is gone but whose conversations remain."""
+    conv = SimpleNamespace(id="sess-1", runner_id="runner-1", host_id="host-gone")
+
+    class _HostStore:
+        def get_host(self, host_id):
+            assert host_id == "host-gone"
+            return None  # noqa: RET501 - explicit None documents the deleted-row fake.
+
+    class _ConversationStore:
+        def list_conversations(self, **kwargs):
+            assert kwargs["host_id"] == "host-gone"
+            return PagedList(data=[conv])
+
+    class _Response:
+        status_code = 200
+
+    class _Client:
+        async def post(self, url, *, json, timeout):
+            del timeout
+            posts.append((url, json))
+            return _Response()
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            assert session_id == conversation.id == "sess-1"
+            return SimpleNamespace(client=_Client(), runner_id="runner-1")
+
+    coordinator = CliRetentionCoordinator(
+        host_store=_HostStore(),
+        conversation_store=_ConversationStore(),
+        runner_router=_Router(),
+    )
+    if seed_revision is not None:
+        coordinator._last_results[(current_workspace_id(), "host-gone")] = {
+            "configured": True,
+            "policy_revision": seed_revision,
+        }
+    return coordinator
+
+
+@pytest.mark.asyncio
+async def test_release_host_after_delete_resets_via_known_revision(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deleted Host row takes its own branch and still releases panes."""
+    posts: list = []
+    coordinator = _deleted_host_coordinator(posts, seed_revision=7)
+    triggered: list[str] = []
+    monkeypatch.setattr(coordinator, "trigger", lambda host_id: triggered.append(host_id))
+    caplog.set_level(logging.WARNING, logger="omnigent.server.cli_retention")
+
+    result = await coordinator.release_host_after_delete(
+        "host-gone", affected_conversation_count=2
+    )
+
+    assert result["status"] == "reset_after_delete"
+    assert result["reset_count"] == 1
+    assert posts == [
+        (
+            "/v1/sessions/sess-1/cli-retention/reset",
+            {"host_id": "host-gone", "policy_revision": 7},
+        )
+    ]
+    # The policy-active branch is never entered for a deleted row.
+    assert triggered == []
+    warnings = [record.message for record in caplog.records if record.levelno >= logging.WARNING]
+    assert any("host-gone" in message and "2" in message for message in warnings)
+
+
+@pytest.mark.asyncio
+async def test_release_host_after_delete_skips_reset_without_known_revision(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Without a recorded revision nothing is sent — but it stays observable."""
+    posts: list = []
+    coordinator = _deleted_host_coordinator(posts, seed_revision=None)
+    caplog.set_level(logging.WARNING, logger="omnigent.server.cli_retention")
+
+    result = await coordinator.release_host_after_delete(
+        "host-gone", affected_conversation_count=3
+    )
+
+    assert result["status"] == "host_deleted_no_known_revision"
+    assert posts == []
+    warnings = [record.message for record in caplog.records if record.levelno >= logging.WARNING]
+    assert any("host-gone" in message and "3" in message for message in warnings)

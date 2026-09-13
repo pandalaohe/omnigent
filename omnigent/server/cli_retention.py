@@ -403,6 +403,85 @@ class CliRetentionCoordinator:
         self._last_results[key] = result
         return dict(result)
 
+    def known_policy_revision(self, host_id: str) -> int | None:
+        """Return the last policy revision observed for one Host.
+
+        The Host row is the revision source of truth, but a deleted row
+        supplies none. The coordinator's last result still carries the
+        revision it last acted on, which the Runner's ``observe_policy``
+        accepts when it is not older than what the Runner already stored
+        (a stale value is rejected without state change, never fencing a
+        newer generation).
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3"``.
+        :returns: The last observed non-negative revision, or ``None``
+            when no usable revision was recorded.
+        """
+        result = self._last_results.get((current_workspace_id(), host_id))
+        if not isinstance(result, dict):
+            return None
+        revision = result.get("policy_revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            return None
+        return revision
+
+    async def release_host_after_delete(
+        self,
+        host_id: str,
+        *,
+        affected_conversation_count: int,
+    ) -> dict[str, Any]:
+        """Return one deleted Host's retained CLIs to legacy TTL ownership.
+
+        A deleted Host row has no policy and no revision, so neither
+        :meth:`reset_host` (its lease claim matches zero rows, and its
+        re-read returns ``None``) nor the trigger/reconcile path (which
+        reports ``configured: False`` without releasing) can reclaim its
+        panes. Reset under no lease instead, keyed by the last observed
+        revision: no cross-replica lease exists to fence, and a revision
+        older than the Runner's stored one is rejected without effect.
+
+        :param host_id: Deleted Host identifier, e.g. ``"host_a1b2c3"``.
+        :param affected_conversation_count: Conversations in the reconnect
+            batch bound to *host_id*, e.g. ``2``.
+        :returns: ``{"status": "reset_after_delete", ...}`` carrying the
+            reset fan-out result, or
+            ``{"status": "host_deleted_no_known_revision", ...}`` when no
+            usable revision was recorded and nothing was sent.
+        """
+        _logger.warning(
+            "CLI retention: Host %s row is deleted with %d affected conversation(s); "
+            "returning retained CLIs to legacy TTL",
+            host_id,
+            affected_conversation_count,
+        )
+        revision = self.known_policy_revision(host_id)
+        if revision is None:
+            _logger.warning(
+                "CLI retention: Host %s has no known policy revision; "
+                "skipping runner reset for %d affected conversation(s)",
+                host_id,
+                affected_conversation_count,
+            )
+            return {
+                "status": "host_deleted_no_known_revision",
+                "host_id": host_id,
+                "affected_conversation_count": affected_conversation_count,
+            }
+        async with self.lock_for_host(host_id):
+            result = await self.reset_host_under_lease(
+                host_id,
+                policy_revision=revision,
+                lease=None,
+            )
+        _logger.info(
+            "CLI retention: deleted Host %s reset %d session(s), %d unavailable",
+            host_id,
+            result.get("reset_count", 0),
+            result.get("unavailable_count", 0),
+        )
+        return {"status": "reset_after_delete", "host_id": host_id, **result}
+
     async def _host_conversations(
         self,
         host_id: str,
