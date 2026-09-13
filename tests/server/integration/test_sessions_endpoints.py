@@ -6010,17 +6010,15 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         sessions_module._session_status_cache.pop(sid, None)
 
     assert resp.status_code == 200, resp.text
-    assert runner_client.posts == [
-        {
-            "url": "/v1/sessions",
-            "json": {
-                "session_id": sid,
-                "agent_id": agent["id"],
-                "sub_agent_name": None,
-            },
-            "timeout": 10.0,
-        }
-    ]
+    assert len(runner_client.posts) == 1
+    post = runner_client.posts[0]
+    assert post["url"] == "/v1/sessions"
+    assert post["timeout"] == 10.0
+    assert post["json"]["session_id"] == sid
+    assert post["json"]["agent_id"] == agent["id"]
+    assert post["json"]["sub_agent_name"] is None
+    assert post["json"]["session_init"]["session_id"] == sid
+    assert post["json"]["session_init"]["agent_id"] == agent["id"]
     assert [event["status"] for event in published] == ["failed", "idle"]
     assert cache_after == "idle"
 

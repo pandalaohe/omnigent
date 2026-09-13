@@ -163,6 +163,53 @@ async def test_session_create_passes_resolved_flag(
     assert snapshot["project_assignments_enabled"] is enabled
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False], ids=["flag-on", "flag-off"])
+async def test_session_rebind_sends_envelope_with_resolved_flag(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """The rebind notify carries the envelope so the runner keeps its tools."""
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    if agent_store.get(AGENT_ID) is None:
+        agent_store.create(
+            agent_id=AGENT_ID, name="test-agent", bundle_location=f"{AGENT_ID}/bundle"
+        )
+    app = _build_app(db_uri, tmp_path, enabled=enabled)
+    recording = _RecordingRunnerClient()
+
+    async def _fake_runner_client(*_args: Any, **_kwargs: Any) -> Any:
+        return recording
+
+    def _accept_runner_id(_router: Any, raw_runner_id: str, **_kwargs: Any) -> str:
+        return raw_runner_id.strip()
+
+    async def _noop_relay(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _noop_recovered(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_routes, "_get_runner_client", _fake_runner_client)
+    monkeypatch.setattr(sessions_routes, "_registered_runner_id", _accept_runner_id)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_relay)
+    monkeypatch.setattr(sessions_routes, "_publish_runner_recovered_status", _noop_recovered)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/v1/sessions", json={"agent_id": AGENT_ID})
+        assert resp.status_code == 201, resp.text
+        session_id = str(resp.json()["id"])
+        recording.bodies.clear()
+        patched = await client.patch(
+            f"/v1/sessions/{session_id}", json={"runner_id": "runner-rebind-1"}
+        )
+    assert patched.status_code == 200, patched.text
+    assert len(recording.bodies) == 1
+    snapshot = recording.bodies[0]["session_init"]["snapshot"]
+    assert snapshot["project_assignments_enabled"] is enabled
+
+
 class _NoopConversationStore:
     def get_conversation(self, _conversation_id: str) -> None:
         return None
