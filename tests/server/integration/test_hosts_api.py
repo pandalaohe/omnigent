@@ -2177,9 +2177,11 @@ async def test_host_cli_retention_reset_heartbeat_cancel_runs_best_effort_cleanu
         calls += 1
         if calls <= 2:
             return await original_ensure_owned(self)
-        # Mirror _renew_host_claim: mark the lease lost, then cancel the
-        # owner task — the fan-out sees CancelledError, not LeaseLost.
+        # Mirror _renew_host_claim: mark the lease lost, set the heartbeat's
+        # dedicated signal, then cancel the owner task — the fan-out sees
+        # CancelledError, not LeaseLost.
         self.lost.set()
+        self.heartbeat_cancelled.set()
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(CliRetentionHostLease, "ensure_owned", _heartbeat_cancel)
@@ -2337,3 +2339,57 @@ async def test_host_cli_retention_reset_real_heartbeat_cancel_absorbs_and_cleans
     # count: without it this task would still report cancelling() == 1 here.
     assert asyncio.current_task() is not None
     assert asyncio.current_task().cancelling() == 0  # type: ignore[union-attr]
+
+
+async def test_host_cli_retention_reset_external_cancel_after_lease_loss_propagates(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An external cancel after an ensure_owned loss must NOT be absorbed.
+
+    ``lease.lost`` is set by both the heartbeat and ``ensure_owned``, so a
+    fan-out child that observes lease loss via ``ensure_owned`` must not
+    cause a LATER external ``Task.cancel()`` to be mistaken for the
+    heartbeat's own owner cancel. Only the heartbeat's dedicated signal
+    absorbs; anything else keeps propagating.
+    """
+    from omnigent.server.cli_retention import CliRetentionHostLease
+
+    app, registry, host_store, conv_store = host_api_app
+    _comm = await _connect_host(app, registry)
+    await _put_cli_retention_policy_v1(app)
+
+    conv = await asyncio.to_thread(conv_store.create_conversation)
+    await asyncio.to_thread(conv_store.set_host_id, conv.id, _HOST_ID, "/tmp/ws")
+    await asyncio.to_thread(conv_store.set_runner_id, conv.id, "runner-1")
+
+    posts: list = []
+    coordinator = _heartbeat_cancel_coordinator(host_store, conv_store, posts)
+    reset_app = _reset_app_for_coordinator(registry, host_store, conv_store, coordinator)
+
+    calls = 0
+    original_ensure_owned = CliRetentionHostLease.ensure_owned
+
+    async def _external_cancel_after_loss(self):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return await original_ensure_owned(self)
+        # A fan-out child already observed lease loss via ensure_owned
+        # (which sets lost); now an EXTERNAL cancel lands here.
+        self.lost.set()
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(CliRetentionHostLease, "ensure_owned", _external_cancel_after_loss)
+    with pytest.raises(asyncio.CancelledError):
+        async with AsyncClient(
+            transport=ASGITransport(app=reset_app), base_url="http://test"
+        ) as client:
+            await client.request(
+                "DELETE",
+                f"/v1/hosts/{_HOST_ID}/cli-retention",
+                json={"expected_revision": 1},
+            )
+
+    # No best-effort pass ran: nothing was posted.
+    assert posts == []

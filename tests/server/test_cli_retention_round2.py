@@ -141,8 +141,18 @@ async def test_stale_reset_cancels_only_its_own_revision(db_uri: str) -> None:
     }
 
 
-def _orphan_coordinator(posts: list, current: SimpleNamespace | None) -> CliRetentionCoordinator:
+def _orphan_coordinator(
+    posts: list,
+    current: SimpleNamespace | None,
+    *,
+    host_rows: dict[str, SimpleNamespace | None] | None = None,
+) -> CliRetentionCoordinator:
     """Coordinator whose host enumeration is empty but whose re-read hits."""
+
+    class _HostStore:
+        def get_host(self, host_id: str) -> SimpleNamespace | None:
+            assert host_rows is not None
+            return host_rows.get(host_id)
 
     class _ConversationStore:
         def list_conversations(self, **kwargs: object) -> PagedList:
@@ -156,7 +166,7 @@ def _orphan_coordinator(posts: list, current: SimpleNamespace | None) -> CliRete
             return current
 
     coordinator = CliRetentionCoordinator(
-        host_store=SimpleNamespace(),
+        host_store=_HostStore(),
         conversation_store=_ConversationStore(),
         runner_router=_OkRouter(posts),
     )
@@ -190,10 +200,14 @@ async def test_release_after_delete_resets_orphaned_conversations() -> None:
 
 @pytest.mark.asyncio
 async def test_release_after_delete_skips_rotated_conversations() -> None:
-    """A conversation rebound to a live host is owned by that host's policy."""
+    """A conversation rebound to a policy-live host is owned by that host's policy."""
     posts: list = []
     rebound = _conv("sess-1", host_id="host-new")
-    coordinator = _orphan_coordinator(posts, rebound)
+    coordinator = _orphan_coordinator(
+        posts,
+        rebound,
+        host_rows={"host-new": SimpleNamespace(cli_retention_policy=SimpleNamespace(version=1))},
+    )
     stale_view = _conv("sess-1", host_id="host-gone")
 
     result = await coordinator.release_host_after_delete("host-gone", conversations=[stale_view])
@@ -205,18 +219,30 @@ async def test_release_after_delete_skips_rotated_conversations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_release_after_delete_drops_vanished_conversations() -> None:
-    """A conversation gone entirely has nothing to reset."""
+async def test_release_after_delete_resets_vanished_conversations_from_snapshot() -> None:
+    """A conversation gone from the store is still reset from the snapshot.
+
+    Round 3: the row's absence does not prove its runtime is gone (a session
+    delete still removes the row when runner-side cleanup failed), so the
+    snapshot's id/runner_id drives the reset instead of a silent drop.
+    """
     posts: list = []
-    coordinator = _orphan_coordinator(posts, None)
+    coordinator = _orphan_coordinator(posts, None, host_rows={})
     stale_view = _conv("sess-1", host_id="host-gone")
 
     result = await coordinator.release_host_after_delete("host-gone", conversations=[stale_view])
 
     assert result["status"] == "reset_after_delete"
-    assert result["reset_count"] == 0
+    assert result["reset_count"] == 1
     assert result["rotated_count"] == 0
-    assert posts == []
+    assert result["vanished_count"] == 1
+    assert result["vanished"] == ["sess-1"]
+    assert posts == [
+        (
+            "/v1/sessions/sess-1/cli-retention/reset",
+            {"host_id": "host-gone", "policy_revision": 7},
+        )
+    ]
 
 
 def test_reconnect_classifier_is_removed_but_routing_survives() -> None:

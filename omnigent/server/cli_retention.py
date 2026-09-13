@@ -10,7 +10,7 @@ import secrets
 import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from omnigent.db.db_models import current_workspace_id
@@ -56,6 +56,11 @@ class CliRetentionHostLease:
     host_id: str
     token: str
     lost: asyncio.Event
+    # Set ONLY by the lease heartbeat immediately before it cancels the
+    # owner task. ``lost`` is too broad for that decision: ``ensure_owned``
+    # also sets it, so keying cancellation-absorption on ``lost`` would let
+    # one fan-out child's lease loss swallow a later external Task.cancel().
+    heartbeat_cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def ensure_owned(self) -> None:
         """Renew immediately and fail before issuing another external command."""
@@ -276,6 +281,7 @@ class CliRetentionCoordinator:
                 continue
             if not renewed:
                 lease.lost.set()
+                lease.heartbeat_cancelled.set()
                 owner_task.cancel()
                 return
 
@@ -474,14 +480,18 @@ class CliRetentionCoordinator:
         skip as success. The caller therefore passes its reconnect-batch
         conversations and each is re-read by id: genuinely orphaned rows
         (``host_id`` NULL) are reset, rows rebound to another host by a
-        rotation belong to that host's live policy and are only counted,
-        and vanished rows are dropped.
+        rotation are only counted as rotated when that host's row exists
+        and carries a live policy (a policy-less or missing new host
+        leaves the session stranded, so it is reset and counted under
+        ``stranded``), and vanished rows are reset from the caller's
+        snapshot and counted under ``vanished``.
 
         :param host_id: Deleted Host identifier, e.g. ``"host_a1b2c3"``.
         :param conversations: Reconnect-batch conversations bound to
             *host_id* before the delete.
         :returns: ``{"status": "reset_after_delete", ...}`` carrying the
-            reset fan-out result plus ``rotated_count``, or
+            reset fan-out result plus ``rotated_count``, ``stranded_count``,
+            and ``vanished_count``, or
             ``{"status": "host_deleted_no_known_revision", ...}`` when no
             usable revision was recorded and nothing was sent.
         """
@@ -507,18 +517,43 @@ class CliRetentionCoordinator:
             }
         orphaned: list[Any] = []
         rotated: list[str] = []
+        stranded: list[str] = []
+        vanished: list[str] = []
+        host_cache: dict[str, Any | None] = {}
         for conversation in conversations:
             current = await asyncio.to_thread(
                 self._conversation_store.get_conversation,
                 conversation.id,
             )
             if current is None:
+                # The row was deleted between the reconnect snapshot and the
+                # re-read (a session delete still removes the row when its
+                # runner-side cleanup failed). The snapshot still carries id
+                # and runner_id — everything the reset fan-out needs — so
+                # reset from it: a dead runner answers 404 and lands in the
+                # failed/unavailable accounting honestly.
+                orphaned.append(conversation)
+                vanished.append(conversation.id)
                 continue
             current_host_id = getattr(current, "host_id", None)
             if current_host_id is not None and current_host_id != host_id:
-                # Rotation repointed this session at a live host whose own
-                # policy governs it now; resetting it here would fight that.
-                rotated.append(current.id)
+                if current_host_id not in host_cache:
+                    host_cache[current_host_id] = await asyncio.to_thread(
+                        self._host_store.get_host,
+                        current_host_id,
+                    )
+                new_host = host_cache[current_host_id]
+                if new_host is not None and new_host.cli_retention_policy is not None:
+                    # Rotation repointed this session at a live host whose own
+                    # policy governs it now; resetting it here would fight that.
+                    rotated.append(current.id)
+                    continue
+                # _rotate_host_id copies cli_retention_policy verbatim, so a
+                # None policy — or a missing new-host row — leaves no live
+                # policy to govern this session. It is stranded exactly like
+                # an orphan: reset it rather than skip it as rotated.
+                orphaned.append(current)
+                stranded.append(current.id)
             else:
                 orphaned.append(current)
         async with self.lock_for_host(host_id):
@@ -540,6 +575,10 @@ class CliRetentionCoordinator:
             **result,
             "rotated": rotated[:_RESET_ID_SAMPLE_CAP],
             "rotated_count": len(rotated),
+            "stranded": stranded[:_RESET_ID_SAMPLE_CAP],
+            "stranded_count": len(stranded),
+            "vanished": vanished[:_RESET_ID_SAMPLE_CAP],
+            "vanished_count": len(vanished),
         }
 
     async def _host_conversations(

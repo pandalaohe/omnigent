@@ -1091,16 +1091,21 @@ def create_hosts_router(
                             )
                             await _reset_without_lease()
                         except asyncio.CancelledError:
-                            if not lease.lost.is_set():
+                            if not lease.heartbeat_cancelled.is_set():
                                 # An ordinary shutdown cancellation, not a
                                 # lease loss: it must keep propagating.
                                 raise
-                            # lease.lost set means the cancel is from our own
-                            # _renew_host_claim (lost.set() then owner cancel),
-                            # not a shutdown. The awaits below run either way;
-                            # uncancel so this task does not return with
-                            # cancelling() > 0 for an enclosing timeout,
-                            # TaskGroup, or the ASGI server to treat as cancelled.
+                            # heartbeat_cancelled set means the cancel is from
+                            # our own _renew_host_claim (heartbeat sets it
+                            # immediately before the owner cancel), not a
+                            # shutdown. Keys on heartbeat_cancelled — NOT on
+                            # lost, which ensure_owned also sets: a fan-out
+                            # child's lease loss must never absorb a later
+                            # external Task.cancel(). The awaits below run
+                            # either way; uncancel so this task does not
+                            # return with cancelling() > 0 for an enclosing
+                            # timeout, TaskGroup, or the ASGI server to treat
+                            # as cancelled.
                             task = asyncio.current_task()
                             if task is not None:
                                 task.uncancel()
