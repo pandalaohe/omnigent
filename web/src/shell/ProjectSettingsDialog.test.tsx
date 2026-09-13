@@ -3,20 +3,34 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
-import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import {
+  getProject,
+  getProjectCollaboration,
+  updateProjectConfig,
+  createProject,
+} from "@/lib/projectsApi";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
+  getProjectCollaboration: vi.fn(),
+  setProjectCollaborationEnabled: vi.fn(),
+  putProjectRepository: vi.fn(),
+  deleteProjectRepository: vi.fn(),
+  putProjectHostBinding: vi.fn(),
+  deleteProjectHostBinding: vi.fn(),
+  verifyProjectHostBinding: vi.fn(),
   updateProjectConfig: vi.fn(),
   createProject: vi.fn(),
 }));
 // Hoisted so the vi.mock factory below can reference it; per-test overrides
 // let cases control the agent catalog (the default is set in beforeEach).
-const { availableAgentsMock, hostModelOptionsMock, workspacePickerPropsMock } = vi.hoisted(() => ({
-  availableAgentsMock: vi.fn(),
-  hostModelOptionsMock: vi.fn(),
-  workspacePickerPropsMock: vi.fn(),
-}));
+const { availableAgentsMock, hostModelOptionsMock, serverInfoMock, workspacePickerPropsMock } =
+  vi.hoisted(() => ({
+    availableAgentsMock: vi.fn(),
+    hostModelOptionsMock: vi.fn(),
+    serverInfoMock: vi.fn(),
+    workspacePickerPropsMock: vi.fn(),
+  }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({
     data: [
@@ -49,7 +63,7 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
   };
 }
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ managed_sandboxes_enabled: false, sandbox_provider: null }),
+  useServerInfo: serverInfoMock,
 }));
 // The filesystem browser owns its own data-fetching; stub it to a marker plus
 // a button that reports a navigated path, so we can drive the disclosure and
@@ -69,6 +83,7 @@ vi.mock("./WorkspacePicker", () => ({
 }));
 
 const getProjectMock = vi.mocked(getProject);
+const getCollaborationMock = vi.mocked(getProjectCollaboration);
 const updateMock = vi.mocked(updateProjectConfig);
 const createMock = vi.mocked(createProject);
 
@@ -83,13 +98,20 @@ function renderDialog(projectId: string | null = "p_1") {
 
 beforeEach(() => {
   getProjectMock.mockReset();
+  getCollaborationMock.mockReset();
   updateMock.mockReset();
   createMock.mockReset();
   availableAgentsMock.mockReset();
   hostModelOptionsMock.mockReset();
+  serverInfoMock.mockReset();
   workspacePickerPropsMock.mockReset();
   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
   hostModelOptionsMock.mockReturnValue({ data: [] });
+  serverInfoMock.mockReturnValue({
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    features: {},
+  });
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 
@@ -350,5 +372,46 @@ describe("ProjectSettingsDialog", () => {
         ([opts]) => (opts as { pinnedAgentIds?: string[] } | undefined)?.pinnedAgentIds != null,
       ),
     ).toBe(true);
+  });
+
+  it("hides the collaboration section when the project_assignments feature is off", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    expect(screen.queryByTestId("project-collaboration-section")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("project-collaboration-enabled")).not.toBeInTheDocument();
+    expect(getCollaborationMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the collaboration section when the project_assignments feature is on", async () => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: false,
+      sandbox_provider: null,
+      features: { project_assignments: true },
+    });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    getCollaborationMock.mockResolvedValue({
+      enabled: false,
+      revision: 1,
+      repositories: [],
+      bindings: [],
+      problems: [],
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    expect(screen.getByTestId("project-collaboration-section")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-enabled")).toBeInTheDocument(),
+    );
   });
 });

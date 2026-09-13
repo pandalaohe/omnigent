@@ -23,6 +23,7 @@ class Feature(StrEnum):
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
+    PROJECT_ASSIGNMENTS = "project_assignments"
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PROJECT_ASSIGNMENTS,
+        description="Cross-host project collaboration: host bindings and durable assignments",
+        owner="server",
+        review_by_release="0.16.0",
     ),
 )
 

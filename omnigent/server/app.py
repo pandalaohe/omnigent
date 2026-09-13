@@ -84,6 +84,7 @@ from omnigent.server.performance_metrics import (
 )
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
+from omnigent.server.routes.assignments import create_assignments_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.custom_agents import create_custom_agents_router
@@ -94,6 +95,9 @@ from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.project_collaboration import (
+    create_project_collaboration_router,
+)
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
@@ -134,11 +138,14 @@ from omnigent.stores import (
     ConversationStore,
     FileStore,
 )
+from omnigent.stores.assignment_store import AssignmentStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
+from omnigent.stores.project_repository_store import ProjectRepositoryStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -1127,6 +1134,9 @@ def create_app(
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
     project_store: ProjectStore | None = None,
+    project_repository_store: ProjectRepositoryStore | None = None,
+    project_host_binding_store: ProjectHostBindingStore | None = None,
+    assignment_store: AssignmentStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1183,6 +1193,15 @@ def create_app(
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
+    :param project_repository_store: Store for a project's registered
+        repositories. Mounts the collaboration router only together with
+        ``project_store`` and ``project_host_binding_store``.
+    :param project_host_binding_store: Store for a project's per-host
+        directory bindings. Mounts the collaboration router only together
+        with ``project_store`` and ``project_repository_store``.
+    :param assignment_store: Store for assignments, attempts and messages.
+        Mounts the assignments router only together with ``project_store``,
+        ``project_repository_store`` and ``conversation_store``.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -1368,6 +1387,7 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        project_assignments_enabled=resolved_feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS),
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1443,6 +1463,38 @@ def create_app(
 
         set_runner_router(runner_router)
         await archive_close_coordinator.start()
+
+        from omnigent.server.feature_flags import Feature
+
+        assignment_coordinator = None
+        if (
+            resolved_feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS)
+            and assignment_store is not None
+            and project_store is not None
+            and project_repository_store is not None
+            and project_host_binding_store is not None
+            and host_store is not None
+        ):
+            from omnigent.server.assignments import AssignmentCoordinator
+
+            assignment_coordinator = AssignmentCoordinator(
+                assignment_store=assignment_store,
+                project_store=project_store,
+                repository_store=project_repository_store,
+                binding_store=project_host_binding_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                runner_router=runner_router,
+                tunnel_registry=tunnel_registry,
+                runner_exit_reports=runner_exit_reports,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                runner_session_initializer=runner_session_initializer,
+            )
+            await assignment_coordinator.start()
+        app_inst.state.assignment_coordinator = assignment_coordinator
 
         # Wake a blocked sub-agent's immediate parent: hooks
         # ``pending_elicitations.record_publish`` to post a ``[System: …]``
@@ -1622,6 +1674,8 @@ def create_app(
             if cli_retention_coordinator is not None:
                 await cli_retention_coordinator.shutdown()
             await archive_close_coordinator.shutdown()
+            if assignment_coordinator is not None:
+                await assignment_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
@@ -1648,6 +1702,7 @@ def create_app(
     app.state.runner_router = runner_router
     app.state.cli_retention_coordinator = cli_retention_coordinator
     app.state.archive_close_coordinator = archive_close_coordinator
+    app.state.assignment_coordinator = None
     app.state.cli_release_intent_store = cli_release_intent_store
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
@@ -3151,6 +3206,55 @@ def create_app(
             prefix="/v1",
             tags=["projects"],
         )
+    # Cross-host collaboration configuration (enable switch, registered
+    # repositories, per-host bindings). Mounted only when the project store
+    # and both config stores are wired; each handler additionally gates on
+    # Feature.PROJECT_ASSIGNMENTS so the surface stays dark until opted in.
+    if (
+        project_store is not None
+        and project_repository_store is not None
+        and project_host_binding_store is not None
+    ):
+        app.include_router(
+            create_project_collaboration_router(
+                project_store,
+                project_repository_store,
+                project_host_binding_store,
+                auth_provider=auth_provider,
+                host_store=host_store,
+                host_registry=host_registry,
+                feature_flags=resolved_feature_flags,
+            ),
+            prefix="/v1",
+            tags=["projects"],
+        )
+
+    # Assignment dispatch and lifecycle. Mounted only when the assignment
+    # store, the project store, the repository store and the conversation
+    # store are wired; creation and refresh additionally gate on
+    # Feature.PROJECT_ASSIGNMENTS, while every other route stays served so
+    # in-flight work can finish after the switch goes off.
+    if (
+        assignment_store is not None
+        and project_store is not None
+        and project_repository_store is not None
+        and conversation_store is not None
+    ):
+        app.include_router(
+            create_assignments_router(
+                assignment_store,
+                project_store,
+                project_repository_store,
+                conversation_store=conversation_store,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                auth_provider=auth_provider,
+                host_store=host_store,
+                feature_flags=resolved_feature_flags,
+            ),
+            prefix="/v1",
+            tags=["assignments"],
+        )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
 
@@ -3532,6 +3636,9 @@ def create_app(
             if cli_retention_coordinator is not None:
                 cli_retention_coordinator.trigger(_host_id)
             archive_close_coordinator.trigger_pending(host_id=_host_id)
+            coordinator = getattr(app.state, "assignment_coordinator", None)
+            if coordinator is not None and host_registry.get(_host_id) is not None:
+                coordinator.trigger_host(_host_id)
 
         app.include_router(
             create_host_tunnel_router(

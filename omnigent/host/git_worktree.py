@@ -12,6 +12,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, overload
 
 # fetch/add can be slow on large repos; bound it so git can't hang the
 # host's tunnel loop.
@@ -91,11 +92,21 @@ def _sanitize_dirname(branch_name: str) -> str:
     return branch_name.strip("/").replace("/", "-")
 
 
+@overload
+def _run_git(
+    args: list[str], *, cwd: str, timeout: float = ..., text: Literal[True] = ...
+) -> subprocess.CompletedProcess[str]: ...
+@overload
+def _run_git(
+    args: list[str], *, cwd: str, timeout: float = ..., text: Literal[False]
+) -> subprocess.CompletedProcess[bytes]: ...
 def _run_git(
     args: list[str],
     *,
     cwd: str,
-) -> subprocess.CompletedProcess[str]:
+    timeout: float = _GIT_TIMEOUT_S,
+    text: bool = True,
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Run a git command, returning the completed process.
 
     :param args: Git argv *after* ``git``, e.g.
@@ -103,23 +114,29 @@ def _run_git(
         shell parsing occurs.
     :param cwd: Working directory to run git in, e.g.
         ``"/Users/alice/myrepo"``.
-    :returns: The completed process with captured text stdout/stderr.
+    :param timeout: Seconds before the command is killed, e.g.
+        ``240.0`` for a fetch that pulls an unbounded object count.
+        Defaults to :data:`_GIT_TIMEOUT_S`.
+    :param text: When ``True`` (default) stdout/stderr are decoded text;
+        pass ``False`` for raw bytes (e.g. hashing a blob byte-for-byte,
+        where decoding would normalise newlines).
+    :returns: The completed process with captured stdout/stderr.
     :raises WorktreeError: If git is not installed, or the command
-        exceeds :data:`_GIT_TIMEOUT_S`.
+        exceeds ``timeout``.
     """
     try:
         return subprocess.run(
             ["git", *args],
             cwd=cwd,
             capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
+            text=text,
+            timeout=timeout,
             check=False,
         )
     except FileNotFoundError as exc:
         raise WorktreeError("git is not installed on the host") from exc
     except subprocess.TimeoutExpired as exc:
-        raise WorktreeError(f"git command timed out after {_GIT_TIMEOUT_S:.0f}s") from exc
+        raise WorktreeError(f"git command timed out after {timeout:.0f}s") from exc
 
 
 def _git_error(label: str, result: subprocess.CompletedProcess[str]) -> WorktreeError:

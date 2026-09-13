@@ -288,6 +288,15 @@ _TAGS: list[dict[str, str]] = [
         ),
     },
     {
+        "name": "assignments",
+        "x-displayName": "Assignments",
+        "description": (
+            "Durable cross-host units of work handed to a named "
+            "(host, agent) destination — dispatch, publish, message, "
+            "cancel, retry, and runner-bound completion."
+        ),
+    },
+    {
         "name": "system",
         "x-displayName": "System",
         "description": "Health, version, and identity endpoints for the running server.",
@@ -338,6 +347,7 @@ def _build_app_with_stub_stores() -> Any:
     from omnigent.server.app import create_app
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignmentStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
@@ -345,6 +355,12 @@ def _build_app_with_stub_stores() -> Any:
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
+        SqlAlchemyProjectHostBindingStore,
+    )
+    from omnigent.stores.project_repository_store.sqlalchemy_store import (
+        SqlAlchemyProjectRepositoryStore,
+    )
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
     # On-disk SQLite (mkdtemp ensures uniqueness so concurrent
@@ -367,6 +383,9 @@ def _build_app_with_stub_stores() -> Any:
         host_store=HostStore(db_uri),
         policy_store=SqlAlchemyPolicyStore(db_uri),
         project_store=SqlAlchemyProjectStore(db_uri),
+        project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),
+        project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
+        assignment_store=SqlAlchemyAssignmentStore(db_uri),
     )
 
 

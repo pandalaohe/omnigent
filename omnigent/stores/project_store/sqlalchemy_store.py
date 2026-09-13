@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import asc, select
+from sqlalchemy import asc, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlProject, current_workspace_id
@@ -80,6 +81,8 @@ def _to_entity(row: SqlProject) -> Project:
         created_at=row.created_at,
         updated_at=row.updated_at,
         config=_decode_config(row.config),
+        collaboration_enabled=row.collaboration_enabled,
+        collaboration_revision=row.collaboration_revision,
     )
 
 
@@ -257,3 +260,55 @@ class SqlAlchemyProjectStore(ProjectStore):
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project", write)
+
+    def set_collaboration(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        enabled: bool,
+        expected_revision: int,
+    ) -> Project | None:
+        """Enable or disable collaboration, bumping ``collaboration_revision``.
+
+        A single conditional UPDATE applies the switch and the bump only
+        when the stored revision still equals ``expected_revision``, so two
+        concurrent writers cannot both believe they moved the same revision
+        — the loser sees zero matched rows and gets ``CONFLICT``.
+        """
+
+        def write(session: Session) -> Project | None:
+            wid = current_workspace_id()
+            # A DML execute returns a CursorResult at runtime; a zero
+            # rowcount means the revision moved (or the row is gone).
+            result = cast(
+                "CursorResult[Any]",
+                session.execute(
+                    update(SqlProject)
+                    .where(
+                        SqlProject.workspace_id == wid,
+                        SqlProject.id == project_id,
+                        SqlProject.user_id == user_id,
+                        SqlProject.collaboration_revision == expected_revision,
+                    )
+                    .values(
+                        collaboration_enabled=enabled,
+                        collaboration_revision=expected_revision + 1,
+                        updated_at=now_epoch(),
+                    )
+                ),
+            )
+            if result.rowcount:
+                session.flush()
+                row = session.get(SqlProject, (wid, project_id))
+                return _to_entity(row) if row is not None else None
+            row = session.get(SqlProject, (wid, project_id))
+            if row is None or row.user_id != user_id:
+                return None
+            raise OmnigentError(
+                f"project {project_id} collaboration_revision is "
+                f"{row.collaboration_revision}, expected {expected_revision}",
+                code=ErrorCode.CONFLICT,
+            )
+
+        return run_write_transaction(self._session_immediate, "set_collaboration", write)

@@ -71,6 +71,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
 )
 from omnigent.server.bundles import validate_agent_bundle
+from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -504,6 +505,34 @@ def register_core_routes(
             )
         return runner_id, launch_failed
 
+    def _session_init_notify_body(conv: Conversation, request: Request) -> dict[str, Any]:
+        # Envelope-less bodies reset the runner's flag cache to absent.
+        init_body: dict[str, Any] = {
+            "session_id": conv.id,
+            "agent_id": conv.agent_id,
+            "sub_agent_name": conv.sub_agent_name,
+        }
+        if conv.agent_id is not None:
+            try:
+                init_body = build_runner_session_init_payload(
+                    conv,
+                    server_version=VERSION,
+                    project_assignments_enabled=request.app.state.feature_flags.enabled(
+                        Feature.PROJECT_ASSIGNMENTS
+                    ),
+                )
+            except Exception:
+                # Must not fail the request; the fallback drops the seeded
+                # model override. Broad on purpose: ValidationError is not
+                # a ValueError.
+                _logger.warning(
+                    "session-init envelope build failed for %s; falling back to the "
+                    "id-only body (a model-pinned first turn may respawn)",
+                    conv.id,
+                    exc_info=True,
+                )
+        return init_body
+
     @router.post(
         "/sessions",
         status_code=201,
@@ -631,33 +660,9 @@ def register_core_routes(
             _publish_terminal_pending(resp.id, True)
         _rc = await _get_runner_client(resp.id, runner_router)
         if _rc is not None and conv is not None:
-            # Send the full session-init envelope (not the legacy id-only body)
-            # so the runner seeds the first spawn from current session state —
-            # notably the persisted /model override — rather than relying on a
-            # best-effort reverse GET whose failure would silently reintroduce
-            # the first-turn respawn. Older runners ignore the extra
-            # ``session_init`` key and still read the top-level id fields.
-            # A session not yet bound to an agent keeps the id-only body: the
-            # envelope builder requires an agent_id.
-            init_body: dict[str, Any] = {
-                "session_id": resp.id,
-                "agent_id": conv.agent_id,
-                "sub_agent_name": conv.sub_agent_name,
-            }
-            if conv.agent_id is not None:
-                try:
-                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
-                except Exception:
-                    # Must not fail the create, but the degradation loses the
-                    # seeded override — surface it instead of silently
-                    # downgrading (a bare ValueError catch would swallow a
-                    # pydantic ValidationError here).
-                    _logger.warning(
-                        "session-init envelope build failed for %s; falling back to the "
-                        "id-only body (a model-pinned first turn may respawn)",
-                        resp.id,
-                        exc_info=True,
-                    )
+            # Full envelope so the runner seeds the first spawn from
+            # current session state; older runners ignore the extra key.
+            init_body = _session_init_notify_body(conv, request)
             try:
                 await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
             except (httpx.HTTPError, ConnectionError):
@@ -2342,22 +2347,16 @@ def register_core_routes(
                     session_id,
                     runner_router,
                 )
-                # Notify the runner about the session so it can
-                # resolve the spec and cache it before the first turn.
-                # This is the design doc's "Server POST /v1/sessions
-                # (to runner)" step from §7 Flow: session creation.
+                # Same envelope as create so a rebind keeps the flag cache.
                 conv = conversation_store.get_conversation(
                     session_id,
                 )
                 if _runner_client is not None and conv is not None:
+                    init_body = _session_init_notify_body(conv, request)
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
-                            json={
-                                "session_id": session_id,
-                                "agent_id": conv.agent_id,
-                                "sub_agent_name": conv.sub_agent_name,
-                            },
+                            json=init_body,
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:

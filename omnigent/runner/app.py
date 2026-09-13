@@ -1120,11 +1120,14 @@ class _CommentRelayBinding:
         the spec could not be resolved and the fallback surface was used.
     :param bridge_dir: Directory the relay wrote ``tool_relay.json`` into,
         e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
+    :param project_assignments_enabled: Flag the surface was built with; a
+        flip rebuilds the relay like an agent switch does.
     """
 
     relay: ClaudeNativeToolRelay
     spec_entry: _SpecEntry | None
     bridge_dir: Path
+    project_assignments_enabled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2837,6 +2840,9 @@ def create_runner_app(
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
     # effort only from the forwarded turn body, which is built field by field.
     _session_reasoning_effort: dict[str, str] = {}
+    # session_id → project-assignments flag from the init snapshot. Kept
+    # beside the other snapshot dicts: the raw envelope cache is TTL'd.
+    _session_project_assignments_enabled: dict[str, bool] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -3592,8 +3598,10 @@ def create_runner_app(
             return Path(workspace.strip()).expanduser().resolve()
         return runner_workspace.resolve() if runner_workspace is not None else None
 
-    async def _load_legacy_session_init_context() -> _SessionInitContext:
+    async def _load_legacy_session_init_context(session_id: str) -> _SessionInitContext:
         await _get_server_version(server_client)
+        _session_project_assignments_enabled.pop(session_id, None)
+        _session_tool_schemas.pop(session_id, None)
         return _SessionInitContext(envelope=None)
 
     def _load_envelope_session_init_context(
@@ -3623,6 +3631,10 @@ def create_runner_app(
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
         if snapshot.reasoning_effort:
             _session_reasoning_effort[session_id] = snapshot.reasoning_effort
+        _session_project_assignments_enabled[session_id] = snapshot.project_assignments_enabled
+        # A re-init may flip the flag: drop the cached tool surface so the
+        # next turn rebuilds it with the new value.
+        _session_tool_schemas.pop(session_id, None)
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
         return _SessionInitContext(envelope=envelope)
 
@@ -3644,7 +3656,7 @@ def create_runner_app(
     ) -> _SessionInitContext:
         envelope = parse_runner_session_init_envelope(body)
         if envelope is None:
-            return await _load_legacy_session_init_context()
+            return await _load_legacy_session_init_context(session_id)
         body_sub_agent = body.get("sub_agent_name")
         if envelope.sub_agent_name != (
             body_sub_agent if isinstance(body_sub_agent, str) else None
@@ -3922,6 +3934,17 @@ def create_runner_app(
                 },
             )
 
+        # A relay started before this init (resource access precedes the
+        # handshake) read the previous flag; rebuild it in place on a flip.
+        _stale_relay = _session_comment_relays.get(session_id)
+        if _stale_relay is not None and (
+            _stale_relay.project_assignments_enabled
+            != _session_project_assignments_enabled.get(session_id, False)
+        ):
+            await _ensure_comment_relay_started(
+                session_id, explicit_bridge_dir=_stale_relay.bridge_dir
+            )
+
         # Stamp the session's Smart Routing class before anything reads it: the
         # spawn env is rebuilt on every harness respawn, long after this
         # envelope is gone, and on the codex family the class decides whether
@@ -4124,6 +4147,9 @@ def create_runner_app(
                 publish_event=_publish_event,
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
+                project_assignments_enabled=_session_project_assignments_enabled.get(
+                    session_id, False
+                ),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -4334,7 +4360,8 @@ def create_runner_app(
                 async def _start_claude_relay_early() -> None:
                     try:
                         await _ensure_comment_relay_started(
-                            session_id, session_labels=init_context.labels
+                            session_id,
+                            session_labels=init_context.labels,
                         )
                     except Exception:
                         _logger.exception(
@@ -4791,6 +4818,7 @@ def create_runner_app(
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
         _session_reasoning_effort.pop(session_id, None)
+        _session_project_assignments_enabled.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -7708,8 +7736,14 @@ def create_runner_app(
         # switch), which the spec comparison already caught. The callers that
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
+        flag_for_relay = _session_project_assignments_enabled.get(session_id, False)
         current = _session_comment_relays.get(session_id)
-        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and current.project_assignments_enabled == flag_for_relay
+            and known_bridge_dir is None
+        ):
             return
 
         bridge_dir = known_bridge_dir
@@ -7730,13 +7764,15 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
+            and current.project_assignments_enabled == flag_for_relay
         ):
             return
 
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
-            _unwrap_spec_entry(spec_entry)
+            _unwrap_spec_entry(spec_entry),
+            project_assignments_enabled=flag_for_relay,
         )
 
         _captured_session_id = session_id
@@ -7778,6 +7814,7 @@ def create_runner_app(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
+            project_assignments_enabled=flag_for_relay,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -8141,6 +8178,9 @@ def create_runner_app(
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
+                        project_assignments_enabled=_session_project_assignments_enabled.get(
+                            conv, False
+                        ),
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -8249,7 +8289,9 @@ def create_runner_app(
             codex_bdir = codex_bridge_dir_for_id(codex_bid or conv)
             write_mcp_bridge_config(codex_bdir)
             await _ensure_comment_relay_started(
-                conv, explicit_bridge_dir=codex_bdir, await_notify=False
+                conv,
+                explicit_bridge_dir=codex_bdir,
+                await_notify=False,
             )
         elif harness_name == "antigravity-native":
             from omnigent.harnesses.antigravity_native.bridge import (
@@ -8268,7 +8310,9 @@ def create_runner_app(
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
             write_mcp_bridge_config(antigravity_bdir)
             await _ensure_comment_relay_started(
-                conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
+                conv,
+                explicit_bridge_dir=antigravity_bdir,
+                await_notify=False,
             )
         elif harness_name == "hermes":
             from omnigent.harnesses.hermes_native.bridge import (
@@ -8433,6 +8477,9 @@ def create_runner_app(
                         publish_event=_publish_event,
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
+                        project_assignments_enabled=_session_project_assignments_enabled.get(
+                            conv_id, False
+                        ),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
                     resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
@@ -9991,6 +10038,9 @@ def create_runner_app(
                 publish_event=_publish_ensure_event,
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
+                project_assignments_enabled=_session_project_assignments_enabled.get(
+                    session_id, False
+                ),
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
@@ -10167,7 +10217,10 @@ def create_runner_app(
                 session_id=session_id,
             )
             relay_before = _session_comment_relays.get(session_id)
-            await _ensure_comment_relay_started(session_id, bridge_id=bridge_id)
+            await _ensure_comment_relay_started(
+                session_id,
+                bridge_id=bridge_id,
+            )
             relay_after = _session_comment_relays.get(session_id)
             if relay_after is not None and (
                 relay_before is None or relay_before.relay is not relay_after.relay

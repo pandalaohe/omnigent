@@ -4533,6 +4533,7 @@ async def _ensure_runner_session_initialized(
                 archive_states=archive_states,
             )
         else:
+            from omnigent.server.feature_flags import Feature, resolve_feature_flags
             from omnigent.version import VERSION
 
             resp = await runner_client.post(
@@ -4542,6 +4543,9 @@ async def _ensure_runner_session_initialized(
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
                     archive_states=archive_states,
+                    project_assignments_enabled=resolve_feature_flags().enabled(
+                        Feature.PROJECT_ASSIGNMENTS
+                    ),
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )

@@ -37,8 +37,9 @@ import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversatio
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { ProjectCollaborationSection } from "./ProjectCollaborationSection";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -116,6 +117,9 @@ export function ProjectSettingsDialog({
     pinnedAgentIds: stored?.agent_id != null ? [stored.agent_id] : [],
   });
   const info = useServerInfo();
+  // Collaboration config lives outside this form (its actions apply
+  // immediately, never through Save) and only for a first-class project.
+  const showCollaboration = projectId !== null && isFeatureEnabled(info, "project_assignments");
   // Sandbox is only a real default when the server can provision managed
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
   // can only fail on create.
@@ -318,7 +322,7 @@ export function ProjectSettingsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         onClick={(e) => e.stopPropagation()}
-        className="sm:max-w-lg"
+        className="max-h-[85vh] overflow-y-auto sm:max-w-lg"
         // Keep a nested dropdown's dismiss (pick an option, or click the modal
         // body while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.
@@ -604,6 +608,9 @@ export function ProjectSettingsDialog({
             </Button>
           </DialogFooter>
         </form>
+        {showCollaboration && projectId !== null && (
+          <ProjectCollaborationSection projectId={projectId} />
+        )}
       </DialogContent>
     </Dialog>
   );

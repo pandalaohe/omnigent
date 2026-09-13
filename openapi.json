@@ -198,6 +198,246 @@
         "title": "ArchivedSessionFacetsResponse",
         "type": "object"
       },
+      "AssignmentCreateRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/assignments`.",
+        "properties": {
+          "binding_name": {
+            "default": "primary",
+            "description": "Which binding of the destination host to run in.",
+            "title": "Binding Name",
+            "type": "string"
+          },
+          "execution_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which repository the workspace is prepared from; required with more than one repository, defaulted otherwise.",
+            "title": "Execution Root"
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-assignment harness override, or `None`.",
+            "title": "Harness Override"
+          },
+          "id": {
+            "description": "Caller-generated id, 32 lowercase hex, stable across retries.",
+            "title": "Id",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "Caller key; unique with `source_session_id`.",
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional structured extras.",
+            "title": "Metadata"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-assignment model override, or `None`.",
+            "title": "Model Override"
+          },
+          "repositories": {
+            "description": "The pinned input repositories, one entry each.",
+            "items": {
+              "$ref": "#/components/schemas/AssignmentRepositoryInput"
+            },
+            "minItems": 1,
+            "title": "Repositories",
+            "type": "array"
+          },
+          "requested_host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The named destination host, or `None`.",
+            "title": "Requested Host Id"
+          },
+          "source_session_id": {
+            "description": "The dispatching session; its project is the assignment's project and the caller needs owner access on it.",
+            "title": "Source Session Id",
+            "type": "string"
+          },
+          "start_deadline": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds bounding the wait, or `None`.",
+            "title": "Start Deadline"
+          },
+          "target_agent_id": {
+            "description": "The agent to launch on arrival.",
+            "title": "Target Agent Id",
+            "type": "string"
+          },
+          "task": {
+            "description": "The natural-language instruction blob.",
+            "minLength": 1,
+            "title": "Task",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "source_session_id",
+          "target_agent_id",
+          "task",
+          "repositories",
+          "idempotency_key"
+        ],
+        "title": "AssignmentCreateRequest",
+        "type": "object"
+      },
+      "AssignmentMessageRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/assignments/{id}/messages`.",
+        "properties": {
+          "body": {
+            "description": "Message text.",
+            "minLength": 1,
+            "title": "Body",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "Caller key for exactly-once append.",
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "sender_session_id": {
+            "description": "The sending session; the caller needs owner access on it.",
+            "title": "Sender Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sender_session_id",
+          "body",
+          "idempotency_key"
+        ],
+        "title": "AssignmentMessageRequest",
+        "type": "object"
+      },
+      "AssignmentOutputInput": {
+        "additionalProperties": false,
+        "description": "One advertised output repository.",
+        "properties": {
+          "artifact_paths": {
+            "description": "Repo-relative paths produced by the attempt.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Artifact Paths",
+            "type": "array"
+          },
+          "commit": {
+            "description": "The advertised output commit.",
+            "title": "Commit",
+            "type": "string"
+          },
+          "repository_name": {
+            "description": "A repository from the assignment's inputs.",
+            "title": "Repository Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_name",
+          "commit"
+        ],
+        "title": "AssignmentOutputInput",
+        "type": "object"
+      },
+      "AssignmentRepositoryInput": {
+        "additionalProperties": false,
+        "description": "One repository pinned into the dispatch snapshot.",
+        "properties": {
+          "artifact_paths": {
+            "description": "Repo-relative paths the receiver materialises.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Artifact Paths",
+            "type": "array"
+          },
+          "commit": {
+            "description": "The pinned input commit (40 or 64 lowercase hex).",
+            "title": "Commit",
+            "type": "string"
+          },
+          "context_manifest_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Repo-relative manifest path; defaults to the registration default when omitted.",
+            "title": "Context Manifest Path"
+          },
+          "manifest_digest": {
+            "description": "Hash of the context manifest at dispatch.",
+            "title": "Manifest Digest",
+            "type": "string"
+          },
+          "repository_name": {
+            "description": "A repository registered on the project.",
+            "title": "Repository Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_name",
+          "commit",
+          "manifest_digest"
+        ],
+        "title": "AssignmentRepositoryInput",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Request body for the current-agent automatic rename endpoint.",
@@ -326,6 +566,40 @@
           }
         },
         "title": "BackgroundTaskInfo",
+        "type": "object"
+      },
+      "BindingPutRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PUT /v1/projects/{project_id}/hosts/{host_id}/bindings/{name}`.",
+        "properties": {
+          "enabled": {
+            "default": true,
+            "description": "Whether the binding is eligible at claim time.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "is_primary": {
+            "default": false,
+            "description": "Whether this is the host's primary binding.",
+            "title": "Is Primary",
+            "type": "boolean"
+          },
+          "repository_name": {
+            "description": "Name of a repository registered on this project.",
+            "title": "Repository Name",
+            "type": "string"
+          },
+          "workspace": {
+            "description": "Absolute path on the host. Validated live via `host.stat`; the canonical path the host returns is stored.",
+            "title": "Workspace",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace",
+          "repository_name"
+        ],
+        "title": "BindingPutRequest",
         "type": "object"
       },
       "Body_update_session_agent_v1_sessions__session_id__agent_put": {
@@ -487,6 +761,26 @@
           "args"
         ],
         "title": "BrowserActionRequestEvent",
+        "type": "object"
+      },
+      "CancelRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/assignments/{id}/cancel`.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional human-readable reason, recorded on the state message.",
+            "title": "Reason"
+          }
+        },
+        "title": "CancelRequest",
         "type": "object"
       },
       "CancelledEvent": {
@@ -1071,6 +1365,17 @@
             "title": "Families",
             "type": "object"
           },
+          "incomplete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Incomplete"
+          },
           "lease": {
             "anyOf": [
               {
@@ -1082,6 +1387,33 @@
               }
             ],
             "title": "Lease"
+          },
+          "not_attempted": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Not Attempted"
+          },
+          "not_attempted_count": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Not Attempted Count"
           },
           "observed_at": {
             "anyOf": [
@@ -1147,6 +1479,19 @@
             ],
             "title": "Reset"
           },
+          "reset_count": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reset Count"
+          },
           "scheduled": {
             "anyOf": [
               {
@@ -1174,6 +1519,46 @@
               }
             ],
             "title": "Unavailable"
+          },
+          "unavailable_count": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailable Count"
+          },
+          "unbound_count": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unbound Count"
+          },
+          "unbound_sample": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unbound Sample"
           }
         },
         "required": [
@@ -1332,6 +1717,29 @@
           "goal"
         ],
         "title": "CodexGoalResponse",
+        "type": "object"
+      },
+      "CollaborationPatchRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PATCH /v1/projects/{project_id}/collaboration`.",
+        "properties": {
+          "enabled": {
+            "description": "The new collaboration switch value.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "expected_revision": {
+            "description": "The `collaboration_revision` the caller read; a mismatch means another writer moved first.",
+            "format": "int64",
+            "title": "Expected Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "enabled",
+          "expected_revision"
+        ],
+        "title": "CollaborationPatchRequest",
         "type": "object"
       },
       "CompactionCompletedEvent": {
@@ -1575,6 +1983,39 @@
           "type"
         ],
         "title": "CompactionInProgressEvent",
+        "type": "object"
+      },
+      "CompleteRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/assignments/{id}/complete`.",
+        "properties": {
+          "outputs": {
+            "description": "The advertised outputs, at most one per repository.",
+            "items": {
+              "$ref": "#/components/schemas/AssignmentOutputInput"
+            },
+            "minItems": 1,
+            "title": "Outputs",
+            "type": "array"
+          },
+          "session_id": {
+            "description": "The calling session; must be the active attempt's session on its bound runner.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "summary": {
+            "description": "Human-readable outcome summary.",
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "outputs",
+          "summary"
+        ],
+        "title": "CompleteRequest",
         "type": "object"
       },
       "CompletedEvent": {
@@ -3018,6 +3459,43 @@
         "title": "FailedResponseObject",
         "type": "object"
       },
+      "FinishRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/assignments/{id}/finish`.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional failure report; any error fails the assignment.",
+            "title": "Error"
+          },
+          "refs": {
+            "description": "The pushed output refs with their observed commits.",
+            "items": {
+              "$ref": "#/components/schemas/RefCommit"
+            },
+            "title": "Refs",
+            "type": "array"
+          },
+          "session_id": {
+            "description": "The calling session; must be the active attempt's session on its bound runner.",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "refs"
+        ],
+        "title": "FinishRequest",
+        "type": "object"
+      },
       "FunctionCallData": {
         "description": "Data for a function_call item.\n\n**Parameters**\n\n- `agent` \u2014 Agent name. Serialized as `\"model\"` in JSON.",
         "properties": {
@@ -4342,6 +4820,25 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "PublishedRefsRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/assignments/{id}/published`.",
+        "properties": {
+          "refs": {
+            "description": "The pushed input refs with their observed commits.",
+            "items": {
+              "$ref": "#/components/schemas/RefCommit"
+            },
+            "title": "Refs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "refs"
+        ],
+        "title": "PublishedRefsRequest",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -4554,6 +5051,28 @@
         "title": "ReasoningTextDeltaEvent",
         "type": "object"
       },
+      "RefCommit": {
+        "additionalProperties": false,
+        "description": "One observed `(repository, commit)` pair.",
+        "properties": {
+          "commit": {
+            "description": "The commit observed at the ref.",
+            "title": "Commit",
+            "type": "string"
+          },
+          "repository_name": {
+            "description": "The repository the ref belongs to.",
+            "title": "Repository Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_name",
+          "commit"
+        ],
+        "title": "RefCommit",
+        "type": "object"
+      },
       "ReplaceCliRetentionPolicyRequest": {
         "additionalProperties": false,
         "description": "Compare-and-swap replacement for one Host policy.",
@@ -4573,6 +5092,40 @@
           "policy"
         ],
         "title": "ReplaceCliRetentionPolicyRequest",
+        "type": "object"
+      },
+      "RepositoryPutRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PUT /v1/projects/{project_id}/repositories/{name}`.",
+        "properties": {
+          "context_manifest_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Repo-relative manifest path. Defaults to `.agents/project/manifest.json` when omitted.",
+            "title": "Context Manifest Path"
+          },
+          "default_branch": {
+            "description": "The repository's default branch name.",
+            "title": "Default Branch",
+            "type": "string"
+          },
+          "remote_url": {
+            "description": "The shared remote. Must be non-empty and carry no credentials.",
+            "title": "Remote Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "remote_url",
+          "default_branch"
+        ],
+        "title": "RepositoryPutRequest",
         "type": "object"
       },
       "ResetCliRetentionPolicyRequest": {
@@ -9874,6 +10427,691 @@
         ]
       }
     },
+    "/v1/assignments": {
+      "get": {
+        "description": "List the caller's assignments, filtered and cursor-paginated.\n\nAlways scoped to rows the caller owns. `role=sent` needs an\nowned `source_session_id`; `role=received` needs an owned\n`session_id` (mapped to the attempt's session).\n\n**Returns:** `{data, first_id, last_id, has_more}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 400 on a bad state, role or missing role session, 403/404 per session access.",
+        "operationId": "list_assignments_v1_assignments_get",
+        "parameters": [
+          {
+            "description": "Return only this project's assignments.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
+            }
+          },
+          {
+            "description": "Return only assignments in this state.",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "description": "`sent` or `received`.",
+            "in": "query",
+            "name": "role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Role"
+            }
+          },
+          {
+            "description": "Dispatching session (`sent` filter).",
+            "in": "query",
+            "name": "source_session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Session Id"
+            }
+          },
+          {
+            "description": "Attempt session (`received` filter).",
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "description": "Cursor id \u2014 return assignments after this one.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Maximum assignments in the page (at most 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Assignments V1 Assignments Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Assignments",
+        "tags": [
+          "assignments"
+        ]
+      },
+      "post": {
+        "description": "Create an assignment in `preparing` with a caller-supplied id.\n\nThe session's project is the assignment's project; input refs are\nderived server-side and returned so the caller pushes to exactly\nthose. Idempotent: the same id (or `source_session_id` +\n`idempotency_key`) with the same digest returns the stored row.\n\n**Parameters**\n\n- `body` \u2014 The dispatch fields.\n\n**Returns:** The inserted (201) or already-stored (200) assignment.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 403/404 per session access, 400 on a bad id, unfiled session, unknown repository, bad commit or missing execution root, 409 when the project switch is off or the payload changed under a reused key.",
+        "operationId": "create_assignment_v1_assignments_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignmentCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Assignment V1 Assignments Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Assignment",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
+    "/v1/assignments/{assignment_id}": {
+      "get": {
+        "description": "Return one assignment the caller owns.\n\n**Returns:** The assignment.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 unless owned.",
+        "operationId": "get_assignment_v1_assignments__assignment_id__get",
+        "parameters": [
+          {
+            "description": "The assignment to read.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Assignment V1 Assignments  Assignment Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Assignment",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
+    "/v1/assignments/{assignment_id}/cancel": {
+      "post": {
+        "description": "Request cancellation of an assignment.\n\n`preparing`/`waiting` cancel at once; `starting`/`running`/\n`publishing` become `stopping` (the coordinator performs the\nstop); `stopping` returns the row; `interrupted` cancels only\nwhen the old execution is confirmed stopped; terminal rows 409.\n\n**Parameters**\n\n- `body` \u2014 Optional reason, recorded on the state message.\n\n**Returns:** The updated (or already-stopping) assignment.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 unless owned, 409 when the row cannot cancel from its state.",
+        "operationId": "cancel_assignment_v1_assignments__assignment_id__cancel_post",
+        "parameters": [
+          {
+            "description": "The assignment to cancel.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Assignment V1 Assignments  Assignment Id  Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Assignment",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
+    "/v1/assignments/{assignment_id}/complete": {
+      "post": {
+        "description": "Report work complete: `running` to `publishing`.\n\nRunner-bound: the caller needs owner access on the calling\nsession, which must be the active attempt's session on its bound\nrunner. Each output must name a repository from the inputs, at\nmost one per repository. An identical repeat while `publishing`\nreturns the row.\n\n**Parameters**\n\n- `body` \u2014 The calling session, advertised outputs and summary.\n\n**Returns:** The updated assignment, whose outputs carry the derived output refs to push to.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 unless owned, 403 on any runner-auth failure, 400 on a bad output, 409 when the row cannot complete from its state.",
+        "operationId": "complete_assignment_v1_assignments__assignment_id__complete_post",
+        "parameters": [
+          {
+            "description": "The assignment being completed.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Complete Assignment V1 Assignments  Assignment Id  Complete Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete Assignment",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
+    "/v1/assignments/{assignment_id}/finish": {
+      "post": {
+        "description": "Verify output publication: `publishing` to `succeeded`/`failed`.\n\nRunner-bound like `complete`. Every advertised output observed\nat its commit with no error succeeds the row \u2014 outputs and success\ncommit in the same transition call; any mismatch or error fails it\nwith `error_code=\"publication_failed\"`. The conditional write is\nwhat lets a concurrent interruption win cleanly (`None` \u2192 409);\na late call from a non-active attempt 409s with the row untouched.\n\n**Parameters**\n\n- `body` \u2014 The calling session, observed output refs and error.\n\n**Returns:** The updated assignment.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 unless owned, 403 on any runner-auth failure, 409 when the row cannot finish from its state or the caller is not the active attempt.",
+        "operationId": "finish_assignment_v1_assignments__assignment_id__finish_post",
+        "parameters": [
+          {
+            "description": "The assignment being finished.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinishRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Finish Assignment V1 Assignments  Assignment Id  Finish Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Finish Assignment",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
+    "/v1/assignments/{assignment_id}/messages": {
+      "get": {
+        "description": "Cursor-read an assignment's messages; repeatable, never consuming.\n\n**Returns:** `{data, first_id, last_id, has_more}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 unless owned.",
+        "operationId": "read_assignment_messages_v1_assignments__assignment_id__messages_get",
+        "parameters": [
+          {
+            "description": "The assignment whose messages to read.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor id \u2014 return messages after this one.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Maximum messages in the page (at most 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Assignment Messages V1 Assignments  Assignment Id  Messages Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Assignment Messages",
+        "tags": [
+          "assignments"
+        ]
+      },
+      "post": {
+        "description": "Append a note to an assignment, idempotently on the key.\n\n**Parameters**\n\n- `body` \u2014 The sender session, text and idempotency key.\n\n**Returns:** The appended (or already-stored) message.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 unless the assignment is owned, 403/404 per sender-session access.",
+        "operationId": "post_assignment_message_v1_assignments__assignment_id__messages_post",
+        "parameters": [
+          {
+            "description": "The assignment to message.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignmentMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Post Assignment Message V1 Assignments  Assignment Id  Messages Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Assignment Message",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
+    "/v1/assignments/{assignment_id}/published": {
+      "post": {
+        "description": "Confirm input publication: `preparing` to `waiting`/`failed`.\n\nEvery input present at its advertised commit moves the row to\n`waiting`; anything else fails it with\n`error_code=\"publication_failed\"` and the landed refs recorded\non the matching inputs entries. A repeat carrying exactly what was\nrecorded returns the current row; any other call on a\nnon-preparing row is a 409.\n\n**Parameters**\n\n- `body` \u2014 The pushed input refs with observed commits.\n\n**Returns:** The updated (or already-recorded) assignment.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 403/404 per source session access and assignment ownership, 400 on a bad ref, 409 on a non-preparing row.",
+        "operationId": "mark_published_v1_assignments__assignment_id__published_post",
+        "parameters": [
+          {
+            "description": "The assignment being published.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublishedRefsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Mark Published V1 Assignments  Assignment Id  Published Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mark Published",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
+    "/v1/assignments/{assignment_id}/refresh": {
+      "post": {
+        "description": "Re-pin a `waiting` assignment against the current configuration.\n\nRe-reads each input's registered `repository_revision` and the\ncurrent `collaboration_revision`, clears `wait_reason` and the\nclaim-time binding snapshot; digests are untouched. Rejected on\nanything but `waiting`.\n\n**Returns:** The re-pinned assignment.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 unless owned, 409 when the project switch is off or the row is not waiting.",
+        "operationId": "refresh_assignment_v1_assignments__assignment_id__refresh_post",
+        "parameters": [
+          {
+            "description": "The assignment to re-pin.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Refresh Assignment V1 Assignments  Assignment Id  Refresh Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Assignment",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
+    "/v1/assignments/{assignment_id}/retry": {
+      "post": {
+        "description": "Resume an `interrupted` assignment after a confirmed stop.\n\nAllowed only when the active attempt is not `active` and has\n`ended_at` set. A passed `start_deadline` expires the row;\notherwise it returns to `waiting` with no active attempt.\n\n**Returns:** The updated assignment.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 unless owned, 409 when the row is not interrupted or the old execution has not stopped.",
+        "operationId": "retry_assignment_v1_assignments__assignment_id__retry_post",
+        "parameters": [
+          {
+            "description": "The assignment to resume.",
+            "in": "path",
+            "name": "assignment_id",
+            "required": true,
+            "schema": {
+              "title": "Assignment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Retry Assignment V1 Assignments  Assignment Id  Retry Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retry Assignment",
+        "tags": [
+          "assignments"
+        ]
+      }
+    },
     "/v1/branding/logo/{variant}": {
       "get": {
         "description": "Serve a validated public branding asset, or 404 when unset.",
@@ -12216,6 +13454,432 @@
           }
         },
         "summary": "Update Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/collaboration": {
+      "get": {
+        "description": "Return the project's collaboration config plus validation status.\n\n**Returns:** `{enabled, revision, repositories, bindings, problems}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
+        "operationId": "get_collaboration_v1_projects__project_id__collaboration_get",
+        "parameters": [
+          {
+            "description": "The project to inspect.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Collaboration V1 Projects  Project Id  Collaboration Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Collaboration",
+        "tags": [
+          "projects"
+        ]
+      },
+      "patch": {
+        "description": "Enable or disable collaboration, with optimistic-concurrency guard.\n\nThe only route that bumps `collaboration_revision`; repository and\nbinding changes carry their own `revision` and leave it alone.\n\n**Parameters**\n\n- `body` \u2014 The new switch value plus the revision the caller read.\n\n**Returns:** `{enabled, revision}` of the updated project.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned, 409 on a stale `expected_revision`.",
+        "operationId": "set_collaboration_v1_projects__project_id__collaboration_patch",
+        "parameters": [
+          {
+            "description": "The project to update.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CollaborationPatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Collaboration V1 Projects  Project Id  Collaboration Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Collaboration",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/hosts/{host_id}/bindings/{name}": {
+      "delete": {
+        "description": "Delete a host binding.\n\n**Returns:** `{\"id\": ..., \"object\": \"project_host_binding.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or binding is not found / not owned.",
+        "operationId": "delete_binding_v1_projects__project_id__hosts__host_id__bindings__name__delete",
+        "parameters": [
+          {
+            "description": "The project the binding belongs to.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The bound host.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The binding name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Binding V1 Projects  Project Id  Hosts  Host Id  Bindings  Name  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Binding",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Validate and store a host binding, stamping `path_verified_at`.\n\nThe typed path is validated live on the host; the canonical path\nthe host returns is what gets stored, never the typed one.\n\n**Parameters**\n\n- `body` \u2014 Workspace, repository name and binding flags.\n\n**Returns:** The inserted or updated binding.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 on a bad name, unknown repository or bad path, 409 when the host is offline or a second primary is requested for the host.",
+        "operationId": "put_binding_v1_projects__project_id__hosts__host_id__bindings__name__put",
+        "parameters": [
+          {
+            "description": "The project the binding belongs to.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The bound host.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Binding name; `primary` is the conventional value.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindingPutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Put Binding V1 Projects  Project Id  Hosts  Host Id  Bindings  Name  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Binding",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/hosts/{host_id}/bindings/{name}/verify": {
+      "post": {
+        "description": "Re-run host validation for the stored binding path.\n\nOn success refreshes `path_verified_at` (and the stored workspace\nwhen the canonical path moved, bumping `revision` only then). On\nfailure the row is left unchanged and the validation error is\nreturned.\n\n**Returns:** The refreshed binding.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or binding is not found / not owned, 409 when the host is offline or the binding changed during verification, 400 when the stored path no longer validates.",
+        "operationId": "verify_binding_v1_projects__project_id__hosts__host_id__bindings__name__verify_post",
+        "parameters": [
+          {
+            "description": "The project the binding belongs to.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The bound host.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The binding name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Verify Binding V1 Projects  Project Id  Hosts  Host Id  Bindings  Name  Verify Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Binding",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/repositories/{name}": {
+      "delete": {
+        "description": "Delete a registered repository.\n\nRefused while any binding of the project still references it.\n\n**Returns:** `{\"id\": ..., \"object\": \"project_repository.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or repository is not found / not owned, 409 when a binding still references the repository.",
+        "operationId": "delete_repository_v1_projects__project_id__repositories__name__delete",
+        "parameters": [
+          {
+            "description": "The project the repository is registered on.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The repository name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Repository V1 Projects  Project Id  Repositories  Name  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Repository",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Register a repository or revise its registration.\n\n**Parameters**\n\n- `body` \u2014 Remote, default branch and optional manifest path.\n\n**Returns:** The inserted or updated repository.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 on a bad name, missing or credentialed remote, or bad manifest path.",
+        "operationId": "put_repository_v1_projects__project_id__repositories__name__put",
+        "parameters": [
+          {
+            "description": "The project to register the repository on.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stable repository identity, unique per project.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepositoryPutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Put Repository V1 Projects  Project Id  Repositories  Name  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Repository",
         "tags": [
           "projects"
         ]
@@ -17201,6 +18865,11 @@
       "description": "First-class, owner-private containers that group sessions \u2014 create, list, rename, and delete.",
       "name": "projects",
       "x-displayName": "Projects"
+    },
+    {
+      "description": "Durable cross-host units of work handed to a named (host, agent) destination \u2014 dispatch, publish, message, cancel, retry, and runner-bound completion.",
+      "name": "assignments",
+      "x-displayName": "Assignments"
     },
     {
       "description": "Health, version, and identity endpoints for the running server.",
