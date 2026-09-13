@@ -684,11 +684,7 @@ def _reset_completion_status(runtime: dict[str, Any]) -> str:
         runtime.get("not_attempted_count"),
         len(not_attempted) if isinstance(not_attempted, list) else 0,
     )
-    if (
-        failed_count > 0
-        or not_attempted_count > 0
-        or runtime.get("incomplete") is True
-    ):
+    if failed_count > 0 or not_attempted_count > 0 or runtime.get("incomplete") is True:
         return "partial" if reset_count > 0 else "pending"
     return "legacy"
 
@@ -1075,7 +1071,8 @@ def create_hosts_router(
                             # is gone, leaving nothing to fence — finish
                             # best-effort and report the outcome honestly.
                             _logger.warning(
-                                "CLI retention lease lost after policy reset for Host %s; completing cleanup best-effort",
+                                "CLI retention lease lost after policy reset for Host %s; "
+                                "completing cleanup best-effort",
                                 host_id,
                                 exc_info=True,
                             )

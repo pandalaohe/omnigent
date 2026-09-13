@@ -196,7 +196,7 @@ class CliRetentionCoordinator:
                             token,
                         )
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - release failure must not mask the body.
                     # Best-effort: a stale claim lapses via claim_cli_retention's
                     # stale_before predicate, so this must not replace the body's
                     # exception — least of all a propagating CancelledError.
@@ -378,7 +378,8 @@ class CliRetentionCoordinator:
                     return "failed"
                 return "ok" if response.status_code < 400 else "failed"
 
-        for conversation, outcome in zip(bound, await asyncio.gather(*(_reset_one(conversation) for conversation in bound))):
+        outcomes = await asyncio.gather(*(_reset_one(conversation) for conversation in bound))
+        for conversation, outcome in zip(bound, outcomes, strict=True):
             if outcome == "ok":
                 reset.append(conversation.id)
             elif outcome == "failed":
@@ -433,9 +434,7 @@ class CliRetentionCoordinator:
                         after,
                     )
                     if cursor_row is not None:
-                        return HostConversationEnumeration(
-                            conversations=rows, incomplete=False
-                        )
+                        return HostConversationEnumeration(conversations=rows, incomplete=False)
                     _logger.warning(
                         "Host conversation enumeration truncated for Host %s "
                         "on pass %d; restarting from the beginning",
@@ -450,9 +449,7 @@ class CliRetentionCoordinator:
                     seen.add(conversation.id)
                     rows.append(conversation)
                 if not page.has_more or not page.last_id:
-                    return HostConversationEnumeration(
-                        conversations=rows, incomplete=False
-                    )
+                    return HostConversationEnumeration(conversations=rows, incomplete=False)
                 after = page.last_id
             if not truncated:
                 break
