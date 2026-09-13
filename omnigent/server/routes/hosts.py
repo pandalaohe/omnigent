@@ -1065,11 +1065,11 @@ def create_hosts_router(
                                 lease=lease,
                             )
                         except CliRetentionHostLeaseLost:
-                            # The policy reset above already committed, so a 409
-                            # "retry" is dishonest: the CAS consumed the
-                            # revision. The lease is gone because the host row
-                            # is gone, leaving nothing to fence — finish
-                            # best-effort and report the outcome honestly.
+                            # The CAS already consumed the revision, so a 409
+                            # "retry" would be dishonest. Renewal fails when the
+                            # row is gone OR when another replica claimed the
+                            # lease; either way the Runner fences on revision, so
+                            # this stale reset cannot undo a newer policy.
                             _logger.warning(
                                 "CLI retention lease lost after policy reset for Host %s; "
                                 "completing cleanup best-effort",
