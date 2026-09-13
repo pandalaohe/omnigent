@@ -32,6 +32,10 @@ class Project:
         empty dict when none are stored. The key vocabulary is owned by the
         client; the store persists and returns it whole. These are hints the
         new-chat dialog pre-fills, not enforced requirements.
+    :param collaboration_enabled: Cross-host collaboration switch. Gates
+        creation, refresh, claim and start only — never in-flight attempts.
+    :param collaboration_revision: Bumped by every collaboration-config
+        change; an assignment records the value it was created against.
     """
 
     id: str
@@ -40,3 +44,5 @@ class Project:
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = field(default_factory=dict)
+    collaboration_enabled: bool = False
+    collaboration_revision: int = 0

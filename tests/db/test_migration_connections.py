@@ -40,7 +40,7 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["a11c20260912"], f"expected a single head, got {heads!r}"
+    assert heads == ["a12c20260913"], f"expected a single head, got {heads!r}"
 
 
 @pytest.mark.parametrize("manual", [False, True])
@@ -105,7 +105,7 @@ def test_legacy_custom_gc_collision_upgrades_without_data_loss(
         "preferences",
     }
     with engine.connect() as conn:
-        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "a11c20260912"
+        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "a12c20260913"
         assert (
             conn.scalar(sa.text("SELECT preferences FROM users WHERE id = 'user_custom'"))
             == preference_bytes

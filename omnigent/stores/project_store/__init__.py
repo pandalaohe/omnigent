@@ -120,3 +120,31 @@ class ProjectStore(ABC):
         :returns: ``True`` if removed; ``False`` if not found / not owned.
         """
         ...
+
+    @abstractmethod
+    def set_collaboration(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        enabled: bool,
+        expected_revision: int,
+    ) -> Project | None:
+        """
+        Enable or disable cross-host collaboration, bumping
+        ``collaboration_revision``.
+
+        Optimistic concurrency: the write applies only when the stored
+        ``collaboration_revision`` still equals ``expected_revision``.
+
+        :param project_id: Opaque project identifier.
+        :param user_id: The requesting owner.
+        :param enabled: The new collaboration switch value.
+        :param expected_revision: The revision the caller read; a mismatch
+            means another writer moved first.
+        :returns: The updated :class:`Project`, or ``None`` if not found /
+            not owned.
+        :raises OmnigentError: ``CONFLICT`` if the stored revision does not
+            match ``expected_revision``.
+        """
+        ...

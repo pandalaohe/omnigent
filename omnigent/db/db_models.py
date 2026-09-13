@@ -810,6 +810,19 @@ class SqlProject(OmnigentBase):
     # can always override. Opaque and never SQL-filtered — stored compressed
     # (CompressedText).
     config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Cross-host collaboration switch. Gates creation, refresh, claim and
+    # start only — never observation, completion, publication, cancellation
+    # or reconciliation, so an attempt already running can finish after the
+    # switch goes off. NOT NULL with a server default so existing rows
+    # backfill in place and no third "unset" state exists.
+    collaboration_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    # Bumped by every collaboration-config change; an assignment records the
+    # value it was created against.
+    collaboration_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with
@@ -1823,5 +1836,448 @@ class SqlScheduledTaskRun(OmnigentBase):
             "ix_scheduled_task_runs_conversation_id",
             "workspace_id",
             "conversation_id",
+        ),
+    )
+
+
+class SqlProjectRepository(OmnigentBase):
+    """
+    SQLAlchemy model for the ``project_repositories`` table.
+
+    One registered repository of a collaboration project. A project may span
+    more than one repository because a coordination root with a nested clone
+    is two repositories, not two directories.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
+        surfaced as a bare 32-char hex string (no dashes).
+    :param project_id: The project this repository is registered on (relates
+        to ``projects.id``). No DB foreign key (Rule R032); cleanup on
+        project deletion is application-owned.
+    :param name: Stable identity used by assignments; unique per project.
+    :param remote_url: The shared remote. Carries no credentials.
+    :param default_branch: The repository's default branch name.
+    :param context_manifest_path: Repo-relative path of the project-context
+        manifest, e.g. ``".agents/project/manifest.json"``.
+    :param revision: Bumped on any change; assignments pin the value they
+        were created against.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None`` if
+        the row has never been updated.
+    """
+
+    __tablename__ = "project_repositories"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relates to projects.id. No DB foreign key (Rule R032); cascade is app-owned.
+    project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    remote_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    default_branch: Mapped[str] = mapped_column(String(255), nullable=False)
+    context_manifest_path: Mapped[str] = mapped_column(
+        String(512),
+        nullable=False,
+        default=".agents/project/manifest.json",
+        server_default=".agents/project/manifest.json",
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "project_id",
+            "name",
+            name="uq_project_repositories_name",
+        ),
+        Index(
+            "ix_project_repositories_project",
+            "workspace_id",
+            "project_id",
+            "id",
+        ),
+    )
+
+
+class SqlProjectHostBinding(OmnigentBase):
+    """
+    SQLAlchemy model for the ``project_host_bindings`` table.
+
+    One host's local directory for a registered repository: one global
+    project identity, N per-host records each naming a local path. Binding
+    granularity is host → directory, never agent → directory.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
+        surfaced as a bare 32-char hex string (no dashes).
+    :param project_id: The project this binding belongs to (relates to
+        ``projects.id``). No DB foreign key (Rule R032).
+    :param host_id: The bound host (relates to ``hosts.host_id``). No DB
+        foreign key (Rule R032).
+    :param name: Binding name; ``primary`` is the conventional value. Unique
+        per (project, host).
+    :param is_primary: At most one true per (project_id, host_id), enforced
+        by the store — a second primary is rejected, never silently applied.
+    :param repository_id: Which registered repository this directory holds
+        (relates to ``project_repositories.id``). No DB foreign key (Rule
+        R032).
+    :param workspace: Absolute path as the host canonicalised it, never as
+        typed. Host-native syntax is preserved (POSIX, Windows drive, UNC).
+    :param enabled: Disabled bindings are skipped at claim time.
+    :param revision: Bumped on any change; assignments pin the value they
+        started against.
+    :param path_verified_at: Unix epoch seconds of the last successful
+        ``host.stat``, or ``None`` if never verified.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None`` if
+        the row has never been updated.
+    """
+
+    __tablename__ = "project_host_bindings"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relates to projects.id. No DB foreign key (Rule R032); cascade is app-owned.
+    project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Relates to hosts.host_id. No DB foreign key (Rule R032).
+    host_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    is_primary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    # Relates to project_repositories.id. No DB foreign key (Rule R032).
+    repository_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    workspace: Mapped[str] = mapped_column(String(2048), nullable=False)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    path_verified_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "project_id",
+            "host_id",
+            "name",
+            name="uq_project_host_bindings_name",
+        ),
+        Index(
+            "ix_project_host_bindings_project",
+            "workspace_id",
+            "project_id",
+            "id",
+        ),
+    )
+
+
+class SqlAssignment(OmnigentBase):
+    """
+    SQLAlchemy model for the ``assignments`` table.
+
+    One unit of work handed to one ``(host, agent)`` destination. Artifacts
+    and context move by git; the row stores pointers, addressing and state,
+    never file content.
+
+    :param id: Caller-generated UUID primary key (see :class:`Uuid16`),
+        stable across retries so a retried create is recognised.
+    :param project_id: The collaboration project (relates to
+        ``projects.id``). No DB foreign key (Rule R032).
+    :param source_session_id: The session that dispatched the assignment
+        (relates to ``conversations.id``). No DB foreign key (Rule R032).
+    :param owner_user_id: The dispatching user, or ``None`` in single-user
+        mode.
+    :param target_agent_id: The agent to launch on arrival (relates to
+        ``agents.id``). No DB foreign key (Rule R032).
+    :param requested_host_id: The named destination host, or ``None`` to
+        resolve once to the owner's freshest eligible online host.
+    :param resolved_host_id: Written once at claim time, then never changed.
+    :param binding_name: Which binding of the destination host to run in;
+        ``primary`` is the conventional value.
+    :param resolved_binding_id: The binding snapshot the work started
+        against (relates to ``project_host_bindings.id``). No DB foreign
+        key (Rule R032).
+    :param resolved_binding_revision: The binding ``revision`` at claim time.
+    :param project_revision: ``collaboration_revision`` at create time.
+    :param task: The natural-language instruction blob. Opaque free text,
+        never SQL-filtered — stored compressed (CompressedText).
+    :param metadata_json: Optional structured extras. Opaque, never
+        SQL-filtered — stored compressed (CompressedText).
+    :param inputs_json: The immutable dispatch snapshot: one entry per
+        repository. Opaque, never SQL-filtered — stored compressed
+        (CompressedText).
+    :param model_override: Per-assignment LLM model override, or ``None``
+        for the agent default.
+    :param harness_override: Per-assignment harness override, or ``None``
+        for the agent default.
+    :param start_deadline: Unix epoch seconds bounding the wait, or ``None``
+        to wait until cancelled.
+    :param idempotency_key: Caller key; unique with ``source_session_id``
+        per workspace. A retried create with the same digest returns the
+        existing row; a changed payload is rejected.
+    :param request_digest: Digest of the create payload the idempotency
+        comparison is made on.
+    :param state: Lifecycle state — ``preparing``/``waiting``/``starting``/
+        ``running``/``publishing``/``stopping``/``succeeded``/``failed``/
+        ``cancelled``/``expired``/``interrupted``. See
+        ``omnigent.entities.assignment.is_legal_transition``.
+    :param wait_reason: The visible reason while ``waiting``.
+    :param next_check_at: Unix epoch seconds when the coordinator may look
+        at this row again, or ``None``.
+    :param active_attempt_id: At most one (relates to
+        ``assignment_attempts.id``). No DB foreign key (Rule R032).
+    :param outputs_json: Accepted outputs, written atomically with
+        ``succeeded``. Opaque, never SQL-filtered — stored compressed
+        (CompressedText).
+    :param result_summary: Human-readable outcome summary. Opaque free text,
+        never SQL-filtered — stored compressed (CompressedText).
+    :param error_code: Short failure classification, or ``None``.
+    :param cancel_requested_at: Unix epoch seconds cancellation was
+        requested, or ``None``.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None`` if
+        the row has never been updated.
+    """
+
+    __tablename__ = "assignments"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relates to projects.id. No DB foreign key (Rule R032); cascade is app-owned.
+    project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Relates to conversations.id. No DB foreign key (Rule R032).
+    source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Relates to agents.id. No DB foreign key (Rule R032).
+    target_agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Relates to hosts.host_id. No DB foreign key (Rule R032).
+    requested_host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    resolved_host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    binding_name: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="primary", server_default="primary"
+    )
+    # Relates to project_host_bindings.id. No DB foreign key (Rule R032).
+    resolved_binding_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    resolved_binding_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    project_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # Opaque free text, never SQL-queried — stored compressed (CompressedText).
+    task: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    metadata_json: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    inputs_json: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    harness_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    start_deadline: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="preparing", server_default="preparing"
+    )
+    wait_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    next_check_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Relates to assignment_attempts.id. No DB foreign key (Rule R032).
+    active_attempt_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    outputs_json: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Opaque free text, never SQL-queried — stored compressed (CompressedText).
+    result_summary: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cancel_requested_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "source_session_id",
+            "idempotency_key",
+            name="uq_assignments_source_idempotency",
+        ),
+        # The bounded due-work pass: non-terminal rows due for a look,
+        # ordered by next_check_at, capped per pass.
+        Index(
+            "ix_assignments_due",
+            "workspace_id",
+            "state",
+            "next_check_at",
+            "id",
+        ),
+        # Host-scoped trigger: rows pinned to one host, without a table scan.
+        Index(
+            "ix_assignments_host",
+            "workspace_id",
+            "resolved_host_id",
+            "state",
+            "id",
+        ),
+    )
+
+
+class SqlAssignmentAttempt(OmnigentBase):
+    """
+    SQLAlchemy model for the ``assignment_attempts`` table.
+
+    One execution attempt of an assignment. At most one ``active`` attempt
+    per assignment; liveness is observed server-side via
+    ``lease_expires_at``, which the coordinator writes.
+
+    :param id: UUID primary key (see :class:`Uuid16`), surfaced as a bare
+        32-char hex string (no dashes).
+    :param assignment_id: The assignment this attempt belongs to (relates
+        to ``assignments.id``). No DB foreign key (Rule R032).
+    :param number: 1-based attempt number; unique per assignment.
+    :param host_id: The host the attempt runs on (relates to
+        ``hosts.host_id``). No DB foreign key (Rule R032).
+    :param runner_id: The runner the attempt launched on, or ``None``
+        before launch.
+    :param session_id: The conversation this attempt created (relates to
+        ``conversations.id``), or ``None`` before creation. One per
+        attempt, idempotently. No DB foreign key (Rule R032).
+    :param state: ``active``/``finished``/``lost``.
+    :param lease_expires_at: Unix epoch seconds the server-side liveness
+        lease expires, or ``None`` when no lease is held.
+    :param event_dispatched_at: Unix epoch seconds the initial assignment
+        event was dispatched, or ``None``. Compare-and-set: the first
+        writer wins, so a retried dispatch never double-prompts.
+    :param started_at: Unix epoch seconds the attempt started, or ``None``.
+    :param ended_at: Unix epoch seconds the attempt ended, or ``None``.
+    :param error_code: Short failure classification, or ``None``.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None`` if
+        the row has never been updated.
+    """
+
+    __tablename__ = "assignment_attempts"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relates to assignments.id. No DB foreign key (Rule R032); cascade is
+    # app-owned.
+    assignment_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Relates to hosts.host_id. No DB foreign key (Rule R032).
+    host_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    runner_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Relates to conversations.id. No DB foreign key (Rule R032).
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", server_default="active"
+    )
+    lease_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    event_dispatched_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ended_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "assignment_id",
+            "number",
+            name="uq_assignment_attempts_number",
+        ),
+        Index(
+            "ix_assignment_attempts_assignment",
+            "workspace_id",
+            "assignment_id",
+            "id",
+        ),
+    )
+
+
+class SqlAssignmentMessage(OmnigentBase):
+    """
+    SQLAlchemy model for the ``assignment_messages`` table.
+
+    Append-only, assignment-scoped messages: the cross-tree channel between
+    the sending and receiving sessions. Reads are cursor-based and
+    repeatable; reading never consumes.
+
+    :param id: UUID primary key (see :class:`Uuid16`), surfaced as a bare
+        32-char hex string (no dashes).
+    :param assignment_id: The assignment this message belongs to (relates
+        to ``assignments.id``). No DB foreign key (Rule R032).
+    :param sender_session_id: The sending session (relates to
+        ``conversations.id``), or ``None`` for a server-generated state
+        event. No DB foreign key (Rule R032).
+    :param kind: ``note``/``state``.
+    :param body: Message text. Opaque free text, never SQL-filtered —
+        stored compressed (CompressedText).
+    :param idempotency_key: Caller key for exactly-once append; ``None``
+        for server state events, which carry none.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None`` —
+        rows are append-only so this stays unset.
+    """
+
+    __tablename__ = "assignment_messages"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relates to assignments.id. No DB foreign key (Rule R032); cascade is
+    # app-owned.
+    assignment_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Relates to conversations.id. No DB foreign key (Rule R032).
+    sender_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Opaque free text, never SQL-queried — stored compressed (CompressedText).
+    body: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "assignment_id",
+            "sender_session_id",
+            "idempotency_key",
+            name="uq_assignment_messages_idempotency",
+        ),
+        Index(
+            "ix_assignment_messages_assignment",
+            "workspace_id",
+            "assignment_id",
+            "created_at",
+            "id",
         ),
     )
