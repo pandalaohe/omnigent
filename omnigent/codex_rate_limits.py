@@ -86,10 +86,13 @@ def normalize_codex_rate_limits_response(
     rows: list[tuple[str, dict[str, Any]]] = []
     by_limit_id = result.get("rateLimitsByLimitId")
     if isinstance(by_limit_id, dict):
-        for raw_limit_id, raw_bucket in by_limit_id.items():
+        for index, (raw_limit_id, raw_bucket) in enumerate(by_limit_id.items()):
+            if index >= _CODEX_RATE_LIMITS_MAX_BUCKETS * 4:
+                break
             limit_id = raw_limit_id.strip() if isinstance(raw_limit_id, str) else ""
             if (
                 limit_id
+                and "@" not in limit_id
                 and len(limit_id) <= _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH
                 and isinstance(raw_bucket, dict)
             ):
@@ -101,7 +104,11 @@ def normalize_codex_rate_limits_response(
         if isinstance(raw_bucket, dict):
             raw_limit_id = raw_bucket.get("limitId")
             limit_id = raw_limit_id.strip() if isinstance(raw_limit_id, str) else "codex"
-            if limit_id and len(limit_id) <= _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH:
+            if (
+                limit_id
+                and "@" not in limit_id
+                and len(limit_id) <= _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH
+            ):
                 rows.append((limit_id, raw_bucket))
 
     limits: list[_JsonObject] = []
@@ -115,7 +122,7 @@ def normalize_codex_rate_limits_response(
             continue
         bucket: _JsonObject = {"limit_id": limit_id, "windows": windows}
         raw_name = raw_bucket.get("limitName")
-        if isinstance(raw_name, str) and raw_name.strip():
+        if isinstance(raw_name, str) and raw_name.strip() and "@" not in raw_name:
             bucket["limit_name"] = raw_name.strip()[:_CODEX_RATE_LIMITS_MAX_TEXT_LENGTH]
         limits.append(bucket)
 
@@ -159,6 +166,7 @@ def validate_codex_rate_limits_snapshot(snapshot: object) -> _JsonObject | None:
         if (
             not isinstance(limit_id, str)
             or not limit_id
+            or "@" in limit_id
             or limit_id != limit_id.strip()
             or len(limit_id) > _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH
         ):
@@ -196,6 +204,7 @@ def validate_codex_rate_limits_snapshot(snapshot: object) -> _JsonObject | None:
             if (
                 not isinstance(limit_name, str)
                 or not limit_name
+                or "@" in limit_name
                 or limit_name != limit_name.strip()
                 or len(limit_name) > _CODEX_RATE_LIMITS_MAX_TEXT_LENGTH
             ):

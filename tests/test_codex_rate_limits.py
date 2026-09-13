@@ -526,3 +526,110 @@ async def test_probe_env_excludes_credentials(monkeypatch: pytest.MonkeyPatch) -
     env = captured["env"]
     assert isinstance(env, dict) and env["CODEX_HOME"] == "C:/synthetic/codex-home"
     assert "OPENAI_API_KEY" not in env and "UNRELATED_PROVIDER_SECRET" not in env
+
+
+def test_normalize_drops_identity_like_ids_and_names() -> None:
+    """Bucket IDs holding '@' never cross; such names are omitted, not kept."""
+    snapshot = normalize_codex_rate_limits_response(
+        {
+            "result": {
+                "rateLimitsByLimitId": {
+                    "user@example.com": {
+                        "limitName": "User",
+                        "primary": {"usedPercent": 90, "windowDurationMins": 300},
+                    },
+                    "team": {
+                        "limitName": "team@example.com",
+                        "primary": {"usedPercent": 5, "windowDurationMins": 300},
+                    },
+                }
+            }
+        },
+        captured_at=1,
+    )
+
+    assert snapshot == {
+        "captured_at": 1,
+        "limits": [
+            {
+                "limit_id": "team",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 5.0,
+                        "window_duration_mins": 300,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_normalize_drops_identity_like_legacy_id() -> None:
+    """The legacy single bucket applies the same identity-ID filter."""
+    assert (
+        normalize_codex_rate_limits_response(
+            {
+                "result": {
+                    "rateLimits": {
+                        "limitId": "user@example.com",
+                        "primary": {"usedPercent": 5, "windowDurationMins": 300},
+                    }
+                }
+            },
+            captured_at=1,
+        )
+        is None
+    )
+
+
+def test_wire_validator_rejects_identity_like_labels() -> None:
+    """Identity-like IDs and names are rejected at the wire boundary."""
+
+    def _bucket(limit_id: str = "codex", limit_name: str | None = None) -> dict[str, object]:
+        bucket: dict[str, object] = {
+            "limit_id": limit_id,
+            "windows": [
+                {
+                    "kind": "primary",
+                    "used_percent": 5,
+                    "window_duration_mins": 300,
+                }
+            ],
+        }
+        if limit_name is not None:
+            bucket["limit_name"] = limit_name
+        return bucket
+
+    with pytest.raises(ValueError, match="id"):
+        validate_codex_rate_limits_snapshot(
+            {"captured_at": 1, "limits": [_bucket(limit_id="user@example.com")]}
+        )
+    with pytest.raises(ValueError, match="name"):
+        validate_codex_rate_limits_snapshot(
+            {"captured_at": 1, "limits": [_bucket(limit_name="team@example.com")]}
+        )
+
+
+def test_normalize_examines_at_most_64_input_buckets() -> None:
+    """Rejected rows still cost scan budget; the 16-output cap is retained."""
+    valid_bucket = {"primary": {"usedPercent": 5, "windowDurationMins": 300}}
+    filler = {f"rejected-{index}": object() for index in range(64)}
+    beyond = {**filler, "codex": valid_bucket}
+    assert (
+        normalize_codex_rate_limits_response({"result": {"rateLimitsByLimitId": beyond}}) is None
+    )
+
+    within = {**{f"rejected-{index}": object() for index in range(63)}, "codex": valid_bucket}
+    snapshot = normalize_codex_rate_limits_response(
+        {"result": {"rateLimitsByLimitId": within}}, captured_at=1
+    )
+    assert snapshot is not None
+    assert [bucket["limit_id"] for bucket in snapshot["limits"]] == ["codex"]
+
+    many = {f"bucket-{index}": valid_bucket for index in range(20)}
+    capped = normalize_codex_rate_limits_response(
+        {"result": {"rateLimitsByLimitId": many}}, captured_at=1
+    )
+    assert capped is not None
+    assert len(capped["limits"]) == 16
