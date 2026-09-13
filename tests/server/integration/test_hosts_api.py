@@ -2248,3 +2248,92 @@ async def test_host_cli_retention_reset_ordinary_cancel_still_propagates(
 
     # No best-effort pass ran: nothing was posted.
     assert posts == []
+
+
+async def test_host_cli_retention_reset_real_heartbeat_cancel_absorbs_and_cleans_up(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real owner_task.cancel() mid-fan-out still returns 200 via uncancel()."""
+    import threading
+    from types import SimpleNamespace
+
+    import omnigent.server.cli_retention as cli_retention_module
+    from omnigent.server.cli_retention import CliRetentionCoordinator
+
+    app, registry, host_store, conv_store = host_api_app
+    _comm = await _connect_host(app, registry)
+    await _put_cli_retention_policy_v1(app)
+
+    conv = await asyncio.to_thread(conv_store.create_conversation)
+    await asyncio.to_thread(conv_store.set_host_id, conv.id, _HOST_ID, "/tmp/ws")
+    await asyncio.to_thread(conv_store.set_runner_id, conv.id, "runner-1")
+
+    monkeypatch.setattr(cli_retention_module, "_LEASE_HEARTBEAT_INTERVAL_S", 0.01)
+
+    fan_out_started = threading.Event()
+    renew_failed_at: list[float] = []
+    post_at: list[float] = []
+    posts: list = []
+    post_calls = 0
+    original_renew = host_store.renew_cli_retention
+
+    def _flaky_renew(host_id: str, token: str, *, claimed_at: int) -> bool:
+        if fan_out_started.is_set():
+            renew_failed_at.append(time.monotonic())
+            return False
+        return original_renew(host_id, token, claimed_at=claimed_at)
+
+    monkeypatch.setattr(host_store, "renew_cli_retention", _flaky_renew)
+
+    class _Client:
+        async def post(self, url, *, json, timeout):
+            nonlocal post_calls
+            del timeout
+            post_calls += 1
+            if post_calls == 1:
+                fan_out_started.set()
+                await asyncio.sleep(0.5)
+            posts.append((url, json))
+            post_at.append(time.monotonic())
+            return SimpleNamespace(status_code=200)
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            return SimpleNamespace(client=_Client(), runner_id=conversation.runner_id)
+
+    coordinator = CliRetentionCoordinator(
+        host_store=host_store,
+        conversation_store=conv_store,
+        runner_router=_Router(),
+    )
+    reset_app = _reset_app_for_coordinator(registry, host_store, conv_store, coordinator)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=reset_app), base_url="http://test"
+    ) as client:
+        reset = await client.request(
+            "DELETE",
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={"expected_revision": 1},
+        )
+
+    assert reset.status_code == 200
+    assert reset.json()["configured"] is False
+    assert reset.json()["revision"] == 2
+    # First POST was cancelled mid-flight (never recorded); the best-effort
+    # pass re-issued it after uncancel() absorbed the real cancellation.
+    assert post_calls == 2
+    assert posts == [
+        (
+            f"/v1/sessions/{conv.id}/cli-retention/reset",
+            {"host_id": _HOST_ID, "policy_revision": 2},
+        )
+    ]
+    assert renew_failed_at, "heartbeat never observed the lost lease"
+    assert post_at and post_at[0] > renew_failed_at[0]
+    # The cancellation was genuinely delivered by Task.cancel() (not a bare
+    # raise like the branch-pinning tests), so uncancel() cleared a pending
+    # count: without it this task would still report cancelling() == 1 here.
+    assert asyncio.current_task() is not None
+    assert asyncio.current_task().cancelling() == 0  # type: ignore[union-attr]

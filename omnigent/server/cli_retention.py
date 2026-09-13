@@ -30,6 +30,10 @@ _HOST_ENUM_MAX_PASSES = 3
 # reported as not attempted, never as reset or failed.
 _RESET_MAX_CONCURRENCY = 8
 _RESET_OVERALL_DEADLINE_S = 60.0
+# How often the lease heartbeat re-asserts ownership of one Host claim.
+# A module constant (not a literal in _renew_host_claim) so tests can
+# shrink the interval and drive a real owner_task.cancel() end to end.
+_LEASE_HEARTBEAT_INTERVAL_S = 60.0
 # The enumeration includes archived conversations, so a host with thousands of
 # historical sessions must not come back as thousands of ids. Result lists are
 # bounded samples; the *_count keys carry the totals.
@@ -255,7 +259,7 @@ class CliRetentionCoordinator:
         owner_task: asyncio.Task[Any],
     ) -> None:
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(_LEASE_HEARTBEAT_INTERVAL_S)
             try:
                 renewed = await asyncio.to_thread(
                     self._host_store.renew_cli_retention,
