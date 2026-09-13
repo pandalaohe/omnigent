@@ -142,9 +142,12 @@ async def test_host_enumeration_truncated_past_bound_reports_incomplete() -> Non
         )
 
     store.list_conversations = _always_truncated  # type: ignore[method-assign]
-    store.get_conversation = lambda conversation_id: store.get_calls.append(  # type: ignore[method-assign]
-        conversation_id
-    ) or None
+    store.get_conversation = lambda conversation_id: (
+        store.get_calls.append(  # type: ignore[method-assign]
+            conversation_id
+        )
+        or None
+    )
     coordinator = _coordinator(store)
 
     result = await coordinator.reset_host_under_lease("host-a", policy_revision=8)
@@ -201,9 +204,7 @@ async def test_reset_pass_over_deadline_reports_unattempted_not_failed(
 
     class _Router:
         def client_for_session_resources(self, session_id, *, conversation):
-            return SimpleNamespace(
-                client=clients[session_id], runner_id=conversation.runner_id
-            )
+            return SimpleNamespace(client=clients[session_id], runner_id=conversation.runner_id)
 
     coordinator = CliRetentionCoordinator(
         host_store=SimpleNamespace(),
@@ -229,9 +230,7 @@ async def test_reset_pass_over_deadline_reports_unattempted_not_failed(
 async def test_reset_pass_isolation_one_failure_does_not_abort_the_rest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        cli_retention_module, "_RESET_OVERALL_DEADLINE_S", 60.0
-    )
+    monkeypatch.setattr(cli_retention_module, "_RESET_OVERALL_DEADLINE_S", 60.0)
     ids = ["ok-1", "boom", "ok-2"]
     store = _SinglePageStore([_conv(conversation_id) for conversation_id in ids])
 
@@ -247,9 +246,7 @@ async def test_reset_pass_isolation_one_failure_does_not_abort_the_rest(
 
     class _Router:
         def client_for_session_resources(self, session_id, *, conversation):
-            return SimpleNamespace(
-                client=_Client(session_id), runner_id=conversation.runner_id
-            )
+            return SimpleNamespace(client=_Client(session_id), runner_id=conversation.runner_id)
 
     coordinator = CliRetentionCoordinator(
         host_store=SimpleNamespace(),
@@ -422,7 +419,5 @@ async def test_reset_with_mostly_runnerless_host_returns_counts_not_id_lists() -
         ({"reset": None, "unavailable": []}, "pending"),
     ],
 )
-def test_reset_completion_status_mapping(
-    result: dict, expected: str
-) -> None:
+def test_reset_completion_status_mapping(result: dict, expected: str) -> None:
     assert _reset_completion_status(result) == expected
