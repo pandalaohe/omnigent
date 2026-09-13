@@ -9,7 +9,7 @@
 > Merged into the branch: yes, `0aec397db` (2026-09-13, T260912-012); `git merge-base --is-ancestor upstream/main local/host-custom` exits 0
 > Branch tip this registry describes: 30c9e8fba (the post-merge repair head; the merge itself is `0aec397db4e5d557445467b02289106ae3f97f86`) — superseding 0ed8c3fc2785696755fe32e435b870b88ae7c379, which the branch passed through on the way here (`0ed8c3fc2` → `3adb4324a`…`bf08310bc` → `c4318d421` → `50b729415` → `0aec397db` merge → `22bc52bf3` → `a486bef5f` → `9e5aa54eb` → `38927089f` → `6db54ece0` → `a95801ab6` → `914f40780` → `30c9e8fba`; the two middle ones are board OMN10's `fix(cli-retention)`/`fix(harness)` work, not this merge's)
 > Local-mod surface after that merge: 450 files (`git diff --name-only upstream/main local/host-custom`), 34 first-parent commits since the merge-base
-> Last updated: 2026-09-13
+> Last updated: 2026-09-14
 
 Rebuilt from v1 (3 rows) on 2026-09-12 — board OMN04 / task T260912-016. The Windows 48-MOD ledger was never committed and could not be recovered, so every row below is **derived** from FEATURE_MAP (S01–S26, F24–F28), PR_STATUS and the branch's own history. Each row's `why` names the evidence it came from and whether the classification is an observed **fact** or a **decision** taken during the rebuild. See `## Narrative` for the method and its blind spots.
 
@@ -45,6 +45,7 @@ Rebuilt from v1 (3 rows) on 2026-09-12 — board OMN04 / task T260912-016. The W
 | `S24-usage-context` | yes | https://github.com/omnigent-ai/omnigent/pull/6634 |  | filed | pending | codex/provider-usage-windows-20260906 | Drop the probe residual when #6634 merges. Claude-side persistence, the source fence and the settings display are still unfiled and stay in this row. Depends on S06. |
 | `S25-agent-library` | yes | https://github.com/omnigent-ai/omnigent/pull/6633 |  | filed | pending | codex/pr-custom-agent-library-20260906 | Drop when #6633 and its follow-ups cover the badges, the editor and every entry point. Depends on S06. |
 | `S26-archive-library` | yes | https://github.com/omnigent-ai/omnigent/pull/6628 |  | filed | pending | codex/pr-archive-library-20260906 | Split by schema / query / reader / entry point rather than re-filing the monolith; drop each part as its own PR merges. The `c732c3b25` project-filter hotfix is not in the filed head. Depends on S22. |
+| `S27-project-assignments` | maybe |  |  | private | pending | feature/project-assignments | Not filed: the owner accepts the feature only after a two-host round trip (Windows → Mac → Windows) on the fn server, so filing waits for that. Before any upstream PR, re-point the `a12c20260913` migration at upstream's alembic head and split by layer (data + routes, host frames, coordinator, tools, UI). Drop when upstream ships an equivalent cross-host assignment capability or a filed stack merges. |
 | `F24-custom-host-maintenance` | no |  |  | private | pending |  | None while the fork ships its own build. Revisit only if upstream adopts a custom update channel. |
 | `F26-deploy-environment` | no |  |  | private | pending |  | None while the fn deployment exists. Drop a repair once no deployed database predates it. |
 | `F28-alignment-residuals` | no |  |  | private | n/a |  | Drop when upstream's own release signature and retry event types make the local alignment unnecessary. |
@@ -85,6 +86,7 @@ Rebuilt from v1 (3 rows) on 2026-09-12 — board OMN04 / task T260912-016. The W
 | `S24-usage-context` | _(no single-feature commit; see Path Ownership)_ | 20 (20 primary) | server usage limits + web context indicator | fact | Provider usage limits and the automatic-compact point projected onto the `session.usage` event, the context-usage settings page, cost formatting, and the stable-limits hook. | Context and provider usage were never projected to the client, so a user could not see how close a session was to compaction or to a provider cap. Derived from FEATURE_MAP S24; the residual in `web/src/lib/sse.ts` and `events.ts` is the wire contract for both fields. |
 | `S25-agent-library` | `c1e143896` `08276393f` | 66 (48 primary) | server builtin agents + web agent library | fact | A reusable custom Agent library — storage, routes, the library UI, badges and editor entry points, hardened alongside usage and Host self-update. | Custom agents had no shared library, so every session re-declared them. Derived from FEATURE_MAP S25, which records #6633 as filing the library reordering only. |
 | `S26-archive-library` | `7e5f92fe0` `c0f827088` `2873e0c4a` `1b1e27a24` `2e3f454c6` `c732c3b25` `02a934b7f` `53e02dada` | 63 (50 primary) | server archive + web library | fact | A searchable, responsive Archive Library — bounded pagination and server facets, date dimensions and rolling presets, transcript search, the archive-from-menu flow with same-tick duplicate suppression, and per-viewer project filters. | Archived sessions were unreachable except by a direct link. Derived from FEATURE_MAP S26, which records that the old 65-file monolith is not the final stack. |
+| `S27-project-assignments` | `c69a929fd` `002c1776f` `2e5f8de3d` `99a88d24a` `d033eda95` `9280f21c3` `a59d9cf67` `968ffe21f` `96bb03f8b` `e909d62f6` `baf861d48` (merge `c3608f4de`) | 77 (53 primary) | server + host + runner + web project collaboration | fact | Cross-host project assignments behind `Feature.PROJECT_ASSIGNMENTS`: per-project collaboration switch, registered repositories and per-host directory bindings; an assignment store and REST routes; host frames that prepare and release a git worktree under `<binding>/.omnigent/worktrees/`; a coordinator that claims, places, watches liveness and releases; seven agent-facing `sys_assignment_*` tools carried by the session-init snapshot; the project settings collaboration UI; and a rebind that re-sends the session-init envelope. | A session could not hand a unit of work to a named agent on another host durably: the work had to be re-explained by hand and its artifacts copied between machines. The owner asked for it as a general omnigent capability (task T260912-020), with artifacts carried by git refs so every pickup is reproducible. |
 | `F24-custom-host-maintenance` | `1d6736bc4` `7c7ce9b03` `9ccc2c4d9` `18b426fa3` `b87cb8af3` | 13 (11 primary) | host update channel, service lifecycle, db lineage migrations | decision | The private custom update channel and its slash-bearing refs, mixed-generation Mac self-update, the launchd shutdown wait, and the migrations that join the custom and upstream schema lineages. | This fork ships its own build to every host and to the fn server, so it needs an update channel and lineage migrations upstream has no reason to carry. Derived from FEATURE_MAP F24, which records custom update and compatibility maintenance as deliberately unfiled. |
 | `F26-deploy-environment` | `eb654e7ec` | 6 (6 primary) | docker entrypoint, databricks deploy | decision | Legacy schema repair on container startup and deployment-local adjustments. | The fn server's container starts from a database predating the current schema and must repair it before serving. Derived from FEATURE_MAP F26, which records environment configuration and history migration as not published. |
 | `F28-alignment-residuals` | `28a555ae7` `afb2fd534` | 3 (1 primary) | runner background titles, session event routes | decision | The `release(...) -> None` to `-> bool \| None` return-type change and the matching retry event types. | After upstream absorbed the background-title feature (#6171, merged), the local retry and event types no longer lined up with the release signature. Derived from commit `afb2fd534 align title release and retry event types`; FEATURE_MAP F28 assigns alignment fixes to the original feature's owner. This row explicitly does NOT claim #6171's own feature — that is upstream's. |
@@ -161,6 +163,8 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 
 **The table has grown past that snapshot and has NOT been regenerated since.** It now holds 450 rows: the 443 above plus 7 test files added by OMN10 (`tests/runner/test_native_pane_absent_probe.py`, `..._reap_outcome.py`, `test_terminal_closing_outcome.py`, `tests/server/test_cli_retention_round2.py`, `..._round3.py`, `test_host_cli_retention_reset.py`, `test_archive_fence_stale_claim.py`). Separately, the upstream re-align of 260913 put the local-mod surface at 450 *files* (see the header and the Narrative entry) — that number is a coincidence, not a match, and the two sets are not the same. A path added since `5ab623360` and not listed here is unregistered, not upstream-owned: regenerate before trusting the "none unowned" claim.
 
+**Grown again on 2026-09-14, still not a full regeneration:** merge `c3608f4de` brought `S27-project-assignments` (77 paths). 53 paths are new rows with that row as `primary`; 24 already had rows and gain it in `also` without their `primary` changing. The table now holds 503 rows. Measured against `git diff --name-only upstream/main...local/host-custom` at `c3608f4de` (514 paths): 13 residual paths still have no row and 2 rows name paths no longer in the residual — all from before this row (the 260913 re-align's migrations and composer files, two storybook baselines), left for the next full regeneration.
+
 `evidence` records how `primary` was decided: `diff-read` the hunk was read by hand; `commit` the path's single-feature commits agree; `path` the filename names the feature; `last-commit` several features touch an aggregate file and the most recent intent won — that tier is a PR-cut hint, not an ownership claim.
 
 | path | primary | also | evidence |
@@ -168,18 +172,19 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `.gitattributes` | `S09-dictation-punctuation` |  | commit |
 | `LOCAL_MODS.md` | `local-ledger` | `S04-askuserquestion-wait`, `S21-claude-native-control`, `S23-host-cli-retention` | path |
 | `NOTICE` | `F26-deploy-environment` |  | path |
-| `deploy/databricks/src/app.py` | `F26-deploy-environment` |  | path |
-| `deploy/docker/entrypoint.py` | `F26-deploy-environment` |  | commit |
+| `deploy/databricks/src/app.py` | `F26-deploy-environment` | `S27-project-assignments` | path |
+| `deploy/docker/entrypoint.py` | `F26-deploy-environment` | `S27-project-assignments` | commit |
 | `designs/main-session-cli-retention.md` | `S23-host-cli-retention` |  | commit |
 | `designs/server-dictation.md` | `S09-dictation-punctuation` |  | commit |
 | `omnigent/chat.py` | `S23-host-cli-retention` |  | diff-read |
 | `omnigent/claude_native_status_probe.py` | `S21-claude-native-control` |  | commit |
-| `omnigent/cli.py` | `S03-windows-host-fixes` | `F24-custom-host-maintenance`, `S25-agent-library` | last-commit |
+| `omnigent/cli.py` | `S03-windows-host-fixes` | `F24-custom-host-maintenance`, `S25-agent-library`, `S27-project-assignments` | last-commit |
 | `omnigent/cli_retention.py` | `S23-host-cli-retention` |  | commit |
 | `omnigent/codex_rate_limits.py` | `S25-agent-library` | `S24-usage-context` | commit |
-| `omnigent/db/db_models.py` | `S25-agent-library` | `S07-host-roots-picker`, `S23-host-cli-retention` | last-commit |
+| `omnigent/db/db_models.py` | `S25-agent-library` | `S07-host-roots-picker`, `S23-host-cli-retention`, `S27-project-assignments` | last-commit |
 | `omnigent/db/migrations/versions/a09c20260909_merge_custom_and_current_upstream.py` | `F24-custom-host-maintenance` |  | path |
 | `omnigent/db/migrations/versions/a10c20260910_merge_custom_retention_and_upstream.py` | `S23-host-cli-retention` |  | path |
+| `omnigent/db/migrations/versions/a12c20260913_add_project_assignments.py` | `S27-project-assignments` |  | commit |
 | `omnigent/db/migrations/versions/f6a1b2c3d4e5_add_host_default_workspace.py` | `S07-host-roots-picker` |  | commit |
 | `omnigent/db/migrations/versions/f7a1b2c3d4e5_add_user_preferences.py` | `S06-preference-sync` |  | path |
 | `omnigent/db/migrations/versions/f8a1b2c3d4e5_add_archived_at.py` | `S26-archive-library` |  | path |
@@ -191,7 +196,12 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `omnigent/db/migrations/versions/fe1b2c3d4e5_add_host_cli_retention_policy.py` | `S23-host-cli-retention` |  | commit |
 | `omnigent/db/migrations/versions/ff1b2c3d4e5_add_archive_close_intent.py` | `S23-host-cli-retention` |  | commit |
 | `omnigent/db/utils.py` | `S26-archive-library` |  | commit |
+| `omnigent/entities/__init__.py` | `S27-project-assignments` |  | commit |
+| `omnigent/entities/assignment.py` | `S27-project-assignments` |  | commit |
 | `omnigent/entities/conversation.py` | `S21-claude-native-control` | `S23-host-cli-retention`, `S26-archive-library` | last-commit |
+| `omnigent/entities/project.py` | `S27-project-assignments` |  | commit |
+| `omnigent/entities/project_host_binding.py` | `S27-project-assignments` |  | commit |
+| `omnigent/entities/project_repository.py` | `S27-project-assignments` |  | commit |
 | `omnigent/harnesses/claude_native/bridge.py` | `S21-claude-native-control` | `S19-native-goal`, `S04-askuserquestion-wait` | path |
 | `omnigent/harnesses/claude_native/forwarder.py` | `S21-claude-native-control` |  | commit |
 | `omnigent/harnesses/claude_native/main.py` | `S21-claude-native-control` |  | path |
@@ -201,8 +211,10 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `omnigent/harnesses/codex_native/bridge.py` | `S20-codex-child-inventory` |  | path |
 | `omnigent/harnesses/codex_native/forwarder.py` | `S20-codex-child-inventory` |  | path |
 | `omnigent/harnesses/codex_native/main.py` | `S20-codex-child-inventory` |  | path |
-| `omnigent/host/connect.py` | `S07-host-roots-picker` | `S25-agent-library`, `S24-usage-context` | last-commit |
-| `omnigent/host/frames.py` | `S25-agent-library` |  | commit |
+| `omnigent/host/assignment_workspace.py` | `S27-project-assignments` |  | commit |
+| `omnigent/host/connect.py` | `S07-host-roots-picker` | `S25-agent-library`, `S24-usage-context`, `S27-project-assignments` | last-commit |
+| `omnigent/host/frames.py` | `S25-agent-library` | `S27-project-assignments` | commit |
+| `omnigent/host/git_worktree.py` | `S27-project-assignments` |  | commit |
 | `omnigent/host/service.py` | `F24-custom-host-maintenance` |  | commit |
 | `omnigent/host/windows_custom_update.ps1` | `F24-custom-host-maintenance` |  | commit |
 | `omnigent/inner/acp_executor.py` | `S10-inline-attachments` |  | commit |
@@ -213,64 +225,84 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `omnigent/inner/qwen_executor.py` | `S10-inline-attachments` |  | commit |
 | `omnigent/native/_native_post_delivery.py` | `S21-claude-native-control` |  | path |
 | `omnigent/native_subagent_snapshot.py` | `S21-claude-native-control` |  | path |
+| `omnigent/project_context.py` | `S27-project-assignments` |  | commit |
 | `omnigent/provider_usage_limits.py` | `S24-usage-context` |  | path |
 | `omnigent/resources/examples/codex-sdk.yaml` | `S25-agent-library` |  | commit |
-| `omnigent/runner/app.py` | `S21-claude-native-control` | `S19-native-goal`, `S23-host-cli-retention` | last-commit |
+| `omnigent/runner/app.py` | `S21-claude-native-control` | `S19-native-goal`, `S23-host-cli-retention`, `S27-project-assignments` | last-commit |
+| `omnigent/runner/assignment_tools.py` | `S27-project-assignments` |  | commit |
 | `omnigent/runner/background_titles/service.py` | `F28-alignment-residuals` |  | commit |
 | `omnigent/runner/identity.py` | `S06-preference-sync` |  | path |
 | `omnigent/runner/native/interrupt.py` | `S23-host-cli-retention` | `S19-native-goal` | last-commit |
-| `omnigent/runner/native/orchestration.py` | `S21-claude-native-control` | `S23-host-cli-retention` | last-commit |
+| `omnigent/runner/native/orchestration.py` | `S21-claude-native-control` | `S23-host-cli-retention`, `S27-project-assignments` | last-commit |
 | `omnigent/runner/resource_registry.py` | `S21-claude-native-control` | `S23-host-cli-retention` | last-commit |
-| `omnigent/runner/session_init_protocol.py` | `S23-host-cli-retention` |  | commit |
+| `omnigent/runner/session_init_protocol.py` | `S23-host-cli-retention` | `S27-project-assignments` | commit |
 | `omnigent/runner/session_runtime_lifecycle.py` | `S23-host-cli-retention` |  | commit |
-| `omnigent/runner/tool_dispatch.py` | `S21-claude-native-control` |  | commit |
+| `omnigent/runner/tool_dispatch.py` | `S21-claude-native-control` | `S27-project-assignments` | commit |
 | `omnigent/runtime/agent_cache.py` | `S05-agent-cache` |  | path |
 | `omnigent/runtime/harnesses/process_manager.py` | `S23-host-cli-retention` |  | commit |
 | `omnigent/runtime/pending_elicitations.py` | `S21-claude-native-control` |  | commit |
 | `omnigent/runtime/pending_inputs.py` | `S10-inline-attachments` |  | commit |
 | `omnigent/runtime/session_stream.py` | `S21-claude-native-control` |  | commit |
 | `omnigent/runtime/subagent_block_notifier.py` | `S21-claude-native-control` |  | commit |
-| `omnigent/server/app.py` | `S25-agent-library` | `S09-dictation-punctuation`, `S23-host-cli-retention` | last-commit |
+| `omnigent/server/app.py` | `S25-agent-library` | `S09-dictation-punctuation`, `S23-host-cli-retention`, `S27-project-assignments` | last-commit |
 | `omnigent/server/archive_close.py` | `S23-host-cli-retention` |  | commit |
+| `omnigent/server/assignment_host.py` | `S27-project-assignments` |  | commit |
+| `omnigent/server/assignments.py` | `S27-project-assignments` |  | commit |
 | `omnigent/server/cli_release_store.py` | `S23-host-cli-retention` |  | commit |
 | `omnigent/server/cli_retention.py` | `S23-host-cli-retention` |  | commit |
 | `omnigent/server/custom_agent_bundles.py` | `S25-agent-library` |  | commit |
 | `omnigent/server/custom_agents_store.py` | `S25-agent-library` |  | commit |
 | `omnigent/server/dictation.py` | `S09-dictation-punctuation` |  | commit |
 | `omnigent/server/dictation_worker.py` | `S09-dictation-punctuation` |  | path |
+| `omnigent/server/feature_flags.py` | `S27-project-assignments` |  | commit |
+| `omnigent/server/host_registry.py` | `S27-project-assignments` |  | commit |
 | `omnigent/server/native_subagent_watchdog.py` | `S21-claude-native-control` |  | path |
 | `omnigent/server/routes/_sessions/common.py` | `S21-claude-native-control` | `S19-native-goal` | last-commit |
 | `omnigent/server/routes/_sessions/helpers.py` | `S21-claude-native-control` | `S10-inline-attachments`, `S19-native-goal`, `S23-host-cli-retention` | last-commit |
-| `omnigent/server/routes/_sessions/orchestration.py` | `S21-claude-native-control` | `S10-inline-attachments`, `S19-native-goal`, `S23-host-cli-retention`, `S25-agent-library`, `S26-archive-library` | last-commit |
+| `omnigent/server/routes/_sessions/orchestration.py` | `S21-claude-native-control` | `S10-inline-attachments`, `S19-native-goal`, `S23-host-cli-retention`, `S25-agent-library`, `S26-archive-library`, `S27-project-assignments` | last-commit |
 | `omnigent/server/routes/_sessions/subagent_reconciliation.py` | `S21-claude-native-control` |  | commit |
 | `omnigent/server/routes/_workspace_validation.py` | `S07-host-roots-picker` | `S03-windows-host-fixes` | last-commit |
+| `omnigent/server/routes/assignments.py` | `S27-project-assignments` |  | commit |
 | `omnigent/server/routes/builtin_agents.py` | `S25-agent-library` |  | path |
 | `omnigent/server/routes/codex/sessions.py` | `S19-native-goal` |  | commit |
 | `omnigent/server/routes/custom_agents.py` | `S25-agent-library` |  | commit |
 | `omnigent/server/routes/dictation.py` | `S09-dictation-punctuation` |  | commit |
-| `omnigent/server/routes/host_tunnel.py` | `S06-preference-sync` |  | path |
+| `omnigent/server/routes/host_tunnel.py` | `S06-preference-sync` | `S27-project-assignments` | path |
 | `omnigent/server/routes/hosts.py` | `S03-windows-host-fixes` | `S07-host-roots-picker`, `S23-host-cli-retention`, `S24-usage-context` | last-commit |
+| `omnigent/server/routes/project_collaboration.py` | `S27-project-assignments` |  | commit |
 | `omnigent/server/routes/sessions/__init__.py` | `S23-host-cli-retention` |  | commit |
 | `omnigent/server/routes/sessions/routes_agent.py` | `S25-agent-library` |  | path |
-| `omnigent/server/routes/sessions/routes_core.py` | `S21-claude-native-control` | `S23-host-cli-retention`, `S25-agent-library`, `S26-archive-library` | last-commit |
+| `omnigent/server/routes/sessions/routes_core.py` | `S21-claude-native-control` | `S23-host-cli-retention`, `S25-agent-library`, `S26-archive-library`, `S27-project-assignments` | last-commit |
 | `omnigent/server/routes/sessions/routes_events.py` | `S21-claude-native-control` | `F28-alignment-residuals`, `S19-native-goal`, `S23-host-cli-retention` | last-commit |
 | `omnigent/server/routes/sessions/routes_hooks.py` | `S05-agent-cache` |  | diff-read |
 | `omnigent/server/routes/sessions/routes_items.py` | `S26-archive-library` | `S21-claude-native-control` | last-commit |
 | `omnigent/server/routes/sessions/routes_resources.py` | `S21-claude-native-control` |  | commit |
-| `omnigent/server/runner_session_init.py` | `S23-host-cli-retention` |  | commit |
+| `omnigent/server/runner_session_init.py` | `S23-host-cli-retention` | `S27-project-assignments` | commit |
 | `omnigent/server/schemas.py` | `S21-claude-native-control` | `S19-native-goal`, `S25-agent-library`, `S26-archive-library` | last-commit |
 | `omnigent/server/user_preferences_store.py` | `S25-agent-library` |  | commit |
 | `omnigent/session_todos.py` | `S18-native-plan` |  | diff-read |
 | `omnigent/stores/agent_store/__init__.py` | `S25-agent-library` |  | commit |
 | `omnigent/stores/agent_store/sqlalchemy_store.py` | `S25-agent-library` |  | commit |
+| `omnigent/stores/assignment_store/__init__.py` | `S27-project-assignments` |  | commit |
+| `omnigent/stores/assignment_store/sqlalchemy_store.py` | `S27-project-assignments` |  | commit |
 | `omnigent/stores/conversation_store/__init__.py` | `S21-claude-native-control` | `S23-host-cli-retention`, `S26-archive-library` | last-commit |
 | `omnigent/stores/conversation_store/sqlalchemy_store.py` | `S26-archive-library` | `S21-claude-native-control`, `S23-host-cli-retention`, `S25-agent-library` | last-commit |
 | `omnigent/stores/host_store.py` | `S07-host-roots-picker` | `S23-host-cli-retention` | last-commit |
+| `omnigent/stores/project_host_binding_store/__init__.py` | `S27-project-assignments` |  | commit |
+| `omnigent/stores/project_host_binding_store/sqlalchemy_store.py` | `S27-project-assignments` |  | commit |
+| `omnigent/stores/project_repository_store/__init__.py` | `S27-project-assignments` |  | commit |
+| `omnigent/stores/project_repository_store/sqlalchemy_store.py` | `S27-project-assignments` |  | commit |
+| `omnigent/stores/project_store/__init__.py` | `S27-project-assignments` |  | commit |
+| `omnigent/stores/project_store/sqlalchemy_store.py` | `S27-project-assignments` |  | commit |
 | `omnigent/terminals/pane_reaper.py` | `S23-host-cli-retention` |  | commit |
 | `omnigent/terminals/registry.py` | `S23-host-cli-retention` |  | commit |
+| `omnigent/tools/builtins/__init__.py` | `S27-project-assignments` |  | commit |
+| `omnigent/tools/builtins/assignments.py` | `S27-project-assignments` |  | commit |
+| `omnigent/tools/manager.py` | `S27-project-assignments` |  | commit |
 | `omnigent/update_check.py` | `F24-custom-host-maintenance` |  | commit |
-| `openapi.json` | `S21-claude-native-control` | `S07-host-roots-picker`, `S09-dictation-punctuation`, `S19-native-goal`, `S23-host-cli-retention`, `S25-agent-library`, `S26-archive-library` | last-commit |
+| `openapi.json` | `S21-claude-native-control` | `S07-host-roots-picker`, `S09-dictation-punctuation`, `S19-native-goal`, `S23-host-cli-retention`, `S25-agent-library`, `S26-archive-library`, `S27-project-assignments` | last-commit |
 | `pyproject.toml` | `F24-custom-host-maintenance` |  | commit |
+| `scripts/dump_openapi.py` | `S27-project-assignments` |  | commit |
 | `scripts/fetch-dictation-models.sh` | `S09-dictation-punctuation` |  | commit |
 | `tests/cli/test_backend.py` | `F24-custom-host-maintenance` | `S25-agent-library` | last-commit |
 | `tests/cli/test_chat.py` | `S23-host-cli-retention` |  | diff-read |
@@ -279,17 +311,20 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `tests/codex_parity/test_codex_goal.py` | `S19-native-goal` |  | commit |
 | `tests/db/test_migration_archive_close_intent.py` | `S23-host-cli-retention` |  | commit |
 | `tests/db/test_migration_archived_at_backfill.py` | `S26-archive-library` |  | path |
-| `tests/db/test_migration_connections.py` | `S23-host-cli-retention` | `F24-custom-host-maintenance` | last-commit |
+| `tests/db/test_migration_connections.py` | `S23-host-cli-retention` | `F24-custom-host-maintenance`, `S27-project-assignments` | last-commit |
 | `tests/db/test_migration_custom_upstream_join.py` | `F24-custom-host-maintenance` |  | diff-read |
 | `tests/db/test_migration_host_cli_retention.py` | `S23-host-cli-retention` |  | commit |
 | `tests/db/test_migration_provider_usage_limits.py` | `S24-usage-context` |  | path |
 | `tests/db/test_migration_session_todos.py` | `S18-native-plan` |  | diff-read |
 | `tests/db/test_migration_user_preferences.py` | `S06-preference-sync` |  | path |
+| `tests/db/test_project_assignments_migration.py` | `S27-project-assignments` |  | commit |
 | `tests/db/test_utils.py` | `S26-archive-library` |  | commit |
 | `tests/deploy/test_databricks_app_lakebase_cold_start.py` | `F26-deploy-environment` |  | path |
 | `tests/deploy/test_databricks_web_ui.py` | `F26-deploy-environment` |  | path |
 | `tests/deploy/test_docker_entrypoint_import.py` | `F26-deploy-environment` |  | commit |
+| `tests/e2e/assignment_env.py` | `S27-project-assignments` |  | commit |
 | `tests/e2e/test_archive_library_filter_e2e.py` | `S26-archive-library` |  | commit |
+| `tests/e2e/test_project_assignments_e2e.py` | `S27-project-assignments` |  | commit |
 | `tests/e2e/test_user_preferences_api_e2e.py` | `S06-preference-sync` |  | path |
 | `tests/e2e_ui/chat/test_native_goal_projection.py` | `S19-native-goal` |  | commit |
 | `tests/e2e_ui/chat/test_plan_tracker.py` | `S18-native-plan` |  | path |
@@ -298,15 +333,18 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `tests/e2e_ui/mobile/test_ios_switcher_in_header.py` | `S14-navigation-titles` |  | path |
 | `tests/e2e_ui/sessions/test_archived_date_filter.py` | `S26-archive-library` |  | commit |
 | `tests/e2e_ui/sessions/test_archived_project_filter.py` | `S26-archive-library` |  | path |
+| `tests/e2e_ui/sessions/test_project_collaboration_settings.py` | `S27-project-assignments` |  | commit |
 | `tests/e2e_ui/shells/test_terminal_ime_composition.py` | `S01-mobile-terminal-ime` |  | path |
 | `tests/e2e_ui/start_session/test_project_config_prefill.py` | `S08-project-target-cwd` |  | path |
 | `tests/e2e_ui/start_session/test_windows_workspace_picker.py` | `S07-host-roots-picker` | `S03-windows-host-fixes` | path |
 | `tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-workspace-workspacepicker--populated-with-conflict][linux].png` | `S07-host-roots-picker` |  | commit |
 | `tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-workspace-workspacepicker--typed-filter][linux].png` | `S07-host-roots-picker` |  | commit |
+| `tests/entities/test_assignment.py` | `S27-project-assignments` |  | commit |
 | `tests/entities/test_conversation_extended.py` | `S21-claude-native-control` |  | commit |
-| `tests/host/test_connect.py` | `S07-host-roots-picker` | `S25-agent-library`, `S24-usage-context` | last-commit |
+| `tests/host/test_assignment_workspace.py` | `S27-project-assignments` |  | commit |
+| `tests/host/test_connect.py` | `S07-host-roots-picker` | `S25-agent-library`, `S24-usage-context`, `S27-project-assignments` | last-commit |
 | `tests/host/test_custom_update.py` | `F24-custom-host-maintenance` | `S03-windows-host-fixes` | path |
-| `tests/host/test_frames.py` | `S25-agent-library` |  | commit |
+| `tests/host/test_frames.py` | `S25-agent-library` | `S27-project-assignments` | commit |
 | `tests/host/test_service.py` | `F24-custom-host-maintenance` |  | commit |
 | `tests/inner/test_acp_executor.py` | `S10-inline-attachments` |  | commit |
 | `tests/inner/test_claude_native_executor.py` | `S10-inline-attachments` |  | commit |
@@ -314,13 +352,17 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `tests/inner/test_goose_executor.py` | `S10-inline-attachments` |  | commit |
 | `tests/inner/test_os_env.py` | `S03-windows-host-fixes` |  | commit |
 | `tests/inner/test_qwen_executor.py` | `S10-inline-attachments` |  | commit |
+| `tests/integration/test_project_assignments_offline_host.py` | `S27-project-assignments` |  | commit |
 | `tests/runner/conftest.py` | `S23-host-cli-retention` |  | commit |
 | `tests/runner/test_app_native_subagent_status_probe.py` | `S21-claude-native-control` |  | commit |
 | `tests/runner/test_app_sessions_native_events_lifecycle.py` | `S21-claude-native-control` |  | path |
 | `tests/runner/test_app_sessions_native_supervision.py` | `S21-claude-native-control` | `S19-native-goal` | last-commit |
 | `tests/runner/test_app_sessions_native_terminals_autocreate.py` | `S21-claude-native-control` |  | commit |
 | `tests/runner/test_app_sessions_native_terminals_runtime.py` | `S21-claude-native-control` |  | path |
-| `tests/runner/test_app_sessions_native_workflow_init.py` | `S21-claude-native-control` |  | commit |
+| `tests/runner/test_app_sessions_native_workflow_init.py` | `S21-claude-native-control` | `S27-project-assignments` | commit |
+| `tests/runner/test_assignment_dispatch_complete.py` | `S27-project-assignments` |  | commit |
+| `tests/runner/test_assignment_flag_transport.py` | `S27-project-assignments` |  | commit |
+| `tests/runner/test_assignment_tool_crud.py` | `S27-project-assignments` |  | commit |
 | `tests/runner/test_cli_retention.py` | `S23-host-cli-retention` |  | commit |
 | `tests/runner/test_comment_relay.py` | `S21-claude-native-control` |  | commit |
 | `tests/runner/test_native_interrupt_runner.py` | `S23-host-cli-retention` | `S19-native-goal` | last-commit |
@@ -341,13 +383,17 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `tests/runtime/test_subagent_block_notifier.py` | `S21-claude-native-control` |  | commit |
 | `tests/server/integration/test_agent_cache_responsiveness.py` | `S05-agent-cache` |  | path |
 | `tests/server/integration/test_hosts_api.py` | `S23-host-cli-retention` | `S07-host-roots-picker`, `S24-usage-context` | last-commit |
+| `tests/server/integration/test_hosts_assignments.py` | `S27-project-assignments` |  | commit |
 | `tests/server/integration/test_hosts_filesystem.py` | `S03-windows-host-fixes` | `S07-host-roots-picker` | last-commit |
 | `tests/server/integration/test_sessions_archive.py` | `S23-host-cli-retention` |  | commit |
 | `tests/server/integration/test_sessions_child_sessions.py` | `S21-claude-native-control` |  | commit |
-| `tests/server/integration/test_sessions_endpoints.py` | `S21-claude-native-control` | `S19-native-goal`, `S26-archive-library` | last-commit |
+| `tests/server/integration/test_sessions_endpoints.py` | `S21-claude-native-control` | `S19-native-goal`, `S26-archive-library`, `S27-project-assignments` | last-commit |
+| `tests/server/integration/test_utility_endpoints.py` | `S27-project-assignments` |  | commit |
+| `tests/server/routes/test_assignment_routes.py` | `S27-project-assignments` |  | commit |
 | `tests/server/routes/test_child_session_summary_labels.py` | `S21-claude-native-control` |  | commit |
 | `tests/server/routes/test_dictation.py` | `S09-dictation-punctuation` |  | commit |
 | `tests/server/routes/test_inline_attachment_order.py` | `S10-inline-attachments` |  | commit |
+| `tests/server/routes/test_project_collaboration_routes.py` | `S27-project-assignments` |  | commit |
 | `tests/server/routes/test_provider_usage_snapshot_fallback.py` | `S24-usage-context` |  | path |
 | `tests/server/routes/test_session_resources.py` | `S21-claude-native-control` |  | commit |
 | `tests/server/routes/test_session_updates_ws.py` | `S21-claude-native-control` |  | commit |
@@ -360,6 +406,8 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `tests/server/routes/test_workspace_validation_helpers.py` | `S03-windows-host-fixes` | `S07-host-roots-picker` | last-commit |
 | `tests/server/test_app.py` | `S25-agent-library` |  | commit |
 | `tests/server/test_archive_fence_stale_claim.py` | `S26-archive-library` |  | commit |
+| `tests/server/test_assignment_coordinator.py` | `S27-project-assignments` |  | commit |
+| `tests/server/test_assignment_session_init_flag.py` | `S27-project-assignments` |  | commit |
 | `tests/server/test_cli_release_intents.py` | `S23-host-cli-retention` |  | commit |
 | `tests/server/test_cli_retention.py` | `S23-host-cli-retention` |  | commit |
 | `tests/server/test_cli_retention_round2.py` | `S23-host-cli-retention` |  | commit |
@@ -367,15 +415,18 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `tests/server/test_custom_agents.py` | `S25-agent-library` |  | commit |
 | `tests/server/test_dictation_engine.py` | `S09-dictation-punctuation` |  | commit |
 | `tests/server/test_dictation_remote.py` | `S09-dictation-punctuation` |  | path |
+| `tests/server/test_feature_flags.py` | `S27-project-assignments` |  | commit |
 | `tests/server/test_host_cli_retention_reset.py` | `S23-host-cli-retention` |  | commit |
 | `tests/server/test_native_subagent_watchdog.py` | `S21-claude-native-control` |  | commit |
 | `tests/server/test_runner_session_init.py` | `S23-host-cli-retention` |  | commit |
 | `tests/server/test_schemas.py` | `S21-claude-native-control` |  | commit |
 | `tests/server/test_session_live_state.py` | `S21-claude-native-control` |  | commit |
 | `tests/server/test_user_preferences.py` | `S25-agent-library` |  | commit |
+| `tests/stores/test_assignment_store.py` | `S27-project-assignments` |  | commit |
 | `tests/stores/test_conversation_store.py` | `S25-agent-library` | `S21-claude-native-control`, `S26-archive-library` | last-commit |
 | `tests/stores/test_host_store.py` | `S07-host-roots-picker` | `S23-host-cli-retention` | last-commit |
 | `tests/stores/test_native_reasoning_recovery.py` | `S21-claude-native-control` |  | path |
+| `tests/stores/test_project_collaboration_stores.py` | `S27-project-assignments` |  | commit |
 | `tests/terminals/test_pane_reaper.py` | `S23-host-cli-retention` |  | commit |
 | `tests/terminals/test_registry.py` | `S23-host-cli-retention` |  | commit |
 | `tests/test_claude_native.py` | `S21-claude-native-control` | `S10-inline-attachments` | path |
@@ -394,7 +445,9 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `tests/test_codex_rate_limits.py` | `S25-agent-library` | `S24-usage-context` | commit |
 | `tests/test_native_forwarder_binding.py` | `S21-claude-native-control` |  | path |
 | `tests/test_native_subagent_snapshots.py` | `S21-claude-native-control` |  | path |
+| `tests/test_project_context.py` | `S27-project-assignments` |  | commit |
 | `tests/test_provider_usage_limits.py` | `S24-usage-context` |  | path |
+| `tests/tools/test_assignment_tools.py` | `S27-project-assignments` |  | commit |
 | `web/electron/README.md` | `S26-archive-library` |  | commit |
 | `web/electron/src/deepLink.js` | `S26-archive-library` |  | commit |
 | `web/electron/test/deepLink.test.js` | `S26-archive-library` |  | commit |
@@ -499,7 +552,7 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `web/src/lib/archiveDateRange.ts` | `S26-archive-library` |  | commit |
 | `web/src/lib/bootCapabilities.ts` | `S09-dictation-punctuation` |  | commit |
 | `web/src/lib/capabilities.test.ts` | `S09-dictation-punctuation` |  | commit |
-| `web/src/lib/capabilities.ts` | `S09-dictation-punctuation` |  | commit |
+| `web/src/lib/capabilities.ts` | `S09-dictation-punctuation` | `S27-project-assignments` | commit |
 | `web/src/lib/composerContent.test.ts` | `S10-inline-attachments` |  | commit |
 | `web/src/lib/composerContent.ts` | `S10-inline-attachments` |  | commit |
 | `web/src/lib/composerSendShortcutPreferences.test.ts` | `S11-configurable-hotkeys` |  | path |
@@ -526,6 +579,8 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `web/src/lib/mobileAssistantPreferences.ts` | `S13-mobile-assistant` |  | path |
 | `web/src/lib/newSessionTarget.test.ts` | `S08-project-target-cwd` |  | path |
 | `web/src/lib/newSessionTarget.ts` | `S08-project-target-cwd` |  | path |
+| `web/src/lib/projectsApi.test.ts` | `S27-project-assignments` |  | commit |
+| `web/src/lib/projectsApi.ts` | `S27-project-assignments` |  | commit |
 | `web/src/lib/providerUsageLimits.test.ts` | `S25-agent-library` |  | commit |
 | `web/src/lib/providerUsageLimits.ts` | `S25-agent-library` |  | commit |
 | `web/src/lib/sessionEvents.test.ts` | `S24-usage-context` |  | diff-read |
@@ -583,8 +638,10 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
 | `web/src/shell/NewChatDialog.test.tsx` | `S08-project-target-cwd` | `S07-host-roots-picker`, `S10-inline-attachments`, `S25-agent-library`, `S26-archive-library` | path |
 | `web/src/shell/NewChatDialog.tsx` | `S08-project-target-cwd` | `S07-host-roots-picker`, `S10-inline-attachments`, `S11-configurable-hotkeys`, `S25-agent-library` | path |
 | `web/src/shell/NewChatLandingScreen.mobileChrome.test.tsx` | `S07-host-roots-picker` |  | commit |
-| `web/src/shell/ProjectSettingsDialog.test.tsx` | `S07-host-roots-picker` |  | commit |
-| `web/src/shell/ProjectSettingsDialog.tsx` | `S07-host-roots-picker` |  | commit |
+| `web/src/shell/ProjectCollaborationSection.test.tsx` | `S27-project-assignments` |  | commit |
+| `web/src/shell/ProjectCollaborationSection.tsx` | `S27-project-assignments` |  | commit |
+| `web/src/shell/ProjectSettingsDialog.test.tsx` | `S07-host-roots-picker` | `S27-project-assignments` | commit |
+| `web/src/shell/ProjectSettingsDialog.tsx` | `S07-host-roots-picker` | `S27-project-assignments` | commit |
 | `web/src/shell/ReconcileSubagentsButton.test.tsx` | `S21-claude-native-control` |  | diff-read |
 | `web/src/shell/ReconcileSubagentsButton.tsx` | `S21-claude-native-control` |  | diff-read |
 | `web/src/shell/ResumeWithDirectoryDialog.test.tsx` | `S07-host-roots-picker` |  | commit |
@@ -651,6 +708,8 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
   **Five items left open, none a regression** (each site is verifiably better than pre-audit): a permanent tmux probe failure still reads as "confirmed dead" at `runner/app.py:12507`; raising at the reaper does not create a real retry because an absent pane leaves `native_panes()`; a window between stranded-classification and the reset POST at `cli_retention.py:555` needs runner-side host-id fencing; one overlapping external cancel is still absorbed at `routes/hosts.py:1094`; and test scaffolding is duplicated across three modules. Disposition table in the task file. **These must be cleared before the next release of these files.** No release this round — production runs `0ed8c3fc2`, which does not even carry OMN07's `c4318d421`.
 
 - [260913] **Custom re-align: review fixes from the S09 / S24 / W0 / orphan PR branches ported** (board OMN02 / task T260912-012). Port map (codex dig) in the omnigent workspace `T260912-012-phaseB-evidence/R-custom-realign-portmap.md`. Merged `fix/custom-realign-py` as `c63a1d77e` (`54284bd10` orphan owner-lock tests `posix_only`; `49a24e97b` S09 punctuation slot held until cancelled work finishes, plus `ec971566d` worker failures contained inside the shielded task (review round 1: Python 3.14 shield leaked the exception message after a disconnect; 3.12/3.13 silent, reproduced with a standalone probe); `0dfa2edbb` S24 probe teardown finishes and re-raises when cancelled; `7bc389f15` S24 drops `@` limit ids/names and scans at most 64 input buckets; `7222311f8` S24 rechecks Codex readiness after the probe, contains a failed send, quota response `Cache-Control: private, no-store`) and `fix/custom-realign-identity` as `97930dec9` (`5b480f7ca` S06 identity fence: Server-identity key with generation fallback, epoch, discarded-lookup null cleared, preference-sync callback epoch-aware, auto-stamped `X-Forwarded-Email` dropped on a switch during session-host resolve, wrong-replica retry skipped after a switch). Not ported, by design: a readiness publish lock (custom's dedicated quota frame has no race), strict extra-field rejection (custom rebuilds allowlisted output), dictation engine and orphan production code (already equivalent). Verification: 13 new Python tests fail on `3d178074c` sources and pass after; affected Python files pass per file except 4 `test_connect.py` model-catalog/log-dir failures identical on `3d178074c`; web identity 38 passed and 15 host/preference-mock files 249 passed under Node 24 (under Node 26 every localStorage-touching test fails at base and head — run web vitest with `PATH=/opt/homebrew/opt/node@24/bin:$PATH`); 3 new web tests fail on base; tsc, oxlint, prettier, ruff, pyrefly clean; codex review round 1 one P1 (the Python 3.14 shield leak, fixed), round 2 "Lean already. Ship."; merged head passes the affected Python files except the same 4 pre-existing failures, identity 38 passed. Path ownership: `S24-usage-context` added to `also` on six quota paths; `omnigent/codex_rate_limits.py` primary `S25-agent-library` came from the multi-feature commit `08276393f` and is a PR-cut hint only — the S24 row owns the probe residual. No lifecycle or absorption flip. Not installed: Mac and fn still run `50b72941`.
+
+- [260914] **Cross-host project assignments landed** (board OMN09 / task T260912-020, merge `c3608f4de` of `feature/project-assignments` at `baf861d48`, signed). New row `S27-project-assignments`: 77 paths, 53 primary, 24 shared as `also` (the aggregate server, runner and host files, `openapi.json`, and two web files owned by S07 / S09). One migration, `a12c20260913` → `a11c20260912`; no other alembic head existed on the branch at merge time. Everything is dark unless `OMNIGENT_FEATURES` enables `project_assignments`. One fix in shared code rides this row: `PATCH /v1/sessions/{id}` rebind now sends the same session-init envelope as session create (`96bb03f8b`, `routes_core.py`, owned by S21 with S27 in `also`). Release blocked on board OMN13 (the fn cutover refuses schema-changing images); acceptance is the Windows → Mac → Windows round trip on fn. Evidence: the task's pretask Records in the omnigent workspace.
 
 ## Upgrade Checklist
 
