@@ -11,7 +11,6 @@ import asyncio
 import json
 import math
 import time
-from contextlib import suppress
 from typing import Any
 
 from omnigent._platform import resolve_cli_binary
@@ -288,18 +287,34 @@ async def read_codex_rate_limits_snapshot(
             response = await _read_response(proc.stdout, request_id=2)
             return normalize_codex_rate_limits_response(response)
     finally:
+        # Record cancellation and re-raise after teardown so cleanup is not skipped.
+        cancelled: asyncio.CancelledError | None = None
         if proc.returncode is None:
             _proc.terminate_tree(proc)
             try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
+                await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=2.0)
             except TimeoutError:
+                pass
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            if proc.returncode is None:
                 _proc.kill_tree(proc)
-                with suppress(Exception):
-                    await proc.wait()
+                try:
+                    await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=2.0)
+                except asyncio.CancelledError as exc:
+                    cancelled = cancelled or exc
+                except Exception:  # noqa: BLE001 - teardown is best effort
+                    pass
         proc.stdin.close()
-        with suppress(Exception):
-            await proc.stdin.wait_closed()
+        try:
+            await asyncio.wait_for(asyncio.shield(proc.stdin.wait_closed()), timeout=2.0)
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+        except Exception:  # noqa: BLE001 - teardown is best effort
+            pass
         close_subprocess_transport(proc)
+        if cancelled is not None:
+            raise cancelled
 
 
 __all__ = [
