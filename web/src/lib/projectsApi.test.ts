@@ -6,10 +6,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createProject,
   deleteProject,
+  deleteProjectHostBinding,
+  deleteProjectRepository,
   getProject,
+  getProjectCollaboration,
   listProjects,
+  putProjectHostBinding,
+  putProjectRepository,
   renameProject,
+  setProjectCollaborationEnabled,
   updateProjectConfig,
+  verifyProjectHostBinding,
 } from "./projectsApi";
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
@@ -132,5 +139,115 @@ describe("deleteProject", () => {
   it("throws on non-2xx", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
     await expect(deleteProject("missing")).rejects.toThrow();
+  });
+});
+
+describe("getProjectCollaboration", () => {
+  it("GETs /v1/projects/{id}/collaboration", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ enabled: false, revision: 3, repositories: [], bindings: [], problems: [] }),
+    );
+    const result = await getProjectCollaboration("p_1");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p_1/collaboration");
+    // No explicit method — fetch defaults to GET; a POST here must fail.
+    expect(init.method).toBeUndefined();
+    expect(result.revision).toBe(3);
+  });
+});
+
+describe("setProjectCollaborationEnabled", () => {
+  it("PATCHes the switch with the expected revision", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ enabled: true, revision: 4 }));
+    const result = await setProjectCollaborationEnabled("p a", true, 3);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p%20a/collaboration");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({ enabled: true, expected_revision: 3 });
+    expect(result).toEqual({ enabled: true, revision: 4 });
+  });
+});
+
+describe("putProjectRepository", () => {
+  it("PUTs the repository body (url-encoded segments)", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "r_1", name: "web" }));
+    await putProjectRepository("p_1", "web", {
+      remote_url: "https://example.com/web.git",
+      default_branch: "main",
+    });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p_1/repositories/web");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({
+      remote_url: "https://example.com/web.git",
+      default_branch: "main",
+    });
+  });
+});
+
+describe("deleteProjectRepository", () => {
+  it("DELETEs /v1/projects/{id}/repositories/{name}", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ deleted: true }));
+    await deleteProjectRepository("p_1", "web");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p_1/repositories/web");
+    expect(init.method).toBe("DELETE");
+  });
+});
+
+describe("putProjectHostBinding", () => {
+  it("PUTs the binding body (url-encoded segments)", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "b_1", name: "primary" }));
+    await putProjectHostBinding("p_1", "h 1", "primary", {
+      workspace: "/repo",
+      repository_name: "web",
+      is_primary: true,
+      enabled: true,
+    });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p_1/hosts/h%201/bindings/primary");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({
+      workspace: "/repo",
+      repository_name: "web",
+      is_primary: true,
+      enabled: true,
+    });
+  });
+
+  it("surfaces the server code and message on a bad path (400)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "invalid_input", message: "host stat failed for path '/x'" } },
+        { ok: false, status: 400 },
+      ),
+    );
+    const err = await putProjectHostBinding("p_1", "h1", "primary", {
+      workspace: "/x",
+      repository_name: "web",
+    }).catch((e) => e);
+    expect(err.status).toBe(400);
+    expect(err.code).toBe("invalid_input");
+    expect(err.message).toContain("host stat failed");
+  });
+});
+
+describe("deleteProjectHostBinding", () => {
+  it("DELETEs /v1/projects/{id}/hosts/{host_id}/bindings/{name}", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ deleted: true }));
+    await deleteProjectHostBinding("p_1", "h1", "primary");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p_1/hosts/h1/bindings/primary");
+    expect(init.method).toBe("DELETE");
+  });
+});
+
+describe("verifyProjectHostBinding", () => {
+  it("POSTs to .../bindings/{name}/verify", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "b_1", name: "primary" }));
+    await verifyProjectHostBinding("p_1", "h1", "primary");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p_1/hosts/h1/bindings/primary/verify");
+    expect(init.method).toBe("POST");
   });
 });

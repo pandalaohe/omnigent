@@ -11,6 +11,7 @@
 // (`id`, `name`), so no boundary conversion is needed.
 
 import { authenticatedFetch } from "./identity";
+import { apiErrorFromResponse } from "./sessionsApi";
 
 /**
  * Default session settings a project stores, pre-filled into the new-chat
@@ -144,4 +145,157 @@ export async function deleteProject(id: string): Promise<void> {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(await readError(res));
+}
+
+/** A repository registered on a collaboration project. */
+export interface ProjectRepository {
+  id: string;
+  project_id: string;
+  name: string;
+  remote_url: string;
+  default_branch: string;
+  context_manifest_path: string;
+  revision: number;
+  created_at: number;
+  updated_at: number | null;
+}
+
+/** A per-host directory binding of a collaboration project. */
+export interface ProjectHostBinding {
+  id: string;
+  project_id: string;
+  host_id: string;
+  name: string;
+  is_primary: boolean;
+  repository_id: string;
+  workspace: string;
+  enabled: boolean;
+  revision: number;
+  path_verified_at: number | null;
+  created_at: number;
+  updated_at: number | null;
+}
+
+/** Machine-readable collaboration config problem. */
+export type ProjectCollaborationProblem =
+  | { code: "missing_primary"; host_id: string }
+  | { code: "dangling_repository"; binding_id: string; host_id: string; repository_id: string };
+
+/** Collaboration config plus validation status for a project. */
+export interface ProjectCollaboration {
+  enabled: boolean;
+  revision: number;
+  repositories: ProjectRepository[];
+  bindings: ProjectHostBinding[];
+  problems: ProjectCollaborationProblem[];
+}
+
+/** Body for `PUT .../repositories/{name}` (extra keys forbidden server-side). */
+export interface PutProjectRepositoryBody {
+  remote_url: string;
+  default_branch: string;
+  context_manifest_path?: string;
+}
+
+/** Body for `PUT .../hosts/{host_id}/bindings/{name}`. */
+export interface PutProjectHostBindingBody {
+  workspace: string;
+  repository_name: string;
+  is_primary?: boolean;
+  enabled?: boolean;
+}
+
+async function readCollaborationJsonOrThrow<T>(res: Response): Promise<T> {
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as T;
+}
+
+/** Fetch a project's collaboration config plus validation status. */
+export async function getProjectCollaboration(id: string): Promise<ProjectCollaboration> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/collaboration`);
+  return readCollaborationJsonOrThrow<ProjectCollaboration>(res);
+}
+
+/** Flip the collaboration switch with an optimistic-concurrency revision. */
+export async function setProjectCollaborationEnabled(
+  id: string,
+  enabled: boolean,
+  expectedRevision: number,
+): Promise<{ enabled: boolean; revision: number }> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/collaboration`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled, expected_revision: expectedRevision }),
+  });
+  return readCollaborationJsonOrThrow<{ enabled: boolean; revision: number }>(res);
+}
+
+/** Register a repository or revise its registration. */
+export async function putProjectRepository(
+  id: string,
+  name: string,
+  body: PutProjectRepositoryBody,
+): Promise<ProjectRepository> {
+  const res = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(id)}/repositories/${encodeURIComponent(name)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return readCollaborationJsonOrThrow<ProjectRepository>(res);
+}
+
+/** Delete a registered repository. */
+export async function deleteProjectRepository(id: string, name: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(id)}/repositories/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
+/** Validate and store a host binding. */
+export async function putProjectHostBinding(
+  id: string,
+  hostId: string,
+  name: string,
+  body: PutProjectHostBindingBody,
+): Promise<ProjectHostBinding> {
+  const res = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(id)}/hosts/${encodeURIComponent(hostId)}/bindings/${encodeURIComponent(name)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return readCollaborationJsonOrThrow<ProjectHostBinding>(res);
+}
+
+/** Delete a host binding. */
+export async function deleteProjectHostBinding(
+  id: string,
+  hostId: string,
+  name: string,
+): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(id)}/hosts/${encodeURIComponent(hostId)}/bindings/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
+/** Re-run host validation for the stored binding path. */
+export async function verifyProjectHostBinding(
+  id: string,
+  hostId: string,
+  name: string,
+): Promise<ProjectHostBinding> {
+  const res = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(id)}/hosts/${encodeURIComponent(hostId)}/bindings/${encodeURIComponent(name)}/verify`,
+    { method: "POST" },
+  );
+  return readCollaborationJsonOrThrow<ProjectHostBinding>(res);
 }
