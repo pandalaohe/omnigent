@@ -980,13 +980,112 @@ async def test_live_host_publishes_sanitized_codex_rate_limits(
     _cleanup_host(host)
 
 
-async def test_live_host_skips_codex_probe_until_harness_is_ready() -> None:
+async def test_live_host_skips_codex_probe_until_harness_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An unavailable Codex CLI never starts an advisory app-server."""
     host = _make_host_process()
     host._configured_harnesses = {"codex": "needs-auth"}
     assert host._codex_rate_limits_enabled() is False
     host._configured_harnesses = {"codex-native": True}
     assert host._codex_rate_limits_enabled() is True
+
+    snapshot = {
+        "captured_at": 1_900_000_000,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 11.0,
+                        "window_duration_mins": 300,
+                    }
+                ],
+            }
+        ],
+    }
+    probed = asyncio.Event()
+
+    async def _read_while_losing_readiness() -> dict[str, object]:
+        host._configured_harnesses = {"codex": False}
+        probed.set()
+        return snapshot
+
+    monkeypatch.setattr(
+        "omnigent.host.connect.read_codex_rate_limits_snapshot",
+        _read_while_losing_readiness,
+    )
+    monkeypatch.setattr("omnigent.host.connect.CODEX_RATE_LIMITS_REFRESH_INTERVAL_S", 0.01)
+    host._configured_harnesses = {"codex": True}
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+    try:
+        await asyncio.wait_for(probed.wait(), timeout=2.0)
+        await asyncio.sleep(0.05)
+    finally:
+        await _cancel(task)
+
+    assert ws.sent == []
+    assert host._codex_rate_limits is None
+    _cleanup_host(host)
+
+
+async def test_live_host_keeps_quota_loop_alive_after_send_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed quota frame send is contained like a probe failure."""
+    snapshot = {
+        "captured_at": 1_900_000_000,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 11.0,
+                        "window_duration_mins": 300,
+                    }
+                ],
+            }
+        ],
+    }
+
+    async def _read() -> dict[str, object]:
+        return snapshot
+
+    class _FlakyWS(_RecordingWS):
+        """Fake tunnel whose first send fails, then behaves normally."""
+
+        def __init__(self) -> None:
+            """Initialize the frame log and the first-send failure flag."""
+            super().__init__()
+            self._failed_once = False
+
+        async def send(self, data: str) -> None:
+            """Fail the first send; record later sends like the parent."""
+            if not self._failed_once:
+                self._failed_once = True
+                raise ConnectionError("tunnel backpressure")
+            await super().send(data)
+
+    monkeypatch.setattr("omnigent.host.connect.read_codex_rate_limits_snapshot", _read)
+    monkeypatch.setattr("omnigent.host.connect.CODEX_RATE_LIMITS_REFRESH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._configured_harnesses = {"codex": True}
+    ws = _FlakyWS()
+
+    task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    assert host._codex_rate_limits == snapshot
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostCodexRateLimitsFrame)
+    assert refresh.codex_rate_limits == snapshot
     _cleanup_host(host)
 
 
@@ -6202,6 +6301,8 @@ def test_handle_list_dir_empty_path_returns_posix_root(monkeypatch) -> None:
 
     assert result.status == "ok"
     assert [(entry.name, entry.path) for entry in result.entries] == [("/", "/")]
+
+
 @pytest.mark.parametrize("action", ["attach", "remove"])
 async def test_github_pr_update_reports_lock_contention_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str

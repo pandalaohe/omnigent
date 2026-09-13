@@ -270,6 +270,7 @@ async def test_codex_rate_limits_refresh_is_available_only_from_live_host(
             await asyncio.sleep(0.01)
         assert response.status_code == 200
         assert response.json() == {"rate_limits": snapshot}
+        assert response.headers["cache-control"] == "private, no-store"
 
         conn = registry.get(_HOST_ID)
         assert conn is not None
