@@ -248,7 +248,9 @@ def test_custom_update_refuses_to_pause_when_session_query_fails(
     )
     monkeypatch.setattr(cli_module, "_load_existing_host_id", lambda: "host-1")
     monkeypatch.setattr(cli_module, "_list_daemon_records", lambda: [record])
-    monkeypatch.setattr(cli_module, "_daemon_owner_is_live", lambda *_a: True)
+    # One positional parameter, matching the real signature: a ``*_a`` stub
+    # accepts a wrong arity and hides a miscall at the only unmocked call site.
+    monkeypatch.setattr(cli_module, "_daemon_owner_is_live", lambda _record: True)
     monkeypatch.setattr(
         cli_module,
         "_sessions_for_daemon",

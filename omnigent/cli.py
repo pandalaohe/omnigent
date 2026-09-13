@@ -9371,7 +9371,7 @@ def _custom_host_records(host_id: str) -> list[_HostDaemonRecord]:
         record
         for record in _list_daemon_records()
         if (record.host_id or fallback_host_id) == host_id
-        and _daemon_owner_is_live(record, record.target)
+        and _daemon_owner_is_live(record)
     ]
 
 
