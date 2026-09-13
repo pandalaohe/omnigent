@@ -17,6 +17,13 @@ from omnigent.db.db_models import current_workspace_id
 
 _logger = logging.getLogger(__name__)
 
+# Total enumeration passes for one host conversation scan. The conversation
+# store resolves a page cursor with a scalar subquery on the cursor row, so a
+# cursor deleted between pages yields an empty page with has_more=False — the
+# same shape as a genuinely complete enumeration. A truncated pass restarts
+# from the beginning; the bound keeps a churn-heavy host from looping forever.
+_HOST_ENUM_MAX_PASSES = 3
+
 
 class CliRetentionHostLeaseBusy(RuntimeError):
     """Another Server replica currently owns this Host's retention boundary."""
@@ -48,6 +55,19 @@ class CliRetentionHostLease:
         if not renewed:
             self.lost.set()
             raise CliRetentionHostLeaseLost(self.host_id)
+
+
+@dataclass(frozen=True)
+class HostConversationEnumeration:
+    """One host-scoped conversation scan plus its completeness signal.
+
+    ``incomplete`` is True only when every pass hit a deleted cursor row, so
+    the returned rows may be a short list. Callers must report that honestly
+    instead of treating the scan as complete.
+    """
+
+    conversations: list[Any]
+    incomplete: bool
 
 
 @dataclass(frozen=True)
@@ -294,7 +314,8 @@ class CliRetentionCoordinator:
             await asyncio.to_thread(self._intent_store.cancel_pending_idle_for_host, host_id)
         if lease is not None:
             await lease.ensure_owned()
-        conversations = await self._host_conversations(host_id, include_archived=True)
+        enumeration = await self._host_conversations(host_id, include_archived=True)
+        conversations = enumeration.conversations
         reset: list[str] = []
         unavailable: list[str] = []
         for conversation in conversations:
@@ -328,6 +349,7 @@ class CliRetentionCoordinator:
             "policy_revision": policy_revision,
             "reset": reset,
             "unavailable": unavailable,
+            "incomplete": enumeration.incomplete,
             "observed_at": int(time.time()),
         }
         self._last_results[key] = result
@@ -338,22 +360,59 @@ class CliRetentionCoordinator:
         host_id: str,
         *,
         include_archived: bool,
-    ) -> list[Any]:
+    ) -> HostConversationEnumeration:
+        seen: set[str] = set()
         rows: list[Any] = []
-        after: str | None = None
-        while True:
-            page = await asyncio.to_thread(
-                self._conversation_store.list_conversations,
-                limit=500,
-                after=after,
-                kind="default",
-                host_id=host_id,
-                include_archived=include_archived,
-            )
-            rows.extend(page.data)
-            if not page.has_more or not page.last_id:
-                return rows
-            after = page.last_id
+        for pass_no in range(1, _HOST_ENUM_MAX_PASSES + 1):
+            after: str | None = None
+            truncated = False
+            while True:
+                page = await asyncio.to_thread(
+                    self._conversation_store.list_conversations,
+                    limit=500,
+                    after=after,
+                    kind="default",
+                    host_id=host_id,
+                    include_archived=include_archived,
+                )
+                if not page.data and after is not None:
+                    # An empty page past a cursor is anomalous: has_more is a
+                    # limit+1 sentinel, so it means either the cursor row was
+                    # deleted (truncation — the store's cursor subquery matches
+                    # zero rows) or every remaining row was deleted (genuinely
+                    # done). Only this path issues the extra existence check.
+                    cursor_row = await asyncio.to_thread(
+                        self._conversation_store.get_conversation,
+                        after,
+                    )
+                    if cursor_row is not None:
+                        return HostConversationEnumeration(
+                            conversations=rows, incomplete=False
+                        )
+                    _logger.warning(
+                        "Host conversation enumeration truncated for Host %s "
+                        "on pass %d; restarting from the beginning",
+                        host_id,
+                        pass_no,
+                    )
+                    truncated = True
+                    break
+                for conversation in page.data:
+                    if conversation.id in seen:
+                        continue
+                    seen.add(conversation.id)
+                    rows.append(conversation)
+                if not page.has_more or not page.last_id:
+                    return HostConversationEnumeration(
+                        conversations=rows, incomplete=False
+                    )
+                after = page.last_id
+            if not truncated:
+                break
+        # Every pass hit a deleted cursor. Never return the short list as
+        # complete, and never raise: raising would abort the cleanup that
+        # this enumeration exists to serve.
+        return HostConversationEnumeration(conversations=rows, incomplete=True)
 
     async def _roots_with_persisted_descendant_protection(self, root_ids: set[str]) -> set[str]:
         """Return roots with active or undelivered descendants in durable state."""
@@ -460,10 +519,11 @@ class CliRetentionCoordinator:
             return dict(result)
 
         threshold_s = float(policy.idle_threshold_minutes * 60)
-        conversations = await self._host_conversations(
+        enumeration = await self._host_conversations(
             host_id,
             include_archived=not policy.close_on_archive,
         )
+        conversations = enumeration.conversations
         conversations_by_id = {conversation.id: conversation for conversation in conversations}
         protected_by_descendant = await self._roots_with_persisted_descendant_protection(
             set(conversations_by_id)
@@ -684,6 +744,7 @@ class CliRetentionCoordinator:
                 "application": application,
                 "families": families,
                 "scheduled": scheduled,
+                "incomplete": enumeration.incomplete,
             }
             self._last_results[key] = result
             return dict(result)
@@ -737,6 +798,7 @@ class CliRetentionCoordinator:
             "application": application,
             "families": families,
             "released": released,
+            "incomplete": enumeration.incomplete,
         }
         self._last_results[key] = result
         return dict(result)
