@@ -392,8 +392,15 @@ class CliReleaseIntentStore:
                 (target_id, generation) for target_id, generation in rows if generation is not None
             }
 
-    def cancel_pending_idle_for_host(self, host_id: str) -> int:
-        """Cancel idle releases not yet claimed when a Host exits the policy."""
+    def cancel_pending_idle_for_host(self, host_id: str, *, max_policy_revision: int) -> int:
+        """Cancel idle releases not yet claimed when a Host exits the policy.
+
+        Only retires revisions at or below *max_policy_revision*: a replica
+        resetting an older revision must not cancel the pending intents a
+        newer revision just created (``ensure_idle_intent`` keys on the
+        revision and never revives a cancelled row, so an over-wide cancel
+        would lose that generation's cleanup permanently).
+        """
         now = now_epoch()
         with self._session("cancel_pending_idle_for_host") as session:
             result = cast(
@@ -405,6 +412,7 @@ class CliReleaseIntentStore:
                         SqlCliReleaseIntent.reason == "idle_pool_overflow",
                         SqlCliReleaseIntent.host_id == host_id,
                         SqlCliReleaseIntent.status == "pending",
+                        SqlCliReleaseIntent.policy_revision <= max_policy_revision,
                     )
                     .values(status="cancelled", updated_at=now)
                 ),

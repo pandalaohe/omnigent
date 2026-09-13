@@ -9,7 +9,6 @@ import pytest
 from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.db.db_models import current_workspace_id
 from omnigent.entities.pagination import PagedList
-from omnigent.server.app import _reconnect_host_action
 from omnigent.server.cli_retention import (
     CliRetentionCoordinator,
     CliRetentionHostLeaseLost,
@@ -735,11 +734,11 @@ async def test_active_archive_close_intent_blocks_work_after_quick_unarchive() -
 
 @pytest.mark.asyncio
 async def test_reset_host_under_lease_cancels_pending_idle_before_lease_check() -> None:
-    cancels: list[str] = []
+    cancels: list[tuple[str, int]] = []
 
     class _IntentStore:
-        def cancel_pending_idle_for_host(self, host_id):
-            cancels.append(host_id)
+        def cancel_pending_idle_for_host(self, host_id, *, max_policy_revision):
+            cancels.append((host_id, max_policy_revision))
             return 1
 
     class _LostLease:
@@ -756,19 +755,7 @@ async def test_reset_host_under_lease_cancels_pending_idle_before_lease_check() 
     with pytest.raises(CliRetentionHostLeaseLost):
         await coordinator.reset_host_under_lease("host-a", policy_revision=8, lease=_LostLease())
 
-    assert cancels == ["host-a"]
-
-
-def test_reconnect_host_action_distinguishes_deleted_row() -> None:
-    """A deleted Host row classifies distinctly from the live branches."""
-    assert _reconnect_host_action(None) == "host_deleted"
-    assert _reconnect_host_action(SimpleNamespace(cli_retention_policy=None)) == "reset"
-    assert (
-        _reconnect_host_action(
-            SimpleNamespace(cli_retention_policy=CliRetentionPolicy(close_on_archive=False))
-        )
-        == "trigger"
-    )
+    assert cancels == [("host-a", 8)]
 
 
 def test_known_policy_revision_needs_a_recorded_revision() -> None:
@@ -796,7 +783,7 @@ def test_known_policy_revision_needs_a_recorded_revision() -> None:
 
 def _deleted_host_coordinator(posts: list, *, seed_revision: int | None):
     """Coordinator whose Host row is gone but whose conversations remain."""
-    conv = SimpleNamespace(id="sess-1", runner_id="runner-1", host_id="host-gone")
+    orphan = SimpleNamespace(id="sess-1", runner_id="runner-1", host_id=None)
 
     class _HostStore:
         def get_host(self, host_id):
@@ -805,8 +792,14 @@ def _deleted_host_coordinator(posts: list, *, seed_revision: int | None):
 
     class _ConversationStore:
         def list_conversations(self, **kwargs):
+            # The delete NULLed every host_id, so enumeration by the dead
+            # host id finds nothing; the reset rides on the re-read rows.
             assert kwargs["host_id"] == "host-gone"
-            return PagedList(data=[conv])
+            return PagedList(data=[])
+
+        def get_conversation(self, conversation_id):
+            assert conversation_id == "sess-1"
+            return orphan
 
     class _Response:
         status_code = 200
@@ -845,10 +838,9 @@ async def test_release_host_after_delete_resets_via_known_revision(
     triggered: list[str] = []
     monkeypatch.setattr(coordinator, "trigger", lambda host_id: triggered.append(host_id))
     caplog.set_level(logging.WARNING, logger="omnigent.server.cli_retention")
+    stale = [SimpleNamespace(id="sess-1", runner_id="runner-1", host_id="host-gone")]
 
-    result = await coordinator.release_host_after_delete(
-        "host-gone", affected_conversation_count=2
-    )
+    result = await coordinator.release_host_after_delete("host-gone", conversations=stale)
 
     assert result["status"] == "reset_after_delete"
     assert result["reset_count"] == 1
@@ -861,7 +853,7 @@ async def test_release_host_after_delete_resets_via_known_revision(
     # The policy-active branch is never entered for a deleted row.
     assert triggered == []
     warnings = [record.message for record in caplog.records if record.levelno >= logging.WARNING]
-    assert any("host-gone" in message and "2" in message for message in warnings)
+    assert any("host-gone" in message and "1" in message for message in warnings)
 
 
 @pytest.mark.asyncio
@@ -872,10 +864,13 @@ async def test_release_host_after_delete_skips_reset_without_known_revision(
     posts: list = []
     coordinator = _deleted_host_coordinator(posts, seed_revision=None)
     caplog.set_level(logging.WARNING, logger="omnigent.server.cli_retention")
+    stale = [
+        SimpleNamespace(id="sess-1", runner_id="runner-1", host_id="host-gone"),
+        SimpleNamespace(id="sess-2", runner_id="runner-2", host_id="host-gone"),
+        SimpleNamespace(id="sess-3", runner_id="runner-3", host_id="host-gone"),
+    ]
 
-    result = await coordinator.release_host_after_delete(
-        "host-gone", affected_conversation_count=3
-    )
+    result = await coordinator.release_host_after_delete("host-gone", conversations=stale)
 
     assert result["status"] == "host_deleted_no_known_revision"
     assert posts == []

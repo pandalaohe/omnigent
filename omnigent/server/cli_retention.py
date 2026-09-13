@@ -9,7 +9,7 @@ import math
 import secrets
 import time
 from collections import defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -280,13 +280,18 @@ class CliRetentionCoordinator:
         result = self._last_results.get((current_workspace_id(), host_id))
         return dict(result) if result is not None else None
 
-    async def cancel_pending_idle(self, host_id: str) -> int:
-        """Cancel old policy revisions before a replacement leaves the Host lock."""
+    async def cancel_pending_idle(self, host_id: str, *, max_policy_revision: int) -> int:
+        """Cancel old policy revisions before a replacement leaves the Host lock.
+
+        Only retires revisions at or below *max_policy_revision* so the
+        replacement never cancels the generation it just installed.
+        """
         if self._intent_store is None:
             return 0
         return await asyncio.to_thread(
             self._intent_store.cancel_pending_idle_for_host,
             host_id,
+            max_policy_revision=max_policy_revision,
         )
 
     async def reset_host(
@@ -316,17 +321,36 @@ class CliRetentionCoordinator:
         *,
         policy_revision: int,
         lease: CliRetentionHostLease | None = None,
+        conversations: Sequence[Any] | None = None,
     ) -> dict[str, Any]:
-        """Release pool ownership on every reachable session for safe downgrade."""
+        """Release pool ownership on every reachable session for safe downgrade.
+
+        :param conversations: Explicit sessions to reset, skipping host
+            enumeration entirely (so ``incomplete`` is False). Used by the
+            deleted-host path, whose rows no longer enumerate under the dead
+            host id. ``None`` enumerates by *host_id* exactly as before.
+        """
         key = (current_workspace_id(), host_id)
         # cancel_pending_idle_for_host needs no lease: run it before the lease
-        # check so a lost lease cannot silently skip it.
+        # check so a lost lease cannot silently skip it. The unfenced call is
+        # safe because the cancel is fenced to revisions at or below
+        # policy_revision — a stale replica cannot retire the pending intents
+        # a newer revision just created.
         if self._intent_store is not None:
-            await asyncio.to_thread(self._intent_store.cancel_pending_idle_for_host, host_id)
+            await asyncio.to_thread(
+                self._intent_store.cancel_pending_idle_for_host,
+                host_id,
+                max_policy_revision=policy_revision,
+            )
         if lease is not None:
             await lease.ensure_owned()
-        enumeration = await self._host_conversations(host_id, include_archived=True)
-        conversations = enumeration.conversations
+        if conversations is None:
+            enumeration = await self._host_conversations(host_id, include_archived=True)
+            conversations = enumeration.conversations
+            incomplete = enumeration.incomplete
+        else:
+            conversations = list(conversations)
+            incomplete = False
         reset: list[str] = []
         failed: list[str] = []
         unbound: list[str] = []
@@ -397,7 +421,7 @@ class CliRetentionCoordinator:
             "unbound_sample": unbound[:_RESET_ID_SAMPLE_CAP],
             "not_attempted": not_attempted[:_RESET_ID_SAMPLE_CAP],
             "not_attempted_count": len(not_attempted),
-            "incomplete": enumeration.incomplete,
+            "incomplete": incomplete,
             "observed_at": int(time.time()),
         }
         self._last_results[key] = result
@@ -429,7 +453,7 @@ class CliRetentionCoordinator:
         self,
         host_id: str,
         *,
-        affected_conversation_count: int,
+        conversations: Sequence[Any],
     ) -> dict[str, Any]:
         """Return one deleted Host's retained CLIs to legacy TTL ownership.
 
@@ -441,14 +465,23 @@ class CliRetentionCoordinator:
         revision: no cross-replica lease exists to fence, and a revision
         older than the Runner's stored one is rejected without effect.
 
+        The delete already NULLed these conversations' ``host_id``, so
+        enumerating by *host_id* would return zero rows and report a silent
+        skip as success. The caller therefore passes its reconnect-batch
+        conversations and each is re-read by id: genuinely orphaned rows
+        (``host_id`` NULL) are reset, rows rebound to another host by a
+        rotation belong to that host's live policy and are only counted,
+        and vanished rows are dropped.
+
         :param host_id: Deleted Host identifier, e.g. ``"host_a1b2c3"``.
-        :param affected_conversation_count: Conversations in the reconnect
-            batch bound to *host_id*, e.g. ``2``.
+        :param conversations: Reconnect-batch conversations bound to
+            *host_id* before the delete.
         :returns: ``{"status": "reset_after_delete", ...}`` carrying the
-            reset fan-out result, or
+            reset fan-out result plus ``rotated_count``, or
             ``{"status": "host_deleted_no_known_revision", ...}`` when no
             usable revision was recorded and nothing was sent.
         """
+        affected_conversation_count = len(conversations)
         _logger.warning(
             "CLI retention: Host %s row is deleted with %d affected conversation(s); "
             "returning retained CLIs to legacy TTL",
@@ -468,11 +501,28 @@ class CliRetentionCoordinator:
                 "host_id": host_id,
                 "affected_conversation_count": affected_conversation_count,
             }
+        orphaned: list[Any] = []
+        rotated: list[str] = []
+        for conversation in conversations:
+            current = await asyncio.to_thread(
+                self._conversation_store.get_conversation,
+                conversation.id,
+            )
+            if current is None:
+                continue
+            current_host_id = getattr(current, "host_id", None)
+            if current_host_id is not None and current_host_id != host_id:
+                # Rotation repointed this session at a live host whose own
+                # policy governs it now; resetting it here would fight that.
+                rotated.append(current.id)
+            else:
+                orphaned.append(current)
         async with self.lock_for_host(host_id):
             result = await self.reset_host_under_lease(
                 host_id,
                 policy_revision=revision,
                 lease=None,
+                conversations=orphaned,
             )
         _logger.info(
             "CLI retention: deleted Host %s reset %d session(s), %d unavailable",
@@ -480,7 +530,13 @@ class CliRetentionCoordinator:
             result.get("reset_count", 0),
             result.get("unavailable_count", 0),
         )
-        return {"status": "reset_after_delete", "host_id": host_id, **result}
+        return {
+            "status": "reset_after_delete",
+            "host_id": host_id,
+            **result,
+            "rotated": rotated[:_RESET_ID_SAMPLE_CAP],
+            "rotated_count": len(rotated),
+        }
 
     async def _host_conversations(
         self,

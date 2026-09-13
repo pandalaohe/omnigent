@@ -1115,29 +1115,6 @@ def _ensure_default_polly_agent(
     )
 
 
-ReconnectHostAction = Literal["host_deleted", "reset", "trigger"]
-
-
-def _reconnect_host_action(host: Any) -> ReconnectHostAction:
-    """Classify one runner-reconnect Host for CLI retention reconciliation.
-
-    A deleted Host row (``None``) is its own outcome: folding it into the
-    policy-active branch releases nothing (reconcile reports
-    ``configured: False``), and the reset branch cannot claim a lease on a
-    missing row. Callers must handle ``"host_deleted"`` distinctly.
-
-    :param host: Host row from ``host_store.get_host``, or ``None`` when
-        the row was deleted.
-    :returns: ``"host_deleted"`` when the row is gone, ``"reset"`` when
-        the row has no retention policy, ``"trigger"`` otherwise.
-    """
-    if host is None:
-        return "host_deleted"
-    if host.cli_retention_policy is None:
-        return "reset"
-    return "trigger"
-
-
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -3483,12 +3460,16 @@ def create_app(
         if cli_retention_coordinator is not None and host_store is not None:
             for host_id in {conv.host_id for conv in convs if conv.host_id is not None}:
                 host = await asyncio.to_thread(host_store.get_host, host_id)
-                if _reconnect_host_action(host) == "host_deleted":
-                    affected = sum(1 for conv in convs if conv.host_id == host_id)
+                if host is None:
+                    # A deleted row is its own outcome: the policy-active
+                    # branch releases nothing (reconcile reports configured:
+                    # False) and the reset branch cannot claim a lease on a
+                    # missing row — so a missing row always releases here.
+                    affected = [conv for conv in convs if conv.host_id == host_id]
                     try:
                         await cli_retention_coordinator.release_host_after_delete(
                             host_id,
-                            affected_conversation_count=affected,
+                            conversations=affected,
                         )
                     except Exception:  # noqa: BLE001 - best-effort release must not fail reconnect.
                         _logger.warning(

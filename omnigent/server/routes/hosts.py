@@ -1007,7 +1007,12 @@ def create_hosts_router(
                         expected_claim_token=lease.token,
                     )
                     if updated is not None:
-                        await cli_retention_coordinator.cancel_pending_idle(host_id)
+                        # Retire only the revisions before the one just
+                        # installed: the new generation's intents stay pending.
+                        await cli_retention_coordinator.cancel_pending_idle(
+                            host_id,
+                            max_policy_revision=updated.cli_retention_revision - 1,
+                        )
         except HostCliRetentionRevisionConflictError as exc:
             raise HTTPException(status_code=409, detail="CLI retention policy changed") from exc
         except (CliRetentionHostLeaseBusy, CliRetentionHostLeaseLost) as exc:
@@ -1058,6 +1063,19 @@ def create_hosts_router(
                         expected_claim_token=lease.token,
                     )
                     if updated is not None:
+
+                        async def _reset_without_lease() -> None:
+                            await cli_retention_coordinator.reset_host_under_lease(
+                                host_id,
+                                policy_revision=updated.cli_retention_revision,
+                                lease=None,
+                            )
+
+                        # The CAS already consumed the revision, so a 409
+                        # "retry" would be dishonest. Renewal fails when the
+                        # row is gone OR when another replica claimed the
+                        # lease; either way the Runner fences on revision, so
+                        # this stale reset cannot undo a newer policy.
                         try:
                             await cli_retention_coordinator.reset_host_under_lease(
                                 host_id,
@@ -1065,22 +1083,35 @@ def create_hosts_router(
                                 lease=lease,
                             )
                         except CliRetentionHostLeaseLost:
-                            # The CAS already consumed the revision, so a 409
-                            # "retry" would be dishonest. Renewal fails when the
-                            # row is gone OR when another replica claimed the
-                            # lease; either way the Runner fences on revision, so
-                            # this stale reset cannot undo a newer policy.
                             _logger.warning(
                                 "CLI retention lease lost after policy reset for Host %s; "
                                 "completing cleanup best-effort",
                                 host_id,
                                 exc_info=True,
                             )
-                            await cli_retention_coordinator.reset_host_under_lease(
+                            await _reset_without_lease()
+                        except asyncio.CancelledError:
+                            if not lease.lost.is_set():
+                                # An ordinary shutdown cancellation, not a
+                                # lease loss: it must keep propagating.
+                                raise
+                            # This cancellation was issued by our own lease
+                            # heartbeat (_renew_host_claim cancels the owner
+                            # task after marking the lease lost), so absorbing
+                            # it is legitimate — the lease.lost guard above is
+                            # what distinguishes it from a shutdown. Clear the
+                            # delivered cancel before awaiting anything else,
+                            # or the next await re-raises immediately.
+                            task = asyncio.current_task()
+                            if task is not None:
+                                task.uncancel()
+                            _logger.warning(
+                                "CLI retention lease lost after policy reset for Host %s; "
+                                "completing cleanup best-effort",
                                 host_id,
-                                policy_revision=updated.cli_retention_revision,
-                                lease=None,
+                                exc_info=True,
                             )
+                            await _reset_without_lease()
         except HostCliRetentionRevisionConflictError as exc:
             raise HTTPException(status_code=409, detail="CLI retention policy changed") from exc
         except (CliRetentionHostLeaseBusy, CliRetentionHostLeaseLost) as exc:

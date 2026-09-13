@@ -1902,8 +1902,8 @@ async def test_host_cli_retention_reset_lost_lease_after_commit_is_not_retryable
     cancels: list[str] = []
 
     class _IntentStore:
-        def cancel_pending_idle_for_host(self, host_id):
-            cancels.append(host_id)
+        def cancel_pending_idle_for_host(self, host_id, *, max_policy_revision):
+            cancels.append((host_id, max_policy_revision))
             return 1
 
     coordinator = CliRetentionCoordinator(
@@ -1946,7 +1946,7 @@ async def test_host_cli_retention_reset_lost_lease_after_commit_is_not_retryable
     assert reset.status_code == 200
     assert reset.json()["configured"] is False
     assert reset.json()["revision"] == 2
-    assert _HOST_ID in cancels
+    assert (_HOST_ID, 2) in cancels
 
 
 @pytest.mark.parametrize(
@@ -2084,3 +2084,167 @@ async def test_live_host_cli_retention_read_reports_other_replica(
         "policy_revision": 1,
         "observed_at": None,
     }
+
+
+async def _put_cli_retention_policy_v1(app: FastAPI) -> None:
+    """Install a revision-1 policy on the connected test host."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        configured = await client.put(
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={
+                "expected_revision": 0,
+                "policy": {
+                    "version": 1,
+                    "idle_threshold_minutes": 60,
+                    "max_idle_clis": 10,
+                    "close_on_archive": True,
+                },
+            },
+        )
+    assert configured.status_code == 200
+
+
+def _heartbeat_cancel_coordinator(
+    host_store: HostStore,
+    conv_store: SqlAlchemyConversationStore,
+    posts: list,
+):
+    """Real coordinator whose runner POSTs succeed and are recorded."""
+    from types import SimpleNamespace
+
+    from omnigent.server.cli_retention import CliRetentionCoordinator
+
+    class _Client:
+        async def post(self, url, *, json, timeout):
+            del timeout
+            posts.append((url, json))
+            return SimpleNamespace(status_code=200)
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            return SimpleNamespace(client=_Client(), runner_id=conversation.runner_id)
+
+    return CliRetentionCoordinator(
+        host_store=host_store,
+        conversation_store=conv_store,
+        runner_router=_Router(),
+    )
+
+
+def _reset_app_for_coordinator(
+    registry: HostRegistry,
+    host_store: HostStore,
+    conv_store: SqlAlchemyConversationStore,
+    coordinator,
+) -> FastAPI:
+    reset_app = FastAPI()
+    reset_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            cli_retention_coordinator=coordinator,
+        ),
+        prefix="/v1",
+    )
+    return reset_app
+
+
+async def test_host_cli_retention_reset_heartbeat_cancel_runs_best_effort_cleanup(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heartbeat-driven lease loss still completes cleanup and stays 200."""
+    from omnigent.server.cli_retention import CliRetentionHostLease
+
+    app, registry, host_store, conv_store = host_api_app
+    _comm = await _connect_host(app, registry)
+    await _put_cli_retention_policy_v1(app)
+
+    conv = await asyncio.to_thread(conv_store.create_conversation)
+    await asyncio.to_thread(conv_store.set_host_id, conv.id, _HOST_ID, "/tmp/ws")
+    await asyncio.to_thread(conv_store.set_runner_id, conv.id, "runner-1")
+
+    posts: list = []
+    coordinator = _heartbeat_cancel_coordinator(host_store, conv_store, posts)
+    reset_app = _reset_app_for_coordinator(registry, host_store, conv_store, coordinator)
+
+    calls = 0
+    original_ensure_owned = CliRetentionHostLease.ensure_owned
+
+    async def _heartbeat_cancel(self):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return await original_ensure_owned(self)
+        # Mirror _renew_host_claim: mark the lease lost, then cancel the
+        # owner task — the fan-out sees CancelledError, not LeaseLost.
+        self.lost.set()
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(CliRetentionHostLease, "ensure_owned", _heartbeat_cancel)
+    async with AsyncClient(
+        transport=ASGITransport(app=reset_app), base_url="http://test"
+    ) as client:
+        reset = await client.request(
+            "DELETE",
+            f"/v1/hosts/{_HOST_ID}/cli-retention",
+            json={"expected_revision": 1},
+        )
+
+    assert reset.status_code == 200
+    assert reset.json()["configured"] is False
+    assert reset.json()["revision"] == 2
+    # The best-effort pass ran to completion: the orphan's reset POST went out.
+    assert posts == [
+        (
+            f"/v1/sessions/{conv.id}/cli-retention/reset",
+            {"host_id": _HOST_ID, "policy_revision": 2},
+        )
+    ]
+    assert calls >= 3
+
+
+async def test_host_cli_retention_reset_ordinary_cancel_still_propagates(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CancelledError without lease loss (shutdown) must keep propagating."""
+    from omnigent.server.cli_retention import CliRetentionHostLease
+
+    app, registry, host_store, conv_store = host_api_app
+    _comm = await _connect_host(app, registry)
+    await _put_cli_retention_policy_v1(app)
+
+    conv = await asyncio.to_thread(conv_store.create_conversation)
+    await asyncio.to_thread(conv_store.set_host_id, conv.id, _HOST_ID, "/tmp/ws")
+    await asyncio.to_thread(conv_store.set_runner_id, conv.id, "runner-1")
+
+    posts: list = []
+    coordinator = _heartbeat_cancel_coordinator(host_store, conv_store, posts)
+    reset_app = _reset_app_for_coordinator(registry, host_store, conv_store, coordinator)
+
+    calls = 0
+    original_ensure_owned = CliRetentionHostLease.ensure_owned
+
+    async def _ordinary_cancel(self):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return await original_ensure_owned(self)
+        # No lease loss: this is an ordinary shutdown cancellation.
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(CliRetentionHostLease, "ensure_owned", _ordinary_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        async with AsyncClient(
+            transport=ASGITransport(app=reset_app), base_url="http://test"
+        ) as client:
+            await client.request(
+                "DELETE",
+                f"/v1/hosts/{_HOST_ID}/cli-retention",
+                json={"expected_revision": 1},
+            )
+
+    # No best-effort pass ran: nothing was posted.
+    assert posts == []
