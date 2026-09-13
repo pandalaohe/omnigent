@@ -256,7 +256,8 @@ let identityPromise: Promise<string | null> | null = null;
 // switches Servers never reuses the previous Server's user. Without an identity
 // every host config install starts a new connection.
 let identityConnectionId: string | null = null;
-// Bumped on every Server change, so a lookup or header from before an A->B->A round trip is never taken for the current one.
+// Bumped when resolveIdentity sees a new Server connection, so a lookup or header
+// from before an A->B->A round trip is never taken for the current one.
 let identityEpoch = 0;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
