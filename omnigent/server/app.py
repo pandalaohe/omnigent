@@ -1410,6 +1410,7 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        project_assignments_enabled=resolved_feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS),
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1513,6 +1514,7 @@ def create_app(
                 runner_exit_reports=runner_exit_reports,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                runner_session_initializer=runner_session_initializer,
             )
             await assignment_coordinator.start()
         app_inst.state.assignment_coordinator = assignment_coordinator

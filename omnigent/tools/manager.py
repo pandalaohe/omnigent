@@ -115,6 +115,7 @@ class ToolManager:
         workdir: Path | None = None,
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
+        project_assignments_enabled: bool = False,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -141,6 +142,11 @@ class ToolManager:
             tools use this shared instance instead of creating their
             own. ``None`` falls back to per-call creation via
             ``create_os_environment()``.
+        :param project_assignments_enabled: Server-owned release flag
+            carried in the session-init snapshot. When ``True`` the
+            seven ``sys_assignment_*`` tools auto-register so agents
+            can hand work across hosts; when ``False`` none of them
+            registers.
         """
         self._spec = spec
         self._workdir = workdir
@@ -192,6 +198,11 @@ class ToolManager:
         # Scheduled-task tools are always auto-registered so agents can
         # manage recurring runs at runtime without the spec opting in.
         self._register_scheduled_task_tools()
+        # Assignment tools auto-register only when the server's release
+        # flag is on (same position and mechanism as the scheduled-task
+        # tools above): with the flag off no new tool reaches any agent.
+        if project_assignments_enabled:
+            self._register_assignment_tools()
         # Embedded-browser tools are always auto-registered so any agent
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
@@ -225,6 +236,37 @@ class ToolManager:
             SysScheduledTaskListTool(),
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
+        ):
+            self._tools[tool.name()] = tool
+
+    def _register_assignment_tools(self) -> None:
+        """
+        Auto-register the cross-host assignment builtins.
+
+        Gated on the server's ``Feature.PROJECT_ASSIGNMENTS`` flag (see
+        :meth:`__init__`): agents hand work to another host's agent and
+        report back without any spec opting in. The runner dispatches
+        all seven via the Omnigent server's ``/v1/assignments`` REST
+        endpoints.
+        """
+        from omnigent.tools.builtins.assignments import (
+            SysAssignmentCancelTool,
+            SysAssignmentCompleteTool,
+            SysAssignmentDispatchTool,
+            SysAssignmentGetTool,
+            SysAssignmentListTool,
+            SysAssignmentReadMessagesTool,
+            SysAssignmentSendTool,
+        )
+
+        for tool in (
+            SysAssignmentDispatchTool(),
+            SysAssignmentGetTool(),
+            SysAssignmentListTool(),
+            SysAssignmentSendTool(),
+            SysAssignmentReadMessagesTool(),
+            SysAssignmentCompleteTool(),
+            SysAssignmentCancelTool(),
         ):
             self._tools[tool.name()] = tool
 

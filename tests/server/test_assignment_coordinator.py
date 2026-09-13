@@ -241,6 +241,7 @@ def _coordinator(
     due_batch_limit: int = 50,
     runner_router: Any | None = None,
     runner_exit_reports: Any | None = None,
+    runner_session_initializer: Any | None = None,
 ) -> AssignmentCoordinator:
     return AssignmentCoordinator(
         assignment_store=stores["assignment"],
@@ -260,6 +261,7 @@ def _coordinator(
         artifact_store=SimpleNamespace(),
         scan_interval_seconds=scan_interval_seconds,
         due_batch_limit=due_batch_limit,
+        runner_session_initializer=runner_session_initializer,
     )
 
 
@@ -271,12 +273,32 @@ def _install_placement_fakes(
     launch_error: str | None = None,
     wait_none: bool = False,
     dispatch_raises: bool = False,
+    init_bodies: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     import omnigent.server.routes._host_launch as host_launch
     import omnigent.server.routes.sessions as sessions_routes
     from omnigent.server.routes._sessions.helpers import _SessionEventDispatchResult
 
     captured: dict[str, Any] = {}
+
+    class _RecordingRunnerClient:
+        """Stand-in runner client capturing the real init handshake body."""
+
+        async def post(self, _path: str, **kwargs: Any) -> Any:
+            if "json" in kwargs:
+                assert init_bodies is not None
+                init_bodies.append(kwargs["json"])
+
+            class _Ok:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self) -> dict[str, Any]:
+                    return {}
+
+            return _Ok()
 
     def _resolve_host_launch(**kwargs: Any) -> Any:
         if order is not None:
@@ -299,10 +321,13 @@ def _install_placement_fakes(
     async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> Any:
         if wait_none:
             return None
+        if init_bodies is not None:
+            return _RecordingRunnerClient()
         return object()
 
     async def _ensure_runner_session_initialized(*args: Any, **kwargs: Any) -> bool:
         captured["ensure_require_success"] = kwargs.get("require_success")
+        captured["ensure_initializer"] = kwargs.get("initializer")
         return False
 
     async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
@@ -320,11 +345,12 @@ def _install_placement_fakes(
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
     monkeypatch.setattr(sessions_routes, "_wait_for_runner_client", _wait_for_runner_client)
-    monkeypatch.setattr(
-        sessions_routes,
-        "_ensure_runner_session_initialized",
-        _ensure_runner_session_initialized,
-    )
+    if init_bodies is None:
+        monkeypatch.setattr(
+            sessions_routes,
+            "_ensure_runner_session_initialized",
+            _ensure_runner_session_initialized,
+        )
     monkeypatch.setattr(
         sessions_routes,
         "_dispatch_session_event_to_runner",
@@ -481,6 +507,76 @@ async def test_happy_path_places_session_and_dispatches_once(
     assert "(execution root)" in text
     assert f"{prepared_dir}/.agents/project/manifest.json" in text
     assert "sys_assignment_complete" in text
+    assert f'sys_assignment_complete with assignment_id "{assignment.id}"' in text
+    assert "`outputs`" in text and "`summary`" in text
+    assert 'attempt_id "' not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [True, False])
+async def test_placement_initializes_receiver_with_flag(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, flag: bool
+) -> None:
+    """Placement's own init handshake carries the initializer's flag value."""
+    from omnigent.server.runner_session_init import RunnerSessionInitializer
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-flag")
+    project_id = _uid("flag-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/work/flag",
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "flag",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    monkeypatch.setattr(
+        assignments_mod, "prepare_assignment_on_host", _prepare_ok({"root": "/prepared/flag"})
+    )
+    init_bodies: list[dict[str, Any]] = []
+    _install_placement_fakes(monkeypatch, init_bodies=init_bodies)
+    import omnigent.server.routes.sessions as sessions_routes
+
+    _fake_launch = sessions_routes._launch_runner_on_host
+
+    async def _launch_and_bind(conv: Any, conversation_store: Any, *args: Any) -> Any:
+        launched = await _fake_launch(conv, conversation_store, *args)
+        if launched.error is None:
+            conversation_store.set_runner_id(conv.id, launched.runner_id)
+        return launched
+
+    monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_and_bind)
+    initializer = RunnerSessionInitializer(
+        FakeHostRegistry(),
+        server_version="0.6.0.dev0",
+        project_assignments_enabled=flag,
+    )
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_session_initializer=initializer,
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    assert init_bodies, "placement skipped the runner session-init handshake"
+    snapshot = init_bodies[0]["session_init"]["snapshot"]
+    assert snapshot["project_assignments_enabled"] is flag
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "running"
 
 
 # ── 3. scenario 3: offline past deadline ──────────────────────────────────

@@ -418,6 +418,19 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
+# Like _SCHEDULED_TASK_TOOLS, but gated by the session-init flag.
+_ASSIGNMENT_TOOLS = frozenset(
+    {
+        "sys_assignment_dispatch",
+        "sys_assignment_get",
+        "sys_assignment_list",
+        "sys_assignment_send",
+        "sys_assignment_read_messages",
+        "sys_assignment_complete",
+        "sys_assignment_cancel",
+    }
+)
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -469,6 +482,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _ASSIGNMENT_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -513,7 +527,11 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     return kept
 
 
-def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
+def build_native_relay_tool_schemas(
+    spec: AgentSpec | None,
+    *,
+    project_assignments_enabled: bool = False,
+) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -530,6 +548,8 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     :param spec: The session's resolved agent spec. ``None`` falls back to the
         always-on read/discovery surface (never the opt-in spawn writes, whose
         gate can't be evaluated without the spec), mirroring the relay.
+    :param project_assignments_enabled: When ``True`` the seven
+        ``sys_assignment_*`` tools join the surface; otherwise none do.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -573,7 +593,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        for schema in ToolManager(spec).get_tool_schemas():
+        for schema in ToolManager(
+            spec, project_assignments_enabled=project_assignments_enabled
+        ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
                 _append(function)
@@ -599,6 +621,32 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             function = _string_object_dict(fallback_schema.get("function"))
             if function is not None:
                 _append(function)
+        if project_assignments_enabled:
+            from omnigent.tools.builtins.assignments import (
+                SysAssignmentCancelTool,
+                SysAssignmentCompleteTool,
+                SysAssignmentDispatchTool,
+                SysAssignmentGetTool,
+                SysAssignmentListTool,
+                SysAssignmentReadMessagesTool,
+                SysAssignmentSendTool,
+            )
+
+            for _cls in (
+                SysAssignmentDispatchTool,
+                SysAssignmentGetTool,
+                SysAssignmentListTool,
+                SysAssignmentSendTool,
+                SysAssignmentReadMessagesTool,
+                SysAssignmentCompleteTool,
+                SysAssignmentCancelTool,
+            ):
+                fallback_schema = _string_object_dict(_cls().get_schema())
+                if fallback_schema is None:
+                    continue
+                function = _string_object_dict(fallback_schema.get("function"))
+                if function is not None:
+                    _append(function)
 
     # OS tools (sys_os_*), relayed unconditionally to override any harness-static
     # versions and centralize policy enforcement. Create a minimal OSEnvironment
@@ -905,6 +953,7 @@ _ALL_LOCAL_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _ASSIGNMENT_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -6413,6 +6462,16 @@ async def execute_tool(
             output = await _execute_scheduled_task_tool(
                 tool_name,
                 arguments,
+                server_client=server_client,
+            )
+        elif tool_name in _ASSIGNMENT_TOOLS:
+            from omnigent.runner.assignment_tools import execute_assignment_tool
+
+            output = await execute_assignment_tool(
+                tool_name,
+                arguments,
+                conversation_id=conversation_id,
+                runner_workspace=runner_workspace,
                 server_client=server_client,
             )
         elif tool_name in _BROWSER_TOOLS:

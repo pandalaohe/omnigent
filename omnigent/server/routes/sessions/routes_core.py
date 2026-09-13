@@ -71,6 +71,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
 )
 from omnigent.server.bundles import validate_agent_bundle
+from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -646,7 +647,13 @@ def register_core_routes(
             }
             if conv.agent_id is not None:
                 try:
-                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                    init_body = build_runner_session_init_payload(
+                        conv,
+                        server_version=VERSION,
+                        project_assignments_enabled=request.app.state.feature_flags.enabled(
+                            Feature.PROJECT_ASSIGNMENTS
+                        ),
+                    )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
                     # seeded override — surface it instead of silently

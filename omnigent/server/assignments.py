@@ -22,6 +22,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from omnigent.entities import (
     Assignment,
@@ -40,6 +41,9 @@ from omnigent.host.frames import (
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+
+if TYPE_CHECKING:
+    from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.assignment_host import (
     host_supports_assignments,
     prepare_assignment_on_host,
@@ -180,9 +184,9 @@ def build_initial_event_text(
         lines.append(f"- {directory}/{entry.context_manifest_path}")
     lines += [
         "",
-        "Work only in the directories above, commit the work there, and call "
-        f'sys_assignment_complete with assignment_id "{assignment.id}" and '
-        f'attempt_id "{attempt_id}" when done.',
+        "Work only in the directories above, commit the work there, then call "
+        f'sys_assignment_complete with assignment_id "{assignment.id}", `outputs` '
+        "(repository_name and commit for each repository changed) and a `summary`.",
     ]
     return "\n".join(lines)
 
@@ -208,6 +212,7 @@ class AssignmentCoordinator:
         artifact_store: ArtifactStore,
         scan_interval_seconds: float = 15.0,
         due_batch_limit: int = 50,
+        runner_session_initializer: RunnerSessionInitializer | None = None,
     ) -> None:
         self._assignment_store = assignment_store
         self._project_store = project_store
@@ -224,6 +229,7 @@ class AssignmentCoordinator:
         self._artifact_store = artifact_store
         self._scan_interval_seconds = scan_interval_seconds
         self._due_batch_limit = due_batch_limit
+        self._runner_session_initializer = runner_session_initializer
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._host_tasks: dict[str, asyncio.Task[None]] = {}
         self._scan_task: asyncio.Task[None] | None = None
@@ -1487,6 +1493,7 @@ class AssignmentCoordinator:
                 conv_for_dispatch,
                 client,
                 self._conversation_store,
+                initializer=self._runner_session_initializer,
                 require_success=True,
             )
         except Exception as exc:  # noqa: BLE001

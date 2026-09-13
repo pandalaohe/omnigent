@@ -310,7 +310,12 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "pi-native",
             "_auto_create_pi_terminal",
-            {"server_client", "agent_spec", "ensure_comment_relay"},
+            {
+                "server_client",
+                "agent_spec",
+                "ensure_comment_relay",
+                "project_assignments_enabled",
+            },
         ),
         (
             "cursor-native",

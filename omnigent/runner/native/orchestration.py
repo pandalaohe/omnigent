@@ -2172,6 +2172,7 @@ async def _auto_create_pi_terminal(
     server_client: httpx.AsyncClient | None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    project_assignments_enabled: bool = False,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -2185,6 +2186,8 @@ async def _auto_create_pi_terminal(
         terminal inherits the agent's ``os_env.sandbox`` rather than falling
         back to the platform default. ``None`` only when the session has no
         spec; callers must not pass ``None`` to paper over a resolution error.
+    :param project_assignments_enabled: Gates the assignment tools on the
+        relay surface, from the session's init snapshot.
     :returns: Created terminal resource view.
     """
     await _cancel_auto_forwarder_task(session_id)
@@ -2244,7 +2247,9 @@ async def _auto_create_pi_terminal(
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        pi_tools = build_native_relay_tool_schemas(
+            spec_for_tools, project_assignments_enabled=project_assignments_enabled
+        )
     except Exception:  # noqa: BLE001 — tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s; "
@@ -8014,6 +8019,7 @@ class NativeLaunchContext:
     skills_filter: str | list[str] = "all"
     agent_name: str | None = None
     session_init: RunnerSessionInitEnvelope | None = None
+    project_assignments_enabled: bool = False
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
@@ -8047,6 +8053,7 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         agent_spec=ctx.agent_spec,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        project_assignments_enabled=ctx.project_assignments_enabled,
     )
 
 

@@ -60,9 +60,16 @@ async def runner_archive_states_for_conversation(
 class RunnerSessionInitializer:
     """Share initialization readiness within one runner tunnel generation."""
 
-    def __init__(self, registry: TunnelRegistry, *, server_version: str) -> None:
+    def __init__(
+        self,
+        registry: TunnelRegistry,
+        *,
+        server_version: str,
+        project_assignments_enabled: bool = False,
+    ) -> None:
         self._registry = registry
         self._server_version = server_version
+        self._project_assignments_enabled = project_assignments_enabled
         self._tasks: dict[
             tuple[str, int, str, str, str | None, tuple[tuple[str, int, bool], ...]],
             asyncio.Task[httpx.Response],
@@ -109,6 +116,7 @@ class RunnerSessionInitializer:
                         server_version=self._server_version,
                         suppress_recovery_turn=suppress_recovery_turn,
                         archive_states=effective_archive_states,
+                        project_assignments_enabled=self._project_assignments_enabled,
                     ),
                     timeout=timeout,
                 ),
