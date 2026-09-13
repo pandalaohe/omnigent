@@ -215,6 +215,22 @@ def _seed_waiting(
     return moved
 
 
+class FakeRunnerRouter:
+    def __init__(self, online: set[str] | None = None) -> None:
+        self._online = set(online or set())
+
+    def runner_is_online(self, runner_id: str) -> bool:
+        return runner_id in self._online
+
+
+class FakeExitReports:
+    def __init__(self, reports: dict[str, str] | None = None) -> None:
+        self._reports = dict(reports or {})
+
+    def get(self, runner_id: str) -> str | None:
+        return self._reports.get(runner_id)
+
+
 def _coordinator(
     stores: dict[str, Any],
     *,
@@ -223,6 +239,8 @@ def _coordinator(
     permission_store: FakePermissionStore,
     scan_interval_seconds: float = 3600.0,
     due_batch_limit: int = 50,
+    runner_router: Any | None = None,
+    runner_exit_reports: Any | None = None,
 ) -> AssignmentCoordinator:
     return AssignmentCoordinator(
         assignment_store=stores["assignment"],
@@ -233,9 +251,11 @@ def _coordinator(
         host_registry=registry,
         conversation_store=stores["conversation"],
         permission_store=permission_store,
-        runner_router=SimpleNamespace(),
+        runner_router=runner_router if runner_router is not None else FakeRunnerRouter(),
         tunnel_registry=SimpleNamespace(),
-        runner_exit_reports=SimpleNamespace(),
+        runner_exit_reports=runner_exit_reports
+        if runner_exit_reports is not None
+        else FakeExitReports(),
         file_store=SimpleNamespace(),
         artifact_store=SimpleNamespace(),
         scan_interval_seconds=scan_interval_seconds,
@@ -974,10 +994,13 @@ class _SpyAssignmentStore:
                 "claim_attempt",
                 "select_due",
                 "select_waiting_for_host",
+                "select_for_host",
                 "list",
                 "update_attempt",
                 "mark_event_dispatched",
                 "get_attempt",
+                "set_lease",
+                "append_message",
             ):
                 self.calls.append((name, dict(kwargs)))
             return getattr(inner, name)(*args, **kwargs)
@@ -1064,6 +1087,9 @@ async def test_scan_guard_uses_scoped_queries(
     waiting_calls = [kw for name, kw in spy.calls if name == "select_waiting_for_host"]
     assert len(waiting_calls) == 1
     assert waiting_calls[0].get("limit") == 7
+    for_host_calls = [kw for name, kw in spy.calls if name == "select_for_host"]
+    assert len(for_host_calls) == 1
+    assert for_host_calls[0].get("limit") == 7
     assert "select_due" not in [name for name, _ in spy.calls]
     assert "list" not in [name for name, _ in spy.calls]
 
@@ -1235,7 +1261,7 @@ async def test_launch_error_returns_to_waiting(
 async def test_dispatch_failure_interrupts_after_runner_recorded(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A dispatch raise after launch is unknown: lost attempt, one delivery."""
+    """A dispatch raise after launch is unknown: active attempt, one delivery."""
     stores = _stores(db_uri)
     host_id = _uid("host-a")
     project_id = _uid("dispatch-fail-proj")
@@ -1270,7 +1296,7 @@ async def test_dispatch_failure_interrupts_after_runner_recorded(
     assert row is not None
     assert row.state == "interrupted"
     assert row.wait_reason is not None and row.wait_reason.startswith("dispatch:")
-    assert row.next_check_at is None
+    assert row.next_check_at is not None
     assert captured.get("dispatch_calls") == 1
     import sqlalchemy as _sa
 
@@ -1287,30 +1313,16 @@ async def test_dispatch_failure_interrupts_after_runner_recorded(
             .all()
         )
     assert len(attempts) == 1
-    assert attempts[0]["state"] == "lost"
+    assert attempts[0]["state"] == "active"
+    assert attempts[0]["ended_at"] is None
     assert attempts[0]["runner_id"] == "runner_1"
     assert attempts[0]["session_id"] is not None
     # Interrupted rows keep the attempt link for /retry and /cancel.
     assert row.active_attempt_id == attempts[0]["id"]
     kept = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
     assert kept is not None
-    assert kept.state == "lost"
-    assert kept.ended_at is not None
-    # The retry route's write then succeeds and a new claim bumps the number.
-    now = kept.ended_at
-    retried = stores["assignment"].transition(
-        assignment.id,
-        from_state="interrupted",
-        to_state="waiting",
-        expected_active_attempt_id=kept.id,
-        active_attempt_id=None,
-        next_check_at=now,
-    )
-    assert retried is not None
-    assert retried.active_attempt_id is None
-    second = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=now)
-    assert second is not None
-    assert second.number == 2
+    assert kept.state == "active"
+    assert kept.ended_at is None
 
 
 @pytest.mark.asyncio
@@ -1357,10 +1369,11 @@ async def test_native_dispatch_without_forward_interrupts(
     assert row.wait_reason is not None and row.wait_reason.startswith("dispatch:")
     assert captured.get("dispatch_calls") == 1
     assert row.active_attempt_id is not None
+    assert row.next_check_at is not None
     attempt = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
     assert attempt is not None
-    assert attempt.state == "lost"
-    assert attempt.ended_at is not None
+    assert attempt.state == "active"
+    assert attempt.ended_at is None
 
 
 @pytest.mark.asyncio
@@ -1732,4 +1745,3161 @@ async def test_published_triggers_coordinator_once(db_uri: str, tmp_path: Path) 
             json={"refs": [{"repository_name": "root", "commit": "a" * 40}]},
         )
         assert resp.status_code == 200, resp.text
+    assert fake.calls == [assignment_id]
+
+
+# ── 14. active liveness ───────────────────────────────────────────────────
+
+
+def _make_session_with_runner(
+    stores: dict[str, Any],
+    conv_id: str,
+    *,
+    host_id: str,
+    workspace: str,
+    runner_id: str,
+    project_id: str,
+) -> Any:
+    stores["conversation"].create_conversation(
+        agent_id=AGENT_ID,
+        title="active",
+        host_id=host_id,
+        workspace=workspace,
+        conversation_id=conv_id,
+        project_id=project_id,
+    )
+    stores["conversation"].replace_runner_id(conv_id, runner_id)
+    updated = stores["conversation"].get_conversation(conv_id)
+    assert updated is not None
+    return updated
+
+
+@pytest.mark.asyncio
+async def test_running_online_clears_lease(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An online runner stays running with a short recheck and no lease."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("live-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 5000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "live",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+    stores["assignment"].set_lease(attempt.id, clock["now"] + 90)
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="running", next_check_at=clock["now"] - 10
+        )
+        is not None
+    )
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter({"runner_1"}),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "running"
+    assert row.wait_reason is None
+    assert row.next_check_at == clock["now"] + 30
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_running_offline_leases_then_interrupts_then_recovers(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An offline runner leases, interrupts with the link kept, then retires."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("offline-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 6000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "offline",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="running", next_check_at=clock["now"] - 10
+        )
+        is not None
+    )
+    registry = FakeHostRegistry({})
+    coordinator = _coordinator(
+        stores,
+        registry=registry,
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "running"
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.lease_expires_at == clock["now"] + 90
+    assert row.next_check_at == clock["now"] + 90
+
+    clock["now"] += 91
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "interrupted"
+    assert row.wait_reason is not None and row.wait_reason.startswith("runner_lost:")
+    assert "runner_1" in row.wait_reason
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.state == "active"
+    assert kept.ended_at is None
+    assert row.next_check_at is not None
+
+    async def _unknown_runner(*args: Any, **kwargs: Any) -> str:
+        return "unknown_runner"
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _unknown_runner)
+    registry._conns[host_id] = _conn(host_id, owner=ALICE, assignments=True)
+    clock["now"] += 20
+    # Re-arm the check so the due pass would pick it up.
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id,
+            expected_state="interrupted",
+            expected_active_attempt_id=attempt.id,
+            next_check_at=clock["now"] - 1,
+        )
+        is not None
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "interrupted"
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.state == "lost"
+    assert kept.ended_at is not None
+    assert row.next_check_at is None
+    retried = stores["assignment"].transition(
+        assignment.id,
+        from_state="interrupted",
+        to_state="waiting",
+        expected_active_attempt_id=kept.id,
+        active_attempt_id=None,
+        next_check_at=kept.ended_at,
+    )
+    assert retried is not None
+
+
+@pytest.mark.asyncio
+async def test_relaunched_session_counts_as_not_alive(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session pointing at a newer runner leaves the old attempt for dead."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("relaunch-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 7000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "relaunch",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_old"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_new",
+        project_id=project_id,
+    )
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="running", next_check_at=clock["now"] - 10
+        )
+        is not None
+    )
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter({"runner_old", "runner_new"}),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.lease_expires_at == clock["now"] + 90
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "running"
+
+
+@pytest.mark.asyncio
+async def test_disabled_project_keeps_running_online(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The switch never pauses an attempt that already started."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("switch-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 8000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "switch",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="running", next_check_at=clock["now"] - 10
+        )
+        is not None
+    )
+    proj = stores["project"].get(project_id, user_id=ALICE)
+    assert proj is not None
+    assert (
+        stores["project"].set_collaboration(
+            project_id,
+            user_id=ALICE,
+            enabled=False,
+            expected_revision=proj.collaboration_revision,
+        )
+        is not None
+    )
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter({"runner_1"}),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "running"
+    assert row.wait_reason is None
+
+
+# ── 15. orphaned placements ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_orphaned_starting_with_runner_interrupts(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A starting row that launched but never reported stays never-starting."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("orphan-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 9000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "orphan",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+
+    async def _unavailable(*args: Any, **kwargs: Any) -> str:
+        return "unavailable"
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _unavailable)
+    clock["now"] += 421
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "interrupted"
+    assert row.wait_reason == "placement_abandoned"
+
+
+@pytest.mark.asyncio
+async def test_orphaned_starting_without_session_returns_to_waiting(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A starting row that never launched goes back to waiting as abandoned."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("orphan-wait-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 9100}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "orphan-wait",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    clock["now"] += 421
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "waiting"
+    assert row.wait_reason == "placement_abandoned"
+    assert row.active_attempt_id is None
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.state == "finished"
+    assert kept.error_code == "placement_abandoned"
+
+
+@pytest.mark.asyncio
+async def test_starting_in_flight_skipped_by_due_pass(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The due pass never double-runs an id already being evaluated."""
+    import asyncio as _asyncio
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("inflight-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "inflight",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    fake_prepare = _prepare_ok({"root": "/prepared"})
+    monkeypatch.setattr(assignments_mod, "prepare_assignment_on_host", fake_prepare)
+    parked: _asyncio.Event = _asyncio.Event()
+    release: _asyncio.Event = _asyncio.Event()
+    _install_placement_fakes(monkeypatch)
+
+    import omnigent.server.routes.sessions as sessions_routes
+
+    async def _parked_launch(*args: Any, **kwargs: Any) -> Any:
+        parked.set()
+        await release.wait()
+        return SimpleNamespace(error=None, runner_id="runner_1")
+
+    monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _parked_launch)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await _asyncio.wait_for(parked.wait(), timeout=10)
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "starting"
+    # Force the row due so the pass would take it without the guard.
+    past = now_epoch() - 100
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="starting", next_check_at=past
+        )
+        is not None
+    )
+    await coordinator._due_pass_and_schedule()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at == past
+    assert getattr(fake_prepare, "calls", 0) == 1
+    release.set()
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    final = stores["assignment"].get(assignment.id)
+    assert final is not None
+    assert final.state == "running"
+
+
+# ── 16. cancellation ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stopping_acked_cancels_and_releases(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A confirmed stop cancels the attempt and releases the worktree."""
+    import omnigent.server.routes.sessions as sessions_routes
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("stop-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    binding = _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/w",
+    )
+    clock = {"now": 10000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "stopping",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(
+        assignment.id,
+        host_id=host_id,
+        now=clock["now"],
+        resolved_binding_id=binding.id,
+        resolved_binding_revision=binding.revision,
+        next_check_at=clock["now"],
+    )
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(
+            assignment.id,
+            from_state="running",
+            to_state="stopping",
+            expected_active_attempt_id=attempt.id,
+        )
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+    # Pin the release snapshot the claim wrote.
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.resolved_binding_id == binding.id
+
+    async def _acked(*args: Any, **kwargs: Any) -> str:
+        return "acked"
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _acked)
+    released: dict[str, Any] = {}
+
+    async def _ok(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        frame = kwargs.get("frame")
+        released["frame"] = frame
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=["root"], failures={}
+        )
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _ok)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "cancelled"
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.state == "finished"
+    assert kept.error_code == "cancelled"
+    assert row.next_check_at is None
+    frame = released.get("frame")
+    assert frame is not None
+    assert [r.repository_name for r in frame.repositories] == ["root"]
+    assert frame.repositories[0].source_directory == "/w"
+
+
+@pytest.mark.asyncio
+async def test_stopping_unavailable_leases_then_interrupts(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unconfirmed stop retries on a lease, then gives up as interrupted."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("stop-retry-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 10100}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "stop-retry",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(
+            assignment.id,
+            from_state="running",
+            to_state="stopping",
+            expected_active_attempt_id=attempt.id,
+        )
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+
+    async def _unavailable(*args: Any, **kwargs: Any) -> str:
+        return "unavailable"
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _unavailable)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "stopping"
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.lease_expires_at == clock["now"] + 90
+    assert row.next_check_at == clock["now"] + 30
+
+    clock["now"] += 91
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id,
+            expected_state="stopping",
+            expected_active_attempt_id=attempt.id,
+            next_check_at=clock["now"] - 1,
+        )
+        is not None
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "interrupted"
+    assert row.wait_reason == "stop_unconfirmed"
+
+
+# ── 17. terminal release ────────────────────────────────────────────────
+
+
+def _seed_terminal(
+    stores: dict[str, Any],
+    seed: str,
+    *,
+    project_id: str,
+    host_id: str | None,
+    to_state: str,
+    clock_now: int,
+) -> Assignment:
+    assignment = _seed_waiting(
+        stores["assignment"],
+        seed,
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=1)],
+    )
+    repo = stores["repository"].get_by_name(project_id=project_id, name="root")
+    assert repo is not None
+    if host_id is None:
+        assert to_state == "expired"
+        assert (
+            stores["assignment"].transition(
+                assignment.id, from_state="waiting", to_state="expired"
+            )
+            is not None
+        )
+        assert (
+            stores["assignment"].reschedule(
+                assignment.id, expected_state="expired", next_check_at=clock_now
+            )
+            is not None
+        )
+        row = stores["assignment"].get(assignment.id)
+        assert row is not None
+        return row
+    binding = stores["binding"].get_by_name(project_id=project_id, host_id=host_id, name="primary")
+    assert binding is not None
+    attempt = stores["assignment"].claim_attempt(
+        assignment.id,
+        host_id=host_id,
+        now=clock_now,
+        resolved_binding_id=binding.id,
+        resolved_binding_revision=binding.revision,
+        next_check_at=clock_now,
+    )
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    if to_state == "succeeded":
+        assert (
+            stores["assignment"].transition(
+                assignment.id, from_state="running", to_state="publishing"
+            )
+            is not None
+        )
+        from omnigent.entities import AssignmentOutputEntry
+
+        assert (
+            stores["assignment"].transition(
+                assignment.id,
+                from_state="publishing",
+                to_state="succeeded",
+                expected_active_attempt_id=attempt.id,
+                outputs=[
+                    AssignmentOutputEntry(
+                        repository_name="root",
+                        commit="b" * 40,
+                        ref="refs/omnigent/assignments/x/output/att/root",
+                    )
+                ],
+            )
+            is not None
+        )
+    elif to_state == "cancelled":
+        assert (
+            stores["assignment"].transition(
+                assignment.id,
+                from_state="running",
+                to_state="stopping",
+                expected_active_attempt_id=attempt.id,
+            )
+            is not None
+        )
+        assert (
+            stores["assignment"].transition(
+                assignment.id,
+                from_state="stopping",
+                to_state="cancelled",
+                expected_active_attempt_id=attempt.id,
+            )
+            is not None
+        )
+    else:  # pragma: no cover
+        raise AssertionError(to_state)
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state=to_state, next_check_at=clock_now
+        )
+        is not None
+    )
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    return row
+
+
+@pytest.mark.asyncio
+async def test_terminal_release_ok_clears(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A due succeeded row releases once and clears its check."""
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-ok-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 11000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_terminal(
+        stores,
+        "rel-ok",
+        project_id=project_id,
+        host_id=host_id,
+        to_state="succeeded",
+        clock_now=clock["now"],
+    )
+    calls = {"n": 0}
+
+    async def _ok(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        calls["n"] += 1
+        frame = kwargs.get("frame")
+        assert [r.repository_name for r in frame.repositories] == ["root"]
+        assert frame.repositories[0].source_directory == "/w"
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=["root"], failures={}
+        )
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _ok)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert calls["n"] == 1
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_release_partial_messages_once(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial release records one message and never retries."""
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-partial-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 11100}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_terminal(
+        stores,
+        "rel-partial",
+        project_id=project_id,
+        host_id=host_id,
+        to_state="succeeded",
+        clock_now=clock["now"],
+    )
+    calls = {"n": 0}
+
+    async def _partial(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        calls["n"] += 1
+        frame = kwargs.get("frame")
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id,
+            status="partial",
+            removed=[],
+            failures={"root": "worktree contains modified files"},
+        )
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _partial)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at is None
+    messages = stores["assignment"].read_messages(assignment.id, limit=10)
+    bodies = [m.body for m in messages.data]
+    assert len([b for b in bodies if "worktree release incomplete" in b]) == 1
+    assert any("root" in b for b in bodies if "worktree release incomplete" in b)
+    clock["now"] += 100
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_release_host_offline_backs_off(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An offline host backs off without a release call."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-off-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 11200}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_terminal(
+        stores,
+        "rel-off",
+        project_id=project_id,
+        host_id=host_id,
+        to_state="succeeded",
+        clock_now=clock["now"],
+    )
+
+    async def _must_not_release(**kwargs: Any) -> Any:
+        raise AssertionError("release must not run while the host is offline")
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _must_not_release)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at is not None and row.next_check_at > clock["now"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_release_stops_live_runner_first(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live runner is stopped before its worktree is removed."""
+    import omnigent.server.routes.sessions as sessions_routes
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-stop-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    binding = _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 11300}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "rel-stop",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(
+        assignment.id,
+        host_id=host_id,
+        now=clock["now"],
+        resolved_binding_id=binding.id,
+        resolved_binding_revision=binding.revision,
+        next_check_at=clock["now"],
+    )
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="running", to_state="publishing")
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+    from omnigent.entities import AssignmentOutputEntry
+
+    assert (
+        stores["assignment"].transition(
+            assignment.id,
+            from_state="publishing",
+            to_state="succeeded",
+            expected_active_attempt_id=attempt.id,
+            outputs=[
+                AssignmentOutputEntry(
+                    repository_name="root",
+                    commit="b" * 40,
+                    ref="refs/omnigent/assignments/x/output/att/root",
+                )
+            ],
+        )
+        is not None
+    )
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="succeeded", next_check_at=clock["now"]
+        )
+        is not None
+    )
+    order: list[str] = []
+
+    async def _acked_stop(*args: Any, **kwargs: Any) -> str:
+        order.append("stop")
+        return "acked"
+
+    async def _ok_release(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        order.append("release")
+        frame = kwargs.get("frame")
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=["root"], failures={}
+        )
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _acked_stop)
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _ok_release)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter({"runner_1"}),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert order == ["stop", "release"]
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at is None
+
+
+@pytest.mark.asyncio
+async def test_guard_failure_skips_side_effects(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost conditional write never reaches stop, release or messaging."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("guard-fail-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 11400}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "guard-fail",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+    stores["assignment"].set_lease(attempt.id, clock["now"] - 1)
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="running", next_check_at=clock["now"] - 10
+        )
+        is not None
+    )
+    real_transition = stores["assignment"].transition
+    calls = {"stop": 0, "release": 0, "message": 0}
+
+    def _lost_transition(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    async def _count_stop(*args: Any, **kwargs: Any) -> str:
+        calls["stop"] += 1
+        return "acked"
+
+    async def _count_release(**kwargs: Any) -> Any:
+        calls["release"] += 1
+        raise AssertionError("release must not run after a lost guard")
+
+    monkeypatch.setattr(stores["assignment"], "transition", _lost_transition)
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _count_stop)
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _count_release)
+    orig_append = stores["assignment"].append_message
+
+    def _spy_append(message: Any) -> Any:
+        calls["message"] += 1
+        return orig_append(message)
+
+    monkeypatch.setattr(stores["assignment"], "append_message", _spy_append)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert real_transition is not None
+    assert calls == {"stop": 0, "release": 0, "message": 0}
+
+
+# ── 18. route triggers ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_running_triggers_with_next_check(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling a running row parks a check and nudges the coordinator."""
+    import httpx
+
+    import omnigent.server.routes.assignments as routes_mod
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _Conv,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    flags = resolve_feature_flags({"OMNIGENT_FEATURES": "project_assignments"})
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=_Conv(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=HostStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+        project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),
+        project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
+        assignment_store=SqlAlchemyAssignmentStore(db_uri),
+        feature_flags=flags,
+    )
+
+    class _FakeCoordinator:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def trigger(self, assignment_id: str) -> None:
+            self.calls.append(assignment_id)
+
+    fake = _FakeCoordinator()
+    app.state.assignment_coordinator = fake  # type: ignore[attr-defined]
+    fixed_now = 19500
+    monkeypatch.setattr(routes_mod, "now_epoch", lambda: fixed_now)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    if agent_store.get(AGENT_ID) is None:
+        agent_store.create(
+            agent_id=AGENT_ID, name="test-agent", bundle_location=f"{AGENT_ID}/bundle"
+        )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/v1/projects", json={"name": "CancelProj"})
+        assert resp.status_code == 200, resp.text
+        project_id = resp.json()["id"]
+        assert (
+            await client.patch(
+                f"/v1/projects/{project_id}/collaboration",
+                json={"enabled": True, "expected_revision": 0},
+            )
+        ).status_code == 200
+        assert (
+            await client.put(
+                f"/v1/projects/{project_id}/repositories/root",
+                json={
+                    "remote_url": "https://example.com/org/repo.git",
+                    "default_branch": "main",
+                },
+            )
+        ).status_code == 200
+        conv = _Conv(db_uri).create_conversation(
+            title="src", agent_id=AGENT_ID, project_id=project_id
+        )
+        assignment_id = _uid("route-cancel")
+        assert (
+            await client.post(
+                "/v1/assignments",
+                json={
+                    "id": assignment_id,
+                    "source_session_id": conv.id,
+                    "target_agent_id": AGENT_ID,
+                    "task": "cancel task",
+                    "repositories": [
+                        {
+                            "repository_name": "root",
+                            "commit": "a" * 40,
+                            "manifest_digest": "d" * 64,
+                        }
+                    ],
+                    "idempotency_key": "key-cancel",
+                },
+            )
+        ).status_code == 201
+        assert (
+            await client.post(
+                f"/v1/assignments/{assignment_id}/published",
+                json={"refs": [{"repository_name": "root", "commit": "a" * 40}]},
+            )
+        ).status_code == 200
+        fake.calls.clear()
+        store = SqlAlchemyAssignmentStore(db_uri)
+        attempt = store.claim_attempt(assignment_id, host_id=_uid("host-a"), now=now_epoch())
+        assert attempt is not None
+        assert (
+            store.transition(assignment_id, from_state="starting", to_state="running") is not None
+        )
+        assert (
+            store.reschedule(assignment_id, expected_state="running", next_check_at=None)
+            is not None
+        )
+        resp = await client.post(f"/v1/assignments/{assignment_id}/cancel", json={})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["state"] == "stopping"
+        assert body["next_check_at"] == fixed_now
+    assert fake.calls == [assignment_id]
+
+
+@pytest.mark.asyncio
+async def test_finish_placed_triggers_with_next_check(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finishing a placed row parks a release and nudges the coordinator."""
+    import secrets
+
+    import httpx
+
+    import omnigent.server.routes.assignments as routes_mod
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _Conv,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    flags = resolve_feature_flags({"OMNIGENT_FEATURES": "project_assignments"})
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=_Conv(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=HostStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+        project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),
+        project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
+        assignment_store=SqlAlchemyAssignmentStore(db_uri),
+        feature_flags=flags,
+    )
+
+    class _FakeCoordinator:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def trigger(self, assignment_id: str) -> None:
+            self.calls.append(assignment_id)
+
+    fake = _FakeCoordinator()
+    app.state.assignment_coordinator = fake  # type: ignore[attr-defined]
+    fixed_now = 19600
+    monkeypatch.setattr(routes_mod, "now_epoch", lambda: fixed_now)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    if agent_store.get(AGENT_ID) is None:
+        agent_store.create(
+            agent_id=AGENT_ID, name="test-agent", bundle_location=f"{AGENT_ID}/bundle"
+        )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/v1/projects", json={"name": "FinishProj"})
+        assert resp.status_code == 200, resp.text
+        project_id = resp.json()["id"]
+        assert (
+            await client.patch(
+                f"/v1/projects/{project_id}/collaboration",
+                json={"enabled": True, "expected_revision": 0},
+            )
+        ).status_code == 200
+        assert (
+            await client.put(
+                f"/v1/projects/{project_id}/repositories/root",
+                json={
+                    "remote_url": "https://example.com/org/repo.git",
+                    "default_branch": "main",
+                },
+            )
+        ).status_code == 200
+        conv = _Conv(db_uri).create_conversation(
+            title="src", agent_id=AGENT_ID, project_id=project_id
+        )
+        assignment_id = _uid("route-finish")
+        assert (
+            await client.post(
+                "/v1/assignments",
+                json={
+                    "id": assignment_id,
+                    "source_session_id": conv.id,
+                    "target_agent_id": AGENT_ID,
+                    "task": "finish task",
+                    "repositories": [
+                        {
+                            "repository_name": "root",
+                            "commit": "a" * 40,
+                            "manifest_digest": "d" * 64,
+                        }
+                    ],
+                    "idempotency_key": "key-finish",
+                },
+            )
+        ).status_code == 201
+        assert (
+            await client.post(
+                f"/v1/assignments/{assignment_id}/published",
+                json={"refs": [{"repository_name": "root", "commit": "a" * 40}]},
+            )
+        ).status_code == 200
+        fake.calls.clear()
+        token = secrets.token_hex(16)
+        runner_id = token_bound_runner_id(token)
+        run_conv = _Conv(db_uri).create_conversation(
+            title="run", agent_id=AGENT_ID, project_id=project_id, runner_id=runner_id
+        )
+        store = SqlAlchemyAssignmentStore(db_uri)
+        attempt = store.claim_attempt(assignment_id, host_id=_uid("host-a"), now=now_epoch())
+        assert attempt is not None
+        assert (
+            store.update_attempt(
+                assignment_id, attempt.id, session_id=run_conv.id, runner_id=runner_id
+            )
+            is not None
+        )
+        assert (
+            store.transition(assignment_id, from_state="starting", to_state="running") is not None
+        )
+        resp = await client.post(
+            f"/v1/assignments/{assignment_id}/complete",
+            json={
+                "session_id": run_conv.id,
+                "outputs": [{"repository_name": "root", "commit": "b" * 40}],
+                "summary": "done",
+            },
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+        )
+        assert resp.status_code == 200, resp.text
+        fake.calls.clear()
+        assert (
+            store.reschedule(assignment_id, expected_state="publishing", next_check_at=None)
+            is not None
+        )
+        resp = await client.post(
+            f"/v1/assignments/{assignment_id}/finish",
+            json={
+                "session_id": run_conv.id,
+                "refs": [{"repository_name": "root", "commit": "b" * 40}],
+            },
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["state"] == "succeeded"
+        assert body["next_check_at"] == fixed_now
+    assert fake.calls == [assignment_id]
+
+
+# ── 19. placement window ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_second_coordinator_waits_out_live_placement(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A starting row inside its window parks instead of retiring."""
+    import asyncio as _asyncio
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("window-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "window",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    monkeypatch.setattr(
+        assignments_mod, "prepare_assignment_on_host", _prepare_ok({"root": "/prepared"})
+    )
+    parked: _asyncio.Event = _asyncio.Event()
+    release: _asyncio.Event = _asyncio.Event()
+    _install_placement_fakes(monkeypatch)
+
+    import omnigent.server.routes.sessions as sessions_routes
+
+    async def _parked_launch(*args: Any, **kwargs: Any) -> Any:
+        parked.set()
+        await release.wait()
+        return SimpleNamespace(error=None, runner_id="runner_1")
+
+    monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _parked_launch)
+    registry = FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)})
+    host_store = FakeHostStore([_FakeHost(host_id, ALICE)])
+    first = _coordinator(
+        stores, registry=registry, host_store=host_store, permission_store=FakePermissionStore()
+    )
+    second = _coordinator(
+        stores, registry=registry, host_store=host_store, permission_store=FakePermissionStore()
+    )
+    first.trigger(assignment.id)
+    await _asyncio.wait_for(parked.wait(), timeout=10)
+    second.trigger(assignment.id)
+    await second.wait_for_idle()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "starting"
+    assert row.active_attempt_id is not None
+    attempt = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
+    assert attempt is not None
+    assert attempt.state == "active"
+    assert attempt.started_at is not None
+    assert row.next_check_at == attempt.started_at + 420
+
+    release.set()
+    await first.wait_for_idle()
+    await first.shutdown()
+    await second.shutdown()
+    final = stores["assignment"].get(assignment.id)
+    assert final is not None
+    assert final.state == "running"
+
+
+# ── 20. ended attempts ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stopping_with_ended_attempt_cancels_without_attempt_write(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel racing a failed placement still cancels cleanly."""
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("ended-stop-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    binding = _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 12000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "ended-stop",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(
+        assignment.id,
+        host_id=host_id,
+        now=clock["now"],
+        resolved_binding_id=binding.id,
+        resolved_binding_revision=binding.revision,
+        next_check_at=clock["now"],
+    )
+    assert attempt is not None
+    # A failed placement ends the attempt, then the cancel lands on the
+    # still-starting row before the return to waiting commits.
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id,
+            attempt.id,
+            state="finished",
+            ended_at=clock["now"],
+            error_code="placement_abandoned",
+        )
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(
+            assignment.id,
+            from_state="starting",
+            to_state="stopping",
+            expected_active_attempt_id=attempt.id,
+        )
+        is not None
+    )
+    writes = {"n": 0}
+    real_update = stores["assignment"].update_attempt
+
+    def _spy_update(*args: Any, **kwargs: Any) -> Any:
+        writes["n"] += 1
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(stores["assignment"], "update_attempt", _spy_update)
+
+    async def _ok(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        frame = kwargs.get("frame")
+        assert [r.repository_name for r in frame.repositories] == ["root"]
+        assert frame.repositories[0].source_directory == "/w"
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=["root"], failures={}
+        )
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _ok)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "cancelled"
+    assert writes["n"] == 0
+    assert row.next_check_at is None
+    kept = stores["assignment"].get_attempt(assignment.id, attempt.id)
+    assert kept is not None
+    assert kept.state == "finished"
+    assert kept.error_code == "placement_abandoned"
+    assert stores["assignment"].select_due(now=clock["now"] + 100000, limit=10) == []
+
+
+# ── 21. release stops the session runner ───────────────────────────────
+
+
+def _seed_succeeded_with_session(
+    stores: dict[str, Any],
+    seed: str,
+    *,
+    project_id: str,
+    host_id: str,
+    clock_now: int,
+    attempt_runner: str,
+    session_runner: str,
+) -> tuple[Assignment, Any]:
+    assignment = _seed_waiting(
+        stores["assignment"],
+        seed,
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=1)],
+    )
+    binding = stores["binding"].get_by_name(project_id=project_id, host_id=host_id, name="primary")
+    assert binding is not None
+    attempt = stores["assignment"].claim_attempt(
+        assignment.id,
+        host_id=host_id,
+        now=clock_now,
+        resolved_binding_id=binding.id,
+        resolved_binding_revision=binding.revision,
+        next_check_at=clock_now,
+    )
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="running", to_state="publishing")
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id=attempt_runner
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id=session_runner,
+        project_id=project_id,
+    )
+    from omnigent.entities import AssignmentOutputEntry
+
+    assert (
+        stores["assignment"].transition(
+            assignment.id,
+            from_state="publishing",
+            to_state="succeeded",
+            expected_active_attempt_id=attempt.id,
+            outputs=[
+                AssignmentOutputEntry(
+                    repository_name="root",
+                    commit="b" * 40,
+                    ref="refs/omnigent/assignments/x/output/att/root",
+                )
+            ],
+        )
+        is not None
+    )
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="succeeded", next_check_at=clock_now
+        )
+        is not None
+    )
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    return row, attempt
+
+
+@pytest.mark.asyncio
+async def test_release_stops_replacement_session_runner(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop names the session runner, not the stale attempt runner."""
+    import omnigent.server.routes.sessions as sessions_routes
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-replace-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 12100}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment, attempt = _seed_succeeded_with_session(
+        stores,
+        "rel-replace",
+        project_id=project_id,
+        host_id=host_id,
+        clock_now=clock["now"],
+        attempt_runner="runner_old",
+        session_runner="runner_new",
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    order: list[str] = []
+    stop_calls: list[tuple[str, str, str]] = []
+
+    async def _record_stop(
+        stopped_session_id: str, stopped_host_id: str, stopped_runner_id: str, registry: Any
+    ) -> str:
+        stop_calls.append((stopped_session_id, stopped_host_id, stopped_runner_id))
+        order.append("stop")
+        return "acked"
+
+    async def _ok_release(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        order.append("release")
+        frame = kwargs.get("frame")
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=["root"], failures={}
+        )
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _record_stop)
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _ok_release)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter({"runner_new"}),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    assert stop_calls == [(session_id, host_id, "runner_new")]
+    assert order == ["stop", "release"]
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at is None
+
+
+@pytest.mark.asyncio
+async def test_release_skipped_when_session_stop_unconfirmed(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable session stop releases nothing and keeps its check."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-unconf-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 12200}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment, _attempt = _seed_succeeded_with_session(
+        stores,
+        "rel-unconf",
+        project_id=project_id,
+        host_id=host_id,
+        clock_now=clock["now"],
+        attempt_runner="runner_1",
+        session_runner="runner_1",
+    )
+
+    async def _unavailable(*args: Any, **kwargs: Any) -> str:
+        return "unavailable"
+
+    release_calls = {"n": 0}
+
+    async def _count_release(**kwargs: Any) -> Any:
+        release_calls["n"] += 1
+        from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+        frame = kwargs.get("frame")
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=[], failures={}
+        )
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _unavailable)
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _count_release)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter({"runner_1"}),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "succeeded"
+    assert row.next_check_at is not None and row.next_check_at > clock["now"]
+    assert release_calls["n"] == 0
+
+
+# ── 22. moved bindings ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_release_skipped_when_root_binding_moved(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bumped root binding skips release with one message and no frame."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-moved-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 12300}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_terminal(
+        stores,
+        "rel-moved",
+        project_id=project_id,
+        host_id=host_id,
+        to_state="succeeded",
+        clock_now=clock["now"],
+    )
+    stores["binding"].upsert(
+        project_id=project_id,
+        host_id=host_id,
+        name="primary",
+        repository_id=repo.id,
+        workspace="/w2",
+    )
+
+    async def _must_not_release(**kwargs: Any) -> Any:
+        raise AssertionError("release must not run against a moved binding")
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _must_not_release)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at is None
+    messages = stores["assignment"].read_messages(assignment.id, limit=10)
+    assert [m.body for m in messages.data] == [
+        "worktree release skipped: binding for root changed since placement"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_release_skipped_when_second_binding_moved(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bumped non-root binding skips release with one message and no frame."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-moved2-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    root_repo = _make_repo(stores["repository"], project_id, "root")
+    extra_repo = _make_repo(stores["repository"], project_id, "extra")
+    root_binding = _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=root_repo.id,
+        workspace="/w",
+    )
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=extra_repo.id,
+        workspace="/x",
+        name="extra",
+    )
+    clock = {"now": 12400}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    created = _seed_waiting(
+        stores["assignment"],
+        "rel-moved2",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[
+            _input("root", revision=root_repo.revision),
+            _input("extra", revision=extra_repo.revision, root=False),
+        ],
+    )
+    attempt = stores["assignment"].claim_attempt(
+        created.id,
+        host_id=host_id,
+        now=clock["now"],
+        resolved_binding_id=root_binding.id,
+        resolved_binding_revision=root_binding.revision,
+        next_check_at=clock["now"],
+    )
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(created.id, from_state="starting", to_state="running")
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(created.id, from_state="running", to_state="publishing")
+        is not None
+    )
+    from omnigent.entities import AssignmentOutputEntry
+
+    assert (
+        stores["assignment"].transition(
+            created.id,
+            from_state="publishing",
+            to_state="succeeded",
+            expected_active_attempt_id=attempt.id,
+            outputs=[
+                AssignmentOutputEntry(
+                    repository_name="root",
+                    commit="b" * 40,
+                    ref="refs/omnigent/assignments/x/output/att/root",
+                ),
+                AssignmentOutputEntry(
+                    repository_name="extra",
+                    commit="c" * 40,
+                    ref="refs/omnigent/assignments/x/output/att/extra",
+                ),
+            ],
+        )
+        is not None
+    )
+    assert (
+        stores["assignment"].reschedule(
+            created.id, expected_state="succeeded", next_check_at=clock["now"]
+        )
+        is not None
+    )
+    assignment = stores["assignment"].get(created.id)
+    assert assignment is not None
+    clock["now"] += 5
+    stores["binding"].upsert(
+        project_id=project_id,
+        host_id=host_id,
+        name="extra",
+        repository_id=extra_repo.id,
+        workspace="/x2",
+    )
+
+    async def _must_not_release(**kwargs: Any) -> Any:
+        raise AssertionError("release must not run against a moved binding")
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _must_not_release)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at is None
+    messages = stores["assignment"].read_messages(assignment.id, limit=10)
+    assert [m.body for m in messages.data] == [
+        "worktree release skipped: binding for extra changed since placement"
+    ]
+
+
+# ── 23. retry route ─────────────────────────────────────────────────────
+
+
+def _retry_app(db_uri: str, tmp_path: Any):  # type: ignore[no-untyped-def]
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _Conv,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    flags = resolve_feature_flags({"OMNIGENT_FEATURES": "project_assignments"})
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=_Conv(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=HostStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+        project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),
+        project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
+        assignment_store=SqlAlchemyAssignmentStore(db_uri),
+        feature_flags=flags,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_route_rejects_active_then_accepts_after_stop(
+    db_uri: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scenario 4 through /retry: 409 while active, 200 once stopped."""
+    import httpx
+
+    import omnigent.server.routes.assignments as routes_mod
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _Conv,
+    )
+
+    app = _retry_app(db_uri, tmp_path)
+
+    class _FakeCoordinator:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def trigger(self, assignment_id: str) -> None:
+            self.calls.append(assignment_id)
+
+    fake = _FakeCoordinator()
+    app.state.assignment_coordinator = fake  # type: ignore[attr-defined]
+    fixed_now = 19700
+    monkeypatch.setattr(routes_mod, "now_epoch", lambda: fixed_now)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    if agent_store.get(AGENT_ID) is None:
+        agent_store.create(
+            agent_id=AGENT_ID, name="test-agent", bundle_location=f"{AGENT_ID}/bundle"
+        )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/v1/projects", json={"name": "RetryProj"})
+        assert resp.status_code == 200, resp.text
+        project_id = resp.json()["id"]
+        assert (
+            await client.patch(
+                f"/v1/projects/{project_id}/collaboration",
+                json={"enabled": True, "expected_revision": 0},
+            )
+        ).status_code == 200
+        assert (
+            await client.put(
+                f"/v1/projects/{project_id}/repositories/root",
+                json={
+                    "remote_url": "https://example.com/org/repo.git",
+                    "default_branch": "main",
+                },
+            )
+        ).status_code == 200
+        conv = _Conv(db_uri).create_conversation(
+            title="src", agent_id=AGENT_ID, project_id=project_id
+        )
+        assignment_id = _uid("route-retry")
+        assert (
+            await client.post(
+                "/v1/assignments",
+                json={
+                    "id": assignment_id,
+                    "source_session_id": conv.id,
+                    "target_agent_id": AGENT_ID,
+                    "task": "retry task",
+                    "repositories": [
+                        {
+                            "repository_name": "root",
+                            "commit": "a" * 40,
+                            "manifest_digest": "d" * 64,
+                        }
+                    ],
+                    "idempotency_key": "key-retry",
+                },
+            )
+        ).status_code == 201
+        assert (
+            await client.post(
+                f"/v1/assignments/{assignment_id}/published",
+                json={"refs": [{"repository_name": "root", "commit": "a" * 40}]},
+            )
+        ).status_code == 200
+        store = SqlAlchemyAssignmentStore(db_uri)
+        attempt = store.claim_attempt(assignment_id, host_id=_uid("host-a"), now=fixed_now)
+        assert attempt is not None
+        assert (
+            store.transition(assignment_id, from_state="starting", to_state="interrupted")
+            is not None
+        )
+        resp = await client.post(f"/v1/assignments/{assignment_id}/retry")
+        assert resp.status_code == 409, resp.text
+        assert (
+            store.update_attempt(assignment_id, attempt.id, state="lost", ended_at=fixed_now)
+            is not None
+        )
+        fake.calls.clear()
+        assert (
+            store.reschedule(assignment_id, expected_state="interrupted", next_check_at=None)
+            is not None
+        )
+        resp = await client.post(f"/v1/assignments/{assignment_id}/retry")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["state"] == "waiting"
+        assert body["active_attempt_id"] is None
+        assert body["next_check_at"] == fixed_now
+    assert fake.calls == [assignment_id]
+
+
+@pytest.mark.asyncio
+async def test_retry_route_expired_parks_release_with_next_check(
+    db_uri: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A past-deadline /retry expires with an exact check and a trigger."""
+    import httpx
+
+    import omnigent.server.routes.assignments as routes_mod
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _Conv,
+    )
+
+    app = _retry_app(db_uri, tmp_path)
+
+    class _FakeCoordinator:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def trigger(self, assignment_id: str) -> None:
+            self.calls.append(assignment_id)
+
+    fake = _FakeCoordinator()
+    app.state.assignment_coordinator = fake  # type: ignore[attr-defined]
+    fixed_now = 19800
+    monkeypatch.setattr(routes_mod, "now_epoch", lambda: fixed_now)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    if agent_store.get(AGENT_ID) is None:
+        agent_store.create(
+            agent_id=AGENT_ID, name="test-agent", bundle_location=f"{AGENT_ID}/bundle"
+        )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/v1/projects", json={"name": "RetryExpProj"})
+        assert resp.status_code == 200, resp.text
+        project_id = resp.json()["id"]
+        assert (
+            await client.patch(
+                f"/v1/projects/{project_id}/collaboration",
+                json={"enabled": True, "expected_revision": 0},
+            )
+        ).status_code == 200
+        assert (
+            await client.put(
+                f"/v1/projects/{project_id}/repositories/root",
+                json={
+                    "remote_url": "https://example.com/org/repo.git",
+                    "default_branch": "main",
+                },
+            )
+        ).status_code == 200
+        conv = _Conv(db_uri).create_conversation(
+            title="src", agent_id=AGENT_ID, project_id=project_id
+        )
+        assignment_id = _uid("route-retry-exp")
+        assert (
+            await client.post(
+                "/v1/assignments",
+                json={
+                    "id": assignment_id,
+                    "source_session_id": conv.id,
+                    "target_agent_id": AGENT_ID,
+                    "task": "retry expiry task",
+                    "repositories": [
+                        {
+                            "repository_name": "root",
+                            "commit": "a" * 40,
+                            "manifest_digest": "d" * 64,
+                        }
+                    ],
+                    "idempotency_key": "key-retry-exp",
+                    "start_deadline": fixed_now - 10,
+                },
+            )
+        ).status_code == 201
+        assert (
+            await client.post(
+                f"/v1/assignments/{assignment_id}/published",
+                json={"refs": [{"repository_name": "root", "commit": "a" * 40}]},
+            )
+        ).status_code == 200
+        store = SqlAlchemyAssignmentStore(db_uri)
+        attempt = store.claim_attempt(assignment_id, host_id=_uid("host-a"), now=fixed_now)
+        assert attempt is not None
+        assert (
+            store.transition(assignment_id, from_state="starting", to_state="interrupted")
+            is not None
+        )
+        assert (
+            store.update_attempt(assignment_id, attempt.id, state="lost", ended_at=fixed_now)
+            is not None
+        )
+        fake.calls.clear()
+        assert (
+            store.reschedule(assignment_id, expected_state="interrupted", next_check_at=None)
+            is not None
+        )
+        resp = await client.post(f"/v1/assignments/{assignment_id}/retry")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["state"] == "expired"
+        assert body["next_check_at"] == fixed_now
+    assert fake.calls == [assignment_id]
+
+
+# ── 24. release guard ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_release_guard_failure_skips_side_effects(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that moved after the read performs no stop, release or message."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-guard-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 12500}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment, _attempt = _seed_succeeded_with_session(
+        stores,
+        "rel-guard",
+        project_id=project_id,
+        host_id=host_id,
+        clock_now=clock["now"],
+        attempt_runner="runner_1",
+        session_runner="runner_1",
+    )
+    calls = {"stop": 0, "release": 0, "message": 0}
+
+    def _lost_reschedule(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    async def _count_stop(*args: Any, **kwargs: Any) -> str:
+        calls["stop"] += 1
+        return "acked"
+
+    async def _count_release(**kwargs: Any) -> Any:
+        calls["release"] += 1
+        raise AssertionError("release must not run after a lost guard")
+
+    orig_append = stores["assignment"].append_message
+
+    def _spy_append(message: Any) -> Any:
+        calls["message"] += 1
+        return orig_append(message)
+
+    monkeypatch.setattr(stores["assignment"], "reschedule", _lost_reschedule)
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _count_stop)
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _count_release)
+    monkeypatch.setattr(stores["assignment"], "append_message", _spy_append)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter({"runner_1"}),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert calls == {"stop": 0, "release": 0, "message": 0}
+
+
+# ── 25. partial release failure ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_partial_release_message_failure_releases_once(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed partial message keeps its backoff: one frame, two passes."""
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("rel-partial-fail-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 12600}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    _seed_terminal(
+        stores,
+        "rel-partial-fail",
+        project_id=project_id,
+        host_id=host_id,
+        to_state="succeeded",
+        clock_now=clock["now"],
+    )
+    calls = {"n": 0}
+
+    async def _partial(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        calls["n"] += 1
+        frame = kwargs.get("frame")
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id,
+            status="partial",
+            removed=[],
+            failures={"root": "worktree contains modified files"},
+        )
+
+    def _boom_append(message: Any) -> Any:
+        raise RuntimeError("message store boom")
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _partial)
+    monkeypatch.setattr(stores["assignment"], "append_message", _boom_append)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    await coordinator._due_pass_and_schedule()
+    await coordinator.wait_for_idle()
+    assert calls["n"] == 1
+    await coordinator._due_pass_and_schedule()
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert calls["n"] == 1
+
+
+# ── 26. nested lease ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_running_interrupted_unconfirmed_takes_lease(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unconfirmed stop after interrupt keeps its backoff across passes."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("nested-lease-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 15000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "nested-lease",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(assignment.id, host_id=host_id, now=clock["now"])
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+    stores["assignment"].set_lease(attempt.id, clock["now"] - 1)
+    assert (
+        stores["assignment"].reschedule(
+            assignment.id, expected_state="running", next_check_at=clock["now"] - 10
+        )
+        is not None
+    )
+    stops = {"n": 0}
+
+    async def _unavailable(*args: Any, **kwargs: Any) -> str:
+        stops["n"] += 1
+        return "unavailable"
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _unavailable)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "interrupted"
+    assert row.next_check_at == next_check_at(row.created_at, clock["now"])
+    assert stops["n"] == 1
+    await coordinator._due_pass_and_schedule()
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert stops["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stopping_cancelled_partial_message_failure_releases_once(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled row whose partial message fails releases exactly once."""
+    import omnigent.server.routes.sessions as sessions_routes
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("nested-cancel-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    binding = _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 15100}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "nested-cancel",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    attempt = stores["assignment"].claim_attempt(
+        assignment.id,
+        host_id=host_id,
+        now=clock["now"],
+        resolved_binding_id=binding.id,
+        resolved_binding_revision=binding.revision,
+        next_check_at=clock["now"],
+    )
+    assert attempt is not None
+    assert (
+        stores["assignment"].transition(assignment.id, from_state="starting", to_state="running")
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(
+            assignment.id,
+            from_state="running",
+            to_state="stopping",
+            expected_active_attempt_id=attempt.id,
+        )
+        is not None
+    )
+    session_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[:32]
+    assert (
+        stores["assignment"].update_attempt(
+            assignment.id, attempt.id, session_id=session_id, runner_id="runner_1"
+        )
+        is not None
+    )
+    _make_session_with_runner(
+        stores,
+        session_id,
+        host_id=host_id,
+        workspace="/w",
+        runner_id="runner_1",
+        project_id=project_id,
+    )
+
+    async def _acked(*args: Any, **kwargs: Any) -> str:
+        return "acked"
+
+    frames = {"n": 0}
+
+    async def _partial(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        frames["n"] += 1
+        frame = kwargs.get("frame")
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id,
+            status="partial",
+            removed=[],
+            failures={"root": "worktree contains modified files"},
+        )
+
+    def _boom_append(message: Any) -> Any:
+        raise RuntimeError("message store boom")
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _acked)
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _partial)
+    monkeypatch.setattr(stores["assignment"], "append_message", _boom_append)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    assert frames["n"] == 1
+    await coordinator._due_pass_and_schedule()
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert frames["n"] == 1
+
+
+# ── 27. release fence ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_release_fenced_against_session_relaunch(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner that changed between stop and frame sends no frame."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("fence-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    clock = {"now": 15200}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    assignment, _attempt = _seed_succeeded_with_session(
+        stores,
+        "fence",
+        project_id=project_id,
+        host_id=host_id,
+        clock_now=clock["now"],
+        attempt_runner="runner_R1",
+        session_runner="runner_R1",
+    )
+    reads = {"n": 0}
+
+    def _flapping(session_id: str) -> Any:
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return SimpleNamespace(runner_id="runner_R1", id=session_id)
+        return SimpleNamespace(runner_id="runner_R2", id=session_id)
+
+    monkeypatch.setattr(stores["conversation"], "get_conversation", _flapping)
+    stops: list[str] = []
+
+    async def _acked(
+        stopped_session_id: str, stopped_host_id: str, stopped_runner_id: str, registry: Any
+    ) -> str:
+        stops.append(stopped_runner_id)
+        return "acked"
+
+    frames = {"n": 0}
+
+    async def _count_release(**kwargs: Any) -> Any:
+        frames["n"] += 1
+        from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+        frame = kwargs.get("frame")
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=["root"], failures={}
+        )
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _acked)
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _count_release)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert stops == ["runner_R1"]
+    assert frames["n"] == 0
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.next_check_at == next_check_at(row.created_at, clock["now"])
+
+
+# ── 28. latest attempt evidence ─────────────────────────────────────────
+
+
+def _seed_waiting_two_repo(
+    stores: dict[str, Any],
+    seed: str,
+    *,
+    project_id: str,
+    host_id: str,
+    root_repo: Any,
+    extra_repo: Any,
+    clock_now: int,
+) -> tuple[Any, Any]:
+    created = _seed_waiting(
+        stores["assignment"],
+        seed,
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[
+            _input("root", revision=root_repo.revision),
+            _input("extra", revision=extra_repo.revision, root=False),
+        ],
+    )
+    root_binding = stores["binding"].get_by_name(
+        project_id=project_id, host_id=host_id, name="primary"
+    )
+    assert root_binding is not None
+    attempt = stores["assignment"].claim_attempt(
+        created.id,
+        host_id=host_id,
+        now=clock_now,
+        resolved_binding_id=root_binding.id,
+        resolved_binding_revision=root_binding.revision,
+        next_check_at=clock_now,
+    )
+    assert attempt is not None
+    return created, attempt
+
+
+@pytest.mark.asyncio
+async def test_release_with_cleared_link_skips_when_second_binding_moved(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cleared link still enforces non-root freshness via the latest attempt."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("latest-skip-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    root_repo = _make_repo(stores["repository"], project_id, "root")
+    extra_repo = _make_repo(stores["repository"], project_id, "extra")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=root_repo.id,
+        workspace="/w",
+    )
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=extra_repo.id,
+        workspace="/x",
+        name="extra",
+    )
+    clock = {"now": 15300}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    created, attempt = _seed_waiting_two_repo(
+        stores,
+        "latest-skip",
+        project_id=project_id,
+        host_id=host_id,
+        root_repo=root_repo,
+        extra_repo=extra_repo,
+        clock_now=clock["now"],
+    )
+    assert (
+        stores["assignment"].update_attempt(
+            created.id,
+            attempt.id,
+            state="finished",
+            ended_at=clock["now"],
+            error_code="prepare_failed",
+        )
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(
+            created.id,
+            from_state="starting",
+            to_state="waiting",
+            expected_active_attempt_id=attempt.id,
+            active_attempt_id=None,
+            next_check_at=clock["now"],
+        )
+        is not None
+    )
+    row = stores["assignment"].get(created.id)
+    assert row is not None
+    assert row.active_attempt_id is None
+    assert row.resolved_host_id == host_id
+    clock["now"] += 5
+    stores["binding"].upsert(
+        project_id=project_id,
+        host_id=host_id,
+        name="extra",
+        repository_id=extra_repo.id,
+        workspace="/x2",
+    )
+    assert (
+        stores["assignment"].transition(
+            created.id, from_state="waiting", to_state="cancelled", next_check_at=clock["now"]
+        )
+        is not None
+    )
+
+    async def _must_not_release(**kwargs: Any) -> Any:
+        frames["n"] += 1
+        from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+        frame = kwargs.get("frame")
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=[], failures={}
+        )
+
+    frames = {"n": 0}
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _must_not_release)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(created.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    assert frames["n"] == 0
+    final = stores["assignment"].get(created.id)
+    assert final is not None
+    assert final.next_check_at is None
+    messages = stores["assignment"].read_messages(created.id, limit=10)
+    assert [m.body for m in messages.data] == [
+        "worktree release skipped: binding for extra changed since placement"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_release_with_cleared_link_releases_when_bindings_unmoved(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cleared link releases with the original directories when fresh."""
+    from omnigent.host.frames import HostAssignmentReleaseResultFrame
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("latest-ok-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    root_repo = _make_repo(stores["repository"], project_id, "root")
+    extra_repo = _make_repo(stores["repository"], project_id, "extra")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=root_repo.id,
+        workspace="/w",
+    )
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=extra_repo.id,
+        workspace="/x",
+        name="extra",
+    )
+    clock = {"now": 15400}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    created, attempt = _seed_waiting_two_repo(
+        stores,
+        "latest-ok",
+        project_id=project_id,
+        host_id=host_id,
+        root_repo=root_repo,
+        extra_repo=extra_repo,
+        clock_now=clock["now"],
+    )
+    assert (
+        stores["assignment"].update_attempt(
+            created.id,
+            attempt.id,
+            state="finished",
+            ended_at=clock["now"],
+            error_code="prepare_failed",
+        )
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(
+            created.id,
+            from_state="starting",
+            to_state="waiting",
+            expected_active_attempt_id=attempt.id,
+            active_attempt_id=None,
+            next_check_at=clock["now"],
+        )
+        is not None
+    )
+    assert (
+        stores["assignment"].transition(
+            created.id, from_state="waiting", to_state="cancelled", next_check_at=clock["now"]
+        )
+        is not None
+    )
+    captured: dict[str, Any] = {}
+
+    async def _ok(**kwargs: Any) -> HostAssignmentReleaseResultFrame:
+        frame = kwargs.get("frame")
+        captured["frame"] = frame
+        return HostAssignmentReleaseResultFrame(
+            request_id=frame.request_id, status="ok", removed=["root", "extra"], failures={}
+        )
+
+    monkeypatch.setattr(assignments_mod, "release_assignment_on_host", _ok)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        runner_router=FakeRunnerRouter(),
+        runner_exit_reports=FakeExitReports(),
+    )
+    coordinator.trigger(created.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    frame = captured.get("frame")
+    assert frame is not None
+    by_name = {r.repository_name: r.source_directory for r in frame.repositories}
+    assert by_name == {"root": "/w", "extra": "/x"}
+    final = stores["assignment"].get(created.id)
+    assert final is not None
+    assert final.next_check_at is None
+
+
+# ── 29. idempotent return ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_return_to_waiting_idempotent_when_attempt_ended(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An already-ended attempt still returns to waiting without raising."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-a")
+    project_id = _uid("idem-ret-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"], project_id=project_id, host_id=host_id, repo_id=repo.id, workspace="/w"
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "idem-ret",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+
+    async def _fail_and_end_first(**kwargs: Any) -> HostAssignmentPrepareResultFrame:
+        frame = kwargs.get("frame")
+        current = stores["assignment"].get(assignment.id)
+        assert current is not None and current.active_attempt_id is not None
+        assert (
+            stores["assignment"].update_attempt(
+                assignment.id,
+                current.active_attempt_id,
+                state="finished",
+                ended_at=9999,
+                error_code="placement_abandoned",
+            )
+            is not None
+        )
+        return HostAssignmentPrepareResultFrame(
+            request_id=frame.request_id,
+            status="failed",
+            directories={},
+            error_code="context_missing",
+            error="required context missing",
+            repository_name="root",
+        )
+
+    monkeypatch.setattr(assignments_mod, "prepare_assignment_on_host", _fail_and_end_first)
+    _install_placement_fakes(monkeypatch)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None
+    assert row.state == "waiting"
+    assert row.active_attempt_id is None
+
+
+# ── 30. cancel to cancelled ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_waiting_with_host_writes_next_check(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling a placed waiting row parks a release check and triggers."""
+    import httpx
+
+    import omnigent.server.routes.assignments as routes_mod
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _Conv,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    flags = resolve_feature_flags({"OMNIGENT_FEATURES": "project_assignments"})
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=_Conv(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=HostStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+        project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),
+        project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
+        assignment_store=SqlAlchemyAssignmentStore(db_uri),
+        feature_flags=flags,
+    )
+
+    class _FakeCoordinator:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def trigger(self, assignment_id: str) -> None:
+            self.calls.append(assignment_id)
+
+    fake = _FakeCoordinator()
+    app.state.assignment_coordinator = fake  # type: ignore[attr-defined]
+    fixed_now = 19900
+    monkeypatch.setattr(routes_mod, "now_epoch", lambda: fixed_now)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    if agent_store.get(AGENT_ID) is None:
+        agent_store.create(
+            agent_id=AGENT_ID, name="test-agent", bundle_location=f"{AGENT_ID}/bundle"
+        )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/v1/projects", json={"name": "CancelWaitProj"})
+        assert resp.status_code == 200, resp.text
+        project_id = resp.json()["id"]
+        assert (
+            await client.patch(
+                f"/v1/projects/{project_id}/collaboration",
+                json={"enabled": True, "expected_revision": 0},
+            )
+        ).status_code == 200
+        assert (
+            await client.put(
+                f"/v1/projects/{project_id}/repositories/root",
+                json={
+                    "remote_url": "https://example.com/org/repo.git",
+                    "default_branch": "main",
+                },
+            )
+        ).status_code == 200
+        conv = _Conv(db_uri).create_conversation(
+            title="src", agent_id=AGENT_ID, project_id=project_id
+        )
+        assignment_id = _uid("route-cancel-wait")
+        assert (
+            await client.post(
+                "/v1/assignments",
+                json={
+                    "id": assignment_id,
+                    "source_session_id": conv.id,
+                    "target_agent_id": AGENT_ID,
+                    "task": "cancel waiting task",
+                    "repositories": [
+                        {
+                            "repository_name": "root",
+                            "commit": "a" * 40,
+                            "manifest_digest": "d" * 64,
+                        }
+                    ],
+                    "idempotency_key": "key-cancel-wait",
+                },
+            )
+        ).status_code == 201
+        assert (
+            await client.post(
+                f"/v1/assignments/{assignment_id}/published",
+                json={"refs": [{"repository_name": "root", "commit": "a" * 40}]},
+            )
+        ).status_code == 200
+        fake.calls.clear()
+        store = SqlAlchemyAssignmentStore(db_uri)
+        host_id = _uid("host-a")
+        attempt = store.claim_attempt(assignment_id, host_id=host_id, now=now_epoch())
+        assert attempt is not None
+        assert (
+            store.transition(
+                assignment_id,
+                from_state="starting",
+                to_state="waiting",
+                expected_active_attempt_id=attempt.id,
+                active_attempt_id=None,
+                next_check_at=now_epoch(),
+            )
+            is not None
+        )
+        assert (
+            store.reschedule(assignment_id, expected_state="waiting", next_check_at=None)
+            is not None
+        )
+        resp = await client.post(f"/v1/assignments/{assignment_id}/cancel", json={})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["state"] == "cancelled"
+        assert body["next_check_at"] == fixed_now
     assert fake.calls == [assignment_id]

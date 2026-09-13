@@ -1144,13 +1144,15 @@ def create_assignments_router(
         ):
             to_state = AssignmentState.CANCELLED.value
             fields: dict[str, Any] = {}
+            if assignment.resolved_host_id is not None:
+                fields["next_check_at"] = now
         elif from_state in (
             AssignmentState.STARTING.value,
             AssignmentState.RUNNING.value,
             AssignmentState.PUBLISHING.value,
         ):
             to_state = AssignmentState.STOPPING.value
-            fields = {"cancel_requested_at": now}
+            fields = {"cancel_requested_at": now, "next_check_at": now}
             expected_active_attempt_id = assignment.active_attempt_id
         elif from_state == AssignmentState.STOPPING.value:
             return _assignment_to_response(assignment)
@@ -1171,6 +1173,8 @@ def create_assignments_router(
                 )
             to_state = AssignmentState.CANCELLED.value
             fields = {}
+            if assignment.resolved_host_id is not None:
+                fields["next_check_at"] = now
             expected_active_attempt_id = attempt.id
         else:
             raise OmnigentError(
@@ -1190,6 +1194,13 @@ def create_assignments_router(
         await _record_state_message(
             assignment_store, assignment_id, from_state, to_state, reason=body.reason
         )
+        coordinator = getattr(request.app.state, "assignment_coordinator", None)
+        if coordinator is not None:
+            if to_state == AssignmentState.STOPPING.value or (
+                to_state == AssignmentState.CANCELLED.value
+                and updated.resolved_host_id is not None
+            ):
+                coordinator.trigger(assignment_id)
         return _assignment_to_response(updated)
 
     @router.post("/assignments/{assignment_id}/retry")
@@ -1232,7 +1243,7 @@ def create_assignments_router(
         now = now_epoch()
         if assignment.start_deadline is not None and now >= assignment.start_deadline:
             to_state = AssignmentState.EXPIRED.value
-            fields = {}
+            fields = {"next_check_at": now} if assignment.resolved_host_id is not None else {}
         else:
             to_state = AssignmentState.WAITING.value
             fields = {"active_attempt_id": None, "next_check_at": now}
@@ -1251,7 +1262,7 @@ def create_assignments_router(
             AssignmentState.INTERRUPTED.value,
             to_state,
         )
-        if to_state == AssignmentState.WAITING.value:
+        if to_state == AssignmentState.WAITING.value or updated.resolved_host_id is not None:
             coordinator = getattr(request.app.state, "assignment_coordinator", None)
             if coordinator is not None:
                 coordinator.trigger(assignment_id)
@@ -1415,6 +1426,9 @@ def create_assignments_router(
             and all(seen[name] == commit for name, commit in advertised.items())
         )
         now = now_epoch()
+        release_fields: dict[str, Any] = (
+            {"next_check_at": now} if assignment.resolved_host_id is not None else {}
+        )
         if matches and not body.error:
             updated = await _transition_or_raise(
                 assignment_store,
@@ -1424,6 +1438,7 @@ def create_assignments_router(
                 action="finishing",
                 expected_active_attempt_id=bound.id,
                 outputs=list(assignment.outputs or []),
+                **release_fields,
             )
             await asyncio.to_thread(
                 assignment_store.update_attempt,
@@ -1438,6 +1453,10 @@ def create_assignments_router(
                 AssignmentState.PUBLISHING.value,
                 AssignmentState.SUCCEEDED.value,
             )
+            if updated.resolved_host_id is not None:
+                coordinator = getattr(request.app.state, "assignment_coordinator", None)
+                if coordinator is not None:
+                    coordinator.trigger(assignment_id)
             return _assignment_to_response(updated)
         reason = (body.error or "output refs do not match the advertised outputs")[:500]
         updated = await _transition_or_raise(
@@ -1448,6 +1467,7 @@ def create_assignments_router(
             action="finishing",
             expected_active_attempt_id=bound.id,
             error_code="publication_failed",
+            **release_fields,
         )
         await asyncio.to_thread(
             assignment_store.update_attempt,
@@ -1464,6 +1484,10 @@ def create_assignments_router(
             AssignmentState.FAILED.value,
             reason=f"publication_failed: {reason}",
         )
+        if updated.resolved_host_id is not None:
+            coordinator = getattr(request.app.state, "assignment_coordinator", None)
+            if coordinator is not None:
+                coordinator.trigger(assignment_id)
         return _assignment_to_response(updated)
 
     return router

@@ -449,8 +449,8 @@ def test_set_lease_observable_through_update(store: SqlAlchemyAssignmentStore) -
 
 
 def test_select_due_orders_limits_and_excludes(store: SqlAlchemyAssignmentStore) -> None:
-    """Due rows come back ordered by ``next_check_at``; terminal, future
-    and unscheduled rows are excluded and the limit is honoured."""
+    """Due rows come back ordered by ``next_check_at``; future,
+    unscheduled and NULL-check rows are excluded and the limit holds."""
     early = _to_waiting(store, "d-early", next_check_at=100)
     late = _to_waiting(store, "d-late", next_check_at=200)
     _to_waiting(store, "d-future", next_check_at=9999)
@@ -459,11 +459,48 @@ def test_select_due_orders_limits_and_excludes(store: SqlAlchemyAssignmentStore)
     claimed = store.claim_attempt(terminal.id, host_id=_uid("host"), now=60)
     assert claimed is not None
     assert store.transition(terminal.id, from_state="starting", to_state="failed")
+    cleared = store.reschedule(terminal.id, expected_state="failed", next_check_at=None)
+    assert cleared is not None
 
     due = store.select_due(now=500, limit=10)
     assert [a.id for a in due] == [early.id, late.id]
     assert [a.id for a in store.select_due(now=500, limit=1)] == [early.id]
     assert store.select_due(now=50, limit=10) == []
+
+
+def _select_due_interrupted_cases(store: SqlAlchemyAssignmentStore) -> None:
+    """Interrupted rows: due selected, NULL skipped."""
+    waiting = _to_waiting(store, "due-int", next_check_at=100)
+    attempt = store.claim_attempt(waiting.id, host_id=_uid("host"), now=110)
+    assert attempt is not None
+    assert store.transition(waiting.id, from_state="starting", to_state="interrupted") is not None
+    due = store.reschedule(waiting.id, expected_state="interrupted", next_check_at=120)
+    assert due is not None
+    assert [a.id for a in store.select_due(now=500, limit=10)] == [waiting.id]
+    cleared = store.reschedule(waiting.id, expected_state="interrupted", next_check_at=None)
+    assert cleared is not None
+    assert store.select_due(now=500, limit=10) == []
+
+
+def test_select_due_interrupted_due_and_null(store: SqlAlchemyAssignmentStore) -> None:
+    """Interrupted: due ``next_check_at`` selected, NULL not."""
+    _select_due_interrupted_cases(store)
+
+
+def test_select_due_terminal_due_and_null(store: SqlAlchemyAssignmentStore) -> None:
+    """Succeeded: due ``next_check_at`` selected (release pending), NULL not."""
+    waiting = _to_waiting(store, "due-term", next_check_at=100)
+    attempt = store.claim_attempt(waiting.id, host_id=_uid("host"), now=110)
+    assert attempt is not None
+    assert store.transition(waiting.id, from_state="starting", to_state="running") is not None
+    assert store.transition(waiting.id, from_state="running", to_state="publishing") is not None
+    assert store.transition(waiting.id, from_state="publishing", to_state="succeeded") is not None
+    due = store.reschedule(waiting.id, expected_state="succeeded", next_check_at=120)
+    assert due is not None
+    assert [a.id for a in store.select_due(now=500, limit=10)] == [waiting.id]
+    cleared = store.reschedule(waiting.id, expected_state="succeeded", next_check_at=None)
+    assert cleared is not None
+    assert store.select_due(now=500, limit=10) == []
 
 
 def test_select_for_host_scoped_to_resolved_host(store: SqlAlchemyAssignmentStore) -> None:
@@ -866,3 +903,34 @@ def test_select_waiting_for_host_honours_limit_and_none_owner(
     assert [
         a.id for a in store.select_waiting_for_host(host_id=host_a, owner_user_id=None, limit=1)
     ] == [first.id]
+
+
+def test_get_latest_attempt_returns_highest_number(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """The highest-numbered attempt is returned, or ``None`` when none exists."""
+    waiting = _to_waiting(store, "latest")
+    assert store.get_latest_attempt(waiting.id) is None
+    first = store.claim_attempt(waiting.id, host_id=_uid("host"), now=2000)
+    assert first is not None
+    assert store.get_latest_attempt(waiting.id) is not None
+    assert store.get_latest_attempt(waiting.id).id == first.id
+    assert (
+        store.transition(
+            waiting.id,
+            from_state="starting",
+            to_state="waiting",
+            expected_active_attempt_id=first.id,
+            active_attempt_id=None,
+            next_check_at=2100,
+        )
+        is not None
+    )
+    second = store.claim_attempt(waiting.id, host_id=_uid("host"), now=2200)
+    assert second is not None
+    assert second.number == 2
+    latest = store.get_latest_attempt(waiting.id)
+    assert latest is not None
+    assert latest.id == second.id
+    assert latest.number == 2
+    assert store.get_latest_attempt(_uid("nope")) is None

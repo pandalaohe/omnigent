@@ -1,15 +1,16 @@
-"""Assignment coordinator — scoped triggers, backoff and placement.
+"""Assignment coordinator — scoped triggers, backoff, placement and teardown.
 
 One durable assignment hands work to one ``(host, agent)`` destination.
 This coordinator evaluates a single row at a time: a ``waiting`` row is
 checked against the project switch, the destination, the binding and the
 registered revisions, then claimed, prepared on the host and placed as a
-runner session with one initial event. Any other non-terminal row only
-moves its ``next_check_at``.
+runner session with one initial event. Active rows are watched for runner
+liveness, orphaned placements are retired, stops are confirmed before an
+attempt is ended, and terminal rows release their worktrees.
 
-Triggers are scoped: one assignment id, one host's waiting rows, or the
-bounded due-work pass. The pass is indexed, terminal-excluding and
-row-capped, and every row carries its own backoff so nothing retries hot.
+Triggers are scoped: one assignment id, one host's rows, or the bounded
+due-work pass. The pass is indexed and row-capped, and every row carries
+its own backoff so nothing retries hot.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from omnigent.entities import (
     Assignment,
     AssignmentAttempt,
+    AssignmentMessage,
     Conversation,
     ProjectHostBinding,
     ProjectRepository,
@@ -33,18 +35,21 @@ from omnigent.entities.assignment import TERMINAL_STATES
 from omnigent.host.frames import (
     HostAssignmentPrepareFrame,
     HostAssignmentPrepareRepository,
+    HostAssignmentReleaseFrame,
+    HostAssignmentReleaseRepository,
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.assignment_host import (
     host_supports_assignments,
     prepare_assignment_on_host,
+    release_assignment_on_host,
 )
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.assignment_store import AssignmentStore
+from omnigent.stores.assignment_store import AssignmentStore, InactiveAttemptError
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError, ConversationStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
@@ -60,6 +65,9 @@ _BACKOFF_MAX_S = 3600
 
 _PLACEMENT_NEXT_CHECK_S = 420
 _RUNNER_CONNECT_TIMEOUT_S = 30.0
+
+_ACTIVE_CHECK_S = 30
+_LEASE_S = 90
 
 
 def next_check_at(created_at: int, now: int) -> int:
@@ -80,6 +88,51 @@ def next_check_at(created_at: int, now: int) -> int:
 def _truncate_reason(reason: str) -> str:
     """Clamp a wait reason to the ``wait_reason`` column width."""
     return reason[:256]
+
+
+def _derived_session_id(attempt_id: str) -> str:
+    """Derive an attempt's session id when none was stored.
+
+    :param attempt_id: The attempt whose session to derive.
+    :returns: The ``sha256("assignment-attempt:" + id)[:32]`` id.
+    """
+    return hashlib.sha256(f"assignment-attempt:{attempt_id}".encode()).hexdigest()[:32]
+
+
+def _attempt_session_id(attempt: AssignmentAttempt) -> str:
+    """Return the stored session id, or the derived one when unset.
+
+    :param attempt: The attempt whose session to address.
+    :returns: The conversation id of the attempt's session.
+    """
+    if attempt.session_id is not None:
+        return attempt.session_id
+    return _derived_session_id(attempt.id)
+
+
+def _attempt_ended(attempt: AssignmentAttempt) -> bool:
+    """Return whether an attempt no longer owns a live execution.
+
+    :param attempt: The attempt to inspect.
+    :returns: ``True`` when the attempt left ``active`` (or stamped an
+        end); ending it again would raise, so callers skip the write.
+    """
+    return attempt.state != "active" or attempt.ended_at is not None
+
+
+def _attempt_runner_id(attempt: AssignmentAttempt, conv: Conversation | None) -> str | None:
+    """Return the runner bound to an attempt, or the session's runner.
+
+    :param attempt: The attempt whose runner to resolve.
+    :param conv: The attempt's session, or ``None`` when missing.
+    :returns: ``attempt.runner_id``, else the session's ``runner_id``,
+        else ``None`` when nothing was ever launched.
+    """
+    if attempt.runner_id is not None:
+        return attempt.runner_id
+    if conv is not None:
+        return conv.runner_id
+    return None
 
 
 @dataclass(frozen=True)
@@ -295,6 +348,22 @@ class AssignmentCoordinator:
             if existing is not None and not existing.done():
                 continue
             self.trigger(row.id)
+        try:
+            hosted = await asyncio.to_thread(
+                self._assignment_store.select_for_host,
+                host_id,
+                limit=self._due_batch_limit,
+            )
+        except Exception:  # noqa: BLE001
+            _logger.warning("Assignment host scan failed for %s", host_id, exc_info=True)
+            return
+        for row in hosted:
+            if row.state not in ("interrupted", "stopping"):
+                continue
+            existing = self._tasks.get(row.id)
+            if existing is not None and not existing.done():
+                continue
+            self.trigger(row.id)
 
     async def _run_one(self, assignment_id: str) -> None:
         try:
@@ -302,74 +371,150 @@ class AssignmentCoordinator:
         except Exception:  # noqa: BLE001
             _logger.warning("Assignment evaluation failed for %s", assignment_id, exc_info=True)
 
+    async def _check_lease(self, assignment: Assignment) -> Assignment | None:
+        # Parked first so a crash or early exit never retries hot, and a
+        # row a concurrent writer moved stops this evaluation now.
+        now = int(time.time())
+        return await asyncio.to_thread(
+            self._assignment_store.reschedule,
+            assignment.id,
+            expected_state=assignment.state,
+            expected_active_attempt_id=assignment.active_attempt_id,
+            next_check_at=next_check_at(assignment.created_at, now),
+        )
+
     async def _evaluate(self, assignment_id: str) -> None:
         assignment = await asyncio.to_thread(self._assignment_store.get, assignment_id)
-        if assignment is None or assignment.state in TERMINAL_STATES:
+        if assignment is None:
             return
-        if assignment.state != "waiting":
-            await self._reschedule_other(assignment)
+        if assignment.state in TERMINAL_STATES:
+            if assignment.next_check_at is None:
+                return
+            if assignment.next_check_at > int(time.time()):
+                return
+            if await self._check_lease(assignment) is None:
+                return
+            await self._evaluate_terminal_release(assignment)
             return
-        await self._evaluate_waiting(assignment)
+        if assignment.state == "waiting":
+            await self._evaluate_waiting(assignment)
+            return
+        if await self._check_lease(assignment) is None:
+            return
+        if assignment.state in ("running", "publishing"):
+            await self._evaluate_active(assignment)
+            return
+        if assignment.state == "starting":
+            await self._evaluate_starting_orphan(assignment)
+            return
+        if assignment.state == "interrupted":
+            await self._evaluate_interrupted(assignment)
+            return
+        if assignment.state == "stopping":
+            await self._evaluate_stopping(assignment)
+            return
 
-    async def _reschedule_other(self, assignment: Assignment) -> None:
-        now = int(time.time())
+    def _runner_alive(self, runner_id: str | None, conv: Conversation | None) -> bool:
+        """Return whether the attempt's runner may still complete.
+
+        A relaunch replaces the session's runner, so an old attempt whose
+        id no longer matches the session is never alive.
+
+        :param runner_id: The attempt's runner, or ``None``.
+        :param conv: The attempt's session, or ``None`` when missing.
+        :returns: ``True`` only when the id exists, the runner is
+            connected, and the session still points at it.
+        """
+        if runner_id is None or conv is None:
+            return False
+        if conv.runner_id != runner_id:
+            return False
+        return bool(self._runner_router.runner_is_online(runner_id))
+
+    async def _stop_confirmed(
+        self,
+        assignment: Assignment,
+        attempt: AssignmentAttempt,
+        runner_id: str | None,
+        session_id: str,
+    ) -> bool:
+        """Return whether the old execution is confirmed stopped.
+
+        Checked in order: no runner was ever bound; the host reported
+        the runner exited; the destination host answers a stop with
+        ``acked`` or ``unknown_runner``. Anything else is unconfirmed.
+
+        :param assignment: The row being reconciled.
+        :param attempt: The attempt whose execution to confirm.
+        :param runner_id: The attempt's runner, or ``None``.
+        :param session_id: The attempt's session id.
+        :returns: ``True`` when the old execution is confirmed stopped.
+        """
+        if runner_id is None:
+            return True
+        if self._runner_exit_reports.get(runner_id) is not None:
+            return True
+        host_id = assignment.resolved_host_id or attempt.host_id
+        if host_id is None:
+            return False
+        if self._host_registry.get(host_id) is None:
+            return False
+        from omnigent.server.routes.sessions import _stop_session_host_runner_outcome
+
         try:
-            await asyncio.to_thread(
-                self._assignment_store.reschedule,
-                assignment.id,
-                expected_state=assignment.state,
-                expected_active_attempt_id=assignment.active_attempt_id,
-                next_check_at=next_check_at(assignment.created_at, now),
+            outcome = await _stop_session_host_runner_outcome(
+                session_id, host_id, runner_id, self._host_registry
             )
         except Exception:  # noqa: BLE001
-            _logger.warning("Assignment reschedule failed for %s", assignment.id, exc_info=True)
+            return False
+        return outcome in ("acked", "unknown_runner")
 
     async def _evaluate_waiting(self, assignment: Assignment) -> None:
-        now = int(time.time())
         outcome = await self._blocking_reason(assignment)
         if isinstance(outcome, str):
+            now = int(time.time())
             if assignment.start_deadline is not None and assignment.start_deadline <= now:
-                try:
-                    await asyncio.to_thread(
-                        self._assignment_store.transition,
-                        assignment.id,
-                        from_state="waiting",
-                        to_state="expired",
-                        expected_active_attempt_id=None,
-                        next_check_at=None,
-                        wait_reason=_truncate_reason(outcome),
-                    )
-                except Exception:  # noqa: BLE001
-                    _logger.warning(
-                        "Assignment expiry failed for %s", assignment.id, exc_info=True
-                    )
-                return
-            try:
-                await asyncio.to_thread(
-                    self._assignment_store.reschedule,
-                    assignment.id,
-                    expected_state="waiting",
-                    expected_active_attempt_id=assignment.active_attempt_id,
-                    next_check_at=next_check_at(assignment.created_at, now),
-                    wait_reason=_truncate_reason(outcome),
-                )
-            except Exception:  # noqa: BLE001
-                _logger.warning(
-                    "Assignment wait reschedule failed for %s", assignment.id, exc_info=True
-                )
-            return
-        if assignment.start_deadline is not None and assignment.start_deadline <= now:
-            try:
-                await asyncio.to_thread(
+                release_at: int | None = now if assignment.resolved_host_id is not None else None
+                expired = await asyncio.to_thread(
                     self._assignment_store.transition,
                     assignment.id,
                     from_state="waiting",
                     to_state="expired",
                     expected_active_attempt_id=None,
-                    next_check_at=None,
+                    next_check_at=release_at,
+                    wait_reason=_truncate_reason(outcome),
                 )
-            except Exception:  # noqa: BLE001
-                _logger.warning("Assignment expiry failed for %s", assignment.id, exc_info=True)
+                if expired is not None and release_at is not None:
+                    if await self._check_lease(expired) is None:
+                        return
+                    await self._evaluate_terminal_release(expired)
+                return
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state="waiting",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=next_check_at(assignment.created_at, now),
+                wait_reason=_truncate_reason(outcome),
+            )
+            return
+        now = int(time.time())
+        if assignment.start_deadline is not None and assignment.start_deadline <= now:
+            release_at = now if assignment.resolved_host_id is not None else None
+            expired = await asyncio.to_thread(
+                self._assignment_store.transition,
+                assignment.id,
+                from_state="waiting",
+                to_state="expired",
+                expected_active_attempt_id=None,
+                next_check_at=release_at,
+            )
+            if expired is not None and release_at is not None:
+                if await self._check_lease(expired) is None:
+                    return
+                await self._evaluate_terminal_release(expired)
+            return
+        if await self._check_lease(assignment) is None:
             return
         if assignment.resolved_binding_id is None:
             expected_pin: tuple[str, int | None] | None = None
@@ -378,20 +523,17 @@ class AssignmentCoordinator:
                 assignment.resolved_binding_id,
                 assignment.resolved_binding_revision,
             )
-        try:
-            attempt = await asyncio.to_thread(
-                self._assignment_store.claim_attempt,
-                assignment.id,
-                host_id=outcome.host_id,
-                now=now,
-                resolved_binding_id=outcome.binding.id,
-                resolved_binding_revision=outcome.binding.revision,
-                next_check_at=now + _PLACEMENT_NEXT_CHECK_S,
-                expected_binding_pin=expected_pin,
-            )
-        except Exception:  # noqa: BLE001 - coordinator retry owns recovery.
-            _logger.warning("Assignment claim failed for %s", assignment.id, exc_info=True)
-            return
+        now = int(time.time())
+        attempt = await asyncio.to_thread(
+            self._assignment_store.claim_attempt,
+            assignment.id,
+            host_id=outcome.host_id,
+            now=now,
+            resolved_binding_id=outcome.binding.id,
+            resolved_binding_revision=outcome.binding.revision,
+            next_check_at=now + _PLACEMENT_NEXT_CHECK_S,
+            expected_binding_pin=expected_pin,
+        )
         if attempt is None:
             return
         await self._prepare_and_place(
@@ -457,6 +599,27 @@ class AssignmentCoordinator:
             )
         return "no_eligible_host"
 
+    async def _enabled_bindings_for_repo(
+        self, project_id: str, host_id: str, repo_id: str
+    ) -> list[ProjectHostBinding]:
+        """Return one host's enabled bindings holding a repository.
+
+        :param project_id: The project the bindings belong to.
+        :param host_id: The host whose bindings to list.
+        :param repo_id: The registered repository the binding must hold.
+        :returns: The matching bindings, empty when none match.
+        """
+        candidates = await asyncio.to_thread(
+            self._binding_store.list_by_host,
+            project_id=project_id,
+            host_id=host_id,
+        )
+        return [
+            candidate
+            for candidate in candidates
+            if candidate.enabled and candidate.repository_id == repo_id
+        ]
+
     async def _check_binding_and_inputs(
         self, assignment: Assignment, host_id: str, binding: ProjectHostBinding
     ) -> str | dict[str, str]:
@@ -495,16 +658,9 @@ class AssignmentCoordinator:
                 return f"repository_changed:{entry.repository_name}"
             if entry.is_execution_root:
                 continue
-            bindings = await asyncio.to_thread(
-                self._binding_store.list_by_host,
-                project_id=assignment.project_id,
-                host_id=host_id,
+            matches = await self._enabled_bindings_for_repo(
+                assignment.project_id, host_id, repo.id
             )
-            matches = [
-                candidate
-                for candidate in bindings
-                if candidate.enabled and candidate.repository_id == repo.id
-            ]
             if not matches:
                 return f"binding_missing:{entry.repository_name}"
             if len(matches) > 1:
@@ -565,7 +721,7 @@ class AssignmentCoordinator:
         reason: str,
     ) -> None:
         failure_now = int(time.time())
-        try:
+        with contextlib.suppress(InactiveAttemptError):
             await asyncio.to_thread(
                 self._assignment_store.update_attempt,
                 assignment.id,
@@ -574,26 +730,16 @@ class AssignmentCoordinator:
                 ended_at=failure_now,
                 error_code=error_code,
             )
-        except Exception:  # noqa: BLE001 - coordinator retry owns recovery.
-            _logger.warning(
-                "Assignment attempt finish failed for %s", assignment.id, exc_info=True
-            )
-            return
-        try:
-            await asyncio.to_thread(
-                self._assignment_store.transition,
-                assignment.id,
-                from_state="starting",
-                to_state="waiting",
-                expected_active_attempt_id=attempt.id,
-                active_attempt_id=None,
-                wait_reason=_truncate_reason(reason),
-                next_check_at=next_check_at(assignment.created_at, failure_now),
-            )
-        except Exception:  # noqa: BLE001 - coordinator retry owns recovery.
-            _logger.warning(
-                "Assignment return to waiting failed for %s", assignment.id, exc_info=True
-            )
+        await asyncio.to_thread(
+            self._assignment_store.transition,
+            assignment.id,
+            from_state="starting",
+            to_state="waiting",
+            expected_active_attempt_id=attempt.id,
+            active_attempt_id=None,
+            wait_reason=_truncate_reason(reason),
+            next_check_at=next_check_at(assignment.created_at, failure_now),
+        )
 
     async def _fail_before_launch(
         self, assignment: Assignment, attempt: AssignmentAttempt, message: str
@@ -608,33 +754,585 @@ class AssignmentCoordinator:
     async def _fail_after_launch(
         self, assignment: Assignment, attempt: AssignmentAttempt, stage: str, message: str
     ) -> None:
-        # Interrupted rows keep the attempt link so /retry and /cancel can
-        # read the ended attempt through active_attempt_id.
+        # The launch outcome is unknown once a runner id exists: the
+        # attempt stays active and the stop is confirmed by the
+        # interrupted handling below.
         now = int(time.time())
-        try:
+        interrupted = await asyncio.to_thread(
+            self._assignment_store.transition,
+            assignment.id,
+            from_state="starting",
+            to_state="interrupted",
+            expected_active_attempt_id=attempt.id,
+            wait_reason=_truncate_reason(f"{stage}: {message}"),
+            next_check_at=now,
+        )
+        if interrupted is None:
+            return
+        if await self._check_lease(interrupted) is None:
+            return
+        await self._evaluate_interrupted(interrupted)
+
+    async def _evaluate_active(self, assignment: Assignment) -> None:
+        """Watch a ``running`` / ``publishing`` row for runner liveness.
+
+        The project switch is never consulted here: an attempt already
+        running must be able to finish after the switch goes off.
+
+        :param assignment: The active row to reconcile.
+        """
+        state = assignment.state
+        if assignment.active_attempt_id is None:
+            return
+        attempt = await asyncio.to_thread(
+            self._assignment_store.get_attempt,
+            assignment.id,
+            assignment.active_attempt_id,
+        )
+        if attempt is None:
+            return
+        conv = await asyncio.to_thread(
+            self._conversation_store.get_conversation,
+            _attempt_session_id(attempt),
+        )
+        runner_id = _attempt_runner_id(attempt, conv)
+        if self._runner_alive(runner_id, conv):
+            now = int(time.time())
+            await asyncio.to_thread(self._assignment_store.set_lease, attempt.id, None)
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state=state,
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=now + _ACTIVE_CHECK_S,
+            )
+            return
+        lease = attempt.lease_expires_at
+        now = int(time.time())
+        if lease is None:
+            await asyncio.to_thread(self._assignment_store.set_lease, attempt.id, now + _LEASE_S)
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state=state,
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=now + _LEASE_S,
+            )
+            return
+        if lease > now:
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state=state,
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=lease,
+            )
+            return
+        interrupted = await asyncio.to_thread(
+            self._assignment_store.transition,
+            assignment.id,
+            from_state=state,
+            to_state="interrupted",
+            expected_active_attempt_id=assignment.active_attempt_id,
+            wait_reason=_truncate_reason(f"runner_lost:{runner_id or 'none'}"),
+            next_check_at=now,
+        )
+        if interrupted is None:
+            return
+        if await self._check_lease(interrupted) is None:
+            return
+        await self._evaluate_interrupted(interrupted)
+
+    async def _evaluate_starting_orphan(self, assignment: Assignment) -> None:
+        """Retire a ``starting`` row no live placement still owns.
+
+        This coordinator skips ids it is already evaluating, but a second
+        replica has its own in-flight set, so a ``starting`` row is only
+        orphaned past the placing attempt's check window.
+
+        :param assignment: The ``starting`` row to reconcile.
+        """
+        if assignment.active_attempt_id is None:
+            now = int(time.time())
+            await asyncio.to_thread(
+                self._assignment_store.transition,
+                assignment.id,
+                from_state="starting",
+                to_state="waiting",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                active_attempt_id=None,
+                wait_reason="placement_abandoned",
+                next_check_at=next_check_at(assignment.created_at, now),
+            )
+            return
+        attempt = await asyncio.to_thread(
+            self._assignment_store.get_attempt,
+            assignment.id,
+            assignment.active_attempt_id,
+        )
+        if attempt is None:
+            now = int(time.time())
+            await asyncio.to_thread(
+                self._assignment_store.transition,
+                assignment.id,
+                from_state="starting",
+                to_state="waiting",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                active_attempt_id=None,
+                wait_reason="placement_abandoned",
+                next_check_at=next_check_at(assignment.created_at, now),
+            )
+            return
+        now = int(time.time())
+        if (attempt.started_at or 0) + _PLACEMENT_NEXT_CHECK_S > now:
+            # Another coordinator may still be placing: park past its
+            # window instead of retiring its in-flight attempt.
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state="starting",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=(attempt.started_at or 0) + _PLACEMENT_NEXT_CHECK_S,
+            )
+            return
+        conv = await asyncio.to_thread(
+            self._conversation_store.get_conversation,
+            _attempt_session_id(attempt),
+        )
+        runner_id = _attempt_runner_id(attempt, conv)
+        if runner_id is None:
+            if not _attempt_ended(attempt):
+                await asyncio.to_thread(
+                    self._assignment_store.update_attempt,
+                    assignment.id,
+                    attempt.id,
+                    state="finished",
+                    ended_at=now,
+                    error_code="placement_abandoned",
+                )
+            await asyncio.to_thread(
+                self._assignment_store.transition,
+                assignment.id,
+                from_state="starting",
+                to_state="waiting",
+                expected_active_attempt_id=attempt.id,
+                active_attempt_id=None,
+                wait_reason="placement_abandoned",
+                next_check_at=next_check_at(assignment.created_at, now),
+            )
+            return
+        interrupted = await asyncio.to_thread(
+            self._assignment_store.transition,
+            assignment.id,
+            from_state="starting",
+            to_state="interrupted",
+            expected_active_attempt_id=attempt.id,
+            wait_reason="placement_abandoned",
+            next_check_at=now,
+        )
+        if interrupted is None:
+            return
+        if await self._check_lease(interrupted) is None:
+            return
+        await self._evaluate_interrupted(interrupted)
+
+    async def _evaluate_interrupted(self, assignment: Assignment) -> None:
+        """Confirm the old execution stopped, then retire or re-arm.
+
+        :param assignment: The ``interrupted`` row to reconcile.
+        """
+        if assignment.active_attempt_id is None:
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state="interrupted",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=None,
+            )
+            return
+        attempt = await asyncio.to_thread(
+            self._assignment_store.get_attempt,
+            assignment.id,
+            assignment.active_attempt_id,
+        )
+        if attempt is not None and not _attempt_ended(attempt):
+            conv = await asyncio.to_thread(
+                self._conversation_store.get_conversation,
+                _attempt_session_id(attempt),
+            )
+            runner_id = _attempt_runner_id(attempt, conv)
+            session_id = _attempt_session_id(attempt)
+            if not await self._stop_confirmed(assignment, attempt, runner_id, session_id):
+                return
+            now = int(time.time())
             await asyncio.to_thread(
                 self._assignment_store.update_attempt,
                 assignment.id,
                 attempt.id,
                 state="lost",
                 ended_at=now,
-                error_code=stage,
+                error_code=attempt.error_code or "runner_lost",
             )
-        except Exception:  # noqa: BLE001
-            _logger.warning("Assignment attempt loss failed for %s", assignment.id, exc_info=True)
+            if assignment.start_deadline is not None and assignment.start_deadline <= now:
+                await asyncio.to_thread(
+                    self._assignment_store.transition,
+                    assignment.id,
+                    from_state="interrupted",
+                    to_state="expired",
+                    expected_active_attempt_id=attempt.id,
+                    next_check_at=now,
+                )
+                return
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state="interrupted",
+                expected_active_attempt_id=attempt.id,
+                next_check_at=None,
+            )
             return
-        try:
+        now = int(time.time())
+        if assignment.start_deadline is not None and assignment.start_deadline <= now:
             await asyncio.to_thread(
                 self._assignment_store.transition,
                 assignment.id,
-                from_state="starting",
-                to_state="interrupted",
+                from_state="interrupted",
+                to_state="expired",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=now,
+            )
+            return
+        await asyncio.to_thread(
+            self._assignment_store.reschedule,
+            assignment.id,
+            expected_state="interrupted",
+            expected_active_attempt_id=assignment.active_attempt_id,
+            next_check_at=None,
+        )
+
+    async def _evaluate_stopping(self, assignment: Assignment) -> None:
+        """Stop the runner, then cancel once the stop is confirmed.
+
+        :param assignment: The ``stopping`` row to reconcile.
+        """
+        attempt: AssignmentAttempt | None = None
+        if assignment.active_attempt_id is not None:
+            attempt = await asyncio.to_thread(
+                self._assignment_store.get_attempt,
+                assignment.id,
+                assignment.active_attempt_id,
+            )
+        if attempt is None or _attempt_ended(attempt):
+            # An ended attempt owns no execution: cancel without asking
+            # the host, and let the release confirm the session's runner.
+            now = int(time.time())
+            cancelled = await asyncio.to_thread(
+                self._assignment_store.transition,
+                assignment.id,
+                from_state="stopping",
+                to_state="cancelled",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=now,
+            )
+            if cancelled is None:
+                return
+            if await self._check_lease(cancelled) is None:
+                return
+            await self._evaluate_terminal_release(cancelled)
+            return
+        conv = await asyncio.to_thread(
+            self._conversation_store.get_conversation,
+            _attempt_session_id(attempt),
+        )
+        runner_id = _attempt_runner_id(attempt, conv)
+        session_id = _attempt_session_id(attempt)
+        if await self._stop_confirmed(assignment, attempt, runner_id, session_id):
+            now = int(time.time())
+            await asyncio.to_thread(
+                self._assignment_store.update_attempt,
+                assignment.id,
+                attempt.id,
+                state="finished",
+                ended_at=now,
+                error_code="cancelled",
+            )
+            cancelled = await asyncio.to_thread(
+                self._assignment_store.transition,
+                assignment.id,
+                from_state="stopping",
+                to_state="cancelled",
                 expected_active_attempt_id=attempt.id,
-                wait_reason=_truncate_reason(f"{stage}: {message}"),
+                next_check_at=now,
+            )
+            if cancelled is None:
+                return
+            if await self._check_lease(cancelled) is None:
+                return
+            await self._evaluate_terminal_release(cancelled)
+            return
+        lease = attempt.lease_expires_at
+        now = int(time.time())
+        if lease is None:
+            await asyncio.to_thread(self._assignment_store.set_lease, attempt.id, now + _LEASE_S)
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state="stopping",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=now + _ACTIVE_CHECK_S,
+            )
+            return
+        if lease > now:
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state="stopping",
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=min(lease, now + _ACTIVE_CHECK_S),
+            )
+            return
+        await asyncio.to_thread(
+            self._assignment_store.transition,
+            assignment.id,
+            from_state="stopping",
+            to_state="interrupted",
+            expected_active_attempt_id=attempt.id,
+            wait_reason="stop_unconfirmed",
+            next_check_at=next_check_at(assignment.created_at, now),
+        )
+
+    async def _evaluate_terminal_release(self, assignment: Assignment) -> None:
+        """Release a terminal row's worktrees once its check is due.
+
+        :param assignment: The terminal row with a pending release.
+        """
+        if assignment.next_check_at is None:
+            return
+        now = int(time.time())
+        if assignment.next_check_at > now:
+            return
+        if assignment.resolved_host_id is None:
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state=assignment.state,
+                expected_active_attempt_id=assignment.active_attempt_id,
                 next_check_at=None,
             )
+            return
+        host_id = assignment.resolved_host_id
+        conn = self._host_registry.get(host_id)
+        if conn is None:
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state=assignment.state,
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=next_check_at(assignment.created_at, now),
+            )
+            return
+        attempt: AssignmentAttempt | None = None
+        if assignment.active_attempt_id is not None:
+            attempt = await asyncio.to_thread(
+                self._assignment_store.get_attempt,
+                assignment.id,
+                assignment.active_attempt_id,
+            )
+        else:
+            attempt = await asyncio.to_thread(
+                self._assignment_store.get_latest_attempt,
+                assignment.id,
+            )
+        session_id: str | None = None
+        confirmed_runner: str | None = None
+        if attempt is not None:
+            session_id = _attempt_session_id(attempt)
+            conv = await asyncio.to_thread(
+                self._conversation_store.get_conversation,
+                session_id,
+            )
+            # A relaunch replaces the session's runner, so the stop
+            # must name the session's current runner, not the attempt's.
+            session_runner = conv.runner_id if conv is not None else None
+            confirmed_runner = session_runner
+            if session_runner is not None and not await self._stop_confirmed(
+                assignment, attempt, session_runner, session_id
+            ):
+                return
+        sources: dict[str, str] = {}
+        for entry in assignment.inputs:
+            if entry.is_execution_root:
+                if assignment.resolved_binding_id is None:
+                    await self._release_skipped(
+                        assignment,
+                        "worktree release skipped: "
+                        f"binding {entry.repository_name} no longer exists",
+                    )
+                    return
+                binding = await asyncio.to_thread(
+                    self._binding_store.get, assignment.resolved_binding_id
+                )
+                if binding is None:
+                    await self._release_skipped(
+                        assignment,
+                        "worktree release skipped: "
+                        f"binding {assignment.resolved_binding_id} no longer exists",
+                    )
+                    return
+                # The host derives paths from the binding it is sent and
+                # drops unknown ones, so a moved binding would silently
+                # clear the schedule and leak the real worktree.
+                if binding.revision != assignment.resolved_binding_revision:
+                    await self._release_skipped(
+                        assignment,
+                        "worktree release skipped: "
+                        f"binding for {entry.repository_name} changed since placement",
+                    )
+                    return
+                sources[entry.repository_name] = binding.workspace
+            else:
+                repo = await asyncio.to_thread(
+                    self._repository_store.get_by_name,
+                    project_id=assignment.project_id,
+                    name=entry.repository_name,
+                )
+                if repo is None:
+                    await self._release_skipped(
+                        assignment,
+                        "worktree release skipped: "
+                        f"binding {entry.repository_name} no longer exists",
+                    )
+                    return
+                matches = await self._enabled_bindings_for_repo(
+                    assignment.project_id, host_id, repo.id
+                )
+                if len(matches) != 1:
+                    await self._release_skipped(
+                        assignment,
+                        "worktree release skipped: "
+                        f"binding {entry.repository_name} no longer exists",
+                    )
+                    return
+                candidate = matches[0]
+                if attempt is None or attempt.started_at is None:
+                    await self._release_skipped(
+                        assignment,
+                        "worktree release skipped: "
+                        f"binding for {entry.repository_name} changed since placement",
+                    )
+                    return
+                if candidate.updated_at is not None and candidate.updated_at > attempt.started_at:
+                    await self._release_skipped(
+                        assignment,
+                        "worktree release skipped: "
+                        f"binding for {entry.repository_name} changed since placement",
+                    )
+                    return
+                sources[entry.repository_name] = candidate.workspace
+        if attempt is not None and session_id is not None:
+            # The stop may have been awaited while the session
+            # relaunched; a changed runner must not be released.
+            fresh = await asyncio.to_thread(
+                self._conversation_store.get_conversation,
+                session_id,
+            )
+            fresh_runner = fresh.runner_id if fresh is not None else None
+            if fresh_runner != confirmed_runner:
+                return
+        frame = HostAssignmentReleaseFrame(
+            request_id=uuid.uuid4().hex,
+            assignment_id=assignment.id,
+            repositories=[
+                HostAssignmentReleaseRepository(
+                    repository_name=entry.repository_name,
+                    source_directory=sources[entry.repository_name],
+                )
+                for entry in assignment.inputs
+            ],
+        )
+        try:
+            result = await release_assignment_on_host(
+                host_registry=self._host_registry, host_conn=conn, frame=frame
+            )
         except Exception:  # noqa: BLE001
-            _logger.warning("Assignment interrupt failed for %s", assignment.id, exc_info=True)
+            _logger.warning("Assignment release failed for %s", assignment.id, exc_info=True)
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state=assignment.state,
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=next_check_at(assignment.created_at, int(time.time())),
+            )
+            return
+        if result.status == "ok":
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state=assignment.state,
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=None,
+            )
+            return
+        if result.status == "partial":
+            parts = []
+            for entry in assignment.inputs:
+                reason = result.failures.get(entry.repository_name)
+                if reason is not None:
+                    parts.append(f"{entry.repository_name}: {reason}")
+            body = "worktree release incomplete: " + "; ".join(parts)
+            body = body[:2000]
+            await asyncio.to_thread(
+                self._assignment_store.append_message,
+                AssignmentMessage(
+                    id=uuid.uuid4().hex,
+                    assignment_id=assignment.id,
+                    kind="state",
+                    body=body,
+                    sender_session_id=None,
+                    idempotency_key=None,
+                ),
+            )
+            await asyncio.to_thread(
+                self._assignment_store.reschedule,
+                assignment.id,
+                expected_state=assignment.state,
+                expected_active_attempt_id=assignment.active_attempt_id,
+                next_check_at=None,
+            )
+            return
+        _logger.warning("Assignment release returned %r for %s", result.status, assignment.id)
+        await asyncio.to_thread(
+            self._assignment_store.reschedule,
+            assignment.id,
+            expected_state=assignment.state,
+            expected_active_attempt_id=assignment.active_attempt_id,
+            next_check_at=next_check_at(assignment.created_at, int(time.time())),
+        )
+
+    async def _release_skipped(self, assignment: Assignment, body: str) -> None:
+        """Record a skipped release and clear its check.
+
+        :param assignment: The terminal row whose release is skipped.
+        :param body: The state message naming the stale binding.
+        """
+        await asyncio.to_thread(
+            self._assignment_store.append_message,
+            AssignmentMessage(
+                id=uuid.uuid4().hex,
+                assignment_id=assignment.id,
+                kind="state",
+                body=body,
+                sender_session_id=None,
+                idempotency_key=None,
+            ),
+        )
+        await asyncio.to_thread(
+            self._assignment_store.reschedule,
+            assignment.id,
+            expected_state=assignment.state,
+            expected_active_attempt_id=assignment.active_attempt_id,
+            next_check_at=None,
+        )
 
     async def _place(
         self,
@@ -649,9 +1347,7 @@ class AssignmentCoordinator:
         if not workspace:
             await self._fail_before_launch(assignment, attempt, "prepare returned no directory")
             return
-        conversation_id = hashlib.sha256(f"assignment-attempt:{attempt.id}".encode()).hexdigest()[
-            :32
-        ]
+        conversation_id = _derived_session_id(attempt.id)
         owner = assignment.owner_user_id or RESERVED_USER_LOCAL
         if self._permission_store is not None:
             try:
@@ -851,20 +1547,15 @@ class AssignmentCoordinator:
                 assignment, attempt, "dispatch", "native terminal did not accept the prompt"
             )
             return
-        try:
-            updated = await asyncio.to_thread(
-                self._assignment_store.transition,
-                assignment.id,
-                from_state="starting",
-                to_state="running",
-                expected_active_attempt_id=attempt.id,
-                next_check_at=next_check_at(assignment.created_at, int(time.time())),
-            )
-        except Exception:  # noqa: BLE001
-            _logger.warning(
-                "Assignment run transition failed for %s", assignment.id, exc_info=True
-            )
-            return
+        now = int(time.time())
+        updated = await asyncio.to_thread(
+            self._assignment_store.transition,
+            assignment.id,
+            from_state="starting",
+            to_state="running",
+            expected_active_attempt_id=attempt.id,
+            next_check_at=now + _ACTIVE_CHECK_S,
+        )
         if updated is None:
             _logger.warning(
                 "Assignment %s left starting by another writer; leaving for reconcile",

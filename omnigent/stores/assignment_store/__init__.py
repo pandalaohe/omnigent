@@ -313,6 +313,22 @@ class AssignmentStore(ABC):
         ...
 
     @abstractmethod
+    def get_latest_attempt(self, assignment_id: str) -> AssignmentAttempt | None:
+        """
+        Return the highest-numbered attempt of an assignment, or ``None``.
+
+        Placement evidence for terminal rows whose link was cleared: a
+        prepared-then-failed placement returns to ``waiting`` with
+        ``active_attempt_id`` cleared while ``resolved_host_id`` stays, so
+        the release still needs the original ``started_at`` and session.
+
+        :param assignment_id: The assignment whose attempts to inspect.
+        :returns: The :class:`AssignmentAttempt` with the highest
+            ``number``, or ``None`` when the assignment has no attempts.
+        """
+        ...
+
+    @abstractmethod
     def refresh_waiting(
         self,
         assignment_id: str,
@@ -378,8 +394,11 @@ class AssignmentStore(ABC):
         """
         Return due assignments for the bounded recovery pass, in one query.
 
-        Non-terminal, actionable rows with ``next_check_at <= now``,
-        ordered by ``next_check_at``, at most ``limit``.
+        Actionable rows with ``next_check_at <= now``, ordered by
+        ``next_check_at``, at most ``limit``. ``interrupted`` rows are
+        included so a confirmed stop can retire them; terminal rows with
+        a due ``next_check_at`` are included so a pending worktree
+        release runs. Rows with ``next_check_at`` NULL are never due.
 
         :param now: Unix epoch seconds the pass runs at.
         :param limit: Maximum rows per pass.

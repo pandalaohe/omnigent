@@ -7,7 +7,7 @@ import json
 import uuid
 from typing import Any, cast
 
-from sqlalchemy import and_, asc, func, or_, select, update
+from sqlalchemy import and_, asc, desc, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -48,8 +48,10 @@ from omnigent.stores.assignment_store import (
     InactiveAttemptError,
 )
 
-# States the bounded due-work pass acts on. ``interrupted`` needs an
-# explicit retry with a confirmed stop, so the pass leaves it alone.
+# States the bounded due-work pass acts on. ``interrupted`` rows are
+# included so a confirmed stop can retire them, and terminal rows with a
+# due ``next_check_at`` are included so a pending worktree release runs;
+# rows with ``next_check_at`` NULL are never due.
 _DUE_STATES = frozenset(
     {
         AssignmentState.PREPARING.value,
@@ -58,6 +60,11 @@ _DUE_STATES = frozenset(
         AssignmentState.RUNNING.value,
         AssignmentState.PUBLISHING.value,
         AssignmentState.STOPPING.value,
+        AssignmentState.INTERRUPTED.value,
+        AssignmentState.SUCCEEDED.value,
+        AssignmentState.FAILED.value,
+        AssignmentState.CANCELLED.value,
+        AssignmentState.EXPIRED.value,
     }
 )
 
@@ -654,6 +661,24 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
                 return None
             return _attempt_to_entity(row)
 
+    def get_latest_attempt(self, assignment_id: str) -> AssignmentAttempt | None:
+        """Return the highest-numbered attempt, or ``None`` when none exists."""
+        with self._session("select_latest_assignment_attempt") as session:
+            row = (
+                session.execute(
+                    select(SqlAssignmentAttempt)
+                    .where(SqlAssignmentAttempt.workspace_id == current_workspace_id())
+                    .where(SqlAssignmentAttempt.assignment_id == assignment_id)
+                    .order_by(desc(SqlAssignmentAttempt.number))
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                return None
+            return _attempt_to_entity(row)
+
     def refresh_waiting(
         self,
         assignment_id: str,
@@ -736,7 +761,12 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
         run_write_transaction(self._session_immediate, "set_lease", write)
 
     def select_due(self, *, now: int, limit: int) -> builtins.list[Assignment]:
-        """Select due rows for the bounded recovery pass in one statement."""
+        """Select due rows for the bounded recovery pass in one statement.
+
+        Includes ``interrupted`` rows awaiting a confirmed stop and
+        terminal rows with a pending worktree release; NULL
+        ``next_check_at`` rows are never due.
+        """
         with self._session("select_due_assignments") as session:
             stmt = (
                 select(SqlAssignment)
