@@ -162,12 +162,24 @@ async def test_reaping_absent_pane_retires_session_pieces_without_raising(
     app, _terminal_registry = _build_app_with_reaper(monkeypatch, calls)
     reaper = app.state.native_pane_reaper
     assert reaper is not None
+
+    async def _dead() -> bool:
+        return False
+
+    async def _close() -> None:
+        return None
+
     pane = PaneRef(
         "conv_gone",
         terminal_resource_id("codex", "main"),
         "codex",
         tmp_path / "tmux.sock",
-        instance=object(),
+        instance=SimpleNamespace(
+            running=True,
+            socket_path=tmp_path / "tmux.sock",
+            close=_close,
+            is_alive=_dead,
+        ),
     )
 
     await reaper._reap(pane)

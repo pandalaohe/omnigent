@@ -139,15 +139,6 @@ class TerminalRegistry:
         # between them — plenty of room for another send to slip in).
         # See ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §9.1.
         self._instance_locks: dict[tuple[str, str, str], threading.Lock] = {}
-        # Keys whose ``close`` popped the instance but has not settled the
-        # await yet. The pop makes the terminal invisible to
-        # ``list_for_conversation`` while its pane is still alive (and the
-        # timeout path may restore it), so absence alone cannot tell "gone"
-        # from "another closer owns it right now". Marked inside the same
-        # ``with self._lock:`` block that pops, cleared in a ``finally``
-        # covering the await — an observation point only, no behaviour
-        # change. Protects both readers and writers via ``self._lock``.
-        self._closing: set[tuple[str, str, str]] = set()
         # Threading lock — see module docstring for the rationale.
         # Protects both ``_by_conversation`` and ``_instance_locks``.
         self._lock = threading.Lock()
@@ -285,54 +276,6 @@ class TerminalRegistry:
                     conversation_id,
                 )
         return winning_instance
-
-    def is_close_in_flight(
-        self,
-        conversation_id: str,
-        terminal_name: str,
-        session_key: str,
-    ) -> bool:
-        """Report whether a close is in flight for one terminal.
-
-        ``True`` from the moment :meth:`close` pops the instance until
-        its await settles (success, timeout-restore, or raise) — the
-        window where the terminal is invisible to
-        :meth:`list_for_conversation` while its pane may still be alive.
-
-        :param conversation_id: Owning conversation id.
-        :param terminal_name: Terminal spec name.
-        :param session_key: Session key from launch.
-        :returns: ``True`` when a :meth:`close` for this triple currently
-            holds the instance outside the map.
-        """
-        with self._lock:
-            return (conversation_id, terminal_name, session_key) in self._closing
-
-    def is_close_in_flight_for_terminal(
-        self,
-        conversation_id: str,
-        terminal_id: str,
-    ) -> bool:
-        """Report whether a close is in flight for one terminal resource id.
-
-        Same signal as :meth:`is_close_in_flight` for callers that only
-        hold the opaque resource id (e.g. ``"terminal_codex_main"``) and
-        cannot name the ``(terminal_name, session_key)`` pair because the
-        listing is currently empty — which is exactly the in-flight
-        window. Compares each in-flight key's resource id under the lock.
-
-        :param conversation_id: Owning conversation id.
-        :param terminal_id: Opaque terminal resource id.
-        :returns: ``True`` when a :meth:`close` for a triple projecting
-            to *terminal_id* currently holds the instance.
-        """
-        from omnigent.entities.session_resources import terminal_resource_id
-
-        with self._lock:
-            return any(
-                conv == conversation_id and terminal_resource_id(name, key) == terminal_id
-                for conv, name, key in self._closing
-            )
 
     def get_instance_lock(
         self,
@@ -531,11 +474,6 @@ class TerminalRegistry:
             # closed instance (callers surface a "not running"
             # error to the LLM).
             instance_lock = self._instance_locks.pop(lock_key, None)
-            if instance is not None:
-                # Mark in the same critical section as the pop: no
-                # window exists where the terminal is absent from the
-                # map but not marked closing.
-                self._closing.add(lock_key)
         if instance is None:
             return False
 
@@ -557,26 +495,20 @@ class TerminalRegistry:
                     )
 
         try:
-            try:
-                await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                _restore_unclosed_instance()
-                logger.warning(
-                    "Terminal close timed out for %s:%s in conv %s",
-                    terminal_name,
-                    session_key,
-                    conversation_id,
-                )
-                return False
-            except BaseException:
-                _restore_unclosed_instance()
-                raise
-            return True
-        finally:
-            # Covers the await, the timeout path and the BaseException
-            # path — including the restores — so no stale mark survives.
-            with self._lock:
-                self._closing.discard(lock_key)
+            await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            _restore_unclosed_instance()
+            logger.warning(
+                "Terminal close timed out for %s:%s in conv %s",
+                terminal_name,
+                session_key,
+                conversation_id,
+            )
+            return False
+        except BaseException:
+            _restore_unclosed_instance()
+            raise
+        return True
 
     async def cleanup_conversation(self, conversation_id: str) -> None:
         """Close every terminal owned by *conversation_id*.
