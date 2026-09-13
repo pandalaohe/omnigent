@@ -37,7 +37,7 @@ Rebuilt from v1 (3 rows) on 2026-09-12 — board OMN04 / task T260912-016. The W
 | `S16-device-layout-memory` | maybe |  |  | private | pending |  | Verify the cross-session path, then resolve `upstreamable`. Drop if upstream persists layout itself. |
 | `S17-ui-font-scale` | yes | candidate |  | candidate | pending |  | Drop when upstream's own font ramp covers the mobile default. Keep only the uncovered residual — do not re-file the parts upstream already has. |
 | `S18-native-plan` | yes | https://github.com/omnigent-ai/omnigent/pull/6629 |  | filed | pending | codex/native-plan-persistence-20260906 | Drop when #6629 merges with the store projection, the accordion and the refresh/reconnect chain. Persistence alone does not retire this row. |
-| `S19-native-goal` | yes | https://github.com/omnigent-ai/omnigent/pull/6630 |  | candidate | pending | codex/native-goal-projection-20260906 | Locate the upstream implementation SHA that replaced #6630 and compare behaviour before retiring anything — a resolved ticket is not evidence the Goal work was absorbed. The `0098e2d46` achieved-marker hotfix has never been filed separately; confirm S19 and S21 do not both claim it. `723825b36`'s second half also carries a divergence from upstream's interrupt contract: `_deliver_interrupt_once` raises `RUNNER_UNAVAILABLE` (503) when the interrupt reaches no live runner, where upstream answers 2xx. Two upstream tests use an `interrupt` POST as a cheap authz probe and assert `< 500` / `== 202`, so both fail on this branch (`tests/server/integration/test_client_credentials_e2e.py::test_machine_client_owns_and_operates_its_own_session`, `tests/server/integration/test_sessions_permissions.py::test_edit_grant_blocked_from_stop_session_requires_owner`) — a PR from this branch must expect that CI signal. Drop the divergence when upstream adopts an equivalent contract, or when the fork stops needing a confirmed interrupt. |
+| `S19-native-goal` | no | https://github.com/omnigent-ai/omnigent/pull/6630 |  | private | pending | codex/native-goal-projection-20260906 | Kept private and never refiled (owner decision 2026-09-13): upstream #6854 (merged 2026-09-09) took the bug-only fix and "intentionally does not add session-list Goal state or sidebar/chat-frame UI" — see `## Upstream Relations`. Nothing here is absorbed; the Goal list state, badge and chat frame remain local. The `0098e2d46` achieved-marker hotfix has never been filed separately; confirm S19 and S21 do not both claim it. `723825b36`'s second half also carries a divergence from upstream's interrupt contract: `_deliver_interrupt_once` raises `RUNNER_UNAVAILABLE` (503) when the interrupt reaches no live runner, where upstream answers 2xx. Two upstream tests use an `interrupt` POST as a cheap authz probe and assert `< 500` / `== 202`, so both fail on this branch (`tests/server/integration/test_client_credentials_e2e.py::test_machine_client_owns_and_operates_its_own_session`, `tests/server/integration/test_sessions_permissions.py::test_edit_grant_blocked_from_stop_session_requires_owner`) — a PR from this branch must expect that CI signal. Drop the divergence when upstream adopts an equivalent contract, or when the fork stops needing a confirmed interrupt. |
 | `S20-codex-child-inventory` | yes | https://github.com/omnigent-ai/omnigent/pull/6393 |  | filed | pending | fix/claude-subagent-authoritative-terminal | Drop when #6393 merges. Keep separate from the Claude owner (#7106) — do not merge this row into S21. |
 | `S21-claude-native-control` | yes | https://github.com/omnigent-ai/omnigent/pull/7106 | https://github.com/omnigent-ai/omnigent/issues/5687 | filed | pending | codex/claude-terminal-7-upgrade | Remove each residual only after upstream supplies equivalent correlation, ordering, replay-safe recovery and status delivery. (v1 row 2, verbatim.) #7106 carries only the sub-agent terminal-state and resume slice — Stop, reconcile, watchdog and Goal recovery are still local, so the merge of #7106 retires part of this row, never all of it. **T260912-012 re-verified at `0aec397db`, no lifecycle change:** the two interacting blocks in `routes_events.py` both survived the merge — the fork-local rescue gate (`scheduled_run_outcome="failed"`, the `stop_backstop_handles` deferral, the persisted-`failed` guard) and upstream #6676's conditional backstop below it, including its own second `get_session_connectivity` read after the host teardown, which was NOT deduplicated. The `c4318d421` `, None` default also survived `orchestration.py`'s conflict: all 6 `_AUTO_CODEX_APP_SERVERS.pop` sites still pass it (`git grep _AUTO_CODEX_APP_SERVERS.pop -- omnigent/`). |
 | `S22-deletion-claim-lock` | yes | candidate |  | candidate | pending |  | File the schema, the lease and the cross-process API as one PR before any S23 or S26 residual goes up — both depend on this contract. Drop when upstream owns the lease. |
@@ -97,6 +97,56 @@ Rebuilt from v1 (3 rows) on 2026-09-12 — board OMN04 / task T260912-016. The W
 |--------|------|-----------|-------|
 
 _Empty: no row has yet been retired on verified blob parity or an explicit human confirm. `F28-alignment-residuals` is adjacent to a merged upstream feature but is a local alignment residual, not that feature._
+
+## Upstream Relations (dated — PR/Issue state, maintainer feedback, our decision)
+
+One place per mod for what upstream said and what we decided, so a declined idea is never refiled by
+accident and a pending review is never forgotten. Update it in the same batch as any PR, Issue or
+comment action (`share/rules/upstream-fork.md`). Quotes are verbatim with their date; everything else
+is a summary. States re-read live 2026-09-13 (`gh pr view` / `gh issue view`). Evidence bundles live
+in the omnigent workspace, `docs/task-files/26/09/T260912-012-phaseB-evidence/` (not in this repo).
+S07 / S08 / S10 belong to board OMN11 and are recorded there.
+
+### Filed
+
+- **`S18-native-plan`** — #6629 OPEN, Closes issue #6622 (OPEN).
+  - 2026-09-07 TomeHirata: "Is there any way to avoid db migration and retrieve the plan from native harnesses?" → reworked onto a reserved key inside `session_state`, no migration (`9d2f851bf`); harness-only retrieval declined with rationale (author reply 2026-09-08).
+  - 2026-09-10 TomeHirata (review, later dismissed by a bot workflow-sync push): "LGTM, can we make sure this change is backward compatible?" → the resolver bot answered with a legacy-row test it could not push.
+  - 2026-09-11 TomeHirata: APPROVED `094b74b6b`; the PR then sat unmergeable on a conflict with #6360.
+  - 2026-09-13 we pushed `20fffd817` (merge of upstream `0708cb40a`: the #6360 transaction closures plus that legacy-row test), updated the body, and asked for re-review (comment 5651545316). The approval was dismissed and auto-merge turned off by the push. Decision (owner, D1): keep it one PR.
+  - Custom still stores the Plan in its own column (`fb1b2c3d4e5`); converge on upstream's reserved key at the re-align after merge. Unfiled residuals: R1 web reconnect/switch projection (file after #6629 merges), R2 mobile Plan strip (private).
+- **`S19-native-goal`** — #6630 CLOSED 2026-09-10 by the resolver bot ("OMNI-6426 is Done"); issue #6623 CLOSED 2026-09-09.
+  - 2026-09-09 dbczumar, #6854 (merged): "Supersedes #6630 with the bug-only fix; this intentionally does not add session-list Goal state or sidebar/chat-frame UI."
+  - Decision (owner, 2026-09-13): the session-list Goal state, the `G` badge and the chat frame stay private. Never refile this or a similar PR.
+- **`S06-preference-sync`** — #6626 OPEN, no reviews.
+  - Upstream direction elsewhere: #6772 (zhengwin, merged 2026-09-09 00:39Z) added a server-side user setting; #6784 (zhengwin, merged 05:40Z) removed it: "Persistence is intentionally browser-local: it follows the browser profile rather than the account, and no server-side per-user preference is retained." No further reason is stated.
+  - Decision (owner, D2, 2026-09-13): the identity-switch fence (W0) files as its own bug Issue + PR. Sync refiles as its own opt-in stack scoped by Server + user; settings features file as separate stacks with sync as their top layer. If upstream refuses or ignores sync, keep sync private (dual path).
+- **`S20-codex-child-inventory` / `S21-claude-native-control`** — #6393 OPEN (blocked), #7106 OPEN (dirty), Related to issue #5687 (OPEN, dhruv0811). No reviews on either, nor on fork review PRs #9–#15.
+  - #3398 (dgokeeffe, binding tokens) closed by its author: "Revive only from a new, prioritized issue."
+  - Decision (owner, D5, 2026-09-13): the running build shows no stuck sub-agents and the `B` badge matches reality. File the whole running fix (S21 + S20 producer, transport and ingest + the native sub-agent watchdog + the background-activity count) as one stack family aiming at merge, with the badge in the top layer.
+- **`S25-agent-library`** — #6633 OPEN, no reviews. Decision (owner, D3): deferred. Rework first (pin a custom agent to the New Chat top level; UI-editable named agent aliases referenced from prompts), then refile complete — board OMN16.
+- **`S26-archive-library`** — #6628 OPEN (dirty), no reviews. Decision (owner, D6): reshape onto upstream's own archive pieces (#7205 #6824 #6967) with the finished behaviour kept in full.
+- **`S09-dictation-punctuation` / `S24-usage-context`** — #6625 OPEN, #6634 OPEN (dirty), no reviews. Decision (owner, D4): carrier + fork review stack. S24 residuals R1–R3 private (upstream redesigned the context ring 2026-09-12, #7243 / #7279). S09 web layers L3/L4 file after #6625's route layer.
+- **`S02-assistant-linebreaks`** — #6624 OPEN, no reviews. Decision: untouched.
+- **`S05-agent-cache`** — #6170 OPEN, no reviews. Restack later in this round.
+- **`S01-mobile-terminal-ime`** — #6910 CLOSED 2026-09-10 by us when it was split into fork review PRs #2–#4; #6913 OPEN by the resolver bot. Hold.
+
+### Unfiled — upstream's reaction at `f2f68f30d` (2026-09-13)
+
+| mod | upstream | our decision |
+|---|---|---|
+| `S03-windows-host-fixes` | drive-letter picker absorbed (#5847 `ea87dd4fa`, patch-id match); daemon UTF-8 + helper scratch dir in #5852 (open, idle); service path / CRLF none | retire the picker locally; wait on #5852; rest private |
+| `S04-askuserquestion-wait` | absorbed by another route: #7239 `29bf5d844` removed the 10 s hook | retire after one live check on custom |
+| `S11-configurable-hotkeys` | fanzeyi's 12-PR stack from #5717 (open, browser-only storage, no review) | wait; later file only our extra actions + sync |
+| `S12-tui-softkeys-touch` | competing #6136 / #6402 / #4950, touch #5853 | wait; do not file |
+| `S13-mobile-assistant` | only our issue #6168 (open); #1263 hid shortcuts on mobile on purpose | private |
+| `S14-navigation-titles` | open-at-latest partial (#6522 merged, #6658 open); polling, title, iOS focus none | iOS focus as a small bug; wait on #6658; polling private |
+| `S15-global-read-all` | none | feature issue, then a client-only PR (next round) |
+| `S16-device-layout-memory` | opposite design merged (#5267 keeps width per agent tree) | private |
+| `S17-ui-font-scale` | absorbed (#5731 `dabd14887`) | retire local, adopt #5731 |
+| `S22-deletion-claim-lock` | none; upstream prefers labels over new columns (#4488) | private; issue first if ever filed |
+| `S23-host-cli-retention` | none; upstream chose fixed-timeout reapers (#1624 / #1626) and a one-shot archive stop (#3783); cursor workaround tracked by our issue #7285, bot PR #7292 open | private; adapt the cursor workaround when #7292 merges |
+| `codex-probe-orphan-reap` | not fixed; #2421 open, #5851 idle and not covering the probe | file now (owner, D8): new bug Issue + one PR, Related to #2421 |
 
 ## Path Ownership
 
@@ -576,6 +626,8 @@ Every path of `git diff --name-only upstream/main...local/host-custom` at `5ab62
   **Result on the web side, per file and in isolation:** the web failing-id set is **identical pre-merge and post-repair** — 16 ids in 13 files, symmetric difference empty. The 13 are host artefacts of the Node store (eleven `*Preferences*`/hook files whose one "never throws when storage is inaccessible" case the real store defeats, plus `hostPreferences` ×2 and `Sidebar.rowActions` ×3), unchanged on both sides.
   **Two method lessons, both costly here.** (1) The whole-suite number under `--localstorage-file` is **not** a clean gate: one store file is shared by every worker, so storage-asserting tests interfere — `NewChatDialog.test.tsx` fails 12 in the suite and passes 314/314 alone. Use the suite run to nominate files, then re-run each alone against a fresh store. (2) **A file outside the conflict set can still take upstream's side against an implementation resolved to ours.** `web/src/shell/NewChatDialog.projectPrefill.test.tsx` was not among the 44, so upstream's version landed whole against a `NewChatDialog.tsx` resolved 100% to ours; its new expectations are the deferred redesign's (`new-chat-landing-repo-add`, `new-chat-landing-repo-row`, an Escape after the agent pick). Restored to ours; 31 passed. Nothing in the conflict census or either survival instrument looks for this, because all three only read conflicted files. The sweep that closes it — *for every test file upstream changed, is its implementation on the same side of the merge?* — is not yet run; treat it as required on the next re-align.
   **One limit of the anchor instrument, stated because it read as stronger than it is.** §5's `PARTIAL=0` is a survival measure over text, not a reachability measure over behaviour. `Sidebar.tsx` scored FULL — the `"Latest message is an error"` string is alive in the merged blob and the priority chain really is upstream's — while the behaviour behind it was unreachable from the collapsed marker. Only running the tests showed it.
+
+- [260913] **Phase B ledger batch: upstream relations recorded** (board OMN02 / task T260912-012). Added `## Upstream Relations` — per mod the PR/Issue state, maintainer feedback quoted with dates, and the owner's decision (cards D1–D8, 2026-09-13), plus upstream's reaction to every unfiled row. One lifecycle transition: `S19-native-goal` `upstreamable yes→no`, `lifecycle candidate→private` (#6854 declined the list state and UI; owner: never refile). One PR state change: #6629 pushed to `20fffd817` (merge of upstream `0708cb40a`, conflict with #6360 resolved, legacy-row test added); approval dismissed by the push, re-review requested — row `S18-native-plan` stays `filed`. No path ownership change; no `absorption` flips (the absorbed S03 picker / S04 / S17 retire only after their local code is removed and checked).
 
 ## Upgrade Checklist
 
