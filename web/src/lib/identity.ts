@@ -256,7 +256,13 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
 let currentIsAdmin = false;
 let identityResolved = false;
 let identityPromise: Promise<string | null> | null = null;
+// The cached identity belongs to one Server identity, so an embedded host that
+// switches Servers never reuses the previous Server's user. Without an identity
+// every host config install starts a new connection.
 let identityConnectionId: string | null = null;
+// Bumped when resolveIdentity sees a new Server connection, so a lookup or header
+// from before an A->B->A round trip is never taken for the current one.
+let identityEpoch = 0;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
 // path per provider — "/login" for accounts, "/auth/login" for OIDC.
@@ -272,11 +278,16 @@ let serverLoginUrl: string | null = null;
 let loginRedirectPending = false;
 
 function currentIdentityConnectionId(): string {
-  return `${getOmnigentServerIdentity() ?? "__default__"}:${getOmnigentHostGeneration()}`;
+  const serverIdentity = getOmnigentServerIdentity();
+  return serverIdentity ?? `__unidentified__:${getOmnigentHostGeneration()}`;
 }
 
 function identityMatchesCurrentConnection(): boolean {
   return identityConnectionId === currentIdentityConnectionId();
+}
+
+function identityIsCurrent(epoch: number, connectionId: string): boolean {
+  return epoch === identityEpoch && connectionId === currentIdentityConnectionId();
 }
 
 /**
@@ -336,6 +347,7 @@ export async function resolveIdentity(): Promise<string | null> {
   const preferenceConnectionId = currentIdentityConnectionId();
   if (identityConnectionId !== preferenceConnectionId) {
     identityConnectionId = preferenceConnectionId;
+    identityEpoch += 1;
     identityResolved = false;
     identityPromise = null;
     currentUserId = null;
@@ -345,12 +357,17 @@ export async function resolveIdentity(): Promise<string | null> {
   }
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
+  const epoch = identityEpoch;
+  // A lookup whose connection was replaced writes nothing. If no newer lookup
+  // replaced it, the next resolve starts a fresh lookup instead of reusing this null.
+  const discardStale = (): null => {
+    if (epoch === identityEpoch) identityPromise = null;
+    return null;
+  };
   identityPromise = (async () => {
     try {
       const res = await hostFetch("/v1/me");
-      if (preferenceConnectionId !== currentIdentityConnectionId()) {
-        return null;
-      }
+      if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
       if (res.status === 401) {
         // OIDC / accounts mode: server requires authentication.
         // Redirect to the login URL provided in the response body —
@@ -361,11 +378,7 @@ export async function resolveIdentity(): Promise<string | null> {
             user_id: null;
             login_url?: string;
           };
-          if (
-            identityConnectionId !== preferenceConnectionId ||
-            preferenceConnectionId !== currentIdentityConnectionId()
-          )
-            return null;
+          if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
           if (data.login_url) {
             serverLoginUrl = data.login_url;
             if (!isOnLoginPath()) {
@@ -383,11 +396,7 @@ export async function resolveIdentity(): Promise<string | null> {
           is_admin?: boolean;
           preferences?: unknown | null;
         };
-        if (
-          identityConnectionId !== preferenceConnectionId ||
-          preferenceConnectionId !== currentIdentityConnectionId()
-        )
-          return null;
+        if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
         currentUserId = data.user_id;
         currentIsAdmin = data.is_admin ?? false;
         await initializeUserPreferencesSync(
@@ -396,21 +405,18 @@ export async function resolveIdentity(): Promise<string | null> {
           data.user_id,
           stablePreferenceServerId,
           preferenceConnectionId,
-          () => preferenceConnectionId === currentIdentityConnectionId(),
+          () => identityIsCurrent(epoch, preferenceConnectionId),
         );
+        // The preference initialization above awaits network work; the Server
+        // may have switched while it was in flight.
+        if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
       }
     } catch {
       // Server unreachable — leave as null.
     }
-    const connectionIsCurrent =
-      identityConnectionId === preferenceConnectionId &&
-      preferenceConnectionId === currentIdentityConnectionId();
-    if (connectionIsCurrent) identityResolved = true;
-    else if (identityConnectionId === preferenceConnectionId) {
-      currentUserId = null;
-      currentIsAdmin = false;
-    }
-    return connectionIsCurrent ? currentUserId : null;
+    if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
+    identityResolved = true;
+    return currentUserId;
   })();
   return identityPromise;
 }
@@ -474,6 +480,9 @@ export async function authenticatedFetch(
   init?: RequestInit,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
+  const stampEpoch = identityEpoch;
+  const stampConnectionId = currentIdentityConnectionId();
+  let stampedUser = false;
   if (
     identityMatchesCurrentConnection() &&
     currentUserId &&
@@ -481,6 +490,7 @@ export async function authenticatedFetch(
     !headers.has("X-Forwarded-Email")
   ) {
     headers.set("X-Forwarded-Email", currentUserId);
+    stampedUser = true;
   }
   // Pin host- and session-scoped requests to the replica holding that host's
   // runner tunnel (key = host_id). Derived centrally so no call site has to
@@ -534,6 +544,12 @@ export async function authenticatedFetch(
       stampedSliceKey = true;
     }
   }
+  // The session host resolve above can span a Server switch; never send the
+  // previous Server's user to the new one.
+  if (stampedUser && !identityIsCurrent(stampEpoch, stampConnectionId)) {
+    headers.delete("X-Forwarded-Email");
+  }
+  const dispatchConnectionId = currentIdentityConnectionId();
   // Bypass the browser HTTP cache for all API calls. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
   // (pending_elicitations) that changes between fetches without any
@@ -553,6 +569,9 @@ export async function authenticatedFetch(
   // back). Only when WE stamped the key; a genuinely-offline runner returns
   // runner_unavailable and is not re-addressed here.
   if (stampedSliceKey && (await _isWrongReplica(res))) {
+    // A retry after a Server switch would reach the new Server with the old
+    // request, so it is skipped.
+    if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
     // Fresh Headers for the retry — mutating the first request's `headers`
     // object in place would also clear the key on the already-sent request
     // (callers/tests hold it by reference).
