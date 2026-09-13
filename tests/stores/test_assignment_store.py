@@ -578,3 +578,24 @@ def test_read_messages_empty(store: SqlAlchemyAssignmentStore) -> None:
     page = store.read_messages(created.id)
     assert page.data == []
     assert page.has_more is False
+
+
+# ── refresh ───────────────────────────────────────────────────────────────
+
+
+def test_refresh_waiting_stale_project_revision_keeps_stored(
+    store: SqlAlchemyAssignmentStore,
+) -> None:
+    """A refresh pinned to a stale revision loses, keeping the stored one."""
+    waiting = _to_waiting(store, "r1", project_revision=3)
+    stale = store.refresh_waiting(
+        waiting.id,
+        inputs=list(waiting.inputs),
+        project_revision=2,
+        now=2000,
+        expected_project_revision=2,
+    )
+    assert stale is None
+    current = store.get(waiting.id)
+    assert current is not None
+    assert current.project_revision == 3

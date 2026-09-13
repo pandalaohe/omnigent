@@ -16,6 +16,11 @@ from omnigent.entities import Assignment, AssignmentAttempt, AssignmentMessage
 from omnigent.entities.pagination import PagedList
 from omnigent.errors import ErrorCode, OmnigentError
 
+# Sentinel for conditional-write predicates: an old attempt's write must
+# not commit after a retry bound a new attempt (ABA), so "not passed"
+# stays distinct from an explicit ``None``.
+_UNSET: Any = object()
+
 
 class AssignmentIdempotencyConflictError(OmnigentError):
     """A retried create carried a different payload than the stored row.
@@ -124,6 +129,7 @@ class AssignmentStore(ABC):
     def list(
         self,
         *,
+        owner_user_id: str | None = None,
         project_id: str | None = None,
         state: str | None = None,
         source_session_id: str | None = None,
@@ -134,6 +140,11 @@ class AssignmentStore(ABC):
         """
         List assignments matching the given filters, cursor-paginated.
 
+        Reads are always owner-scoped: only rows whose ``owner_user_id``
+        equals the caller are returned. ``None`` selects single-user rows;
+        there is no unfiltered mode.
+
+        :param owner_user_id: Return only this owner's assignments.
         :param project_id: Return only this project's assignments.
         :param state: Return only assignments in this state.
         :param source_session_id: Return only assignments dispatched by this
@@ -153,6 +164,7 @@ class AssignmentStore(ABC):
         *,
         from_state: str,
         to_state: str,
+        expected_active_attempt_id: Any = _UNSET,
         **fields: Any,
     ) -> Assignment | None:
         """
@@ -161,17 +173,23 @@ class AssignmentStore(ABC):
         The pair is first checked against the legal transition table, then
         applied as ``UPDATE ... WHERE state = from_state`` — a concurrent
         writer that moved the row first makes this call return ``None``
-        instead of clobbering it.
+        instead of clobbering it. When ``expected_active_attempt_id`` is
+        passed (including ``None``), the write also requires
+        ``active_attempt_id`` to still equal it.
 
         :param assignment_id: Opaque assignment identifier.
         :param from_state: The state the caller last saw.
         :param to_state: The desired next state.
+        :param expected_active_attempt_id: Pinned attempt the caller
+            validated; ``None`` pins no active attempt. Omitted pins
+            nothing.
         :param fields: Additional mutable columns to set atomically
             (``wait_reason``, ``next_check_at``, ``active_attempt_id``,
-            ``resolved_host_id``, …, plus the ``outputs`` /
+            ``resolved_host_id``, …, plus the ``inputs`` / ``outputs`` /
             ``metadata`` entity conveniences).
         :returns: The updated :class:`Assignment`, or ``None`` when the row
-            is missing or no longer in ``from_state``.
+            is missing or no longer in ``from_state`` (or the pinned
+            attempt changed).
         :raises IllegalAssignmentTransitionError: If the pair is not legal.
         """
         ...
@@ -219,6 +237,60 @@ class AssignmentStore(ABC):
         :raises InactiveAttemptError: When ``attempt_id`` is not the
             assignment's ``active_attempt_id`` or the attempt is not
             ``active``.
+        """
+        ...
+
+    @abstractmethod
+    def get_attempt(self, assignment_id: str, attempt_id: str) -> AssignmentAttempt | None:
+        """
+        Return one attempt of an assignment, or ``None`` if not found.
+
+        A plain read with no activeness check: lifecycle routes need ended
+        attempts too (cancellation and retry must confirm the old execution
+        stopped), so this never raises :class:`InactiveAttemptError`.
+
+        :param assignment_id: The assignment the attempt belongs to.
+        :param attempt_id: The attempt to return.
+        :returns: The :class:`AssignmentAttempt`, or ``None`` when the
+            attempt row is missing or belongs to another assignment.
+        """
+        ...
+
+    @abstractmethod
+    def refresh_waiting(
+        self,
+        assignment_id: str,
+        *,
+        inputs: builtins.list[Any],
+        project_revision: int,
+        now: int,
+        expected_inputs_json: Any = _UNSET,
+        expected_project_revision: Any = _UNSET,
+    ) -> Assignment | None:
+        """
+        Re-pin a ``waiting`` row against the current configuration.
+
+        A conditional write, not a transition: ``wait_reason`` changes are
+        not transitions, so the legal-transition table (which has no
+        self-loop) does not apply. Sets ``inputs_json``, clears
+        ``wait_reason``, stamps ``next_check_at``, and clears the
+        claim-time binding snapshot (the coordinator re-pins at claim).
+        When ``expected_inputs_json`` is passed, the write also requires
+        the stored ``inputs_json`` blob to still equal it. When
+        ``expected_project_revision`` is passed, the write also requires
+        the stored ``project_revision`` to still equal it.
+
+        :param assignment_id: The waiting assignment to re-pin.
+        :param inputs: The re-pinned input entries (revisions refreshed,
+            digests untouched).
+        :param project_revision: The current ``collaboration_revision``.
+        :param now: Unix epoch seconds stamped on ``next_check_at``.
+        :param expected_inputs_json: Pinned ``inputs_json`` blob the caller
+            computed from. Omitted pins nothing.
+        :param expected_project_revision: Pinned ``project_revision`` the
+            caller read with the row. Omitted pins nothing.
+        :returns: The updated :class:`Assignment`, or ``None`` when the row
+            is missing, no longer ``waiting``, or the pinned inputs changed.
         """
         ...
 

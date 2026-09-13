@@ -41,6 +41,7 @@ from omnigent.entities.assignment import (
 from omnigent.entities.pagination import PagedList, paginate_in_memory
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.assignment_store import (
+    _UNSET,
     AssignmentIdempotencyConflictError,
     AssignmentStore,
     IllegalAssignmentTransitionError,
@@ -73,6 +74,7 @@ _TRANSITION_COLUMNS = frozenset(
         "project_revision",
         "task",
         "metadata_json",
+        "inputs_json",
         "model_override",
         "harness_override",
         "start_deadline",
@@ -343,6 +345,7 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
     def list(
         self,
         *,
+        owner_user_id: str | None = None,
         project_id: str | None = None,
         state: str | None = None,
         source_session_id: str | None = None,
@@ -355,6 +358,10 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
             stmt = select(SqlAssignment).where(
                 SqlAssignment.workspace_id == current_workspace_id()
             )
+            if owner_user_id is None:
+                stmt = stmt.where(SqlAssignment.owner_user_id.is_(None))
+            else:
+                stmt = stmt.where(SqlAssignment.owner_user_id == owner_user_id)
             if project_id is not None:
                 stmt = stmt.where(SqlAssignment.project_id == project_id)
             if state is not None:
@@ -381,14 +388,15 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
         *,
         from_state: str,
         to_state: str,
+        expected_active_attempt_id: Any = _UNSET,
         **fields: Any,
     ) -> Assignment | None:
         """Conditionally move an assignment to a new state.
 
         The pair is legality-checked first; the write then applies only
-        when the stored state still equals ``from_state``. ``outputs`` and
-        ``metadata`` accept entity values and are encoded; every other key
-        must name a mutable column.
+        when the stored state still equals ``from_state``. ``inputs``,
+        ``outputs`` and ``metadata`` accept entity values and are encoded;
+        every other key must name a mutable column.
         """
         if not is_legal_transition(from_state, to_state):
             raise IllegalAssignmentTransitionError(from_state, to_state)
@@ -397,6 +405,9 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
             if key == "outputs":
                 value = outputs_to_json(value) if isinstance(value, list) else value
                 key = "outputs_json"
+            elif key == "inputs":
+                value = inputs_to_json(value) if isinstance(value, list) else value
+                key = "inputs_json"
             elif key == "metadata":
                 value = _encode_metadata(value)
                 key = "metadata_json"
@@ -411,17 +422,21 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
             wid = current_workspace_id()
             # A DML execute returns a CursorResult at runtime; the rowcount
             # is the single-flight signal (1 = this writer won, 0 = lost).
+            stmt = update(SqlAssignment).where(
+                SqlAssignment.workspace_id == wid,
+                SqlAssignment.id == assignment_id,
+                SqlAssignment.state == from_state,
+            )
+            if expected_active_attempt_id is not _UNSET:
+                if expected_active_attempt_id is None:
+                    stmt = stmt.where(SqlAssignment.active_attempt_id.is_(None))
+                else:
+                    stmt = stmt.where(
+                        SqlAssignment.active_attempt_id == expected_active_attempt_id
+                    )
             result = cast(
                 "CursorResult[Any]",
-                session.execute(
-                    update(SqlAssignment)
-                    .where(
-                        SqlAssignment.workspace_id == wid,
-                        SqlAssignment.id == assignment_id,
-                        SqlAssignment.state == from_state,
-                    )
-                    .values(state=to_state, updated_at=now_epoch(), **values)
-                ),
+                session.execute(stmt.values(state=to_state, updated_at=now_epoch(), **values)),
             )
             if not result.rowcount:
                 return None
@@ -557,6 +572,60 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
             return _attempt_to_entity(attempt)
 
         return run_write_transaction(self._session_immediate, "update_attempt", write)
+
+    def get_attempt(self, assignment_id: str, attempt_id: str) -> AssignmentAttempt | None:
+        """Return one attempt of an assignment, with no activeness check."""
+        with self._session("select_assignment_attempt") as session:
+            row = session.get(SqlAssignmentAttempt, (current_workspace_id(), attempt_id))
+            if row is None or row.assignment_id != assignment_id:
+                return None
+            return _attempt_to_entity(row)
+
+    def refresh_waiting(
+        self,
+        assignment_id: str,
+        *,
+        inputs: builtins.list[Any],
+        project_revision: int,
+        now: int,
+        expected_inputs_json: Any = _UNSET,
+        expected_project_revision: Any = _UNSET,
+    ) -> Assignment | None:
+        """Re-pin a ``waiting`` row; ``None`` when missing or not waiting."""
+
+        def write(session: Session) -> Assignment | None:
+            wid = current_workspace_id()
+            stmt = update(SqlAssignment).where(
+                SqlAssignment.workspace_id == wid,
+                SqlAssignment.id == assignment_id,
+                SqlAssignment.state == AssignmentState.WAITING.value,
+            )
+            if expected_inputs_json is not _UNSET:
+                stmt = stmt.where(SqlAssignment.inputs_json == expected_inputs_json)
+            if expected_project_revision is not _UNSET:
+                stmt = stmt.where(SqlAssignment.project_revision == expected_project_revision)
+            result = cast(
+                "CursorResult[Any]",
+                session.execute(
+                    stmt.values(
+                        inputs_json=(
+                            inputs_to_json(inputs) if isinstance(inputs, list) else inputs
+                        ),
+                        project_revision=project_revision,
+                        wait_reason=None,
+                        next_check_at=now,
+                        resolved_binding_id=None,
+                        resolved_binding_revision=None,
+                        updated_at=now,
+                    )
+                ),
+            )
+            if not result.rowcount:
+                return None
+            row = session.get(SqlAssignment, (wid, assignment_id))
+            return _assignment_to_entity(row) if row is not None else None
+
+        return run_write_transaction(self._session_immediate, "refresh_waiting", write)
 
     def mark_event_dispatched(self, attempt_id: str, *, now: int) -> bool:
         """Compare-and-set ``event_dispatched_at``; ``True`` for the first caller."""

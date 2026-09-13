@@ -144,6 +144,10 @@ class AssignmentInputEntry:
     :param is_execution_root: Exactly one entry per assignment is the
         execution root — the repository the session workspace is prepared
         from.
+    :param observed_commit: The commit actually observed at ``input_ref``
+        when publication was confirmed, or ``None`` when unobserved. Lives
+        inside ``inputs_json`` (no new column); the ``published`` route
+        records it on a failed publication so the state is reconcilable.
     """
 
     repository_name: str
@@ -155,6 +159,7 @@ class AssignmentInputEntry:
     manifest_digest: str
     artifact_paths: list[str] = field(default_factory=list)
     is_execution_root: bool = False
+    observed_commit: str | None = None
 
 
 @dataclass
@@ -192,6 +197,7 @@ def inputs_to_json(entries: list[AssignmentInputEntry]) -> str:
                 "manifest_digest": e.manifest_digest,
                 "artifact_paths": list(e.artifact_paths),
                 "is_execution_root": e.is_execution_root,
+                "observed_commit": e.observed_commit,
             }
             for e in entries
         ],
@@ -218,6 +224,7 @@ def inputs_from_json(raw: str | None) -> list[AssignmentInputEntry]:
             manifest_digest=item["manifest_digest"],
             artifact_paths=list(item.get("artifact_paths", [])),
             is_execution_root=item.get("is_execution_root", False),
+            observed_commit=item.get("observed_commit"),
         )
         for item in json.loads(raw)
     ]

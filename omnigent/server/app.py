@@ -84,6 +84,7 @@ from omnigent.server.performance_metrics import (
 )
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
+from omnigent.server.routes.assignments import create_assignments_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.custom_agents import create_custom_agents_router
@@ -137,6 +138,7 @@ from omnigent.stores import (
     ConversationStore,
     FileStore,
 )
+from omnigent.stores.assignment_store import AssignmentStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
 from omnigent.stores.host_store import HostStore
@@ -1157,6 +1159,7 @@ def create_app(
     project_store: ProjectStore | None = None,
     project_repository_store: ProjectRepositoryStore | None = None,
     project_host_binding_store: ProjectHostBindingStore | None = None,
+    assignment_store: AssignmentStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1219,6 +1222,9 @@ def create_app(
     :param project_host_binding_store: Store for a project's per-host
         directory bindings. Mounts the collaboration router only together
         with ``project_store`` and ``project_repository_store``.
+    :param assignment_store: Store for assignments, attempts and messages.
+        Mounts the assignments router only together with ``project_store``,
+        ``project_repository_store`` and ``conversation_store``.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -3208,6 +3214,33 @@ def create_app(
             ),
             prefix="/v1",
             tags=["projects"],
+        )
+
+    # Assignment dispatch and lifecycle. Mounted only when the assignment
+    # store, the project store, the repository store and the conversation
+    # store are wired; creation and refresh additionally gate on
+    # Feature.PROJECT_ASSIGNMENTS, while every other route stays served so
+    # in-flight work can finish after the switch goes off.
+    if (
+        assignment_store is not None
+        and project_store is not None
+        and project_repository_store is not None
+        and conversation_store is not None
+    ):
+        app.include_router(
+            create_assignments_router(
+                assignment_store,
+                project_store,
+                project_repository_store,
+                conversation_store=conversation_store,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                auth_provider=auth_provider,
+                host_store=host_store,
+                feature_flags=resolved_feature_flags,
+            ),
+            prefix="/v1",
+            tags=["assignments"],
         )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
