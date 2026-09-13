@@ -30,6 +30,27 @@ afterEach(() => {
 });
 
 describe("resolveIdentity", () => {
+  it("discards a body decoded after switching Servers before a new identity lookup", async () => {
+    let finishBody!: (body: unknown) => void;
+    const json = vi.fn(
+      () =>
+        new Promise<unknown>((resolve) => {
+          finishBody = resolve;
+        }),
+    );
+    const serverA = vi.fn().mockResolvedValue({ ok: true, status: 200, json });
+    const serverB = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "bob" }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity } = await import("./identity");
+    const pending = resolveIdentity();
+    await vi.waitFor(() => expect(json).toHaveBeenCalledOnce());
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    finishBody({ user_id: "alice" });
+    expect(await pending).toBeNull();
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
   it("calls GET /v1/me and caches the user id", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice@example.com" }));
     const { resolveIdentity, getCurrentUserId } = await import("./identity");
@@ -77,6 +98,67 @@ describe("resolveIdentity", () => {
     expect(await a).toBe("carol");
     expect(await b).toBe("carol");
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes the cached identity after the embedded Server connection changes", async () => {
+    const serverA = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "alice" }));
+    const serverB = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "bob" }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+
+    expect(await resolveIdentity()).toBe("alice");
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+
+    expect(await resolveIdentity()).toBe("bob");
+    expect(getCurrentUserId()).toBe("bob");
+    expect(serverA).toHaveBeenCalledOnce();
+    expect(serverB).toHaveBeenCalledOnce();
+  });
+
+  it("discards a delayed identity response from the previous Server", async () => {
+    let resolveServerA!: (response: Response) => void;
+    const serverA = vi.fn().mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveServerA = resolve;
+      }),
+    );
+    const serverB = vi.fn().mockResolvedValue(mockJsonResponse({ user_id: "bob" }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+
+    const staleResolution = resolveIdentity();
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    const currentResolution = resolveIdentity();
+    resolveServerA(mockJsonResponse({ user_id: "alice" }));
+
+    expect(await staleResolution).toBeNull();
+    expect(await currentResolution).toBe("bob");
+    expect(getCurrentUserId()).toBe("bob");
+    expect(serverA).toHaveBeenCalledOnce();
+    expect(serverB).toHaveBeenCalledOnce();
+  });
+
+  it("drops the cached user and header after switching Servers without resolving", async () => {
+    const serverA = vi
+      .fn()
+      .mockResolvedValue(mockJsonResponse({ user_id: "alice", is_admin: true }));
+    const serverB = vi.fn().mockResolvedValue(mockJsonResponse({}));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, getCurrentUserId, getCurrentIsAdmin, authenticatedFetch } =
+      await import("./identity");
+
+    expect(await resolveIdentity()).toBe("alice");
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+
+    expect(getCurrentUserId()).toBeNull();
+    expect(getCurrentIsAdmin()).toBe(false);
+    await authenticatedFetch("/v1/sessions");
+    const init = serverB.mock.calls[0][1] as RequestInit;
+    const headers = new Headers(init.headers);
+    expect(headers.has("X-Forwarded-Email")).toBe(false);
   });
 
   it("returns null when the server responds with user_id: null", async () => {
@@ -223,6 +305,8 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentHostGeneration: vi.fn(() => 0),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -255,6 +339,8 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({})),
+        getOmnigentHostGeneration: vi.fn(() => 0),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -281,6 +367,8 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentHostGeneration: vi.fn(() => 0),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -331,6 +419,8 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentHostGeneration: vi.fn(() => 0),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
