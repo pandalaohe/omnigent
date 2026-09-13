@@ -4160,6 +4160,11 @@ class HostProcess:
                 continue
             try:
                 snapshot = await read_codex_rate_limits_snapshot()
+                if snapshot is not None and self._codex_rate_limits_enabled():
+                    self._codex_rate_limits = snapshot
+                    await ws.send(
+                        encode_host_frame(HostCodexRateLimitsFrame(codex_rate_limits=snapshot))
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - optional telemetry must not stop refreshing
@@ -4167,12 +4172,6 @@ class HostProcess:
                 # Retain the last good snapshot; never let this advisory probe
                 # endanger Host liveness or print credential-bearing output.
                 _logger.debug("Codex rate-limit probe unavailable", exc_info=True)
-            else:
-                if snapshot is not None:
-                    self._codex_rate_limits = snapshot
-                    await ws.send(
-                        encode_host_frame(HostCodexRateLimitsFrame(codex_rate_limits=snapshot))
-                    )
             await asyncio.sleep(CODEX_RATE_LIMITS_REFRESH_INTERVAL_S)
 
     def _codex_rate_limits_enabled(self) -> bool:

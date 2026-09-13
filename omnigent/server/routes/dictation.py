@@ -151,18 +151,29 @@ def create_dictation_router(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="dictation punctuation busy",
             )
-        async with punctuation_slots:
+        await punctuation_slots.acquire()
+
+        async def _load_and_restore() -> str | None:
             try:
                 restorer = await asyncio.to_thread(resolve_punctuation)
-                restored = await asyncio.to_thread(restorer.restore, body.text)
-            except Exception as exc:
-                # Model exceptions are not trusted to omit their input. Keep
-                # transcript text out of logs while retaining the error class.
+                return await asyncio.to_thread(restorer.restore, body.text)
+            except Exception as exc:  # noqa: BLE001 - contain model failures as None
                 _logger.error("dictation punctuation failed (%s)", type(exc).__name__)
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="dictation punctuation unavailable",
-                ) from exc
+                return None
+            finally:
+                punctuation_slots.release()
+
+        work = asyncio.create_task(_load_and_restore())
+        try:
+            restored = await asyncio.shield(work)
+        except asyncio.CancelledError:
+            # Worker keeps the slot until inference finishes and contains its own failures.
+            raise
+        if restored is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="dictation punctuation unavailable",
+            )
         return DictationPunctuationResponse(text=restored)
 
     if include_punctuation:
