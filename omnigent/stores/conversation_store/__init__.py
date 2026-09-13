@@ -1072,6 +1072,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def clear_stale_archive_close_claim(
+        self,
+        conversation_id: str,
+        *,
+        stale_before: int,
+    ) -> bool:
+        """Release a dead worker's lease whose close request is no longer current."""
+        ...
+
+    @abstractmethod
     def finalize_archive_close(self, conversation_id: str, revision: int) -> bool:
         """Mark a current root request complete after every target completed."""
         ...

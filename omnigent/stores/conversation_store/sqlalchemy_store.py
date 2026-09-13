@@ -1732,6 +1732,73 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return result.rowcount > 0
 
+    def clear_stale_archive_close_claim(
+        self,
+        conversation_id: str,
+        *,
+        stale_before: int,
+    ) -> bool:
+        """Release a dead worker's fence left behind across an unarchive.
+
+        Separate from :meth:`claim_archive_close` on purpose: a claim leases
+        CURRENT close work, so it must require ``archived`` and a matching
+        revision, and must never mint close work on an unarchived row. This
+        clear is the reverse — it only fires where no current request is
+        outstanding (unarchived/superseded, or otherwise no longer current),
+        so it can never create or move a lease, only drop a dead one.
+
+        Keyed on staleness (``archive_close_claimed_at < stale_before``, the
+        same notion ``claim_archive_close`` uses), not mere presence, so a
+        live worker that keeps renewing via :meth:`renew_archive_close_claim`
+        never matches. A still-current archived request is refused even when
+        stale-looking: its recovery is a reclaiming ``claim_archive_close``
+        (which transfers ownership to a live worker), and clearing the token
+        there would not even lift the user-work fence (an archived row with
+        ``requested == revision`` stays fenced) while destroying lease
+        accountability.
+
+        No in-scope caller yet: the natural caller is the user-work fence in
+        ``omnigent/server/routes/sessions/routes_events.py``
+        (``_archive_blocks_external_user_work``), which should attempt this
+        clear — with ``stale_before = now - ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S``
+        — when it observes ``archive_close_claimed`` on a scope whose request
+        is no longer current, then re-read before fencing.
+        """
+        with self._conv_session("clear_stale_archive_close_claim") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.archive_close_claim_token.is_not(None),
+                        or_(
+                            SqlConversation.archive_close_claimed_at.is_(None),
+                            SqlConversation.archive_close_claimed_at < stale_before,
+                        ),
+                        # No current request outstanding: unarchived, superseded
+                        # (the request is gone or trails the archive revision),
+                        # or already completed. A still-current archived request
+                        # is deliberately excluded (see docstring).
+                        or_(
+                            SqlConversation.archived.is_(False),
+                            SqlConversation.archive_close_requested_revision.is_(None),
+                            SqlConversation.archive_close_requested_revision
+                            != SqlConversation.archive_revision,
+                            SqlConversation.archive_close_completed_revision
+                            == SqlConversation.archive_close_requested_revision,
+                        ),
+                    )
+                    .values(
+                        archive_close_claim_token=None,
+                        archive_close_claimed_at=None,
+                        archive_close_last_error="stale_claim_cleared",
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
     def finalize_archive_close(self, conversation_id: str, revision: int) -> bool:
         """Complete a root request only if its archive revision is still current."""
         with self._conv_session("finalize_archive_close") as session:
@@ -1914,6 +1981,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_session_usage", write)
+
     def set_provider_usage_limits(
         self,
         conversation_id: str,
@@ -4465,6 +4533,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             return result.rowcount == 1
 
         return run_write_transaction(self._session_immediate, "settle_orphaned_live_status", write)
+
     def get_native_subagent_reconcile_fingerprint(
         self,
         conversation_id: str,

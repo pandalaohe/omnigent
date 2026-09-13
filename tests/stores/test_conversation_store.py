@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -7490,3 +7490,147 @@ def test_archive_search_keeps_visible_notification_discussions(
     assert [
         match.id for match in conversation_store.search_visible_items_literal(conv.id, "needle")
     ] == [item.id]
+
+
+# ── Stale archive-close recovery across unarchive ──
+
+
+def _archive_claim_unarchive(
+    conversation_store: SqlAlchemyConversationStore,
+    *,
+    claimed_at: int = 100,
+) -> tuple[str, int]:
+    """Archive with close requested, claim it, then unarchive.
+
+    :returns: The ``(conversation_id, archive_revision)`` the claim was taken on.
+    """
+    conv = conversation_store.create_conversation()
+    archived = conversation_store.update_conversation(
+        conv.id, archived=True, close_cli_on_archive=True
+    )
+    assert archived is not None
+    assert (
+        conversation_store.claim_archive_close(
+            conv.id,
+            archived.archive_revision,
+            "worker",
+            claimed_at=claimed_at,
+            stale_before=0,
+        )
+        == "claimed"
+    )
+    unarchived = conversation_store.update_conversation(conv.id, archived=False)
+    assert unarchived is not None
+    return conv.id, archived.archive_revision
+
+
+def test_unarchive_retains_close_lease_and_fresh_token_survives_stale_clear(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Unarchive keeps the held lease fenced; a fresh token is not stale-cleared."""
+    conversation_id, _revision = _archive_claim_unarchive(conversation_store, claimed_at=100)
+
+    fenced = conversation_store.get_conversation(conversation_id)
+    assert fenced is not None
+    assert fenced.archive_close_claimed is True
+
+    assert not conversation_store.clear_stale_archive_close_claim(
+        conversation_id, stale_before=100
+    )
+    still_fenced = conversation_store.get_conversation(conversation_id)
+    assert still_fenced is not None
+    assert still_fenced.archive_close_claimed is True
+
+
+def test_live_worker_release_after_unarchive_lifts_fence(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The live holder's token-identity release still works after unarchive."""
+    conversation_id, revision = _archive_claim_unarchive(conversation_store, claimed_at=100)
+
+    assert conversation_store.release_archive_close_claim(conversation_id, revision, "worker")
+
+    settled = conversation_store.get_conversation(conversation_id)
+    assert settled is not None
+    assert settled.archive_close_claimed is False
+
+
+def test_stale_clear_releases_dead_lease_after_unarchive(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A never-returning holder's stale token is reclaimable once unarchived."""
+    conversation_id, _revision = _archive_claim_unarchive(conversation_store, claimed_at=100)
+
+    assert conversation_store.clear_stale_archive_close_claim(conversation_id, stale_before=1000)
+
+    settled = conversation_store.get_conversation(conversation_id)
+    assert settled is not None
+    assert settled.archive_close_claimed is False
+    assert settled.archive_close_last_error == "stale_claim_cleared"
+    # Second clear is a no-op: no token left to drop.
+    assert not conversation_store.clear_stale_archive_close_claim(
+        conversation_id, stale_before=1000
+    )
+    assert (
+        conversation_store.clear_stale_archive_close_claim(
+            "c55a64c3f6f954fe0fc8738ba3f45f27", stale_before=1000
+        )
+        is False
+    )
+
+
+def test_stale_clear_spares_renewed_lease_after_unarchive(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A token refreshed by a live worker is not stolen by the stale clear."""
+    conversation_id, _revision = _archive_claim_unarchive(conversation_store, claimed_at=100)
+    assert conversation_store.renew_archive_close_claim(conversation_id, "worker", claimed_at=900)
+
+    assert not conversation_store.clear_stale_archive_close_claim(
+        conversation_id, stale_before=500
+    )
+    held = conversation_store.get_conversation(conversation_id)
+    assert held is not None
+    assert held.archive_close_claimed is True
+
+
+def test_stale_clear_refuses_current_archived_request(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A still-archived row with a current outstanding request keeps its lease.
+
+    Its recovery is a reclaiming ``claim_archive_close`` (which transfers
+    ownership to a live worker), so the blind clear must refuse even when the
+    token looks stale.
+    """
+    conv = conversation_store.create_conversation()
+    archived = conversation_store.update_conversation(
+        conv.id, archived=True, close_cli_on_archive=True
+    )
+    assert archived is not None
+    assert (
+        conversation_store.claim_archive_close(
+            conv.id,
+            archived.archive_revision,
+            "owner-a",
+            claimed_at=100,
+            stale_before=0,
+        )
+        == "claimed"
+    )
+
+    assert not conversation_store.clear_stale_archive_close_claim(conv.id, stale_before=500)
+    held = conversation_store.get_conversation(conv.id)
+    assert held is not None
+    assert held.archive_close_claimed is True
+    # Normal stale reclaim still transfers the lease to a live worker.
+    assert (
+        conversation_store.claim_archive_close(
+            conv.id,
+            archived.archive_revision,
+            "owner-b",
+            claimed_at=1000,
+            stale_before=500,
+        )
+        == "claimed"
+    )
