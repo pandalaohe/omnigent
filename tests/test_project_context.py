@@ -187,6 +187,23 @@ def test_identity_must_be_an_object() -> None:
         parse_manifest(_blob({"version": 1, "identity": "shop"}))
 
 
+def test_identity_id_kept_verbatim() -> None:
+    """The optional identity id parses and is kept exactly as given."""
+    identity_id = "  Shop Root/AbC-001  "
+    manifest = parse_manifest(
+        _blob({"version": 1, "identity": {"id": identity_id, "name": "shop"}})
+    )
+    assert manifest.identity is not None
+    assert manifest.identity["id"] == identity_id
+
+
+@pytest.mark.parametrize("identity_id", [123, "", "   ", None, [], {}])
+def test_identity_id_must_be_a_non_empty_string(identity_id: object) -> None:
+    """A present identity id must be a non-empty string."""
+    with pytest.raises(ManifestError, match=r"identity\.id"):
+        parse_manifest(_blob({"version": 1, "identity": {"id": identity_id}}))
+
+
 @pytest.mark.parametrize("blob", [b"not json", b"[1, 2]", b'"version"', b"1"])
 def test_non_object_or_invalid_json_rejected(blob: bytes) -> None:
     """Garbage bytes and non-object JSON never parse."""
