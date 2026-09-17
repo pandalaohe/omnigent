@@ -61,7 +61,10 @@ class ProjectManifest:
     :param artifacts: Output paths; declared but never required at pickup.
     :param cross_repo: Required paths in sibling repositories.
     :param identity: The manifest's ``identity`` object as a read-only
-        view, or ``None`` when absent.
+        view, or ``None`` when absent. The optional ``id`` sub-key is a
+        stable, opaque identifier of the project root that external
+        tooling may key on; it is validated only as a non-empty string,
+        and other sub-keys are not checked.
     """
 
     version: int = MANIFEST_VERSION
@@ -212,6 +215,12 @@ def parse_manifest(blob: bytes) -> ProjectManifest:
     identity = raw.get("identity")
     if identity is not None and not isinstance(identity, dict):
         raise ManifestError("manifest field 'identity' must be an object")
+    if identity is not None and "id" in identity:
+        identity_id = identity["id"]
+        if not isinstance(identity_id, str) or not identity_id.strip():
+            raise ManifestError(
+                f"manifest field 'identity.id' must be a non-empty string, got {identity_id!r}"
+            )
     return ProjectManifest(
         version=MANIFEST_VERSION,
         context=_path_list(raw.get("context"), "context"),
