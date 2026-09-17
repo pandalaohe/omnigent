@@ -90,6 +90,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPostBindHookFrame,
+    HostPostBindHookResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -111,7 +113,8 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
-from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
+from omnigent.host.post_bind_hook import PostBindHookRunner
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
@@ -998,6 +1001,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        config_path: Path | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1008,9 +1012,17 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param config_path: Config file this host process was started with.
+            The post-bind hook re-reads it per request, so it must be the
+            effective path, never a re-derived default. ``None`` falls back
+            to ``~/.omnigent/config.yaml``.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        # The hook reads the command from the config file this process was
+        # started with; a host launched with an explicit --config must not
+        # fall back to the default file.
+        self._post_bind_hook_runner = PostBindHookRunner(config_path or CONFIG_PATH)
         self._interactive_shells = normalize_interactive_shells(
             interactive_shells
             if interactive_shells is not None
@@ -3435,6 +3447,32 @@ class HostProcess:
         result.request_id = frame.request_id
         return result
 
+    async def _handle_post_bind_hook(
+        self,
+        frame: HostPostBindHookFrame,
+    ) -> HostPostBindHookResultFrame:
+        """Handle a ``host.post_bind_hook`` request from the server.
+
+        The runner blocks (config read, manifest read, child process), so it
+        runs in a worker thread with the orphan reaper paused.
+
+        :param frame: The post-bind hook request frame.
+        :returns: The hook outcome frame. An unexpected exception still
+            answers ``"failed"`` with a message, never silence.
+        """
+        try:
+            with self._host_subprocess_op():
+                return await asyncio.to_thread(self._post_bind_hook_runner.run, frame)
+        except Exception as exc:
+            _logger.exception(
+                "Post-bind hook crashed for %s/%s", frame.project_id, frame.binding_name
+            )
+            return HostPostBindHookResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"post-bind hook crashed: {exc}",
+            )
+
     async def _probe_configured_harnesses(
         self,
         *,
@@ -4108,6 +4146,7 @@ class HostProcess:
             codex_rate_limits=self._codex_rate_limits,
             filesystem_roots=True,
             assignments=True,
+            post_bind_hook=True,
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -4407,6 +4446,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_assignment_prepare(frame)))
         elif isinstance(frame, HostAssignmentReleaseFrame):
             await ws.send(encode_host_frame(await self._handle_assignment_release(frame)))
+        elif isinstance(frame, HostPostBindHookFrame):
+            await ws.send(encode_host_frame(await self._handle_post_bind_hook(frame)))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.
@@ -4592,6 +4633,7 @@ def run_host_process(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        config_path=path,
     )
     try:
         asyncio.run(host.run())

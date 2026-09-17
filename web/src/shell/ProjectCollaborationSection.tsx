@@ -15,11 +15,19 @@ import {
   putProjectRepository,
   setProjectCollaborationEnabled,
   verifyProjectHostBinding,
+  type PostBindResult,
   type ProjectCollaborationProblem,
 } from "@/lib/projectsApi";
 
 const CONFLICT_MESSAGE =
   "Collaboration settings changed elsewhere; the latest settings are shown. Try again.";
+
+/** Hook statuses worth surfacing in the settings section; the rest are silent. */
+const WARNING_HOOK_STATUSES = new Set(["failed", "timed_out", "unreachable"]);
+
+function postBindWarning(result: PostBindResult | undefined): PostBindResult | null {
+  return result && WARNING_HOOK_STATUSES.has(result.status) ? result : null;
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Something went wrong. Try again.";
@@ -50,6 +58,7 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
   });
   const hosts = useHosts();
   const [actionError, setActionError] = useState<string | null>(null);
+  const [hookWarning, setHookWarning] = useState<PostBindResult | null>(null);
 
   const [repoName, setRepoName] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
@@ -134,11 +143,15 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
         is_primary: input.isPrimary,
       }),
     retry: false,
-    onMutate: () => setActionError(null),
+    onMutate: () => {
+      setActionError(null);
+      setHookWarning(null);
+    },
     onError: (error: unknown) => setActionError(errorMessage(error)),
-    onSuccess: () => {
+    onSuccess: (binding) => {
       setActionError(null);
       setBindingWorkspace("");
+      setHookWarning(postBindWarning(binding.post_bind));
       invalidate();
     },
   });
@@ -159,10 +172,14 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
     mutationFn: (input: { hostId: string; name: string }) =>
       verifyProjectHostBinding(projectId, input.hostId, input.name),
     retry: false,
-    onMutate: () => setActionError(null),
-    onError: (error: unknown) => setActionError(errorMessage(error)),
-    onSuccess: () => {
+    onMutate: () => {
       setActionError(null);
+      setHookWarning(null);
+    },
+    onError: (error: unknown) => setActionError(errorMessage(error)),
+    onSuccess: (binding) => {
+      setActionError(null);
+      setHookWarning(postBindWarning(binding.post_bind));
       invalidate();
     },
   });
@@ -447,6 +464,22 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
               {problemText(problem, hostName, bindingNameById)}
             </p>
           ))}
+        </div>
+      )}
+
+      {hookWarning && (
+        <div
+          className="text-destructive text-ui"
+          role="status"
+          data-testid="project-collaboration-hook-warning"
+        >
+          Binding saved; post-bind command{" "}
+          {hookWarning.status === "timed_out" ? "timed out" : hookWarning.status}
+          {hookWarning.error ? `: ${hookWarning.error}` : ""}
+          {typeof hookWarning.exit_code === "number" ? ` (exit code ${hookWarning.exit_code})` : ""}
+          {hookWarning.output ? (
+            <pre className="mt-1 whitespace-pre-wrap">{hookWarning.output}</pre>
+          ) : null}
         </div>
       )}
 

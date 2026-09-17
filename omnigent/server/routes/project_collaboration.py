@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+import secrets
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -24,6 +25,7 @@ from pydantic import BaseModel, ConfigDict
 from omnigent.db.utils import now_epoch
 from omnigent.entities import ProjectHostBinding, ProjectRepository
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import HostPostBindHookFrame, encode_host_frame
 from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import require_user
@@ -38,7 +40,14 @@ from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_repository_store import ProjectRepositoryStore
 from omnigent.stores.project_store import ProjectStore
 
+if TYPE_CHECKING:
+    from omnigent.server.host_registry import HostRegistry
+
 _DEFAULT_MANIFEST_PATH = ".agents/project/manifest.json"
+
+# The host caps one hook run at 30 s; the server waits a little longer so a
+# host that is still starting the command when it replies lands inside the wait.
+_POST_BIND_HOOK_TIMEOUT_S: float = 35.0
 
 # Repository and binding names become part of
 # ``refs/omnigent/assignments/<id>/input/<name>``, so they must be a single
@@ -382,6 +391,79 @@ async def _canonical_binding_workspace(
     return canonical, host_name
 
 
+def _post_bind_result(status: str, *, error: str | None = None) -> dict[str, Any]:
+    """Build the ``post_bind`` response object for a non-frame outcome.
+
+    :param status: One of the D9 statuses the server itself reports.
+    :param error: Failure detail when the status is ``"failed"``.
+    :returns: Dict with ``status``, ``exit_code``, ``output`` and ``error``.
+    """
+    return {"status": status, "exit_code": None, "output": None, "error": error}
+
+
+async def _run_post_bind_hook(
+    *,
+    host_registry: HostRegistry,
+    host_id: str,
+    binding: ProjectHostBinding,
+    repository: ProjectRepository,
+) -> dict[str, Any]:
+    """Ask the host to run its own post-bind command for a stored binding.
+
+    Never raises for hook outcomes: a missing tunnel, a host without the
+    capability, a dropped connection and an expired wait all map to a
+    status object the caller returns beside the binding.
+
+    :param host_registry: Live host tunnels on this replica.
+    :param host_id: The bound host.
+    :param binding: The stored binding the hook runs for; its ``revision``
+        rides the frame so the host can drop a superseded request.
+    :param repository: The registered repository the binding points at.
+    :returns: The D9 object (``status``, ``exit_code``, ``output``,
+        ``error``).
+    """
+    conn = host_registry.get(host_id)
+    if conn is None:
+        return _post_bind_result("unreachable")
+    if not conn.hello.post_bind_hook:
+        return _post_bind_result("unsupported")
+    request_id = secrets.token_hex(8)
+    future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+    conn.pending_post_bind_hooks[request_id] = future
+    frame = encode_host_frame(
+        HostPostBindHookFrame(
+            request_id=request_id,
+            project_id=binding.project_id,
+            binding_name=binding.name,
+            binding_id=binding.id,
+            revision=binding.revision,
+            repository_name=repository.name,
+            workspace=binding.workspace,
+            is_primary=binding.is_primary,
+            context_manifest_path=repository.context_manifest_path,
+        )
+    )
+    try:
+        try:
+            host_registry.send_text(conn, frame)
+        except ConnectionError:
+            return _post_bind_result("unreachable")
+        try:
+            result = await asyncio.wait_for(future, timeout=_POST_BIND_HOOK_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return _post_bind_result("unreachable")
+    finally:
+        # The tunnel's receive loop also pops on success; this is the only
+        # cleanup path when the caller is cancelled mid-wait.
+        conn.pending_post_bind_hooks.pop(request_id, None)
+    return {
+        "status": result.get("status", "failed"),
+        "exit_code": result.get("exit_code"),
+        "output": result.get("output"),
+        "error": result.get("error"),
+    }
+
+
 async def _require_owned_project(
     project_store: ProjectStore,
     project_id: str,
@@ -579,7 +661,8 @@ def create_project_collaboration_router(
         :param host_id: The bound host.
         :param name: Binding name; ``primary`` is the conventional value.
         :param body: Workspace, repository name and binding flags.
-        :returns: The inserted or updated binding.
+        :returns: The inserted or updated binding plus the ``post_bind``
+            outcome object.
         :raises HTTPException: 404 when the feature is disabled.
         :raises OmnigentError: 401 if unauthenticated, 404 if the project
             is not found / not owned, 400 on a bad name, unknown
@@ -617,7 +700,16 @@ def create_project_collaboration_router(
             enabled=body.enabled,
             path_verified_at=now_epoch(),
         )
-        return _binding_to_response(binding)
+        # The binding itself is the admission, so the hook runs for enabled
+        # and disabled bindings alike and never refuses the stored row.
+        assert host_registry is not None  # guaranteed by _canonical_binding_workspace
+        post_bind = await _run_post_bind_hook(
+            host_registry=host_registry,
+            host_id=host_id,
+            binding=binding,
+            repository=repository,
+        )
+        return {**_binding_to_response(binding), "post_bind": post_bind}
 
     @router.delete("/projects/{project_id}/hosts/{host_id}/bindings/{name}")
     async def delete_binding(
@@ -668,7 +760,7 @@ def create_project_collaboration_router(
         :param project_id: The project the binding belongs to.
         :param host_id: The bound host.
         :param name: The binding name.
-        :returns: The refreshed binding.
+        :returns: The refreshed binding plus the ``post_bind`` outcome object.
         :raises HTTPException: 404 when the feature is disabled.
         :raises OmnigentError: 401 if unauthenticated, 404 if the project
             or binding is not found / not owned, 409 when the host is
@@ -705,6 +797,22 @@ def create_project_collaboration_router(
                 "binding changed during verification; retry",
                 code=ErrorCode.CONFLICT,
             )
-        return _binding_to_response(refreshed)
+        assert host_registry is not None  # guaranteed by _canonical_binding_workspace
+        repository = await asyncio.to_thread(repository_store.get, refreshed.repository_id)
+        if repository is None:
+            # Store invariants make this unreachable; keep the response shape
+            # and surface the corruption instead of inventing a frame.
+            post_bind = _post_bind_result(
+                "failed",
+                error=f"repository {refreshed.repository_id!r} is not registered",
+            )
+        else:
+            post_bind = await _run_post_bind_hook(
+                host_registry=host_registry,
+                host_id=host_id,
+                binding=refreshed,
+                repository=repository,
+            )
+        return {**_binding_to_response(refreshed), "post_bind": post_bind}
 
     return router

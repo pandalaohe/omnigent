@@ -130,6 +130,8 @@ class HostFrameKind(str, Enum):
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_DONE = "host.import_local_done"
+    POST_BIND_HOOK = "host.post_bind_hook"
+    POST_BIND_HOOK_RESULT = "host.post_bind_hook_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -178,6 +180,7 @@ class HostHelloFrame:
     codex_rate_limits: _JsonObject | None = None
     filesystem_roots: bool = False
     assignments: bool = False
+    post_bind_hook: bool = False
 
 
 @dataclass
@@ -1185,6 +1188,61 @@ class HostImportLocalDoneFrame:
     failed: int = 0
 
 
+@dataclass
+class HostPostBindHookFrame:
+    """Server → host: run this host's own configured post-bind command.
+
+    Sent after a binding upsert or a successful re-verify. The command
+    comes from the host's startup config (``host.post_bind_command``), so
+    the server can never choose what runs.
+
+    :param request_id: Correlates the result, e.g. ``"req_pb_1"``.
+    :param project_id: The binding's project id.
+    :param binding_name: Binding name, e.g. ``"primary"``.
+    :param binding_id: Stored binding row id; a deleted and recreated binding
+        gets a new one, restarting its revision sequence.
+    :param revision: Stored binding revision; used to drop a request that
+        is older than one already started for the same binding.
+    :param repository_name: Registered repository name, e.g. ``"root"``.
+    :param workspace: Canonical bound directory on this host.
+    :param is_primary: Whether this binding is the host's primary.
+    :param context_manifest_path: Repo-relative manifest path, e.g.
+        ``".agents/project/manifest.json"``.
+    """
+
+    request_id: str
+    project_id: str
+    binding_name: str
+    binding_id: str
+    revision: int
+    repository_name: str
+    workspace: str
+    is_primary: bool
+    context_manifest_path: str
+
+
+@dataclass
+class HostPostBindHookResultFrame:
+    """Host → server: outcome of a ``host.post_bind_hook`` request.
+
+    :param request_id: Correlates to the
+        :class:`HostPostBindHookFrame`.
+    :param status: ``"ok"`` (exit 0), ``"failed"`` (non-zero exit, missing
+        executable, bad config or bad workspace), ``"timed_out"``,
+        ``"superseded"`` or ``"not_configured"``.
+    :param exit_code: Child exit status when one was observed, else ``None``.
+    :param output: Last 2000 characters of the child's combined output, or
+        ``None`` when nothing ran.
+    :param error: Failure detail, ``None`` when the run succeeded.
+    """
+
+    request_id: str
+    status: str
+    exit_code: int | None = None
+    output: str | None = None
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostConnectionErrorFrame
@@ -1228,6 +1286,8 @@ HostFrame = (
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
     | HostImportLocalDoneFrame
+    | HostPostBindHookFrame
+    | HostPostBindHookResultFrame
 )
 
 
@@ -1283,6 +1343,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "codex_rate_limits": frame.codex_rate_limits,
                 "filesystem_roots": frame.filesystem_roots,
                 "assignments": frame.assignments,
+                "post_bind_hook": frame.post_bind_hook,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1713,6 +1774,32 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "failed": frame.failed,
             }
         )
+    if isinstance(frame, HostPostBindHookFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.POST_BIND_HOOK.value,
+                "request_id": frame.request_id,
+                "project_id": frame.project_id,
+                "binding_name": frame.binding_name,
+                "binding_id": frame.binding_id,
+                "revision": frame.revision,
+                "repository_name": frame.repository_name,
+                "workspace": frame.workspace,
+                "is_primary": frame.is_primary,
+                "context_manifest_path": frame.context_manifest_path,
+            }
+        )
+    if isinstance(frame, HostPostBindHookResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.POST_BIND_HOOK_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "exit_code": frame.exit_code,
+                "output": frame.output,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -1863,6 +1950,10 @@ def _decode_known_host_frame(
             return _decode_import_local_session(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
+        case HostFrameKind.POST_BIND_HOOK:
+            return _decode_post_bind_hook(msg)
+        case HostFrameKind.POST_BIND_HOOK_RESULT:
+            return _decode_post_bind_hook_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -1891,6 +1982,9 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
             _required_bool(msg, "filesystem_roots") if "filesystem_roots" in msg else False
         ),
         assignments=(_required_bool(msg, "assignments") if "assignments" in msg else False),
+        post_bind_hook=(
+            _required_bool(msg, "post_bind_hook") if "post_bind_hook" in msg else False
+        ),
     )
 
 
@@ -2577,6 +2671,35 @@ def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
         error=_optional_nullable_str(msg, "error"),
         # Absent on older hosts; default to 0 so decode stays backward-compatible.
         failed=raw_failed if isinstance(raw_failed := msg.get("failed"), int) else 0,
+    )
+
+
+def _decode_post_bind_hook(msg: _JsonObject) -> HostPostBindHookFrame:
+    """Decode a host.post_bind_hook request frame."""
+    return HostPostBindHookFrame(
+        request_id=_required_str(msg, "request_id"),
+        project_id=_required_str(msg, "project_id"),
+        binding_name=_required_str(msg, "binding_name"),
+        binding_id=_required_str(msg, "binding_id"),
+        revision=_required_int(msg, "revision"),
+        repository_name=_required_str(msg, "repository_name"),
+        workspace=_required_str(msg, "workspace"),
+        is_primary=_required_bool(msg, "is_primary"),
+        context_manifest_path=_required_str(msg, "context_manifest_path"),
+    )
+
+
+def _decode_post_bind_hook_result(msg: _JsonObject) -> HostPostBindHookResultFrame:
+    """Decode a host.post_bind_hook_result frame."""
+    exit_code = msg.get("exit_code")
+    if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
+        raise ValueError("frame field must be an int or null: 'exit_code'")
+    return HostPostBindHookResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        exit_code=exit_code,
+        output=_optional_nullable_str(msg, "output"),
+        error=_optional_nullable_str(msg, "error"),
     )
 
 

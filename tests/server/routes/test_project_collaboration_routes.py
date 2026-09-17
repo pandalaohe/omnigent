@@ -25,6 +25,8 @@ from fastapi import FastAPI
 
 from omnigent.host.frames import (
     HostHelloFrame,
+    HostPostBindHookFrame,
+    HostPostBindHookResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     decode_host_frame,
@@ -55,6 +57,7 @@ BOB = "bob@example.com"
 _HOST_A = "a1b2c3d4e5f60718293a4b5c6d7e8f01"
 _HOST_B = "b1b2c3d4e5f60718293a4b5c6d7e8f02"
 _HOST_OFFLINE = "c1b2c3d4e5f60718293a4b5c6d7e8f03"
+_HOST_HOOKED = "d1b2c3d4e5f60718293a4b5c6d7e8f04"
 
 
 def _as_user(user: str) -> dict[str, str]:
@@ -78,10 +81,15 @@ def _websocket_scope(path: str) -> dict[str, object]:
     }
 
 
-def _hello_text(name: str) -> str:
+def _hello_text(name: str, *, post_bind_hook: bool = False) -> str:
     """Encode a hello frame for tests."""
     return encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name=name)
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name=name,
+            post_bind_hook=post_bind_hook,
+        )
     )
 
 
@@ -173,13 +181,17 @@ async def _make_project(
     return resp.json()["id"]
 
 
-async def _connect_fake_host(app: FastAPI, host_id: str, name: str) -> ApplicationCommunicator:
+async def _connect_fake_host(
+    app: FastAPI, host_id: str, name: str, *, post_bind_hook: bool = False
+) -> ApplicationCommunicator:
     """Open a tunnel and complete the hello handshake."""
     comm = ApplicationCommunicator(app, _websocket_scope(f"/v1/hosts/{host_id}/tunnel"))
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=5.0)
     assert accepted["type"] == "websocket.accept"
-    await comm.send_input({"type": "websocket.receive", "text": _hello_text(name)})
+    await comm.send_input(
+        {"type": "websocket.receive", "text": _hello_text(name, post_bind_hook=post_bind_hook)}
+    )
     registry = app.state.host_registry
     for _ in range(500):
         if registry.get(host_id) is not None:
@@ -190,9 +202,16 @@ async def _connect_fake_host(app: FastAPI, host_id: str, name: str) -> Applicati
 
 
 def _start_stat_drain(
-    comm: ApplicationCommunicator, replies: dict[str, dict[str, Any]]
+    comm: ApplicationCommunicator,
+    replies: dict[str, dict[str, Any]],
+    hooks: dict[str, Any] | None = None,
 ) -> asyncio.Task[None]:
     """Answer outbound ``host.stat`` frames from the registered replies.
+
+    When *hooks* is given, ``host.post_bind_hook`` frames are also answered
+    from ``hooks["replies"][binding_name]`` (default ``status="ok"``) and
+    appended to ``hooks["seen"]``; ``hooks["drop"] = True`` leaves them
+    unanswered so a test can exercise the server's wait.
 
     The receive timeout is deliberately long: asgiref cancels the served
     application task when a ``receive_output`` timeout fires, so a short
@@ -212,6 +231,18 @@ def _start_stat_drain(
             if not isinstance(text, str):
                 continue
             frame = decode_host_frame(text)
+            if isinstance(frame, HostPostBindHookFrame):
+                if hooks is None:
+                    continue
+                hooks["seen"].append(frame)
+                if hooks["drop"]:
+                    continue
+                reply = hooks["replies"].get(frame.binding_name, {"status": "ok", "exit_code": 0})
+                result = HostPostBindHookResultFrame(request_id=frame.request_id, **reply)
+                await comm.send_input(
+                    {"type": "websocket.receive", "text": encode_host_frame(result)}
+                )
+                continue
             if not isinstance(frame, HostStatFrame):
                 continue
             reply = replies.get(frame.path)
@@ -258,6 +289,33 @@ async def live_host(
     drain_task = _start_stat_drain(comm, replies)
     try:
         yield {"host_id": _HOST_A, "replies": replies, "app": collab_app}
+    finally:
+        await _stop_fake_host(comm, drain_task)
+
+
+@pytest_asyncio.fixture()
+async def hooked_host(
+    collab_app: FastAPI,
+) -> AsyncIterator[dict[str, Any]]:
+    """Connect a fake host that advertises and answers ``host.post_bind_hook``.
+
+    Tests register per-binding hook results as
+    ``hooks["replies"][binding_name]`` dicts with the
+    ``HostPostBindHookResultFrame`` fields; a missing entry answers
+    ``status="ok"``. Every received frame is appended to ``hooks["seen"]``,
+    and ``hooks["drop"] = True`` leaves hook frames unanswered.
+    """
+    comm = await _connect_fake_host(collab_app, _HOST_HOOKED, "fake-hooked", post_bind_hook=True)
+    replies: dict[str, dict[str, Any]] = {}
+    hooks: dict[str, Any] = {"replies": {}, "seen": [], "drop": False}
+    drain_task = _start_stat_drain(comm, replies, hooks=hooks)
+    try:
+        yield {
+            "host_id": _HOST_HOOKED,
+            "replies": replies,
+            "hooks": hooks,
+            "app": collab_app,
+        }
     finally:
         await _stop_fake_host(comm, drain_task)
 
@@ -1008,3 +1066,227 @@ async def test_verify_failure_leaves_row_unchanged(
     assert after["workspace"] == before["workspace"]
     assert after["path_verified_at"] == before["path_verified_at"]
     assert after["revision"] == before["revision"]
+
+
+# ── Post-bind hook (live host) ────────────────────────────
+
+
+async def _put_binding(
+    client: httpx.AsyncClient,
+    host_id: str,
+    project_id: str,
+    *,
+    workspace: str = "/data/work",
+    name: str = "primary",
+    enabled: bool = True,
+) -> httpx.Response:
+    """PUT a binding for the registered ``root`` repository."""
+    return await client.put(
+        f"/v1/projects/{project_id}/hosts/{host_id}/bindings/{name}",
+        json={
+            "workspace": workspace,
+            "repository_name": "root",
+            "is_primary": True,
+            "enabled": enabled,
+        },
+    )
+
+
+async def test_binding_put_legacy_host_unsupported(
+    collab_client: httpx.AsyncClient,
+    live_host: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hello without post_bind_hook answers unsupported and sends no frame."""
+    # A short server wait makes an accidental send fail as ``unreachable``
+    # instead of hanging the test, so this stays a real no-frame assertion.
+    monkeypatch.setattr(
+        "omnigent.server.routes.project_collaboration._POST_BIND_HOOK_TIMEOUT_S", 0.1
+    )
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    live_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+
+    resp = await _put_binding(collab_client, live_host["host_id"], project_id)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["post_bind"] == {
+        "status": "unsupported",
+        "exit_code": None,
+        "output": None,
+        "error": None,
+    }
+    config = (await collab_client.get(f"/v1/projects/{project_id}/collaboration")).json()
+    assert [b["name"] for b in config["bindings"]] == ["primary"]
+
+
+async def test_binding_put_post_bind_runs_for_disabled_binding(
+    collab_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """The hook runs for a disabled binding and its result rides the response."""
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    hooked_host["hooks"]["replies"]["primary"] = {
+        "status": "ok",
+        "exit_code": 0,
+        "output": "joined",
+    }
+
+    resp = await _put_binding(collab_client, hooked_host["host_id"], project_id, enabled=False)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["enabled"] is False
+    assert body["post_bind"] == {
+        "status": "ok",
+        "exit_code": 0,
+        "output": "joined",
+        "error": None,
+    }
+    frames = hooked_host["hooks"]["seen"]
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame.project_id == project_id
+    assert frame.binding_name == "primary"
+    assert frame.revision == body["revision"]
+    assert frame.binding_id == body["id"]
+    assert frame.repository_name == "root"
+    assert frame.workspace == "/data/work"
+    assert frame.is_primary is True
+    assert frame.context_manifest_path == ".agents/project/manifest.json"
+
+
+async def test_binding_put_post_bind_failure_is_carried_back(
+    collab_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """A failing command reports its exit code and output without refusing."""
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    hooked_host["hooks"]["replies"]["primary"] = {
+        "status": "failed",
+        "exit_code": 3,
+        "output": "hook exploded",
+        "error": "command exited 3",
+    }
+
+    resp = await _put_binding(collab_client, hooked_host["host_id"], project_id)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["post_bind"] == {
+        "status": "failed",
+        "exit_code": 3,
+        "output": "hook exploded",
+        "error": "command exited 3",
+    }
+    config = (await collab_client.get(f"/v1/projects/{project_id}/collaboration")).json()
+    assert [b["name"] for b in config["bindings"]] == ["primary"]
+
+
+async def test_binding_put_post_bind_unreachable_without_an_answer(
+    collab_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that never answers costs the bounded wait; the row is stored."""
+    monkeypatch.setattr(
+        "omnigent.server.routes.project_collaboration._POST_BIND_HOOK_TIMEOUT_S", 0.1
+    )
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    hooked_host["hooks"]["drop"] = True
+
+    resp = await _put_binding(collab_client, hooked_host["host_id"], project_id)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["post_bind"] == {
+        "status": "unreachable",
+        "exit_code": None,
+        "output": None,
+        "error": None,
+    }
+    assert body["revision"] == 1
+    config = (await collab_client.get(f"/v1/projects/{project_id}/collaboration")).json()
+    assert [b["name"] for b in config["bindings"]] == ["primary"]
+
+
+async def test_verify_post_bind_reruns_with_stored_revision(
+    collab_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """Verify re-runs the hook with the stored binding revision."""
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    created = await _put_binding(collab_client, hooked_host["host_id"], project_id)
+    assert created.status_code == 200, created.text
+
+    verified = await collab_client.post(
+        f"/v1/projects/{project_id}/hosts/{hooked_host['host_id']}/bindings/primary/verify"
+    )
+
+    assert verified.status_code == 200, verified.text
+    body = verified.json()
+    assert body["post_bind"]["status"] == "ok"
+    frames = hooked_host["hooks"]["seen"]
+    assert len(frames) == 2
+    assert frames[1].revision == body["revision"] == created.json()["revision"]
+    assert frames[1].binding_id == body["id"]
+    assert frames[1].binding_name == "primary"
+
+
+async def test_binding_delete_sends_no_post_bind_frame(
+    collab_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """DELETE runs no hook; only the PUT's frame was ever sent."""
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    created = await _put_binding(collab_client, hooked_host["host_id"], project_id)
+    assert created.status_code == 200, created.text
+    assert len(hooked_host["hooks"]["seen"]) == 1
+
+    deleted = await collab_client.delete(
+        f"/v1/projects/{project_id}/hosts/{hooked_host['host_id']}/bindings/primary"
+    )
+
+    assert deleted.status_code == 200, deleted.text
+    await asyncio.sleep(0.05)
+    assert len(hooked_host["hooks"]["seen"]) == 1
