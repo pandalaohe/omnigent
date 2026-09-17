@@ -23,6 +23,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFrameKind,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
@@ -44,6 +45,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPostBindHookFrame,
+    HostPostBindHookResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -1992,3 +1995,121 @@ def test_assignment_release_result_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostAssignmentReleaseResultFrame)
     assert decoded == original
+
+
+def test_post_bind_hook_frame_kinds_are_wire_stable() -> None:
+    """The two hook kinds keep the wire strings older/newer peers agree on."""
+    assert HostFrameKind.POST_BIND_HOOK.value == "host.post_bind_hook"
+    assert HostFrameKind.POST_BIND_HOOK_RESULT.value == "host.post_bind_hook_result"
+
+
+def test_post_bind_hook_frame_round_trip() -> None:
+    """A hook request survives encode → decode with the binding revision."""
+    original = HostPostBindHookFrame(
+        request_id="req_pb_1",
+        project_id="proj_abc",
+        binding_name="primary",
+        binding_id="bind_abc",
+        revision=4,
+        repository_name="root",
+        workspace="/Users/alice/myrepo",
+        is_primary=True,
+        context_manifest_path=".agents/project/manifest.json",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostPostBindHookFrame)
+    assert decoded == original
+
+
+def test_post_bind_hook_frame_missing_revision_raises() -> None:
+    """A hook request without a revision is rejected, not defaulted."""
+    encoded = encode_host_frame(
+        HostPostBindHookFrame(
+            request_id="req_pb_2",
+            project_id="proj_abc",
+            binding_name="primary",
+            binding_id="bind_abc",
+            revision=1,
+            repository_name="root",
+            workspace="/Users/alice/myrepo",
+            is_primary=False,
+            context_manifest_path=".agents/project/manifest.json",
+        )
+    )
+    msg = json.loads(encoded)
+    del msg["revision"]
+    with pytest.raises(ValueError, match="revision"):
+        decode_host_frame(json.dumps(msg))
+
+
+def test_post_bind_hook_result_frame_round_trip() -> None:
+    """A completed hook result carries the exit code and output tail."""
+    original = HostPostBindHookResultFrame(
+        request_id="req_pb_1",
+        status="failed",
+        exit_code=3,
+        output="hook output",
+        error="command exited 3",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostPostBindHookResultFrame)
+    assert decoded == original
+
+
+def test_post_bind_hook_result_frame_timeout_round_trip() -> None:
+    """A timed-out result has no exit code and still round-trips."""
+    original = HostPostBindHookResultFrame(
+        request_id="req_pb_3",
+        status="timed_out",
+        output="partial output",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostPostBindHookResultFrame)
+    assert decoded == original
+
+
+def test_hello_frame_post_bind_hook_round_trip() -> None:
+    """The post-bind capability survives encode → decode."""
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="laptop",
+        post_bind_hook=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.post_bind_hook is True
+
+
+def test_hello_frame_omitted_post_bind_hook_is_legacy_false() -> None:
+    """An older host that omits the capability never receives hook frames."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "older-host",
+                "runners": [],
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.post_bind_hook is False
+
+
+def test_hello_frame_post_bind_hook_requires_boolean() -> None:
+    """Capability metadata must fail closed instead of coercing strings."""
+    with pytest.raises(ValueError, match="post_bind_hook"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.hello",
+                    "version": "0.1.0",
+                    "frame_protocol_version": 1,
+                    "name": "invalid-host",
+                    "runners": [],
+                    "post_bind_hook": "true",
+                }
+            )
+        )

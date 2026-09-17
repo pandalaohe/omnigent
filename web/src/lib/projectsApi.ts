@@ -160,6 +160,17 @@ export interface ProjectRepository {
   updated_at: number | null;
 }
 
+/**
+ * Outcome of the host's post-bind hook on a binding PUT/verify. Response-only
+ * (never persisted), and absent entirely on servers that predate the hook.
+ */
+export interface PostBindResult {
+  status: string;
+  exit_code: number | null;
+  output: string | null;
+  error: string | null;
+}
+
 /** A per-host directory binding of a collaboration project. */
 export interface ProjectHostBinding {
   id: string;
@@ -174,6 +185,8 @@ export interface ProjectHostBinding {
   path_verified_at: number | null;
   created_at: number;
   updated_at: number | null;
+  /** Hook outcome from the PUT/verify that returned this binding, if any. */
+  post_bind?: PostBindResult;
 }
 
 /** Machine-readable collaboration config problem. */

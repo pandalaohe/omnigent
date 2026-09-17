@@ -46,6 +46,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostModelOptionsResultFrame,
+    HostPostBindHookResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -654,6 +655,19 @@ async def _receive_loop(
                         "exists": frame.exists,
                         "type": frame.type,
                         "canonical_path": frame.canonical_path,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostPostBindHookResultFrame):
+            hook_future = conn.pending_post_bind_hooks.pop(frame.request_id, None)
+            if hook_future is not None and not hook_future.done():
+                hook_future.set_result(
+                    {
+                        "status": frame.status,
+                        "exit_code": frame.exit_code,
+                        "output": frame.output,
                         "error": frame.error,
                     }
                 )

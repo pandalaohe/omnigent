@@ -268,6 +268,10 @@ class HostConnection:
         in-flight ``host.assignment_release`` requests. Resolved when
         the host sends ``host.assignment_release_result``. Values
         carry ``status``, ``removed`` and ``failures``.
+    :param pending_post_bind_hooks: Per-``request_id`` futures for
+        in-flight ``host.post_bind_hook`` requests. Resolved when the
+        host sends ``host.post_bind_hook_result``. Values carry
+        ``status``, ``exit_code``, ``output`` and ``error``.
     """
 
     workspace_id: int
@@ -328,6 +332,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_assignment_releases: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_post_bind_hooks: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     # Import streams one session per frame, so the tunnel pushes each onto a

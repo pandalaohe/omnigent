@@ -70,6 +70,24 @@ function repo(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function binding(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "b_1",
+    project_id: "p_1",
+    host_id: "h1",
+    name: "primary",
+    is_primary: true,
+    repository_id: "r_1",
+    workspace: "/repo",
+    enabled: true,
+    revision: 1,
+    path_verified_at: 1,
+    created_at: 1,
+    updated_at: null,
+    ...overrides,
+  };
+}
+
 function renderSection() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -209,6 +227,95 @@ describe("ProjectCollaborationSection", () => {
     // Host select option + the binding's host group header.
     expect(screen.getAllByText("Laptop")).toHaveLength(2);
     expect(screen.getByText("web · /repo")).toBeInTheDocument();
+  });
+
+  it("warns with exit code and output when the post-bind command fails", async () => {
+    const added = binding({
+      post_bind: { status: "failed", exit_code: 3, output: "boom", error: null },
+    });
+    // The initial read has no bindings; the refetch after the add returns the
+    // new binding, so a failing hook can never hide the stored row.
+    getMock
+      .mockResolvedValueOnce(collaboration({ repositories: [repo()] }))
+      .mockResolvedValue(collaboration({ repositories: [repo()], bindings: [added] }));
+    putBindingMock.mockResolvedValue(added);
+    renderSection();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-binding-add")).toBeInTheDocument(),
+    );
+
+    fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
+      target: { value: "/repo" },
+    });
+    fireEvent.submit(screen.getByTestId("project-collaboration-binding-add").closest("form")!);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-hook-warning")).toHaveTextContent(
+        /Binding saved; post-bind command failed/,
+      ),
+    );
+    const warning = screen.getByTestId("project-collaboration-hook-warning");
+    expect(warning).toHaveTextContent("exit code 3");
+    expect(warning).toHaveTextContent("boom");
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("project-collaboration-binding-verify-h1-primary"),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("shows no warning when the host has no post-bind command configured", async () => {
+    const added = binding({
+      post_bind: { status: "not_configured", exit_code: null, output: null, error: null },
+    });
+    getMock
+      .mockResolvedValueOnce(collaboration({ repositories: [repo()] }))
+      .mockResolvedValue(collaboration({ repositories: [repo()], bindings: [added] }));
+    putBindingMock.mockResolvedValue(added);
+    renderSection();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-binding-add")).toBeInTheDocument(),
+    );
+
+    fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
+      target: { value: "/repo" },
+    });
+    fireEvent.submit(screen.getByTestId("project-collaboration-binding-add").closest("form")!);
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("project-collaboration-binding-verify-h1-primary"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("project-collaboration-hook-warning")).not.toBeInTheDocument();
+  });
+
+  it("shows the post-bind error when verify reports the host unreachable", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    vi.mocked(verifyProjectHostBinding).mockResolvedValue(
+      binding({
+        post_bind: {
+          status: "unreachable",
+          exit_code: null,
+          output: null,
+          error: "no live connection to the host",
+        },
+      }),
+    );
+    renderSection();
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("project-collaboration-binding-verify-h1-primary"),
+      ).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("project-collaboration-binding-verify-h1-primary"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-hook-warning")).toHaveTextContent(
+        "no live connection to the host",
+      ),
+    );
   });
 
   it("disables the repository form while the add is pending", async () => {

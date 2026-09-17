@@ -56,6 +56,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPostBindHookFrame,
+    HostPostBindHookResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -6512,3 +6514,86 @@ async def test_hello_advertises_assignments_capability() -> None:
     hello = decode_host_frame(tunnel.sent[0])
     assert isinstance(hello, HostHelloFrame)
     assert hello.assignments is True
+    assert hello.post_bind_hook is True
+
+
+# ── host.post_bind_hook dispatch ──────────────────────────
+
+
+def _post_bind_hook_frame() -> HostPostBindHookFrame:
+    """Build a post-bind hook request for the dispatch tests."""
+    return HostPostBindHookFrame(
+        request_id="req_pb_9",
+        project_id="proj_1",
+        binding_name="primary",
+        binding_id="bind_1",
+        revision=2,
+        repository_name="root",
+        workspace="/Users/alice/myrepo",
+        is_primary=True,
+        context_manifest_path=".agents/project/manifest.json",
+    )
+
+
+def test_host_process_receives_the_startup_config_path(tmp_path: Path) -> None:
+    """The hook reads the config the daemon was started with, not a default."""
+    identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
+    config = tmp_path / "alt.yaml"
+
+    host = HostProcess(identity, "http://localhost:8000", config_path=config)
+
+    assert host._post_bind_hook_runner._config_path == config
+    _cleanup_host(host)
+
+
+async def test_dispatch_post_bind_hook_replies_with_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-bind dispatch branch answers with the runner's result frame."""
+    host = _make_host_process()
+    seen: dict[str, object] = {}
+
+    def _fake_run(frame: HostPostBindHookFrame) -> HostPostBindHookResultFrame:
+        seen["frame"] = frame
+        return HostPostBindHookResultFrame(
+            request_id=frame.request_id, status="ok", exit_code=0, output="hook ran"
+        )
+
+    monkeypatch.setattr(host._post_bind_hook_runner, "run", _fake_run)
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(ws, _post_bind_hook_frame())  # type: ignore[arg-type]
+
+    assert seen["frame"] == _post_bind_hook_frame()
+    assert len(ws.sent) == 1
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostPostBindHookResultFrame)
+    assert result.request_id == "req_pb_9"
+    assert result.status == "ok"
+    assert result.exit_code == 0
+    assert host._owned_subprocess_ops == 0
+    _cleanup_host(host)
+
+
+async def test_dispatch_post_bind_hook_crash_still_answers_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected hook exception answers failed, never silence."""
+    host = _make_host_process()
+
+    def _boom(frame: HostPostBindHookFrame) -> HostPostBindHookResultFrame:
+        raise RuntimeError("hook on fire")
+
+    monkeypatch.setattr(host._post_bind_hook_runner, "run", _boom)
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(ws, _post_bind_hook_frame())  # type: ignore[arg-type]
+
+    assert len(ws.sent) == 1
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostPostBindHookResultFrame)
+    assert result.request_id == "req_pb_9"
+    assert result.status == "failed"
+    assert "hook on fire" in (result.error or "")
+    assert host._owned_subprocess_ops == 0
+    _cleanup_host(host)
