@@ -364,7 +364,9 @@ describe("useSessionPollingHotkeys", () => {
 
     act(() => window.dispatchEvent(new Event(ARCHIVE_SESSION_ACTION_EVENT)));
 
-    await waitFor(() => expect(onArchive).toHaveBeenCalledWith(expect.objectContaining({ id: "active" })));
+    await waitFor(() =>
+      expect(onArchive).toHaveBeenCalledWith(expect.objectContaining({ id: "active" })),
+    );
     expect(navigate).toHaveBeenLastCalledWith("/c/recent", { replace: true });
   });
 
@@ -382,7 +384,9 @@ describe("useSessionPollingHotkeys", () => {
 
     act(() => window.dispatchEvent(new Event(ARCHIVE_SESSION_ACTION_EVENT)));
 
-    await waitFor(() => expect(onArchive).toHaveBeenCalledWith(expect.objectContaining({ id: "a" })));
+    await waitFor(() =>
+      expect(onArchive).toHaveBeenCalledWith(expect.objectContaining({ id: "a" })),
+    );
     expect(navigate).toHaveBeenLastCalledWith("/c/c", { replace: true });
   });
 
@@ -406,7 +410,9 @@ describe("useSessionPollingHotkeys", () => {
       await pendingRows.promise;
     });
 
-    await waitFor(() => expect(onArchive).toHaveBeenCalledWith(expect.objectContaining({ id: "archive-a" })));
+    await waitFor(() =>
+      expect(onArchive).toHaveBeenCalledWith(expect.objectContaining({ id: "archive-a" })),
+    );
     expect(navigate).not.toHaveBeenCalled();
   });
 });

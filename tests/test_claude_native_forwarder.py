@@ -13912,6 +13912,8 @@ async def test_batched_child_items_preserve_replay_and_terminal_truth(
         assert result.subagents["batch-child"].last_activity_ts is None
     else:
         assert statuses == [{"status": "running"}]
+
+
 # ── /btw side-chat overlay relay ───────────────────────────────────
 
 

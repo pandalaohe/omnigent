@@ -80,7 +80,6 @@ describe("buildHostFilesystemUrl", () => {
       "/v1/hosts/host_abc/filesystem?path=C%3A%2FUsers%2Falice%2Fwork",
     );
   });
-
 });
 
 // ---------------------------------------------------------------------------

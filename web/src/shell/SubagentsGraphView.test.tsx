@@ -165,9 +165,7 @@ describe("childActivity", () => {
   });
 
   it("returns activity unverified without a working spinner", () => {
-    const result = childActivity(
-      childInfo({ id: "x", busy: false, activity_unverified: true }),
-    );
+    const result = childActivity(childInfo({ id: "x", busy: false, activity_unverified: true }));
     expect(result).toEqual({ activity: "unverified", label: "Activity unverified" });
   });
 

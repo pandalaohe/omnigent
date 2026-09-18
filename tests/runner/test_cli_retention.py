@@ -474,7 +474,7 @@ async def test_runner_idle_release_cleans_up_when_pane_vanished_first() -> None:
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(process_manager=pm, server_client=NullServerClient())  # type: ignore[arg-type]
     reaper = NativePaneReaper(
-        list_native_panes=lambda: [],
+        list_native_panes=list,
         is_busy=_never_busy,
         reap=_never_reap,
     )

@@ -103,8 +103,11 @@ def test_deletion_claim_migration_round_trips_and_rebuilds_lock_mirror(tmp_path:
     command.upgrade(config, "head")
     engine = sa.create_engine(uri)
     with engine.connect() as connection:
-        assert connection.scalar(
-            sa.text("SELECT archive_locked FROM conversations WHERE id = :id"),
-            {"id": conversation_id},
-        ) == 1
+        assert (
+            connection.scalar(
+                sa.text("SELECT archive_locked FROM conversations WHERE id = :id"),
+                {"id": conversation_id},
+            )
+            == 1
+        )
     engine.dispose()

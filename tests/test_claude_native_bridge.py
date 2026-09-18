@@ -10782,6 +10782,8 @@ def test_read_transcript_items_ignores_goal_like_prose(tmp_path: Path) -> None:
     )
     assert result.goal_state_observed is False
     assert result.latest_goal_state is None
+
+
 # ── /btw side-chat overlay parsing ─────────────────────────────────
 
 _BTW_BORDER = "▔" * 120
