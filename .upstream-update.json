@@ -1,0 +1,81 @@
+{
+  "schema_version": 2,
+  "branches": {
+    "custom": "local/host-custom",
+    "never_gc": [
+      "local/host-custom",
+      "merge/upstream-7a8846b26",
+      "feature/manifest-identity-id",
+      "feature/post-bind-hook",
+      "feature/project-assignments",
+      "fix/custom-realign-identity",
+      "fix/custom-realign-py"
+    ],
+    "managed_backup_prefixes": [
+      "backup/"
+    ]
+  },
+  "worktree": {
+    "tracked_dirty": "block",
+    "untracked": "report",
+    "incoming_collision": "block"
+  },
+  "verify": {
+    "steps": [
+      {
+        "id": "lint-all",
+        "cwd": ".",
+        "argv": ["just", "lint-all"],
+        "required": true,
+        "timeout_s": 900,
+        "expect": "exit0"
+      },
+      {
+        "id": "typecheck-python",
+        "cwd": ".",
+        "argv": ["just", "typecheck-python"],
+        "required": true,
+        "timeout_s": 900,
+        "expect": "exit0"
+      },
+      {
+        "id": "lint-ts",
+        "cwd": ".",
+        "argv": ["just", "lint-ts"],
+        "required": true,
+        "timeout_s": 1800,
+        "expect": "exit0"
+      },
+      {
+        "id": "pytest",
+        "cwd": ".",
+        "argv": ["uv", "run", "--no-sync", "pytest"],
+        "required": true,
+        "timeout_s": 3600,
+        "expect": "exit0"
+      }
+    ]
+  },
+  "gc": {
+    "enabled": false,
+    "require_verified_merged": true,
+    "require_head_oid_match": true
+  },
+  "deployment": {
+    "executor": "human-only",
+    "steps": [
+      {
+        "id": "release-custom",
+        "run": "bash infra/server/gen-release.sh   # from the coordination root that holds this fork; full procedure in infra/server/RUNBOOK.md",
+        "cwd": "..",
+        "expected_observations": [
+          "the release batch is approved by the user before any push, build or cutover",
+          "content scan of origin/local/host-custom..local/host-custom is clean (scripts/custom-push-scan.sh)",
+          "cutover prints CUTOVER_READY and COUNTS_PRESERVED; a migrating release also prints REHEARSAL_OK",
+          "parity: host CLI version, fn container image revision label and the origin head of local/host-custom agree",
+          "the released commit carries a release/<image-tag> tag pushed with that batch"
+        ]
+      }
+    ]
+  }
+}
