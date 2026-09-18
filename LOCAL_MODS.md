@@ -1,3 +1,7 @@
+> FROZEN 2026-09-18 — the ledger moved to the coordination root's `local_mods/`; this file is evidence only.
+> Nothing writes here any more. The live record is one JSON file per MOD, outside this repository, and a
+> row's id is its MOD's id lowercased: `S01-mobile-terminal-ime` → `MOD-s01-mobile-terminal-ime`.
+
 # LOCAL_MODS — pandalaohe/omnigent `local/host-custom`
 
 > Fork: pandalaohe/omnigent (running branch `local/host-custom`)
