@@ -1657,9 +1657,15 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        peer_sweeper = getattr(app_inst.state, "peer_sweeper", None)
+        if peer_sweeper is not None:
+            await peer_sweeper.start(app_inst)
+
         try:
             yield
         finally:
+            if peer_sweeper is not None:
+                await peer_sweeper.shutdown()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
@@ -3033,6 +3039,7 @@ def create_app(
             background_title_coordinator=background_title_coordinator,
             feature_flags=resolved_feature_flags,
             peer_message_store=peer_message_store,
+            app_state=app.state,
         ),
         prefix="/v1",
         tags=["sessions"],

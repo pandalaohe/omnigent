@@ -810,6 +810,7 @@ def create_sessions_router(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     feature_flags: FeatureFlags | None = None,
     peer_message_store: PeerMessageStore | None = None,
+    app_state: Any | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -877,6 +878,10 @@ def create_sessions_router(
     :param background_title_coordinator: Optional app-owned coordinator for
         semantic title generation after first-turn forwarding. ``None`` disables
         background titles in focused router tests.
+    :param app_state: The owning FastAPI app's ``.state``, threaded to
+        ``register_peer_routes`` so it can stash the constructed peer
+        sweeper for the lifespan to start/stop. ``None`` in routers built
+        without a host app (focused tests).
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -974,6 +979,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         feature_flags=feature_flags,
         peer_message_store=peer_message_store,
+        app_state=app_state,
     )
 
     register_permissions_routes(

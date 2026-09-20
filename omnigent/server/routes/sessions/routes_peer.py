@@ -239,6 +239,42 @@ _PEER_ADMISSION = _PeerAdmission()
 _POST_EVENT_IMPL_OVERRIDE: PostEventImpl | None = None
 _LIVENESS_OVERRIDE: Callable[[list[str]], dict[str, SessionLiveness]] | None = None
 
+# "Not given" sentinel for the shared ``_deliver`` helper's acting-user
+# override — the inline send route omits it (its ambient request already
+# carries the sender's own auth); the sweeper always passes one.
+_ACTING_USER_ID_NOT_GIVEN: Any = object()
+
+
+def format_peer_back_notice(
+    *,
+    peer_id: str,
+    receiver_session_id: str,
+    receiver_title: str | None,
+    state: str,
+    reason: str | None,
+) -> str:
+    """Render one back-notice line for a sweeper/action-route transition.
+
+    Several notices to the same sender, generated while it is mid-turn,
+    batch into one message (newline-joined lines in this exact format).
+
+    :param peer_id: The record's id.
+    :param receiver_session_id: The receiving session's id.
+    :param receiver_title: The receiver's stored title, or ``None``/empty
+        to fall back to its id.
+    :param state: The transition's terminal state (``delivered`` /
+        ``failed`` / ``expired`` / ``refused_by_user``).
+    :param reason: The disposition reason; rendered only when truthy.
+    :returns: One ``[System: ...]`` line.
+    """
+    title = title_without_closed_marker(receiver_title) or receiver_session_id
+    title = title.replace('"', "'")
+    suffix = f" ({reason})" if reason else ""
+    return (
+        f"[System: peer message {peer_id} to session {receiver_session_id} "
+        f'"{title}" {state}{suffix}]'
+    )
+
 
 class PeerSendRequest(BaseModel):
     """Body of ``POST /sessions/{receiver_id}/peer-messages``."""
@@ -362,6 +398,7 @@ def register_peer_routes(
     host_store: HostStore | None = None,
     agent_cache: AgentCache | None = None,
     notify_sender: Callable[..., Any] | None = None,
+    app_state: Any | None = None,
 ) -> None:
     """Register the peer-messaging routes on the sessions router.
 
@@ -381,8 +418,14 @@ def register_peer_routes(
     :param file_store: Unused; reserved for the sweeper's shared signature.
     :param host_store: Unused; reserved for the sweeper's shared signature.
     :param agent_cache: Unused; reserved for dispatch parity.
-    :param notify_sender: T3 back-notice hook; no-op until the sweeper
-        lands.
+    :param notify_sender: Unused; the sweeper owns back-notice delivery
+        directly (see ``app_state.peer_sweeper``), not this hook.
+    :param app_state: The owning FastAPI app's ``.state``, or ``None``.
+        When the flag is on and a store is configured, the constructed
+        :class:`~omnigent.server.peer_sweeper.PeerSweeper` is stashed on
+        ``app_state.peer_sweeper`` for the lifespan to start/stop; ``None``
+        input skips the stash (routers built for focused tests without a
+        host app), and a disabled/unconfigured setup stashes ``None``.
     """
     del file_store, host_store, agent_cache, notify_sender
     flags = feature_flags if feature_flags is not None else resolve_feature_flags()
@@ -434,6 +477,118 @@ def register_peer_routes(
     def _new_record_id(correlation_id: str | None) -> str:
         del correlation_id
         return secrets.token_hex(16)
+
+    async def _true_state(conv: Conversation) -> tuple[str, bool | None]:
+        """Return a session's true state and runner_online (D6/D7 table).
+
+        ``state`` is one of ``offline`` / ``not_ready`` / ``busy`` /
+        ``idle``. A native session gets one readiness probe per call; an
+        SDK session is always ready. Shared by the send route (receiver)
+        and the sweeper (receiver readiness, sender notice idle-gate) so
+        both apply the exact same gate.
+        """
+        liveness = _liveness(conv.id)
+        runner_online = liveness.runner_online if liveness is not None else None
+        busy = _session_status_from_cache(conv.id, conv.live_status) in _MID_TURN_STATUSES
+        native = await asyncio.to_thread(_is_native_terminal_session, conv)
+        terminal_ready: bool | None = None
+        if native:
+            runner_client = await _get_runner_client(conv.id, runner_router, conversation=conv)
+            if runner_client is None:
+                terminal_ready = False
+            else:
+                try:
+                    outcome = await _ensure_native_terminal_ready(
+                        runner_client,
+                        conv.id,
+                        conv,
+                        persist_resource_event=False,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "Peer native ensure probe raised",
+                        exc_info=True,
+                        extra={"session_id": conv.id},
+                    )
+                    terminal_ready = False
+                else:
+                    terminal_ready = outcome.error is None
+        if runner_online is False:
+            return "offline", runner_online
+        if native and terminal_ready is False:
+            return "not_ready", runner_online
+        if busy:
+            return "busy", runner_online
+        return "idle", runner_online
+
+    async def _deliver(
+        request: Request,
+        sender: Conversation,
+        receiver: Conversation,
+        ref: str,
+        text: str,
+        *,
+        acting_user_id: Any = _ACTING_USER_ID_NOT_GIVEN,
+    ) -> tuple[str, str | None]:
+        """Deliver one peer message via the events path.
+
+        Readiness is the caller's job (``_true_state``); this only builds
+        the envelope, posts it, and maps the outcome — the steps the
+        inline send route and the sweeper both need once they've decided
+        to deliver. Shared so inline and deferred delivery are one path.
+
+        :returns: ``("delivered", None)`` or ``("failed", reason)``.
+        """
+        native_receiver = await asyncio.to_thread(_is_native_terminal_session, receiver)
+        envelope = format_peer_envelope(
+            sender_session_id=sender.id,
+            sender_title=sender.title,
+            sender_agent_name=_sender_agent_name(sender),
+            sender_project_id=_sender_project_id(sender),
+            ref=ref,
+            text=text,
+        )
+        deliver_impl = _POST_EVENT_IMPL_OVERRIDE or post_event_impl
+        kwargs: dict[str, Any] = {}
+        if acting_user_id is not _ACTING_USER_ID_NOT_GIVEN:
+            kwargs["acting_user_id"] = acting_user_id
+        try:
+            delivery = await deliver_impl(
+                request,
+                receiver.id,
+                SessionEventInput(
+                    type="message",
+                    data={
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": envelope}],
+                    },
+                ),
+                **kwargs,
+            )
+        except OmnigentError as exc:
+            reason = "offline" if exc.code == ErrorCode.RUNNER_UNAVAILABLE else "not_ready"
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                _logger.warning(
+                    "Peer delivery failed: %s",
+                    exc.message,
+                    extra={"session_id": receiver.id},
+                )
+            return "failed", reason
+        except HTTPException as exc:
+            _logger.warning(
+                "Peer delivery raised HTTP %s",
+                exc.status_code,
+                extra={"session_id": receiver.id},
+            )
+            return "failed", "not_ready"
+        if (
+            native_receiver
+            and isinstance(delivery, dict)
+            and delivery.get("item_id") is not None
+            and delivery.get("pending_id") is None
+        ):
+            return "failed", "not_ready"
+        return "delivered", None
 
     @router.post(
         "/sessions/{receiver_id}/peer-messages",
@@ -553,9 +708,6 @@ def register_peer_routes(
             ref = body.correlation_id or secrets.token_hex(16)
             liveness = _liveness(receiver_id)
             runner_online = liveness.runner_online if liveness is not None else None
-            busy = (
-                _session_status_from_cache(receiver.id, receiver.live_status) in _MID_TURN_STATUSES
-            )
             if (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_HOLD:
                 record = await asyncio.to_thread(
                     peer_message_store.create,
@@ -582,39 +734,7 @@ def register_peer_routes(
                 if reply_to is not None:
                     response["reply_to"] = reply_to
                 return response
-            native_receiver = await asyncio.to_thread(_is_native_terminal_session, receiver)
-            runner_client = await _get_runner_client(
-                receiver_id, runner_router, conversation=receiver
-            )
-            terminal_ready: bool | None = None
-            if native_receiver:
-                if runner_client is None:
-                    terminal_ready = False
-                else:
-                    try:
-                        outcome = await _ensure_native_terminal_ready(
-                            runner_client,
-                            receiver_id,
-                            receiver,
-                            persist_resource_event=False,
-                        )
-                    except Exception:
-                        _logger.warning(
-                            "Peer native ensure probe raised",
-                            exc_info=True,
-                            extra={"session_id": receiver_id},
-                        )
-                        terminal_ready = False
-                    else:
-                        terminal_ready = outcome.error is None
-            if runner_online is False:
-                receiver_state = "offline"
-            elif native_receiver and terminal_ready is False:
-                receiver_state = "not_ready"
-            elif busy:
-                receiver_state = "busy"
-            else:
-                receiver_state = "idle"
+            receiver_state, runner_online = await _true_state(receiver)
             if receiver_state in ("offline", "not_ready"):
                 reason = receiver_state
                 if body.wait_seconds == 0:
@@ -697,80 +817,16 @@ def register_peer_routes(
                 ),
             )
             record = delivering
-            envelope = format_peer_envelope(
-                sender_session_id=sender_id,
-                sender_title=sender.title,
-                sender_agent_name=_sender_agent_name(sender),
-                sender_project_id=_sender_project_id(sender),
-                ref=record.ref,
-                text=body.text,
+            result_state, reason = await _deliver(request, sender, receiver, record.ref, body.text)
+            await asyncio.to_thread(
+                peer_message_store.transition,
+                record.id,
+                result_state,
+                reason,
+                ("delivering",),
             )
-            try:
-                deliver_impl = _POST_EVENT_IMPL_OVERRIDE or post_event_impl
-                delivery = await deliver_impl(
-                    request,
-                    receiver_id,
-                    SessionEventInput(
-                        type="message",
-                        data={
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": envelope}],
-                        },
-                    ),
-                )
-            except OmnigentError as exc:
-                reason = "offline" if exc.code == ErrorCode.RUNNER_UNAVAILABLE else "not_ready"
-                if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
-                    _logger.warning(
-                        "Peer inline delivery failed: %s",
-                        exc.message,
-                        extra={"session_id": receiver_id},
-                    )
-                await asyncio.to_thread(
-                    peer_message_store.transition,
-                    record.id,
-                    "failed",
-                    reason,
-                    ("delivering",),
-                )
+            if result_state == "failed":
                 terminal_verdict = f"failed:{reason}"
-            except HTTPException as exc:
-                _logger.warning(
-                    "Peer inline delivery raised HTTP %s",
-                    exc.status_code,
-                    extra={"session_id": receiver_id},
-                )
-                await asyncio.to_thread(
-                    peer_message_store.transition,
-                    record.id,
-                    "failed",
-                    "not_ready",
-                    ("delivering",),
-                )
-                terminal_verdict = "failed:not_ready"
-            else:
-                if (
-                    native_receiver
-                    and isinstance(delivery, dict)
-                    and delivery.get("item_id") is not None
-                    and delivery.get("pending_id") is None
-                ):
-                    await asyncio.to_thread(
-                        peer_message_store.transition,
-                        record.id,
-                        "failed",
-                        "not_ready",
-                        ("delivering",),
-                    )
-                    terminal_verdict = "failed:not_ready"
-                else:
-                    await asyncio.to_thread(
-                        peer_message_store.transition,
-                        record.id,
-                        "delivered",
-                        None,
-                        ("delivering",),
-                    )
             if terminal_verdict is not None:
                 return _terminal_response(
                     terminal_verdict, record, body.correlation_id, receiver, runner_online
@@ -1002,7 +1058,34 @@ def register_peer_routes(
             )
         updated = await asyncio.to_thread(peer_message_store.get, peer_id)
         assert updated is not None
+        if sweeper is not None:
+            # Best-effort: the refuse itself already succeeded (CAS above),
+            # so a back-notice failure never turns a successful action into
+            # a 500 — same fail-open the sweeper's own tick applies.
+            try:
+                await sweeper.notify(updated, conv.title, app=request.app)
+            except Exception:
+                _logger.warning(
+                    "Peer refuse back-notice failed",
+                    exc_info=True,
+                    extra={"session_id": session_id, "peer_id": peer_id},
+                )
         return _record_to_dict(updated)
+
+    sweeper: Any | None = None
+    if flags.enabled(Feature.SESSION_PEER_MESSAGING) and peer_message_store is not None:
+        from omnigent.server.peer_sweeper import PeerSweeper
+
+        sweeper = PeerSweeper(
+            peer_store=peer_message_store,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            true_state=_true_state,
+            deliver=_deliver,
+            post_event_impl=post_event_impl,
+        )
+    if app_state is not None:
+        app_state.peer_sweeper = sweeper
 
 
 __all__ = [
@@ -1016,6 +1099,7 @@ __all__ = [
     "PEER_THREAD_LIMIT",
     "PostEventImpl",
     "effective_owner_id",
+    "format_peer_back_notice",
     "format_peer_envelope",
     "register_peer_routes",
 ]

@@ -157,11 +157,15 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
         state: str,
         reason: str | None = None,
         expected_states: tuple[str, ...] | None = None,
+        *,
+        expires_at: int | None = None,
     ) -> bool:
         """Compare-and-set a record's state; ``False`` on a lost race."""
         values: dict[str, Any] = {"state": state, "updated_at": now_epoch()}
         if reason is not None:
             values["reason"] = reason
+        if expires_at is not None:
+            values["expires_at"] = expires_at
 
         def write(session: Session) -> bool:
             stmt = update(SqlSessionPeerMessage).where(
