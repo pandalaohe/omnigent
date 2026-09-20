@@ -157,6 +157,7 @@ class _TrueStateScript:
         self.states: dict[str, str] = {}
         self.sequences: dict[str, list[str]] = {}
         self.calls: list[str] = []
+        self.raise_once_for: set[str] = set()
 
     async def __call__(self, conv: Conversation) -> tuple[str, bool | None]:
         self.calls.append(conv.id)
@@ -165,6 +166,9 @@ class _TrueStateScript:
         # interleave instead of one running to completion uninterrupted,
         # which a fake with no suspension point can never exercise.
         await asyncio.sleep(0)
+        if conv.id in self.raise_once_for:
+            self.raise_once_for.discard(conv.id)
+            raise RuntimeError("simulated true_state read failure")
         seq = self.sequences.get(conv.id)
         if seq:
             return seq.pop(0), True
@@ -420,6 +424,66 @@ async def test_transient_failure_until_expiry_expires_with_one_notice(harness: _
     assert "expired" in harness.post_event.calls[0]["text"]
 
 
+async def test_uncertain_delivery_leaves_record_delivering_without_notice(
+    harness: _Harness,
+) -> None:
+    """X2: an uncertain outcome must not be retried blindly.
+
+    Leaves the record in ``delivering`` (no revert, no terminal
+    transition), posts no notice, and the next tick does not call
+    ``_deliver`` again for it (it's no longer due).
+    """
+    record = harness.seed_record(state="pending")
+    harness.deliver.outcomes["receiver"] = ("uncertain", "not_ready")
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "delivering"
+    assert harness.post_event.calls == []
+
+    calls_before = len(harness.deliver.calls)
+    await harness.sweeper._tick()
+    assert len(harness.deliver.calls) == calls_before
+    assert _row(harness.store, record.id).state == "delivering"
+
+
+async def test_uncertain_delivery_reconciles_delivered_via_marker_after_grace(
+    harness: _Harness,
+) -> None:
+    """X2: past the grace, a marker in the receiver's transcript settles
+    an uncertain delivery as delivered, with one notice."""
+    record = harness.seed_record(state="pending")
+    harness.deliver.outcomes["receiver"] = ("uncertain", "not_ready")
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "delivering"
+
+    harness.conv_store.visible_text["receiver"] = [f"[Peer message ...] ref=ref1 msg={record.id}"]
+    harness._now += 130
+    await harness.sweeper._tick()
+    updated = _row(harness.store, record.id)
+    assert updated.state == "delivered"
+    assert len(harness.post_event.calls) == 1
+    assert "delivered" in harness.post_event.calls[0]["text"]
+
+
+async def test_uncertain_delivery_reconciles_to_pending_without_marker(
+    harness: _Harness,
+) -> None:
+    """X2: past the grace, no marker reverts to pending; a later tick retries
+    and delivers exactly once."""
+    record = harness.seed_record(state="pending")
+    harness.deliver.sequences["receiver"] = [("uncertain", "not_ready"), ("delivered", None)]
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "delivering"
+
+    harness._now += 130
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "pending"
+    assert harness.post_event.calls == []
+
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "delivered"
+    assert len(harness.post_event.calls) == 1
+
+
 async def test_two_concurrent_flushes_post_once(harness: _Harness) -> None:
     """F6: two concurrent flush attempts for one sender post exactly once."""
     record = harness.seed_record(state="pending")
@@ -499,6 +563,24 @@ async def test_notice_post_failure_reparks_for_a_later_attempt(harness: _Harness
     record = harness.seed_record(state="pending")
     sender = harness.conv_store.convs["sender"]
     harness.post_event.raise_once_for.add("sender")
+    await harness.sweeper._notify_for(record, "delivered", None, "Receiver", _APP)
+    assert harness.post_event.calls == []
+    assert len(harness.sweeper._parked["sender"]) == 1
+
+    await harness.sweeper._maybe_flush(sender, _APP)
+    assert len(harness.post_event.calls) == 1
+    assert harness.sweeper._parked["sender"] == []
+
+
+async def test_true_state_exception_during_flush_reparks_for_a_later_attempt(
+    harness: _Harness,
+) -> None:
+    """X3: an exception between the swap-out and the post (the fresh
+    ``_true_state`` read) must not drop the parked lines — same restore as
+    a post failure. The next flush posts once."""
+    record = harness.seed_record(state="pending")
+    sender = harness.conv_store.convs["sender"]
+    harness.true_state.raise_once_for.add("sender")
     await harness.sweeper._notify_for(record, "delivered", None, "Receiver", _APP)
     assert harness.post_event.calls == []
     assert len(harness.sweeper._parked["sender"]) == 1

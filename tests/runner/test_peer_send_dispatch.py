@@ -438,6 +438,57 @@ async def test_reply_poll_bounds_request_timeout_and_sleep_by_remaining_budget(
 
 
 @pytest.mark.asyncio
+async def test_reply_detected_near_budget_fetch_timeout_returns_without_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X4: a reply detected at 0.9 s of a 1 s budget must not overshoot the
+    deadline fetching its text. The remaining ~0.1 s budget threads into the
+    fetch's own timeout; a fetch that times out inside it still reports the
+    reply as detected (text unavailable) rather than block past the caller's
+    deadline or lose the detected-reply signal entirely.
+    """
+    import time as _time
+
+    from omnigent.runner.tool_dispatch import _poll_peer_reply
+
+    real_monotonic = _time.monotonic
+    start = real_monotonic()
+    calls = 0
+
+    def _fake_clock() -> float:
+        nonlocal calls
+        calls += 1
+        # Calls 1-2 (the deadline calc, then the loop's remaining check
+        # before the GET) read as "just started"; call 3+ (remaining for
+        # the text fetch, after the reply is detected) reads as 0.9 s in —
+        # simulating a reply detected near the end of the wait budget
+        # without a real sleep.
+        return start if calls <= 2 else start + 0.9
+
+    monkeypatch.setattr(_time, "monotonic", _fake_clock)
+
+    seen_fetch_timeout: list[float | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/peer-messages/peer_abc123":
+            return httpx.Response(
+                200,
+                json=_record("delivered", reply_peer_id="peer_reply1", replied_at=2),
+            )
+        if request.url.path == "/v1/peer-messages/peer_reply1":
+            seen_fetch_timeout.append(request.extensions.get("timeout", {}).get("read"))
+            raise httpx.ReadTimeout("simulated slow fetch", request=request)
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _client(handler) as client:
+        out = await _poll_peer_reply(client, "peer_abc123", 1)
+    assert out == {"peer_id": "peer_reply1", "text": None}
+    assert seen_fetch_timeout, "the reply-text fetch was never attempted"
+    fetch_timeout = seen_fetch_timeout[0]
+    assert fetch_timeout is not None and fetch_timeout == pytest.approx(0.1, abs=0.02)
+
+
+@pytest.mark.asyncio
 async def test_no_poll_when_wait_is_zero() -> None:
     """Default (no ``wait_for_reply_seconds``) returns at once with no ``reply``."""
     gets = 0

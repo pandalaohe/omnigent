@@ -546,9 +546,18 @@ def register_peer_routes(
         inline send route and the sweeper both need once they've decided
         to deliver. Shared so inline and deferred delivery are one path.
 
+        A native forward can lose the response after the runner already
+        accepted the input, and an SDK receiver whose relaunch is refused
+        gets back ``{queued: true, ...}`` without anything forwarded — both
+        are UNCERTAIN (something may have landed), not a definite failure, so
+        a caller must never retry one blindly (double delivery). Only
+        ``RUNNER_UNAVAILABLE`` means nothing was forwarded.
+
         :param peer_id: This delivery's own record id, threaded into the
             envelope's ``msg=`` field for restart reconciliation.
-        :returns: ``("delivered", None)`` or ``("failed", reason)``.
+        :returns: ``("delivered", None)``, ``("failed", "offline")`` (nothing
+            forwarded — safe to retry), or ``("uncertain", "not_ready")``
+            (something may have landed — the caller must not retry blindly).
         """
         native_receiver = await asyncio.to_thread(_is_native_terminal_session, receiver)
         envelope = format_peer_envelope(
@@ -578,28 +587,28 @@ def register_peer_routes(
                 **kwargs,
             )
         except OmnigentError as exc:
-            reason = "offline" if exc.code == ErrorCode.RUNNER_UNAVAILABLE else "not_ready"
-            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
-                _logger.warning(
-                    "Peer delivery failed: %s",
-                    exc.message,
-                    extra={"session_id": receiver.id},
-                )
-            return "failed", reason
+            if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                return "failed", "offline"
+            _logger.warning(
+                "Peer delivery uncertain: %s",
+                exc.message,
+                extra={"session_id": receiver.id},
+            )
+            return "uncertain", "not_ready"
         except HTTPException as exc:
             _logger.warning(
                 "Peer delivery raised HTTP %s",
                 exc.status_code,
                 extra={"session_id": receiver.id},
             )
-            return "failed", "not_ready"
+            return "uncertain", "not_ready"
         if (
             native_receiver
             and isinstance(delivery, dict)
             and delivery.get("item_id") is not None
             and delivery.get("pending_id") is None
         ):
-            return "failed", "not_ready"
+            return "uncertain", "not_ready"
         return "delivered", None
 
     @router.post(
@@ -717,6 +726,21 @@ def register_peer_routes(
         record: SessionPeerMessage | None = None
         runner_online: bool | None = None
 
+        async def _queued_response_for_record(
+            queued: SessionPeerMessage, runner_online: bool | None
+        ) -> dict[str, Any]:
+            reply_to = await _mark_reply_locked(queued, body.correlation_id)
+            queued_response: dict[str, Any] = {
+                "disposition": "queued",
+                "reason": None,
+                "peer_id": queued.id,
+                "ref": queued.ref,
+                "receiver": _receiver_summary(receiver, runner_online=runner_online),
+            }
+            if reply_to is not None:
+                queued_response["reply_to"] = reply_to
+            return queued_response
+
         async def _queued_response(ref: str, now: int, runner_online: bool | None) -> dict[str, Any]:
             # Narrowed once at function entry (the flag-off/store-absent
             # checks above already returned/raised); a nested closure loses
@@ -736,17 +760,7 @@ def register_peer_routes(
                     expires_at=now + PEER_QUEUE_LIFETIME,
                 ),
             )
-            reply_to = await _mark_reply_locked(queued, body.correlation_id)
-            queued_response: dict[str, Any] = {
-                "disposition": "queued",
-                "reason": None,
-                "peer_id": queued.id,
-                "ref": queued.ref,
-                "receiver": _receiver_summary(receiver, runner_online=runner_online),
-            }
-            if reply_to is not None:
-                queued_response["reply_to"] = reply_to
-            return queued_response
+            return await _queued_response_for_record(queued, runner_online)
 
         try:
             now = now_epoch()
@@ -824,13 +838,6 @@ def register_peer_routes(
                 return _terminal_response(
                     terminal_verdict, record, body.correlation_id, receiver, runner_online
                 )
-            # Re-check right before delivering: the awaits above (readiness
-            # probe, record creation) leave a window where a turn can start
-            # concurrently. A Codex-native receiver is never steered mid-turn
-            # (design Decision 5) — queue instead of delivering into it.
-            recheck_state, _recheck_runner_online = await _true_state(receiver)
-            if recheck_state == "busy":
-                return await _queued_response(ref, now, runner_online)
             assert record is None
             delivering = await asyncio.to_thread(
                 peer_message_store.create,
@@ -847,17 +854,38 @@ def register_peer_routes(
                 ),
             )
             record = delivering
+            # Re-check right before delivering: the readiness probe above and
+            # this record's own creation each awaited a store write, during
+            # which a turn can start concurrently. A Codex-native receiver is
+            # never steered mid-turn (design Decision 5) — queue this same
+            # record instead of delivering into it (no second record).
+            recheck_state, _recheck_runner_online = await _true_state(receiver)
+            if recheck_state == "busy":
+                await asyncio.to_thread(
+                    peer_message_store.transition,
+                    record.id,
+                    "queued",
+                    None,
+                    ("delivering",),
+                )
+                return await _queued_response_for_record(record, runner_online)
             result_state, reason = await _deliver(
                 request, sender, receiver, record.ref, record.id, body.text
             )
+            # The inline route always reports a terminal outcome to the
+            # sender; only the sweeper's retry needs to distinguish
+            # "uncertain" (native forward may have landed) from a definite
+            # failure, so collapse it onto the existing "failed" disposition
+            # here rather than surface a new one.
+            stored_state = "failed" if result_state == "uncertain" else result_state
             await asyncio.to_thread(
                 peer_message_store.transition,
                 record.id,
-                result_state,
+                stored_state,
                 reason,
                 ("delivering",),
             )
-            if result_state == "failed":
+            if stored_state == "failed":
                 terminal_verdict = f"failed:{reason}"
             if terminal_verdict is not None:
                 return _terminal_response(

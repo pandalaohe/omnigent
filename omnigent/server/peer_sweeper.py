@@ -5,14 +5,20 @@ A ``session_peer_messages`` record that could not deliver inline
 expires overdue records, fails records whose receiver has closed, and
 delivers the rest once the receiver's true state goes idle, through the
 same ``deliver`` callable the inline send route uses
-(``routes_peer._deliver``). Every terminal transition — delivered, failed,
-expired — and the action route's ``refuse`` post a ``[System: ...]``
-back-notice to the sender, idle-gated the same way: notices generated
-while the sender is mid-turn park in an in-memory per-sender queue and
-post as one batched message on a later tick when the sender goes idle.
-The parked queue is process-local and does not survive a restart (a
-survivable choice: the ``session_peer_messages`` row itself is durable and
-the sweeper's own tick keeps searching for it).
+(``routes_peer._deliver``). A definite failure (``offline`` — nothing was
+forwarded) reverts for the next tick's retry; an *uncertain* outcome (the
+runner may have accepted the input despite a lost or unconfirmable
+response) is never retried blindly — the record stays in ``delivering``
+until ``_reconcile_stale_delivering`` settles it by searching the
+receiver's transcript for the record's ``msg=`` marker. Every terminal
+transition — delivered, failed, expired — and the action route's
+``refuse`` post a ``[System: ...]`` back-notice to the sender, idle-gated
+the same way: notices generated while the sender is mid-turn park in an
+in-memory per-sender queue and post as one batched message on a later
+tick when the sender goes idle. The parked queue is process-local and
+does not survive a restart (a survivable choice: the
+``session_peer_messages`` row itself is durable and the sweeper's own
+tick keeps searching for it).
 
 On startup, before the first tick, every ``delivering`` record left behind
 by a crash between runner acceptance and its own transition is reconciled
@@ -257,11 +263,25 @@ class PeerSweeper:
             _logger.exception("Peer sweeper delivery raised for record %s", record.id)
             result_state, reason = "failed", "not_ready"
         if result_state == "failed":
-            # A transient delivery failure is not the sweeper's call to end
-            # the record — the sender chose to wait. Revert to the state it
-            # came from so the next tick retries; only the closed check
-            # above ends a record from here.
+            # A definite failure (offline: nothing was forwarded) is not the
+            # sweeper's call to end the record — the sender chose to wait.
+            # Revert to the state it came from so the next tick retries;
+            # only the closed check above ends a record from here.
             await self._revert_delivering(record, origin_state, reason or "not_ready")
+            return
+        if result_state == "uncertain":
+            # The runner may have accepted the input despite the lost/absent
+            # confirmation (a lost native forward, or an SDK relaunch refused
+            # with queued:true) — a blind retry would double-deliver. Leave
+            # the record in `delivering`; `_reconcile_stale_delivering`
+            # settles it once the grace elapses by searching the receiver's
+            # transcript for this record's `msg=` marker.
+            _logger.warning(
+                "Peer delivery uncertain for record %s (%s); leaving "
+                "delivering for reconciliation",
+                record.id,
+                reason,
+            )
             return
         await asyncio.to_thread(
             self._store.transition, record.id, result_state, reason, ("delivering",)
@@ -330,18 +350,26 @@ class PeerSweeper:
             if not lines:
                 return
             self._parked[sender.id] = []
-            if is_session_closed(sender.labels, sender.title) or sender.archived_at is not None:
-                return
-            state, _runner_online = await self._true_state(sender)
-            if state != "idle":
-                self._parked[sender.id] = lines + self._parked.get(sender.id, [])
-                return
-            joined = "\n".join(lines)
-            request = self._synthetic_request(sender.id, app)
-            sender_owner = effective_owner_id(
-                sender, self._conversation_store, self._permission_store
-            )
+            # Everything from here through a successful post is wrapped: an
+            # exception anywhere in this window (the fresh conversation read
+            # in `_true_state`, the owner walk, or the post itself) must not
+            # drop the parked lines, so restore is a single `except` rather
+            # than only covering the post call.
             try:
+                if (
+                    is_session_closed(sender.labels, sender.title)
+                    or sender.archived_at is not None
+                ):
+                    return
+                state, _runner_online = await self._true_state(sender)
+                if state != "idle":
+                    self._parked[sender.id] = lines + self._parked.get(sender.id, [])
+                    return
+                joined = "\n".join(lines)
+                request = self._synthetic_request(sender.id, app)
+                sender_owner = effective_owner_id(
+                    sender, self._conversation_store, self._permission_store
+                )
                 await self._post_event_impl(
                     request,
                     sender.id,
@@ -352,9 +380,7 @@ class PeerSweeper:
                     acting_user_id=sender_owner,
                 )
             except Exception:
-                _logger.exception(
-                    "Peer sweeper failed to post back-notice to sender %s", sender.id
-                )
+                _logger.exception("Peer sweeper failed to flush notices for sender %s", sender.id)
                 # Restore (old lines first) for a later attempt rather than
                 # silently dropping the notice.
                 self._parked[sender.id] = lines + self._parked.get(sender.id, [])

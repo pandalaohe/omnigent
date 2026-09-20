@@ -750,6 +750,44 @@ async def test_busy_receiver_queues_without_delivery(
         sessions_module._session_status_cache.pop(receiver.id, None)
 
 
+async def test_busy_recheck_after_record_creation_queues_same_record(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """X1: a turn starting during the delivering record's own creation must
+    not reach ``_deliver`` — the busy re-check runs after the record exists
+    and transitions that same record to ``queued`` instead of a second one.
+    """
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    fake: _FakePostEvent = peer_env["fake"]
+    peer_store: Any = peer_env["peer_store"]
+    real_create = peer_store.create
+
+    def _create_then_go_busy(record: Any) -> Any:
+        created = real_create(record)
+        if created.state == "delivering":
+            sessions_module._session_status_cache[receiver.id] = "running"
+        return created
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(peer_store, "create", _create_then_go_busy)
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"br-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+    finally:
+        monkeypatch.undo()
+        sessions_module._session_status_cache.pop(receiver.id, None)
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert fake.calls == [], "a turn starting during record creation reached _deliver"
+    records = peer_store.list_for_session(receiver.id, None, 50)
+    assert len(records) == 1, f"expected exactly one record, got {len(records)}"
+    assert records[0].id == resp.json()["peer_id"]
+    assert records[0].state == "queued"
+
+
 async def test_relaunchable_receiver_delivers_inline(
     peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
 ) -> None:

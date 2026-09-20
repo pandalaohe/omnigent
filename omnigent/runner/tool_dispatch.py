@@ -3311,7 +3311,10 @@ async def _poll_peer_reply(
                     if body.get("replied_at") is not None:
                         reply_id = body.get("reply_peer_id")
                         if isinstance(reply_id, str) and reply_id:
-                            return await _fetch_peer_reply_text(server_client, reply_id)
+                            remaining = deadline - _time.monotonic()
+                            return await _fetch_peer_reply_text(
+                                server_client, reply_id, remaining=remaining
+                            )
                         return None
                     state = body.get("state")
                     if state in ("failed", "expired", "refused_by_user"):
@@ -3329,15 +3332,28 @@ async def _poll_peer_reply(
 async def _fetch_peer_reply_text(
     server_client: httpx.AsyncClient,
     reply_peer_id: str,
+    *,
+    remaining: float = 30.0,
 ) -> _JsonObject | None:
     """Fetch the reply record's text for a replied-to peer send.
 
+    Bounded by the caller's remaining poll budget so a reply detected near
+    the end of ``wait_for_reply_seconds`` cannot overshoot the deadline —
+    a request that times out inside that budget still reports the reply
+    as detected (only its text is unavailable) rather than block past the
+    deadline the caller already spent waiting.
+
     :param server_client: HTTP client pointed at the Omnigent server.
     :param reply_peer_id: The reply record's id.
-    :returns: ``{"peer_id", "text"}``, or ``None`` when unreadable.
+    :param remaining: Seconds left in the caller's poll budget.
+    :returns: ``{"peer_id", "text"}`` (``text`` ``None`` on a timeout), or
+        plain ``None`` for any other fetch failure.
     """
+    timeout = max(0.1, min(30.0, remaining))
     try:
-        resp = await server_client.get(f"/v1/peer-messages/{reply_peer_id}", timeout=30.0)
+        resp = await server_client.get(f"/v1/peer-messages/{reply_peer_id}", timeout=timeout)
+    except httpx.TimeoutException:
+        return {"peer_id": reply_peer_id, "text": None}
     except Exception:  # noqa: BLE001
         return None
     if resp.status_code != 200:
