@@ -1161,7 +1161,7 @@ export type PeerMessageState =
   | "refused_by_user";
 
 interface PeerMessageWire {
-  id: string;
+  peer_id: string;
   sender_session_id: string;
   receiver_session_id: string;
   correlation_id: string | null;
@@ -1195,7 +1195,7 @@ export interface PeerMessageRecord {
 
 function peerMessageFromWire(wire: PeerMessageWire): PeerMessageRecord {
   return {
-    id: wire.id,
+    id: wire.peer_id,
     senderSessionId: wire.sender_session_id,
     receiverSessionId: wire.receiver_session_id,
     correlationId: wire.correlation_id ?? null,

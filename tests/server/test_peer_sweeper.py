@@ -145,22 +145,43 @@ class _FakeConversationStore:
 
 
 class _TrueStateScript:
-    """Per-session scripted true state; defaults to idle."""
+    """Per-session scripted true state; defaults to idle.
+
+    ``sequences`` (when set for a session id) is consumed one entry per
+    call, falling back to ``states`` once exhausted — lets a test script a
+    state that changes between two calls for the same session (the F2
+    busy re-check race).
+    """
 
     def __init__(self) -> None:
         self.states: dict[str, str] = {}
+        self.sequences: dict[str, list[str]] = {}
         self.calls: list[str] = []
 
     async def __call__(self, conv: Conversation) -> tuple[str, bool | None]:
         self.calls.append(conv.id)
+        # A real checkpoint, not just an `async def` with no internal
+        # await — lets two "concurrent" callers (asyncio.gather) actually
+        # interleave instead of one running to completion uninterrupted,
+        # which a fake with no suspension point can never exercise.
+        await asyncio.sleep(0)
+        seq = self.sequences.get(conv.id)
+        if seq:
+            return seq.pop(0), True
         return self.states.get(conv.id, "idle"), True
 
 
 class _DeliverScript:
-    """Records calls; scriptable outcome or raise, keyed by receiver id."""
+    """Records calls; scriptable outcome or raise, keyed by receiver id.
+
+    ``sequences`` (when set for a receiver id) is consumed one outcome per
+    call before falling back to ``outcomes`` — lets a test script a
+    transient failure that later succeeds (R3-C retry).
+    """
 
     def __init__(self) -> None:
         self.outcomes: dict[str, tuple[str, str | None]] = {}
+        self.sequences: dict[str, list[tuple[str, str | None]]] = {}
         self.raises: dict[str, BaseException] = {}
         self.calls: list[dict[str, Any]] = []
 
@@ -170,6 +191,7 @@ class _DeliverScript:
         sender: Conversation,
         receiver: Conversation,
         ref: str,
+        peer_id: str,
         text: str,
         *,
         acting_user_id: Any = None,
@@ -179,12 +201,16 @@ class _DeliverScript:
                 "sender": sender.id,
                 "receiver": receiver.id,
                 "ref": ref,
+                "peer_id": peer_id,
                 "text": text,
                 "acting_user_id": acting_user_id,
             }
         )
         if receiver.id in self.raises:
             raise self.raises[receiver.id]
+        seq = self.sequences.get(receiver.id)
+        if seq:
+            return seq.pop(0)
         return self.outcomes.get(receiver.id, ("delivered", None))
 
 
@@ -311,6 +337,24 @@ async def test_closed_receiver_fails_with_notice() -> None:
     assert "(closed)" in h.post_event.calls[0]["text"]
 
 
+async def test_held_record_expires_past_expiry(harness: _Harness) -> None:
+    """A held record past its expiry expires with a notice, same as pending."""
+    record = harness.seed_record(state="held", expires_at=999)
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "expired"
+    assert harness.deliver.calls == []
+    assert "expired" in harness.post_event.calls[0]["text"]
+
+
+async def test_held_record_before_expiry_untouched(harness: _Harness) -> None:
+    """A held record before its expiry is never delivered by the sweeper."""
+    record = harness.seed_record(state="held")
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "held"
+    assert harness.deliver.calls == []
+    assert harness.post_event.calls == []
+
+
 async def test_busy_receiver_left_untouched(harness: _Harness) -> None:
     record = harness.seed_record(state="pending")
     harness.true_state.states["receiver"] = "busy"
@@ -320,7 +364,8 @@ async def test_busy_receiver_left_untouched(harness: _Harness) -> None:
     assert harness.post_event.calls == []
 
 
-async def test_delivery_exception_fails_record_and_tick_continues(harness: _Harness) -> None:
+async def test_delivery_exception_reverts_record_and_tick_continues(harness: _Harness) -> None:
+    """An unexpected raise from ``_deliver`` reverts (R3-C), it doesn't fail terminally."""
     harness.add_conv(_conv("receiver2", title="Receiver Two"))
     boom = harness.seed_record(id="peer_boom", receiver_session_id="receiver", ref="r-boom")
     ok = harness.seed_record(
@@ -328,10 +373,69 @@ async def test_delivery_exception_fails_record_and_tick_continues(harness: _Harn
     )
     harness.deliver.raises["receiver"] = RuntimeError("boom")
     await harness.sweeper._tick()
-    assert _row(harness.store, boom.id).state == "failed"
+    assert _row(harness.store, boom.id).state == boom.state
     assert _row(harness.store, boom.id).reason == "not_ready"
     assert _row(harness.store, ok.id).state == "delivered"
     assert {c["receiver"] for c in harness.deliver.calls} == {"receiver", "receiver2"}
+    assert not any("peer_boom" in c["text"] for c in harness.post_event.calls)
+
+
+async def test_busy_recheck_before_deliver_reverts_without_notice(harness: _Harness) -> None:
+    """A receiver that goes busy between the CAS and ``_deliver`` is reverted, not delivered."""
+    record = harness.seed_record(state="pending")
+    harness.true_state.sequences["receiver"] = ["idle", "busy"]
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "pending"
+    assert harness.deliver.calls == []
+    assert harness.post_event.calls == []
+
+
+async def test_transient_failure_retries_then_delivers(harness: _Harness) -> None:
+    """R3-C: a failed delivery reverts for the next tick's retry, no failed notice."""
+    record = harness.seed_record(state="pending")
+    harness.deliver.sequences["receiver"] = [("failed", "offline")]
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "pending"
+    assert harness.post_event.calls == []
+
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "delivered"
+    assert len(harness.post_event.calls) == 1
+    assert "delivered" in harness.post_event.calls[0]["text"]
+    assert "failed" not in harness.post_event.calls[0]["text"]
+
+
+async def test_transient_failure_until_expiry_expires_with_one_notice(harness: _Harness) -> None:
+    """R3-C: a delivery that keeps failing still ends at its own expiry."""
+    record = harness.seed_record(state="pending", expires_at=harness._now + 1)
+    harness.deliver.outcomes["receiver"] = ("failed", "not_ready")
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "pending"
+    assert harness.post_event.calls == []
+
+    harness._now += 1
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "expired"
+    assert len(harness.post_event.calls) == 1
+    assert "expired" in harness.post_event.calls[0]["text"]
+
+
+async def test_two_concurrent_flushes_post_once(harness: _Harness) -> None:
+    """F6: two concurrent flush attempts for one sender post exactly once."""
+    record = harness.seed_record(state="pending")
+    harness.true_state.states["sender"] = "busy"
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "delivered"
+    assert len(harness.sweeper._parked["sender"]) == 1
+
+    harness.true_state.states["sender"] = "idle"
+    sender = harness.conv_store.convs["sender"]
+    await asyncio.gather(
+        harness.sweeper._maybe_flush(sender, _APP),
+        harness.sweeper._maybe_flush(sender, _APP),
+    )
+    assert len(harness.post_event.calls) == 1
+    assert harness.sweeper._parked["sender"] == []
 
 
 async def test_concurrent_ticks_deliver_exactly_once(harness: _Harness) -> None:
@@ -408,8 +512,12 @@ async def test_startup_reconciliation_marker_found_is_delivered() -> None:
     h = _Harness()
     h.add_conv(_conv("sender", title="Sender"))
     h.add_conv(_conv("receiver", title="Receiver"))
-    record = h.seed_record(id="peer_deliv", state="delivering", ref="ref-found")
-    h.conv_store.visible_text["receiver"] = ["[Peer message ...] ref=ref-found ..."]
+    record = h.seed_record(
+        id="peer_deliv", state="delivering", ref="ref-found", updated_at=h._now - 200
+    )
+    h.conv_store.visible_text["receiver"] = [
+        f"[Peer message ...] ref=ref-found msg={record.id} ..."
+    ]
     await h.sweeper._reconcile_startup()
     updated = _row(h.store, record.id)
     assert updated.state == "delivered"
@@ -422,14 +530,50 @@ async def test_startup_reconciliation_marker_missing_reverts_to_pending() -> Non
     h.add_conv(_conv("receiver", title="Receiver"))
     future_expiry = h._now + 500
     still_future = h.seed_record(
-        id="peer_future", state="delivering", ref="ref-future", expires_at=future_expiry
+        id="peer_future",
+        state="delivering",
+        ref="ref-future",
+        expires_at=future_expiry,
+        updated_at=h._now - 200,
     )
     already_past = h.seed_record(
-        id="peer_past", state="delivering", ref="ref-past", expires_at=h._now - 10
+        id="peer_past",
+        state="delivering",
+        ref="ref-past",
+        expires_at=h._now - 10,
+        updated_at=h._now - 200,
     )
     await h.sweeper._reconcile_startup()
     assert _row(h.store, still_future.id).state == "pending"
     assert _row(h.store, still_future.id).expires_at == future_expiry
     assert _row(h.store, already_past.id).state == "pending"
-    assert _row(h.store, already_past.id).expires_at == h._now + 300
+    assert _row(h.store, already_past.id).expires_at == h._now + 120
     assert h.post_event.calls == []  # reverting to pending is not a notice-worthy state
+
+
+async def test_startup_reconciliation_skips_recent_delivering_record() -> None:
+    """A ``delivering`` record younger than the grace is left untouched at startup."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver"))
+    record = h.seed_record(
+        id="peer_recent", state="delivering", ref="ref-recent", updated_at=h._now - 10
+    )
+    await h.sweeper._reconcile_startup()
+    assert _row(h.store, record.id).state == "delivering"
+    assert h.post_event.calls == []
+
+
+async def test_tick_reconciles_delivering_record_once_grace_elapses() -> None:
+    """A tick (not just startup) reconciles a ``delivering`` record past the grace."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver"))
+    record = h.seed_record(
+        id="peer_aged", state="delivering", ref="ref-aged", updated_at=h._now - 130
+    )
+    h.conv_store.visible_text["receiver"] = [
+        f"[Peer message ...] ref=ref-aged msg={record.id} ..."
+    ]
+    await h.sweeper._tick()
+    assert _row(h.store, record.id).state == "delivered"

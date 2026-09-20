@@ -53,12 +53,10 @@ const TASK_KIND_LABEL: Record<string, string> = {
 };
 
 // Peer-messaging back-notice: `[System: peer message <peer_id> to session
-// <receiver_id> "<title>" <state>[ (<reason>)]]`. A batched notice packs
-// several such clauses, one per line, inside ONE marker — the closing `]`
-// sits after the LAST clause rather than each one's own line — so this is
-// matched against the whole text (`[\s\S]` spans the embedded newlines)
-// instead of going through the single-line HEADER_RE dispatch below.
-const PEER_OUTCOME_WRAPPER_RE = /^\[System: (peer message [\s\S]+)\]$/;
+// <receiver_id> "<title>" <state>[ (<reason>)]]`. A batched notice is N of
+// these full markers joined by "\n" — each one closes its own `]` — not one
+// wrapper around several clauses (`format_peer_back_notice` /
+// `_maybe_flush` in peer_sweeper.py).
 const PEER_OUTCOME_CLAUSE_RE =
   /^peer message (\S+) to session (\S+) "([^"]*)" (delivered|failed|expired|refused_by_user)(?: \(([^)]*)\))?$/;
 const PEER_OUTCOME_STATE_LABEL: Record<string, string> = {
@@ -69,14 +67,19 @@ const PEER_OUTCOME_STATE_LABEL: Record<string, string> = {
 };
 
 function parsePeerOutcome(text: string): ParsedSystemMessage | null {
-  const wrapperMatch = PEER_OUTCOME_WRAPPER_RE.exec(text);
-  if (!wrapperMatch) return null;
-  const lines = wrapperMatch[1].split("\n");
-  const clauseMatch = PEER_OUTCOME_CLAUSE_RE.exec(lines[0]);
+  const lines = text.split("\n").filter((line) => line.length > 0);
+  if (lines.length === 0) return null;
+  const inners: string[] = [];
+  for (const line of lines) {
+    const headerMatch = HEADER_RE.exec(line);
+    if (!headerMatch || !PEER_OUTCOME_CLAUSE_RE.test(headerMatch[1])) return null;
+    inners.push(headerMatch[1]);
+  }
+  const clauseMatch = PEER_OUTCOME_CLAUSE_RE.exec(inners[0]);
   if (!clauseMatch) return null;
   const [, , , , state, reason] = clauseMatch;
   const label = `Peer message ${PEER_OUTCOME_STATE_LABEL[state]}${reason ? ` (${reason})` : ""}`;
-  return { kind: "peer_outcome", label, body: lines.slice(1).join("\n") };
+  return { kind: "peer_outcome", label, body: inners.slice(1).join("\n") };
 }
 
 export function parseSystemMessage(text: string): ParsedSystemMessage | null {

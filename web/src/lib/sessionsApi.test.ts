@@ -993,7 +993,7 @@ describe("getSession", () => {
 
 function peerMessageWire(overrides: Partial<Record<string, unknown>> = {}) {
   return {
-    id: "peer_abc123",
+    peer_id: "peer_abc123",
     sender_session_id: "conv_sender",
     receiver_session_id: "conv_receiver",
     correlation_id: "corr-1",
@@ -1038,7 +1038,7 @@ describe("listPeerMessages", () => {
   });
 
   it("also accepts a bare list response (no {data: ...} envelope)", async () => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse([peerMessageWire({ id: "peer_bare" })]));
+    fetchMock.mockResolvedValueOnce(mockJsonResponse([peerMessageWire({ peer_id: "peer_bare" })]));
 
     const records = await listPeerMessages("conv_receiver");
 

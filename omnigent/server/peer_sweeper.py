@@ -46,7 +46,7 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_INTERVAL_S = 2.0
 _DEFAULT_BATCH_LIMIT = 500
-_RECONCILE_GRACE_S = 300
+_RECONCILE_GRACE_S = 120
 
 TrueStateFn = Callable[[Conversation], Awaitable[tuple[str, bool | None]]]
 DeliverFn = Callable[..., Awaitable[tuple[str, str | None]]]
@@ -103,6 +103,7 @@ class PeerSweeper:
         self._clock = clock
         self._batch_limit = batch_limit
         self._parked: dict[str, list[str]] = {}
+        self._flush_locks: dict[str, asyncio.Lock] = {}
         self._app: Any | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -150,12 +151,12 @@ class PeerSweeper:
             await asyncio.sleep(self._interval)
 
     async def _tick(self) -> None:
-        """One sweep: process due records, then flush any eligible parked notices."""
+        """One sweep: process due records, reconcile stale deliveries, flush notices."""
         assert self._app is not None, "PeerSweeper.start() must run before _tick()"
         now = self._clock()
         try:
             due = await asyncio.to_thread(
-                self._store.list_due, ("pending", "queued"), self._batch_limit
+                self._store.list_due, ("pending", "queued", "held"), self._batch_limit
             )
         except Exception:
             _logger.exception("Peer sweeper failed to list due records")
@@ -165,6 +166,7 @@ class PeerSweeper:
                 await self._process_due(record, now)
             except Exception:
                 _logger.exception("Peer sweeper failed to process record %s", record.id)
+        await self._reconcile_stale_delivering(now)
         for sender_id in list(self._parked.keys()):
             if not self._parked.get(sender_id):
                 continue
@@ -200,11 +202,20 @@ class PeerSweeper:
             if moved:
                 await self._notify_for(record, "failed", "closed", receiver_title, self._app)
             return
+        if record.state == "held":
+            # Held records only expire (above) or get released by the
+            # action route (held -> pending); the sweeper never delivers
+            # one on its own.
+            return
+        # Captured before the CAS below: some store implementations hand
+        # back the same mutable row on every read, so ``record.state``
+        # itself can flip to ``delivering`` as a side effect of that CAS.
+        origin_state = record.state
         state, _runner_online = await self._true_state(receiver)
         if state != "idle":
             return
         moved = await asyncio.to_thread(
-            self._store.transition, record.id, "delivering", None, (record.state,)
+            self._store.transition, record.id, "delivering", None, (origin_state,)
         )
         if not moved:
             # Lost the CAS race — another tick (or the inline route) already
@@ -218,6 +229,14 @@ class PeerSweeper:
                 self._store.transition, record.id, "failed", "closed", ("delivering",)
             )
             return
+        # Re-check busy immediately before delivering: the CAS above awaited
+        # a store write, during which a turn can start concurrently. A
+        # Codex-native receiver is never steered mid-turn (design
+        # Decision 5) — abandon this attempt and let a later tick retry.
+        recheck_state, _recheck_runner_online = await self._true_state(receiver)
+        if recheck_state != "idle":
+            await self._revert_delivering(record, origin_state, "busy_recheck")
+            return
         request = self._synthetic_request(receiver.id, self._app)
         receiver_owner = effective_owner_id(
             receiver, self._conversation_store, self._permission_store
@@ -228,21 +247,46 @@ class PeerSweeper:
                 sender,
                 receiver,
                 record.ref,
+                record.id,
                 record.text,
                 acting_user_id=receiver_owner,
             )
         except Exception:
             # ``_deliver`` already maps its own expected failures to a
-            # reason; anything reaching here is unexpected, but the record
-            # must still leave ``delivering`` — otherwise it is orphaned,
-            # invisible to both ``list_due`` (excludes ``delivering``) and
-            # startup reconciliation (which only runs once, at boot).
+            # reason; anything reaching here is unexpected.
             _logger.exception("Peer sweeper delivery raised for record %s", record.id)
             result_state, reason = "failed", "not_ready"
+        if result_state == "failed":
+            # A transient delivery failure is not the sweeper's call to end
+            # the record — the sender chose to wait. Revert to the state it
+            # came from so the next tick retries; only the closed check
+            # above ends a record from here.
+            await self._revert_delivering(record, origin_state, reason or "not_ready")
+            return
         await asyncio.to_thread(
             self._store.transition, record.id, result_state, reason, ("delivering",)
         )
         await self._notify_for(record, result_state, reason, receiver_title, self._app)
+
+    async def _revert_delivering(
+        self, record: SessionPeerMessage, origin_state: str, reason: str
+    ) -> None:
+        """Abandon a claimed ``delivering`` record without a terminal state.
+
+        Reverts to ``origin_state`` (the state the record came from,
+        captured before the CAS to ``delivering``) so the next tick
+        retries; posts no notice, since nothing terminal happened yet from
+        the sender's point of view.
+        """
+        await asyncio.to_thread(
+            self._store.transition, record.id, origin_state, reason, ("delivering",)
+        )
+        _logger.warning(
+            "Peer sweeper reverted delivering record %s to %s (%s)",
+            record.id,
+            origin_state,
+            reason,
+        )
 
     async def _notify_for(
         self,
@@ -272,35 +316,48 @@ class PeerSweeper:
         await self._maybe_flush(sender, app)
 
     async def _maybe_flush(self, sender: Conversation, app: Any) -> None:
-        lines = self._parked.get(sender.id)
-        if not lines:
+        if not self._parked.get(sender.id):
             return
-        if is_session_closed(sender.labels, sender.title) or sender.archived_at is not None:
+        lock = self._flush_locks.setdefault(sender.id, asyncio.Lock())
+        async with lock:
+            # Take the parked lines out of the map before any await, so a
+            # concurrent flush attempt (the tick's own pass racing the
+            # action route's direct ``notify()``) sees an empty slot and
+            # bails at the top instead of posting the same lines twice; a
+            # notice that parks while we're mid-flush lands in the fresh
+            # list this leaves behind, not the one we're about to post.
+            lines = self._parked.get(sender.id)
+            if not lines:
+                return
             self._parked[sender.id] = []
-            return
-        state, _runner_online = await self._true_state(sender)
-        if state != "idle":
-            return
-        joined = "\n".join(lines)
-        self._parked[sender.id] = []
-        request = self._synthetic_request(sender.id, app)
-        sender_owner = effective_owner_id(sender, self._conversation_store, self._permission_store)
-        try:
-            await self._post_event_impl(
-                request,
-                sender.id,
-                SessionEventInput(
-                    type="message",
-                    data={"role": "user", "content": [{"type": "input_text", "text": joined}]},
-                ),
-                acting_user_id=sender_owner,
+            if is_session_closed(sender.labels, sender.title) or sender.archived_at is not None:
+                return
+            state, _runner_online = await self._true_state(sender)
+            if state != "idle":
+                self._parked[sender.id] = lines + self._parked.get(sender.id, [])
+                return
+            joined = "\n".join(lines)
+            request = self._synthetic_request(sender.id, app)
+            sender_owner = effective_owner_id(
+                sender, self._conversation_store, self._permission_store
             )
-        except Exception:
-            _logger.exception("Peer sweeper failed to post back-notice to sender %s", sender.id)
-            # Restore for a later attempt rather than silently dropping the
-            # notice; safe — a tick never re-enters this coroutine while it
-            # awaits, so no concurrent appends were lost.
-            self._parked[sender.id] = lines + self._parked.get(sender.id, [])
+            try:
+                await self._post_event_impl(
+                    request,
+                    sender.id,
+                    SessionEventInput(
+                        type="message",
+                        data={"role": "user", "content": [{"type": "input_text", "text": joined}]},
+                    ),
+                    acting_user_id=sender_owner,
+                )
+            except Exception:
+                _logger.exception(
+                    "Peer sweeper failed to post back-notice to sender %s", sender.id
+                )
+                # Restore (old lines first) for a later attempt rather than
+                # silently dropping the notice.
+                self._parked[sender.id] = lines + self._parked.get(sender.id, [])
 
     @staticmethod
     def _synthetic_request(session_id: str, app: Any) -> Request:
@@ -326,27 +383,39 @@ class PeerSweeper:
         )
 
     async def _reconcile_startup(self) -> None:
-        now = self._clock()
+        """Reconcile ``delivering`` records left behind by a crash, at boot."""
+        await self._reconcile_stale_delivering(self._clock())
+
+    async def _reconcile_stale_delivering(self, now: int) -> None:
+        """Reconcile ``delivering`` records whose last write is past the grace.
+
+        Called at startup and from every tick. A record younger than
+        ``_RECONCILE_GRACE_S`` is left alone — native acceptance precedes
+        transcript mirroring, so reconciling it this soon would risk a
+        duplicate resend of a delivery that actually succeeded; it ages
+        into a later tick's pass once the grace elapses.
+        """
         try:
             records = await asyncio.to_thread(
                 self._store.list_due, ("delivering",), self._batch_limit
             )
         except Exception:
-            _logger.exception("Peer sweeper startup reconciliation failed to list records")
+            _logger.exception("Peer sweeper failed to list delivering records")
             return
         for record in records:
+            age_from = record.updated_at if record.updated_at is not None else record.created_at
+            if now - age_from < _RECONCILE_GRACE_S:
+                continue
             try:
                 await self._reconcile_one(record, now)
             except Exception:
-                _logger.exception(
-                    "Peer sweeper startup reconciliation failed for record %s", record.id
-                )
+                _logger.exception("Peer sweeper reconciliation failed for record %s", record.id)
 
     async def _reconcile_one(self, record: SessionPeerMessage, now: int) -> None:
         matches = await asyncio.to_thread(
             self._conversation_store.search_visible_items_literal,
             record.receiver_session_id,
-            f"ref={record.ref}",
+            f"msg={record.id}",
             1,
         )
         if matches:

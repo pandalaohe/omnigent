@@ -402,6 +402,42 @@ async def test_reply_poll_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reply_poll_bounds_request_timeout_and_sleep_by_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F9: the per-request timeout shrinks to what's left of the wait budget.
+
+    Neither a 30 s request read-timeout nor a 2 s poll sleep may outlive the
+    caller's own wait budget — otherwise a short ``wait_for_reply_seconds``
+    could still block far longer than requested. A handler that eats real
+    wall-clock time on each poll drains the budget for real (poll interval
+    shrunk so the between-poll sleep itself stays cheap), so later requests'
+    timeouts are observably smaller than the first's.
+    """
+    import time
+
+    monkeypatch.setattr(tool_dispatch, "_PEER_REPLY_POLL_S", 0.1)
+    from omnigent.runner.tool_dispatch import _poll_peer_reply
+
+    seen_timeouts: list[float | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_timeouts.append(request.extensions.get("timeout", {}).get("read"))
+        time.sleep(0.3)
+        return httpx.Response(200, json=_record("pending"))
+
+    async with _client(handler) as client:
+        out = await _poll_peer_reply(client, "peer_abc123", 2)
+    assert out == {"reply": None, "reply_wait": "timed_out"}
+    assert len(seen_timeouts) >= 2
+    first, second = seen_timeouts[0], seen_timeouts[1]
+    assert first is not None and second is not None
+    assert first == pytest.approx(2.0, abs=0.05)
+    assert second < first
+    assert all(t is not None and t <= 2.0 for t in seen_timeouts)
+
+
+@pytest.mark.asyncio
 async def test_no_poll_when_wait_is_zero() -> None:
     """Default (no ``wait_for_reply_seconds``) returns at once with no ``reply``."""
     gets = 0

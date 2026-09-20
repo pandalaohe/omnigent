@@ -3292,8 +3292,13 @@ async def _poll_peer_reply(
     budget = min(max(wait_for_reply_seconds, 0), _PEER_REPLY_WAIT_MAX_S)
     deadline = _time.monotonic() + budget
     while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return {"reply": None, "reply_wait": "timed_out"}
         try:
-            resp = await server_client.get(f"/v1/peer-messages/{peer_id}", timeout=30.0)
+            resp = await server_client.get(
+                f"/v1/peer-messages/{peer_id}", timeout=min(30.0, remaining)
+            )
         except Exception:  # noqa: BLE001
             pass
         else:
@@ -3315,9 +3320,10 @@ async def _poll_peer_reply(
                         if isinstance(reason, str) and reason:
                             out["reason"] = reason
                         return out
-        if _time.monotonic() >= deadline:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
             return {"reply": None, "reply_wait": "timed_out"}
-        await asyncio.sleep(_PEER_REPLY_POLL_S)
+        await asyncio.sleep(min(_PEER_REPLY_POLL_S, remaining))
 
 
 async def _fetch_peer_reply_text(
