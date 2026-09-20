@@ -1497,9 +1497,7 @@ def register_core_routes(
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
-                last_message_preview=(
-                    previews_by_conv.get(conv.id) if include_preview else None
-                ),
+                last_message_preview=(previews_by_conv.get(conv.id) if include_preview else None),
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -1575,16 +1573,14 @@ def register_core_routes(
                         order="desc",
                         limit=10,
                     )
-                except Exception:  # noqa: BLE001 — preview is best-effort
+                except Exception:
                     per_row[conv_id] = None
                     continue
                 per_row[conv_id] = _latest_message_preview(items.data)
             return per_row
-        except Exception:  # noqa: BLE001 — preview is best-effort
+        except Exception:
             return {}
-        return {
-            conv_id: _latest_message_preview(batched.get(conv_id, [])) for conv_id in conv_ids
-        }
+        return {conv_id: _latest_message_preview(batched.get(conv_id, [])) for conv_id in conv_ids}
 
     # ── WS /sessions/updates ────────────────────────────────────
 

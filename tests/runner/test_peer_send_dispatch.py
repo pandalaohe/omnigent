@@ -442,8 +442,8 @@ async def test_flag_read_from_session_cache(monkeypatch: pytest.MonkeyPatch) -> 
             return httpx.Response(200, json={"labels": {}})
         raise AssertionError(f"unexpected {request.method} {request.url.path}")
 
-    from omnigent.runner.app import _session_peer_messaging_enabled_ref as _flag_cache
     from omnigent.runner.app import _session_inboxes_ref as _inboxes_ref
+    from omnigent.runner.app import _session_peer_messaging_enabled_ref as _flag_cache
 
     monkeypatch.setitem(_flag_cache, _CALLER, True)
     import asyncio as _asyncio
@@ -472,9 +472,9 @@ async def test_peer_opts_rejected_in_child_mode() -> None:
             return httpx.Response(200, json={"labels": {}})
         raise AssertionError(f"unexpected {request.method} {request.url.path}")
 
-    from omnigent.runner.app import _session_inboxes_ref as _inboxes_ref
-
     import asyncio as _asyncio
+
+    from omnigent.runner.app import _session_inboxes_ref as _inboxes_ref
 
     monkeypatch_queue = _asyncio.Queue()
     _inboxes_ref[_CALLER] = monkeypatch_queue  # type: ignore[assignment]
@@ -497,9 +497,9 @@ async def test_peer_opts_rejected_in_child_mode() -> None:
 @pytest.mark.asyncio
 async def test_peer_opts_rejected_in_named_mode() -> None:
     """``wait_seconds`` on a named send fails with the peer-only error."""
-    from omnigent.runner.app import _session_inboxes_ref as _inboxes_ref
-
     import asyncio as _asyncio
+
+    from omnigent.runner.app import _session_inboxes_ref as _inboxes_ref
 
     _inboxes_ref[_CALLER] = _asyncio.Queue()  # type: ignore[assignment]
     try:

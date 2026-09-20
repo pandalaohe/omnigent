@@ -3301,12 +3301,11 @@ async def _poll_peer_reply(
 
     budget = min(max(wait_for_reply_seconds, 0), _PEER_REPLY_WAIT_MAX_S)
     deadline = _time.monotonic() + budget
-    last: _JsonObject | None = None
     while True:
         try:
             resp = await server_client.get(f"/v1/peer-messages/{peer_id}", timeout=30.0)
         except Exception:  # noqa: BLE001
-            last = None
+            pass
         else:
             if resp.status_code == 200:
                 try:
@@ -3314,7 +3313,6 @@ async def _poll_peer_reply(
                 except (ValueError, json.JSONDecodeError):
                     body = None
                 if isinstance(body, dict):
-                    last = body
                     if body.get("replied_at") is not None:
                         reply_id = body.get("reply_peer_id")
                         if isinstance(reply_id, str) and reply_id:
