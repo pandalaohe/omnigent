@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  actOnPeerMessage,
   apiErrorFromResponse,
   approve,
   bindOnlyOnlineRunner,
@@ -20,6 +21,7 @@ import {
   getSessionSlim,
   importLocalSessions,
   interrupt,
+  listPeerMessages,
   listRunners,
   openSessionStream,
   postEvent,
@@ -986,6 +988,98 @@ describe("getSession", () => {
     );
     const session = await getSession("conv_top");
     expect(session.parentSessionId).toBeNull();
+  });
+});
+
+function peerMessageWire(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: "peer_abc123",
+    sender_session_id: "conv_sender",
+    receiver_session_id: "conv_receiver",
+    correlation_id: "corr-1",
+    ref: "corr-1",
+    text: "hello",
+    state: "held",
+    reason: null,
+    created_at: 1704067200,
+    updated_at: 1704067205,
+    expires_at: 1704153600,
+    reply_peer_id: null,
+    replied_at: null,
+    ...overrides,
+  };
+}
+
+describe("listPeerMessages", () => {
+  it("GETs the peer-messages endpoint with a comma-joined state filter and camelCases the data envelope", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ data: [peerMessageWire()] }));
+
+    const records = await listPeerMessages("conv_receiver", ["held", "pending", "queued"]);
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_receiver/peer-messages?state=held%2Cpending%2Cqueued");
+    expect(records).toEqual([
+      {
+        id: "peer_abc123",
+        senderSessionId: "conv_sender",
+        receiverSessionId: "conv_receiver",
+        correlationId: "corr-1",
+        ref: "corr-1",
+        text: "hello",
+        state: "held",
+        reason: null,
+        createdAtS: 1704067200,
+        updatedAtS: 1704067205,
+        expiresAtS: 1704153600,
+        replyPeerId: null,
+        repliedAtS: null,
+      },
+    ]);
+  });
+
+  it("also accepts a bare list response (no {data: ...} envelope)", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse([peerMessageWire({ id: "peer_bare" })]));
+
+    const records = await listPeerMessages("conv_receiver");
+
+    expect(records).toHaveLength(1);
+    expect(records[0].id).toBe("peer_bare");
+  });
+
+  it("url-encodes the session id", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ data: [] }));
+    await listPeerMessages("conv/with slash");
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/v1/sessions/conv%2Fwith%20slash/peer-messages");
+  });
+});
+
+describe("actOnPeerMessage", () => {
+  it("POSTs the action body and returns the camelCased record", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(peerMessageWire({ state: "pending" })),
+    );
+
+    const record = await actOnPeerMessage("conv_receiver", "peer_abc123", "release");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_receiver/peer-messages/peer_abc123/action");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ action: "release" });
+    expect(record.state).toBe("pending");
+  });
+
+  it("surfaces a 409 (not actionable) as a thrown ApiError", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "conflict", message: "Record is no longer actionable." } },
+        { ok: false, status: 409 },
+      ),
+    );
+
+    await expect(actOnPeerMessage("conv_receiver", "peer_abc123", "refuse")).rejects.toMatchObject(
+      { status: 409, code: "conflict" },
+    );
   });
 });
 
