@@ -4274,6 +4274,7 @@ def server(
 
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignmentStore
+    from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
         SqlAlchemyProjectHostBindingStore,
@@ -4297,6 +4298,7 @@ def server(
     project_repository_store = SqlAlchemyProjectRepositoryStore(db_uri)
     project_host_binding_store = SqlAlchemyProjectHostBindingStore(db_uri)
     assignment_store = SqlAlchemyAssignmentStore(db_uri)
+    peer_message_store = SqlAlchemyPeerMessageStore(db_uri)
     user_preferences_store = SqlAlchemyUserPreferencesStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
@@ -4487,6 +4489,7 @@ def server(
         project_repository_store=project_repository_store,
         project_host_binding_store=project_host_binding_store,
         assignment_store=assignment_store,
+        peer_message_store=peer_message_store,
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,

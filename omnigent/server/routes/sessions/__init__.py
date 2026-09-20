@@ -684,6 +684,7 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 
 # isort: on
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.schemas import (
     AgentObject,
     AutomaticSessionRenameRequest,
@@ -735,6 +736,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
 )
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
@@ -806,6 +808,8 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    feature_flags: FeatureFlags | None = None,
+    peer_message_store: PeerMessageStore | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -968,6 +972,8 @@ def create_sessions_router(
         host_registry=host_registry,
         background_title_coordinator=background_title_coordinator,
         runner_tunnel_tokens=runner_tunnel_tokens,
+        feature_flags=feature_flags,
+        peer_message_store=peer_message_store,
     )
 
     register_permissions_routes(

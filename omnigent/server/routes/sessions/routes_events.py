@@ -72,6 +72,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.native_subagent_watchdog import (
     NativeSubagentWatchdog,
@@ -260,6 +261,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
+from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -699,6 +701,8 @@ def register_events_routes(
     host_registry: HostRegistry | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     runner_tunnel_tokens: frozenset[str] | None = None,
+    feature_flags: FeatureFlags | None = None,
+    peer_message_store: PeerMessageStore | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
@@ -793,6 +797,29 @@ def register_events_routes(
             )
 
     router.include_router(event_router)
+
+    async def _peer_post_event(
+        request: Request,
+        session_id: str,
+        body: SessionEventInput,
+    ) -> dict[str, bool | str | None]:
+        return await _post_event_impl(request, session_id, body)
+
+    from omnigent.server.routes.sessions.routes_peer import register_peer_routes
+
+    register_peer_routes(
+        router,
+        post_event_impl=_peer_post_event,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+        liveness_lookup=liveness_lookup,
+        runner_tunnel_tokens=runner_tunnel_tokens,
+        feature_flags=feature_flags,
+        peer_message_store=peer_message_store,
+        runner_router=runner_router,
+        agent_store=agent_store,
+    )
 
     async def _post_event_impl(
         request: Request,
