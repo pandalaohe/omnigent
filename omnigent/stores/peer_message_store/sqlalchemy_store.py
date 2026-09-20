@@ -143,9 +143,7 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                 select(SqlSessionPeerMessage)
                 .where(SqlSessionPeerMessage.workspace_id == current_workspace_id())
                 .where(SqlSessionPeerMessage.state.in_(sorted(states)))
-                .order_by(
-                    asc(SqlSessionPeerMessage.expires_at), asc(SqlSessionPeerMessage.id)
-                )
+                .order_by(asc(SqlSessionPeerMessage.expires_at), asc(SqlSessionPeerMessage.id))
                 .limit(limit)
             )
             rows = session.execute(stmt).scalars().all()
