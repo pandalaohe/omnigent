@@ -4546,6 +4546,9 @@ async def _ensure_runner_session_initialized(
                     project_assignments_enabled=resolve_feature_flags().enabled(
                         Feature.PROJECT_ASSIGNMENTS
                     ),
+                    peer_messaging_enabled=resolve_feature_flags().enabled(
+                        Feature.SESSION_PEER_MESSAGING
+                    ),
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )

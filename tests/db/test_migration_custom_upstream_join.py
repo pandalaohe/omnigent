@@ -61,7 +61,7 @@ def test_join_preserves_existing_data(tmp_path: Path, start: str, manual: bool) 
     assert "background_session_titles_enabled" not in columns
     assert "preferences" in columns
     with engine.connect() as conn:
-        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "a10c20260910"
+        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "a13c20260920"
         assert conn.scalar(sa.text("SELECT name FROM hosts WHERE host_id = 'host'")) == "preserved"
         if custom:
             assert (

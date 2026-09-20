@@ -24,6 +24,7 @@ class Feature(StrEnum):
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
     PROJECT_ASSIGNMENTS = "project_assignments"
+    SESSION_PEER_MESSAGING = "session_peer_messaging"
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.PROJECT_ASSIGNMENTS,
         description="Cross-host project collaboration: host bindings and durable assignments",
+        owner="server",
+        review_by_release="0.16.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SESSION_PEER_MESSAGING,
+        description=(
+            "Peer messaging between sessions the same user owns: "
+            "durable records, receiver policy, sweeper"
+        ),
         owner="server",
         review_by_release="0.16.0",
     ),

@@ -520,6 +520,9 @@ def register_core_routes(
                     project_assignments_enabled=request.app.state.feature_flags.enabled(
                         Feature.PROJECT_ASSIGNMENTS
                     ),
+                    peer_messaging_enabled=request.app.state.feature_flags.enabled(
+                        Feature.SESSION_PEER_MESSAGING
+                    ),
                 )
             except Exception:
                 # Must not fail the request; the fallback drops the seeded

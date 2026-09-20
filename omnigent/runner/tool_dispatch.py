@@ -531,6 +531,7 @@ def build_native_relay_tool_schemas(
     spec: AgentSpec | None,
     *,
     project_assignments_enabled: bool = False,
+    peer_messaging_enabled: bool = False,
 ) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
@@ -550,6 +551,8 @@ def build_native_relay_tool_schemas(
         gate can't be evaluated without the spec), mirroring the relay.
     :param project_assignments_enabled: When ``True`` the seven
         ``sys_assignment_*`` tools join the surface; otherwise none do.
+    :param peer_messaging_enabled: When ``True`` a no-spawn spec still
+        registers ``sys_session_send`` in by-id mode for peer sends.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -594,7 +597,9 @@ def build_native_relay_tool_schemas(
         from omnigent.tools.manager import ToolManager
 
         for schema in ToolManager(
-            spec, project_assignments_enabled=project_assignments_enabled
+            spec,
+            project_assignments_enabled=project_assignments_enabled,
+            peer_messaging_enabled=peer_messaging_enabled,
         ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
@@ -644,6 +649,16 @@ def build_native_relay_tool_schemas(
                 fallback_schema = _string_object_dict(_cls().get_schema())
                 if fallback_schema is None:
                     continue
+                function = _string_object_dict(fallback_schema.get("function"))
+                if function is not None:
+                    _append(function)
+        if peer_messaging_enabled:
+            # No-spec fallback mirrors the manager's flag rule: by-id send
+            # only, so spec-less native sessions stay peer senders.
+            from omnigent.tools.builtins.spawn import SysSessionSendTool
+
+            fallback_schema = _string_object_dict(SysSessionSendTool(sub_specs={}).get_schema())
+            if fallback_schema is not None:
                 function = _string_object_dict(fallback_schema.get("function"))
                 if function is not None:
                     _append(function)

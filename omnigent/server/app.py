@@ -139,6 +139,7 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.assignment_store import AssignmentStore
+from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
 from omnigent.stores.host_store import HostStore
@@ -1137,6 +1138,7 @@ def create_app(
     project_repository_store: ProjectRepositoryStore | None = None,
     project_host_binding_store: ProjectHostBindingStore | None = None,
     assignment_store: AssignmentStore | None = None,
+    peer_message_store: PeerMessageStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1202,6 +1204,9 @@ def create_app(
     :param assignment_store: Store for assignments, attempts and messages.
         Mounts the assignments router only together with ``project_store``,
         ``project_repository_store`` and ``conversation_store``.
+    :param peer_message_store: Store for durable session peer-message
+        records. Wired onto ``app.state`` for the peer-message routes
+        (a later task) and the delivery sweeper; no route in this task.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -1388,6 +1393,7 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
         project_assignments_enabled=resolved_feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS),
+        peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1698,6 +1704,7 @@ def create_app(
     # Expose the registry on app.state so integration tests and
     # diagnostics can verify that the production app wires the route
     # and WSTunnelTransport to the same session registry.
+    app.state.peer_message_store = peer_message_store
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.cli_retention_coordinator = cli_retention_coordinator

@@ -1122,12 +1122,15 @@ class _CommentRelayBinding:
         e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
     :param project_assignments_enabled: Flag the surface was built with; a
         flip rebuilds the relay like an agent switch does.
+    :param peer_messaging_enabled: Flag the surface was built with; a
+        flip rebuilds the relay like an agent switch does.
     """
 
     relay: ClaudeNativeToolRelay
     spec_entry: _SpecEntry | None
     bridge_dir: Path
     project_assignments_enabled: bool = False
+    peer_messaging_enabled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2843,6 +2846,9 @@ def create_runner_app(
     # session_id → project-assignments flag from the init snapshot. Kept
     # beside the other snapshot dicts: the raw envelope cache is TTL'd.
     _session_project_assignments_enabled: dict[str, bool] = {}
+    # session_id → peer-messaging flag from the init snapshot. Same
+    # placement and lifecycle as the project-assignments one above.
+    _session_peer_messaging_enabled: dict[str, bool] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -3601,6 +3607,7 @@ def create_runner_app(
     async def _load_legacy_session_init_context(session_id: str) -> _SessionInitContext:
         await _get_server_version(server_client)
         _session_project_assignments_enabled.pop(session_id, None)
+        _session_peer_messaging_enabled.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
         return _SessionInitContext(envelope=None)
 
@@ -3632,6 +3639,7 @@ def create_runner_app(
         if snapshot.reasoning_effort:
             _session_reasoning_effort[session_id] = snapshot.reasoning_effort
         _session_project_assignments_enabled[session_id] = snapshot.project_assignments_enabled
+        _session_peer_messaging_enabled[session_id] = snapshot.peer_messaging_enabled
         # A re-init may flip the flag: drop the cached tool surface so the
         # next turn rebuilds it with the new value.
         _session_tool_schemas.pop(session_id, None)
@@ -3940,6 +3948,8 @@ def create_runner_app(
         if _stale_relay is not None and (
             _stale_relay.project_assignments_enabled
             != _session_project_assignments_enabled.get(session_id, False)
+            or _stale_relay.peer_messaging_enabled
+            != _session_peer_messaging_enabled.get(session_id, False)
         ):
             await _ensure_comment_relay_started(
                 session_id, explicit_bridge_dir=_stale_relay.bridge_dir
@@ -4150,6 +4160,7 @@ def create_runner_app(
                 project_assignments_enabled=_session_project_assignments_enabled.get(
                     session_id, False
                 ),
+                peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -4819,6 +4830,7 @@ def create_runner_app(
         _session_init_envelopes.pop(session_id, None)
         _session_reasoning_effort.pop(session_id, None)
         _session_project_assignments_enabled.pop(session_id, None)
+        _session_peer_messaging_enabled.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -7737,11 +7749,13 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         flag_for_relay = _session_project_assignments_enabled.get(session_id, False)
+        peer_for_relay = _session_peer_messaging_enabled.get(session_id, False)
         current = _session_comment_relays.get(session_id)
         if (
             current is not None
             and current.spec_entry is spec_entry
             and current.project_assignments_enabled == flag_for_relay
+            and current.peer_messaging_enabled == peer_for_relay
             and known_bridge_dir is None
         ):
             return
@@ -7765,6 +7779,7 @@ def create_runner_app(
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
             and current.project_assignments_enabled == flag_for_relay
+            and current.peer_messaging_enabled == peer_for_relay
         ):
             return
 
@@ -7773,6 +7788,7 @@ def create_runner_app(
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
             _unwrap_spec_entry(spec_entry),
             project_assignments_enabled=flag_for_relay,
+            peer_messaging_enabled=peer_for_relay,
         )
 
         _captured_session_id = session_id
@@ -7815,6 +7831,7 @@ def create_runner_app(
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             project_assignments_enabled=flag_for_relay,
+            peer_messaging_enabled=peer_for_relay,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -8181,6 +8198,7 @@ def create_runner_app(
                         project_assignments_enabled=_session_project_assignments_enabled.get(
                             conv, False
                         ),
+                        peer_messaging_enabled=_session_peer_messaging_enabled.get(conv, False),
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -8480,6 +8498,7 @@ def create_runner_app(
                         project_assignments_enabled=_session_project_assignments_enabled.get(
                             conv_id, False
                         ),
+                        peer_messaging_enabled=_session_peer_messaging_enabled.get(conv_id, False),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
                     resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
@@ -10041,6 +10060,7 @@ def create_runner_app(
                 project_assignments_enabled=_session_project_assignments_enabled.get(
                     session_id, False
                 ),
+                peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None

@@ -55,6 +55,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     archive_fenced: bool = False
     archive_states: list[RunnerArchiveState] = Field(default_factory=list)
     project_assignments_enabled: bool = False
+    peer_messaging_enabled: bool = False
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -83,6 +84,7 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     archive_states: list[RunnerArchiveState] | None = None,
     project_assignments_enabled: bool = False,
+    peer_messaging_enabled: bool = False,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     if conversation.agent_id is None:
@@ -116,6 +118,7 @@ def build_runner_session_init_payload(
             archive_fenced=own_archive_state.archived,
             archive_states=effective_archive_states,
             project_assignments_enabled=project_assignments_enabled,
+            peer_messaging_enabled=peer_messaging_enabled,
         ),
     )
     return {

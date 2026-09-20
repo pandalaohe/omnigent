@@ -2281,3 +2281,94 @@ class SqlAssignmentMessage(OmnigentBase):
             "id",
         ),
     )
+
+
+class SqlSessionPeerMessage(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_peer_messages`` table.
+
+    Durable peer messages between two sessions the same user owns: the
+    server stores a record whenever a send cannot be delivered inline
+    (receiver busy, offline, policy hold) and a background sweeper
+    delivers, expires, or fails it. Delivered messages become ordinary
+    conversation items; the record keeps the disposition and reply.
+
+    :param id: UUID primary key (see :class:`Uuid16`), surfaced as a bare
+        32-char hex string (no dashes).
+    :param sender_session_id: The sending session (relates to
+        ``conversations.id``). No DB foreign key (Rule R032).
+    :param receiver_session_id: The receiving session (relates to
+        ``conversations.id``). No DB foreign key (Rule R032).
+    :param correlation_id: Optional caller correlation id (≤ 64 chars),
+        used to thread replies and bound per-thread record counts.
+    :param ref: ``correlation_id`` or the id hex — the envelope always
+        carries it so a reply can be matched to this record.
+    :param text: Message text. Opaque free text, never SQL-filtered —
+        stored compressed (CompressedText).
+    :param state: ``pending``/``queued``/``held``/``delivering``/
+        ``delivered``/``failed``/``expired``/``refused_by_user``.
+    :param reason: Short disposition classification (e.g. ``offline``,
+        ``closed``, ``feature_disabled``), or ``None``.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    :param expires_at: Unix epoch seconds the sweeper expires the record.
+    :param reply_peer_id: The reply record's id (relates to
+        ``session_peer_messages.id``), or ``None``. No DB foreign key
+        (Rule R032).
+    :param replied_at: Unix epoch seconds the reply was recorded, or
+        ``None``.
+    """
+
+    __tablename__ = "session_peer_messages"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relate to conversations.id. No DB foreign keys (Rule R032); cascade
+    # is app-owned.
+    sender_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    receiver_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ref: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Opaque free text, never SQL-queried — stored compressed (CompressedText).
+    text: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Relates to session_peer_messages.id. No DB foreign key (Rule R032).
+    reply_peer_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    replied_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        # Receiver-side reads: the sweeper and the held panel.
+        Index(
+            "ix_session_peer_messages_receiver",
+            "workspace_id",
+            "receiver_session_id",
+            "state",
+            "id",
+        ),
+        # Sender-side reads: dispositions and back-notices.
+        Index(
+            "ix_session_peer_messages_sender",
+            "workspace_id",
+            "sender_session_id",
+            "created_at",
+            "id",
+        ),
+        # Reply matching by envelope ref.
+        Index(
+            "ix_session_peer_messages_ref",
+            "workspace_id",
+            "ref",
+            "id",
+        ),
+    )

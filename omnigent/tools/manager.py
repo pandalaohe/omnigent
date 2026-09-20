@@ -116,6 +116,7 @@ class ToolManager:
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
         project_assignments_enabled: bool = False,
+        peer_messaging_enabled: bool = False,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -147,8 +148,14 @@ class ToolManager:
             seven ``sys_assignment_*`` tools auto-register so agents
             can hand work across hosts; when ``False`` none of them
             registers.
+        :param peer_messaging_enabled: Server-owned release flag
+            carried in the session-init snapshot. When ``True`` a
+            session with no spawn grant still registers
+            ``sys_session_send`` in by-id mode so it can message a
+            peer session.
         """
         self._spec = spec
+        self._peer_messaging_enabled = peer_messaging_enabled
         self._workdir = workdir
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
@@ -513,7 +520,14 @@ class ToolManager:
             )
 
         # send + close: opt-in via declared sub-agents or spawn: true.
+        # The peer-messaging flag makes every session a peer sender: with
+        # no spawn grant it still registers send (by-id mode, empty
+        # sub_specs) so it can reach a peer session.
         if not (self._spec.tools.agents or self._spec.spawn):
+            if self._peer_messaging_enabled:
+                self._tools[SysSessionSendTool.name()] = SysSessionSendTool(
+                    sub_specs={},
+                )
             return
 
         sub_specs = {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}

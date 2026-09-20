@@ -2173,6 +2173,7 @@ async def _auto_create_pi_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     project_assignments_enabled: bool = False,
+    peer_messaging_enabled: bool = False,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -2188,6 +2189,8 @@ async def _auto_create_pi_terminal(
         spec; callers must not pass ``None`` to paper over a resolution error.
     :param project_assignments_enabled: Gates the assignment tools on the
         relay surface, from the session's init snapshot.
+    :param peer_messaging_enabled: Registers ``sys_session_send`` in
+        by-id mode on the relay surface, from the session's init snapshot.
     :returns: Created terminal resource view.
     """
     await _cancel_auto_forwarder_task(session_id)
@@ -2248,7 +2251,9 @@ async def _auto_create_pi_terminal(
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
         pi_tools = build_native_relay_tool_schemas(
-            spec_for_tools, project_assignments_enabled=project_assignments_enabled
+            spec_for_tools,
+            project_assignments_enabled=project_assignments_enabled,
+            peer_messaging_enabled=peer_messaging_enabled,
         )
     except Exception:  # noqa: BLE001 — tool registration is additive
         _logger.warning(
@@ -8020,6 +8025,7 @@ class NativeLaunchContext:
     agent_name: str | None = None
     session_init: RunnerSessionInitEnvelope | None = None
     project_assignments_enabled: bool = False
+    peer_messaging_enabled: bool = False
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
@@ -8054,6 +8060,7 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         ensure_comment_relay=ctx.ensure_comment_relay,
         project_assignments_enabled=ctx.project_assignments_enabled,
+        peer_messaging_enabled=ctx.peer_messaging_enabled,
     )
 
 

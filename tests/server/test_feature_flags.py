@@ -24,6 +24,7 @@ def test_features_default_off() -> None:
         "harness_install": False,
         "canvas": False,
         "project_assignments": False,
+        "session_peer_messaging": False,
     }
 
 
@@ -77,6 +78,14 @@ def test_snapshot_is_immutable_and_does_not_follow_environment_mutation() -> Non
     assert not flags.enabled(Feature.HARNESS_INSTALL)
     with pytest.raises(dataclasses.FrozenInstanceError):
         flags.enabled_features = frozenset()  # type: ignore[misc]
+
+
+def test_session_peer_messaging_flag_resolves() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "session_peer_messaging"})
+
+    assert flags.enabled(Feature.SESSION_PEER_MESSAGING)
+    assert flags.frontend_dict()["session_peer_messaging"] is True
+    assert flags.enabled_names() == ("session_peer_messaging",)
 
 
 def test_release_flags_have_lifecycle_metadata_and_default_off() -> None:
