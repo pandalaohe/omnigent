@@ -2233,7 +2233,6 @@ class _PeerSendOpts:
     wait_seconds: int = 0
     wait_for_reply_seconds: int = 0
     present: bool = False
-    named_mode_present: bool = False
 
 
 def _peer_messaging_enabled_for(conversation_id: str | None) -> bool:
@@ -2276,7 +2275,6 @@ def _peer_send_opts_from_args(args: _JsonObject) -> _PeerSendOpts:
     raw_correlation = args.get("correlation_id")
     if raw_correlation is not None:
         opts.present = True
-        opts.named_mode_present = True
         if not isinstance(raw_correlation, str) or not raw_correlation:
             raise ValueError("'correlation_id' must be a non-empty string when provided")
         if len(raw_correlation) > 64:
@@ -2285,7 +2283,6 @@ def _peer_send_opts_from_args(args: _JsonObject) -> _PeerSendOpts:
     raw_wait = args.get("wait_seconds")
     if raw_wait is not None:
         opts.present = True
-        opts.named_mode_present = True
         if isinstance(raw_wait, bool) or not isinstance(raw_wait, int):
             raise ValueError("'wait_seconds' must be an integer when provided")
         if raw_wait < 0 or raw_wait > 3600:
@@ -2294,7 +2291,6 @@ def _peer_send_opts_from_args(args: _JsonObject) -> _PeerSendOpts:
     raw_reply_wait = args.get("wait_for_reply_seconds")
     if raw_reply_wait is not None:
         opts.present = True
-        opts.named_mode_present = True
         if isinstance(raw_reply_wait, bool) or not isinstance(raw_reply_wait, int):
             raise ValueError("'wait_for_reply_seconds' must be an integer when provided")
         if raw_reply_wait < 0 or raw_reply_wait > 600:
@@ -2518,12 +2514,6 @@ async def _execute_subagent_tool(
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'cost_budget' to continue "
                 f"session {target_session_id!r}."
-            )
-        if peer_opts.named_mode_present:
-            return (
-                "Error: sys_session_send 'correlation_id'/'wait_seconds'/"
-                "'wait_for_reply_seconds' apply only to peer sends; they cannot "
-                f"change an existing child session {target_session_id!r}."
             )
         dispatch_created_by = await _session_turn_actor(
             server_client=server_client,
@@ -3436,6 +3426,14 @@ async def _send_to_existing_session(
                     "sys_session_send by session_id is child-only."
                 ),
             }
+        )
+    if correlation_id is not None or wait_seconds or wait_for_reply_seconds:
+        # Only a direct child reaches here; the peer-only options are
+        # meaningful solely on the peer route taken above.
+        return (
+            "Error: sys_session_send 'correlation_id'/'wait_seconds'/"
+            "'wait_for_reply_seconds' apply only to peer sends; they cannot "
+            f"change an existing child session {target_session_id!r}."
         )
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(

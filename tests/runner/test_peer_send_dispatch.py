@@ -462,6 +462,40 @@ async def test_flag_read_from_session_cache(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_peer_opts_reach_peer_route_by_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``correlation_id`` on a by-id send to a non-child rides the peer route."""
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{_TARGET}":
+            return httpx.Response(200, json=_snapshot(parent="conv_other"))
+        if request.method == "POST" and request.url.path.endswith("/peer-messages"):
+            posted.append(json.loads(request.content))
+            return httpx.Response(200, json=_send_response())
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{_CALLER}":
+            return httpx.Response(200, json={"labels": {}})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    import asyncio as _asyncio
+
+    from omnigent.runner.app import _session_inboxes_ref as _inboxes_ref
+    from omnigent.runner.app import _session_peer_messaging_enabled_ref as _flag_cache
+
+    monkeypatch.setitem(_flag_cache, _CALLER, True)
+    monkeypatch.setitem(_inboxes_ref, _CALLER, _asyncio.Queue())
+    async with _client(handler) as client:
+        out = json.loads(
+            await _execute_subagent_tool(
+                {"session_id": _TARGET, "args": "hello peer", "correlation_id": "corr_1"},
+                server_client=client,
+                conversation_id=_CALLER,
+            )
+        )
+    assert out["peer"] is True
+    assert posted and posted[0].get("correlation_id") == "corr_1"
+
+
+@pytest.mark.asyncio
 async def test_peer_opts_rejected_in_child_mode() -> None:
     """``correlation_id`` on a direct-child send fails with the peer-only error."""
 
