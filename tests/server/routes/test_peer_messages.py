@@ -665,6 +665,22 @@ async def test_native_item_id_without_pending_id_is_not_ready(
     native = conv_store.create_conversation(title="native-recv", agent_id=AGENT_ID, runner_id="rn")
     peer_env["perm_store"].grant(ALICE, native.id, LEVEL_OWNER)
     monkeypatch.setattr(peer_module, "_is_native_terminal_session", lambda _conv: True)
+
+    async def _present_runner_client(
+        session_id: str, runner_router: Any = None, **kwargs: Any
+    ) -> Any:
+        del session_id, runner_router, kwargs
+        return object()
+
+    monkeypatch.setattr(peer_module, "_get_runner_client", _present_runner_client)
+
+    async def _ready_ok(runner_client: Any, session_id: str, conv: Any, **kwargs: Any) -> Any:
+        del runner_client, session_id, conv, kwargs
+        from omnigent.server.routes.sessions import _NativeTerminalEnsureOutcome
+
+        return _NativeTerminalEnsureOutcome(error=None)
+
+    monkeypatch.setattr(peer_module, "_ensure_native_terminal_ready", _ready_ok)
     peer_env["fake"].outcome = {"queued": True, "item_id": "item_fail"}
     try:
         resp = await peer_client.post(
@@ -812,6 +828,53 @@ async def test_relaunchable_receiver_delivers_inline(
     finally:
         peer_env["offline_ids"].discard(receiver.id)
         peer_env["host_online_ids"].discard(receiver.id)
+
+
+async def test_unroutable_runner_treated_as_dead_for_delivery(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F5: a native runner no replica can route to is dead for delivery.
+
+    Scripted liveness reads ``runner_online=True`` (the ``runner_last_seen``
+    stamp outlives an ungraceful death for ``RUNNER_LIVENESS_TTL_S``), but
+    ``_get_runner_client`` returns ``None``. On a live host the send must
+    deliver through the events path (which relaunches), reporting
+    ``runner_online False``; with the host down it must fail offline.
+    """
+    sender = peer_env["sender"]
+    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
+    target = conv_store.create_conversation(
+        title="dead-runner", agent_id=AGENT_ID, runner_id="rdead"
+    )
+    peer_env["perm_store"].grant(ALICE, target.id, LEVEL_OWNER)
+    # Liveness still reads runner_online=True (stale stamp); the host is live.
+    peer_env["host_online_ids"].add(target.id)
+    monkeypatch.setattr(peer_module, "_is_native_terminal_session", lambda _conv: True)
+    monkeypatch.setattr(peer_module, "_get_runner_client", _null_runner_client())
+    peer_env["fake"].outcome = {"queued": True, "pending_id": "pending_1"}
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{target.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"f5-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert resp.json()["disposition"] == "delivered", resp.text
+        assert resp.json()["receiver"]["runner_online"] is False
+        # Host down too: the same unroutable runner is offline, not relaunchable.
+        peer_env["host_online_ids"].discard(target.id)
+        resp = await peer_client.post(
+            f"/v1/sessions/{target.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"f5b-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert resp.json()["disposition"] == "failed", resp.text
+        assert resp.json()["reason"] == "offline"
+        assert resp.json()["receiver"]["runner_online"] is False
+    finally:
+        peer_env["host_online_ids"].discard(target.id)
+        peer_env["fake"].outcome = {"queued": True, "item_id": "item_1"}
 
 
 # ── guards ──────────────────────────────────────────────────────────

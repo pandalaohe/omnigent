@@ -501,7 +501,14 @@ def register_peer_routes(
             if native:
                 runner_client = await _get_runner_client(conv.id, runner_router, conversation=conv)
                 if runner_client is None:
-                    terminal_ready = False
+                    # The liveness stamp can outlive an ungraceful runner death
+                    # for up to RUNNER_LIVENESS_TTL_S; a runner no replica can
+                    # route to is dead for delivery, and the events path
+                    # relaunches it — so reclassify instead of probing.
+                    runner_online = False
+                    relaunchable = host_online is True
+                    if not relaunchable:
+                        return "offline", runner_online
                 else:
                     try:
                         outcome = await _ensure_native_terminal_ready(
