@@ -2846,6 +2846,9 @@ class SessionListItem(BaseModel):
         matched in its body. Present whenever the query hit an item body
         (even if the title also matched); ``None`` on non-search reads and
         when only the title matched.
+    :param last_message_preview: Single-line excerpt of the session's
+        newest visible message. Present only when the list request
+        passes ``include_preview=true``.
     """
 
     id: str
@@ -2885,6 +2888,12 @@ class SessionListItem(BaseModel):
     # unfiled. Lets the sidebar group sessions by project without a follow-up
     # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
     project_id: str | None = None
+    # Single-line excerpt of the session's newest visible message, e.g.
+    # ``"I'll search the codebase for references…"``. Present only when
+    # the list request passes ``include_preview=true``; ``None`` otherwise
+    # (absent on the wire via ``exclude_none``). Lets an agent pick a
+    # peer by recent work without opening each transcript.
+    last_message_preview: str | None = None
 
 
 class SessionList(BaseModel):

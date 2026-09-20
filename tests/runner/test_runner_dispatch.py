@@ -7257,7 +7257,9 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
     # Both sessions projected with status + connectivity from the single
-    # shared-runner status lookup.
+    # shared-runner status lookup. Discovery rows also carry project,
+    # workspace, activity and excerpt keys (None when the server omits
+    # them — the fake rows here carry no preview fields).
     assert out["sessions"] == [
         {
             "session_id": "s1",
@@ -7267,6 +7269,10 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "project_id": None,
+            "workspace": None,
+            "updated_at": None,
+            "last_message_preview": None,
         },
         {
             "session_id": "s2",
@@ -7276,6 +7282,10 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "project_id": None,
+            "workspace": None,
+            "updated_at": None,
+            "last_message_preview": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share

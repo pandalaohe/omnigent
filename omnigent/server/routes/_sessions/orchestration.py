@@ -1126,6 +1126,7 @@ def _build_session_list_item(
     comments_fingerprint: CommentsFingerprint | None,
     activity_unverified_child_ids: set[str] | None = None,
     agent_template_ids: Mapping[str, str] | None = None,
+    last_message_preview: str | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1167,6 +1168,9 @@ def _build_session_list_item(
         wired — emitted as ``comments_count=0`` /
         ``comments_updated_at=None`` so the two states look identical
         on the wire.
+    :param last_message_preview: Single-line excerpt of the newest
+        visible message, or ``None`` when the list request did not ask
+        for previews.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -1269,6 +1273,7 @@ def _build_session_list_item(
         ),
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
+        last_message_preview=last_message_preview,
     )
 
 

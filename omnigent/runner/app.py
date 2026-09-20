@@ -2697,6 +2697,24 @@ _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 # used by the sub-agent work registry to deliver completions to the parent.
 _session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
 
+# Module-level refs to the per-session release flags from the init snapshot.
+# Populated inside create_runner_app; read by tool_dispatch dispatch paths
+# (e.g. the sys_session_send peer branch) that have the conversation id but
+# no flag kwarg. Kept beside the other snapshot dicts: the raw envelope
+# cache is TTL'd.
+_session_project_assignments_enabled_ref: dict[str, bool] = {}
+_session_peer_messaging_enabled_ref: dict[str, bool] = {}
+
+
+def get_session_peer_messaging_enabled(session_id: str) -> bool:
+    """
+    Return the session's cached peer-messaging flag, defaulting off.
+
+    :param session_id: Session/conversation ID, e.g. ``"conv_abc123"``.
+    :returns: ``True`` when the session initialized with the flag on.
+    """
+    return _session_peer_messaging_enabled_ref.get(session_id, False)
+
 
 def get_session_agent_id(session_id: str) -> str | None:
     """
@@ -2845,10 +2863,12 @@ def create_runner_app(
     _session_reasoning_effort: dict[str, str] = {}
     # session_id → project-assignments flag from the init snapshot. Kept
     # beside the other snapshot dicts: the raw envelope cache is TTL'd.
-    _session_project_assignments_enabled: dict[str, bool] = {}
+    # Aliased to the module-level ref so dispatch paths can read the flag
+    # with only a conversation id.
+    _session_project_assignments_enabled = _session_project_assignments_enabled_ref
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
-    _session_peer_messaging_enabled: dict[str, bool] = {}
+    _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}

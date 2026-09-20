@@ -527,6 +527,7 @@ class ToolManager:
             if self._peer_messaging_enabled:
                 self._tools[SysSessionSendTool.name()] = SysSessionSendTool(
                     sub_specs={},
+                    peer_enabled=True,
                 )
             return
 

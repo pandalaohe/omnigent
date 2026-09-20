@@ -128,3 +128,47 @@ def test_empty_file_id_rejected() -> None:
 def test_file_ids_non_string_item_rejected() -> None:
     with pytest.raises(jsonschema.ValidationError):
         _validate({"input": "go", "file_ids": [123]})
+
+
+# ── Peer options (T4) ───────────────────────────────────
+
+
+def _top_properties(*, peer_enabled: bool = False) -> dict:
+    """:returns: Top-level parameter properties of the send schema."""
+    schema = _build_sys_session_send_schema({}, peer_enabled=peer_enabled)
+    return schema["function"]["parameters"]["properties"]
+
+
+def test_peer_options_present_with_bounds() -> None:
+    """``correlation_id`` / ``wait_seconds`` / ``wait_for_reply_seconds`` ranges."""
+    props = _top_properties()
+    assert props["correlation_id"]["maxLength"] == 64
+    assert (props["wait_seconds"]["minimum"], props["wait_seconds"]["maximum"]) == (0, 3600)
+    assert props["wait_seconds"]["default"] == 0
+    assert (props["wait_for_reply_seconds"]["minimum"], props["wait_for_reply_seconds"]["maximum"]) == (
+        0,
+        600,
+    )
+    assert props["wait_for_reply_seconds"]["default"] == 0
+
+
+def test_session_id_description_advertises_peer_sends() -> None:
+    """The by-id text names peer messaging and the ``sys_session_list`` source."""
+    desc = _top_properties()["session_id"]["description"]
+    assert "peer messaging is enabled" in desc
+    assert "sys_session_list" in desc
+    assert "not from its user" in desc
+
+
+def test_send_description_mentions_peer_mode() -> None:
+    """The named-mode description points at peer sends for the by-id mode."""
+    desc = _schema_with_subagent()["function"]["description"]
+    assert "peer messaging is enabled" in desc
+
+
+def test_by_id_description_mentions_peer_when_flagged() -> None:
+    """The empty-spec variant advertises peers only with ``peer_enabled``."""
+    plain = _build_sys_session_send_schema({})["function"]["description"]
+    assert "peer messaging is enabled" not in plain
+    peer = _build_sys_session_send_schema({}, peer_enabled=True)["function"]["description"]
+    assert "peer messaging is enabled" in peer

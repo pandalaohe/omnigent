@@ -157,17 +157,29 @@ class SysSessionSendTool(Tool):
             f"runtime posts `{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session "
             "as a new message, starting a turn for you if you are idle. That "
             "notice comes from the runtime, not from a person; respond by "
-            "calling sys_read_inbox to collect the result."
+            "calling sys_read_inbox to collect the result. "
+            "By-session-id mode addresses an existing child, or — when peer "
+            "messaging is enabled on this server — any session you own that "
+            "appears in sys_session_list (peer message: the receiver sees it "
+            "labelled as coming from your session, not from its user)."
         )
 
-    def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
+    def __init__(
+        self,
+        sub_specs: dict[str, AgentSpec],
+        *,
+        peer_enabled: bool = False,
+    ) -> None:
         """
         Initialize with the agent's available sub-agent specs.
 
         :param sub_specs: Name-to-AgentSpec mapping, e.g.
             ``{"researcher": AgentSpec(...)}``.
+        :param peer_enabled: Advertise peer sends in the by-id schema
+            variant (empty ``sub_specs`` only).
         """
         self._sub_specs = sub_specs
+        self._peer_enabled = peer_enabled
 
     def get_schema(self) -> dict[str, Any]:
         """
@@ -180,7 +192,7 @@ class SysSessionSendTool(Tool):
         :returns: Dict with ``"type": "function"`` and a
             ``"function"`` sub-dict.
         """
-        return _build_sys_session_send_schema(self._sub_specs)
+        return _build_sys_session_send_schema(self._sub_specs, peer_enabled=self._peer_enabled)
 
 
 def _spec_opts_into_harness_override(spec: Any) -> bool:
@@ -213,6 +225,8 @@ def _spec_opts_into_harness_override(spec: Any) -> bool:
 
 def _build_sys_session_send_schema(
     sub_specs: dict[str, AgentSpec],
+    *,
+    peer_enabled: bool = False,
 ) -> dict[str, Any]:
     """
     Build the OpenAI function schema for ``sys_session_send``.
@@ -226,6 +240,8 @@ def _build_sys_session_send_schema(
     enum would be both unusable and invalid for some providers.
 
     :param sub_specs: Name-to-AgentSpec mapping; may be empty.
+    :param peer_enabled: When ``True`` the by-id description advertises
+        peer sends to any owned session, not just direct children.
     :returns: OpenAI function-format schema dict.
     """
     named_mode_properties: dict[str, Any] = {}
@@ -263,16 +279,32 @@ def _build_sys_session_send_schema(
         SysSessionSendTool.description()
         if sub_specs
         else (
-            "Send a message to an existing child session you created "
-            "(e.g. via sys_session_create), identified by session_id. "
-            "Child sessions are separate Omnigent agent sessions (own "
-            "conversation, visible in the session tree) — not your "
-            "harness's built-in subagent/Task tool, which remains the "
+            "Send a message to an existing session by session_id: a direct "
+            "child session you created (e.g. via sys_session_create), or — "
+            "when peer messaging is enabled on this server — any session "
+            "you own that appears in sys_session_list (peer message: the "
+            "receiver sees it labelled as coming from your session, not "
+            "from its user). Child sessions are separate Omnigent agent "
+            "sessions (own conversation, visible in the session tree) — not "
+            "your harness's built-in subagent/Task tool, which remains the "
             "right choice for quick in-context delegation. "
-            "Confined to your direct children. Returns the child's "
-            "output when its turn completes. To run multiple sessions "
+            "Returns the child's output when its turn completes, or the peer "
+            "disposition with an optional reply. To run multiple sessions "
             "in parallel, emit multiple sys_session_send tool_calls in "
             "the same response — they dispatch concurrently."
+            if peer_enabled
+            else (
+                "Send a message to an existing child session you created "
+                "(e.g. via sys_session_create), identified by session_id. "
+                "Child sessions are separate Omnigent agent sessions (own "
+                "conversation, visible in the session tree) — not your "
+                "harness's built-in subagent/Task tool, which remains the "
+                "right choice for quick in-context delegation. "
+                "Confined to your direct children. Returns the child's "
+                "output when its turn completes. To run multiple sessions "
+                "in parallel, emit multiple sys_session_send tool_calls in "
+                "the same response — they dispatch concurrently."
+            )
         )
     )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
@@ -335,10 +367,42 @@ def _build_sys_session_send_schema(
                         "type": "string",
                         "description": (
                             "By-session-id mode: post to an existing "
-                            "child session (e.g. one returned by "
-                            "sys_session_create), e.g. 'conv_abc123'. "
-                            "Must be a direct child of the calling "
-                            "session. Use instead of agent + title."
+                            "child session, or — when peer messaging is "
+                            "enabled on this server — to any session you "
+                            "own that appears in sys_session_list (peer "
+                            "message: the receiver sees it labelled as "
+                            "coming from your session, not from its user)."
+                        ),
+                    },
+                    "correlation_id": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": (
+                            "Optional id echoed in the peer envelope and "
+                            "returned in the reply; use the same value "
+                            "when replying."
+                        ),
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 3600,
+                        "default": 0,
+                        "description": (
+                            "Peer mode only: how long a message to an "
+                            "offline / not-ready receiver may wait before "
+                            "it fails; 0 = fail immediately."
+                        ),
+                    },
+                    "wait_for_reply_seconds": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 600,
+                        "default": 0,
+                        "description": (
+                            "Peer mode only: block until the receiver "
+                            "replies (matched by correlation_id / ref), "
+                            "else return at once."
                         ),
                     },
                     "args": {
@@ -521,6 +585,10 @@ class SysSessionListTool(Tool):
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
       (``sys_session_send`` by ``session_id``).
 
+    Each global row carries project, workspace, last activity time and
+    a last-message excerpt; ``sys_session_get_history`` reads a peer's
+    full history.
+
     The global ``sessions`` view is populated only on the runner
     (REST) path, where the server enforces permissions; the in-process
     path returns ``sub_agents`` with an empty ``sessions`` list.
@@ -541,8 +609,11 @@ class SysSessionListTool(Tool):
             "history, get info, or close. 'sessions': a global list of "
             "every session "
             "you can access, each with status + runner connectivity, "
+            "project, workspace, last activity time and a last-message "
+            "excerpt, "
             "for orchestration (inspect via sys_agent_get / "
-            "sys_session_get_info, or drive via sys_session_send by "
+            "sys_session_get_info, read the full transcript via "
+            "sys_session_get_history, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
             "sessions running that agent. Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
@@ -672,7 +743,8 @@ class SysSessionGetInfoTool(Tool):
     ``last_activity_at`` across polls distinguishes a running session that
     is advancing from one whose persisted output has stalled. For the
     conversation transcript, use
-    ``sys_session_get_history`` instead.
+    ``sys_session_get_history`` instead. List rows carry project,
+    workspace, last activity time and a last-message excerpt.
 
     ``session_id`` is optional — when omitted, the caller's own
     session is described.
@@ -701,7 +773,8 @@ class SysSessionGetInfoTool(Tool):
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
-            "use sys_session_get_history for the conversation transcript."
+            "use sys_session_get_history for the conversation transcript, "
+            "including a peer's full history."
         )
 
     def get_schema(self) -> dict[str, Any]:
