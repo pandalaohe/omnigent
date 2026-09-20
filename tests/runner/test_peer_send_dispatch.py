@@ -489,6 +489,24 @@ async def test_reply_detected_near_budget_fetch_timeout_returns_without_text(
 
 
 @pytest.mark.asyncio
+async def test_exhausted_budget_fetch_returns_without_request() -> None:
+    """``remaining <= 0`` reports the reply as detected without any request."""
+    from omnigent.runner.tool_dispatch import _fetch_peer_reply_text
+
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _client(handler) as client:
+        out = await _fetch_peer_reply_text(client, "peer_reply1", remaining=0)
+    assert out == {"peer_id": "peer_reply1", "text": None}
+    assert not called
+
+
+@pytest.mark.asyncio
 async def test_no_poll_when_wait_is_zero() -> None:
     """Default (no ``wait_for_reply_seconds``) returns at once with no ``reply``."""
     gets = 0

@@ -534,6 +534,7 @@ class ToolManager:
         sub_specs = {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
         self._tools[SysSessionSendTool.name()] = SysSessionSendTool(
             sub_specs=sub_specs,
+            peer_enabled=self._peer_messaging_enabled,
         )
         self._tools[SysSessionCloseTool.name()] = SysSessionCloseTool()
         # Model awareness pairs with the dispatch grant: the per-worker

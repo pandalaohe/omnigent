@@ -3349,10 +3349,14 @@ async def _fetch_peer_reply_text(
     :returns: ``{"peer_id", "text"}`` (``text`` ``None`` on a timeout), or
         plain ``None`` for any other fetch failure.
     """
-    timeout = max(0.1, min(30.0, remaining))
+    if remaining <= 0:
+        return {"peer_id": reply_peer_id, "text": None}
     try:
-        resp = await server_client.get(f"/v1/peer-messages/{reply_peer_id}", timeout=timeout)
-    except httpx.TimeoutException:
+        resp = await asyncio.wait_for(
+            server_client.get(f"/v1/peer-messages/{reply_peer_id}", timeout=min(30.0, remaining)),
+            timeout=remaining,
+        )
+    except (httpx.TimeoutException, asyncio.TimeoutError):
         return {"peer_id": reply_peer_id, "text": None}
     except Exception:  # noqa: BLE001
         return None

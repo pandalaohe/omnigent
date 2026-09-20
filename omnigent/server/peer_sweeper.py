@@ -379,6 +379,9 @@ class PeerSweeper:
                     ),
                     acting_user_id=sender_owner,
                 )
+            except asyncio.CancelledError:
+                self._parked[sender.id] = lines + self._parked.get(sender.id, [])
+                raise
             except Exception:
                 _logger.exception("Peer sweeper failed to flush notices for sender %s", sender.id)
                 # Restore (old lines first) for a later attempt rather than
@@ -460,14 +463,31 @@ class PeerSweeper:
                     self._app,
                 )
             return
-        new_expiry = record.expires_at if record.expires_at > now else now + _RECONCILE_GRACE_S
+        if record.expires_at <= now:
+            # Past its deadline with no marker: end the record instead of
+            # granting another grace window, which would postpone expiry
+            # indefinitely across repeated uncertain deliveries.
+            moved = await asyncio.to_thread(
+                self._store.transition, record.id, "expired", None, ("delivering",)
+            )
+            if moved:
+                receiver = await asyncio.to_thread(
+                    self._conversation_store.get_conversation, record.receiver_session_id
+                )
+                await self._notify_for(
+                    record,
+                    "expired",
+                    None,
+                    receiver.title if receiver is not None else None,
+                    self._app,
+                )
+            return
         await asyncio.to_thread(
             self._store.transition,
             record.id,
             "pending",
             None,
             ("delivering",),
-            expires_at=new_expiry,
         )
 
 

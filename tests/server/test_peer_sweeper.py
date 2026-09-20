@@ -476,12 +476,29 @@ async def test_uncertain_delivery_reconciles_to_pending_without_marker(
 
     harness._now += 130
     await harness.sweeper._tick()
-    assert _row(harness.store, record.id).state == "pending"
+    updated = _row(harness.store, record.id)
+    assert updated.state == "pending"
+    assert updated.expires_at == harness._now - 130 + 3600
     assert harness.post_event.calls == []
 
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "delivered"
     assert len(harness.post_event.calls) == 1
+
+
+async def test_uncertain_delivery_past_expiry_expires_with_notice(
+    harness: _Harness,
+) -> None:
+    """An uncertain delivery past its deadline ends as expired, not re-pended."""
+    record = harness.seed_record(
+        state="delivering",
+        updated_at=harness._now - 200,
+        expires_at=harness._now - 10,
+    )
+    await harness.sweeper._reconcile_stale_delivering(harness._now)
+    assert _row(harness.store, record.id).state == "expired"
+    assert len(harness.post_event.calls) == 1
+    assert "expired" in harness.post_event.calls[0]["text"]
 
 
 async def test_two_concurrent_flushes_post_once(harness: _Harness) -> None:
@@ -590,6 +607,24 @@ async def test_true_state_exception_during_flush_reparks_for_a_later_attempt(
     assert harness.sweeper._parked["sender"] == []
 
 
+async def test_flush_cancelled_during_true_state_reparks_and_reraises(
+    harness: _Harness,
+) -> None:
+    """A cancel in the swap-to-post window restores the lines, then re-raises."""
+    record = harness.seed_record(state="pending")
+    sender = harness.conv_store.convs["sender"]
+
+    async def _cancelled(_conv: Conversation) -> tuple[str, bool | None]:
+        raise asyncio.CancelledError
+
+    harness.sweeper._true_state = _cancelled  # type: ignore[method-assign]
+    harness.sweeper._parked[sender.id] = ["notice-1"]
+    with pytest.raises(asyncio.CancelledError):
+        await harness.sweeper._maybe_flush(sender, _APP)
+    assert harness.sweeper._parked[sender.id] == ["notice-1"]
+    assert record.id  # keep linters honest about the seeded row
+
+
 async def test_startup_reconciliation_marker_found_is_delivered() -> None:
     h = _Harness()
     h.add_conv(_conv("sender", title="Sender"))
@@ -628,9 +663,9 @@ async def test_startup_reconciliation_marker_missing_reverts_to_pending() -> Non
     await h.sweeper._reconcile_startup()
     assert _row(h.store, still_future.id).state == "pending"
     assert _row(h.store, still_future.id).expires_at == future_expiry
-    assert _row(h.store, already_past.id).state == "pending"
-    assert _row(h.store, already_past.id).expires_at == h._now + 120
-    assert h.post_event.calls == []  # reverting to pending is not a notice-worthy state
+    assert _row(h.store, already_past.id).state == "expired"
+    assert len(h.post_event.calls) == 1
+    assert "expired" in h.post_event.calls[0]["text"]
 
 
 async def test_startup_reconciliation_skips_recent_delivering_record() -> None:

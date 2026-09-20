@@ -69,6 +69,33 @@ def test_spawn_spec_registers_both_regardless_of_flag() -> None:
         assert _CLOSE in names
 
 
+def _send_description(spec: AgentSpec, *, peer_messaging_enabled: bool = False) -> str:
+    manager = ToolManager(spec, peer_messaging_enabled=peer_messaging_enabled)
+    for schema in manager.get_tool_schemas():
+        function = schema.get("function")
+        if isinstance(function, dict) and function.get("name") == _SEND:
+            description = function.get("description")
+            assert isinstance(description, str)
+            return description
+    raise AssertionError(f"{_SEND} not registered")
+
+
+def test_spawn_spec_without_sub_agents_advertises_peers_when_flag_on() -> None:
+    """A spawn-granted spec with no declared sub-agents advertises peer sends."""
+    on = _send_description(_spawn_spec(), peer_messaging_enabled=True)
+    assert "peer messaging is enabled" in on
+    assert "Confined to your direct children" not in on
+    off = _send_description(_spawn_spec())
+    assert "Confined to your direct children" in off
+
+    relayed = {
+        s["name"]: str(s["description"])
+        for s in build_native_relay_tool_schemas(_spawn_spec(), peer_messaging_enabled=True)
+    }
+    assert "peer messaging is enabled" in relayed[_SEND]
+    assert "Confined to your direct children" not in relayed[_SEND]
+
+
 def test_relay_schemas_follow_the_flag() -> None:
     """The native relay surface carries send for no-spawn specs only when on."""
     on = {s["name"] for s in build_native_relay_tool_schemas(_no_spawn_spec(), peer_messaging_enabled=True)}
