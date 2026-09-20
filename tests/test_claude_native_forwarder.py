@@ -10398,7 +10398,12 @@ async def test_forwarder_records_each_api_call_usage_exactly_once(
         recorded = _recorded_token_spans(otel_exporter)
         assert recorded == [(1000, 50)], "one completed API call must record exactly one span"
 
-        # A second API call is new usage and does add a span.
+        # A second API call is new usage and does add a span. The statusLine
+        # gauge advances too — as it would for a real completed call — since
+        # the side-channel tail now also runs on quiet polls (A3b) and would
+        # otherwise have already caught the dedupe baseline up to the a1
+        # snapshot, masking a2's own usage POST.
+        status_box["value"] = {"input_tokens": 2200, "output_tokens": 80}
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_assistant("a2", "more", {"input_tokens": 2200, "output_tokens": 80}) + "\n")
         await poll()
@@ -11801,6 +11806,220 @@ def test_compaction_snapshot_orders_shuffled_tools_and_excludes_sidechain(
     ]
 
 
+def _write_chain_records(path: Path, records: list[dict[str, Any]]) -> None:
+    """
+    Write raw transcript records to ``path`` as newline-delimited JSON.
+
+    :param path: Transcript file to write.
+    :param records: Records to serialize, one per line.
+    :returns: None.
+    """
+    path.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def _boundary_chain_records(*, chain_uuids: list[str]) -> list[dict[str, Any]]:
+    """
+    Build a boundary + summary transcript with an arbitrary parent chain.
+
+    The summary's ``parentUuid`` points at the first UUID in
+    ``chain_uuids``; each intermediate record points at the next one, and
+    the last one points at the ``compact_boundary`` record. An empty
+    ``chain_uuids`` means the summary's direct parent is the boundary.
+
+    :param chain_uuids: UUIDs of intermediate records between summary and boundary.
+    :returns: Transcript records ending in an ``isCompactSummary`` summary.
+    """
+    records: list[dict[str, Any]] = [
+        {
+            "type": "user",
+            "uuid": "preserved-user",
+            "parentUuid": None,
+            "message": {"role": "user", "content": "preserved question"},
+        },
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary",
+            "parentUuid": "preserved-user",
+            "compactMetadata": {"preservedMessages": {"uuids": ["preserved-user"]}},
+        },
+    ]
+    next_uuid = "boundary"
+    for intermediate_uuid in reversed(chain_uuids):
+        records.append(
+            {
+                "type": "attachment",
+                "uuid": intermediate_uuid,
+                "parentUuid": next_uuid,
+            }
+        )
+        next_uuid = intermediate_uuid
+    records.append(
+        {
+            "type": "user",
+            "uuid": "summary",
+            "parentUuid": next_uuid,
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "summary context"},
+        }
+    )
+    return records
+
+
+def test_compaction_snapshot_walks_through_interleaved_attachment(tmp_path: Path) -> None:
+    """A summary -> attachment -> boundary chain resolves the boundary, not an error."""
+    transcript = tmp_path / "session.jsonl"
+    _write_chain_records(transcript, _boundary_chain_records(chain_uuids=["attachment-1"]))
+
+    summary_id, snapshot = forwarder._read_native_compaction_snapshot(
+        transcript,
+        "summary:0:compact_summary",
+    )
+
+    assert summary_id == "summary"
+    assert snapshot == [
+        {"type": "message", "role": "user", "content": "summary context"},
+        {"type": "message", "role": "user", "content": "preserved question"},
+    ]
+
+
+def test_compaction_snapshot_walks_through_multiple_intermediate_records(
+    tmp_path: Path,
+) -> None:
+    """Two or more non-boundary records between summary and boundary still resolve."""
+    transcript = tmp_path / "session.jsonl"
+    records = _boundary_chain_records(chain_uuids=["mid-1", "mid-2", "mid-3"])
+    type_by_uuid = {"mid-1": "attachment", "mid-2": "user", "mid-3": "assistant"}
+    for record in records:
+        record_uuid = record.get("uuid")
+        if isinstance(record_uuid, str) and record_uuid in type_by_uuid:
+            record["type"] = type_by_uuid[record_uuid]
+    _write_chain_records(transcript, records)
+
+    summary_id, snapshot = forwarder._read_native_compaction_snapshot(
+        transcript,
+        "summary:0:compact_summary",
+    )
+
+    assert summary_id == "summary"
+    assert snapshot == [
+        {"type": "message", "role": "user", "content": "summary context"},
+        {"type": "message", "role": "user", "content": "preserved question"},
+    ]
+
+
+def test_compaction_snapshot_without_boundary_returns_summary_only(tmp_path: Path) -> None:
+    """A parent chain with no boundary yields ``boundary=None`` instead of raising."""
+    transcript = tmp_path / "session.jsonl"
+    _write_chain_records(
+        transcript,
+        [
+            {
+                "type": "user",
+                "uuid": "root",
+                "parentUuid": None,
+                "message": {"role": "user", "content": "root text"},
+            },
+            {
+                "type": "attachment",
+                "uuid": "mid",
+                "parentUuid": "root",
+            },
+            {
+                "type": "user",
+                "uuid": "summary",
+                "parentUuid": "mid",
+                "isCompactSummary": True,
+                "message": {"role": "user", "content": "summary context"},
+            },
+        ],
+    )
+
+    summary_id, snapshot = forwarder._read_native_compaction_snapshot(
+        transcript,
+        "summary:0:compact_summary",
+    )
+
+    assert summary_id == "summary"
+    assert snapshot == [{"type": "message", "role": "user", "content": "summary context"}]
+
+
+def test_compaction_snapshot_cyclic_parent_chain_terminates(tmp_path: Path) -> None:
+    """A self-referential or looping ``parentUuid`` chain terminates without raising."""
+    transcript = tmp_path / "session.jsonl"
+    _write_chain_records(
+        transcript,
+        [
+            {
+                "type": "attachment",
+                "uuid": "loop-a",
+                "parentUuid": "loop-b",
+            },
+            {
+                "type": "attachment",
+                "uuid": "loop-b",
+                "parentUuid": "loop-a",
+            },
+            {
+                "type": "user",
+                "uuid": "summary",
+                "parentUuid": "loop-a",
+                "isCompactSummary": True,
+                "message": {"role": "user", "content": "summary context"},
+            },
+        ],
+    )
+
+    summary_id, snapshot = forwarder._read_native_compaction_snapshot(
+        transcript,
+        "summary:0:compact_summary",
+    )
+
+    assert summary_id == "summary"
+    assert snapshot == [{"type": "message", "role": "user", "content": "summary context"}]
+
+
+def test_compaction_snapshot_depth_limit_exceeded_terminates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent chain longer than the hop bound terminates without raising."""
+    monkeypatch.setattr(forwarder, "_COMPACTION_BOUNDARY_CHAIN_MAX_HOPS", 4)
+    transcript = tmp_path / "session.jsonl"
+    _write_chain_records(
+        transcript,
+        _boundary_chain_records(chain_uuids=[f"mid-{index}" for index in range(10)]),
+    )
+
+    summary_id, snapshot = forwarder._read_native_compaction_snapshot(
+        transcript,
+        "summary:0:compact_summary",
+    )
+
+    assert summary_id == "summary"
+    assert snapshot == [{"type": "message", "role": "user", "content": "summary context"}]
+
+
+def test_compaction_snapshot_direct_boundary_parent_regression(tmp_path: Path) -> None:
+    """A summary whose direct parent is the boundary still resolves exactly as before."""
+    transcript = tmp_path / "session.jsonl"
+    _write_chain_records(transcript, _boundary_chain_records(chain_uuids=[]))
+
+    summary_id, snapshot = forwarder._read_native_compaction_snapshot(
+        transcript,
+        "summary:0:compact_summary",
+    )
+
+    assert summary_id == "summary"
+    assert snapshot == [
+        {"type": "message", "role": "user", "content": "summary context"},
+        {"type": "message", "role": "user", "content": "preserved question"},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_hook_ack_waits_for_summary_durability(tmp_path: Path) -> None:
     """The compact SessionStart cannot persist stale history before the deadline."""
@@ -12191,6 +12410,694 @@ async def test_failed_boundary_post_is_retried_not_consumed(tmp_path: Path) -> N
     assert state.pending is not None
     assert state.pending.seq == 1
     assert state.persisted_seqs == ()
+
+
+@pytest.mark.asyncio
+async def test_permanent_snapshot_read_error_persists_degraded_boundary(tmp_path: Path) -> None:
+    """
+    A structural transcript-read error persists a degraded boundary at once.
+
+    ``ValueError`` from ``_read_native_compaction_snapshot`` means the
+    summary record is not durable in a STATIC, append-only transcript file
+    — retrying can never change that outcome. Routing this through the
+    retry tracker would retry forever (its ``permanent`` verdict comes from
+    an HTTP status, ``False`` for a ``ValueError``, and ``give_up`` is
+    unreachable since ``max_transient_attempts`` defaults to ``None``), so
+    the handler must judge permanence itself, persist a degraded boundary,
+    and let the caller advance the transcript cursor past the record.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
+
+    persist = _persist_mock()
+    with (
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+        ),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._read_native_compaction_snapshot",
+            side_effect=ValueError("compact summary not durable"),
+        ),
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_degraded",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("the summary"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_called_once()
+    assert persist.call_args.kwargs["summary_override"] == "the summary"
+    assert persist.call_args.kwargs["compacted_messages_override"] is None
+    # Deliberate: a failed transcript read does not mean the SDK snapshot is
+    # gone, so the helper is still allowed to try that fallback.
+    assert persist.call_args.kwargs["fallback_snapshot_loaded"] is False
+    assert persist.call_args.kwargs["snapshot_source"] == "transcript_degraded"
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert "summary-uuid" in state.persisted_summary_ids
+    assert "summary-uuid" in state.degraded_summary_ids
+
+
+@pytest.mark.asyncio
+async def test_degraded_persist_failure_still_advances_cursor(tmp_path: Path) -> None:
+    """
+    The degraded persist itself failing still advances past the record.
+
+    A stalled transcript stream is worse than one lost boundary — the
+    handler must return ``True`` even when its own degraded-boundary POST
+    raises, letting ``_note_forward_failure`` (already counted) carry
+    visibility instead of stalling the cursor a second time.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
+
+    persist = AsyncMock(side_effect=httpx.HTTPError("boundary post also failed"))
+    with (
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+        ),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._read_native_compaction_snapshot",
+            side_effect=ValueError("compact summary not durable"),
+        ),
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_degraded_fail",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_called_once()
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert "summary-uuid" in state.persisted_summary_ids
+    assert "summary-uuid" in state.degraded_summary_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "read_exc",
+    [
+        KeyError("missing"),
+        IndexError("out of range"),
+        json.JSONDecodeError("bad json", "{", 1),
+    ],
+    ids=["KeyError", "IndexError", "JSONDecodeError"],
+)
+async def test_other_structural_exception_types_take_degraded_path(
+    tmp_path: Path, read_exc: Exception
+) -> None:
+    """``KeyError`` / ``IndexError`` / ``json.JSONDecodeError`` are each permanent."""
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
+
+    persist = _persist_mock()
+    with (
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+        ),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._read_native_compaction_snapshot",
+            side_effect=read_exc,
+        ),
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_degraded_types",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    assert persist.call_args.kwargs["snapshot_source"] == "transcript_degraded"
+    state = _read_compaction_state(bridge_dir)
+    assert "summary-uuid" in state.degraded_summary_ids
+
+
+@pytest.mark.asyncio
+async def test_non_permanent_exception_type_still_holds_cursor_for_retry(
+    tmp_path: Path,
+) -> None:
+    """
+    An exception outside the permanent set keeps the old hold-and-retry behavior.
+
+    This is the "transcript may not yet be complete" case (e.g. a plain
+    ``OSError`` mid-write) — retrying next poll CAN change the outcome, so
+    the handler must not treat it as permanent.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
+
+    persist = _persist_mock()
+    with (
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+        ),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._read_native_compaction_snapshot",
+            side_effect=OSError("transcript line incomplete"),
+        ),
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_transient",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is False
+    persist.assert_not_called()
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.persisted_summary_ids == ()
+    assert state.degraded_summary_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_http_error_from_persist_still_uses_retry_tracker_not_degraded(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression: ``httpx.HTTPError`` still takes the pre-existing retry path.
+
+    A real (valid) transcript reaches ``_persist_native_compaction_item``,
+    which then raises an HTTP rejection — that stays on the ``except
+    httpx.HTTPError`` branch (retry-and-hold), never the new structural-error
+    degraded path, since the two branches are mutually exclusive by
+    exception type.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
+
+    request = httpx.Request("POST", "http://x/events")
+    response = httpx.Response(400, request=request)
+    failing = AsyncMock(
+        side_effect=httpx.HTTPStatusError("bad", request=request, response=response)
+    )
+
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_http_regression",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is False
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.persisted_summary_ids == ()
+    assert state.degraded_summary_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_boundary_post_marks_persisted_not_retried(
+    tmp_path: Path,
+) -> None:
+    """
+    An ambiguous boundary POST is treated as committed, not retried.
+
+    A read timeout means the request was sent but the response was lost,
+    so the server may already have committed the boundary. Retrying would
+    risk persisting the same boundary twice, so the handler must mark the
+    sequence persisted, clear the retry state, and report handled.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
+
+    request = httpx.Request("POST", "http://x/events")
+    failing = AsyncMock(side_effect=httpx.ReadTimeout("response lost", request=request))
+    retry_tracker = _PostRetryTracker()
+
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_ambiguous",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=retry_tracker,
+        )
+
+    assert handled is True
+    assert retry_tracker.has_retry_state("compaction:1") is False
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert 1 in state.persisted_seqs
+    assert state.persisted_summary_ids == ("summary-uuid",)
+
+
+@pytest.mark.asyncio
+async def test_forward_available_items_advances_past_permanently_failed_compaction(
+    tmp_path: Path,
+) -> None:
+    """
+    A batch's compact-summary item that fails permanently still advances.
+
+    End-to-end through ``_forward_available_items``: the transcript cursor
+    must land past the compact-summary record (not stall at its
+    batch-start position), and the summary must never be POSTed as an
+    ``external_conversation_item`` chat bubble — only the degraded
+    ``compaction`` boundary event.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "summary-uuid",
+                "isCompactSummary": True,
+                "message": {"role": "user", "content": "the compaction summary"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript_path)
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Answer the item-lookup GET and record every POST body."""
+        if request.method == "GET":
+            requests.append({"method": "GET"})
+            return httpx.Response(200, json={"data": []})
+        payload = json.loads(request.content.decode("utf-8"))
+        requests.append({"method": "POST", "body": payload})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._read_native_compaction_snapshot",
+        side_effect=ValueError("compact summary not durable"),
+    ):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            dedupe = forwarder._ForwardDedupeState()
+            updated = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_degraded_batch",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+
+    # Cursor advanced past the failed record instead of stalling at the
+    # batch-start position (the A2 bug: a permanent failure used to make
+    # the caller return the un-advanced ``updated`` state forever).
+    assert updated.byte_offset == transcript_path.stat().st_size
+    assert updated.line_cursor == 1
+    post_bodies = [entry["body"] for entry in requests if entry["method"] == "POST"]
+    assert [body["type"] for body in post_bodies] == ["compaction"]
+    assert post_bodies[0]["data"]["snapshot_source"] == "transcript_degraded"
+    persisted = json.loads((bridge_dir / "transcript_forwarder.json").read_text("utf-8"))
+    assert persisted["byte_offset"] == transcript_path.stat().st_size
+    state_after = _read_compaction_state(bridge_dir)
+    assert "summary-uuid" in state_after.persisted_summary_ids
+    assert "summary-uuid" in state_after.degraded_summary_ids
+
+
+@pytest.mark.asyncio
+async def test_forward_available_items_posts_side_channel_when_compact_summary_holds_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A3b: a compact-summary early return must not stall usage/model/title.
+
+    ``_handle_compact_summary_item`` returning ``False`` (a hard persist
+    failure or active backoff — see
+    ``test_failed_boundary_post_is_retried_not_consumed``) makes
+    ``_forward_transcript_item_batch`` ``return`` before its FIRST item is
+    fully processed, long before the batch's own fall-through tail. Measured
+    live this held the usage POST hostage every poll, pinning the web UI's
+    context ring at 98-99% for hours. The usage / model / title POSTs have
+    no dependency on the item batch completing, so they must still fire —
+    the ``model`` and ``custom-title`` records here are never reached by the
+    item loop (it returns on item #1), yet the transcript pre-scan already
+    captured them onto ``result.latest_model`` / ``result.latest_custom_title``.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "summary-uuid",
+                        "isCompactSummary": True,
+                        "message": {"role": "user", "content": "the compaction summary"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-sonnet-5",
+                            "content": [{"type": "text", "text": "after compaction"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {"type": "custom-title", "customTitle": "post-compaction", "sessionId": "s1"}
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript_path)
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {
+            "context_window_size": 180_000,
+            "current_usage": {"input_tokens": 5_000, "output_tokens": 200},
+        },
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+
+    # A definitively-permanent 400 makes ``_handle_compact_summary_item``
+    # return ``False`` (same shape as ``test_failed_boundary_post_is_retried_not_consumed``)
+    # — the exact early return the live incident hit every poll.
+    request = httpx.Request("POST", "http://x/events")
+    response = httpx.Response(400, request=request)
+    failing_persist = AsyncMock(
+        side_effect=httpx.HTTPStatusError("bad", request=request, response=response)
+    )
+
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
+        failing_persist,
+    ):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            dedupe = forwarder._ForwardDedupeState()
+            updated = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_stuck_ring",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+
+    # A2's retry contract is unchanged: the cursor holds before the summary.
+    assert updated.byte_offset == 0
+    assert updated.seen_source_ids == ()
+
+    post_types = [r["type"] for r in requests]
+    assert "external_session_usage" in post_types, "usage POST must not be collateral damage"
+    assert "external_model_change" in post_types, "model POST must not be collateral damage"
+    assert "external_session_title" in post_types, "title POST must not be collateral damage"
+
+    usage_post = next(r for r in requests if r["type"] == "external_session_usage")
+    assert usage_post["data"]["context_tokens"] == 5_000
+    assert usage_post["data"]["context_window"] == 180_000
+    assert dedupe.usage is not None
+    assert dedupe.context_window == 180_000
+
+    model_post = next(r for r in requests if r["type"] == "external_model_change")
+    assert model_post["data"] == {"model": "claude-sonnet-5"}
+    assert dedupe.posted_model == "claude-sonnet-5"
+
+    title_post = next(r for r in requests if r["type"] == "external_session_title")
+    assert title_post["data"] == {"title": "post-compaction"}
+    assert dedupe.posted_title == "post-compaction"
+
+
+@pytest.mark.asyncio
+async def test_forward_available_items_posts_usage_once_after_items_on_normal_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The ordinary fall-through path is unchanged by the A3b split.
+
+    Regression guard: the usage/model/title tail still runs exactly once
+    per poll, and still after the item POSTs — covering the early-return
+    exits must not duplicate or reorder the normal path.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "u1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {
+            "context_window_size": 150_000,
+            "current_usage": {"input_tokens": 10, "output_tokens": 1},
+        },
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        dedupe = forwarder._ForwardDedupeState()
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_normal",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    usage_posts = [r for r in requests if r["type"] == "external_session_usage"]
+    assert len(usage_posts) == 1
+    # Usage still posts AFTER the item, never before or interleaved.
+    item_index = next(
+        i for i, r in enumerate(requests) if r["type"] == "external_conversation_item"
+    )
+    usage_index = next(i for i, r in enumerate(requests) if r["type"] == "external_session_usage")
+    assert item_index < usage_index
+
+
+@pytest.mark.asyncio
+async def test_forward_available_items_side_channel_failure_does_not_corrupt_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A failing usage POST must not corrupt dedupe or the batch's own return.
+
+    ``_post_forward_side_channel_updates`` guards its own work so a POST
+    failure there is logged and swallowed rather than surfacing as the item
+    batch's own exception, and the dedupe fields it guards (``usage`` /
+    ``context_window``) are left unchanged so the next poll retries —
+    exactly the pre-existing contract this refactor must preserve.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "u1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {
+            "context_window_size": 150_000,
+            "current_usage": {"input_tokens": 10, "output_tokens": 1},
+        },
+    )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] == "external_session_usage":
+            return httpx.Response(500, json={"error": "boom"})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        dedupe = forwarder._ForwardDedupeState()
+        updated = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_usage_fails",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    # The item batch's own outcome (the fall-through advance) is untouched
+    # by the side-channel failure — no exception propagated out of it.
+    assert updated.byte_offset == transcript_path.stat().st_size
+    assert updated.seen_source_ids == ("u1:0:message",)
+    # Dedupe fields the failed POST would have set stay behind, so the next
+    # poll retries instead of believing a post that never landed.
+    assert dedupe.usage is None
+    assert dedupe.context_window is None
+
+
+@pytest.mark.asyncio
+async def test_forward_available_items_cancellation_skips_side_channel_posts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A cancelled poll must not start new usage/model/title POSTs.
+
+    ``_post_forward_side_channel_updates`` runs from a ``finally`` guarding
+    every NON-cancelled exit; ``asyncio.CancelledError`` is the one exit
+    that must re-raise promptly instead of awaiting new POSTs.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "cancel-me",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "text", "text": "hi"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {
+            "context_window_size": 150_000,
+            "current_usage": {"input_tokens": 10, "output_tokens": 1},
+        },
+    )
+
+    async def _cancelled_post(*_args: Any, **_kwargs: Any) -> None:
+        """Simulate the poll being cancelled mid-item-POST."""
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder, "_post_external_conversation_item", _cancelled_post)
+
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        dedupe = forwarder._ForwardDedupeState()
+        with pytest.raises(asyncio.CancelledError):
+            await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_cancel",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+
+    assert requests == []
+    assert dedupe.usage is None
+    assert dedupe.posted_model is None
 
 
 @pytest.mark.asyncio
