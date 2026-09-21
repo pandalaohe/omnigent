@@ -689,6 +689,18 @@ def _schedule_deferred_elicitation_clear(
                 if current is not None:
                     current.resolved_elsewhere.set()
             return
+        if resolved_in_terminal:
+            # Keep the terminal-side tombstone the resolve helper would have
+            # written had the record already been gone. A hook retry can
+            # re-park after this clear (it backs off between POSTs), and
+            # without the tombstone it re-publishes an answered question and
+            # waits out its own timeout.
+            _prune_pre_resolved_harness_elicitations()
+            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+                session_id=session_id,
+                created_at=time.time(),
+            )
+            _prune_pre_resolved_harness_elicitations()
         reason = None if resolved_in_terminal else "unanswered"
         _publish_elicitation_resolved(session_id, elicitation_id, reason=reason)
         if conversation_store is not None:

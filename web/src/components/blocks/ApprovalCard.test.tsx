@@ -829,6 +829,50 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     } as Partial<ReturnType<typeof useChatStore.getState>>);
   });
 
+  it("interrupts the question's own session, not the chat it is rendered in", async () => {
+    // A sub-agent's question is mirrored into its PARENT's chat, and the
+    // block names the child as its target. The verdict already routes to the
+    // child; interrupting the active conversation would cut the parent's
+    // turn, which nobody asked to stop, and leave the child running.
+    const original = useChatStore.getState();
+    useChatStore.setState({
+      conversationId: "conv_parent",
+      blocks: [
+        {
+          type: "elicitation",
+          elicitationId: "elic_child",
+          targetSessionId: "conv_child",
+          status: "pending",
+          response: null,
+        },
+      ],
+      submitApproval: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+    } as Partial<ReturnType<typeof useChatStore.getState>>);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_child"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview={sampleSinglePreview}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("ask-user-question-abort"));
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().stop).toHaveBeenCalledWith("conv_child");
+    });
+    useChatStore.setState({
+      submitApproval: original.submitApproval,
+      stop: original.stop,
+    } as Partial<ReturnType<typeof useChatStore.getState>>);
+  });
+
   it("omits the abort control when the card routes verdicts elsewhere", () => {
     // The Inbox renders cards for sessions other than the active one and
     // supplies its own submitter. An abort there would interrupt whichever

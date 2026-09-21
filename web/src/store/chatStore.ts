@@ -2436,6 +2436,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   declineAndInterrupt: async (elicitationId, conversationId) => {
+    // Resolve the turn to cut BEFORE anything awaits. It is the question's
+    // own session — a sub-agent's card is rendered in the parent's chat but
+    // the blocked turn is the child's, so the active conversation is the
+    // wrong target. Reading it after the await would also let a navigation
+    // mid-POST redirect the interrupt into whatever chat is now open.
+    const target =
+      elicitationTargetSession(elicitationId, conversationId) ??
+      conversationId ??
+      get().conversationId;
+    if (!target) return;
     // Decline FIRST and await it. The decline is what resolves the parked
     // hook wait, so the agent learns the question was refused and the card
     // flips to a verdict. Interrupting first would sever that wait with no
@@ -2446,7 +2456,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Then cut the turn. ``stop`` posts an interrupt, never a session
     // stop: for claude-native the latter hard-kills the tmux pane, and
     // this control must leave the session alive.
-    await get().stop(conversationId);
+    await get().stop(target);
   },
 
   switchTo: async (conversationId) => {
@@ -2574,12 +2584,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // would answer the wrong session and leave the child blocked.
     const sessionId = conversationId ?? get().conversationId;
     if (!sessionId) return;
-    const scopedState = conversationId ? (setterForState(conversationId) ?? get()) : get();
     const write = setterFor(sessionId);
-    const targetSessionId =
-      scopedState.blocks.find(
-        (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
-      )?.targetSessionId ?? sessionId;
+    const targetSessionId = elicitationTargetSession(elicitationId, conversationId) ?? sessionId;
     // Optimistically flip the matching elicitation block to
     // "responded" so the buttons disappear immediately. No server
     // event confirms the approval — the agent just resumes (or
@@ -4370,6 +4376,33 @@ function reconcileElicitationBlocks(
  * @param historyBlocks - Blocks translated from persisted items.
  * @returns `liveBlocks` without the copies history now carries.
  */
+/**
+ * The session an elicitation's verdict and interrupt both belong to.
+ *
+ * A sub-agent's question is mirrored into its parent's chat, so the block
+ * the user clicks lives in the parent's entry while the question — and the
+ * turn waiting on it — belong to the child, named by `targetSessionId`.
+ * Answering the parent would leave the child blocked, and interrupting the
+ * parent would cut an unrelated turn, so both paths resolve through here.
+ *
+ * @param elicitationId - The card's elicitation id.
+ * @param conversationId - Conversation whose blocks hold the card, or
+ *   `undefined` for the active one.
+ * @returns The target session, or `null` when no such card is rendered.
+ */
+function elicitationTargetSession(
+  elicitationId: string,
+  conversationId: string | undefined,
+): string | null {
+  const state = conversationId
+    ? (setterForState(conversationId) ?? useChatStore.getState())
+    : useChatStore.getState();
+  const block = state.blocks.find(
+    (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
+  );
+  return block?.targetSessionId ?? null;
+}
+
 function withoutRebuiltUserInputCards(
   liveBlocks: AnyBlock[],
   historyBlocks: AnyBlock[],

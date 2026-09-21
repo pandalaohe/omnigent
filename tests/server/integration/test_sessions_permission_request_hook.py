@@ -37,10 +37,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 
+from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.runtime import session_stream
 from omnigent.server._elicitation_registry import (
+    _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
@@ -2230,7 +2233,53 @@ async def test_terminal_answer_during_grace_resolves_instead_of_expiring(
         f"index should clear once the terminal answer lands, got "
         f"{pending_elicitations.count_for(session_id)!r}"
     )
+    # A hook retry backs off between POSTs, so it can re-park AFTER this
+    # clear. Without a terminal tombstone it re-publishes the answered
+    # question and waits out its own timeout, so the clear must leave one
+    # behind — the same one the resolve helper writes when it finds no
+    # parked record at all.
+    tombstone = _harness_pre_resolved_elicitations.get(resolved[0]["elicitation_id"])
+    assert tombstone is not None, "a terminal resolution must survive the clear as a tombstone"
+    assert tombstone.session_id == session_id
+    assert tombstone.result is None, "a terminal resolution carries no verdict"
+    _harness_pre_resolved_elicitations.clear()
     pending_elicitations.reset_for_tests()
+
+
+async def test_terminal_resolve_rejects_a_foreign_session_during_the_grace() -> None:
+    """
+    A retained parked record still answers only to its own session.
+
+    The owners entry is the ownership check for a LIVE wait, and it is
+    dropped the moment the wait unwinds — but the parked record now outlives
+    it for the re-park grace. Checking ownership through the owners entry
+    alone would therefore wave through anything inside that window, letting a
+    caller authorized only for another session clear this one's approval card
+    by naming its elicitation id.
+    """
+    elicitation_id = "elicit_claude_foreign_probe"
+    parked = _ParkedHarnessElicitation(
+        session_id="conv_owner",
+        tool_name="Bash",
+        tool_input={"command": "ls"},
+        resolved_elsewhere=asyncio.Event(),
+    )
+    _harness_parked_elicitations[elicitation_id] = parked
+    try:
+        with pytest.raises(OmnigentError):
+            sessions_route._signal_harness_elicitation_resolved_by_id(
+                "conv_intruder",
+                elicitation_id,
+            )
+        assert not parked.resolved_elsewhere.is_set(), (
+            "a foreign session must not resolve this prompt"
+        )
+        # The real owner still resolves it.
+        sessions_route._signal_harness_elicitation_resolved_by_id("conv_owner", elicitation_id)
+        assert parked.resolved_elsewhere.is_set()
+    finally:
+        _harness_parked_elicitations.pop(elicitation_id, None)
+        _harness_pre_resolved_elicitations.clear()
 
 
 _REATTACH_ELICITATION_ID = f"elicit_claude_{'ab' * 16}"

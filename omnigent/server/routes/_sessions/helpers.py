@@ -1188,6 +1188,19 @@ def _signal_harness_elicitation_resolved_by_id(
         )
     _prune_pre_resolved_harness_elicitations()
     parked = _harness_parked_elicitations.get(elicitation_id)
+    # The owners entry above is the ownership check for a LIVE wait, but a
+    # record outlives it: a severed wait leaves its parked record in place
+    # for the re-park grace while the owners entry is dropped at once, so
+    # ``owner is None`` stops proving anything there. The record carries its
+    # own session, so check that too — otherwise, inside the grace, a caller
+    # authorized only for session B could clear session A's card by naming
+    # A's elicitation id. The veto lives here, in the shared predicate, so
+    # every producer of ``external_elicitation_resolved`` is covered.
+    if parked is not None and parked.session_id != session_id:
+        raise OmnigentError(
+            "Elicitation does not belong to this session.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if parked is None:
         _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
             session_id=session_id,
