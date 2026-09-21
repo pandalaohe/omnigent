@@ -31,16 +31,36 @@ export function ComposerAttachments({
   files,
   onRemove,
   className,
+  badges,
+  activeIndex,
+  onTileHover,
+  onBadgeClick,
 }: {
   files: File[];
   onRemove: (index: number) => void;
   className?: string;
+  /** Per-file token legend; a null entry renders no badge for that tile. */
+  badges?: readonly ({ label: string; unreferenced: boolean } | null)[];
+  /** Index of the tile whose token holds the caret; rings that tile. */
+  activeIndex?: number | null;
+  /** Hovering a tile highlights its token in the composer backdrop. */
+  onTileHover?: (index: number | null) => void;
+  /** Clicking a badge focuses the field holding its token. */
+  onBadgeClick?: (index: number) => void;
 }) {
   if (files.length === 0) return null;
   return (
     <div className={cn("flex flex-wrap items-start gap-2 px-4 pb-2", className)}>
       {files.map((file, i) => (
-        <AttachmentTile key={attachmentKey(file)} file={file} onRemove={() => onRemove(i)} />
+        <AttachmentTile
+          key={attachmentKey(file)}
+          file={file}
+          onRemove={() => onRemove(i)}
+          badge={badges?.[i] ?? null}
+          active={activeIndex === i}
+          onHover={onTileHover ? (hovering) => onTileHover(hovering ? i : null) : undefined}
+          onBadgeClick={onBadgeClick ? () => onBadgeClick(i) : undefined}
+        />
       ))}
     </div>
   );
@@ -131,17 +151,39 @@ function useObjectUrl(file: File | null): string | undefined {
   return url;
 }
 
-function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }) {
+function AttachmentTile({
+  file,
+  onRemove,
+  badge = null,
+  active = false,
+  onHover,
+  onBadgeClick,
+}: {
+  file: File;
+  onRemove: () => void;
+  badge?: { label: string; unreferenced: boolean } | null;
+  active?: boolean;
+  onHover?: (hovering: boolean) => void;
+  onBadgeClick?: () => void;
+}) {
   // An image whose blob can't decode falls back to the file card (spec rule 4).
   const [thumbFailed, setThumbFailed] = useState(false);
   const showThumb = file.type.startsWith("image/") && !thumbFailed;
   const name = attachmentFilename(file);
   const url = useObjectUrl(showThumb ? file : null);
+  const hoverProps = onHover
+    ? { onMouseEnter: () => onHover(true), onMouseLeave: () => onHover(false) }
+    : undefined;
 
   if (showThumb) {
     return (
-      <div className="relative shrink-0">
-        <div className="size-14 overflow-hidden rounded-xl border border-border bg-muted">
+      <div className="relative shrink-0" {...hoverProps}>
+        <div
+          className={cn(
+            "size-14 overflow-hidden rounded-xl border border-border bg-muted",
+            active && "ring-2 ring-ring",
+          )}
+        >
           <ZoomableImage
             src={url}
             alt={name}
@@ -150,6 +192,7 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
           />
         </div>
         <RemoveButton name={name} onRemove={onRemove} />
+        <AttachmentBadge badge={badge} onClick={onBadgeClick} />
       </div>
     );
   }
@@ -159,8 +202,13 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
   const meta = ext ? `${ext} · ${formatFileSize(file.size)}` : formatFileSize(file.size);
   const Icon = iconForFile(file);
   return (
-    <div className="relative shrink-0">
-      <div className="flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2">
+    <div className="relative shrink-0" {...hoverProps}>
+      <div
+        className={cn(
+          "flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2",
+          active && "ring-2 ring-ring",
+        )}
+      >
         <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
           <Icon className="size-5" />
         </span>
@@ -170,7 +218,30 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
         </span>
       </div>
       <RemoveButton name={name} onRemove={onRemove} />
+      <AttachmentBadge badge={badge} onClick={onBadgeClick} />
     </div>
+  );
+}
+
+/** Token legend for one tile, rendered outside `ZoomableImage`'s button so an
+ *  image click still opens the lightbox instead of triggering this badge. */
+function AttachmentBadge({
+  badge,
+  onClick,
+}: {
+  badge: { label: string; unreferenced: boolean } | null;
+  onClick?: () => void;
+}) {
+  if (!badge) return null;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="absolute -bottom-1 left-1 rounded-full border border-border bg-background px-1.5 py-0 text-[10px] text-muted-foreground shadow-sm"
+    >
+      {badge.label}
+      {badge.unreferenced && <span className="text-muted-foreground/70"> · not in text</span>}
+    </button>
   );
 }
 
