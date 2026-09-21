@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
@@ -558,13 +559,17 @@ async def test_reset_state_rematerializes_env_from_new_agent_spec(tmp_path: Path
         name="agent_a",
         os_env=OSEnvSpec(type="caller_process", cwd=".", sandbox=OSEnvSandboxSpec(type="none")),
     )
+    # A real backend, not just a distinct string: materializing the env
+    # constructs it, and a backend for another OS raises there. Pick this
+    # platform's own so the switch is observable wherever the suite runs.
+    native_sandbox = "darwin_seatbelt" if sys.platform == "darwin" else "linux_bwrap"
     spec_b = AgentSpec(
         spec_version=1,
         name="agent_b",
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=".",
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+            sandbox=OSEnvSandboxSpec(type=native_sandbox),
         ),
     )
 
@@ -621,11 +626,11 @@ async def test_reset_state_rematerializes_env_from_new_agent_spec(tmp_path: Path
         resp2 = await c.get(env_path)
         assert resp2.status_code == 200, resp2.text
 
-    # After the reset the next access resolved agent_b (sandbox=linux_bwrap).
+    # After the reset the next access resolved agent_b (this platform's sandbox).
     # If reset-state had NOT dropped the spec/snapshot caches, this would
     # still be agent_a/"none" — the cross-agent sandbox leak this guards.
     assert captured_specs[-1].name == "agent_b"
-    assert captured_specs[-1].os_env.sandbox.type == "linux_bwrap"
+    assert captured_specs[-1].os_env.sandbox.type == native_sandbox
 
 
 @pytest.mark.asyncio

@@ -661,7 +661,10 @@ async def test_edit_grant_blocked_from_stop_session_requires_owner(
         json={"type": "interrupt", "data": {}},
         headers={"X-Forwarded-Email": "user-b"},
     )
-    assert resp.status_code == 202, (
+    # Fork mod: interrupt delivery is synchronous, so a session with no live
+    # runner answers 503 rather than accepting the event. That is orthogonal to
+    # the gate under test — what matters here is that it is not an auth refusal.
+    assert resp.status_code not in (401, 403), (
         f"user-b with edit grant should be able to post interrupt "
         f"(LEVEL_EDIT), got {resp.status_code}: {resp.text}"
     )

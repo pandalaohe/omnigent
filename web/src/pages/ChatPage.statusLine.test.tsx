@@ -1,3 +1,8 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
@@ -5,7 +10,6 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
 import { USAGE_CONTEXT_STORAGE_KEY, usageContextSourceKey } from "@/lib/usageContextPreferences";
@@ -28,6 +32,29 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // the workspace-files stub above.
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
+}));
+
+// The composer's own git probe reaches TanStack through useSessionWorktrees.
+// Stub it rather than standing up a QueryClient: this hook — not the chat
+// store's `gitBranch` — is what the tray's branch trigger reads, so a test
+// that wants a branch on screen sets `gitStatusStub` in its own body.
+const { gitStatusStub } = vi.hoisted(() => ({
+  gitStatusStub: {
+    branch: null as string | null,
+    branchState: "unknown" as "loading" | "branch" | "detached" | "not-git" | "unknown",
+    isWorktree: null as boolean | null,
+    worktreePath: null as string | null,
+    creationBranch: null as string | null,
+    repoNameWithOwner: null as string | null,
+    prCount: 0,
+    prNumber: null as number | null,
+    refresh: () => {},
+    refreshing: false,
+  },
+}));
+const _gitStatusDefaults = { ...gitStatusStub };
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: () => gitStatusStub,
 }));
 
 // HostBadge now lives in the status-line tray (left of the worktree branch).
@@ -140,6 +167,7 @@ describe("Composer status line (branch + context ring)", () => {
   beforeEach(() => {
     localStorage.removeItem(CONTEXT_INDICATOR_STORAGE_KEY);
     localStorage.removeItem(USAGE_CONTEXT_STORAGE_KEY);
+    Object.assign(gitStatusStub, _gitStatusDefaults);
     // Default: no host bound, so HostBadge renders nothing.
     useSessionMock.mockReset().mockReturnValue({
       session: { hostId: null },
@@ -151,7 +179,6 @@ describe("Composer status line (branch + context ring)", () => {
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
     useChatStore.setState({
       conversationId: "conv_test",
-      skills: [],
       contextWindow: null,
       autoCompactTokenLimit: null,
       providerUsageLimits: null,
@@ -159,8 +186,8 @@ describe("Composer status line (branch + context ring)", () => {
       sessionCostUsd: null,
       gitBranch: null,
       llmModel: null,
-      selectedModel: null,
-      selectedEffort: null,
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
       codexModelOptions: [],
       codexPlanMode: false,
       nativeVendorOwnsModel: false,
@@ -268,7 +295,7 @@ describe("Composer status line (branch + context ring)", () => {
     // vendor-owned native session where the model used to be (wrongly) shown.
     useChatStore.setState({
       llmModel: "claude-sonnet-4-6",
-      selectedEffort: "medium",
+      sessionReasoningEffort: "medium",
       nativeVendorOwnsModel: true,
       contextWindow: 100_000,
       tokensUsed: 25_000,
@@ -316,31 +343,35 @@ describe("Composer status line (branch + context ring)", () => {
   });
 
   it("shows the worktree branch on the left and truncates it", () => {
-    useChatStore.setState({
-      gitBranch: "feature/a-very-long-worktree-branch-name-that-would-wrap",
-    });
+    gitStatusStub.branch = "feature/a-very-long-worktree-branch-name-that-would-wrap";
+    gitStatusStub.branchState = "branch";
     renderComposer();
     const branch = screen.getByTestId("composer-git-branch");
     expect(branch).toHaveTextContent("feature/a-very-long-worktree-branch-name-that-would-wrap");
     // `truncate` (overflow-hidden + ellipsis + nowrap) is the guard that
-    // keeps a long branch from wrapping the tray onto a second line.
-    expect(branch).toHaveClass("truncate");
+    // keeps a long branch from wrapping the tray onto a second line. It sits
+    // on the trigger's label span, which is the element that carries the name.
+    expect(branch.querySelector("[data-workspace-collapse-label]")).toHaveClass("truncate");
   });
 
-  it("renders the tray with a branch even when the ring is absent", () => {
-    // The branch alone is enough to surface the tray — the visibility
-    // guard must not key off the ring only.
-    useChatStore.setState({ gitBranch: "main" });
+  it("shows the branch in the workspace bar even when the tray is hidden", () => {
+    // The branch sits in the workspace bar, a row of its own above the tray,
+    // so it survives a session that gives the tray nothing to show.
+    gitStatusStub.branch = "main";
+    gitStatusStub.branchState = "branch";
     renderComposer();
-    expect(statusLine()).not.toBeNull();
+    expect(statusLine()).toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("main");
   });
 
-  it("shows no branch when the session uses no worktree", () => {
-    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000, gitBranch: null });
+  it("names no branch when the workspace is not a git checkout", () => {
+    // The trigger is always on screen — it reserves its slot in the bar — so
+    // "no branch" reads as a stated reason, never as a blank or a stale name.
+    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000 });
+    gitStatusStub.branchState = "not-git";
     renderComposer();
     expect(statusLine()).not.toBeNull();
-    expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("Not a Git repository");
   });
 
   it("shows a persistent Plan mode badge when Codex Plan mode is active", () => {
@@ -499,19 +530,23 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByTestId("host-badge")).toHaveTextContent("mac-laptop");
   });
 
-  it("shows the host badge to the left of the worktree branch", () => {
-    // The host indicator moved out of the chat header into this tray; it
-    // sits immediately left of the worktree branch.
+  it("keeps the host badge in the tray, below the workspace bar's branch", () => {
+    // The host indicator belongs under the composer, not in the chat header.
+    // The branch moved up into the workspace bar, so the two are stacked
+    // rather than side by side: branch first in the DOM, host badge after it.
     bindHost("mac-laptop");
-    useChatStore.setState({ gitBranch: "geist" });
+    gitStatusStub.branch = "geist";
+    gitStatusStub.branchState = "branch";
     renderComposer();
 
     const host = screen.getByTestId("host-badge");
     const branch = screen.getByTestId("composer-git-branch");
     expect(host).toHaveTextContent("mac-laptop");
-    expect(host.compareDocumentPosition(branch) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+    expect(branch).toHaveTextContent("geist");
+    expect(branch.compareDocumentPosition(host) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
+    expect(statusLine()?.contains(host)).toBe(true);
   });
 
   it("turns the host badge into a clickable reconnect prompt for an offline host", () => {
@@ -548,11 +583,12 @@ describe("Composer status line (branch + context ring)", () => {
     // host_offline anyway — a stranded child is local_stranded, handled by the
     // banner elsewhere.
     bindHost("mac-laptop");
-    useChatStore.setState({ gitBranch: "geist" });
+    gitStatusStub.branch = "geist";
+    gitStatusStub.branchState = "branch";
     renderComposer({ subAgentLabel: "check-eligibility" });
 
     expect(screen.queryByTestId("host-badge")).toBeNull();
-    expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("geist");
   });
 });
 
@@ -647,8 +683,13 @@ describe("composerHarnessLabel", () => {
   });
 });
 
+// One rule across the cases below: when the catalog knows the model, the
+// backend owns the spelling — its display name AND its own effort token
+// ("xhigh"), which is what the model picker lists. Only a catalog-less id is
+// ours to prettify. `@/lib/composerModelLabel` normalizes effort either way;
+// this composer keeps its own copy, as HarnessConfigControls.tsx records.
 describe("formatModelEffortStatusLabel", () => {
-  it("uses Codex display names exactly as returned in model metadata", () => {
+  it("uses the Codex display name from model metadata", () => {
     expect(
       formatModelEffortStatusLabel("gpt-5.5", "xhigh", [
         {
@@ -675,7 +716,7 @@ describe("formatModelEffortStatusLabel", () => {
     );
   });
 
-  it("prefers the catalog display name for a Claude [1m] alias", () => {
+  it("resolves an exact Claude alias to its catalog display name", () => {
     expect(
       formatModelEffortStatusLabel("sonnet[1m]", "high", [
         { id: "sonnet[1m]", model: "claude-sonnet-5[1m]", displayName: "Sonnet 5 (1M context)" },

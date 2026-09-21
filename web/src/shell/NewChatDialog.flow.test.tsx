@@ -1,4 +1,35 @@
 import { readLastCreatedWorkspace, writeLastCreatedWorkspace } from "@/lib/lastCreatedWorkspace";
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useConversations as useTestConversations } from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: ({ target, enabled }: { target: { agentId?: string } | null; enabled?: boolean }) => ({
+    skills:
+      useAvailableAgents().data?.find((candidate) => candidate.id === target?.agentId)?.skills ??
+      [],
+    skillsStatus: enabled === false || target === null ? "unavailable" : "ready",
+    refetch: vi.fn(),
+  }),
+}));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
@@ -7,7 +38,6 @@ import type { SessionListWireItem } from "@/lib/sessionListCache";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
@@ -85,7 +115,11 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof CustomAgentsApiModule>()),
   useCustomAgents: vi.fn(() => ({ data: [], isPending: false, error: null })),
@@ -267,21 +301,50 @@ function openWorktree(): void {
  */
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  // Two submenus can hide a row: "More" holds the remaining harnesses, and
+  // (fork mod) "Custom agents" holds the user's own. Try More first — a
+  // harness id opened under Custom agents would never surface.
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    const more = screen.queryByTestId("new-chat-landing-harness-more");
+    if (more) fireEvent.click(more);
+  }
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
     const customAgents = screen.queryByTestId("new-chat-landing-custom-agents");
-    fireEvent.click(customAgents ?? screen.getByTestId("new-chat-landing-harness-more"));
+    if (customAgents) fireEvent.click(customAgents);
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
 /**
- * Select <agentId> and open its run-config modal via the composer gear icon.
- * The knobs (model / effort / permission / approval / cursor mode / brain
- * harness) live in this modal, not the picker dropdown.
+ * Select <agentId> and open its model and effort submenu.
+ * (Fork note: our cloned config modal still exists for permission / cursor /
+ * brain-harness knobs — openAgentConfig below covers that path.)
  */
+function openAgentModels(agentId: string): void {
+  const picker = screen.getByTestId("new-chat-landing-agent-select");
+  fireEvent.pointerDown(picker, { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+  }
+  if (screen.queryByTestId(`new-chat-landing-agent-config-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+    fireEvent.pointerDown(picker, { button: 0 });
+    if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    }
+  }
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+}
+
+/** Open a configurable agent's advanced brain-harness settings. */
 function openAgentConfig(agentId: string): void {
-  selectAgent(agentId);
+  openAgentModels(agentId);
   fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+}
+
+function pickPermissionOption(value: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-chip"), { button: 0 });
+  fireEvent.click(screen.getByTestId(`new-chat-landing-permission-option-${value}`));
 }
 
 /** Open a Radix Select trigger (opens on pointerdown in jsdom). */
@@ -370,7 +433,10 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         expect.any(Object),
         project,
-        expect.any(Array),
+        expect.objectContaining({ boundAgentId: "ag_hello", reasoningEffort: null }),
+        // Fork mod (MOD-s10), last slot: the inline-attachment order, sent only
+        // when there are attachments to order. This draft is text-only.
+        undefined,
       ),
     );
     await waitFor(() =>
@@ -1071,6 +1137,38 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("enables Send for a file-only draft and creates the session without text", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+
+    // An attached image alone is a sendable draft: the send path omits the
+    // input_text block for blank text, so nothing downstream needs typing.
+    const file = new File(["x"], "screenshot.png", { type: "image/png" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
+        text: "",
+        skill: null,
+        files: [file],
+        // Fork mod (MOD-s10): the draft's visual order rides along, so the
+        // first message renders the image where the user placed it.
+        composerParts: [{ type: "attachment", file }],
+      }),
+    );
+  });
+
   it("hands a bundled-skill first message off as a structured invocation", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -1142,9 +1240,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Not a bundled skill — e.g. a typo or a host-discovered skill the
-    // server can't know pre-session. Falls through to plain text, same as
-    // the in-session composer's unknown-command path.
+    // Unknown names fall through to plain text, as in the session composer.
     typeMessage("/typo do something");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1280,13 +1376,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Claude Code's config modal and pick a non-default permission mode,
-    // then Save. The create call proves the choice travels as a
-    // `--permission-mode <mode>` pair in terminal_launch_args.
-    openAgentConfig("ag_native");
-    pickSelectOption("new-chat-landing-config-permission", "Bypass permissions");
-    saveConfig();
-    // The trigger label stays the bare agent name (the pick lives in the modal).
+    // The hand dropdown's selection must travel as Claude's two-token CLI flag.
+    pickPermissionOption("bypassPermissions");
+    // Permissions stay separate from the agent/model trigger.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -1389,9 +1481,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_native");
-    pickSelectOption("new-chat-landing-config-permission", "Accept edits");
-    saveConfig();
+    pickPermissionOption("acceptEdits");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1414,9 +1504,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_codex");
-    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
-    saveConfig();
+    pickPermissionOption("bypass");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1430,9 +1518,8 @@ describe("NewChatLandingScreen create flow", () => {
     cleanup();
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_codex");
-    expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain(
-      "Bypass approvals & sandbox",
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Bypass approvals & sandbox",
     );
   });
 
@@ -1447,17 +1534,16 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Claude Code's config modal: it shows the permission select (not an
-    // approval select), and Codex's stored "full-access" preset doesn't bleed
-    // in — the permission select sits at its Default.
-    openAgentConfig("ag_native");
-    expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
-    // The permission select's trigger displays its current value — "Manual"
-    // (Claude's own label for the prompting `default` mode), not Codex's
-    // stored "full-access" (which isn't even a valid value here).
-    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
+    // Claude's hand menu stays on Manual and never offers Codex approval presets.
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Manual",
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-chip"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-permission-option-default")).toHaveTextContent(
       "Manual",
     );
+    expect(screen.queryByTestId("new-chat-landing-permission-option-full-access")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-permission-option-bypass")).toBeNull();
   });
 
   it("posts no launch args for opencode-native, even after a codex full-access pick", async () => {
@@ -1477,10 +1563,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick "Full access" for Codex in its config modal and Save.
-    openAgentConfig("ag_codex");
-    pickSelectOption("new-chat-landing-config-approval", "Full access");
-    saveConfig();
+    pickPermissionOption("full-access");
 
     // Switch to OpenCode by clicking its row. It has no mode knobs, so no gear
     // shows for it — its launch posts no terminal_launch_args.
@@ -1580,9 +1663,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_agy");
-    pickSelectOption("new-chat-landing-config-agy-skip", "Skip permissions");
-    saveConfig();
+    pickPermissionOption("skip");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1609,13 +1690,13 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_cursor");
-    pickSelectOption("new-chat-landing-config-cursor-mode", "Plan");
-    saveConfig();
+    pickPermissionOption("plan");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).terminal_launch_args).toEqual(["--mode", "plan"]);
     const stored = JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")[
       "cursor-native"
     ];
@@ -1651,12 +1732,16 @@ describe("NewChatLandingScreen create flow", () => {
     ]);
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_agy");
     // agy exposes no firing pre-tool hook, so Omnigent cannot re-gate tools
     // once this is armed — the banner is the only guardrail the user gets.
     expect(screen.queryByTestId("new-chat-landing-agy-skip-banner")).toBeNull();
-    pickSelectOption("new-chat-landing-config-agy-skip", "Skip permissions");
-    expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toBeTruthy();
+    pickPermissionOption("skip");
+    expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toHaveAttribute("role", "alert");
+    expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toHaveTextContent(
+      "all tool permission prompts disabled",
+    );
+    pickPermissionOption("default");
+    expect(screen.queryByTestId("new-chat-landing-agy-skip-banner")).toBeNull();
   });
 
   it("omits model + effort on create when the picker is untouched for claude-native", async () => {
@@ -1690,12 +1775,11 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Model, effort and permission mode share Claude Code's one config modal;
-    // both can be set in one visit and commit together on Save.
-    openAgentConfig("ag_native");
-    pickSelectOption("new-chat-landing-config-model", "Opus");
-    pickSelectOption("new-chat-landing-config-effort", "High");
-    saveConfig();
+    // Model and effort selections apply directly from the Edit submenu.
+    openAgentModels("ag_native");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1737,20 +1821,19 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_pi");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
+    openAgentModels("ag_pi");
     const fullNameRow = document.querySelector(
-      '[data-model-id="omnigent-openai/system.ai.gpt-5-6-sol"]',
+      '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
     expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
-    fireEvent.change(screen.getByTestId("new-chat-landing-config-model-search"), {
+    fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
       target: { value: "gpt sol" },
     });
     expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
     expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
     fireEvent.click(screen.getByText("GPT 5.6 Sol"));
-    saveConfig();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1791,6 +1874,48 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.reasoning_effort).toBe("high");
   });
 
+  it("clears remembered model + effort when both create-composer picks return to Default", async () => {
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": { model: "opus", effort: "high" } }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_native");
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-default"));
+    const stored = JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")[
+      "claude-native"
+    ];
+    expect(stored?.model).toBe("");
+    expect(stored?.effort).toBe("");
+
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
   it("persists a picked model for claude-native, preserving the stored effort", async () => {
     // Effort is already on record. Picking only the model must merge — not
     // clobber — so the next session seeds BOTH from storage.
@@ -1806,9 +1931,11 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_native");
-    pickSelectOption("new-chat-landing-config-model", "Opus");
-    saveConfig();
+    // claude-native has no advanced-settings gear in the picker menu — its
+    // model lives in the agent's own models submenu.
+    openAgentModels("ag_native");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -1880,10 +2007,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Codex's config modal, pick "Full access", and Save.
-    openAgentConfig("ag_codex");
-    pickSelectOption("new-chat-landing-config-approval", "Full access");
-    saveConfig();
+    pickPermissionOption("full-access");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -2010,10 +2134,8 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.harness_override).toBeUndefined();
   });
 
-  // Skipped while the toggle is hidden behind the false-gate in NewChatDialog; un-skip when re-enabling.
   it("no longer renders a standalone smart-routing composer toggle", async () => {
-    // The sparkle toggle was folded into the gear modal's Model dropdown — it
-    // must not render as a separate composer control anymore.
+    // Smart Routing belongs in the model menu, not a separate composer toggle.
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     renderLanding();
     await waitForWorkspaceSeed();
@@ -2023,10 +2145,12 @@ describe("NewChatLandingScreen create flow", () => {
   it("renders the config modal footer without its own background or top border", async () => {
     // The Cancel/Save footer should blend into the modal body — no gray tray
     // band and no divider line above the buttons.
-    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_native");
+    openAgentConfig("ag_polly");
 
     const footer = screen
       .getByTestId("new-chat-landing-config-save")

@@ -281,8 +281,30 @@ def _install_placement_fakes(
 
     captured: dict[str, Any] = {}
 
+    class _ReadyStreamResponse:
+        """Runner SSE stream that goes ready on its first heartbeat, then ends."""
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_text(self) -> Any:
+            yield 'data: {"type": "session.heartbeat"}\n\n'
+            yield "data: [DONE]\n\n"
+
     class _RecordingRunnerClient:
         """Stand-in runner client capturing the real init handshake body."""
+
+        def stream(self, _method: str, _path: str, **_kwargs: Any) -> Any:
+            # Placement waits for the relay's ready heartbeat before it
+            # dispatches, so the fake client has to answer GET /stream — an
+            # exception here reads as "relay exited before becoming ready".
+            return _ReadyStreamResponse()
 
         async def post(self, _path: str, **kwargs: Any) -> Any:
             if "json" in kwargs:

@@ -50,6 +50,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
@@ -280,7 +281,7 @@ def create_host_tunnel_router(
                 return
 
             stage = "registration"
-            await asyncio.to_thread(
+            persisted_host = await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
                 name=frame.name,
@@ -290,6 +291,10 @@ def create_host_tunnel_router(
                 managed_token=managed_token,
             )
             host_persisted = True
+            if persisted_host.account_generation is not None:
+                from omnigent.db.account_authority import bind_account_authority
+
+                bind_account_authority(tunnel_owner, persisted_host.account_generation)
 
             stage = "registry"
             conn = host_registry.register(
@@ -827,6 +832,11 @@ async def _receive_loop(
                     }
                 )
             continue
+        if isinstance(frame, HostSkillsResultFrame):
+            skills_future = conn.pending_skills.pop(frame.request_id, None)
+            if skills_future is not None and not skills_future.done():
+                skills_future.set_result(frame)
+            continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
             if queue is not None:
@@ -851,7 +861,12 @@ async def _receive_loop(
                 queue.put_nowait(
                     (
                         "done",
-                        {"status": frame.status, "error": frame.error, "failed": frame.failed},
+                        {
+                            "status": frame.status,
+                            "error": frame.error,
+                            "failed": frame.failed,
+                            "failures": frame.failures,
+                        },
                     )
                 )
             continue

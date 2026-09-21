@@ -23,6 +23,7 @@ export const BUILTIN_AGENTS = new Set([
   "qwen-native-ui", // Qwen Code
   "kimi-native-ui", // Kimi
   "codex-sdk",
+  "devin-native-ui", // Devin
   "polly",
   "debby",
 ]);

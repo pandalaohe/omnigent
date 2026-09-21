@@ -2,25 +2,40 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import logging
 import os
 import shutil
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 
 from omnigent.entities import LoadedAgent
 from omnigent.spec import AgentSpec
 from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store import ArtifactStore
 
+_logger = logging.getLogger(__name__)
+
 
 @dataclass
 class _MutationLockEntry:
+    """One agent's serialization lock, plus how many callers hold a reference."""
+
     lock: RLock
     users: int = 0
+
+
+def _cleanup_staging_dir(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass  # Successful publication moved this staging directory into the cache.
+    except OSError as exc:
+        _logger.warning("Could not clean agent cache staging directory %s: %s", path, exc)
 
 
 class AgentCache:
@@ -57,12 +72,23 @@ class AgentCache:
         self._artifact_store = artifact_store
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
-        self._mutation_locks_guard = RLock()
+        self._mutation_locks_guard = Lock()
         self._mutation_locks: dict[str, _MutationLockEntry] = {}
 
-    @contextmanager
+    @contextlib.contextmanager
     def _mutation_lock_for(self, agent_id: str) -> Iterator[None]:
-        """Serialize one agent while allowing unrelated agents to proceed."""
+        """
+        Serialize one agent's cache operations, leaving other agents concurrent.
+
+        Fork mod. Upstream's staging directory makes PUBLICATION atomic, so a
+        reader never sees a half-written tree — but two misses for the same
+        agent still both download and extract the same bundle, and the loser's
+        work is thrown away. This lock collapses them into one download; a
+        global lock would serialize unrelated agents, so it is keyed per agent.
+
+        The entry is reference-counted and dropped at zero, so a long-lived
+        cache does not accumulate one lock per agent it has ever seen.
+        """
         with self._mutation_locks_guard:
             entry = self._mutation_locks.get(agent_id)
             if entry is None:
@@ -76,22 +102,23 @@ class AgentCache:
         finally:
             with self._mutation_locks_guard:
                 entry.users -= 1
-                if entry.users == 0:
-                    self._mutation_locks.pop(agent_id, None)
+                if entry.users == 0 and self._mutation_locks.get(agent_id) is entry:
+                    del self._mutation_locks[agent_id]
 
-    def _cache_path(self, agent_id: str, *, suffix: str = "") -> Path:
+    def _cache_path(self, agent_id: str) -> Path:
         """Return a direct child of the cache root for an agent id."""
         component = os.path.basename(agent_id)
         if (
             not component
             or component in {".", ".."}
+            or component.casefold() == ".staging"
             or component != agent_id
             or "\\" in component
             or "\x00" in component
         ):
             raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
         cache_root = self._cache_dir.resolve(strict=False)
-        normalized_path = os.path.normpath(cache_root / f"{component}{suffix}")
+        normalized_path = os.path.normpath(cache_root / component)
         if not normalized_path.startswith(os.path.join(cache_root, "")):
             raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
         path = Path(normalized_path)
@@ -132,8 +159,6 @@ class AgentCache:
         """
         workdir = self._cache_path(agent_id)
 
-        # Serialize cache reads with mutations so a caller cannot observe a
-        # spec while its workdir is being replaced or evicted.
         with self._mutation_lock_for(agent_id):
             # Tier 1: in-memory spec. The cached spec was parsed with the
             # *expand_env* value of whichever caller populated it first.
@@ -149,9 +174,11 @@ class AgentCache:
                 self._specs[agent_id] = spec
                 return LoadedAgent(spec=spec, workdir=workdir)
 
-            # Cache miss — download bundle, write to temp file, extract
+            # Cache miss — validate privately before publishing the disk entry.
+            # Inside the lock: a second miss for this agent waits and then
+            # finds the tier-1 spec above rather than re-downloading.
             bundle_bytes = self._artifact_store.get(bundle_location)
-            return self._extract_and_cache(agent_id, bundle_bytes, workdir, expand_env=expand_env)
+            return self._extract_and_cache(agent_id, bundle_bytes, expand_env=expand_env)
 
     def replace(
         self,
@@ -164,10 +191,13 @@ class AgentCache:
         """
         Warm-swap an agent's cached spec and disk directory.
 
-        Extracts the new bundle to a temp directory, swaps the
-        in-memory spec entry, renames into the cache location, and
-        cleans up the old directory. Concurrent readers see either
-        the old spec or the new spec, never an empty cache.
+        Validates the new bundle in a temporary directory before
+        replacing the disk directory and updating the in-memory spec.
+        Restores the previous directory if publication fails; if rollback
+        also fails, retains the backup path in the error's notes.
+        Fork mod: serialized per agent, so a concurrent :meth:`load` or
+        :meth:`evict` for the same agent waits rather than interleaving with
+        the swap. Unrelated agents still proceed in parallel.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
@@ -184,84 +214,86 @@ class AgentCache:
         :returns: A LoadedAgent with the new spec and working
             directory.
         """
-        with self._mutation_lock_for(agent_id):
+        workdir = self._cache_path(agent_id)
+        with self._mutation_lock_for(agent_id), self._staging_dir() as staging_dir:
+            spec = load_spec(
+                bundle_bytes,
+                dest=staging_dir,
+                expand_env=expand_env,
+                prune_invalid_sub_agents=True,
+            )
             workdir = self._cache_path(agent_id)
-            staging_dir = self._reserve_swap_path(agent_id, "staging")
             backup_dir: Path | None = None
-
-            # Extract new bundle to staging directory
-            tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-            os.close(tmp_fd)
-            tmp_path = Path(tmp_name)
-            try:
-                tmp_path.write_bytes(bundle_bytes)
-                spec = load_spec(
-                    tmp_path,
-                    dest=staging_dir,
-                    expand_env=expand_env,
-                    prune_invalid_sub_agents=True,
-                )
-            except Exception:
-                if staging_dir.exists():
-                    shutil.rmtree(staging_dir)
-                raise
-            finally:
-                tmp_path.unlink()
-
+            published = False
             try:
                 if workdir.is_dir():
-                    backup_dir = self._reserve_swap_path(agent_id, "backup")
-                    workdir.rename(backup_dir)
+                    backup_dir = Path(tempfile.mkdtemp(prefix="backup-", dir=staging_dir.parent))
+                    workdir.rename(backup_dir / "previous")
                 try:
                     staging_dir.rename(workdir)
-                except Exception:
-                    if backup_dir is not None and backup_dir.exists():
-                        backup_dir.rename(workdir)
+                except OSError as publish_error:
+                    if backup_dir is not None:
+                        try:
+                            (backup_dir / "previous").rename(workdir)
+                        except OSError as restore_error:
+                            self._specs.pop(agent_id, None)
+                            restore_error.add_note(
+                                f"Previous cached bundle retained at {backup_dir / 'previous'}"
+                            )
+                            # Surface failed recovery, preserving the publish error as its cause.
+                            raise restore_error from publish_error
                     raise
-
-                # Publish the new spec only after its workdir is in place.
-                self._specs[agent_id] = spec
+                published = True
             finally:
-                if staging_dir.exists():
-                    shutil.rmtree(staging_dir)
-
-            # A failed cleanup must not undo a completed replacement. A later
-            # process cleanup may remove this uniquely named orphan.
-            if backup_dir is not None and backup_dir.exists():
-                shutil.rmtree(backup_dir, ignore_errors=True)
-
-            return LoadedAgent(spec=spec, workdir=workdir)
+                # A failed rollback retains its backup for manual recovery/cleanup.
+                # Crash remnants also need manual cleanup; no automatic reaper runs.
+                if backup_dir is not None and (
+                    published or not (backup_dir / "previous").exists()
+                ):
+                    _cleanup_staging_dir(backup_dir)
+        self._specs[agent_id] = spec
+        return LoadedAgent(spec=spec, workdir=workdir)
 
     def evict(self, agent_id: str) -> None:
         """
         Remove an agent from both cache tiers. Called when an
         agent is deleted. No-op if the agent is not cached.
 
+        Fork mod: the directory is renamed out of the cache before it is
+        deleted, so a concurrent :meth:`load` reading tier 2 sees either the
+        complete bundle or nothing — never a half-deleted tree. Deleting in
+        place is only atomic for the final unlink.
+
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
         """
+        workdir = self._cache_path(agent_id)
         with self._mutation_lock_for(agent_id):
-            workdir = self._cache_path(agent_id)
-            tombstone_dir: Path | None = None
-            if workdir.is_dir():
-                tombstone_dir = self._reserve_swap_path(agent_id, "evicted")
-                workdir.rename(tombstone_dir)
             self._specs.pop(agent_id, None)
-            if tombstone_dir is not None:
-                shutil.rmtree(tombstone_dir, ignore_errors=True)
+            if not workdir.is_dir():
+                return
+            with self._staging_dir() as staging_dir:
+                workdir.rename(staging_dir / "evicted")
 
-    def _reserve_swap_path(self, agent_id: str, purpose: str) -> Path:
-        """Return a unique, currently absent path inside the cache directory."""
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        path = Path(tempfile.mkdtemp(prefix=f".{agent_id}-{purpose}-", dir=self._cache_dir))
-        path.rmdir()
-        return path
+    @contextlib.contextmanager
+    def _staging_dir(self) -> Iterator[Path]:
+        """Stage on the cache filesystem in a reserved, symlink-checked namespace."""
+        cache_root = self._cache_dir.resolve(strict=False)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        staging_root = cache_root / ".staging"
+        if staging_root.resolve(strict=False) != staging_root:
+            raise ValueError(f"unsafe staging root: {staging_root}")
+        staging_root.mkdir(mode=0o700, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(prefix="bundle-", dir=staging_root))
+        try:
+            yield staging_dir
+        finally:
+            _cleanup_staging_dir(staging_dir)
 
     def _extract_and_cache(
         self,
         agent_id: str,
         bundle_bytes: bytes,
-        workdir: Path,
         *,
         expand_env: bool = False,
     ) -> LoadedAgent:
@@ -270,32 +302,33 @@ class AgentCache:
 
         :param agent_id: Unique agent identifier.
         :param bundle_bytes: Raw bytes of the ``.tar.gz`` bundle.
-        :param workdir: Target directory for extraction.
         :param expand_env: Whether to expand ``${VAR}`` references
             against the server process environment. Forwarded from
             :meth:`load`; defaults to ``False`` (fail-safe). See
             :meth:`load` for the rationale.
         :returns: A LoadedAgent with the parsed spec and workdir.
         """
-        staging_dir = self._reserve_swap_path(agent_id, "staging")
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
-        try:
-            tmp_path.write_bytes(bundle_bytes)
+        with self._staging_dir() as staging_dir:
             spec = load_spec(
-                tmp_path,
+                bundle_bytes,
                 dest=staging_dir,
                 expand_env=expand_env,
                 prune_invalid_sub_agents=True,
             )
-            staging_dir.rename(workdir)
-        except Exception:
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            raise
-        finally:
-            tmp_path.unlink()
-
+            workdir = self._cache_path(agent_id)
+            try:
+                staging_dir.rename(workdir)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                # Another cold loader published first; use its complete bundle.
+                workdir = self._cache_path(agent_id)
+                if not workdir.is_dir():
+                    raise
+                spec = load_spec(
+                    workdir,
+                    expand_env=expand_env,
+                    prune_invalid_sub_agents=True,
+                )
         self._specs[agent_id] = spec
         return LoadedAgent(spec=spec, workdir=workdir)

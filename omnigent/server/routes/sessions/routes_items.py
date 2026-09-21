@@ -34,6 +34,9 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
+from omnigent.server.routes._errors import (
+    STALE_CURSOR_RESPONSE,
+)
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -57,11 +60,12 @@ from omnigent.server.schemas import (
     PaginatedList,
     SessionItemsWindow,
 )
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
-_subagent_reconcile_locks: dict[str, asyncio.Lock] = {}
-_native_lazy_reconcile_after: dict[str, float] = {}
+_subagent_reconcile_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache()
+_native_lazy_reconcile_after: WorkspaceScopedCache[str, float] = WorkspaceScopedCache()
 _NATIVE_LAZY_RECONCILE_INTERVAL_S = 300.0
 _NATIVE_LAZY_RECONCILE_RETRY_S = 30.0
 
@@ -153,7 +157,7 @@ def register_items_routes(
     @router.get(
         "/sessions/{session_id}/items",
         response_model=None,
-        responses={200: {"model": PaginatedList}},
+        responses={200: {"model": PaginatedList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_session_items(
         request: Request,
@@ -409,7 +413,7 @@ def register_items_routes(
     @router.get(
         "/sessions/{session_id}/child_sessions",
         response_model=None,
-        responses={200: {"model": ChildSessionList}},
+        responses={200: {"model": ChildSessionList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_child_sessions(
         request: Request,

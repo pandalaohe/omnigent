@@ -344,12 +344,16 @@ async def test_machine_client_owns_and_operates_its_own_session(env: SimpleNames
 
     # Post an event (owner satisfies the LEVEL_EDIT gate — not rejected).
     # Bounded above too: a 500 is a failure, not a pass, for "not rejected".
+    # Fork mod: interrupt delivery is synchronous, so this runner-less session
+    # answers 503 runner_unavailable — a state answer, not a server fault.
     posted = await env.client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "interrupt", "data": {}},
         headers=auth,
     )
-    assert posted.status_code not in (401, 403) and posted.status_code < 500, posted.text
+    assert posted.status_code not in (401, 403) and (
+        posted.status_code < 500 or posted.status_code == 503
+    ), posted.text
 
     # Resolve an elicitation (owner passes the gate; a missing elicitation
     # degrades gracefully rather than being an authz failure).

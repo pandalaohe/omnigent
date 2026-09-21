@@ -36,10 +36,18 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
         command.downgrade(config, revision)
 
 
-def test_single_alembic_head_is_peer_messages() -> None:
+def test_single_alembic_head_includes_peer_messages() -> None:
+    """One head, and the peer-messages revision is on the way to it.
+
+    Pinning the head to a literal revision breaks on every upstream merge,
+    which adds a mergepoint above it. What must hold is that the chain never
+    forks and that this migration stays in the lineage that head runs.
+    """
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["a13c20260920"], f"expected a single head, got {heads!r}"
+    assert len(heads) == 1, f"expected a single head, got {heads!r}"
+    lineage = {rev.revision for rev in script.iterate_revisions(heads[0], "base")}
+    assert "a13c20260920" in lineage, "peer-messages migration is not an ancestor of head"
 
 
 def test_upgrade_head_creates_peer_messages_with_indexes(tmp_path: Path) -> None:
@@ -78,7 +86,10 @@ def test_upgrade_head_creates_peer_messages_with_indexes(tmp_path: Path) -> None
     inspector = sa.inspect(engine)
     assert "session_peer_messages" not in inspector.get_table_names()
     with engine.connect() as conn:
-        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "a12c20260913"
+        # Each upstream mergepoint forks the chain, so unwinding this branch
+        # leaves the other branch's head stamped alongside it.
+        stamped = set(conn.scalars(sa.text("SELECT version_num FROM alembic_version")))
+        assert "a12c20260913" in stamped, stamped
 
     engine.dispose()
     clear_engine_cache()

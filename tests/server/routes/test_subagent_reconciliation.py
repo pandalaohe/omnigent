@@ -15,6 +15,7 @@ from omnigent.entities.conversation import (
     ResourceEventData,
 )
 from omnigent.runtime import pending_elicitations
+from omnigent.runtime import session_stream as runtime_session_stream
 from omnigent.server import session_live_state
 from omnigent.server.routes._sessions import (
     helpers as helpers_module,
@@ -341,8 +342,12 @@ def test_latest_child_fanout_prefers_durable_terminal_over_quarantine(
         "submit",
         lambda _description, fn, *args, **_kwargs: fn(*args),
     )
+    # Patch the stream MODULE, not `<module>.session_stream`: that name is a
+    # `_FacadeAttrProxy` whose `__getattr__` always answers, so monkeypatch
+    # reads the pre-existing value as an instance attribute and restores it as
+    # one — pinning `publish` on the proxy for the rest of the process.
     monkeypatch.setattr(
-        helpers_module.session_stream,
+        runtime_session_stream,
         "publish",
         lambda session_id, payload: published.append((session_id, payload)),
     )
@@ -457,8 +462,9 @@ async def test_reconcile_route_corrects_only_reliable_terminal_metadata(
     )
     published: list[tuple[str, dict[str, Any]]] = []
     parent_updates: list[tuple[str, str]] = []
+    # The stream module itself, for the reason spelled out above.
     monkeypatch.setattr(
-        reconciliation_module.session_stream,
+        runtime_session_stream,
         "publish",
         lambda session_id, payload, **_kwargs: published.append((session_id, payload)),
     )

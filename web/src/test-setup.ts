@@ -115,7 +115,14 @@ vi.mock("@tanstack/react-virtual", () => ({
       getOffsetForIndex: (index: number) => [index * ROW, "start"] as const,
       takeSnapshot: () => items,
       scrollOffset: 0,
+      scrollAdjustments: 0,
+      scrollDirection: null,
       range: count > 0 ? { startIndex: 0, endIndex: count - 1 } : null,
+      // The transcript's prepend hold measures fresh rows itself and reads the
+      // raw measurements back; sizes never change under jsdom.
+      measurementsCache: items,
+      itemSizeCache: new Map(),
+      resizeItem: () => {},
     };
   },
 }));
@@ -133,3 +140,54 @@ Object.defineProperty(window, "matchMedia", {
     dispatchEvent: () => false,
   }),
 });
+
+// ProseMirror (the inline composer editor, MOD-s10) measures the caret through
+// layout APIs jsdom does not implement: Text nodes carry no rect methods and
+// Document has no elementFromPoint. Left missing they throw out of an event
+// handler, which tears down the jsdom environment for the rest of the file —
+// every later test then fails on a missing `localStorage`. Inert stubs keep the
+// editor mountable in the many tests that assert on content, never geometry.
+const EMPTY_RECT: DOMRect = {
+  x: 0,
+  y: 0,
+  width: 0,
+  height: 0,
+  top: 0,
+  right: 0,
+  bottom: 0,
+  left: 0,
+  toJSON: () => ({}),
+};
+if (!("getClientRects" in Text.prototype)) {
+  Object.defineProperty(Text.prototype, "getClientRects", {
+    configurable: true,
+    writable: true,
+    value: () => Object.assign([] as DOMRect[], { item: () => null }),
+  });
+}
+if (!("getBoundingClientRect" in Text.prototype)) {
+  Object.defineProperty(Text.prototype, "getBoundingClientRect", {
+    configurable: true,
+    writable: true,
+    value: () => EMPTY_RECT,
+  });
+}
+// The caret measurement goes through a Range, which jsdom leaves unimplemented
+// for geometry as well.
+if (!("getClientRects" in Range.prototype)) {
+  Object.defineProperty(Range.prototype, "getClientRects", {
+    configurable: true,
+    writable: true,
+    value: () => Object.assign([] as DOMRect[], { item: () => null }),
+  });
+}
+if (!("getBoundingClientRect" in Range.prototype)) {
+  Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+    configurable: true,
+    writable: true,
+    value: () => EMPTY_RECT,
+  });
+}
+if (typeof document.elementFromPoint !== "function") {
+  document.elementFromPoint = () => null;
+}

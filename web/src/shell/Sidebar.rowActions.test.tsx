@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar conversation-row quick actions:
 //   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
 //      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
@@ -10,7 +14,6 @@ import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
@@ -242,17 +245,19 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
     const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
     const tree = (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-            {activeId ? (
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-              </Routes>
-            ) : (
-              sidebar
-            )}
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+              {activeId ? (
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                </Routes>
+              ) : (
+                sidebar
+              )}
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     // No explicit info → CapabilitiesContext default ("loading"), matching
@@ -300,7 +305,9 @@ describe("quick pin/unpin hover button", () => {
     const pin = screen.getByTestId("quick-pin-conversation");
     const kebab = screen.getByTestId("conversation-actions");
     expect(pin).toHaveClass("size-6");
-    expect(kebab).toHaveClass("size-6");
+    // Fork mod: the kebab is a touch target on mobile and only shrinks to the
+    // pin's size from md up, so the compact size is the responsive class.
+    expect(kebab).toHaveClass("size-8", "md:size-6");
     // Both buttons live in the same wrapper, which owns the position + gap.
     const controls = pin.parentElement!;
     expect(controls).toBe(kebab.parentElement);
@@ -341,8 +348,9 @@ describe("quick pin/unpin hover button", () => {
       expect(button.querySelector("svg")).toHaveClass("size-3.5");
       expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
     }
-    // Same compact size as the session-row kebab it aligns with.
-    expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
+    // Same compact size as the session-row kebab it aligns with — which the
+    // fork only applies from md up, the mobile kebab being a touch target.
+    expect(screen.getByTestId("conversation-actions")).toHaveClass("md:size-6");
   });
 
   it("sizes the Projects group-header controls to the same compact icon", () => {
@@ -497,17 +505,18 @@ describe("quick pin/unpin hover button", () => {
     expect(quickButton).not.toHaveClass("md:block");
   });
 
-  it("drops the row kebab on mobile, revealing it only from md up", () => {
-    // The per-row "..." menu is desktop-only: on mobile the chat page's own
-    // header menu covers these per-session actions, so the row kebab is hidden
-    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
-    // like the quick-pin button — flex, not block — so its glyph stays
-    // centered.
+  it("keeps the row kebab on mobile as a touch target, shrinking it from md up", () => {
+    // Fork mod (`fix(web): keep stopped-session recovery reachable on mobile`):
+    // upstream hides the per-row "..." on mobile because the chat header menu
+    // covers the same actions, but recovering a stopped session is reachable
+    // only from this menu. So it stays visible at a touch size and shrinks to
+    // the desktop kebab from md up, where it also becomes hover-revealed.
     renderSidebar();
 
     const kebab = screen.getByTestId("conversation-actions");
-    expect(kebab).toHaveClass("hidden", "md:inline-flex");
-    expect(kebab).not.toHaveClass("md:block");
+    expect(kebab).toHaveClass("inline-flex", "size-8", "md:size-6");
+    expect(kebab).not.toHaveClass("hidden", "md:block");
+    expect(kebab).toHaveClass("md:opacity-0", "md:group-hover:opacity-100");
   });
 });
 
@@ -1400,11 +1409,13 @@ describe("peek mode row menu", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <Sidebar open={false} peek onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open={false} peek onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     return { onClose };

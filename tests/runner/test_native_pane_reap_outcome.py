@@ -32,6 +32,8 @@ def _fake_instance(tmp_path: Path) -> Any:
         running=True,
         socket_path=tmp_path / "tmux.sock",
         close=_close,
+        # Real instances carry one; the close path stamps it into telemetry.
+        diagnostic_id="term_diag_fake",
     )
 
 
@@ -112,7 +114,7 @@ async def test_detailed_close_reports_close_failed(
 ) -> None:
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    current = SimpleNamespace(running=True)
+    current = SimpleNamespace(running=True, diagnostic_id="term_diag_fake")
     terminal_registry._by_conversation.setdefault("conv_a", {})[("codex", "main")] = current
     terminal_id = terminal_resource_id("codex", "main")
 

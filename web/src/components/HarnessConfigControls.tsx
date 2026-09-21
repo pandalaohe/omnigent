@@ -29,43 +29,15 @@ export interface RoutingModelOption {
   label: string;
 }
 
-/** The native-catalog fields the Model row's copy is built from. */
-export interface NativeModelLabelFields {
-  id: string;
-  /** Provider-facing model id. Accepted so a full catalog row fits; the label
-   *  below deliberately does not read it — see the note. */
-  model?: string;
-  displayName?: string;
-  isDefault?: boolean;
-}
-
-// Upstream moved these helpers to @/lib/composerModelLabel and changed the Model
-// row to show the provider model id instead of the advertised name
-// ("Default (claude-opus-4-8[1m])" rather than "Default (Opus 4.8 (1M context))").
-// That is part of the composer redesign stack this branch defers, so the
-// advertised-name form stays here with the rest of our composer. The shared leaf
-// module is untouched and keeps its own test, ready for the port to adopt.
-
-/** A catalog row's user-facing name: what the harness advertises, else its id. */
-export function nativeModelLabel(option: NativeModelLabelFields): string {
-  return option.displayName ?? option.id;
-}
-
-/**
- * Label for the Model row's "Default" choice, naming the model it resolves to
- * when the catalog marks one.
- *
- * Shared by the landing dialog and the in-session composer: read from one place
- * so the same session can't read "Default" in one gear and
- * "Default (GPT-5.6-Luna)" in the other.
- *
- * @param options Harness catalog rows; at most one is marked default.
- * @returns ``Default (<name>)``, or plain ``Default`` when unmarked.
- */
-export function defaultModelLabel(options: readonly NativeModelLabelFields[]): string {
-  const dflt = options.find((option) => option.isDefault);
-  return dflt ? `Default (${nativeModelLabel(dflt)})` : "Default";
-}
+// These used to be local copies here, kept because upstream's Model row had
+// started showing the provider model id instead of the advertised name
+// ("Default (claude-opus-4-8[1m])" rather than "Default (Opus 4.8 (1M
+// context))"). Upstream has since fixed that: the shared leaf now returns the
+// advertised name whenever it is a real label, and only unwraps a display name
+// that merely repeats the transport id (hiding "system.ai."/"databricks-").
+// That is a superset of what the copies did, so the copies are gone.
+export { defaultModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
+export type { NativeModelLabelFields } from "@/lib/composerModelLabel";
 
 /**
  * The Model row's Select: the Smart Routing sentinel (when offered), the
@@ -162,6 +134,9 @@ export function RoutingModelSelect({
 // picker's `null` state uses. Mirrors ANTHROPIC_EFFORTS server-side. Lives here
 // (a leaf module, no heavy imports) so both NewChatDialog and the scheduled-task
 // dialog can share the single source of truth.
+// Also Devin's ladder: Devin encodes effort as a model-variant suffix
+// (`<family>-<rung>`) over exactly this rung set, so devin-native shares this
+// list rather than duplicating it.
 export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },

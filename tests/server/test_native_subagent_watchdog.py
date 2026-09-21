@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshot
+from omnigent.runtime import session_stream as runtime_session_stream
 from omnigent.server.native_subagent_watchdog import NativeSubagentWatchdog
 
 
@@ -127,8 +128,12 @@ async def test_timeout_fanout_preserves_durable_running_on_cache_miss(
         "submit",
         lambda _description, fn, *args, **_kwargs: fn(*args),
     )
+    # The stream MODULE, not `helpers_module.session_stream`: that name is a
+    # `_FacadeAttrProxy` whose `__getattr__` always answers, so monkeypatch
+    # restores the pre-existing value as an instance attribute and pins
+    # `publish` on the proxy for every later test in the process.
     monkeypatch.setattr(
-        helpers_module.session_stream,
+        runtime_session_stream,
         "publish",
         lambda session_id, payload: published.append((session_id, payload)),
     )

@@ -85,11 +85,14 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["needs_setup"] is False
     assert isinstance(data["databricks_features"], bool)
     assert isinstance(data["managed_sandboxes_enabled"], bool)
+    # The last two are fork features; the map is exact, so every registered
+    # flag in `omnigent/server/feature_flags.py` has to appear here.
     assert data["features"] == {
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
         "project_assignments": False,
+        "session_peer_messaging": False,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False

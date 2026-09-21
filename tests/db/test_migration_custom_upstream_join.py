@@ -11,6 +11,13 @@ from alembic import command
 from omnigent.db.utils import _build_alembic_config, _initialize_or_verify_schema, _run_migrations
 
 
+def _head(uri: str) -> str:
+    """The chain's current head — pinning a literal breaks on every merge."""
+    from alembic.script import ScriptDirectory
+
+    return ScriptDirectory.from_config(_build_alembic_config(uri)).get_heads()[0]
+
+
 @pytest.mark.parametrize("start", ["ff1b2c3d4e5", "ge1b2c3d4e5f", "legacy-custom-ge"])
 @pytest.mark.parametrize("manual", [False, True])
 def test_join_preserves_existing_data(tmp_path: Path, start: str, manual: bool) -> None:
@@ -61,7 +68,7 @@ def test_join_preserves_existing_data(tmp_path: Path, start: str, manual: bool) 
     assert "background_session_titles_enabled" not in columns
     assert "preferences" in columns
     with engine.connect() as conn:
-        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "a13c20260920"
+        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == _head(uri)
         assert conn.scalar(sa.text("SELECT name FROM hosts WHERE host_id = 'host'")) == "preserved"
         if custom:
             assert (

@@ -15,10 +15,11 @@ the Model picker → every row must read as a plain model name and both
 
 The catalog is produced by the REAL probe pipeline
 (``omnigent.harnesses.claude_native.main.claude_model_catalog``) against a stub ``claude``
-CLI whose stream-json output is byte-identical to what a real Claude Code
-2.1.250 ``claude -p "/model"`` run printed when captured live — so the test
-is deterministic regardless of which CLI version this machine has installed,
-while every line of Omnigent's parsing/composition code still runs for real.
+CLI that supplies structured initialize options and replays the model labels
+captured from Claude Code 2.1.250. The test is deterministic regardless of the
+installed CLI version, while Omnigent's parsing/composition code runs for real.
+The availability regression marks Fable disabled in initialize while leaving
+its help alias and model resolution intact.
 """
 
 from __future__ import annotations
@@ -38,16 +39,20 @@ from playwright.sync_api import Page, Route, expect
 from omnigent.harnesses.claude_native.main import claude_model_catalog
 from tests.e2e_ui.conftest import fetch_with_retry
 
+# What each picker row must read as once the harness's markdown-code label
+# formatting is neutralized: plain names, with both 1M rows phrased alike.
 _EXPECTED_LABELS = [
-    ("sonnet", "claude-sonnet-5"),
-    ("opus", "claude-opus-5"),
-    ("haiku", "claude-haiku-4-5-20251001"),
-    ("fable", "claude-fable-5"),
-    ("sonnet[1m]", "claude-sonnet-5[1m]"),
-    ("opus[1m]", "claude-opus-5[1m]"),
+    ("sonnet", "Sonnet 5"),
+    ("opus", "Opus 5"),
+    ("haiku", "Haiku 4.5"),
+    ("fable", "Fable 5"),
+    ("sonnet[1m]", "Sonnet 5 (1M context)"),
+    ("opus[1m]", "Opus 5 (1M context)"),
 ]
 
-_ONE_M_ROW_SHAPE = re.compile(r"claude-[\w-]+\[1m\]")
+# Every visible 1M-context row must follow this one shape — a bare model name
+# followed by the marker, no wrapping punctuation anywhere.
+_ONE_M_ROW_SHAPE = re.compile(r"[\w.]+(?: [\w.]+)* \(1M context\)")
 
 # The stub CLI replays Claude Code 2.1.250's stream-json ``/model`` answers,
 # captured verbatim from the real 2.1.250 binary: the enumeration run (no
@@ -58,6 +63,7 @@ _FAKE_CLAUDE_CLI = textwrap.dedent(
     """\
     #!/usr/bin/env python3
     import json
+    import os
     import sys
 
     RESOLUTIONS = {
@@ -80,6 +86,16 @@ _FAKE_CLAUDE_CLI = textwrap.dedent(
     args = sys.argv[1:]
     alias = args[args.index("--model") + 1] if "--model" in args else None
     if alias is None:
+        models = [
+            {"value": value, "disabled": bool(os.environ.get("FAKE_FABLE_DISABLED"))
+             and value.startswith("fable")}
+            for value in RESOLUTIONS
+        ]
+        print(json.dumps({
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": "model-catalog",
+                         "response": {"models": models}},
+        }))
         model, label = RESOLUTIONS["default"]
         text = f"Current model: {label}\\n{USAGE}"
     else:
@@ -237,10 +253,33 @@ def test_claude_native_picker_1m_context_rows_read_alike(
     one_m_texts = [
         rows.nth(index).inner_text().strip()
         for index in range(len(_EXPECTED_LABELS))
-        if "[1m]" in rows.nth(index).inner_text()
+        if "1M context" in rows.nth(index).inner_text()
     ]
     assert len(one_m_texts) == 2, f"expected two 1M-context rows, saw {one_m_texts!r}"
     for text in one_m_texts:
         assert _ONE_M_ROW_SHAPE.fullmatch(text), (
-            f"1M-context row {text!r} does not preserve its model ID and [1m] marker"
+            f"1M-context row {text!r} does not read as a plain '<Name> (1M context)' label"
         )
+
+
+def test_claude_native_picker_omits_disabled_fable(
+    page: Page,
+    seeded_session: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Fable stays absent even when /model help and alias resolution advertise it."""
+    monkeypatch.setenv("FAKE_FABLE_DISABLED", "1")
+    base_url, session_id = seeded_session
+    catalog = _probe_catalog_from_claude_2_1_250(monkeypatch, tmp_path)
+    _patch_session_as_claude_native(page, session_id, catalog, llm_model="claude-opus-5[1m]")
+
+    _open_model_picker(page, base_url, session_id)
+
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows).to_have_count(len(_EXPECTED_LABELS) - 1)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="fable"]')).to_have_count(0)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="fable[1m]"]')).to_have_count(0)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="opus"]')).to_contain_text(
+        "Opus 5"
+    )

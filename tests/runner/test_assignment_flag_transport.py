@@ -218,6 +218,15 @@ class _RelayStubRegistry:
         del session_id, agent_spec
         return str(self._tmp_path)
 
+    def session_activity_epoch(self, session_id: str) -> int:
+        # This stub never spawns, so no turn activity is ever observed.
+        del session_id
+        return 0
+
+    def session_turn_is_active(self, session_id: str) -> bool:
+        del session_id
+        return False
+
     async def launch_required_terminal(
         self,
         session_id: str,

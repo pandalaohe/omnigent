@@ -119,7 +119,11 @@ def test_downgrade_drops_assignment_tables_and_columns(tmp_path: Path) -> None:
     project_columns = {c["name"] for c in inspector.get_columns("projects")}
     assert not ({"collaboration_enabled", "collaboration_revision"} & project_columns)
     with engine.connect() as conn:
-        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "a11c20260912"
+        # The chain forks at each upstream mergepoint, so unwinding this branch
+        # leaves the other branch's head stamped alongside it; assert this
+        # branch landed rather than that it is the only row.
+        stamped = set(conn.scalars(sa.text("SELECT version_num FROM alembic_version")))
+        assert "a11c20260912" in stamped, stamped
 
     engine.dispose()
     clear_engine_cache()

@@ -23,6 +23,11 @@ from omnigent.db.utils import (
 )
 
 
+def _head(uri: str) -> str:
+    """The chain's current head — pinning a literal breaks on every merge."""
+    return ScriptDirectory.from_config(_build_alembic_config(uri)).get_heads()[0]
+
+
 def _upgrade(uri: str, engine: sa.Engine, revision: str) -> None:
     config = _build_alembic_config(uri)
     with engine.begin() as conn:
@@ -40,7 +45,7 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["a13c20260920"], f"expected a single head, got {heads!r}"
+    assert len(heads) == 1, f"expected a single head, got {heads!r}"
 
 
 @pytest.mark.parametrize("manual", [False, True])
@@ -105,7 +110,7 @@ def test_legacy_custom_gc_collision_upgrades_without_data_loss(
         "preferences",
     }
     with engine.connect() as conn:
-        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == "a13c20260920"
+        assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == _head(uri)
         assert (
             conn.scalar(sa.text("SELECT preferences FROM users WHERE id = 'user_custom'"))
             == preference_bytes
