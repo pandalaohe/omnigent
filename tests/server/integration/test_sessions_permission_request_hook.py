@@ -2151,6 +2151,88 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
     pending_elicitations.reset_for_tests()
 
 
+async def test_terminal_answer_during_grace_resolves_instead_of_expiring(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A question answered in the native TUI reads as answered, not expired.
+
+    Answering in the CLI severs the hook's long-poll instantly, but the
+    proof that it was answered — the mirrored tool result the forwarder
+    correlates — needs a transcript poll plus a POST to arrive. It
+    therefore always loses the race against the disconnect, which is why
+    the card used to sit ``pending`` for the grace and then render
+    "Prompt expired" on a question the user had already answered.
+
+    The grace is the window that evidence must be allowed to land in, so
+    the severed wait's parked record survives it and the clear waits on
+    that record rather than sleeping blind. Asserting the ABSENCE of
+    ``reason`` is the whole point: both outcomes publish
+    ``response.elicitation_resolved`` and clear the index, and only the
+    reason distinguishes "someone answered" from "the prompt expired".
+    """
+    from omnigent.runtime import pending_elicitations, session_stream
+
+    async def _disconnect_immediately(_request: Any) -> None:
+        # Same ordering as the real socket close: one short yield so the
+        # disconnect lands after the hook published its SSE request.
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _disconnect_immediately)
+    monkeypatch.setattr(sessions_route, "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 30.0)
+    # Long enough that the mirrored result below lands well inside it, so
+    # a pass cannot come from the grace simply elapsing first.
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 5.0)
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-permission-terminal-answer")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload()
+
+    resolved: list[dict[str, Any]] = []
+
+    async def _drain_until_resolved() -> None:
+        """
+        Capture the ``response.elicitation_resolved`` event.
+
+        :returns: None.
+        """
+        async with asyncio.timeout(10.0):
+            async for event in session_stream.subscribe(session_id):
+                if event.get("type") == "response.elicitation_resolved":
+                    resolved.append(event)
+                    return
+
+    drain_task = asyncio.create_task(_drain_until_resolved())
+    await asyncio.sleep(0.05)
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/permission-request",
+        json=payload,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"", f"expected empty body on disconnect, got {resp.content!r}"
+
+    # The forwarder mirrors the tool result the CLI answer produced. It
+    # arrives after the poll is already gone — that lateness is the defect.
+    sessions_route._signal_terminal_resolved_harness_elicitation(
+        session_id,
+        payload["tool_name"],
+        payload["tool_input"],
+    )
+
+    await drain_task
+    assert resolved, "the severed wait must still publish a resolution"
+    assert "reason" not in resolved[0], (
+        f"a CLI-answered question must not be published as expired, got {resolved[0]!r}"
+    )
+    assert pending_elicitations.count_for(session_id) == 0, (
+        f"index should clear once the terminal answer lands, got "
+        f"{pending_elicitations.count_for(session_id)!r}"
+    )
+    pending_elicitations.reset_for_tests()
+
+
 _REATTACH_ELICITATION_ID = f"elicit_claude_{'ab' * 16}"
 
 

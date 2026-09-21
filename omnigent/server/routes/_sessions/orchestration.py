@@ -584,15 +584,26 @@ async def _publish_and_wait_for_harness_elicitation(
         if _harness_elicitation_registry.get(elicitation_id) is future:
             _harness_elicitation_registry.pop(elicitation_id, None)
             _harness_elicitation_owners.pop(elicitation_id, None)
-        if _harness_parked_elicitations.get(elicitation_id) is parked:
+        deferring_clear = published_request and not settled
+        # A deferred clear keeps the parked record alive for the grace so a
+        # terminal-side resolution that is still in flight can still land on
+        # it; that task owns the pop. Popping here instead is what made a
+        # CLI-answered question expire: the answer severs the poll
+        # instantly, while the mirrored tool result proving it was answered
+        # needs a transcript poll plus a POST, so it always arrived after
+        # the record it had to correlate against was gone. The owners entry
+        # is still dropped above, which keeps the web-verdict path from
+        # reaching this record — only the terminal correlation can.
+        if not deferring_clear and _harness_parked_elicitations.get(elicitation_id) is parked:
             _harness_parked_elicitations.pop(elicitation_id, None)
-        if published_request and not settled:
+        if deferring_clear:
             # Severed without an answer — defer the clear (scheduled
             # before any await so handler cancellation can't skip it).
             _schedule_deferred_elicitation_clear(
                 session_id,
                 elicitation_id,
                 conversation_store,
+                parked=parked,
             )
         elif published_request:
             _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
@@ -610,10 +621,11 @@ def _schedule_deferred_elicitation_clear(
     session_id: str,
     elicitation_id: str,
     conversation_store: ConversationStore | None,
+    parked: _ParkedHarnessElicitation | None = None,
 ) -> None:
     """
     Clear one elicitation's approval card after the re-park grace, unless
-    a hook retry re-parks the id first.
+    a hook retry re-parks the id or the terminal answers first.
 
     A wait severed without an answer (proxy cut, timeout) may still be
     blocked in the native terminal; clearing immediately wiped the only
@@ -623,17 +635,31 @@ def _schedule_deferred_elicitation_clear(
     ``reason="unanswered"``: nobody decided anything, so the card can say
     the prompt expired instead of implying someone resolved it elsewhere.
 
+    The grace is also the window in which a terminal-side answer proves
+    itself. Answering in the native TUI severs the hook's poll at once,
+    but the evidence — the mirrored tool result correlated by
+    :func:`_signal_terminal_resolved_harness_elicitation` — needs a
+    transcript poll and a POST to arrive, so it lands here rather than on
+    the live wait. Waiting on ``parked.resolved_elsewhere`` instead of
+    sleeping blind both wakes the moment that evidence arrives and turns
+    the clear into a plain resolution, so a question answered in the CLI
+    reads as answered rather than expired.
+
     :param session_id: Session that owns the elicitation, e.g.
         ``"conv_abc123"``.
     :param elicitation_id: Correlation id whose card may need clearing,
         e.g. ``"elicit_claude_0f3a..."``.
     :param conversation_store: Store used to mirror the clear into
         ancestor streams, or ``None`` to keep it session-local.
+    :param parked: The severed wait's own parked record, left in the
+        registry so a late terminal resolution can still correlate
+        against it; this task owns its removal. ``None`` keeps the
+        legacy blind sleep for callers that hold no record.
     """
 
     async def _clear_after_grace() -> None:
         """
-        Sleep out the grace, then publish the clear unless re-parked.
+        Wait out the grace, then publish the clear unless re-parked.
 
         :returns: None.
         """
@@ -641,18 +667,37 @@ def _schedule_deferred_elicitation_clear(
         # constant is honored here.
         from omnigent.server.routes import sessions as _facade
 
-        await asyncio.sleep(_facade._HARNESS_ELICITATION_REPARK_GRACE_S)
+        grace_s = _facade._HARNESS_ELICITATION_REPARK_GRACE_S
+        resolved_in_terminal = False
+        if parked is None:
+            await asyncio.sleep(grace_s)
+        else:
+            try:
+                await asyncio.wait_for(parked.resolved_elsewhere.wait(), timeout=grace_s)
+                resolved_in_terminal = True
+            except TimeoutError:
+                pass
+            if _harness_parked_elicitations.get(elicitation_id) is parked:
+                _harness_parked_elicitations.pop(elicitation_id, None)
         if elicitation_id in _harness_elicitation_registry:
-            # Re-parked — the new wait owns the eventual clear.
+            # Re-parked — the new wait owns the eventual clear. Hand it the
+            # terminal's answer, whose only other carrier was the record
+            # just popped: its own race is watching a fresh Event, and the
+            # mirrored result that proved the answer will not be sent twice.
+            if resolved_in_terminal:
+                current = _harness_parked_elicitations.get(elicitation_id)
+                if current is not None:
+                    current.resolved_elsewhere.set()
             return
-        _publish_elicitation_resolved(session_id, elicitation_id, reason="unanswered")
+        reason = None if resolved_in_terminal else "unanswered"
+        _publish_elicitation_resolved(session_id, elicitation_id, reason=reason)
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_resolved_to_ancestors,
                 conversation_store,
                 session_id,
                 elicitation_id,
-                reason="unanswered",
+                reason=reason,
             )
 
     task = asyncio.create_task(_clear_after_grace())
