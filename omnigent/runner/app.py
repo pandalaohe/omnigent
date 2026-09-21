@@ -166,7 +166,10 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
-from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLifecycle
+from omnigent.runner.session_runtime_lifecycle import (
+    SessionRuntimeLifecycle,
+    SessionRuntimeLock,
+)
 from omnigent.runner.subagent_routing import (
     PLAIN_SESSION,
     SessionRoutingClass,
@@ -3107,8 +3110,17 @@ def create_runner_app(
     # retention teardown.
     _cli_runtime_lifecycle = SessionRuntimeLifecycle()
 
-    def _cli_runtime_lock(session_id: str) -> asyncio.Lock:
+    def _cli_runtime_lock(session_id: str) -> SessionRuntimeLock:
+        # Held `shared()` by whoever USES the runtime (session-init, a turn,
+        # terminal creation) and `exclusive()` by whoever replaces or destroys
+        # it (CLI-retention reclaim, the archive fence).
         return _cli_runtime_lifecycle.lock_for(session_id)
+
+    # Two handshakes for one session still run one at a time: they both
+    # advance the runtime generation, which is not a runtime *use* and so is
+    # not covered by the shared hold above. Always taken last, so it orders
+    # against nothing else.
+    _session_init_locks: dict[str, asyncio.Lock] = {}
 
     app.state.cli_runtime_lifecycle = _cli_runtime_lifecycle
 
@@ -4051,7 +4063,10 @@ def create_runner_app(
         if isinstance(raw_snapshot, dict):
             _apply_archive_states(session_id, raw_snapshot.get("archive_states"))
         expected_runtime_token = _cli_runtime_lifecycle.runtime_token(session_id)
-        async with _cli_runtime_lock(session_id):
+        init_lock = _session_init_locks.setdefault(session_id, asyncio.Lock())
+        # Shared: a handshake USES the runtime, so it must not queue behind a
+        # turn that is streaming. A reclaim or archive fence still waits for it.
+        async with _cli_runtime_lock(session_id).shared(), init_lock:
             if not _cli_runtime_lifecycle.runtime_start_allowed(
                 session_id
             ) or not _cli_runtime_lifecycle.runtime_token_matches(
@@ -8501,7 +8516,10 @@ def create_runner_app(
         # context carries it for its lifetime). Coded errors keep their own phase.
         with phase_scope(ErrorPhase.TURN):
             try:
-                async with _cli_runtime_lock(conv):
+                # Shared for the whole stream: a reclaim waits the turn out (it
+                # cancels first, which is what makes the wait short), while a
+                # handshake arriving mid-turn is answered rather than queued.
+                async with _cli_runtime_lock(conv).shared():
                     if not _cli_runtime_lifecycle.runtime_start_allowed(
                         conv
                     ) or not _cli_runtime_lifecycle.runtime_token_matches(
@@ -10073,7 +10091,8 @@ def create_runner_app(
 
                 if stream:
                     expected_runtime_token = _cli_runtime_lifecycle.runtime_token(conversation_id)
-                    async with _cli_runtime_lock(conversation_id):
+                    # Shared for the same reason as the background turn above.
+                    async with _cli_runtime_lock(conversation_id).shared():
                         if not _cli_runtime_lifecycle.runtime_start_allowed(
                             conversation_id
                         ) or not _cli_runtime_lifecycle.runtime_token_matches(
@@ -10727,7 +10746,9 @@ def create_runner_app(
         request: Request,
     ) -> JSONResponse:
         expected_runtime_token = _cli_runtime_lifecycle.runtime_token(session_id)
-        async with _cli_runtime_lock(session_id):
+        # Shared: creating a pane uses the runtime. Concurrency between two
+        # creates is already settled by the per-harness ensure locks.
+        async with _cli_runtime_lock(session_id).shared():
             if not _cli_runtime_lifecycle.runtime_start_allowed(
                 session_id
             ) or not _cli_runtime_lifecycle.runtime_token_matches(
@@ -13495,7 +13516,9 @@ def create_runner_app(
                 status_code=400,
                 content={"error": "invalid_input", "detail": "invalid retention reset"},
             )
-        async with _cli_runtime_lock(session_id):
+        # Exclusive: a retention reset re-owns the runtime, so no turn, no
+        # handshake and no pane creation may be mid-flight across it.
+        async with _cli_runtime_lock(session_id).exclusive():
             if not _cli_runtime_lifecycle.observe_policy(
                 session_id, host_id=host_id, revision=policy_revision
             ):
@@ -13693,13 +13716,15 @@ def create_runner_app(
                 )
             body["archive_scope_id"] = archive_scope_id
             body["archive_revision"] = archive_revision
-            # Interrupt outside the lifecycle lock: a background turn holds the
-            # lock for its full runtime-start/stream section, so cancellation is
-            # what makes it release the lock promptly for archive teardown.
+            # Interrupt outside the lifecycle lock: a background turn holds it
+            # shared for its full runtime-start/stream section, so cancellation
+            # is what makes it release promptly for archive teardown.
             harness = _session_harness_name(session_id)
             await _native_interrupt_runner.stop(harness, session_id)
             await _cancel_inprocess_turn(session_id)
-        async with _cli_runtime_lock(session_id):
+        # Exclusive: teardown destroys the runtime, so it waits until every
+        # user — turn, handshake, pane creation — has left.
+        async with _cli_runtime_lock(session_id).exclusive():
             return await _release_session_cli_retention_locked(session_id, body)
 
     @app.post("/v1/sessions/{session_id}/cli-retention/archive-state")
@@ -13727,7 +13752,9 @@ def create_runner_app(
                 status_code=400,
                 content={"error": "invalid_input", "detail": "invalid archive state"},
             )
-        async with _cli_runtime_lock(session_id):
+        # Exclusive: the fence decides whether a runtime may exist at all, so
+        # it must not land while a handshake is checking it mid-init.
+        async with _cli_runtime_lock(session_id).exclusive():
             applied = _cli_runtime_lifecycle.observe_archive_state(
                 session_id,
                 scope_id=scope_id,

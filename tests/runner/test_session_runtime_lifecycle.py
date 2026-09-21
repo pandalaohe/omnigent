@@ -7,7 +7,134 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLifecycle
+from omnigent.runner.session_runtime_lifecycle import (
+    SessionRuntimeLifecycle,
+    SessionRuntimeLock,
+)
+
+
+@pytest.mark.asyncio
+async def test_two_runtime_users_hold_the_session_at_the_same_time() -> None:
+    """A handshake must not queue behind a turn: both only USE the runtime."""
+    lock = SessionRuntimeLock()
+    both_inside = asyncio.Event()
+    inside = 0
+
+    async def user() -> None:
+        nonlocal inside
+        async with lock.shared():
+            inside += 1
+            if inside == 2:
+                both_inside.set()
+            await asyncio.wait_for(both_inside.wait(), timeout=1)
+
+    await asyncio.gather(user(), user())
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_reclaim_waits_for_every_runtime_user_to_leave() -> None:
+    """Teardown destroys the runtime, so no user may still be mid-flight."""
+    lock = SessionRuntimeLock()
+    allow_release = asyncio.Event()
+    order: list[str] = []
+
+    async def user(tag: str) -> None:
+        async with lock.shared():
+            order.append(tag)
+            await allow_release.wait()
+
+    async def reclaim() -> None:
+        async with lock.exclusive():
+            order.append("reclaim")
+
+    users = [asyncio.create_task(user("a")), asyncio.create_task(user("b"))]
+    await asyncio.sleep(0)
+    reclaim_task = asyncio.create_task(reclaim())
+    await asyncio.sleep(0.05)
+    assert order == ["a", "b"], "reclaim ran while the runtime was still in use"
+
+    allow_release.set()
+    await asyncio.gather(*users, reclaim_task)
+    assert order == ["a", "b", "reclaim"]
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_reclaim_is_not_starved_by_a_later_user() -> None:
+    """Grants follow arrival order, so back-to-back turns cannot hold off an
+    archive teardown indefinitely."""
+    lock = SessionRuntimeLock()
+    allow_release = asyncio.Event()
+    order: list[str] = []
+
+    async def first_user() -> None:
+        async with lock.shared():
+            order.append("first")
+            await allow_release.wait()
+
+    async def reclaim() -> None:
+        async with lock.exclusive():
+            order.append("reclaim")
+
+    async def late_user() -> None:
+        async with lock.shared():
+            order.append("late")
+
+    first = asyncio.create_task(first_user())
+    await asyncio.sleep(0.01)
+    reclaim_task = asyncio.create_task(reclaim())
+    await asyncio.sleep(0.01)
+    late = asyncio.create_task(late_user())
+    await asyncio.sleep(0.01)
+
+    allow_release.set()
+    await asyncio.gather(first, reclaim_task, late)
+    assert order == ["first", "reclaim", "late"]
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_turn_hands_the_runtime_back() -> None:
+    """Archive teardown reclaims by cancelling the turn, so the release path
+    has to survive cancellation at every point it can arrive."""
+    lock = SessionRuntimeLock()
+    inside = asyncio.Event()
+
+    async def holder() -> None:
+        async with lock.shared():
+            inside.set()
+            await asyncio.sleep(10)
+
+    held = asyncio.create_task(holder())
+    await asyncio.wait_for(inside.wait(), timeout=1)
+    held.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await held
+    assert not lock.locked(), "a cancelled holder left the runtime held"
+
+    # Cancelled while queued, before any grant.
+    async with lock.exclusive():
+        queued = asyncio.create_task(holder())
+        await asyncio.sleep(0.01)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+    assert not lock.locked(), "a cancelled waiter left the runtime held"
+
+    # Cancelled after the grant landed but before the task ever resumed: the
+    # hold is already taken on its behalf, and only _acquire can give it back.
+    await lock._acquire(exclusive=True)
+    granted = asyncio.create_task(holder())
+    await asyncio.sleep(0.01)
+    lock._release(exclusive=True)
+    assert lock._shared_holders == 1, "the grant never landed; the case is untested"
+    granted.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await granted
+    assert not lock.locked(), "a grant landed on a cancelled waiter and stuck"
+    async with lock.exclusive():
+        pass
 
 
 def test_runtime_token_is_scoped_to_runner_boot() -> None:
@@ -84,7 +211,8 @@ async def test_release_first_blocks_runtime_start_until_cleanup_finishes() -> No
     runtime_started = asyncio.Event()
 
     async def release() -> None:
-        async with lock:
+        # Reclaim replaces the runtime, so it is the exclusive side.
+        async with lock.exclusive():
             release_started.set()
             assert lifecycle.claim_reclaim("session")
             await allow_release.wait()
@@ -92,7 +220,7 @@ async def test_release_first_blocks_runtime_start_until_cleanup_finishes() -> No
 
     async def start() -> None:
         await release_started.wait()
-        async with lock:
+        async with lock.shared():
             lifecycle.mark_live("session")
             runtime_started.set()
 

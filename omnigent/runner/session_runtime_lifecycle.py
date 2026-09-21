@@ -4,10 +4,110 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from collections import deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
 RuntimePhase = Literal["absent", "starting", "live", "reclaiming"]
+
+
+class SessionRuntimeLock:
+    """Shared/exclusive lock over one session's CLI runtime.
+
+    Session-init, a background turn and terminal creation all *use* the
+    runtime, so they hold it shared and may overlap: a parent reconnecting
+    mid-turn has to get its handshake answered instead of waiting the turn out.
+    CLI retention's reclaim and the archive fence *replace or destroy* the
+    runtime, so they hold it exclusive and wait for every user to leave.
+
+    Waiters are granted in arrival order, which keeps a stream of overlapping
+    turns from starving a pending reclaim and a stream of reclaims from
+    starving a turn. Hand-rolled on futures because asyncio ships no
+    reader/writer lock; the release path is deliberately synchronous, so a
+    cancelled turn — which is how archive teardown reclaims the runtime —
+    cannot lose its release to a second cancellation at an ``await``.
+    """
+
+    def __init__(self) -> None:
+        self._shared_holders = 0
+        self._exclusive_held = False
+        # (exclusive?, future) in arrival order.
+        self._waiters: deque[tuple[bool, asyncio.Future[None]]] = deque()
+
+    def locked(self) -> bool:
+        """Whether the runtime is held at all, in either mode."""
+        return self._exclusive_held or self._shared_holders > 0
+
+    @asynccontextmanager
+    async def shared(self) -> AsyncIterator[None]:
+        """Hold the runtime as a user, concurrently with other users."""
+        await self._acquire(exclusive=False)
+        try:
+            yield
+        finally:
+            self._release(exclusive=False)
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        """Hold the runtime as its owner, with no user overlapping."""
+        await self._acquire(exclusive=True)
+        try:
+            yield
+        finally:
+            self._release(exclusive=True)
+
+    def _grantable(self, exclusive: bool) -> bool:
+        if self._exclusive_held:
+            return False
+        return not exclusive or self._shared_holders == 0
+
+    async def _acquire(self, *, exclusive: bool) -> None:
+        if not self._waiters and self._grantable(exclusive):
+            self._take(exclusive)
+            return
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append((exclusive, waiter))
+        try:
+            await waiter
+        except BaseException:
+            # Cancelled after the grant already landed: the hold was taken on
+            # this task's behalf, so hand it back rather than leave the runtime
+            # held by a task that is unwinding.
+            if waiter.done() and not waiter.cancelled():
+                self._release(exclusive=exclusive)
+            else:
+                self._drain()
+            raise
+
+    def _take(self, exclusive: bool) -> None:
+        if exclusive:
+            self._exclusive_held = True
+        else:
+            self._shared_holders += 1
+
+    def _release(self, *, exclusive: bool) -> None:
+        if exclusive:
+            self._exclusive_held = False
+        else:
+            self._shared_holders -= 1
+        self._drain()
+
+    def _drain(self) -> None:
+        """Grant the queue head, plus the shared run behind a shared head."""
+        while self._waiters:
+            exclusive, waiter = self._waiters[0]
+            if waiter.done():  # cancelled while queued
+                self._waiters.popleft()
+                continue
+            if not self._grantable(exclusive):
+                return
+            self._waiters.popleft()
+            self._take(exclusive)
+            waiter.set_result(None)
+            if exclusive:
+                return
 
 
 @dataclass
@@ -24,16 +124,16 @@ class SessionRuntimeLifecycle:
 
     def __init__(self, *, boot_id: str | None = None) -> None:
         self._boot_id = boot_id or secrets.token_hex(16)
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: dict[str, SessionRuntimeLock] = {}
         self._states: dict[str, _SessionRuntimeState] = {}
 
     @property
     def boot_id(self) -> str:
         return self._boot_id
 
-    def lock_for(self, session_id: str) -> asyncio.Lock:
+    def lock_for(self, session_id: str) -> SessionRuntimeLock:
         """Return the stable process-lifetime lock for one session."""
-        return self._locks.setdefault(session_id, asyncio.Lock())
+        return self._locks.setdefault(session_id, SessionRuntimeLock())
 
     def _state(self, session_id: str) -> _SessionRuntimeState:
         return self._states.setdefault(session_id, _SessionRuntimeState())
