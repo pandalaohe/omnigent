@@ -689,12 +689,20 @@ def _schedule_deferred_elicitation_clear(
                 if current is not None:
                     current.resolved_elsewhere.set()
             return
-        if resolved_in_terminal:
+        if resolved_in_terminal and elicitation_id not in _harness_pre_resolved_elicitations:
             # Keep the terminal-side tombstone the resolve helper would have
             # written had the record already been gone. A hook retry can
             # re-park after this clear (it backs off between POSTs), and
             # without the tombstone it re-publishes an answered question and
             # waits out its own timeout.
+            #
+            # Never over an existing one. ``resolved_elsewhere`` has two
+            # producers, and the web verdict is the other: it sets the event
+            # AND writes a verdict-carrying tombstone, so when a cancellation
+            # lands between that verdict and ``settled`` being read, this
+            # clear sees the event set and would replace the user's answer
+            # with a no-verdict tombstone. The retry would then fail-ask a
+            # question that was already approved.
             _prune_pre_resolved_harness_elicitations()
             _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
                 session_id=session_id,

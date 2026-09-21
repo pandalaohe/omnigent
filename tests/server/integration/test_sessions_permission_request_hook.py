@@ -2246,6 +2246,56 @@ async def test_terminal_answer_during_grace_resolves_instead_of_expiring(
     pending_elicitations.reset_for_tests()
 
 
+async def test_deferred_clear_keeps_a_web_verdict_tombstone() -> None:
+    """
+    The clear never replaces a web answer with a no-verdict tombstone.
+
+    ``resolved_elsewhere`` has two producers: the terminal correlation and
+    the web verdict, which sets the event AND writes a verdict-carrying
+    tombstone. A cancellation landing between that verdict and ``settled``
+    being read leaves the clear looking at a set event it did not cause, so
+    writing unconditionally would drop the user's approval and make the
+    hook's retry fail-ask a question that was already answered.
+    """
+    from omnigent.server.schemas import ElicitationResult
+
+    elicitation_id = "elicit_claude_verdict_keep"
+    parked = _ParkedHarnessElicitation(
+        session_id="conv_web",
+        tool_name="Bash",
+        tool_input={"command": "ls"},
+        resolved_elsewhere=asyncio.Event(),
+    )
+    # What the web resolver leaves behind before the cancelled wait unwinds.
+    parked.resolved_elsewhere.set()
+    _harness_parked_elicitations[elicitation_id] = parked
+    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+        session_id="conv_web",
+        created_at=time.time(),
+        result=ElicitationResult(action="accept"),
+    )
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
+    try:
+        sessions_route._schedule_deferred_elicitation_clear(
+            "conv_web",
+            elicitation_id,
+            None,
+            parked=parked,
+        )
+        await asyncio.sleep(0.2)
+        surviving = _harness_pre_resolved_elicitations.get(elicitation_id)
+        assert surviving is not None, "the web verdict tombstone must survive the clear"
+        assert surviving.result is not None, (
+            f"the clear replaced an accepted verdict with a terminal tombstone: {surviving!r}"
+        )
+        assert surviving.result.action == "accept"
+    finally:
+        monkey.undo()
+        _harness_parked_elicitations.pop(elicitation_id, None)
+        _harness_pre_resolved_elicitations.clear()
+
+
 async def test_terminal_resolve_rejects_a_foreign_session_during_the_grace() -> None:
     """
     A retained parked record still answers only to its own session.
