@@ -6259,14 +6259,23 @@ async def _post_forward_side_channel_updates(
         # provider actually charged for.
         token_usage = _gen_ai_usage_tokens(result.latest_usage)
         record_token_usage = token_usage if token_usage != dedupe.recorded_token_usage else None
-        if usage_changed or window_changed or provider_limits_changed:
+        # Token recording carries its own trigger. The three flags below compare
+        # the statusLine gauge, which is re-read every poll, so a quiet poll can
+        # advance ``dedupe.usage`` to the snapshot that the later poll — the one
+        # carrying the newly completed call — then reads as unchanged. Gating the
+        # span on them drops that call's tokens for good: nothing retries, and by
+        # the next post ``result.latest_usage`` has moved to the following call.
+        usage_post_needed = usage_changed or window_changed or provider_limits_changed
+        if usage_post_needed or record_token_usage is not None:
             try:
                 await _post_external_session_usage(
                     client,
                     session_id=session_id,
-                    usage=posted_usage,
-                    context_window=resolved_context_window,
-                    provider_usage_limits=provider_usage_limits,
+                    usage=posted_usage if usage_post_needed else None,
+                    context_window=resolved_context_window if usage_post_needed else None,
+                    provider_usage_limits=(
+                        provider_usage_limits if usage_post_needed else None
+                    ),
                     token_usage=record_token_usage,
                 )
                 if usage_changed:
@@ -6911,8 +6920,10 @@ async def _post_external_session_usage(
     """
     Post one ``external_session_usage`` event to the Sessions API.
 
-    At least one of ``usage`` / ``context_window`` / ``provider_usage_limits`` must be set; a
-    payload with neither is a no-op (the server would 400 it).
+    At least one of ``usage`` / ``context_window`` / ``provider_usage_limits`` must be set for
+    the request to go out; with none of them the request is skipped (the server would 400 it).
+    ``token_usage`` alone is still honoured — the span is recorded and nothing is POSTed, which
+    is how a completed API call whose statusLine gauge never moved still reaches the backend.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -6935,7 +6946,7 @@ async def _post_external_session_usage(
         payload["context_window"] = context_window
     if provider_usage_limits is not None:
         payload["provider_usage_limits"] = provider_usage_limits
-    if not payload:
+    if not payload and token_usage is None:
         return
     from omnigent.runtime import telemetry
 
@@ -6951,6 +6962,8 @@ async def _post_external_session_usage(
     ):
         if token_usage is not None:
             telemetry.record_llm_usage(usage_span, token_usage)
+        if not payload:
+            return
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
             json={"type": "external_session_usage", "data": payload},

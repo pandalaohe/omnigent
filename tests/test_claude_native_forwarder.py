@@ -11045,12 +11045,11 @@ async def test_forwarder_records_each_api_call_usage_exactly_once(
         recorded = _recorded_token_spans(otel_exporter)
         assert recorded == [(1000, 50)], "one completed API call must record exactly one span"
 
-        # A second API call is new usage and does add a span. The statusLine
-        # gauge advances too — as it would for a real completed call — since
-        # the side-channel tail now also runs on quiet polls (A3b) and would
-        # otherwise have already caught the dedupe baseline up to the a1
-        # snapshot, masking a2's own usage POST.
-        status_box["value"] = {"input_tokens": 2200, "output_tokens": 80}
+        # A second API call is new usage and does add a span — and the
+        # statusLine gauge deliberately does NOT move for it. The side-channel
+        # tail runs on quiet polls too, so the gauge comparison has already
+        # caught up to this snapshot; if the span were gated on that
+        # comparison, a2's tokens would be dropped and never retried.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_assistant("a2", "more", {"input_tokens": 2200, "output_tokens": 80}) + "\n")
         await poll()
