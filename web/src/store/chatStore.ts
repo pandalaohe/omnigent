@@ -1086,7 +1086,13 @@ export interface ChatActions {
     agentId: string,
     opts?: SendOptions,
   ) => Promise<void>;
-  stop: () => Promise<void>;
+  // The conversation to interrupt. Omitted targets the active one; a
+  // side-chat card passes its child id so the child's turn is the one cut.
+  stop: (conversationId?: string) => Promise<void>;
+  // Abort a pending question outright: decline it, then interrupt the turn
+  // it blocks, leaving the session alive. See the implementation for why the
+  // two must run in this order.
+  declineAndInterrupt: (elicitationId: string, conversationId?: string) => Promise<void>;
   switchTo: (conversationId: string | null) => Promise<void>;
   submitApproval: (
     elicitationId: string,
@@ -2407,8 +2413,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  stop: async () => {
-    const sessionId = get().conversationId;
+  stop: async (conversationId) => {
+    const sessionId = conversationId ?? get().conversationId;
     if (!sessionId || interruptRequestsInFlight.has(sessionId)) return;
     interruptRequestsInFlight.add(sessionId);
     // Keep the stream and lifecycle state live until the server confirms that
@@ -2427,6 +2433,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } finally {
       interruptRequestsInFlight.delete(sessionId);
     }
+  },
+
+  declineAndInterrupt: async (elicitationId, conversationId) => {
+    // Decline FIRST and await it. The decline is what resolves the parked
+    // hook wait, so the agent learns the question was refused and the card
+    // flips to a verdict. Interrupting first would sever that wait with no
+    // answer, leaving the question to the server's deferred clear — the
+    // card would read as unanswered rather than declined, which is the
+    // ambiguity this control exists to remove.
+    await get().submitApproval(elicitationId, "cancel", undefined, undefined, conversationId);
+    // Then cut the turn. ``stop`` posts an interrupt, never a session
+    // stop: for claude-native the latter hard-kills the tmux pane, and
+    // this control must leave the session alive.
+    await get().stop(conversationId);
   },
 
   switchTo: async (conversationId) => {

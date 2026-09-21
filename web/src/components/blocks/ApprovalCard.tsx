@@ -224,6 +224,19 @@ export function ApprovalCard({
         void store.submitApproval(id, action, content, meta);
       }
     });
+  // Decline the question and cut the turn it blocks. Only available on the
+  // in-chat path: aborting needs the session whose turn is waiting, and the
+  // Inbox renders cards for sessions other than the active one behind its own
+  // submitter — there the control would interrupt whichever conversation the
+  // chat store happens to be showing, so it is not offered.
+  const abortTurn =
+    onSubmit === undefined
+      ? () => {
+          void useChatStore
+            .getState()
+            .declineAndInterrupt(elicitationId, scopedConversationId ?? undefined);
+        }
+      : undefined;
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);
   };
@@ -663,6 +676,7 @@ export function ApprovalCard({
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
+            onAbort={abortTurn}
           />
         ) : isCodexCommandApproval ? (
           <>

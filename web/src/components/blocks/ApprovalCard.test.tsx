@@ -783,6 +783,75 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     });
   });
 
+  it("declines before interrupting when the abort control is used", async () => {
+    // Order is the whole point of this control. The decline resolves the
+    // parked hook wait, so the agent learns the question was refused and the
+    // card flips to a verdict; interrupting first severs that wait with no
+    // answer and leaves the card reading unanswered. The decline spy resolves
+    // on a later microtask so a missing ``await`` shows up as the wrong order
+    // rather than passing by luck.
+    const original = useChatStore.getState();
+    const calls: string[] = [];
+    const submitSpy = vi.fn(async () => {
+      await Promise.resolve();
+      calls.push("decline");
+    });
+    const stopSpy = vi.fn(async () => {
+      calls.push("interrupt");
+    });
+    useChatStore.setState({ submitApproval: submitSpy, stop: stopSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_abort"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview={sampleSinglePreview}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("ask-user-question-abort"));
+    await vi.waitFor(() => {
+      expect(calls).toEqual(["decline", "interrupt"]);
+    });
+    // "cancel", not "decline": the user is abandoning the turn, not refusing
+    // this one tool. Both map to deny for the hook; the card's pill differs.
+    expect(submitSpy).toHaveBeenCalledWith("elic_abort", "cancel", undefined, undefined, undefined);
+    useChatStore.setState({
+      submitApproval: original.submitApproval,
+      stop: original.stop,
+    } as Partial<ReturnType<typeof useChatStore.getState>>);
+  });
+
+  it("omits the abort control when the card routes verdicts elsewhere", () => {
+    // The Inbox renders cards for sessions other than the active one and
+    // supplies its own submitter. An abort there would interrupt whichever
+    // conversation the chat store happens to be showing, so the control is
+    // not offered rather than offered and wrong.
+    render(
+      <ApprovalCard
+        elicitationId="elic_inbox"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview={sampleSinglePreview}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId("ask-user-question-form")).toBeDefined();
+    expect(screen.queryByTestId("ask-user-question-abort")).toBeNull();
+  });
+
   it("submits structured question answers keyed by id when present", () => {
     // Codex requestUserInput questions carry stable ids that the
     // app-server expects in the result. The display text is only UI

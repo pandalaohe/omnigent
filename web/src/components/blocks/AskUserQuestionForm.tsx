@@ -29,7 +29,7 @@
 // answer}`` map matching MCP's ``ElicitResult.content`` shape and
 // passed to ``onSubmit``.
 
-import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
+import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, SquareIcon, XIcon } from "lucide-react";
 import { type ChangeEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
@@ -44,6 +44,15 @@ interface AskUserQuestionFormProps {
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
+  /**
+   * Decline the question AND cut the turn it blocks, leaving the session
+   * alive — the web equivalent of Ctrl+C at the terminal. Plain `onReject`
+   * only answers the tool: the agent takes the refusal and keeps going,
+   * which is the right default and the wrong thing when the user wants out
+   * of the whole turn. Omitted where the card cannot know which session to
+   * interrupt (the Inbox), and the control is then not rendered.
+   */
+  onAbort?: () => void;
 }
 
 /**
@@ -82,7 +91,12 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
+export function AskUserQuestionForm({
+  questions,
+  onSubmit,
+  onReject,
+  onAbort,
+}: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -387,6 +401,18 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
           <XIcon className="mr-1 size-3.5" />
           Cancel
         </Button>
+        {onAbort && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onAbort}
+            data-testid="ask-user-question-abort"
+            componentId="question.abort"
+          >
+            <SquareIcon className="mr-1 size-3.5" />
+            Cancel &amp; interrupt
+          </Button>
+        )}
       </div>
     </div>
   );
