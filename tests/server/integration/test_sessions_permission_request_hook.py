@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import threading
+import time
 from typing import Any
 
 import httpx
@@ -1794,6 +1795,46 @@ async def test_permission_request_hook_timeout_returns_empty_body(
     )
     assert resp.status_code == 200, resp.text
     assert resp.content == b"", f"expected empty body on timeout, got {resp.content!r}"
+
+
+async def test_ask_user_question_waits_on_its_own_shorter_budget(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AskUserQuestion expires on its own budget, not the permission one.
+
+    A question is not a permission gate: an unanswered card must hand the turn
+    back to Claude's TUI prompt rather than park for the permission timeout
+    (a day in production). The two budgets are set far apart here so a card
+    that returned on the permission clock would blow the assertion below.
+    """
+    monkeypatch.setattr(
+        sessions_route,
+        "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
+        30.0,
+    )
+    monkeypatch.setattr(
+        sessions_route,
+        "_CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S",
+        0.1,
+    )
+    agent = await create_test_agent(client, "test-ask-user-question-timeout")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("AskUserQuestion")
+    payload["tool_input"] = {
+        "questions": [{"question": "Continue?", "header": "Next", "options": []}]
+    }
+
+    started = time.monotonic()
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/permission-request",
+        json=payload,
+    )
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"", f"expected empty body on timeout, got {resp.content!r}"
+    assert elapsed < 10.0, f"waited {elapsed:.1f}s — the permission budget, not the question one"
 
 
 async def test_permission_request_hook_timeout_clears_pending_index(

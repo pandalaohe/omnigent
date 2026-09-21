@@ -373,7 +373,14 @@ def register_hooks_routes(
             request,
             session_id=session_id,
             params=params,
-            timeout_s=_sf._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            # AskUserQuestion parks on its own budget: it is a question, not a
+            # permission gate, so it expires into Claude's TUI prompt in under
+            # an hour instead of holding the turn for a day.
+            timeout_s=(
+                _sf._CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S
+                if tool_name == "AskUserQuestion"
+                else _sf._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S
+            ),
             conversation_store=conversation_store,
             # Client-minted stable id so a retry re-parks the same elicitation.
             elicitation_id=elicitation_id,

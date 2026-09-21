@@ -447,6 +447,14 @@ _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
 _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 
 
+# AskUserQuestion is the agent asking the operator to choose, not a permission
+# gate: nothing is blocked by answering late, and an unanswered card should hand
+# the turn back to Claude's own TUI prompt rather than park for a day. 50
+# minutes is long enough to step away from the desk and short enough that a
+# forgotten card does not pin a session overnight.
+_CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S = 3000.0
+
+
 # custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_registry: dict[str, asyncio.Future[dict[str, Any]]] = {}  # -> parked Future
 
@@ -1022,6 +1030,7 @@ __all__ = [
     "_BROWSER_ACTION_NO_RENDERER_RESULT",
     "_BROWSER_ACTION_TIMEOUT_RESULT",
     "_CHILD_PREVIEW_LIMIT",
+    "_CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S",
     "_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY",
     "_CLAUDE_NATIVE_EDIT_TOOLS",
     "_CLAUDE_NATIVE_HARNESS",
