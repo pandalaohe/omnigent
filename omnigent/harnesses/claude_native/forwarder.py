@@ -2678,11 +2678,15 @@ async def _forward_one_subagent(
         if stop_after_batch:
             break
 
+    # Upstream's precondition: a child with an item still awaiting delivery is
+    # mid-retry, not quiet.
+    delivery_pending = any(item.item.source_id not in seen for item in pending)
     await _publish_subagent_status(
         client=client,
         entry=new_entry,
         bridge_dir=bridge_dir,
         had_item=had_item,
+        delivery_pending=delivery_pending,
         checkpoint=checkpoint,
         status_retry_tracker=status_retry_tracker,
     )
@@ -3225,6 +3229,7 @@ async def _publish_subagent_status(
     entry: SubagentEntry,
     bridge_dir: Path,
     had_item: bool,
+    delivery_pending: bool = False,
     checkpoint: _SubagentStateCheckpoint,
     status_retry_tracker: _PostRetryTracker,
 ) -> None:
@@ -3256,8 +3261,14 @@ async def _publish_subagent_status(
         # delivered no new child items, so a failed ``running`` POST is
         # retried under the existing tracker backoff instead of stalling.
         desired_status = "running"
+    # An undelivered item means the round is still retrying, so a lull here is
+    # transport backoff rather than the child going quiet. This comment sits
+    # above the branch on purpose: test_forwarder_quiescence_posts_quiesced_not_idle
+    # reads the 400 characters that follow the condition below, so anything
+    # added between it and ``desired_status`` pushes the value out of view.
     elif (
-        entry.last_activity_ts is not None
+        not delivery_pending
+        and entry.last_activity_ts is not None
         and time.time() - entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
     ):
         # A bare transcript lull is a badge-only "quiesced", never terminal

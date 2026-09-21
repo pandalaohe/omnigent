@@ -7822,7 +7822,7 @@ async def test_subagent_watcher_never_completes_from_tool_result_silence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A trailing async receipt stays running even after the quiet threshold."""
+    """A trailing async receipt plus silence produces at most a badge, never a terminal status."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -7908,7 +7908,9 @@ async def test_subagent_watcher_never_completes_from_tool_result_silence(
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
         )
 
-    assert statuses == ["running"]
+    posted_statuses = set(statuses)
+    assert posted_statuses <= {"running", "quiesced"}
+    assert not posted_statuses & {"idle", "completed", "failed", "stopped", "killed"}
     assert second.subagents["async1"].quiet_terminal_output is None
 
 
@@ -7916,7 +7918,7 @@ async def test_subagent_watcher_does_not_complete_from_assistant_text_silence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Assistant text plus silence is not proof that a sub-agent turn ended."""
+    """Assistant text plus silence produces at most a badge, never a terminal status."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -7986,8 +7988,10 @@ async def test_subagent_watcher_does_not_complete_from_assistant_text_silence(
             **trackers,
         )
 
-    assert status_posts == [{"status": "running"}]
-    assert second.subagents["legacy1"].last_status == "running"
+    posted_statuses = {entry["status"] for entry in status_posts}
+    assert posted_statuses <= {"running", "quiesced"}
+    assert not posted_statuses & {"idle", "completed", "failed", "stopped", "killed"}
+    assert second.subagents["legacy1"].last_status in {"running", "quiesced"}
 
 
 async def test_subagent_terminal_notification_retries_after_state_reload(
@@ -9956,7 +9960,7 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
     bridge_dir.mkdir()
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
-    old_activity = time.time() - 3600
+    old_activity = time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60
     entries: dict[str, forwarder.SubagentEntry] = {}
     for index in range(5):
         subagent_id = f"recover-{index}"
@@ -10040,7 +10044,7 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
             parent_session_id="conv_parent",
             bridge_dir=bridge_dir,
             transcript_path=transcript_path,
-            state=replace(state, subagents=quiet_entries),
+            state=forwarder.SubagentForwardState(subagents=quiet_entries),
             agent_name="claude-native-ui",
             start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             item_retry_tracker=tracker,

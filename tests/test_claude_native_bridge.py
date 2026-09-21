@@ -5398,22 +5398,25 @@ def test_inject_slash_command_outlasts_slow_submit_acceptance(
     ]
 
 
-def test_inject_interrupt_sends_escape_keystroke(
+def test_inject_interrupt_sends_ctrl_c_keystroke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    inject_interrupt issues ``tmux send-keys ... Escape`` on the pane.
+    inject_interrupt issues ``tmux send-keys ... C-c`` on the pane.
 
-    Without the ``-l`` flag, tmux interprets ``Escape`` as the key
-    name (the single ASCII byte 0x1b). If the flag leaks in or the
-    keyword changes, Claude won't see a cancel and the Omnigent stop
-    button silently degrades back to a no-op.
+    ``C-c`` and not ``Escape``: Claude Code leaves a foreground Bash
+    tool process running after ``Escape``, while ``Ctrl+C`` interrupts
+    that foreground process group and leaves the interactive Claude
+    session alive (observed on Claude Code 2.1.263). Without the ``-l``
+    flag, tmux interprets ``C-c`` as the key name. If the flag leaks in
+    or the keyword changes, the Omnigent stop button silently degrades
+    to a no-op.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
+        socket_path=_TEST_TMUX_SOCKET,
         tmux_target="claude:0.0",
     )
 
@@ -5441,17 +5444,17 @@ def test_inject_interrupt_sends_escape_keystroke(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_interrupt(bridge_dir)
 
-    # One tmux call: send Escape (no literal flag). If 2+, a stray
+    # One tmux call: send Ctrl+C (no literal flag). If 2+, a stray
     # Enter or extra key was appended; if 0, the call was skipped.
     assert len(captured) == 1, f"Expected 1 tmux send-keys call, got {len(captured)}."
     assert captured[0] == [
         "tmux",
         "-S",
-        "/tmp/example/tmux.sock",
+        str(_TEST_TMUX_SOCKET),
         "send-keys",
         "-t",
         "claude:0.0",
-        "Escape",
+        "C-c",
     ]
 
 
