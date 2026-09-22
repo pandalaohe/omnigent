@@ -1864,7 +1864,8 @@ async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
 ) -> None:
     import omnigent.harnesses.claude_native.bridge as claude_bridge
 
-    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    # Fork mod (s21): the helper also returns background-task counts (5-tuple).
+    callbacks, _, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
     instance = registry.terminal_registry.get("child", "claude", "main")
     assert instance is not None
     on_tick = callbacks["on_tick"]
@@ -1908,7 +1909,8 @@ async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge
 ) -> None:
     import omnigent.harnesses.claude_native.bridge as claude_bridge
 
-    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "source")
+    # Fork mod (s21): the helper also returns background-task counts (5-tuple).
+    callbacks, _, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "source")
     instance = registry.terminal_registry.get("source", "claude", "main")
     assert instance is not None
     original_bridge = tmp_path / "cli-direct-bridge"
@@ -1954,7 +1956,8 @@ async def test_claude_native_ignores_other_panes_without_attempting_acknowledgem
 ) -> None:
     import omnigent.harnesses.claude_native.bridge as claude_bridge
 
-    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    # Fork mod (s21): the helper also returns background-task counts (5-tuple).
+    callbacks, _, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "child")
     instance = registry.terminal_registry.get("child", "claude", "main")
     assert instance is not None
     on_tick = callbacks["on_tick"]
@@ -1979,7 +1982,8 @@ async def test_claude_native_billing_acknowledgement_error_preserves_watcher(
 ) -> None:
     import omnigent.harnesses.claude_native.bridge as claude_bridge
 
-    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    # Fork mod (s21): the helper also returns background-task counts (5-tuple).
+    callbacks, _, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
     instance = registry.terminal_registry.get("child", "claude", "main")
     assert instance is not None
     on_tick = callbacks["on_tick"]
