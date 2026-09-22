@@ -145,7 +145,10 @@ def test_peer_options_present_with_bounds() -> None:
     assert props["correlation_id"]["maxLength"] == 64
     assert (props["wait_seconds"]["minimum"], props["wait_seconds"]["maximum"]) == (0, 3600)
     assert props["wait_seconds"]["default"] == 0
-    assert (props["wait_for_reply_seconds"]["minimum"], props["wait_for_reply_seconds"]["maximum"]) == (
+    assert (
+        props["wait_for_reply_seconds"]["minimum"],
+        props["wait_for_reply_seconds"]["maximum"],
+    ) == (
         0,
         600,
     )

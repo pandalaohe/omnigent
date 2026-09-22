@@ -98,7 +98,10 @@ def test_spawn_spec_without_sub_agents_advertises_peers_when_flag_on() -> None:
 
 def test_relay_schemas_follow_the_flag() -> None:
     """The native relay surface carries send for no-spawn specs only when on."""
-    on = {s["name"] for s in build_native_relay_tool_schemas(_no_spawn_spec(), peer_messaging_enabled=True)}
+    on = {
+        s["name"]
+        for s in build_native_relay_tool_schemas(_no_spawn_spec(), peer_messaging_enabled=True)
+    }
     assert _SEND in on
     assert _CLOSE not in on
     off = {s["name"] for s in build_native_relay_tool_schemas(_no_spawn_spec())}
