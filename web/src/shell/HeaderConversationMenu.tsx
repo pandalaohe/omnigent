@@ -17,6 +17,7 @@ import {
   GitForkIcon,
   InfoIcon,
   MailIcon,
+  MessageCircleIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
@@ -79,6 +80,13 @@ interface HeaderConversationMenuProps {
   hasAgentInfo?: boolean;
   onAgentInfo?: () => void;
   /**
+   * Whether the "Peer messages" entry should render — the server's
+   * `session_peer_messaging` feature is on (SCC01-S1 peer messaging).
+   */
+  showPeerMessages?: boolean;
+  /** Open the peer-messages held panel (`PeerHeldPanel`) for this session. */
+  onPeerMessages?: () => void;
+  /**
    * Mobile Chat/Terminal view switch (ViewModeMenuItems) — leads the menu on
    * terminal-first sessions and carries its own trailing separator. `null`
    * otherwise.
@@ -99,6 +107,8 @@ export function HeaderConversationMenu({
   onFork,
   hasAgentInfo = false,
   onAgentInfo,
+  showPeerMessages = false,
+  onPeerMessages,
   viewItems = null,
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
@@ -303,6 +313,16 @@ export function HeaderConversationMenu({
         <DownloadIcon className="size-3.5" />
         Export
       </DropdownMenuItem>
+      {showPeerMessages && onPeerMessages && (
+        <DropdownMenuItem
+          data-testid="header-peer-messages"
+          className={itemClass}
+          onSelect={onPeerMessages}
+        >
+          <MessageCircleIcon className="size-3.5" />
+          Peer messages
+        </DropdownMenuItem>
+      )}
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"

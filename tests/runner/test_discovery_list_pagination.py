@@ -37,6 +37,10 @@ def _session_rows(*, large: bool) -> list[dict[str, object]]:
             "status": "idle",
             "runner_id": None,
             "parent_session_id": None,
+            "project_id": f"proj_{index:02d}",
+            "workspace": f"/work/{index:02d}",
+            "updated_at": 1_700_000_000 + index,
+            "last_message_preview": f"preview {index:02d}",
         }
         for index in range(_ROW_COUNT)
     ]
@@ -783,3 +787,38 @@ async def test_discovery_list_rejects_invalid_windows(
         )
 
     assert error in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_projects_discovery_fields() -> None:
+    """The global view carries project, workspace, activity and excerpt keys."""
+    seen_params: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            seen_params.update(dict(request.url.params))
+            return httpx.Response(200, json={"data": _session_rows(large=False)})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_list",
+                arguments="{}",
+                server_client=client,
+                conversation_id="conv_caller",
+            )
+        )
+
+    assert seen_params.get("include_preview") == "1"
+    row = result["sessions"][0]
+    assert row["project_id"] == "proj_00"
+    assert row["workspace"] == "/work/00"
+    assert row["updated_at"] == 1_700_000_000
+    assert row["last_message_preview"] == "preview 00"

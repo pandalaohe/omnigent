@@ -152,7 +152,6 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.assignment_store import AssignmentStore
-from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
@@ -160,6 +159,7 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
@@ -1432,8 +1432,9 @@ def create_app(
         Mounts the assignments router only together with ``project_store``,
         ``project_repository_store`` and ``conversation_store``.
     :param peer_message_store: Store for durable session peer-message
-        records. Wired onto ``app.state`` for the peer-message routes
-        (a later task) and the delivery sweeper; no route in this task.
+        records. Wired onto ``app.state`` and into the peer-message
+        routes; ``None`` leaves ``POST .../peer-messages`` failing
+        with a clear 500.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -1901,9 +1902,15 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        peer_sweeper = getattr(app_inst.state, "peer_sweeper", None)
+        if peer_sweeper is not None:
+            await peer_sweeper.start(app_inst)
+
         try:
             yield
         finally:
+            if peer_sweeper is not None:
+                await peer_sweeper.shutdown()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
@@ -3416,6 +3423,9 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            feature_flags=resolved_feature_flags,
+            peer_message_store=peer_message_store,
+            app_state=app.state,
         ),
         prefix="/v1",
         tags=["sessions"],

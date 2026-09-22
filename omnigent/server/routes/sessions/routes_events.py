@@ -73,6 +73,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.native_subagent_watchdog import (
     NativeSubagentWatchdog,
@@ -268,6 +269,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
+from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
@@ -522,6 +524,11 @@ class _DeletionClaimLease:
             self._ensure_release_task()
 
 
+# Sentinel default for ``_post_event_impl``'s ``acting_user_id`` override:
+# ``None`` is a legal user id in no-auth mode, so "not given" needs its own
+# value distinct from every legal argument.
+_ACTING_USER_ID_UNSET: Any = object()
+
 # POST /events types that arrive per streamed chunk — the harness echoing its
 # own live output back. Their per-call audit row is pure noise (the content is
 # already on the SSE-event logger), so the envelope is suppressed for them.
@@ -720,6 +727,9 @@ def register_events_routes(
     host_registry: HostRegistry | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     runner_tunnel_tokens: frozenset[str] | None = None,
+    feature_flags: FeatureFlags | None = None,
+    peer_message_store: PeerMessageStore | None = None,
+    app_state: Any | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
@@ -815,11 +825,39 @@ def register_events_routes(
 
     router.include_router(event_router)
 
+    async def _peer_post_event(
+        request: Request,
+        session_id: str,
+        body: SessionEventInput,
+        *,
+        acting_user_id: Any = _ACTING_USER_ID_UNSET,
+    ) -> dict[str, bool | str | None]:
+        return await _post_event_impl(request, session_id, body, acting_user_id=acting_user_id)
+
+    from omnigent.server.routes.sessions.routes_peer import register_peer_routes
+
+    register_peer_routes(
+        router,
+        post_event_impl=_peer_post_event,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+        liveness_lookup=liveness_lookup,
+        runner_tunnel_tokens=runner_tunnel_tokens,
+        feature_flags=feature_flags,
+        peer_message_store=peer_message_store,
+        runner_router=runner_router,
+        agent_store=agent_store,
+        app_state=app_state,
+    )
+
     async def _post_event_impl(
         request: Request,
         session_id: str,
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
+        *,
+        acting_user_id: Any = _ACTING_USER_ID_UNSET,
     ) -> dict[str, bool | str | None]:
         """
         Submit a session event (input message, tool output,
@@ -903,6 +941,11 @@ def register_events_routes(
         :param in_flight: When given, the session is marked as having a
             dispatch in flight once the caller is authorized, for the rest
             of the request.
+        :param acting_user_id: When given (even ``None``), replaces the
+            ``_get_user_id(request, auth_provider)`` call — the peer sweeper
+            posts through a synthetic request with no auth headers, so it
+            must supply the acting user (a resolved session owner, or
+            ``None`` in no-permission-store mode) directly.
         :returns: ``{"queued": True, "item_id": "..."}`` for
             item-typed events, where ``item_id`` is the persisted
             conversation item id also emitted by
@@ -910,7 +953,11 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
-        user_id = _get_user_id(request, auth_provider)
+        user_id = (
+            _get_user_id(request, auth_provider)
+            if acting_user_id is _ACTING_USER_ID_UNSET
+            else acting_user_id
+        )
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )

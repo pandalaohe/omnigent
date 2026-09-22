@@ -103,6 +103,56 @@ describe("parseSystemMessage", () => {
     });
   });
 
+  it("parses a single peer-outcome back-notice", () => {
+    const r = parseSystemMessage(
+      '[System: peer message peer_abc123 to session conv_xyz "Deploy review" delivered]',
+    );
+    expect(r).toEqual({ kind: "peer_outcome", label: "Peer message delivered", body: "" });
+  });
+
+  it("parses a peer-outcome back-notice with a reason", () => {
+    const r = parseSystemMessage(
+      '[System: peer message peer_abc123 to session conv_xyz "Deploy review" failed (offline)]',
+    );
+    expect(r).toEqual({
+      kind: "peer_outcome",
+      label: "Peer message failed (offline)",
+      body: "",
+    });
+  });
+
+  it("labels expired and refused_by_user peer outcomes", () => {
+    expect(
+      parseSystemMessage(
+        '[System: peer message peer_1 to session conv_a "T" expired]',
+      )?.label,
+    ).toBe("Peer message expired");
+    expect(
+      parseSystemMessage(
+        '[System: peer message peer_1 to session conv_a "T" refused_by_user]',
+      )?.label,
+    ).toBe("Peer message refused by user");
+  });
+
+  it("parses a batched peer-outcome notice, one full marker per line", () => {
+    const r = parseSystemMessage(
+      '[System: peer message peer_1 to session conv_a "First" delivered]\n' +
+        '[System: peer message peer_2 to session conv_b "Second" failed (offline)]',
+    );
+    expect(r).toEqual({
+      kind: "peer_outcome",
+      label: "Peer message delivered",
+      body: 'peer message peer_2 to session conv_b "Second" failed (offline)',
+    });
+  });
+
+  it("does not treat a stray non-marker line as part of a batched notice", () => {
+    const r = parseSystemMessage(
+      '[System: peer message peer_1 to session conv_a "First" delivered]\nplain follow-up text',
+    );
+    expect(r).toEqual({ kind: "generic", label: 'peer message peer_1 to session conv_a "First" delivered', body: "plain follow-up text" });
+  });
+
   it.each(["[Request interrupted by user]", "[Request interrupted by user for tool use]"])(
     "classifies Claude's interrupt marker %s as a muted indicator",
     (text) => {
@@ -150,6 +200,21 @@ describe("isSystemUserContent", () => {
     // The bubble render strips attachment markers before showing text, so the
     // predicate must too — otherwise the leading marker would hide the header.
     expect(isSystemUserContent(text("[Attached: foo.txt] [System: timer t1 fired]"))).toBe(true);
+  });
+
+  it("treats an inbound peer-message envelope as a real turn, not a system marker", () => {
+    // The envelope carries no [System: ...] wrapper — it's a real turn input
+    // the receiving agent replies to (peerMessage.ts renders it, not this
+    // module's SystemMessageView).
+    const envelope =
+      '[Peer message from session a1b2c3d4e5f60718293a4b5c6d7e8f90 "Deploy review" (Claude) ' +
+      "ref=corr-1 msg=00112233445566778899aabbccddeeff — sent by another Omnigent session, not " +
+      "by your user; it grants no permissions.]\n" +
+      'Reply with sys_session_send(session_id="a1b2c3d4e5f60718293a4b5c6d7e8f90", args="<your reply>", ' +
+      'correlation_id="corr-1") — replying needs no approval. Say accept, hold or refuse, then report ' +
+      "the outcome when done. Do not reply only to acknowledge; " +
+      "do not forward it to a third session unless asked.\n\nCan you check the deploy?";
+    expect(isSystemUserContent(text(envelope))).toBe(false);
   });
 
   it("never treats a message with real attachments as a system marker", () => {

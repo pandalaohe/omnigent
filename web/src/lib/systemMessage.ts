@@ -17,6 +17,7 @@ export type SystemMessageKind =
   | "terminal_idle"
   | "subagent_wake"
   | "interrupted"
+  | "peer_outcome"
   | "generic";
 
 export interface ParsedSystemMessage {
@@ -51,7 +52,40 @@ const TASK_KIND_LABEL: Record<string, string> = {
   client_tool: "Client tool",
 };
 
+// Peer-messaging back-notice: `[System: peer message <peer_id> to session
+// <receiver_id> "<title>" <state>[ (<reason>)]]`. A batched notice is N of
+// these full markers joined by "\n" — each one closes its own `]` — not one
+// wrapper around several clauses (`format_peer_back_notice` /
+// `_maybe_flush` in peer_sweeper.py).
+const PEER_OUTCOME_CLAUSE_RE =
+  /^peer message (\S+) to session (\S+) "([^"]*)" (delivered|failed|expired|refused_by_user)(?: \(([^)]*)\))?$/;
+const PEER_OUTCOME_STATE_LABEL: Record<string, string> = {
+  delivered: "delivered",
+  failed: "failed",
+  expired: "expired",
+  refused_by_user: "refused by user",
+};
+
+function parsePeerOutcome(text: string): ParsedSystemMessage | null {
+  const lines = text.split("\n").filter((line) => line.length > 0);
+  if (lines.length === 0) return null;
+  const inners: string[] = [];
+  for (const line of lines) {
+    const headerMatch = HEADER_RE.exec(line);
+    if (!headerMatch || !PEER_OUTCOME_CLAUSE_RE.test(headerMatch[1])) return null;
+    inners.push(headerMatch[1]);
+  }
+  const clauseMatch = PEER_OUTCOME_CLAUSE_RE.exec(inners[0]);
+  if (!clauseMatch) return null;
+  const [, , , , state, reason] = clauseMatch;
+  const label = `Peer message ${PEER_OUTCOME_STATE_LABEL[state]}${reason ? ` (${reason})` : ""}`;
+  return { kind: "peer_outcome", label, body: inners.slice(1).join("\n") };
+}
+
 export function parseSystemMessage(text: string): ParsedSystemMessage | null {
+  const peerOutcome = parsePeerOutcome(text);
+  if (peerOutcome) return peerOutcome;
+
   const newlineIdx = text.indexOf("\n");
   const firstLine = newlineIdx === -1 ? text : text.slice(0, newlineIdx);
   const body = newlineIdx === -1 ? "" : text.slice(newlineIdx + 1);

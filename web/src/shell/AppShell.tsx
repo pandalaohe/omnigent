@@ -85,7 +85,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { isTempConvId, useChatStore } from "@/store/chatStore";
 import {
@@ -121,6 +121,7 @@ import {
 } from "./TerminalFirstContext";
 import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
+import { PeerHeldPanel } from "@/components/PeerHeldPanel";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { MobileFloatingAssistant } from "@/components/MobileFloatingAssistant";
 import { CommandPalette } from "./CommandPalette";
@@ -450,6 +451,7 @@ export function AppShell() {
       : false,
   );
   const [shareOpen, setShareOpen] = useState(false);
+  const [peerMessagesOpen, setPeerMessagesOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
   // Truncation point for a "fork from here" opened from a message's
   // actions (ChatPage, via ForkDialogContext). `null` = full clone —
@@ -688,6 +690,10 @@ export function AppShell() {
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
   // Whether the mobile three-dot menu has any entry to offer.
   const hasHeaderMenu = canShare || hasAgentInfo;
+  // Held-messages panel entry (SCC01-S1 peer messaging) — gated on the
+  // server's feature flag; the panel itself reads the open session, so no
+  // owner/permission check here beyond having a session to show it for.
+  const showPeerMessages = !!conversationId && isFeatureEnabled(serverInfo, "session_peer_messaging");
   // The live snapshot is authoritative; the sidebar row is only a fallback
   // (it is absent entirely for sub-agent children, which the list omits).
   const wrapperLabel =
@@ -2209,6 +2215,8 @@ export function AppShell() {
                     onFork={() => forkDialogContextValue.openForkDialog()}
                     hasAgentInfo={hasAgentInfo}
                     onAgentInfo={() => setAgentInfoOpen(true)}
+                    showPeerMessages={showPeerMessages}
+                    onPeerMessages={() => setPeerMessagesOpen(true)}
                     hasHeaderMenu={hasHeaderMenu}
                     showFilesPanel={showFilesPanel}
                     hasRailContent={hasRailContent}
@@ -2451,6 +2459,13 @@ export function AppShell() {
               workspace={activeSession?.workspace ?? activeConv?.workspace}
               open={shareOpen}
               onOpenChange={setShareOpen}
+            />
+          )}
+          {conversationId && showPeerMessages && (
+            <PeerHeldPanel
+              sessionId={conversationId}
+              open={peerMessagesOpen}
+              onOpenChange={setPeerMessagesOpen}
             />
           )}
           {conversationId && (

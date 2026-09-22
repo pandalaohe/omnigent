@@ -47,7 +47,9 @@ import {
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
+import { PeerMessageView } from "@/components/blocks/PeerMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { parsePeerMessage } from "@/lib/peerMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
@@ -718,6 +720,11 @@ function UserBubble({
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
+    // Checked before parseSystemMessage: a peer envelope is a real turn
+    // input (the receiving agent replies to it), never a `[System: ...]`
+    // marker, even though both ride in on role=user.
+    const peerMessage = parsePeerMessage(text);
+    if (peerMessage) return <PeerMessageView message={peerMessage} />;
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
   }

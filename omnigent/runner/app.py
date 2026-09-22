@@ -2828,6 +2828,34 @@ _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 # used by the sub-agent work registry to deliver completions to the parent.
 _session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
 
+# Module-level refs to the per-session release flags from the init snapshot.
+# Populated inside create_runner_app; read by tool_dispatch dispatch paths
+# (e.g. the sys_session_send peer branch) that have the conversation id but
+# no flag kwarg. Kept beside the other snapshot dicts: the raw envelope
+# cache is TTL'd.
+_session_project_assignments_enabled_ref: dict[str, bool] = {}
+_session_peer_messaging_enabled_ref: dict[str, bool] = {}
+
+
+def get_session_project_assignments_enabled(session_id: str) -> bool:
+    """
+    Return the session's cached project-assignments flag, defaulting off.
+
+    :param session_id: Session/conversation ID, e.g. ``"conv_abc123"``.
+    :returns: ``True`` when the session initialized with the flag on.
+    """
+    return _session_project_assignments_enabled_ref.get(session_id, False)
+
+
+def get_session_peer_messaging_enabled(session_id: str) -> bool:
+    """
+    Return the session's cached peer-messaging flag, defaulting off.
+
+    :param session_id: Session/conversation ID, e.g. ``"conv_abc123"``.
+    :returns: ``True`` when the session initialized with the flag on.
+    """
+    return _session_peer_messaging_enabled_ref.get(session_id, False)
+
 
 def get_session_agent_id(session_id: str) -> str | None:
     """
@@ -3006,10 +3034,12 @@ def create_runner_app(
     _session_reasoning_effort: dict[str, str] = {}
     # session_id → project-assignments flag from the init snapshot. Kept
     # beside the other snapshot dicts: the raw envelope cache is TTL'd.
-    _session_project_assignments_enabled: dict[str, bool] = {}
+    # Aliased to the module-level ref so dispatch paths can read the flag
+    # with only a conversation id.
+    _session_project_assignments_enabled = _session_project_assignments_enabled_ref
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
-    _session_peer_messaging_enabled: dict[str, bool] = {}
+    _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -3802,12 +3832,14 @@ def create_runner_app(
 
     async def _load_legacy_session_init_context(session_id: str) -> _SessionInitContext:
         await _get_server_version(server_client)
-        _session_project_assignments_enabled.pop(session_id, None)
-        _session_peer_messaging_enabled.pop(session_id, None)
+        # An envelope-free re-init (WS reconnect, resume) carries no flag
+        # snapshot; keep this session's last known project_assignments /
+        # peer_messaging values instead of popping them back to the off
+        # default — a legacy load must not silently revert a real grant.
         _session_tool_schemas.pop(session_id, None)
         return _SessionInitContext(envelope=None)
 
-    def _load_envelope_session_init_context(
+    async def _load_envelope_session_init_context(
         envelope: RunnerSessionInitEnvelope,
         *,
         session_id: str,
@@ -3839,6 +3871,16 @@ def create_runner_app(
             _session_reasoning_effort[session_id] = snapshot.reasoning_effort
         _session_project_assignments_enabled[session_id] = snapshot.project_assignments_enabled
         _session_peer_messaging_enabled[session_id] = snapshot.peer_messaging_enabled
+        # A relay started before this init (resource access precedes the
+        # handshake) read the previous flag; rebuild it in place on a flip.
+        _stale_relay = _session_comment_relays.get(session_id)
+        if _stale_relay is not None and (
+            _stale_relay.project_assignments_enabled != snapshot.project_assignments_enabled
+            or _stale_relay.peer_messaging_enabled != snapshot.peer_messaging_enabled
+        ):
+            await _ensure_comment_relay_started(
+                session_id, explicit_bridge_dir=_stale_relay.bridge_dir
+            )
         # A re-init may flip the flag: drop the cached tool surface so the
         # next turn rebuilds it with the new value.
         _session_tool_schemas.pop(session_id, None)
@@ -3873,7 +3915,7 @@ def create_runner_app(
             body_sub_agent if isinstance(body_sub_agent, str) else None
         ):
             raise ValueError("session initialization envelope sub-agent mismatch")
-        return _load_envelope_session_init_context(
+        return await _load_envelope_session_init_context(
             envelope,
             session_id=session_id,
             agent_id=agent_id,
@@ -4197,19 +4239,6 @@ def create_runner_app(
                     "error": "invalid_request",
                     "detail": "Invalid session initialization envelope.",
                 },
-            )
-
-        # A relay started before this init (resource access precedes the
-        # handshake) read the previous flag; rebuild it in place on a flip.
-        _stale_relay = _session_comment_relays.get(session_id)
-        if _stale_relay is not None and (
-            _stale_relay.project_assignments_enabled
-            != _session_project_assignments_enabled.get(session_id, False)
-            or _stale_relay.peer_messaging_enabled
-            != _session_peer_messaging_enabled.get(session_id, False)
-        ):
-            await _ensure_comment_relay_started(
-                session_id, explicit_bridge_dir=_stale_relay.bridge_dir
             )
 
         # Stamp the session's Smart Routing class before anything reads it: the

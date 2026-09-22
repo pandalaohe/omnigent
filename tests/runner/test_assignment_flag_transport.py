@@ -4,7 +4,9 @@ A session initialized with ``project_assignments_enabled`` true serves
 the seven ``sys_assignment_*`` tools on its turn path; a session
 initialized without it (or with false) does not. The flag lives in a
 per-session dict seeded from the init snapshot — never the TTL'd
-envelope cache — so a re-init flips the surface on the next turn.
+envelope cache — so an envelope re-init flips the surface on the next
+turn; an envelope-free (legacy) re-init carries no flag snapshot and
+keeps the session's last known value instead.
 """
 
 from __future__ import annotations
@@ -172,8 +174,8 @@ async def test_reinit_flips_the_turn_surface() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reinit_legacy_clears_the_turn_surface() -> None:
-    """An envelope-free re-init states no flag, so the next turn drops the tools."""
+async def test_reinit_legacy_keeps_the_turn_surface() -> None:
+    """An envelope-free re-init carries no flag; a known True grant survives."""
     app, harness_client = _build_turn_app()
     session_id = f"c1b2c3d4e5f60718293a4b5c6d7e8{uuid.uuid4().hex[:2]}"
     agent_id = f"aa0b5afda28ad55ff74cbeb9b5fc67fb{uuid.uuid4().hex[:2]}"
@@ -181,7 +183,7 @@ async def test_reinit_legacy_clears_the_turn_surface() -> None:
         names = await _init_and_turn(client, harness_client, session_id, agent_id, flag=True)
         assert names >= _SEVEN
         names = await _init_and_turn(client, harness_client, session_id, agent_id, flag=None)
-        assert not (names & _SEVEN)
+        assert names >= _SEVEN
 
 
 @pytest.mark.asyncio
@@ -284,7 +286,12 @@ def _relay_tool_names(bridge_dir: Path) -> set[str]:
 async def test_session_init_rebuilds_early_relay_on_flag_flip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A relay started before session init picks up a later flag flip."""
+    """A relay started before session init picks up a later flag flip.
+
+    A subsequent legacy (envelope-free) re-init carries no flag snapshot and
+    must not revert the relay's known-True grant back to False (a WS
+    reconnect must not downgrade a real grant).
+    """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.post_tools_changed",
         lambda *args: None,
@@ -315,6 +322,6 @@ async def test_session_init_rebuilds_early_relay_on_flag_flip(
                 "/v1/sessions", json=_init_body(session_id, agent_id, flag=None)
             )
             assert reinit.status_code == 201, reinit.text
-            assert not (_relay_tool_names(bridge_dir) & _SEVEN)
+            assert _relay_tool_names(bridge_dir) >= _SEVEN
     finally:
         shutil.rmtree(bridge_dir, ignore_errors=True)

@@ -5,6 +5,7 @@ import {
   CheckCircle2Icon,
   ChevronRightIcon,
   InfoIcon,
+  MessageCircleIcon,
   TerminalIcon,
   type LucideIcon,
 } from "lucide-react";
@@ -19,6 +20,7 @@ const KIND_ICON: Record<Exclude<SystemMessageKind, "subagent_wake">, LucideIcon>
   timer_fired: BellIcon,
   terminal_idle: TerminalIcon,
   interrupted: BanIcon,
+  peer_outcome: MessageCircleIcon,
   generic: InfoIcon,
 };
 

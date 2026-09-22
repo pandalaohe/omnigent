@@ -229,3 +229,37 @@ async def test_execute_tool_branch_routes_assignment_tools() -> None:
     assert client.calls == [("GET", f"/v1/assignments/{_ASSIGNMENT_ID}", None)]
     assert should_dispatch_locally("sys_assignment_dispatch")
     assert should_dispatch_locally("sys_assignment_complete")
+
+
+# Grant gate (_granted_tool_names/_ungranted_tool_reason) mirrors the flag-gated advertisement.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_grant_gate_mirrors_project_assignments_flag(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """The gate admits ``sys_assignment_list`` only while the session flag is on."""
+    from omnigent.runner import assignment_tools, tool_dispatch
+    from omnigent.spec.types import AgentSpec
+
+    reached: list[str] = []
+
+    async def _record(tool_name: str, _arguments: str, **_kwargs: Any) -> str:
+        reached.append(tool_name)
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(assignment_tools, "execute_assignment_tool", _record)
+    monkeypatch.setattr(tool_dispatch, "_project_assignments_enabled_for", lambda _cid: enabled)
+
+    out = await execute_tool(
+        tool_name="sys_assignment_list",
+        arguments=json.dumps({"role": "sent"}),
+        agent_spec=AgentSpec(spec_version=1),
+        conversation_id=_CONV,
+    )
+
+    if enabled:
+        assert json.loads(out) == {"ok": True}
+        assert reached == ["sys_assignment_list"]
+    else:
+        assert "not enabled" in out
+        assert reached == []

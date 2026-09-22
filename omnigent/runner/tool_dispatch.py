@@ -329,6 +329,11 @@ _PUBLIC_USER_SENTINEL = "__public__"
 _SHARE_ENABLED_POLICIES = frozenset({"non-public", "public"})
 _SHARE_PUBLIC_POLICY = "public"
 
+# Peer sends poll the record every 2 s; the reply wait never exceeds 600 s
+# so harness tool timeouts are not reached.
+_PEER_REPLY_POLL_S = 2.0
+_PEER_REPLY_WAIT_MAX_S = 600
+
 # Priority 5f.1: web_fetch — translates the LLM-facing query/url
 # arguments into a sys_session_send call against the built-in
 # ``__web_researcher`` sub-agent, then reuses
@@ -658,7 +663,9 @@ def build_native_relay_tool_schemas(
             # only, so spec-less native sessions stay peer senders.
             from omnigent.tools.builtins.spawn import SysSessionSendTool
 
-            fallback_schema = _string_object_dict(SysSessionSendTool(sub_specs={}).get_schema())
+            fallback_schema = _string_object_dict(
+                SysSessionSendTool(sub_specs={}, peer_enabled=True).get_schema()
+            )
             if fallback_schema is not None:
                 function = _string_object_dict(fallback_schema.get("function"))
                 if function is not None:
@@ -1018,9 +1025,11 @@ def should_dispatch_locally(tool_name: str) -> bool:
 
 # Granted tool names per live AgentSpec + effective harness, keyed by
 # ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
-# guards against id reuse after the spec is garbage-collected.
+# guards against id reuse after the spec is garbage-collected. The session
+# release flags are part of the key: the same spec advertises a different
+# surface under each flag.
 _granted_tool_names_cache: dict[
-    tuple[int, str | None], tuple[weakref.ref[AgentSpec], frozenset[str]]
+    tuple[int, str | None, bool, bool], tuple[weakref.ref[AgentSpec], frozenset[str]]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -1062,7 +1071,13 @@ def _surface_only_spec(agent_spec: AgentSpec) -> AgentSpec:
     )
 
 
-def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> frozenset[str]:
+def _granted_tool_names(
+    agent_spec: AgentSpec,
+    harness: str | None = None,
+    *,
+    project_assignments_enabled: bool = False,
+    peer_messaging_enabled: bool = False,
+) -> frozenset[str]:
     """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
 
     Mirrors advertisement: the names ``ToolManager`` registers, spec-local
@@ -1075,17 +1090,27 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
     :param harness: Canonical harness the session runs, from
         :func:`_effective_harness_name`. Only the native/non-native split
         matters here.
+    :param project_assignments_enabled: The session's cached
+        project-assignments flag; ``True`` adds the ``sys_assignment_*`` tools
+        a spec registers only under the flag, mirroring the turn surface.
+    :param peer_messaging_enabled: The session's cached peer-messaging flag;
+        ``True`` adds the by-id ``sys_session_send`` a no-spawn spec registers,
+        mirroring the turn surface.
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness)
+    cache_key = (id(agent_spec), harness, project_assignments_enabled, peer_messaging_enabled)
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
     # Shut the probe manager down so a manager-created OS environment doesn't
     # outlive the check; with fork/scratch stripped above there is nothing
     # expensive to tear down.
-    manager = ToolManager(_surface_only_spec(agent_spec))
+    manager = ToolManager(
+        _surface_only_spec(agent_spec),
+        project_assignments_enabled=project_assignments_enabled,
+        peer_messaging_enabled=peer_messaging_enabled,
+    )
     try:
         names = set(manager.get_tool_names())
     finally:
@@ -1104,6 +1129,9 @@ def _ungranted_tool_reason(
     tool_name: str,
     agent_spec: AgentSpec | None,
     effective_harness: str | None = None,
+    *,
+    project_assignments_enabled: bool = False,
+    peer_messaging_enabled: bool = False,
 ) -> str | None:
     """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
 
@@ -1117,6 +1145,11 @@ def _ungranted_tool_reason(
     :param effective_harness: The session's harness override, so a session
         running a harness its spec never declared is judged on the surface it
         was actually advertised. ``None`` falls back to the spec.
+    :param project_assignments_enabled: The session's cached
+        project-assignments flag, so the judged surface matches the one the
+        session advertised.
+    :param peer_messaging_enabled: The session's cached peer-messaging flag,
+        so the judged surface matches the one the session advertised.
     """
     from omnigent.spec.types import AgentSpec as _AgentSpec
 
@@ -1124,7 +1157,10 @@ def _ungranted_tool_reason(
         return None
     try:
         granted = _granted_tool_names(
-            agent_spec, _effective_harness_name(agent_spec, effective_harness)
+            agent_spec,
+            _effective_harness_name(agent_spec, effective_harness),
+            project_assignments_enabled=project_assignments_enabled,
+            peer_messaging_enabled=peer_messaging_enabled,
         )
     except Exception as exc:
         _logger.exception("granted tool surface unavailable for %s", tool_name)
@@ -2362,6 +2398,103 @@ def _dispatch_model_mismatch(harness: str, model: str) -> str | None:
     return model_family_mismatch(harness, model)
 
 
+@dataclass
+class _PeerSendOpts:
+    """Validated peer-only options from ``sys_session_send`` arguments."""
+
+    correlation_id: str | None = None
+    wait_seconds: int = 0
+    wait_for_reply_seconds: int = 0
+    present: bool = False
+
+
+def _project_assignments_enabled_for(conversation_id: str | None) -> bool:
+    """Return the session's cached project-assignments flag, defaulting off.
+
+    Reads the runner's per-session init snapshot cache (seeded from the
+    server's session-init envelope). Importing the runner app module is lazy
+    so unit tests can exercise dispatch standalone.
+
+    :param conversation_id: The caller's session id, or ``None``.
+    :returns: ``True`` when the session initialized with the flag on.
+    """
+    if not conversation_id:
+        return False
+    try:
+        import omnigent.runner.app as _runner_app_mod
+
+        get_flag = getattr(_runner_app_mod, "get_session_project_assignments_enabled", None)
+        if callable(get_flag):
+            return bool(get_flag(conversation_id))
+    except ImportError:  # pragma: no cover — runner always present in prod
+        return False
+    return False
+
+
+def _peer_messaging_enabled_for(conversation_id: str | None) -> bool:
+    """Return the session's cached peer-messaging flag, defaulting off.
+
+    Reads the runner's per-session init snapshot cache (seeded from the
+    server's session-init envelope, mirroring
+    ``_session_project_assignments_enabled``). Importing the runner app
+    module is lazy so unit tests can exercise dispatch standalone.
+
+    :param conversation_id: The caller's session id, or ``None``.
+    :returns: ``True`` when the session initialized with the flag on.
+    """
+    if not conversation_id:
+        return False
+    try:
+        import omnigent.runner.app as _runner_app_mod
+
+        get_flag = getattr(_runner_app_mod, "get_session_peer_messaging_enabled", None)
+        if callable(get_flag):
+            return bool(get_flag(conversation_id))
+    except ImportError:  # pragma: no cover — runner always present in prod
+        return False
+    return False
+
+
+def _peer_send_opts_from_args(args: _JsonObject) -> _PeerSendOpts:
+    """Extract and validate the peer-only ``sys_session_send`` options.
+
+    ``correlation_id`` (≤ 64 chars), ``wait_seconds`` (0–3600) and
+    ``wait_for_reply_seconds`` (0–600) ride top-level alongside
+    ``session_id``; named (agent, title) sends reject them and child
+    sends reject them once the peer branch is out of reach.
+
+    :param args: Parsed ``sys_session_send`` arguments.
+    :returns: The validated options (all defaults when absent).
+    :raises ValueError: If any present option is out of range or mistyped.
+    """
+    opts = _PeerSendOpts()
+    raw_correlation = args.get("correlation_id")
+    if raw_correlation is not None:
+        opts.present = True
+        if not isinstance(raw_correlation, str) or not raw_correlation:
+            raise ValueError("'correlation_id' must be a non-empty string when provided")
+        if len(raw_correlation) > 64:
+            raise ValueError("'correlation_id' must be at most 64 characters")
+        opts.correlation_id = raw_correlation
+    raw_wait = args.get("wait_seconds")
+    if raw_wait is not None:
+        opts.present = True
+        if isinstance(raw_wait, bool) or not isinstance(raw_wait, int):
+            raise ValueError("'wait_seconds' must be an integer when provided")
+        if raw_wait < 0 or raw_wait > 3600:
+            raise ValueError("'wait_seconds' must be between 0 and 3600")
+        opts.wait_seconds = raw_wait
+    raw_reply_wait = args.get("wait_for_reply_seconds")
+    if raw_reply_wait is not None:
+        opts.present = True
+        if isinstance(raw_reply_wait, bool) or not isinstance(raw_reply_wait, int):
+            raise ValueError("'wait_for_reply_seconds' must be an integer when provided")
+        if raw_reply_wait < 0 or raw_reply_wait > 600:
+            raise ValueError("'wait_for_reply_seconds' must be between 0 and 600")
+        opts.wait_for_reply_seconds = raw_reply_wait
+    return opts
+
+
 def _normalize_subagent_model(
     model: str,
     *,
@@ -2535,6 +2668,11 @@ async def _execute_subagent_tool(
     except (ValueError, TypeError) as exc:
         return f"Error: sys_session_send invalid 'cost_budget': {exc}"
 
+    try:
+        peer_opts = _peer_send_opts_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid peer option: {exc}"
+
     # By-session-id mode: post to an existing direct child instead of
     # spawning/continuing a named (agent, title) sub-agent.
     target_session_id = args.get("session_id")
@@ -2591,6 +2729,10 @@ async def _execute_subagent_tool(
             conversation_id=conversation_id,
             publish_event=publish_event,
             created_by=dispatch_created_by,
+            peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
+            correlation_id=peer_opts.correlation_id,
+            wait_seconds=peer_opts.wait_seconds,
+            wait_for_reply_seconds=peer_opts.wait_for_reply_seconds,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -2598,6 +2740,12 @@ async def _execute_subagent_tool(
     llm_title_hint = args.get("title")
     if not isinstance(sub_agent_name, str) or not sub_agent_name:
         return "Error: sys_session_send requires 'agent' (or 'session_id')"
+    if peer_opts.present:
+        return (
+            "Error: sys_session_send 'correlation_id'/'wait_seconds'/"
+            "'wait_for_reply_seconds' apply only to peer sends by 'session_id'; "
+            "named (agent, title) sends do not accept them."
+        )
     if llm_title_hint is not None and not isinstance(llm_title_hint, str):
         llm_title_hint = None
 
@@ -3151,6 +3299,282 @@ async def _execute_subagent_tool(
     )
 
 
+async def _send_peer_message(
+    target_session_id: str,
+    message: str,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    correlation_id: str | None = None,
+    wait_seconds: int = 0,
+    wait_for_reply_seconds: int = 0,
+) -> str:
+    """Send a chat-style message to a non-child session via the peer route.
+
+    POSTs ``/v1/sessions/{target}/peer-messages`` (30 s budget) and maps the
+    route's disposition to the peer tool result. The route owns guard,
+    ownership and true-state truth; this branch only translates its answer
+    into the tool contract. ``wait_for_reply_seconds`` polls the record for
+    a reply without holding any dispatch lock.
+
+    :param target_session_id: The receiving session id.
+    :param message: The user message text to post.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The caller's own session id (the sender).
+    :param correlation_id: Optional id echoed in the peer envelope.
+    :param wait_seconds: How long the record may wait for an offline receiver.
+    :param wait_for_reply_seconds: How long to poll for a receiver reply.
+    :returns: JSON peer tool result (``{"peer": true, ...}``) or a JSON error.
+    """
+    body: _JsonObject = {
+        "sender_session_id": conversation_id,
+        "text": message,
+        "wait_seconds": wait_seconds,
+    }
+    if correlation_id is not None:
+        body["correlation_id"] = correlation_id
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{target_session_id}/peer-messages",
+            json=body,
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps(
+            {
+                "error": "peer_send_failed",
+                "conversation_id": target_session_id,
+                "status": None,
+                "message": f"peer send failed: {exc}",
+            }
+        )
+    if resp.status_code == 401:
+        return json.dumps(
+            {
+                "error": "peer_unauthorized",
+                "conversation_id": target_session_id,
+                "message": "the runner is not authorized to send as this session.",
+            }
+        )
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "conversation_id": target_session_id})
+    if resp.status_code == 422:
+        detail = resp.text[:200]
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                raw_detail = payload.get("detail") or payload.get("message")
+                if isinstance(raw_detail, str) and raw_detail:
+                    detail = raw_detail[:200]
+        except (ValueError, json.JSONDecodeError):
+            pass
+        return json.dumps(
+            {
+                "error": "peer_send_failed",
+                "conversation_id": target_session_id,
+                "status": 422,
+                "message": detail,
+            }
+        )
+    if resp.status_code >= 400:
+        detail = resp.text[:200]
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                raw_detail = payload.get("detail") or payload.get("message")
+                if isinstance(raw_detail, str) and raw_detail:
+                    detail = raw_detail[:200]
+        except (ValueError, json.JSONDecodeError):
+            pass
+        return json.dumps(
+            {
+                "error": "peer_send_failed",
+                "conversation_id": target_session_id,
+                "status": resp.status_code,
+                "message": detail,
+            }
+        )
+    try:
+        payload = resp.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        return json.dumps(
+            {
+                "error": "peer_send_failed",
+                "conversation_id": target_session_id,
+                "status": resp.status_code,
+                "message": f"peer send returned invalid JSON: {exc}",
+            }
+        )
+    if not isinstance(payload, dict):
+        return json.dumps(
+            {
+                "error": "peer_send_failed",
+                "conversation_id": target_session_id,
+                "status": resp.status_code,
+                "message": "peer send returned a non-object response",
+            }
+        )
+    disposition = payload.get("disposition")
+    if not isinstance(disposition, str) or not disposition:
+        return json.dumps(
+            {
+                "error": "peer_send_failed",
+                "conversation_id": target_session_id,
+                "status": resp.status_code,
+                "message": "peer send response omitted the disposition",
+            }
+        )
+    reason = payload.get("reason")
+    reason_text = reason if isinstance(reason, str) and reason else None
+    if disposition == "refused" and reason_text == "feature_disabled":
+        return json.dumps(
+            {
+                "error": "peer_messaging_disabled",
+                "conversation_id": target_session_id,
+                "message": (
+                    "sys_session_send by session_id is child-only on this server; "
+                    "peer messaging is off."
+                ),
+            }
+        )
+    receiver = _string_object_dict(payload.get("receiver")) or {}
+    result: _JsonObject = {
+        "peer": True,
+        "peer_id": payload.get("peer_id"),
+        "conversation_id": target_session_id,
+        "title": receiver.get("title"),
+        "agent": receiver.get("agent_name"),
+        "disposition": disposition,
+        "ref": payload.get("ref"),
+        "receiver_state": {
+            "status": receiver.get("status"),
+            "runner_online": receiver.get("runner_online"),
+        },
+    }
+    if reason_text is not None:
+        result["reason"] = reason_text
+    reply_to = payload.get("reply_to")
+    if isinstance(reply_to, str) and reply_to:
+        result["reply_to"] = reply_to
+    peer_id = payload.get("peer_id")
+    if (
+        wait_for_reply_seconds > 0
+        and isinstance(peer_id, str)
+        and peer_id
+        and disposition in ("delivered", "queued", "pending", "held")
+    ):
+        result["reply"] = await _poll_peer_reply(
+            server_client,
+            peer_id,
+            wait_for_reply_seconds,
+        )
+    return json.dumps(result)
+
+
+async def _poll_peer_reply(
+    server_client: httpx.AsyncClient,
+    peer_id: str,
+    wait_for_reply_seconds: int,
+) -> _JsonObject | None:
+    """Poll one peer record until it carries a reply or the wait elapses.
+
+    Reads ``GET /v1/peer-messages/{peer_id}`` every 2 s. A set
+    ``replied_at`` fetches the reply record for its text; a terminal
+    ``failed`` / ``expired`` / ``refused_by_user`` state returns that
+    state; an exhausted budget returns a ``timed_out`` marker. The wait
+    is capped at 600 s.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param peer_id: The sent record's id.
+    :param wait_for_reply_seconds: Poll budget in seconds.
+    :returns: ``{"peer_id", "text"}``, a terminal-state dict, or ``None``
+        with a ``reply_wait: timed_out`` marker handled by the caller.
+    """
+    import time as _time
+
+    budget = min(max(wait_for_reply_seconds, 0), _PEER_REPLY_WAIT_MAX_S)
+    deadline = _time.monotonic() + budget
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return {"reply": None, "reply_wait": "timed_out"}
+        try:
+            resp = await server_client.get(
+                f"/v1/peer-messages/{peer_id}", timeout=min(30.0, remaining)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            if resp.status_code == 200:
+                try:
+                    body = resp.json()
+                except (ValueError, json.JSONDecodeError):
+                    body = None
+                if isinstance(body, dict):
+                    if body.get("replied_at") is not None:
+                        reply_id = body.get("reply_peer_id")
+                        if isinstance(reply_id, str) and reply_id:
+                            remaining = deadline - _time.monotonic()
+                            return await _fetch_peer_reply_text(
+                                server_client, reply_id, remaining=remaining
+                            )
+                        return None
+                    state = body.get("state")
+                    if state in ("failed", "expired", "refused_by_user"):
+                        out: _JsonObject = {"state": state}
+                        reason = body.get("reason")
+                        if isinstance(reason, str) and reason:
+                            out["reason"] = reason
+                        return out
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return {"reply": None, "reply_wait": "timed_out"}
+        await asyncio.sleep(min(_PEER_REPLY_POLL_S, remaining))
+
+
+async def _fetch_peer_reply_text(
+    server_client: httpx.AsyncClient,
+    reply_peer_id: str,
+    *,
+    remaining: float = 30.0,
+) -> _JsonObject | None:
+    """Fetch the reply record's text for a replied-to peer send.
+
+    Bounded by the caller's remaining poll budget so a reply detected near
+    the end of ``wait_for_reply_seconds`` cannot overshoot the deadline —
+    a request that times out inside that budget still reports the reply
+    as detected (only its text is unavailable) rather than block past the
+    deadline the caller already spent waiting.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param reply_peer_id: The reply record's id.
+    :param remaining: Seconds left in the caller's poll budget.
+    :returns: ``{"peer_id", "text"}`` (``text`` ``None`` on a timeout), or
+        plain ``None`` for any other fetch failure.
+    """
+    if remaining <= 0:
+        return {"peer_id": reply_peer_id, "text": None}
+    try:
+        resp = await asyncio.wait_for(
+            server_client.get(f"/v1/peer-messages/{reply_peer_id}", timeout=min(30.0, remaining)),
+            timeout=remaining,
+        )
+    except (httpx.TimeoutException, asyncio.TimeoutError):
+        return {"peer_id": reply_peer_id, "text": None}
+    except Exception:  # noqa: BLE001
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        body = resp.json()
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    text = body.get("text")
+    return {"peer_id": reply_peer_id, "text": text if isinstance(text, str) else None}
+
+
 async def _send_to_existing_session(
     target_session_id: str,
     message: str,
@@ -3159,6 +3583,10 @@ async def _send_to_existing_session(
     conversation_id: str,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     created_by: str | None = None,
+    peer_messaging_enabled: bool = False,
+    correlation_id: str | None = None,
+    wait_seconds: int = 0,
+    wait_for_reply_seconds: int = 0,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -3186,6 +3614,12 @@ async def _send_to_existing_session(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's own session id — the required
         parent of the target.
+    :param peer_messaging_enabled: When ``True`` a target outside the
+        caller's subtree is sent as a peer message via the server route
+        instead of failing ``session_out_of_tree``.
+    :param correlation_id: Peer-only id echoed in the peer envelope.
+    :param wait_seconds: Peer-only wait budget for an offline receiver.
+    :param wait_for_reply_seconds: Peer-only poll budget for a reply.
     :returns: JSON handle on success; a JSON/text error otherwise.
     """
     from omnigent.runner import app as _runner_app
@@ -3202,6 +3636,16 @@ async def _send_to_existing_session(
         return f"Error: sys_session_send lookup returned {snap.status_code}"
     snap_data = snap.json()
     if snap_data.get("parent_session_id") != conversation_id:
+        if peer_messaging_enabled:
+            return await _send_peer_message(
+                target_session_id,
+                message,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                correlation_id=correlation_id,
+                wait_seconds=wait_seconds,
+                wait_for_reply_seconds=wait_for_reply_seconds,
+            )
         return json.dumps(
             {
                 "error": "session_out_of_tree",
@@ -3211,6 +3655,14 @@ async def _send_to_existing_session(
                     "sys_session_send by session_id is child-only."
                 ),
             }
+        )
+    if correlation_id is not None or wait_seconds or wait_for_reply_seconds:
+        # Only a direct child reaches here; the peer-only options are
+        # meaningful solely on the peer route taken above.
+        return (
+            "Error: sys_session_send 'correlation_id'/'wait_seconds'/"
+            "'wait_for_reply_seconds' apply only to peer sends; they cannot "
+            f"change an existing child session {target_session_id!r}."
         )
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(
@@ -5980,7 +6432,8 @@ async def _collect_global_sessions(
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
     Projects each accessible session to ``{session_id, agent_name, title,
-    status, runner_id, runner_online, parent_session_id}``.
+    status, runner_id, runner_online, parent_session_id, project_id,
+    workspace, updated_at, last_message_preview}``.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
@@ -5994,7 +6447,12 @@ async def _collect_global_sessions(
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
+    params: dict[str, str | int] = {
+        "limit": limit,
+        "order": "desc",
+        "visibility": "all",
+        "include_preview": 1,
+    }
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:
@@ -6028,6 +6486,10 @@ async def _collect_global_sessions(
                 "runner_id": r.get("runner_id"),
                 "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
                 "parent_session_id": r.get("parent_session_id"),
+                "project_id": r.get("project_id"),
+                "workspace": r.get("workspace"),
+                "updated_at": r.get("updated_at"),
+                "last_message_preview": r.get("last_message_preview"),
             }
             for r in rows
         ],
@@ -6443,7 +6905,13 @@ async def execute_tool(
     # MCP dispatch resolves the target against the spec inside the MCP
     # manager; every other branch is gated on the spec's granted surface.
     if mcp_manager is None:
-        refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
+        refusal = _ungranted_tool_reason(
+            tool_name,
+            agent_spec,
+            effective_harness,
+            project_assignments_enabled=_project_assignments_enabled_for(conversation_id),
+            peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
+        )
         if refusal is not None:
             return json.dumps({"error": refusal})
     try:
@@ -8224,7 +8692,13 @@ def _spawn_async_tool(
     if session_inbox is None or session_async_tasks is None:
         return "Error: async inbox not initialized for this session"
     if mcp_manager is None:
-        refusal = _ungranted_tool_reason(target_tool, agent_spec, effective_harness)
+        refusal = _ungranted_tool_reason(
+            target_tool,
+            agent_spec,
+            effective_harness,
+            project_assignments_enabled=_project_assignments_enabled_for(conversation_id),
+            peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
+        )
         if refusal is not None:
             return f"Error: sys_call_async refused: {refusal}"
 

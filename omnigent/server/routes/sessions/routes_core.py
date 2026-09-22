@@ -134,6 +134,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
+    _latest_message_preview,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _notify_runner_of_bundled_child,
@@ -1308,6 +1309,7 @@ def register_core_routes(
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
+        include_preview: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -1363,6 +1365,9 @@ def register_core_routes(
             owned. ``"archived"`` returns only archived sessions.
             ``"all"`` (default) returns all accessible non-archived
             sessions, matching the legacy behaviour.
+        :param include_preview: When ``True`` each row also carries
+            ``last_message_preview`` — a single-line excerpt of its
+            newest visible message. ``False`` (default) omits it.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -1522,6 +1527,15 @@ def register_core_routes(
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        # Preview excerpts ride one batched message read capped by the page
+        # size; per-row ``list_items`` would be N+1 traffic. The child rail
+        # already shares this pattern via
+        # ``_child_session_summaries_from_conversations``.
+        previews_by_conv: dict[str, str | None] = {}
+        if include_preview:
+            previews_by_conv = await _message_previews_for(
+                [conv.id for conv in page.data if conv.agent_id is not None]
+            )
         # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
         # A session whose persisted live_status is still running/waiting but
         # whose runner is confirmed gone — a replica that restarted and
@@ -1605,6 +1619,7 @@ def register_core_routes(
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
+                last_message_preview=(previews_by_conv.get(conv.id) if include_preview else None),
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -1645,6 +1660,49 @@ def register_core_routes(
         if comment_store is None or not conv_ids:
             return {}
         return await asyncio.to_thread(comment_store.get_comments_fingerprints, conv_ids)
+
+    async def _message_previews_for(
+        conv_ids: list[str],
+    ) -> dict[str, str | None]:
+        """
+        Batch-fetch one message preview excerpt per session.
+
+        One batched ``list_latest_message_items_for_conversations`` read
+        serves the whole page; previews are computed with the shared
+        ``_latest_message_preview`` excerpt function. Sessions without
+        visible messages map to ``None``.
+
+        :param conv_ids: Session ids on the current page,
+            e.g. ``["conv_abc123"]``.
+        :returns: Map from session id to its preview excerpt.
+        """
+        if not conv_ids:
+            return {}
+        try:
+            batched = await asyncio.to_thread(
+                conversation_store.list_latest_message_items_for_conversations,
+                conv_ids,
+                10,
+            )
+        except (AttributeError, TypeError):
+            per_row: dict[str, str | None] = {}
+            for conv_id in conv_ids:
+                try:
+                    items = await asyncio.to_thread(
+                        conversation_store.list_items,
+                        conv_id,
+                        type="message",
+                        order="desc",
+                        limit=10,
+                    )
+                except Exception:
+                    per_row[conv_id] = None
+                    continue
+                per_row[conv_id] = _latest_message_preview(items.data)
+            return per_row
+        except Exception:
+            return {}
+        return {conv_id: _latest_message_preview(batched.get(conv_id, [])) for conv_id in conv_ids}
 
     # ── WS /sessions/updates ────────────────────────────────────
 

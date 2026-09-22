@@ -1254,6 +1254,109 @@ export async function getSessionUsage(
   };
 }
 
+/** `session_peer_messages.state` values (contract: peer-messaging design §Contracts). */
+export type PeerMessageState =
+  | "pending"
+  | "queued"
+  | "held"
+  | "delivering"
+  | "delivered"
+  | "failed"
+  | "expired"
+  | "refused_by_user";
+
+interface PeerMessageWire {
+  peer_id: string;
+  sender_session_id: string;
+  receiver_session_id: string;
+  correlation_id: string | null;
+  ref: string;
+  text: string;
+  state: PeerMessageState;
+  reason: string | null;
+  created_at: number;
+  updated_at: number;
+  expires_at: number | null;
+  reply_peer_id: string | null;
+  replied_at: number | null;
+}
+
+/** One `session_peer_messages` record, camelCased at the wire boundary. */
+export interface PeerMessageRecord {
+  id: string;
+  senderSessionId: string;
+  receiverSessionId: string;
+  correlationId: string | null;
+  ref: string;
+  text: string;
+  state: PeerMessageState;
+  reason: string | null;
+  createdAtS: number;
+  updatedAtS: number;
+  expiresAtS: number | null;
+  replyPeerId: string | null;
+  repliedAtS: number | null;
+}
+
+function peerMessageFromWire(wire: PeerMessageWire): PeerMessageRecord {
+  return {
+    id: wire.peer_id,
+    senderSessionId: wire.sender_session_id,
+    receiverSessionId: wire.receiver_session_id,
+    correlationId: wire.correlation_id ?? null,
+    ref: wire.ref,
+    text: wire.text,
+    state: wire.state,
+    reason: wire.reason ?? null,
+    createdAtS: wire.created_at,
+    updatedAtS: wire.updated_at,
+    expiresAtS: wire.expires_at ?? null,
+    replyPeerId: wire.reply_peer_id ?? null,
+    repliedAtS: wire.replied_at ?? null,
+  };
+}
+
+/**
+ * List held / pending / queued peer-message records addressed to
+ * `sessionId`, for the receiver's held-messages panel. Requires user READ
+ * on the session. Accepts either response shape the route may return
+ * (`{"data": [...]}` or a bare array).
+ */
+export async function listPeerMessages(
+  sessionId: string,
+  states: PeerMessageState[] = ["held", "pending", "queued"],
+): Promise<PeerMessageRecord[]> {
+  const params = new URLSearchParams({ state: states.join(",") });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/peer-messages?${params}`,
+  );
+  const payload = await readJsonOrThrow<PeerMessageWire[] | { data: PeerMessageWire[] }>(res);
+  const records = Array.isArray(payload) ? payload : payload.data;
+  return records.map(peerMessageFromWire);
+}
+
+/**
+ * Release (deliver) or refuse a held/pending/queued peer-message record.
+ * Requires user EDIT on the receiver session. Throws `ApiError` with
+ * `status === 409` when the record is no longer in an actionable state —
+ * callers should refetch the list rather than retry the action.
+ */
+export async function actOnPeerMessage(
+  sessionId: string,
+  peerId: string,
+  action: "release" | "refuse",
+): Promise<PeerMessageRecord> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/peer-messages/${encodeURIComponent(peerId)}/action`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    },
+  );
+  return peerMessageFromWire(await readJsonOrThrow<PeerMessageWire>(res));
+}
+
 /** One page of a session's committed items, in chronological order. */
 export interface SessionItemsPage {
   /** Items oldest-to-newest, ready to feed `itemsToBlocks`. */

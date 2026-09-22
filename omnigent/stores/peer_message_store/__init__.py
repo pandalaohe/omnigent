@@ -95,6 +95,8 @@ class PeerMessageStore(ABC):
         state: str,
         reason: str | None = None,
         expected_states: tuple[str, ...] | None = None,
+        *,
+        expires_at: int | None = None,
     ) -> bool:
         """
         Compare-and-set a record's state.
@@ -109,6 +111,9 @@ class PeerMessageStore(ABC):
             it.
         :param expected_states: States the caller last saw; a concurrent
             move makes this return ``False``.
+        :param expires_at: New expiry, or omitted to leave it. Used by the
+            sweeper's startup reconciliation, which resets a crash-orphaned
+            ``delivering`` record's expiry when it reverts to ``pending``.
         :returns: ``True`` when exactly one row changed, else ``False``.
         """
         ...

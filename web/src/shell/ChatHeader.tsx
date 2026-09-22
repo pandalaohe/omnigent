@@ -172,6 +172,10 @@ interface ChatHeaderProps {
   hasAgentInfo: boolean;
   /** Open the mobile agent-info dialog. */
   onAgentInfo: () => void;
+  /** Whether the "Peer messages" menu entry should render (SCC01-S1). */
+  showPeerMessages?: boolean;
+  /** Open the peer-messages held panel for this session. */
+  onPeerMessages?: () => void;
   /** Whether the mobile three-dot menu has any entry to offer. */
   hasHeaderMenu: boolean;
   /** Whether the Files tab/right panel is available for this session. */
@@ -325,6 +329,8 @@ export function ChatHeader({
   onFork,
   hasAgentInfo,
   onAgentInfo,
+  showPeerMessages = false,
+  onPeerMessages,
   hasHeaderMenu,
   showFilesPanel,
   hasRailContent,
@@ -499,6 +505,8 @@ export function ChatHeader({
         onFork={onFork}
         hasAgentInfo={isMobile && hasAgentInfo}
         onAgentInfo={onAgentInfo}
+        showPeerMessages={showPeerMessages}
+        onPeerMessages={onPeerMessages}
         viewItems={isMobile ? <ViewModeMenuItems /> : null}
         workspaceItems={isMobile ? workspaceItems : null}
       />
