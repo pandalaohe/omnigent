@@ -469,3 +469,70 @@ async def test_claude_interrupt_rechecks_idle_after_bridge_lookup(
     assert resp.body == b'{"interrupted":false,"reason":"idle"}'
     assert injected == []
     assert captured["wakes"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_still_pending", [False, True])
+async def test_claude_interrupt_rechecks_pending_prompt_after_bridge_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_still_pending: bool,
+) -> None:
+    """A question answered during bridge lookup must not take Ctrl+C at the composer.
+
+    ``prompt_pending`` is a snapshot taken before the async bridge-id lookup;
+    only the post-lookup ``has_pending_user_prompt`` re-check may authorise
+    injecting into a pane with no active work.
+    """
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    release_lookup = asyncio.Event()
+    lookup_started = asyncio.Event()
+    events: list[Any] = []
+    injected: list[str] = []
+
+    async def _slow_bridge_lookup(*, server_client: Any, session_id: str) -> str:
+        del server_client
+        events.append("lookup-start")
+        lookup_started.set()
+        await release_lookup.wait()
+        events.append("lookup-end")
+        return f"bid-{session_id}"
+
+    def _pending_prompt(bridge_dir: Any) -> bool:
+        events.append(("prompt-check", bridge_dir))
+        return prompt_still_pending
+
+    monkeypatch.setattr(
+        interrupt_mod,
+        "_claude_native_bridge_id_for_session",
+        _slow_bridge_lookup,
+    )
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(claude_bridge, "has_pending_user_prompt", _pending_prompt)
+    monkeypatch.setattr(
+        claude_bridge,
+        "inject_interrupt",
+        lambda bridge_dir, *, timeout_s: injected.append(bridge_dir),
+    )
+    runner, captured = _make_runner(session_has_active_work=lambda _session_id: False)
+
+    pending = asyncio.create_task(
+        runner.interrupt("claude-native", "conv_cl", prompt_pending=True)
+    )
+    await asyncio.wait_for(lookup_started.wait(), timeout=1.0)
+    release_lookup.set()
+    resp = await pending
+
+    # The predicate the waiter polls is consulted only after the lookup, and only
+    # with the resolved bridge directory.
+    assert events == ["lookup-start", "lookup-end", ("prompt-check", "dir/bid-conv_cl")]
+    if prompt_still_pending:
+        assert isinstance(resp, Response) and resp.status_code == 204
+        assert injected == ["dir/bid-conv_cl"]
+        assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+    else:
+        assert isinstance(resp, Response) and resp.status_code == 200
+        assert resp.body == b'{"interrupted":false,"reason":"idle"}'
+        assert injected == []
+        assert captured["wakes"] == []

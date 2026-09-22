@@ -350,7 +350,8 @@ class NativeInterruptRunner:
         :param conv_id: The session (conversation) id.
         :param prompt_pending: Whether a live question waiter proves the pane is
             parked on a user prompt; Claude's stale-Stop idle guard is skipped
-            so the interrupt still reaches the dialog.
+            so the interrupt still reaches the dialog. Re-checked after the
+            bridge-id lookup, since the question may be answered meanwhile.
         :returns: A response when this harness has an interrupt handler, else
             ``None`` so the caller falls through to the in-process turn cancel
             (antigravity/opencode).
@@ -510,9 +511,12 @@ class NativeInterruptRunner:
         :param conv_id: The session (conversation) id.
         :param prompt_pending: A live question waiter proves the pane is parked
             on a prompt, not the idle composer, so the idle guard is skipped.
+            Re-checked after the bridge-id lookup, since the question may be
+            answered meanwhile.
         """
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
+            has_pending_user_prompt,
             inject_interrupt,
         )
 
@@ -532,18 +536,21 @@ class NativeInterruptRunner:
             server_client=self._server_client,
             session_id=conv_id,
         )
-        if not prompt_pending and not self._session_has_active_work(conv_id):
-            # The bridge-id lookup crosses an async boundary. Re-check at the
-            # last safe point so a terminal idle edge during that await cannot
-            # turn the pending control into Ctrl+C at Claude's idle composer.
-            self._logger.debug(
-                "claude-native interrupt: work settled during bridge lookup for %s", conv_id
-            )
-            return JSONResponse(
-                status_code=200,
-                content={"interrupted": False, "reason": "idle"},
-            )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        if not self._session_has_active_work(conv_id):
+            # The bridge-id lookup crosses an async boundary: the question may have been
+            # answered meanwhile, so re-check it by the predicate the waiter polls.
+            still_pending = prompt_pending and await asyncio.to_thread(
+                has_pending_user_prompt, bridge_dir
+            )
+            if not still_pending:
+                self._logger.debug(
+                    "claude-native interrupt: work settled during bridge lookup for %s", conv_id
+                )
+                return JSONResponse(
+                    status_code=200,
+                    content={"interrupted": False, "reason": "idle"},
+                )
         try:
             await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
         except RuntimeError as exc:
