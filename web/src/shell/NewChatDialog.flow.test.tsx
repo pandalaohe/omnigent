@@ -1117,7 +1117,9 @@ describe("NewChatLandingScreen create flow", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [file] },
     });
-    await screen.findByLabelText(/Image attachment diagram\.png/);
+    // MOD-s10: attachments now render as tiles under the field (the removed
+    // editor's chip carried the "Image attachment …" aria-label).
+    await screen.findByRole("img", { name: "diagram.png" });
     typeMessage("what is in this image?");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1219,7 +1221,9 @@ describe("NewChatLandingScreen create flow", () => {
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
         "conv_new",
         expect.objectContaining({
-          text: "/review-pr 123",
+          // MOD-s10: the token's own insertion space stays in the authored
+          // text, so the prompt reads with it (the token itself is gone).
+          text: "/review-pr 123 ",
           skill: null,
           files: [file],
         }),

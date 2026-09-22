@@ -23,7 +23,7 @@ function renderBackdrop(props: Partial<React.ComponentProps<typeof ComposerToken
       />
     </>,
   );
-  return container.querySelector('[data-testid="composer-token-backdrop"]') as HTMLElement;
+  return container.querySelector('[data-testid="composer-highlight-overlay"]') as HTMLElement;
 }
 
 describe("hasTint", () => {
@@ -126,7 +126,7 @@ describe("ComposerTokenBackdrop", () => {
       </>,
     );
     const node = () =>
-      container.querySelector('[data-testid="composer-token-backdrop"]') as HTMLElement;
+      container.querySelector('[data-testid="composer-highlight-overlay"]') as HTMLElement;
     expect(node().style.top).toBe("0px");
     // The anchor moved (a reply quote was inserted above it) without any
     // resize — jsdom never fires ResizeObserver for this, so only a
@@ -171,7 +171,9 @@ describe("ComposerTokenBackdrop", () => {
         <textarea ref={stubGeometry} />
       </>,
     );
-    const node = container.querySelector('[data-testid="composer-token-backdrop"]') as HTMLElement;
+    const node = container.querySelector(
+      '[data-testid="composer-highlight-overlay"]',
+    ) as HTMLElement;
     expect(node.style.top).toBe("20px");
     expect(node.style.left).toBe("10px");
     expect(node.style.width).toBe("300px");

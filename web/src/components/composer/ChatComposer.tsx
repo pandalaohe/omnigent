@@ -47,8 +47,7 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
     submitWithModEnter: boolean;
     preventsKeyboardSubmit: boolean;
   };
-  /** Omitted only when `slots.input` supplies a replacement editor. */
-  input?: Omit<ComponentPropsWithRef<"textarea">, "onKeyDown"> & {
+  input: Omit<ComponentPropsWithRef<"textarea">, "onKeyDown"> & {
     onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => void;
     "data-testid"?: string;
     "data-slash-command"?: string;
@@ -60,10 +59,6 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
     inputBackdrop?: ReactNode;
     inputHint?: ReactNode;
     attachments?: ReactNode;
-    /** Fork-only: renders in place of the textarea, for an editor that keeps
-        attachments inline among the text instead of in a separate row. The
-        replacement owns its own key handling, so `keyboard` does not reach it. */
-    input?: ReactNode;
   };
   actions: {
     leading: ReactNode;
@@ -88,9 +83,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       ref={ref}
       data-composer-card
       className={cn(
-        // The second has- selector covers the fork's `slots.input` editor, which
-        // focuses a contenteditable rather than a textarea.
-        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] has-[[contenteditable]:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
+        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
         className,
       )}
       {...props}
@@ -101,7 +94,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       >
         {slots?.inputPrefix}
         {slots?.inputBackdrop}
-        {slots?.input ?? (input ? <ComposerTextInput input={input} keyboard={keyboard} /> : null)}
+        <ComposerTextInput input={input} keyboard={keyboard} />
         {slots?.inputHint}
       </ComposerInputArea>
       {slots?.attachments}
@@ -216,11 +209,7 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
 export function ComposerTextInput({
   input,
   keyboard,
-}: Pick<ChatComposerProps, "keyboard"> & {
-  // `input` is optional on the composer (a `slots.input` replacement supplies
-  // its own editor), but this component IS the textarea — it always gets one.
-  input: NonNullable<ChatComposerProps["input"]>;
-}) {
+}: Pick<ChatComposerProps, "input" | "keyboard">) {
   return (
     <ComposerTextarea
       {...input}

@@ -192,7 +192,9 @@ export const ComposerTokenBackdrop = forwardRef<
     <div
       ref={innerRef}
       aria-hidden
-      data-testid="composer-token-backdrop"
+      // Upstream's testid: this overlay replaces the slash-command
+      // highlighter, and upstream's composer tests query it by that name.
+      data-testid="composer-highlight-overlay"
       className="composer-input-text pointer-events-none absolute overflow-hidden whitespace-pre-wrap break-words p-0 text-ui text-foreground"
       style={{ top: box.top, left: box.left, width: box.width, height: box.height }}
     >

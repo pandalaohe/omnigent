@@ -28,6 +28,7 @@ import {
   readSessionModelLabelCache,
 } from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import type { ComposerDraftPart } from "@/lib/composerContent";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
@@ -153,6 +154,21 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     showCodexPlanMode: false,
     ...overrides,
   };
+}
+
+/**
+ * The fork store's `enqueueMessage(text, files, composerParts, replyDraft)` has
+ * `composerParts` third while the composer's `onSend` keeps `replyDraft` third
+ * (upstream's contract, which the tests below assert), so a queued send goes
+ * through this adapter rather than handing the store function over directly.
+ */
+function enqueueAsOnSend(
+  text: string,
+  files?: File[],
+  replyDraft?: StoredReplyDraft,
+  composerParts?: ComposerDraftPart[],
+) {
+  return useChatStore.getState().enqueueMessage(text, files, composerParts, replyDraft);
 }
 
 async function openSessionModels() {
@@ -370,7 +386,7 @@ describe("Composer growth layout", () => {
 
     fireEvent.change(ta, { target: { value: "one\ntwo\nthree\nfour" } });
 
-    expect(ta).toHaveClass("max-h-[208px]", "overflow-y-auto");
+    expect(ta.style.height).toBe("200px");
     expect(form?.style.marginTop).toBe("");
   });
 
@@ -383,7 +399,7 @@ describe("Composer growth layout", () => {
       "[scrollbar-width:none]",
       "[&::-webkit-scrollbar]:hidden",
     );
-    expect(ta).toHaveClass("max-h-[208px]");
+    expect(ta.parentElement).toHaveClass("overflow-hidden");
   });
 });
 
@@ -530,7 +546,7 @@ describe("Composer send shortcut", () => {
       render(<Composer {...composerProps({ onSend })} />);
       fireEvent.change(textarea(), { target: { value: "/des" } });
       fireEvent.keyDown(textarea(), { key: "Enter" });
-      expect(textarea().value).toBe("/des\n");
+      expect(textarea().value).toBe("/des");
       expect(onSend).not.toHaveBeenCalled();
 
       fireEvent.focus(screen.getByRole("button", { name: "Send" }));
@@ -2637,16 +2653,25 @@ describe("SlashCommandMenu", () => {
   });
 });
 
-// Renders the real composer and inspects the decorated token in its DOM.
+// Renders the real composer and inspects the highlight overlay's DOM, so a
+// regression where the WHOLE draft tints (not just the token) is caught.
 describe("Composer slash-command highlight overlay", () => {
   beforeEach(() => {
     setComposerState({ conversationId: "conv_test", skills: [] });
   });
   afterEach(() => cleanup());
 
-  /** The only tinted run in the editor — should be just the token. */
+  /** The only tinted (pink) run in the overlay — should be just the token. */
   function tintedText(): string | null {
-    return document.querySelector("[data-composer-slash-token]")?.textContent ?? null;
+    return (
+      screen.getByTestId("composer-highlight-overlay").querySelector(".text-brand-accent")
+        ?.textContent ?? null
+    );
+  }
+
+  /** The overlay's full text, tinted + untinted — should mirror the draft. */
+  function overlayText(): string {
+    return screen.getByTestId("composer-highlight-overlay").textContent ?? "";
   }
 
   // A slash command followed by args; only the leading token should tint.
@@ -2658,13 +2683,15 @@ describe("Composer slash-command highlight overlay", () => {
     fireEvent.change(textarea(), { target: { value: COMMAND_PROMPT } });
     expect(textarea().value).toBe(COMMAND_PROMPT);
     expect(tintedText()).toBe("/cross-review");
-    expect(textarea().textContent).toBe(COMMAND_PROMPT);
+    expect(overlayText()).toBe(COMMAND_PROMPT);
+    expect(textarea()).toHaveClass("text-ui");
+    expect(screen.getByTestId("composer-highlight-overlay")).toHaveClass("text-ui");
   });
 
   it("renders no overlay for plain prose", () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "just a normal message" } });
-    expect(document.querySelector("[data-composer-slash-token]")).toBeNull();
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
   });
 });
 
@@ -3489,7 +3516,9 @@ describe("Composer file-attachment focus", () => {
     const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
     fireEvent.change(fileInput(), { target: { files: [file] } });
 
-    expect(ta.value).toBe("");
+    // The picker inserts the attachment's visible token at the caret, so an
+    // attachment-only draft has text (the token) as well as the file.
+    expect(ta.value).toBe("[image 1] ");
     expect(ta.getAttribute("data-has-draft")).toBe("true");
   });
 
@@ -3737,7 +3766,7 @@ describe("Composer — editing queued messages", () => {
 
   it("dequeues the recalled message so re-sending can't duplicate it", async () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueAsOnSend });
     renderWithTooltips(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
@@ -3810,7 +3839,7 @@ describe("Composer — editing queued messages", () => {
     useChatStore.setState({
       queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
     });
-    const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+    const onSend = vi.fn(enqueueAsOnSend);
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
     const strip = screen.getByTestId("composer-queued-strip");
@@ -3864,7 +3893,7 @@ describe("Composer — editing queued messages", () => {
 
   it.each([false, true])("recalls queued path mentions with quotes: %s", (quoted) => {
     useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueAsOnSend });
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...props} ref={ref} />);
     act(() =>
@@ -4410,7 +4439,7 @@ describe("Composer config gear", () => {
         })}
       />,
     );
-    const modelTextarea = textarea();
+    const modelTextarea = document.querySelector("textarea") as HTMLTextAreaElement;
     fireEvent.change(modelTextarea, { target: { value: "/model" } });
     fireEvent.keyDown(modelTextarea, { key: "Enter", code: "Enter" });
     // Give the nonce effect a tick; the modal must stay closed.

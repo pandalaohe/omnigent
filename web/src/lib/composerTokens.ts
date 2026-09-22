@@ -1,4 +1,16 @@
-import { COMPOSER_ATTACHMENT_PLACEHOLDER, type ComposerDraftPart } from "./composerContent";
+import {
+  COMPOSER_ATTACHMENT_PLACEHOLDER,
+  composerPartsFromProjection,
+  composerPartsToText,
+  type ComposerDraftPart,
+} from "./composerContent";
+import {
+  restoreReplyDraft,
+  serializeReplyDraft,
+  snapshotReplyDraft,
+  type ReplyDraft,
+  type StoredReplyDraft,
+} from "./replyDraft";
 
 /** `[image N]` for image/* MIME types, `[file N]` for anything else. */
 export type TokenKind = "image" | "file";
@@ -93,6 +105,26 @@ export function stripPlaceholders(text: string): string {
   return text.replaceAll(COMPOSER_ATTACHMENT_PLACEHOLDER, "");
 }
 
+/** Legacy cleanup for a draft restored from before the token model: strip
+ *  U+FFFC from the text AND its saved snapshot together. Stripping a field
+ *  empty can change the separators `serializeReplyDraft` picks, so the text
+ *  has to be re-derived from the cleaned snapshot afterwards (see
+ *  `restoreRecordDraft`). */
+export function stripPlaceholdersFromStoredDraft(
+  saved: StoredReplyDraft | undefined,
+): StoredReplyDraft | undefined {
+  if (!saved) return undefined;
+  return {
+    ...saved,
+    quotes: saved.quotes.map((quote) => ({
+      ...quote,
+      before: stripPlaceholders(quote.before),
+      text: stripPlaceholders(quote.text),
+    })),
+    text: stripPlaceholders(saved.text),
+  };
+}
+
 /** Among files sharing a label, the k-th occurrence (document order) belongs
  *  to the k-th such file (`files` order); every file after the first gets a
  *  fresh label and its occurrence, if any, is rewritten. Idempotent. */
@@ -169,6 +201,121 @@ export function tokenInsertion(
   return { insert: `${leading}${tokens} `, replaceStart: selStart, replaceEnd: selEnd };
 }
 
+/** Replace `range` in a live textarea with `insert` (empty `insert` deletes).
+ *  When the browser has `execCommand`, the edit runs through the DOM so the
+ *  textarea's own undo stack keeps working; the caller's change handler sees
+ *  the resulting input event. Otherwise returns the spliced text and caret for
+ *  the caller to commit to state and restore in a layout effect. */
+export function applyFieldEdit(
+  field: HTMLTextAreaElement | null,
+  text: string,
+  range: { start: number; end: number },
+  insert: string,
+): { applied: boolean; text: string; caret: number } {
+  const nextText = text.slice(0, range.start) + insert + text.slice(range.end);
+  const caret = range.start + insert.length;
+  if (
+    field !== null &&
+    field.value === text &&
+    !field.disabled &&
+    typeof document !== "undefined" &&
+    typeof document.execCommand === "function"
+  ) {
+    field.focus({ preventScroll: true });
+    field.setSelectionRange(range.start, range.end);
+    if (document.execCommand(insert ? "insertText" : "delete", false, insert || undefined)) {
+      return { applied: true, text: nextText, caret };
+    }
+  }
+  return { applied: false, text: nextText, caret };
+}
+
+/** Insert already-labelled `files`' tokens into a field at its caret. A field
+ *  the user has never focused has no meaningful caret, so the tokens go at its
+ *  end. `applied` means the DOM edit already happened. */
+export function insertTokenFiles(
+  field: HTMLTextAreaElement | null,
+  text: string,
+  files: readonly File[],
+  useSelection: boolean,
+): { applied: boolean; text: string; caret: number } {
+  const selection =
+    useSelection && field !== null
+      ? { start: field.selectionStart ?? text.length, end: field.selectionEnd ?? text.length }
+      : { start: text.length, end: text.length };
+  const { insert, replaceStart, replaceEnd } = tokenInsertion(
+    text,
+    selection.start,
+    selection.end,
+    files,
+  );
+  return applyFieldEdit(field, text, { start: replaceStart, end: replaceEnd }, insert);
+}
+
+/** The whole-token delete a collapsed Backspace/Delete should perform at
+ *  `caret`, or null when the caret is not at a live token's edge. */
+export function deleteTokenAt(
+  field: HTMLTextAreaElement | null,
+  text: string,
+  caret: number,
+  key: "Backspace" | "Delete",
+  files: readonly File[],
+): { applied: boolean; text: string; caret: number } | null {
+  const range = wholeTokenRange(text, caret, key, files);
+  if (range === null) return null;
+  return applyFieldEdit(field, text, range, "");
+}
+
+/** Focus the authored field holding `token` and put the caret just after it.
+ *  The tail textarea is passed in; quote `before` fields are reached by the
+ *  stable aria-label `ReplyDraftBlocks` gives them. */
+export function focusTokenInComposer(
+  token: string,
+  tail: HTMLTextAreaElement | null,
+  quotes: readonly { before: string }[],
+): boolean {
+  const fields: (HTMLTextAreaElement | null)[] = [tail];
+  if (typeof document !== "undefined") {
+    quotes.forEach((_, index) => {
+      fields.push(
+        document.querySelector<HTMLTextAreaElement>(
+          `[aria-label="Reply text before quote ${index + 1}"]`,
+        ),
+      );
+    });
+  }
+  const field = fields.find((candidate) => candidate?.value.includes(token)) ?? null;
+  if (field === null) return false;
+  const at = field.value.indexOf(token);
+  field.focus({ preventScroll: true });
+  field.setSelectionRange(at + token.length, at + token.length);
+  return true;
+}
+
+/** Rebuild a draft from a sent/queued record: legacy placeholders are
+ *  stripped from the text and its snapshot together, quotes are restored the
+ *  upstream way, then each attachment's token goes back at the offset its
+ *  parts recorded. Records without parts (legacy rows) keep plain text. */
+export function restoreRecordDraft(record: {
+  text: string;
+  files?: readonly File[];
+  composerParts?: readonly ComposerDraftPart[];
+  replyDraft?: StoredReplyDraft;
+}): ReplyDraft {
+  const cleaned = stripPlaceholdersFromStoredDraft(record.replyDraft);
+  // The saved pair was consistent before stripping, so re-derive the text
+  // from the cleaned snapshot: the strip can empty a field and shift
+  // `serializeReplyDraft`'s separators, which would fail its own validation.
+  // A pair that was already inconsistent keeps the old plain-text fallback.
+  const text =
+    record.replyDraft && cleaned && serializeReplyDraft(record.replyDraft) === record.text
+      ? serializeReplyDraft(cleaned)
+      : stripPlaceholders(record.text);
+  const draft = restoreReplyDraft(text, cleaned);
+  const { attachments } = attachmentOffsets(record.composerParts ?? []);
+  return reconcileLabels(placeTokens(draft, serializeReplyDraft, attachments), record.files ?? []);
+}
+
 /** Remove every occurrence of `file`'s token (and the one trailing space an
  *  insertion added, if still there) from every authored field. The file
  *  itself is untouched — the caller drops it from `files` separately. */
@@ -182,6 +329,26 @@ export function removeTokens<D extends DraftShape>(draft: D, file: File): D {
     draft,
     getFields(draft).map((field) => field.replace(re, "")),
   );
+}
+
+/** The authored fields whose text changes when `files[index]`'s token is
+ *  removed, as the new text for each (per-field, so the caller keeps the
+ *  active field and a side-chat draft intact). */
+export function removeFileTokens(
+  draft: ReplyDraft,
+  index: number,
+  files: readonly File[],
+): { fieldId: string | null; text: string }[] {
+  const file = files[index];
+  if (!file) return [];
+  const stripped = removeTokens(draft, file);
+  const edits: { fieldId: string | null; text: string }[] = [];
+  draft.quotes.forEach((quote, i) => {
+    const next = stripped.quotes[i]?.before;
+    if (next !== undefined && next !== quote.before) edits.push({ fieldId: quote.id, text: next });
+  });
+  if (stripped.text !== draft.text) edits.push({ fieldId: null, text: stripped.text });
+  return edits;
 }
 
 /** The live token (plus the one space `tokenInsertion` added) a collapsed
@@ -246,11 +413,19 @@ function spliceAtOffsets(
  *  with one U+FFFC spliced back at each bound token's original position (in
  *  bound order) and one U+FFFC appended at the very end per unreferenced
  *  file — so `stripPlaceholders(projection) === serialize(snapshot)` always,
- *  regardless of how `serialize` (e.g. `joinParagraphs`) picks separators. */
+ *  regardless of how `serialize` (e.g. `joinParagraphs`) picks separators.
+ *  `options.generatedPrefixLength` marks that many leading characters of
+ *  authored field 0 as generated, not authored: token matches starting inside
+ *  them never bind (their offsets still count for the projection). Measured
+ *  on the placeholder-stripped field, the coordinate space the matches use. */
+export interface BindDraftOptions {
+  generatedPrefixLength?: number;
+}
 export function bindDraft<D extends DraftShape>(
   draft: D,
   files: readonly File[],
   serialize: (d: D) => string,
+  options?: BindDraftOptions,
 ): { projection: string; snapshot: D; files: File[]; bound: number } {
   const strippedFields = getFields(draft).map(stripPlaceholders);
   const strippedQuotes = draft.quotes.map((quote, i) => ({
@@ -276,10 +451,15 @@ export function bindDraft<D extends DraftShape>(
   // Local offset (within the field's OWN token-free text) of each bound
   // file's removed token — the position `projection` must re-insert it at.
   const localOffsets = new Map<File, { fieldIndex: number; offset: number }>();
+  const generatedPrefixLength = Math.max(0, options?.generatedPrefixLength ?? 0);
   const snapshotFields = getFields(stripped).map((text, fieldIndex) => {
     let result = "";
     let cursor = 0;
     for (const match of allTokenMatches(text)) {
+      // A generated prefix is not authored text: a lookalike token inside it
+      // must never bind an attachment (F1). Anchored matches end exactly at
+      // the boundary, so checking the start is enough.
+      if (fieldIndex === 0 && match.start < generatedPrefixLength) continue;
       if (!live.has(match.text)) continue;
       const file = fileByLabel.get(match.text);
       if (!file || seen.has(file)) continue;
@@ -310,8 +490,65 @@ export function bindDraft<D extends DraftShape>(
   return { projection, snapshot, files: ordered, bound };
 }
 
-/** Recover text-only offsets and their attachments from restored parts. */
-export function attachmentOffsets(parts: readonly ComposerDraftPart[]): {
+/** One composer send decision. `bound === 0` keeps upstream's call — the
+ *  plain text plus the files as an argument list — so legacy rows and
+ *  attachment-only drafts send exactly as before; otherwise `parts` carries
+ *  each attachment's position and `files` is the bound order. Text, parts and
+ *  replyDraft all derive from the single preamble-prefixed draft: the
+ *  generated `preamble` lands on authored field 0 (`quotes[0].before` when
+ *  quoted, the tail otherwise) BEFORE binding, so e.g. `joinParagraphs`
+ *  picks the same separators for the snapshot and the sent text; the first
+ *  `stripPlaceholders(preamble).length` characters of that field are marked
+ *  generated so a path in the preamble can never bind a token (F1). */
+export function planComposerSend(
+  draft: ReplyDraft,
+  files: readonly File[],
+  preamble: string,
+  trimmedText: string,
+): {
+  sendFiles: File[] | undefined;
+  text: string;
+  parts: ComposerDraftPart[] | undefined;
+  replyDraft: StoredReplyDraft | undefined;
+} {
+  const quoted = draft.quotes.length > 0;
+  const withPreamble: ReplyDraft = quoted
+    ? {
+        ...draft,
+        quotes: draft.quotes.map((quote, index) =>
+          index === 0 ? { ...quote, before: preamble + quote.before } : quote,
+        ),
+      }
+    : { ...draft, text: preamble + trimmedText };
+  const bound = bindDraft(withPreamble, files, quoted ? serializeReplyDraft : (d) => d.text, {
+    // The boundary must be in the same coordinate space as the matches, which
+    // are found in the placeholder-stripped field: a U+FFFC inside the
+    // generated path would otherwise make it one character too long (F1).
+    generatedPrefixLength: stripPlaceholders(preamble).length,
+  });
+  if (bound.bound === 0) {
+    return {
+      sendFiles: files.length > 0 ? [...files] : undefined,
+      text: quoted ? serializeReplyDraft(withPreamble) : preamble + trimmedText,
+      parts: undefined,
+      replyDraft: quoted ? snapshotReplyDraft(withPreamble) : undefined,
+    };
+  }
+  const parts = composerPartsFromProjection(bound.projection, bound.files);
+  return {
+    sendFiles: bound.files,
+    // `stripPlaceholders(projection) === serialize(snapshot)` is bindDraft's
+    // own invariant, so both reproduce the exact text that was sent — and the
+    // stored pair validates, so recalling the message keeps its quotes.
+    text: composerPartsToText(parts),
+    parts,
+    replyDraft: quoted ? snapshotReplyDraft(bound.snapshot) : undefined,
+  };
+}
+
+/** Recover text-only offsets and their attachments from restored parts. */ export function attachmentOffsets(
+  parts: readonly ComposerDraftPart[],
+): {
   text: string;
   attachments: { offset: number; file: File }[];
 } {

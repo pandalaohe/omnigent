@@ -4243,8 +4243,10 @@ describe("NewChatLandingScreen", () => {
     first.unmount();
 
     renderLanding();
+    // The attachment re-inserts its token at the caret, so the restored draft
+    // reads as the typed text followed by the visible token.
     expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
-      "half-typed thought",
+      "half-typed thought [image 1] ",
     );
     // The attachment thumbnail re-renders from the restored draft.
     expect(screen.getByAltText("diagram.png")).toBeTruthy();
