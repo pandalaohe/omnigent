@@ -3014,6 +3014,7 @@ async def test_replayed_terminal_status_rejects_non_native_and_nonterminal_targe
     assert non_native.status_code == 400, non_native.text
     assert nonterminal.status_code == 400, nonterminal.text
 
+
 async def test_skill_slash_command_missing_session_agent_returns_typed_410(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -4825,7 +4826,6 @@ async def test_get_session_agent_name_is_spec_name_after_switch(
     Drives the REAL switch route end-to-end: source session → seeded
     bindable built-in → ``POST .../switch-agent`` → ``GET`` snapshot.
     """
-    from omnigent.server.routes import sessions as sessions_module
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 
     # Source session bound to a session-scoped "nessie" agent.

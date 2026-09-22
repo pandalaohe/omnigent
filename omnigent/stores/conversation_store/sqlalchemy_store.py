@@ -3781,9 +3781,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # prefetch fallback. host_id is a metadata filter, not a permission
         # scope, and the EXISTS does not carry it — those queries keep the
         # prefetch too, or the host filter would silently drop.
-        acl_pushdown = (
-            needs_meta_filter and host_id is None and self._conv_engine is self._engine
-        )
+        acl_pushdown = needs_meta_filter and host_id is None and self._conv_engine is self._engine
 
         qualifying_ids: list[str] | None = None
         workspace_matching_ids: list[str] | None = None

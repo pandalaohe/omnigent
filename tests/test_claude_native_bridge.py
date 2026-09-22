@@ -29,8 +29,8 @@ from urllib.error import URLError
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
-from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native import hook as claude_native_hook
+from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _LOGIN_GUIDANCE,

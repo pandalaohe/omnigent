@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
+from typing import Any, Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
 import click
 import httpx
