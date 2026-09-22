@@ -54,7 +54,7 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 from urllib import request
 
 from omnigent._platform import is_wsl, stable_user_id
@@ -467,8 +467,27 @@ class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
 
 
+class ClaudeTerminalExited(ClaudePromptTimeout):
+    """
+    Claude Code's pane process had already exited when delivery was attempted.
+
+    Subclasses :class:`ClaudePromptTimeout` so existing delivery handlers
+    keep catching it, while callers that care about severity can tell a
+    clean quit (``exit_status`` ``"0"`` — the person closed Claude Code)
+    from a crash.
+    """
+
+    def __init__(self, message: str, *, exit_status: str | None = None) -> None:
+        super().__init__(message)
+        self.exit_status = exit_status
+
+
 class ClaudeInjectionCancelled(RuntimeError):
     """The caller cancelled delivery before the injection worker finished."""
+
+
+class ClaudeUserPromptPending(RuntimeError):
+    """A native question or permission prompt must be answered before injection."""
 
 
 @contextlib.contextmanager
@@ -1463,7 +1482,7 @@ def clear_approval_wait_marker(marker: Path) -> None:
         marker.unlink(missing_ok=True)
 
 
-def approval_wait_is_fresh(session_id: str) -> bool:
+def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -> bool:
     """
     Whether a permission hook is parked on this session's verdict right now.
 
@@ -1472,12 +1491,14 @@ def approval_wait_is_fresh(session_id: str) -> bool:
 
     :param session_id: Omnigent session id to check, e.g.
         ``"conv_abc123"``.
+    :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
     :returns: ``True`` when any marker was touched within
         :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
+    root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
     try:
-        markers = list(_APPROVAL_WAIT_ROOT.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
+        markers = list(root.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
     except OSError:
         return False
     now = time.time()
@@ -2070,6 +2091,11 @@ def build_hook_settings(
     """
     Build invocation-local Claude Code hook settings.
 
+    Besides the hooks, the fragment pre-approves every project ``.mcp.json``
+    server (``enableAllProjectMcpServers``): the "New MCP server found"
+    dialog is another unhookable startup gate that a host-spawned terminal
+    can never answer.
+
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/.venv/bin/python"``. ``None`` uses
@@ -2363,6 +2389,10 @@ def build_hook_settings(
         # the org policy (``disableBypassPermissionsMode``) BEFORE this
         # consent gate, so a managed host still strips bypass regardless.
         settings["skipDangerousModePermissionPrompt"] = True
+    # Project ``.mcp.json`` servers raise a blocking "New MCP server found"
+    # approval dialog in every new directory (each worktree included). It
+    # fires no hook either, so pre-approve them like the other consent gates.
+    settings["enableAllProjectMcpServers"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -2557,7 +2587,9 @@ def augment_claude_args(
             skills_filter=skills_filter,
         )
     )
-    return args
+    from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
+
+    return augment_claude_debug_args(args, bridge_dir)
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
@@ -3935,7 +3967,7 @@ def inject_user_message(
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
-    _restore_occupied_input(info["socket_path"], info["tmux_target"])
+    _restore_occupied_input(info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir)
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
@@ -3943,6 +3975,7 @@ def inject_user_message(
         info["socket_path"],
         info["tmux_target"],
         timeout_s=timeout_s,
+        bridge_dir=bridge_dir,
     )
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
@@ -4023,6 +4056,10 @@ def _paste_and_submit(
     :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
         never leaves the input box after repeated submit Enters.
     """
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Answer the pending Claude question or permission request before sending a message."
+        )
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -4077,6 +4114,10 @@ def _paste_and_submit(
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; message not sent."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if not draft_seen:
         # The draft was never observed, so its absence proves nothing —
@@ -4088,7 +4129,13 @@ def _paste_and_submit(
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
-    if _verify_submit_accepted(socket_path, tmux_target, needle=needle, what="submitted message"):
+    if _verify_submit_accepted(
+        socket_path,
+        tmux_target,
+        needle=needle,
+        what="submitted message",
+        bridge_dir=bridge_dir,
+    ):
         return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
@@ -4102,6 +4149,7 @@ def _verify_submit_accepted(
     *,
     needle: str,
     what: str,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4120,6 +4168,7 @@ def _verify_submit_accepted(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
+    :param bridge_dir: Bridge whose pending questions protect submit retries.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4129,7 +4178,8 @@ def _verify_submit_accepted(
     warned = False
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        pane = _capture_pane(socket_path, tmux_target)
+        if not _draft_in_input_box(pane, needle):
             if warned:
                 _logger.info(
                     "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4148,6 +4198,7 @@ def _verify_submit_accepted(
                 _SUBMIT_VERIFY_TIMEOUT_S,
             )
         if now - last_enter >= retry_interval:
+            _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
@@ -4346,7 +4397,11 @@ def inject_slash_command(
     tmux_target = info["tmux_target"]
     # Same reclaim as inject_user_message: a surface left occupying the
     # composer would swallow the C-u and the typed command.
-    _restore_occupied_input(socket_path, tmux_target)
+    _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Answer the pending Claude question or permission request before changing settings."
+        )
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
@@ -4362,20 +4417,27 @@ def inject_slash_command(
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
+        if _draft_in_input_box(pane, needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; settings command not sent."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
-        # Re-send only while the command verifiably still sits in the box —
-        # a one-poll-stale retry can at worst hit the empty composer (no-op)
-        # or our own confirm dialog (the intended answer), never a foreign
-        # surface. The command leaving the box is the submit signal; the
-        # dialog replacing the composer counts, since submission pops it.
+        # Retry only while the command remains drafted and no user decision
+        # is pending. A dialog replacing the composer counts as submission.
         if not _verify_submit_accepted(
-            socket_path, tmux_target, needle=needle, what="slash command"
+            socket_path,
+            tmux_target,
+            needle=needle,
+            what="slash command",
+            bridge_dir=bridge_dir,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -4383,7 +4445,7 @@ def inject_slash_command(
                 "input box). The command was not delivered."
             )
     if dialog_hint is not None:
-        _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint)
+        _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
 
 
 def _confirm_tui_dialog(
@@ -4392,6 +4454,7 @@ def _confirm_tui_dialog(
     *,
     hint: str,
     timeout_s: float = _CONFIRM_DIALOG_TIMEOUT_S,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Accept the TUI confirmation dialog titled *hint*.
@@ -4405,8 +4468,9 @@ def _confirm_tui_dialog(
 
     On timeout the Enter is still sent, so a dialog whose title drifted in a
     Claude Code release does not sit open forever wedging the pane. It is
-    withheld only when the pane shows a :data:`_FOREIGN_DIALOG_HINTS` surface,
-    where taking the default answer would commit something unasked-for.
+    withheld when a question or permission request is pending, or the pane
+    shows a :data:`_FOREIGN_DIALOG_HINTS` surface, whose default answer would
+    commit something unasked-for.
 
     The same load that renders the dialog late can also swallow the confirm
     Enter outright (the TUI drops keystrokes mid-repaint), so a matched-hint
@@ -4420,14 +4484,18 @@ def _confirm_tui_dialog(
     :param hint: Text the dialog renders, e.g.
         :data:`SWITCH_MODEL_DIALOG_HINT`.
     :param timeout_s: Seconds to watch for the dialog, e.g. ``4.0``.
+    :param bridge_dir: Bridge whose live permission hooks protect confirmation.
     :returns: ``True`` when the dialog was seen and confirmed, ``False`` when
         the watch timed out.
     """
     deadline = time.monotonic() + timeout_s
     while True:
         pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
         if hint in pane:
-            _confirm_and_verify_dialog_closed(socket_path, tmux_target, hint=hint)
+            _confirm_and_verify_dialog_closed(
+                socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
+            )
             return True
         if time.monotonic() >= deadline:
             break
@@ -4441,6 +4509,10 @@ def _confirm_tui_dialog(
             foreign,
         )
         return False
+    if bridge_dir is not None and has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; settings dialog not confirmed."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
 
@@ -4778,7 +4850,9 @@ def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
         pane = _capture_pane(socket_path, tmux_target)
         if hint not in pane:
             return False
-        _confirm_and_verify_dialog_closed(socket_path, tmux_target, hint=hint)
+        _confirm_and_verify_dialog_closed(
+            socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
+        )
     except (RuntimeError, OSError):
         return False
     return True
@@ -4789,6 +4863,7 @@ def _confirm_and_verify_dialog_closed(
     tmux_target: str,
     *,
     hint: str,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Press Enter on the *hint* dialog, re-pressing while it stays on screen.
@@ -4796,17 +4871,21 @@ def _confirm_and_verify_dialog_closed(
     A single Enter is enough in the common case, but under a busy repaint the
     TUI can drop it — leaving the dialog parked, the composer gone, and every
     later delivery failing the readiness gate. Each retry fires only while the
-    dialog is verifiably still up; a one-poll-stale retry can at worst land
-    on the empty composer that replaces it (a no-op), never a foreign
-    surface. A dialog outliving the budget is left on screen; the persisted
+    dialog is verifiably still up and no user decision is pending.
+    A dialog outliving the budget is left on screen; the persisted
     session value remains the authoritative fallback.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param hint: Text the dialog renders, e.g.
         :data:`SWITCH_MODEL_DIALOG_HINT`.
+    :param bridge_dir: Bridge whose pending questions protect confirmation retries.
     :returns: None.
     """
+    if bridge_dir is not None and has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; settings dialog not confirmed."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     last_enter = time.monotonic()
     deadline = last_enter + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
@@ -4817,7 +4896,8 @@ def _confirm_and_verify_dialog_closed(
         # WITHOUT the hint shows the dialog actually closed.
         if pane.strip() and hint not in pane:
             return
-        if time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
+        _raise_if_user_prompt_pending(bridge_dir, pane)
+        if hint in pane and time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
 
@@ -5009,20 +5089,41 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
-def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
+class _ClaudePaneState(NamedTuple):
+    """A liveness answer for the Claude pane, with the exit status when dead."""
+
+    alive: bool | None
+    # ``True`` only when tmux affirmed ``#{pane_dead}``. A rejected query
+    # also ends the wait, but it is not evidence the process exited, so it
+    # must not be reported as one.
+    exited: bool = False
+    exit_status: str | None = None
+
+
+def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     """
     Report whether the Claude pane's process is still running.
 
-    ``keep_alive_after_exit`` retains dead panes, so check ``#{pane_dead}``
-    rather than pane existence. An unanswered probe is inconclusive: a
-    busy tmux server must not prematurely end the slow-boot wait.
+    ``keep_alive_after_exit`` retains dead panes, so read ``#{pane_dead}``
+    rather than pane existence, and ``#{pane_dead_status}`` beside it so a
+    dead pane's exit code comes from the same answer — a second probe at
+    failure time can race the session's teardown and come back empty.
+
+    ``list-panes`` rather than ``display-message``: the latter prints an
+    empty line and still exits 0 for a target it cannot resolve, which is
+    indistinguishable from an answer of "alive". ``list-panes`` fails
+    outright, so a rejected query stays a rejected query.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :returns: ``True`` when tmux affirms the pane's process is alive,
-        ``False`` when tmux affirms it exited or rejects the query, and
-        ``None`` when the probe went unanswered.
+    :returns: A :class:`_ClaudePaneState` whose ``alive`` is ``True`` when
+        tmux affirms the process is running, ``False`` when tmux affirms it
+        exited or rejects the query, and ``None`` when the probe went
+        unanswered or answered without a usable flag — a busy tmux server
+        must not prematurely end the slow-boot wait. ``exited`` is set only
+        for an affirmed ``#{pane_dead}``, with ``exit_status`` carrying the
+        pane's wait-status when tmux reported one.
     """
     import subprocess
 
@@ -5033,11 +5134,11 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
                 "tmux",
                 "-S",
                 socket_path,
-                "display-message",
-                "-p",
+                "list-panes",
                 "-t",
                 tmux_target,
-                "#{pane_dead}",
+                "-F",
+                "#{pane_dead} #{pane_dead_status}",
             ],
             check=False,
             capture_output=True,
@@ -5045,8 +5146,22 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.SubprocessError, OSError):
-        return None
-    return proc.returncode == 0 and proc.stdout.strip() == "0"
+        return _ClaudePaneState(None)
+    if proc.returncode != 0:
+        # The target or the server is gone. That ends the wait, but tmux has
+        # told us nothing about how the process finished.
+        return _ClaudePaneState(False)
+    fields = proc.stdout.split()
+    if not fields:
+        # tmux answered without saying anything about the pane.
+        return _ClaudePaneState(None)
+    if fields[0] == "0":
+        return _ClaudePaneState(True)
+    if fields[0] == "1":
+        return _ClaudePaneState(
+            False, exited=True, exit_status=fields[1] if len(fields) > 1 else None
+        )
+    return _ClaudePaneState(None)
 
 
 def claude_pane_ready(bridge_dir: Path) -> bool:
@@ -5082,7 +5197,63 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     return _claude_prompt_rendered(pane)
 
 
-def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
+def claude_pane_text_ready(pane: str) -> bool:
+    """Recognize input readiness for logging without capturing another pane."""
+    if _MODEL_PICKER_OPEN_HINT in pane:
+        return False
+    if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
+        return False
+    return _claude_prompt_rendered(pane)
+
+
+def _user_prompt_visible(pane: str) -> bool:
+    """Recognize a native decision dialog, excluding text above a mounted composer."""
+    if not pane.strip() or _composer_row(pane) is not None:
+        return False
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    return (
+        "Do you want to " in region
+        or "Yes, and don't ask again" in region
+        or (
+            any(hint in region for hint in ("Enter to select", "Enter to submit"))
+            and "Esc to cancel" in region
+        )
+    )
+
+
+def _has_approval_wait(bridge_dir: Path) -> bool:
+    session_id = read_active_session_id(bridge_dir)
+    return session_id is not None and approval_wait_is_fresh(session_id, bridge_dir=bridge_dir)
+
+
+def _raise_if_user_prompt_pending(bridge_dir: Path | None, pane: str) -> None:
+    """Protect live hook waits even when a captured pane is torn or stale."""
+    if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(pane):
+        raise ClaudeUserPromptPending("Claude is waiting for an explicit answer; input not sent.")
+
+
+def has_pending_user_prompt(bridge_dir: Path) -> bool:
+    """Check live hook waits and terminal-side fallback prompts without sending input.
+
+    :param bridge_dir: The session's native bridge directory.
+    :returns: Whether a question or permission request needs an explicit answer.
+    """
+    if _has_approval_wait(bridge_dir):
+        return True
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    return _user_prompt_visible(_capture_pane(socket_path, target))
+
+
+def _restore_occupied_input(
+    socket_path: str, tmux_target: str, *, bridge_dir: Path | None = None
+) -> None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
 
@@ -5099,6 +5270,9 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
     cancel"), which commits nothing and hands the empty input box back, so
     the web-UI message wins the pane.
 
+    Questions and permission prompts are protected by their hook wait markers
+    and visible decision controls; they require an explicit answer.
+
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. An empty (torn) capture means "unknown" and gets no
@@ -5113,6 +5287,7 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :returns: None.
     """
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
@@ -5120,6 +5295,13 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
     confirmed = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
+        if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
+            pane
+        ):
+            raise ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request "
+                "before sending a message."
+            )
         surface = _occupying_surface(pane)
         if surface is None:
             return
@@ -5418,6 +5600,7 @@ def _wait_for_claude_prompt_ready(
     tmux_target: str,
     *,
     timeout_s: float,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
@@ -5442,7 +5625,11 @@ def _wait_for_claude_prompt_ready(
         unanswered liveness probe extends the wait to
         :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
         query ends the wait at the next liveness check.
+    :param bridge_dir: Protect live permission-hook waits when delivering a message.
     :returns: None.
+    :raises ClaudeTerminalExited: If tmux affirms the pane's process has
+        exited, carrying the pane's wait-status so a clean quit is
+        distinguishable from a crash.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -5464,11 +5651,19 @@ def _wait_for_claude_prompt_ready(
     # which misrepresents why the gate failed. Attaching what was observed
     # while it mattered keeps the error honest.
     last_nonempty = ""
+    exited_status: str | None = None
+    pane_exited = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
         _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
+        if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
+            pane
+        ):
+            raise ClaudeUserPromptPending(
+                "Claude is waiting for an explicit answer; message not sent."
+            )
         polls += 1
         if pane.strip():
             last_nonempty = pane
@@ -5480,7 +5675,10 @@ def _wait_for_claude_prompt_ready(
         if now >= hard_deadline:
             break
         if now >= next_liveness_probe:
-            if _claude_pane_alive(socket_path, tmux_target) is False:
+            state = _claude_pane_state(socket_path, tmux_target)
+            if state.alive is False:
+                pane_exited = state.exited
+                exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -5490,6 +5688,17 @@ def _wait_for_claude_prompt_ready(
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     waited_s = time.monotonic() - started
+    if pane_exited:
+        # A readiness timeout's poll counts describe a box that never mounted,
+        # which reads as a rendering bug. An exited process is a different
+        # failure and its wait-status is what tells a quit from a crash.
+        status = "unknown" if exited_status is None else exited_status
+        raise ClaudeTerminalExited(
+            f"The Claude Code terminal has exited (status {status}), so the "
+            "message was not delivered. Relaunch the terminal to continue "
+            "this conversation." + _format_terminal_failure_tail(last_nonempty),
+            exit_status=exited_status,
+        )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "

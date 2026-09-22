@@ -1960,6 +1960,11 @@ async def test_concurrent_resource_reads_share_one_session_snapshot(
         """
         nonlocal snapshot_count
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+            }
             snapshot_count += 1
             snapshot_started.set()
             await release.wait()

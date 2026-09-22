@@ -9,6 +9,7 @@ import {
   updateProjectConfig,
   createProject,
 } from "@/lib/projectsApi";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
@@ -57,7 +58,7 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
     name: "hello",
     display_name: "Hello",
     description: null,
-    harness: null,
+    harness: "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -91,7 +92,14 @@ function renderDialog(projectId: string | null = "p_1") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <ProjectSettingsDialog open onOpenChange={vi.fn()} projectId={projectId} projectName="Work" />
+      <TooltipProvider>
+        <ProjectSettingsDialog
+          open
+          onOpenChange={vi.fn()}
+          projectId={projectId}
+          projectName="Work"
+        />
+      </TooltipProvider>
     </QueryClientProvider>,
   );
 }

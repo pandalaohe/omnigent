@@ -341,9 +341,16 @@ class NativeInterruptRunner:
         self._client_safe_error_detail = client_safe_error_detail
         self._logger = logger
 
-    async def interrupt(self, harness_name: str | None, conv_id: str) -> Response | None:
+    async def interrupt(
+        self, harness_name: str | None, conv_id: str, *, prompt_pending: bool = False
+    ) -> Response | None:
         """Dispatch an interrupt to the harness's bridge.
 
+        :param harness_name: The session's native harness label.
+        :param conv_id: The session (conversation) id.
+        :param prompt_pending: Whether a live question waiter proves the pane is
+            parked on a user prompt; Claude's stale-Stop idle guard is skipped
+            so the interrupt still reaches the dialog.
         :returns: A response when this harness has an interrupt handler, else
             ``None`` so the caller falls through to the in-process turn cancel
             (antigravity/opencode).
@@ -353,7 +360,7 @@ class NativeInterruptRunner:
             return None
         key = agent.key
         if key == "claude":
-            return await self._claude_interrupt(conv_id)
+            return await self._claude_interrupt(conv_id, prompt_pending=prompt_pending)
         if key == "codex":
             return await self._codex_interrupt(conv_id)
         spec = _UNIFORM_INTERRUPT.get(key)
@@ -497,13 +504,20 @@ class NativeInterruptRunner:
             )
         return Response(status_code=204)
 
-    async def _claude_interrupt(self, conv_id: str) -> Response:
+    async def _claude_interrupt(self, conv_id: str, *, prompt_pending: bool = False) -> Response:
+        """Forward Ctrl+C into Claude's bridge pane unless it is provably idle.
+
+        :param conv_id: The session (conversation) id.
+        :param prompt_pending: A live question waiter proves the pane is parked
+            on a prompt, not the idle composer, so the idle guard is skipped.
+        """
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
             inject_interrupt,
         )
 
-        if not self._session_has_active_work(conv_id):
+        # A question waiter proves the pane is parked on a prompt, not the idle composer.
+        if not prompt_pending and not self._session_has_active_work(conv_id):
             # A delayed Web Stop can arrive after the terminal's authoritative
             # idle edge. Ctrl+C is not a harmless no-op at Claude's composer:
             # two presses exit the interactive CLI. Treat the stale control as
@@ -518,7 +532,7 @@ class NativeInterruptRunner:
             server_client=self._server_client,
             session_id=conv_id,
         )
-        if not self._session_has_active_work(conv_id):
+        if not prompt_pending and not self._session_has_active_work(conv_id):
             # The bridge-id lookup crosses an async boundary. Re-check at the
             # last safe point so a terminal idle edge during that await cannot
             # turn the pending control into Ctrl+C at Claude's idle composer.

@@ -112,9 +112,9 @@ _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE: str = "external_native_subagent_snapshot"
 
 
-# "quiesced": the claude-native sub-agent transcript-quiescence badge — a
-# UI signal only, never a terminal edge (the runner must not deliver a
-# parent-inbox completion from it).
+_SUBAGENT_STATUS_TYPE: str = "subagent.status"
+
+
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
     {
         "idle",
@@ -125,7 +125,6 @@ _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
         "stopped",
         "killed",
         "activity_unverified",
-        "quiesced",
     }
 )
 
@@ -312,6 +311,9 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 
 
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
+
+
+_LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: str = "omnigent.last_task_error_agent_name"
 
 
 # Optional structured failure fields (present when the runner classified the
@@ -564,6 +566,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
+    _SUBAGENT_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MCP_STARTUP_TYPE,
@@ -1163,6 +1166,7 @@ __all__ = [
     "_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
     "_SUBAGENT_STATUS_GENERATION_LABEL_KEY",
+    "_SUBAGENT_STATUS_TYPE",
     "_SUBAGENT_TERMINAL_STATUS_LABEL_KEY",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",

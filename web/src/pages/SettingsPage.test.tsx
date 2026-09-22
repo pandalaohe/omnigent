@@ -4,13 +4,18 @@
 // Archived sessions list (which moved here out of the sidebar).
 
 import type { ReactNode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
+import * as host from "@/lib/host";
+import {
+  readTerminalClipboardPreference,
+  writeTerminalClipboardPreference,
+} from "@/lib/terminalClipboardPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 
 const mocks = vi.hoisted(() => ({
@@ -174,10 +179,12 @@ vi.mock("@/components/ui/select", async () => {
   const Select = ({
     value,
     onValueChange,
+    disabled,
     children,
   }: {
     value: string;
     onValueChange: (v: string) => void;
+    disabled?: boolean;
     children: ReactNode;
   }) => {
     const kids = Children.toArray(children);
@@ -190,6 +197,7 @@ vi.mock("@/components/ui/select", async () => {
       <select
         data-testid={typeof testId === "string" ? testId : undefined}
         value={value}
+        disabled={disabled}
         onChange={(e) => onValueChange(e.target.value)}
       >
         {kids.filter((c) => !(isValidElement(c) && c.type === SelectTrigger))}
@@ -305,6 +313,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   // Reset the font-size preference + applied desktop size so the Appearance
   // tests don't leak state into each other.
   localStorage.clear();
@@ -378,6 +387,89 @@ describe("SettingsPage", () => {
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
   });
+
+  it("asks before terminal copying by default and explains the scope", () => {
+    renderPage("/settings/general");
+    const select = screen.getByTestId("terminal-clipboard-preference-select");
+    expect(select).toHaveValue("ask");
+    expect(screen.getByText("Copying from terminals")).toBeInTheDocument();
+    expect(screen.getByText(/Controls copying text from all sessions/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Allowing copying also lets terminal programs silently replace/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/all sessions and terminals on this server/)).toBeInTheDocument();
+    expect(screen.getByText(/this browser or app/)).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Allow copying" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Block copying" })).toBeInTheDocument();
+  });
+
+  it("persists terminal clipboard choices and can revoke copying", () => {
+    renderPage("/settings/general");
+    const select = screen.getByTestId("terminal-clipboard-preference-select");
+    fireEvent.change(select, { target: { value: "allow" } });
+    expect(select).toHaveValue("allow");
+    expect(readTerminalClipboardPreference()).toBe("allow");
+
+    fireEvent.change(select, { target: { value: "block" } });
+    expect(select).toHaveValue("block");
+    expect(readTerminalClipboardPreference()).toBe("block");
+
+    fireEvent.change(select, { target: { value: "ask" } });
+    expect(select).toHaveValue("ask");
+    expect(readTerminalClipboardPreference()).toBe("ask");
+  });
+
+  it("loads a saved terminal clipboard decision and updates from same-tab changes", () => {
+    writeTerminalClipboardPreference("allow");
+    renderPage("/settings/general");
+    const select = screen.getByTestId("terminal-clipboard-preference-select");
+    expect(select).toHaveValue("allow");
+
+    act(() => {
+      writeTerminalClipboardPreference("ask");
+    });
+    expect(select).toHaveValue("ask");
+  });
+
+  it("updates the terminal clipboard control when another tab changes its decision", () => {
+    renderPage("/settings/general");
+    const key = `omnigent:terminal-clipboard:v1:${JSON.stringify(host.getOmnigentServerIdentity())}`;
+    localStorage.setItem(key, "block");
+    fireEvent(window, new StorageEvent("storage", { key, storageArea: localStorage }));
+    expect(screen.getByTestId("terminal-clipboard-preference-select")).toHaveValue("block");
+  });
+
+  it("disables remembered clipboard preferences when the server identity is unavailable", () => {
+    vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue(null);
+    renderPage("/settings/general");
+
+    expect(screen.getByTestId("terminal-clipboard-preference-select")).toBeDisabled();
+    expect(
+      screen.getByText(
+        "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("does not claim terminal clipboard permission was saved when storage fails", () => {
+    renderPage("/settings/general");
+    const select = screen.getByTestId("terminal-clipboard-preference-select");
+    const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    try {
+      fireEvent.change(select, { target: { value: "allow" } });
+      expect(select).toHaveValue("ask");
+      expect(screen.getByRole("alert")).toHaveTextContent("Your previous setting is unchanged.");
+    } finally {
+      write.mockRestore();
+    }
+
+    fireEvent.change(select, { target: { value: "allow" } });
+    expect(select).toHaveValue("allow");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("renders composer shortcut guidance as two accessible lines", () => {
     renderPage("/settings/general");
     const toggle = screen.getByTestId("composer-submit-with-mod-enter-toggle");
@@ -1279,12 +1371,17 @@ describe("SettingsPage", () => {
     mocks.projectNames = ["Alpha", "Beta"];
     mocks.conversations = [
       conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
-      conv("conv_b", { archived: true, title: "Beta chat", labels: { omni_project: "Beta" } }),
+      conv("conv_b", {
+        archived: true,
+        title: "Beta chat",
+        labels: { omni_project: "Beta" },
+        owner: "bob",
+      }),
       conv("conv_active"),
     ];
     renderPage("/settings/archived");
 
-    // "All projects" (default) lists every archived session.
+    // "All projects" includes shared archives as well as owned ones.
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
     chooseArchiveFilter("Filter archived sessions by project", "Alpha");
     const rows = screen.getAllByTestId("archived-row");

@@ -10,9 +10,10 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,7 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
+from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
@@ -57,6 +59,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
 )
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
+from omnigent.process_logging import harness_stderr_capture_enabled
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     encode_session_event_batch,
@@ -103,11 +106,9 @@ _SUBAGENT_RECOVERY_BATCH_ITEMS = 64
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
 
-# Seconds of transcript inactivity after which a sub-agent's badge goes
-# ``quiesced``. Badge only — a lull says the transcript stopped growing, never
-# that the child finished, so the terminal verdict still comes from the runner.
-# 5s is the shortest window that absorbs a stalled tool call without flicker.
-_SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+# Seconds without transcript activity before reporting an idle observation.
+# This heuristic does not establish that the sub-agent has completed.
+_SUBAGENT_IDLE_THRESHOLD_S = 5.0
 
 # Structured task notifications are the authoritative sub-agent terminal
 # signal. This longer window is only a compatibility fallback for Claude runs
@@ -397,13 +398,14 @@ def _note_forward_success() -> None:
     _forward_health.degraded_logged = False
 
 
-def _note_forward_failure(retry_key: str, exc: httpx.HTTPError) -> None:
+def _note_forward_failure(retry_key: str, exc: Exception, *, session_id: str) -> None:
     """
     Record a forward post failure; escalate once when sync degrades.
 
     :param retry_key: Stable retry key of the failed post, e.g.
         ``"item:source-1"``.
-    :param exc: The latest failed post's HTTP exception.
+    :param exc: The latest failed post's exception.
+    :param session_id: Session targeted by the failed post.
     :returns: None.
     """
     _forward_health.consecutive_failures += 1
@@ -418,6 +420,7 @@ def _note_forward_failure(retry_key: str, exc: httpx.HTTPError) -> None:
             _forward_health.consecutive_failures,
             retry_key,
             extra={
+                "session_id": session_id,
                 "event_name": "claude_forward_sync_degraded",
                 "attributes": {
                     "exception_type": type(exc).__name__,
@@ -594,18 +597,15 @@ class SubagentEntry:
         so a failed later item can leave the cursor behind without
         re-posting earlier accepted items on the next poll.
     :param last_activity_ts: Unix timestamp of the most recent item
-        observed in this sub-agent's transcript. Used by the quiescence
+        observed in this sub-agent's transcript. Used by the inactivity
         heuristic — when ``now - last_activity_ts >
-        _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
-        ``external_session_status: quiesced`` event (a badge-only
-        signal; the server never forwards it to the runner as a
-        terminal edge). ``None`` when no items have been seen yet (so
-        the heuristic doesn't fire before there's anything to be
-        quiescent about).
-    :param last_status: Last status string POSTed for this
-        sub-agent — used to dedupe so we don't spam ``running`` or
-        terminal events on every tick when nothing changed. ``None`` means no
-        status has been posted yet.
+        _SUBAGENT_IDLE_THRESHOLD_S`` we publish an
+        ``subagent.status`` event with ``idle: true``. The server publishes
+        idle but never forwards this observation as a terminal edge.
+        ``None`` means no items have been seen, so the heuristic cannot fire.
+    :param last_status: Last status handled for this sub-agent (``running``,
+        ``idle``, ``activity_unverified`` or a terminal status), used to
+        dedupe per tick. ``None`` means none handled yet.
     :param quiet_terminal_output: Assistant result eligible for the legacy
         long-quiet fallback. A newer call, result, user input, or meta item
         clears it.
@@ -628,8 +628,8 @@ class SubagentEntry:
         next historical item.
     :param recovery_seen_source_ids: Historical item source ids already
         acknowledged within the frozen prefix.
-    :param delivery_error: Durable reason the mirrored transcript is incomplete.
-        Its quiescence edge is ``failed`` instead of ``quiesced``.
+    :param delivery_error: Durable reason the mirrored transcript is
+        incomplete. After inactivity it reports ``failed`` instead of idle.
     :param resume_observed_at: Latest accepted user prompt's record timestamp.
     """
 
@@ -715,6 +715,47 @@ class _SessionEventBatchCapability:
     """Cache whether this server accepts arrays at the session-events route."""
 
     supported: bool | None = None
+
+
+@dataclass
+class _SubagentStatusCapability:
+    """Remember an unsupported idle event for this forwarder's server connection."""
+
+    supported: bool = True
+
+    async def post_idle(self, client: httpx.AsyncClient, *, session_id: str) -> None:
+        """Post an idle observation, or skip it once an old server rejects the type.
+
+        :param client: Omnigent HTTP client.
+        :param session_id: Child session receiving the observation.
+        :raises httpx.HTTPError: For failures other than an unknown event type.
+        """
+        if not self.supported:
+            return
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "subagent.status", "data": {"idle": True}},
+        )
+        if resp.status_code == 400:
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = None
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if (
+                isinstance(error, dict)
+                and error.get("code") == "invalid_input"
+                and isinstance(error.get("message"), str)
+                and error["message"].startswith("Unknown event type: 'subagent.status'.")
+            ):
+                if self.supported:
+                    _logger.info(
+                        "Omnigent server does not accept subagent.status; "
+                        "skipping idle observations until the forwarder restarts"
+                    )
+                self.supported = False
+                return
+        resp.raise_for_status()
 
 
 class _SubagentStateCheckpoint:
@@ -1080,7 +1121,7 @@ class _PostRetryTracker:
         # delivered); reset process-level forward-sync health (#1120).
         _note_forward_success()
 
-    def record_failure(self, key: str, exc: Exception) -> _PostRetryDecision:
+    def record_failure(self, key: str, exc: Exception, *, session_id: str) -> _PostRetryDecision:
         """
         Record one failed post and compute the next retry action.
 
@@ -1091,11 +1132,12 @@ class _PostRetryTracker:
             failure but classify as neither permanent nor not-confirmed
             here — a caller with its own permanence verdict must branch on
             that verdict, not on this decision's ``permanent`` field.
+        :param session_id: Session targeted by the failed post.
         :returns: Retry decision for this failure.
         """
         # Count every failed post (transient or permanent) so a sustained
         # outage escalates once to a degraded-sync signal (#1120).
-        _note_forward_failure(key, exc)
+        _note_forward_failure(key, exc, session_id=session_id)
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()
@@ -1157,6 +1199,59 @@ async def _forward_progress_timeout(
             yield
     finally:
         response_hooks.remove(_response_received)
+
+
+@contextlib.asynccontextmanager
+async def _forward_claude_diagnostics(
+    bridge_dir: Path,
+    session_id: str,
+    poll_interval_s: float,
+) -> AsyncIterator[None]:
+    """Follow diagnostics independently of transcript discovery and HTTP progress."""
+    if not harness_stderr_capture_enabled():
+        yield
+        return
+
+    follower = ClaudeDebugLogFollower(bridge_dir)
+
+    def active_session_id() -> str:
+        try:
+            return read_active_session_id(bridge_dir) or session_id
+        except Exception:  # noqa: BLE001 — invalid bridge metadata must not stop diagnostics
+            return session_id
+
+    stop = asyncio.Event()
+    follower_lock = threading.Lock()
+
+    def run_serialized(operation: Callable[[str], None]) -> None:
+        # Cancelling an await cannot stop its worker thread.
+        with follower_lock:
+            operation(active_session_id())
+
+    async def poll() -> None:
+        try:
+            while not stop.is_set():
+                await asyncio.to_thread(run_serialized, follower.poll)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=poll_interval_s)
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(asyncio.to_thread(run_serialized, follower.close))
+
+    task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
+    try:
+        yield
+    finally:
+        stop.set()
+        # Let an in-flight thread finish before closing its descriptor. A second
+        # caller cancellation may return early, but the shielded task still drains.
+        try:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A separately cancelled collector must not replace the caller's error.
+            if not task.cancelled():
+                raise
 
 
 async def forward_claude_transcript_to_session(
@@ -1225,6 +1320,7 @@ async def forward_claude_transcript_to_session(
     )
     subagent_status_retries = _PostRetryTracker()
     session_event_batch_capability = _SessionEventBatchCapability()
+    subagent_status_capability = _SubagentStatusCapability()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1255,6 +1351,7 @@ async def forward_claude_transcript_to_session(
     from omnigent.cli_auth import open_server_client
 
     async with (
+        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s),
         open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
         open_server_client(
             base_url, headers=headers, auth=auth, timeout=timeout
@@ -1537,6 +1634,7 @@ async def forward_claude_transcript_to_session(
                                         item_retry_tracker=subagent_item_retries,
                                         status_retry_tracker=subagent_status_retries,
                                         batch_capability=session_event_batch_capability,
+                                        status_capability=subagent_status_capability,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
@@ -2397,6 +2495,7 @@ async def _forward_one_subagent(
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability,
+    status_capability: _SubagentStatusCapability,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches.
 
@@ -2414,6 +2513,7 @@ async def _forward_one_subagent(
             had_item=False,
             checkpoint=checkpoint,
             status_retry_tracker=status_retry_tracker,
+            status_capability=status_capability,
         )
         return
     recovered = await _recover_subagent_history(
@@ -2472,7 +2572,18 @@ async def _forward_one_subagent(
                 "child=%s source_id=%s",
                 entry.child_conversation_id,
                 item.source_id,
-                extra={"session_id": parent_session_id},
+                extra={
+                    "session_id": entry.child_conversation_id,
+                    "event_name": "claude_subagent_transcript_dropped",
+                    "attributes": {
+                        "parent_session_id": parent_session_id,
+                        "drop_reason": "oversized_item",
+                        "item_count": 1,
+                        "http_status": 413,
+                        "attempts": 0,
+                        "response_id": item.response_id,
+                    },
+                },
             )
             append_dead_letter(
                 bridge_dir,
@@ -2506,7 +2617,9 @@ async def _forward_one_subagent(
                     batch_capability=batch_capability,
                 )
             except httpx.HTTPError as exc:
-                decision = item_retry_tracker.record_failure(retry_key, exc)
+                decision = item_retry_tracker.record_failure(
+                    retry_key, exc, session_id=entry.child_conversation_id
+                )
                 if not decision.exhausted:
                     _logger.warning(
                         "Failed to forward claude-native sub-agent item batch; "
@@ -2522,7 +2635,11 @@ async def _forward_one_subagent(
                         extra={"session_id": parent_session_id},
                     )
                     break
-                if not decision.permanent and not _is_subagent_delivery_not_confirmed(exc):
+                if (
+                    not decision.permanent
+                    and not _is_subagent_delivery_not_confirmed(exc)
+                    and not _batch_response_never_received(exc)
+                ):
                     _logger.error(
                         "Dropping claude-native sub-agent transcript batch after "
                         "transient delivery retries were exhausted; child=%s items=%s "
@@ -2531,7 +2648,18 @@ async def _forward_one_subagent(
                         len(batch),
                         decision.attempts,
                         _http_status_for_log(exc),
-                        extra={"session_id": parent_session_id},
+                        extra={
+                            "session_id": entry.child_conversation_id,
+                            "event_name": "claude_subagent_transcript_dropped",
+                            "attributes": {
+                                "parent_session_id": parent_session_id,
+                                "drop_reason": "transient_retries_exhausted",
+                                "item_count": len(batch),
+                                "http_status": _http_status_for_log(exc),
+                                "attempts": decision.attempts,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
                     )
                     for pending_item in batch:
                         item = pending_item.item
@@ -2588,7 +2716,9 @@ async def _forward_one_subagent(
                         item=item,
                     )
                 except httpx.HTTPError as item_exc:
-                    item_decision = item_retry_tracker.record_failure(item_retry_key, item_exc)
+                    item_decision = item_retry_tracker.record_failure(
+                        item_retry_key, item_exc, session_id=entry.child_conversation_id
+                    )
                     if not item_decision.exhausted:
                         stop_after_batch = True
                         _logger.warning(
@@ -2604,20 +2734,35 @@ async def _forward_one_subagent(
                             extra={"session_id": parent_session_id},
                         )
                         break
+                    if _is_permanent_http_error(item_exc):
+                        dead_letter_reason = "permanent HTTP failure after retries"
+                        drop_category = "permanent_http_failure"
+                    elif _is_subagent_delivery_not_confirmed(item_exc):
+                        dead_letter_reason = "delivery not confirmed after retries"
+                        drop_category = "delivery_not_confirmed"
+                    else:
+                        dead_letter_reason = "transient HTTP failure after retries"
+                        drop_category = "transient_retries_exhausted"
                     _logger.error(
                         "Dropping claude-native sub-agent transcript item after "
                         "individual delivery retries; child=%s source_id=%s http_status=%s",
                         entry.child_conversation_id,
                         item.source_id,
                         _http_status_for_log(item_exc),
-                        extra={"session_id": parent_session_id},
+                        extra={
+                            "session_id": entry.child_conversation_id,
+                            "event_name": "claude_subagent_transcript_dropped",
+                            "attributes": {
+                                "parent_session_id": parent_session_id,
+                                "drop_reason": drop_category,
+                                "item_count": 1,
+                                "http_status": _http_status_for_log(item_exc),
+                                "attempts": item_decision.attempts,
+                                "exception_type": type(item_exc).__name__,
+                                "response_id": item.response_id,
+                            },
+                        },
                     )
-                    if _is_permanent_http_error(item_exc):
-                        dead_letter_reason = "permanent HTTP failure after retries"
-                    elif _is_subagent_delivery_not_confirmed(item_exc):
-                        dead_letter_reason = "delivery not confirmed after retries"
-                    else:
-                        dead_letter_reason = "transient HTTP failure after retries"
                     append_dead_letter(
                         bridge_dir,
                         session_id=entry.child_conversation_id,
@@ -2689,6 +2834,7 @@ async def _forward_one_subagent(
         delivery_pending=delivery_pending,
         checkpoint=checkpoint,
         status_retry_tracker=status_retry_tracker,
+        status_capability=status_capability,
     )
 
 
@@ -3172,7 +3318,9 @@ async def _recover_subagent_history(
                     recovery_after=entry.recovery_after,
                 )
             except httpx.HTTPError as exc:
-                decision = item_retry_tracker.record_failure(retry_key, exc)
+                decision = item_retry_tracker.record_failure(
+                    retry_key, exc, session_id=entry.child_conversation_id
+                )
                 _logger.warning(
                     "Claude sub-agent history reconciliation held; child=%s "
                     "source_id=%s attempt=%s http_status=%s",
@@ -3232,8 +3380,11 @@ async def _publish_subagent_status(
     delivery_pending: bool = False,
     checkpoint: _SubagentStateCheckpoint,
     status_retry_tracker: _PostRetryTracker,
+    status_capability: _SubagentStatusCapability | None = None,
 ) -> None:
     """Publish structured terminal truth; transport silence is not completion."""
+    if status_capability is None:
+        status_capability = _SubagentStatusCapability()
     if entry.terminal_evidence_pending:
         return
     original_entry = entry
@@ -3262,36 +3413,39 @@ async def _publish_subagent_status(
         # retried under the existing tracker backoff instead of stalling.
         desired_status = "running"
     # An undelivered item means the round is still retrying, so a lull here is
-    # transport backoff rather than the child going quiet. This comment sits
-    # above the branch on purpose: test_forwarder_quiescence_posts_quiesced_not_idle
-    # reads the 400 characters that follow the condition below, so anything
-    # added between it and ``desired_status`` pushes the value out of view.
+    # transport backoff rather than the child going quiet.
     elif (
         not delivery_pending
         and entry.last_activity_ts is not None
-        and time.time() - entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
+        and time.time() - entry.last_activity_ts > _SUBAGENT_IDLE_THRESHOLD_S
     ):
-        # A bare transcript lull is a badge-only "quiesced", never terminal
-        # "idle": the runner delivers idle/failed as authoritative completions,
-        # and a still-running sub-agent mid tool call must not complete.
-        desired_status = "failed" if entry.delivery_error else "quiesced"
+        # A transcript lull is an idle observation, not an authoritative
+        # completion: the child may still be in a long-running tool call.
+        desired_status = "failed" if entry.delivery_error else "idle"
     if desired_status is not None and (
         desired_status != entry.last_status or entry.status_reconcile_pending
     ):
         retry_key = f"subagent_status:{entry.child_conversation_id}"
         if status_retry_tracker.retry_delay_s(retry_key) is None:
             try:
-                await post_external_session_status(
-                    client,
-                    session_id=entry.child_conversation_id,
-                    status=desired_status,
-                    output=desired_output
-                    if desired_status != "failed"
-                    else (desired_output or entry.delivery_error),
-                    replayed=desired_replayed,
-                )
+                if desired_status == "idle":
+                    await status_capability.post_idle(
+                        client, session_id=entry.child_conversation_id
+                    )
+                else:
+                    await post_external_session_status(
+                        client,
+                        session_id=entry.child_conversation_id,
+                        status=desired_status,
+                        output=desired_output
+                        if desired_status != "failed"
+                        else (desired_output or entry.delivery_error),
+                        replayed=desired_replayed,
+                    )
             except httpx.HTTPError as exc:
-                decision = status_retry_tracker.record_failure(retry_key, exc)
+                decision = status_retry_tracker.record_failure(
+                    retry_key, exc, session_id=entry.child_conversation_id
+                )
                 if decision.exhausted:
                     _logger.error(
                         "Dropping claude-native sub-agent status after bounded "
@@ -3306,12 +3460,20 @@ async def _publish_subagent_status(
                     append_dead_letter(
                         bridge_dir,
                         session_id=entry.child_conversation_id,
-                        event_type="external_session_status",
-                        payload={
-                            "status": desired_status,
-                            "output": desired_output,
-                            **({"replayed": True} if desired_replayed else {}),
-                        },
+                        event_type=(
+                            "subagent.status"
+                            if desired_status == "idle"
+                            else "external_session_status"
+                        ),
+                        payload=(
+                            {"idle": True}
+                            if desired_status == "idle"
+                            else {
+                                "status": desired_status,
+                                "output": desired_output,
+                                **({"replayed": True} if desired_replayed else {}),
+                            }
+                        ),
                         reason="terminal status delivery not confirmed after retries",
                         delivered_ambiguous=False,
                         http_status=_http_status_for_log(exc),
@@ -3420,6 +3582,7 @@ async def _forward_available_subagents(
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
+    status_capability: _SubagentStatusCapability | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -3450,12 +3613,16 @@ async def _forward_available_subagents(
         ``status:<child_id>``).
     :param batch_capability: Process-local cache of whether the server accepts
         event arrays. A new cache is created for direct callers that omit it.
+    :param status_capability: Process-local cache of whether the server accepts
+        idle observations. A new cache is created for direct callers that omit it.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
     subagents_dir = _subagents_dir_for_transcript(transcript_path)
     if batch_capability is None:
         batch_capability = _SessionEventBatchCapability()
+    if status_capability is None:
+        status_capability = _SubagentStatusCapability()
 
     # Existing rows from the old schema may lack the correlation id. Recover
     # it before the one-time parent scan; otherwise explicit historical
@@ -3601,7 +3768,9 @@ async def _forward_available_subagents(
                     registration_id=registration_id,
                 )
             except httpx.HTTPError as exc:
-                decision = start_retry_tracker.record_failure(retry_key, exc)
+                decision = start_retry_tracker.record_failure(
+                    retry_key, exc, session_id=immediate_parent_session_id
+                )
                 if decision.exhausted:
                     _logger.error(
                         "Dropping claude-native sub-agent after permanent HTTP failures; "
@@ -3951,6 +4120,7 @@ async def _forward_available_subagents(
                 item_retry_tracker=item_retry_tracker,
                 status_retry_tracker=status_retry_tracker,
                 batch_capability=batch_capability,
+                status_capability=status_capability,
             )
 
     entries = list(updated.subagents.values())
@@ -5215,7 +5385,7 @@ async def _forward_available_status_events(
                 background_tasks=(None if status == "failed" else record.background_tasks),
             )
         except httpx.HTTPError as exc:
-            decision = retry_tracker.record_failure(retry_key, exc)
+            decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
             if decision.exhausted:
                 _logger.error(
                     "Dropping Claude hook status after permanent HTTP failures; "
@@ -5727,7 +5897,7 @@ async def _handle_compact_summary_item_unlocked(
                 summary_id=durable_summary_id,
             )
             return True
-        decision = retry_tracker.record_failure(retry_key, exc)
+        decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
         _logger.warning(
             "Failed to persist compaction boundary (transcript path); "
             "session=%s seq=%s attempt=%s permanent=%s next_retry_s=%.3f http_status=%s",
@@ -5750,7 +5920,7 @@ async def _handle_compact_summary_item_unlocked(
         # defaults to None) — the retry tracker alone can NEVER stop retrying
         # this, so the cursor would still stall forever even though logs go
         # quiet at the 30s backoff ceiling.
-        retry_tracker.record_failure(retry_key, exc)
+        retry_tracker.record_failure(retry_key, exc, session_id=session_id)
         if isinstance(exc, (ValueError, KeyError, IndexError, json.JSONDecodeError)):
             # These arise while reading a STATIC, append-only transcript file
             # or parsing a server response shape — retrying cannot change the
@@ -6049,7 +6219,7 @@ async def _forward_transcript_item_batch(
                 item=item,
             )
         except httpx.HTTPError as exc:
-            decision = retry_tracker.record_failure(retry_key, exc)
+            decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
             if decision.exhausted:
                 _logger.error(
                     "Dropping Claude transcript item after permanent HTTP failures; "
@@ -6273,9 +6443,7 @@ async def _post_forward_side_channel_updates(
                     session_id=session_id,
                     usage=posted_usage if usage_post_needed else None,
                     context_window=resolved_context_window if usage_post_needed else None,
-                    provider_usage_limits=(
-                        provider_usage_limits if usage_post_needed else None
-                    ),
+                    provider_usage_limits=(provider_usage_limits if usage_post_needed else None),
                     token_usage=record_token_usage,
                 )
                 if usage_changed:
@@ -6400,7 +6568,7 @@ async def _post_observed_goal_state_if_needed(
             state=dedupe.observed_goal_state,
         )
     except httpx.HTTPError as exc:
-        decision = retry_tracker.record_failure(retry_key, exc)
+        decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
         _logger.warning(
             "Failed to forward Claude Goal state; session=%s bridge_dir=%s "
             "attempt=%s next_retry_s=%.3f http_status=%s",
@@ -7771,17 +7939,34 @@ def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
     return isinstance(message, str) and "subagent_delivery_not_confirmed" in message
 
 
-def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
+def _http_status_for_log(exc: Exception) -> int | None:
     """
     Extract an HTTP status code from ``exc`` when present.
 
-    :param exc: HTTP exception raised while posting an Omnigent event.
+    :param exc: Exception raised while posting an Omnigent event.
     :returns: Numeric HTTP status code, or ``None`` for transport
         failures that did not receive a response.
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return None
+
+
+def _batch_response_never_received(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` failed before any response reached the client.
+
+    A transport failure (read/connect/write timeout, read error, protocol
+    error) means the server never rendered a verdict on the batch, so the
+    payload is unproven rather than rejected. Splitting the batch is then
+    strictly better than discarding it: a whole-batch read timeout is usually
+    the batch's own size against the flat post timeout, and single items fit
+    where 100 do not.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` when no HTTP response was received.
+    """
+    return not isinstance(exc, httpx.HTTPStatusError)
 
 
 def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:

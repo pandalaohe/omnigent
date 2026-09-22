@@ -400,11 +400,12 @@ export interface Session {
    * render immediately on conversation resume.
    */
   lastTotalTokens?: number | null;
+  /** False when subtree usage was skipped and must be fetched separately. */
+  usageIncluded?: boolean;
   /**
    * Cumulative session spend in USD, server-computed (the cost-budget
-   * total). ``null``/absent when the session is **unpriced** (no turn
-   * priced yet), so the UI renders "—" rather than ``$0.00``. Lets the
-   * cost indicator render immediately on conversation resume.
+   * total). ``null``/absent when usage was skipped or the session is
+   * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
   /**
@@ -424,6 +425,7 @@ export interface Session {
   lastTaskError?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;

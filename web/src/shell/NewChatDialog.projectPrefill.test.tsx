@@ -29,6 +29,7 @@ vi.mock("@/hooks/useSkills", () => ({
 }));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -46,6 +47,7 @@ import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // A `?project=` visit prefills the composer from the project's STORED config
 // (host / working directory / agent / worktree). A field the config leaves
@@ -96,8 +98,13 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystemRoots: () => ({ data: undefined, isLoading: false, error: null }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
-vi.mock("@/hooks/useHostWorktrees", () => ({
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
   useHostWorktrees: vi.fn(),
+  hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
+    queryKey: ["host-worktrees", hostId, repoPath],
+    queryFn: async () => [],
+  }),
 }));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: () => ({ data: [] }),
@@ -140,7 +147,7 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
     name: "hello_world",
     display_name: "Hello World",
     description: null,
-    harness: null,
+    harness: "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -165,7 +172,14 @@ function setRepoIsGit(): void {
     const known = hostId === "host_1" && path === REPO;
     return {
       data: known
-        ? ([{ path: REPO, branch: "main", is_main: true, detached: false }] as HostWorktree[])
+        ? ([
+            {
+              path: REPO,
+              branch: "main",
+              is_main: true,
+              detached: false,
+            },
+          ] as HostWorktree[])
         : ([] as HostWorktree[]),
       isError: false,
     } as ReturnType<typeof useHostWorktrees>;
@@ -196,7 +210,9 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -229,7 +245,9 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -262,7 +280,9 @@ function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: (
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -522,7 +542,9 @@ describe("NewChatLandingScreen project prefill", () => {
       "title",
       RECENT_WORKSPACE,
     );
-    expect(worktree).toBeDisabled();
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument(),
+    );
 
     const body = await submitAndReadBody();
     expect(body.project_id).toBe("proj_alpha");
@@ -683,8 +705,18 @@ describe("NewChatLandingScreen project prefill", () => {
   const MAIN_REPO = "/Users/corey/projects/gamma";
   const LINKED_WORKTREE = "/Users/corey/projects/gamma-worktrees/feature-x";
   const WORKTREE_LIST: HostWorktree[] = [
-    { path: MAIN_REPO, branch: "main", is_main: true, detached: false },
-    { path: LINKED_WORKTREE, branch: "feature/x", is_main: false, detached: false },
+    {
+      path: MAIN_REPO,
+      branch: "main",
+      is_main: true,
+      detached: false,
+    },
+    {
+      path: LINKED_WORKTREE,
+      branch: "feature/x",
+      is_main: false,
+      detached: false,
+    },
   ];
 
   function setWorktreeRepo(): void {
@@ -1097,7 +1129,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     localStorage.removeItem(ALWAYS_WORKTREE_KEY);
     renderLanding();
 
-    await waitFor(() => expect(branchLabel()).toBe("New worktree"));
+    await waitFor(() => expect(branchLabel()).toBe("New"));
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();

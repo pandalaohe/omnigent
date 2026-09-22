@@ -124,6 +124,7 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 vi.mock("@/hooks/useHostWorktrees", () => ({
   useHostWorktrees: () => ({ data: undefined }),
+  useVerifiedGitWorktrees: () => [],
 }));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: () => ({ data: [] }),

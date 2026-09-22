@@ -2431,6 +2431,7 @@ export function AppShell() {
               {serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
+                    viewport="mobile"
                     open
                     conversationId={serverConversationId}
                     path={selectedFilePath}

@@ -193,7 +193,8 @@ import {
   getSessionState,
   type SessionState,
 } from "@/hooks/useSessionState";
-import { useSessionErrors } from "@/hooks/useSessionErrors";
+import { useSessionErrorStates } from "@/hooks/useSessionErrors";
+import type { LatestSessionError } from "@/lib/sessionError";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -704,17 +705,20 @@ function SidebarImpl({
     [selectionMode, exitSelectionMode],
   );
 
-  useSidebarView(activeTab);
-  const archivedQuery = useArchivedSessions(activeTab === "archived");
+  const availableTab = activeTab === "shared" && !sidebarData.sharedAvailable ? "mine" : activeTab;
+  useLayoutEffect(() => {
+    if (availableTab !== activeTab) switchTab(availableTab);
+  }, [activeTab, availableTab, switchTab]);
+
+  useSidebarView(availableTab);
+  const archivedQuery = useArchivedSessions(availableTab === "archived");
   const displayQuery: SidebarListQuery =
-    activeTab === "archived"
+    availableTab === "archived"
       ? archivedQuery
-      : activeTab === "mine"
+      : availableTab === "mine"
         ? sidebarData.mine
-        : activeTab === "shared"
-          ? sidebarData.sharedAvailable
-            ? sidebarData.shared
-            : { ...sidebarData.all, data: undefined, isLoading: false, hasNextPage: false }
+        : availableTab === "shared"
+          ? sidebarData.shared
           : sidebarData.all;
   const inboxCount = sidebarData.inboxCount;
   // Fork feature — the unread set drives the "mark all seen" affordance. A
@@ -1367,31 +1371,37 @@ function SidebarImpl({
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
                 )}
               >
-                <ConversationList
-                  conversationsQuery={displayQuery}
-                  unreadConversations={unreadConversations}
-                  scrollContainerRef={scrollContainerRef}
-                  onRowClick={onNavClick}
-                  searchQuery=""
-                  selectedNewSessionProjectName={selectedNewSessionProjectName}
-                  noProjectNewSessionTargetSelected={noProjectNewSessionTargetSelected}
-                  onSelectProjectNewSessionTarget={selectProjectTarget}
-                  onSelectNoProjectNewSessionTarget={selectNoProjectTarget}
-                  activeTab={activeTab}
-                  onActiveTabChange={switchTab}
-                  multiUser={multiUser}
-                  pinnedConversationIds={pinnedConversationIds}
-                  pinnedConversations={pinnedConversations}
-                  onTogglePinned={togglePinnedConversation}
-                  onEnterSelectionMode={enterSelectionMode}
-                  selectionMode={selectionMode}
-                  selectionScope={selectionScope}
-                  selectedIds={selectedIds}
-                  onToggleSelected={toggleSelected}
-                  onDeselectAll={deselectAll}
-                  onExitSelectionMode={exitSelectionMode}
-                  getVisibleIdsRef={getVisibleIdsRef}
-                />
+                {sidebarData.identityReady ? (
+                  <ConversationList
+                    conversationsQuery={displayQuery}
+                    unreadConversations={unreadConversations}
+                    scrollContainerRef={scrollContainerRef}
+                    onRowClick={onNavClick}
+                    searchQuery=""
+                    selectedNewSessionProjectName={selectedNewSessionProjectName}
+                    noProjectNewSessionTargetSelected={noProjectNewSessionTargetSelected}
+                    onSelectProjectNewSessionTarget={selectProjectTarget}
+                    onSelectNoProjectNewSessionTarget={selectNoProjectTarget}
+                    activeTab={availableTab}
+                    onActiveTabChange={switchTab}
+                    multiUser={multiUser}
+                    pinnedConversationIds={pinnedConversationIds}
+                    pinnedConversations={pinnedConversations}
+                    onTogglePinned={togglePinnedConversation}
+                    onEnterSelectionMode={enterSelectionMode}
+                    selectionMode={selectionMode}
+                    selectionScope={selectionScope}
+                    selectedIds={selectedIds}
+                    onToggleSelected={toggleSelected}
+                    onDeselectAll={deselectAll}
+                    onExitSelectionMode={exitSelectionMode}
+                    getVisibleIdsRef={getVisibleIdsRef}
+                  />
+                ) : (
+                  <p role="status" className="px-2 py-1 text-muted-foreground text-sm">
+                    Loading sessions…
+                  </p>
+                )}
               </nav>
               {/* Mobile: Settings floats over the bottom of the session list, with
           Search floating at the top of the header row — the two icons the
@@ -1531,7 +1541,7 @@ function ProjectFolder({
       frozenSortKeys,
     );
   }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
-  const errors = useSessionErrors(conversations);
+  const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -2875,7 +2885,7 @@ interface ProjectMarkerState {
 
 function projectMarkerState(
   conversations: Conversation[],
-  errors: readonly boolean[],
+  errors: readonly (LatestSessionError | null)[],
   startingConversationId: string | null,
   showGoalSessionMarkers: boolean,
 ): ProjectMarkerState {
@@ -2884,6 +2894,7 @@ function projectMarkerState(
   let backgroundActivityCount = 0;
   let starting = false;
   let error = false;
+  let disconnected = false;
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
     backgroundActivityCount += c.background_activity_count ?? 0;
@@ -2896,6 +2907,8 @@ function projectMarkerState(
       starting = true;
     } else if (state?.kind === "error") {
       error = true;
+    } else if (state?.kind === "disconnected") {
+      disconnected = true;
     } else if (
       !(showGoalSessionMarkers && c.goal_state === "active") &&
       isConversationUnseen(c.id, c.updated_at, getConversationForegroundStatus(c))
@@ -2912,9 +2925,11 @@ function projectMarkerState(
           ? { kind: "starting" }
           : error
             ? { kind: "error" }
-            : unseen
-              ? { kind: "unseen" }
-              : null;
+            : disconnected
+              ? { kind: "disconnected" }
+              : unseen
+                ? { kind: "unseen" }
+                : null;
   return { state, backgroundActivityCount };
 }
 
@@ -4328,8 +4343,8 @@ function ConversationRowImpl({
   // unread signal) via `hasUnseenMessages` below. Failures join approvals
   // ahead of the dot without clearing read state.
   const errorConversations = useMemo(() => [conversation], [conversation]);
-  const [latestMessageIsError] = useSessionErrors(errorConversations);
-  const derivedState = getSessionState(conversation, latestMessageIsError);
+  const [latestError] = useSessionErrorStates(errorConversations);
+  const derivedState = getSessionState(conversation, latestError);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a

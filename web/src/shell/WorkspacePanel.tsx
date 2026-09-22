@@ -1284,6 +1284,7 @@ function WorkspacePanelImpl({
           />
         ) : selectedFilePath !== null ? (
           <FileViewer
+            viewport="desktop"
             frameless
             open
             conversationId={conversationId}

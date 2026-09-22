@@ -91,7 +91,10 @@ def _find_receiver_session(
     """Poll the session list until the coordinator's session for ``task`` shows."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        resp = client.get("/v1/sessions", params={"agent_name": receiver_name, "limit": 100})
+        resp = client.get(
+            "/v1/sessions",
+            params={"agent_name": receiver_name, "limit": 100, "visibility": "all"},
+        )
         resp.raise_for_status()
         for session in resp.json().get("data", []):
             if task_token in str(session.get("title") or ""):

@@ -31,6 +31,7 @@ vi.mock("@/hooks/useSkills", () => ({
   }),
 }));
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
@@ -40,6 +41,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
@@ -50,6 +52,7 @@ import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -149,8 +152,38 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
-vi.mock("@/hooks/useHostWorktrees", () => ({
-  useHostWorktrees: () => ({ data: undefined }),
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
+  useHostWorktrees: (_hostId: string | null, path: string | null) => ({
+    data:
+      path === "/Users/corey/universe/src/foo"
+        ? [
+            {
+              path,
+              branch: "main",
+              is_main: true,
+              detached: false,
+            },
+          ]
+        : path === null
+          ? undefined
+          : [],
+    isPlaceholderData: false,
+  }),
+  hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
+    queryKey: ["host-worktrees", hostId, repoPath],
+    queryFn: async () =>
+      repoPath === "/Users/corey/universe/src/foo"
+        ? [
+            {
+              path: repoPath,
+              branch: "main",
+              is_main: true,
+              detached: false,
+            },
+          ]
+        : [],
+  }),
 }));
 // No other sessions in scope — keep the conflict hooks inert so they don't
 // issue their own /health fetch or surface a warning. The warning is covered
@@ -197,12 +230,20 @@ function host(overrides: Partial<Host> = {}): Host {
 }
 
 function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
+  const name = overrides.name ?? "hello_world";
+  const harnessByName: Record<string, string> = {
+    "antigravity-native-ui": "antigravity-native",
+    "claude-native-ui": "claude-native",
+    "codex-native-ui": "codex-native",
+    "cursor-native-ui": "cursor-native",
+    "opencode-native-ui": "opencode-native",
+  };
   return {
     id: "ag_hello",
-    name: "hello_world",
+    name,
     display_name: "Hello World",
     description: null,
-    harness: null,
+    harness: harnessByName[name] ?? "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -264,7 +305,9 @@ function renderLanding(
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -339,7 +382,6 @@ function openAgentModels(agentId: string): void {
 /** Open a configurable agent's advanced brain-harness settings. */
 function openAgentConfig(agentId: string): void {
   openAgentModels(agentId);
-  fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
 }
 
 function pickPermissionOption(value: string): void {
@@ -359,9 +401,9 @@ function pickSelectOption(triggerTestId: string, label: string): void {
   fireEvent.click(screen.getByText(label));
 }
 
-/** Close the config modal by clicking Save (commits the draft). */
-function saveConfig(): void {
-  fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
+/** Close the inline config after its selection applies immediately. */
+function closeAgentConfig(): void {
+  fireEvent.keyDown(document, { key: "Escape" });
 }
 
 beforeEach(() => {
@@ -525,6 +567,10 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.id).toBeUndefined();
     expect(body.labels).toEqual({
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
 
     // On success the screen routes to the freshly created session.
@@ -816,7 +862,13 @@ describe("NewChatLandingScreen create flow", () => {
     expect(calls[1]?.[0]).toBe("/v1/sessions");
     const form = calls[1]?.[1]?.body as FormData;
     const metadata = JSON.parse(form.get("metadata") as string);
-    expect(metadata.labels).toEqual({ "omnigent:agent-template-id": "ca_kimi" });
+    expect(metadata.labels).toEqual({
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
+      "omnigent:agent-template-id": "ca_kimi",
+    });
   });
 
   it("records the launched workspace under its host without corrupting other recents", async () => {
@@ -1340,6 +1392,10 @@ describe("NewChatLandingScreen create flow", () => {
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "claude-code-native-ui",
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
   });
 
@@ -1368,6 +1424,10 @@ describe("NewChatLandingScreen create flow", () => {
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "antigravity-native-ui",
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
   });
 
@@ -2063,10 +2123,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Polly's config modal and pick the Pi harness, then Save.
+    // Open Polly's inline config and pick the Pi harness.
     openAgentConfig("ag_polly");
     pickSelectOption("new-chat-landing-config-harness", "Pi");
-    saveConfig();
+    closeAgentConfig();
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -2091,12 +2151,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // With no explicit pick the pill shows just the agent name — the spec
-    // default is not suffixed (it lives in the Advanced menu's radios).
+    // With no explicit pick the pill shows the agent and its declared SDK.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
-      "Claude SDK",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Claude SDK");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -2119,14 +2176,13 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick Pi, Save, then change mind back to the spec default (Claude SDK)
-    // and Save again.
+    // Pick Pi, then change mind back to the spec default (Claude SDK).
     openAgentConfig("ag_polly");
     pickSelectOption("new-chat-landing-config-harness", "Pi");
-    saveConfig();
+    closeAgentConfig();
     openAgentConfig("ag_polly");
     pickSelectOption("new-chat-landing-config-harness", "Claude SDK");
-    saveConfig();
+    closeAgentConfig();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -2146,9 +2202,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.queryByTestId("cost-toggle-trigger")).toBeNull();
   });
 
-  it("renders the config modal footer without its own background or top border", async () => {
-    // The Cancel/Save footer should blend into the modal body — no gray tray
-    // band and no divider line above the buttons.
+  it("renders the inline config surface without a gray tray or top border", async () => {
     setAgents([
       agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
     ]);
@@ -2156,12 +2210,10 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     openAgentConfig("ag_polly");
 
-    const footer = screen
-      .getByTestId("new-chat-landing-config-save")
-      .closest("[data-slot=dialog-footer]");
-    expect(footer).not.toBeNull();
-    expect(footer).toHaveClass("bg-transparent", "border-t-0");
-    expect(footer?.className).not.toMatch(/bg-muted/);
+    const configMenu = screen.getAllByRole("menu").at(-1);
+    expect(configMenu).toHaveClass("composer-agent-config-menu");
+    expect(configMenu?.className).not.toMatch(/bg-muted|border-t/);
+    expect(screen.queryByTestId("new-chat-landing-config-save")).toBeNull();
   });
 
   it("omits cost_control_mode_override when Smart Routing is left unpicked", async () => {
