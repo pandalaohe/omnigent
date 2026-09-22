@@ -3380,11 +3380,9 @@ async def _publish_subagent_status(
     delivery_pending: bool = False,
     checkpoint: _SubagentStateCheckpoint,
     status_retry_tracker: _PostRetryTracker,
-    status_capability: _SubagentStatusCapability | None = None,
+    status_capability: _SubagentStatusCapability,
 ) -> None:
     """Publish structured terminal truth; transport silence is not completion."""
-    if status_capability is None:
-        status_capability = _SubagentStatusCapability()
     if entry.terminal_evidence_pending:
         return
     original_entry = entry
