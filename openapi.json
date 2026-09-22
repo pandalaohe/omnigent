@@ -7168,6 +7168,18 @@
             "title": "Labels",
             "type": "object"
           },
+          "last_message_preview": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Single-line excerpt of the session's newest visible message. Present only when the list request passes `include_preview=true`.",
+            "title": "Last Message Preview"
+          },
           "owner": {
             "anyOf": [
               {
@@ -14642,6 +14654,17 @@
               "pattern": "^(all|mine|shared|archived)$",
               "title": "Visibility",
               "type": "string"
+            }
+          },
+          {
+            "description": "When `True` each row also carries `last_message_preview` \u2014 a single-line excerpt of its newest visible message. `False` (default) omits it.",
+            "in": "query",
+            "name": "include_preview",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Preview",
+              "type": "boolean"
             }
           }
         ],
