@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
   DialogContent,
@@ -458,8 +459,9 @@ export function HeaderConversationMenu({
         >
           {isMobile && !projectPickerOpen && (
             <>
-              <DropdownMenuLabel className="truncate px-2.5 pb-1.5 text-foreground">
-                {label}
+              <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
+                <span className="min-w-0 flex-1 truncate">{label}</span>
+                <PresenceAvatars />
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
             </>

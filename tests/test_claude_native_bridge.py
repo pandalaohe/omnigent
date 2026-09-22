@@ -5767,15 +5767,14 @@ def test_tmux_injections_are_serialized_per_bridge(
             self._counter_lock = threading.Lock()
             self._acquire_count = 0
 
-        def __enter__(self) -> ObservedInjectionLock:
+        def acquire(self, *, timeout: float = -1) -> bool:
             with self._counter_lock:
                 self._acquire_count += 1
                 if self._acquire_count == 2:
                     second_lock_acquire_started.set()
-            self._lock.acquire()
-            return self
+            return self._lock.acquire(timeout=timeout)
 
-        def __exit__(self, *_args: object) -> None:
+        def release(self) -> None:
             self._lock.release()
 
     lock_key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
@@ -9872,6 +9871,49 @@ def test_hook_record_stop_counts_only_running_background_tasks() -> None:
     assert record.background_task_count == 3
 
 
+def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
+    """Claude ``local_agent`` tasks belong to the sub-agent tally, not shell tally.
+
+    The SDK task lifecycle uses ``local_bash`` and ``local_agent`` task types,
+    including when Ctrl+B moves a foreground sub-agent into the background.
+    Counting both here would show that child in ``BackgroundTaskIndicator`` and
+    ``SubagentTaskIndicator`` at the same time.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "bash-task",
+                        "type": "local_bash",
+                        "status": "running",
+                        "description": "Watch tests",
+                        "command": "pytest -f",
+                    },
+                    {
+                        "id": "agent-task",
+                        "type": "local_agent",
+                        "status": "running",
+                        "description": "Review the change",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert record.background_task_count == 1
+    assert record.background_tasks == [
+        {
+            "id": "bash-task",
+            "type": "local_bash",
+            "status": "running",
+            "description": "Watch tests",
+            "command": "pytest -f",
+        }
+    ]
+
+
 def test_hook_record_stop_all_background_tasks_terminal_counts_zero() -> None:
     """Every shell finished → count is 0, dropping the indicator."""
     record = _hook_record_from_jsonl_record(
@@ -10845,6 +10887,168 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     )
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
     assert tails[-1] == "Enter"
+
+
+_MCP_APPROVAL_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  New MCP server found in this project: e2e-noop
+  MCP servers may execute code or access system resources. All tool calls
+  require approval. Learn more in the MCP documentation.
+    Use this MCP server
+    Use this and all future MCP servers in this project
+  ❯ Continue without using this MCP server
+  Enter to confirm · Esc to cancel
+"""
+
+_MCP_APPROVAL_CHECKLIST_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  2 new MCP servers found in this project
+  Select any you wish to enable.
+  MCP servers may execute code or access system resources. All tool calls
+  require approval. Learn more in the MCP documentation.
+  ❯ [✔] srv0
+    [✔] srv1
+       Enable selected
+ Space to select · Esc to reject all
+"""
+
+_API_KEY_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  Detected a custom API key in your environment
+  ANTHROPIC_API_KEY: sk-ant-...000000000000000000AA
+  Do you want to use this API key?
+    Yes
+  ❯ No (recommended)
+  Enter to confirm · Esc to cancel
+"""
+
+_TRUST_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+ /private/tmp/ws
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+"""
+
+# The same dialog text scrolled into the transcript above a live input box.
+_DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
+
+
+@pytest.mark.parametrize(
+    ("pane", "headline"),
+    [
+        (_MCP_APPROVAL_DIALOG_PANE, "New MCP server found in this project: e2e-noop"),
+        (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project"),
+        (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment"),
+        (_TRUST_DIALOG_PANE, "Accessing workspace:"),
+    ],
+    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust"],
+)
+def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str) -> None:
+    """
+    Each real startup dialog is recognised by shape and named by its headline.
+
+    All four captures come from Claude Code 2.1.269. None of them is a mounted
+    input box, and each replaces the box with an option list under a
+    "Enter to … · Esc to …" footer, so the headline is what the web error
+    can show the person who has to answer it.
+    """
+    assert claude_native_bridge._terminal_dialog_headline(pane) == headline
+    assert _claude_prompt_rendered(pane) is False
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _READY_PANE,
+        _BOOTING_PANE,
+        _IDLE_PANE,
+        _SHORTCUTS_PANEL_PANE,
+        _SHELL_MODE_PANE,
+        _SETTINGS_PANEL_PANE,
+        _PERMISSION_PROMPT_PANE,
+        _DIALOG_ECHO_ABOVE_COMPOSER_PANE,
+    ],
+    ids=[
+        "ready",
+        "booting",
+        "idle",
+        "shortcuts-panel",
+        "shell-mode",
+        "settings-panel",
+        "permission-prompt",
+        "dialog-echo-above-composer",
+    ],
+)
+def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
+    """
+    Nothing but a footer-bearing dialog without an input box reads as one.
+
+    A live composer wins even with dialog text scrolled above it; a booting
+    pane has no footer; the settings panel's "Esc to clear" is not a confirm
+    footer; and a boxed tool permission prompt has no footer at all, so it
+    stays on its own PermissionRequest path.
+    """
+    assert claude_native_bridge._terminal_dialog_headline(pane) is None
+
+
+def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dialog holding the terminal fails the gate at once, not at the cap.
+
+    Before, the gate sat on the dialog for the 180 s slow-boot cap and raised
+    :class:`ClaudePromptTimeout`, which the executor answers by reaping the
+    pane. The dialog error is a different type on purpose, names the dialog,
+    tells the person what to do, and still carries the pane tail.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: _MCP_APPROVAL_DIALOG_PANE,
+    )
+    started = time.monotonic()
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert time.monotonic() - started < 5.0
+    assert not isinstance(excinfo.value, claude_native_bridge.ClaudePromptTimeout)
+    message = str(excinfo.value)
+    assert "New MCP server found in this project: e2e-noop" in message
+    assert "Open the terminal" in message
+    assert "answer the prompt" in message
+    assert "resend your message" in message
+    assert "Esc to cancel" in message
+
+
+def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One dialog-shaped frame is not enough; the composer on the next poll wins.
+
+    A single capture can misreport during a repaint, so the gate only fails
+    when two consecutive polls agree on the same dialog.
+    """
+    frames = iter([_MCP_APPROVAL_DIALOG_PANE, _READY_PANE])
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: next(frames, _READY_PANE),
+    )
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=30.0,
+    )
 
 
 @pytest.mark.parametrize(

@@ -2234,6 +2234,7 @@ describe("Composer shared visible controls", () => {
     );
 
     const workspace = screen.getByTestId("composer-workspace-controls");
+    const taskIndicators = within(workspace).getByTestId("composer-task-indicators");
     const background = within(workspace).getByTestId("background-task-pill");
     const subagent = within(workspace).getByTestId("subagent-task-pill");
     // The context ring lives in the status line below, not the workspace bar.
@@ -2241,6 +2242,7 @@ describe("Composer shared visible controls", () => {
     expect(
       background.compareDocumentPosition(subagent) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
+    expect(taskIndicators).toHaveClass("gap-0");
     expect(childSessionsArgsSpy).toHaveBeenCalledWith("conv_parent");
 
     fireEvent.click(subagent);

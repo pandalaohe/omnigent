@@ -4172,8 +4172,13 @@ function ComposerImpl(
             {/* The context ring lives in ComposerStatusLine below: the fork's
                 ring honours the usage-context preferences and the
                 auto-compact budget, which this bar's ring does not read. */}
-            <BackgroundTaskIndicator />
-            <SubagentTaskIndicator conversationId={conversationId} />
+            <div
+              data-testid="composer-task-indicators"
+              className="flex items-center gap-0 empty:hidden"
+            >
+              <BackgroundTaskIndicator />
+              <SubagentTaskIndicator conversationId={conversationId} />
+            </div>
           </div>
         </ComposerWorkspaceBar>
       </div>
