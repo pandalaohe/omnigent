@@ -281,6 +281,7 @@ _ASYNC_INBOX_TOOLS = frozenset(
 # continues child sessions. The read-only observability helpers
 # (peek/list/close) dispatch via ``_SESSION_QUERY_TOOLS`` below.
 _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
+_HANDOFF_TOOLS = frozenset({"sys_session_handoff", "sys_handoff_report"})
 _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 # Priority 5f.0a: Session-create write. ``sys_session_create`` spawns a
@@ -479,6 +480,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
+    | _HANDOFF_TOOLS
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
@@ -661,6 +663,12 @@ def build_native_relay_tool_schemas(
             )
             if fallback_schema is not None:
                 function = _string_object_dict(fallback_schema.get("function"))
+                if function is not None:
+                    _append(function)
+            from omnigent.tools.builtins.handoff import SysHandoffReportTool, SysSessionHandoffTool
+
+            for cls in (SysSessionHandoffTool, SysHandoffReportTool):
+                function = _string_object_dict(cls().get_schema().get("function"))
                 if function is not None:
                     _append(function)
 
@@ -923,6 +931,7 @@ _ALL_LOCAL_TOOLS = (
     | _TERMINAL_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
+    | _HANDOFF_TOOLS
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
@@ -3335,6 +3344,185 @@ async def _execute_subagent_tool(
             "message": _subagent_launching_message(sub_agent_name, session_name, child_session_id),
         }
     )
+
+
+async def _execute_handoff_tool(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+) -> str:
+    """Validate a hand-off call and return the server's JSON view."""
+
+    def invalid(message: str) -> str:
+        return json.dumps(
+            {"error": "invalid_handoff_args", "message": message}, separators=(",", ":")
+        )
+
+    if server_client is None or conversation_id is None:
+        return invalid("handoff tools require server_client and conversation_id")
+    if tool_name == "sys_session_handoff":
+        raw_action = args.get("action", "start")
+        if not isinstance(raw_action, str) or raw_action not in ("start", "status", "cancel"):
+            return invalid("'action' must be start, status, or cancel")
+        action = raw_action
+    else:
+        action = "report"
+    allowed = {
+        "start": {
+            "action",
+            "project",
+            "task",
+            "constraints",
+            "expected_outcome",
+            "artifacts",
+            "branch",
+            "existing_branch",
+            "base_branch",
+            "agent",
+            "session",
+            "host",
+            "lifetime_minutes",
+            "allow_onward",
+        },
+        "status": {"action", "handoff_id"},
+        "cancel": {"action", "handoff_id"},
+        "report": {"handoff_id", "status", "summary", "done", "not_done", "artifacts"},
+    }[action]
+    extra = set(args) - allowed
+    if extra:
+        return invalid(f"unexpected argument: {sorted(extra)[0]}")
+    if action == "start":
+        for key, limit in (("project", None), ("task", 8000)):
+            value = args.get(key)
+            if (
+                not isinstance(value, str)
+                or not value
+                or (limit is not None and len(value) > limit)
+            ):
+                return invalid(
+                    f"'{key}' must be a non-empty string"
+                    + (f" of at most {limit} characters" if limit else "")
+                )
+        for key in (
+            "constraints",
+            "expected_outcome",
+            "branch",
+            "base_branch",
+            "agent",
+            "session",
+            "host",
+        ):
+            if key in args and not isinstance(args[key], str):
+                return invalid(f"'{key}' must be a string")
+        for key in ("existing_branch", "allow_onward"):
+            if key in args and not isinstance(args[key], bool):
+                return invalid(f"'{key}' must be a boolean")
+        lifetime = args.get("lifetime_minutes", 1440)
+        if (
+            isinstance(lifetime, bool)
+            or not isinstance(lifetime, int)
+            or not 5 <= lifetime <= 4320
+        ):
+            return invalid("'lifetime_minutes' must be an integer between 5 and 4320")
+    else:
+        hid = args.get("handoff_id")
+        if (action != "status" or hid is not None) and (not isinstance(hid, str) or not hid):
+            return invalid("'handoff_id' must be a non-empty string")
+        if action == "report":
+            if args.get("status") not in ("completed", "incomplete", "failed"):
+                return invalid("'status' must be completed, incomplete, or failed")
+            summary = args.get("summary")
+            if not isinstance(summary, str) or len(summary) > 4000:
+                return invalid("'summary' must be a string of at most 4000 characters")
+    for key in (
+        ("artifacts",)
+        if action == "start"
+        else ("done", "not_done", "artifacts")
+        if action == "report"
+        else ()
+    ):
+        values = args.get(key, [])
+        limit = 20 if action == "start" else 50
+        if (
+            not isinstance(values, list)
+            or len(values) > limit
+            or any(not isinstance(item, str) or len(item) > 500 for item in values)
+        ):
+            return invalid(
+                f"'{key}' must contain at most {limit} strings of at most 500 characters"
+            )
+
+    if action == "start":
+        method, path, body, timeout = (
+            "POST",
+            f"/v1/sessions/{conversation_id}/handoffs",
+            {key: value for key, value in args.items() if key != "action"},
+            90.0,
+        )
+    elif action == "status":
+        method, path, body, timeout = (
+            "GET",
+            f"/v1/handoffs/{args['handoff_id']}"
+            if args.get("handoff_id")
+            else f"/v1/sessions/{conversation_id}/handoffs",
+            None,
+            30.0,
+        )
+    else:
+        method, path, body, timeout = (
+            "POST",
+            f"/v1/handoffs/{args['handoff_id']}/{action}",
+            {key: value for key, value in args.items() if key != "handoff_id"}
+            if action == "report"
+            else None,
+            30.0,
+        )
+    try:
+        if method == "GET":
+            response = await server_client.get(path, timeout=timeout)
+        elif body is None:
+            response = await server_client.post(path, timeout=timeout)
+        else:
+            response = await server_client.post(path, json=body, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        message = f"hand-off request failed: {exc}"
+        if action == "start":
+            message += (
+                "; call sys_session_handoff(action='status') without a handoff_id before retrying"
+            )
+        return json.dumps(
+            {"error": "handoff_request_failed", "message": message}, separators=(",", ":")
+        )
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = None
+    if response.status_code >= 400:
+        detail = (
+            payload.get("detail") or payload.get("message") if isinstance(payload, dict) else None
+        )
+        return json.dumps(
+            {
+                "error": {
+                    401: "handoff_unauthorized",
+                    404: "handoff_not_found",
+                    409: "handoff_conflict",
+                    400: "invalid_handoff_request",
+                    422: "invalid_handoff_request",
+                }.get(response.status_code, "handoff_request_failed"),
+                "status": response.status_code,
+                "message": str(detail or response.text)[:200],
+            },
+            separators=(",", ":"),
+        )
+    if not isinstance(payload, (dict, list)):
+        return json.dumps(
+            {"error": "handoff_request_failed", "message": "hand-off route returned invalid JSON"},
+            separators=(",", ":"),
+        )
+    return json.dumps(payload, separators=(",", ":"))
 
 
 async def _send_peer_message(
@@ -7053,6 +7241,12 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 publish_event=publish_event,
                 session_inbox=session_inbox,
+            )
+        elif tool_name in _HANDOFF_TOOLS:
+            if not _peer_messaging_enabled_for(conversation_id):
+                return json.dumps({"error": f"tool {tool_name!r} is not enabled"})
+            output = await _execute_handoff_tool(
+                tool_name, args, server_client=server_client, conversation_id=conversation_id
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)

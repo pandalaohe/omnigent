@@ -4,6 +4,7 @@ import { parsePeerMessage } from "./peerMessage";
 const SENDER_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
 const REF = "corr-abc123";
 const PEER_ID = "00112233445566778899aabbccddeeff";
+const HANDOFF_ID = "ffeeddccbbaa99887766554433221100";
 
 function envelope(headerLine: string, body = "Can you check the deploy status?"): string {
   const instruction =
@@ -94,5 +95,24 @@ describe("parsePeerMessage", () => {
 
   it("returns null for plain text", () => {
     expect(parsePeerMessage("Hey, can you take a look at this?")).toBeNull();
+  });
+
+  it("recognizes each hand-off header only in a valid peer envelope", () => {
+    const cases = [
+      [`[Hand-off ${HANDOFF_ID} · project "Omnigent" · until 2026-09-24T12:00:00Z]`, { kind: "brief", id: HANDOFF_ID, project: "Omnigent", until: "2026-09-24T12:00:00Z" }],
+      [`[Hand-off result ${HANDOFF_ID} · project "Omnigent" · completed]`, { kind: "result", id: HANDOFF_ID, project: "Omnigent", status: "completed" }],
+      [`[Hand-off ${HANDOFF_ID} · stop requested (expired)] Stop the work, then call sys_handoff_report with what is done and not done.`, { kind: "stop", id: HANDOFF_ID, why: "expired" }],
+    ] as const;
+    for (const [line, expected] of cases) {
+      expect(parsePeerMessage(envelope(header('"Deploy review" (Claude)'), `${line}\nDetails`))?.handoff).toEqual(expected);
+      expect(parsePeerMessage(`${line}\nDetails`)).toBeNull();
+    }
+  });
+
+  it("leaves a malformed hand-off header as an ordinary peer body", () => {
+    const line = `[Hand-off result ${HANDOFF_ID} · project "Omnigent" · pending]`;
+    const parsed = parsePeerMessage(envelope(header('"Deploy review" (Claude)'), line));
+    expect(parsed?.body).toBe(line);
+    expect(parsed?.handoff).toBeUndefined();
   });
 });
