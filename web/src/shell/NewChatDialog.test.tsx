@@ -10492,6 +10492,208 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     ["Polly", "ag_polly"],
   ] as const;
 
+  const sdkCodexModels = {
+    ...SUCCESS_QUERY_STATE,
+    data: [
+      {
+        id: "codex-default",
+        displayName: "Codex default",
+        isDefault: true,
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+      },
+      {
+        id: "codex-light",
+        displayName: "Codex light",
+        supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+      },
+    ],
+  };
+
+  function mockSdkModels(): void {
+    mockModelQueries((harness) =>
+      harness === "codex" ? sdkCodexModels : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+  }
+
+  it("pins the Codex SDK host default row and its advertised Ultra effort", async () => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_codex" }),
+    } as Response);
+    renderLanding();
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Codex");
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex", true, {
+      poll: true,
+    });
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Models");
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("Effort");
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-codex-default"));
+    expect(screen.getByTestId("new-chat-landing-agent-model-codex-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-ultra")).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-ultra"));
+    expect(screen.getByTestId("new-chat-landing-agent-ag_debby")).toHaveTextContent(
+      "Codex default Ultra",
+    );
+    saveConfig();
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Codex default");
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Ultra");
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      harness_override: "codex",
+      model_override: "codex-default",
+      reasoning_effort: "ultra",
+    });
+    expect(readHarnessOptions("codex")).toMatchObject({
+      model: "codex-default",
+      effort: "ultra",
+    });
+  });
+
+  it("keeps a saved Codex SDK model and effort when host model options fail", async () => {
+    mockModelQueries((harness) =>
+      harness === "codex"
+        ? {
+            ...SUCCESS_QUERY_STATE,
+            status: "error",
+            isError: true,
+            isSuccess: false,
+            error: new Error("Host model options unavailable"),
+            data: undefined,
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    localStorage.setItem(LAST_AGENT_KEY, "ag_debby");
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_debby: "codex" }));
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ codex: { model: "codex-default", effort: "ultra" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_failed_catalog" }),
+    } as Response);
+
+    renderLanding();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex", true, {
+      poll: true,
+    });
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      harness_override: "codex",
+      model_override: "codex-default",
+      reasoning_effort: "ultra",
+    });
+    expect(readHarnessOptions("codex")).toMatchObject({
+      model: "codex-default",
+      effort: "ultra",
+    });
+  });
+
+  it("drops a saved Codex SDK model and effort when the host catalog is empty", async () => {
+    mockModelQueries((harness) =>
+      harness === "codex" ? { ...SUCCESS_QUERY_STATE, data: [] } : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    localStorage.setItem(LAST_AGENT_KEY, "ag_debby");
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_debby: "codex" }));
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ codex: { model: "codex-default", effort: "ultra" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_empty_catalog" }),
+    } as Response);
+
+    renderLanding();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex", true, {
+      poll: true,
+    });
+    const { body } = await submitAndReadBody();
+    expect(body.harness_override).toBe("codex");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("keeps Harness default unpinned and drops an unsupported Codex SDK effort", async () => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_default" }),
+    } as Response);
+    renderLanding();
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Codex");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-codex-default"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-ultra"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-codex-light"));
+    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-ultra")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    saveConfig();
+    const { body } = await submitAndReadBody();
+    expect(body.harness_override).toBe("codex");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("uses the Claude SDK ladder and restores each SDK's own picks on switching", async () => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_claude" }),
+    } as Response);
+    renderLanding();
+    openAgentConfig("ag_debby");
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "claude-sdk", true, {
+      poll: true,
+    });
+    expect(screen.getByTestId("new-chat-landing-agent-effort-max")).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-ultra")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-opus"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    pickSelectOption("new-chat-landing-config-harness", "Codex");
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    pickSelectOption("new-chat-landing-config-harness", "Claude SDK");
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-max")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    saveConfig();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      model_override: "opus",
+      reasoning_effort: "max",
+    });
+    expect(body.harness_override).toBeUndefined();
+  });
+
   it("shows the selected SDK in Polly's trigger and session-info tooltip", async () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("ag_polly");
@@ -10509,15 +10711,14 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
   });
 
   it.each(BOTH_BUNDLES)(
-    "%s's config menu is the brain-harness row alone, led by Smart Routing",
+    "%s's config offers SDK model and effort below the Smart Routing choice",
     (_name, agentId) => {
       renderLanding({ smart_routing_enabled: true });
       openAgentConfig(agentId);
       expect(screen.getByTestId("new-chat-landing-config-harness")).toHaveTextContent("Agent SDK");
-      // claude-sdk isn't a routable native harness, so none of the per-harness
-      // knobs (which is where the per-turn routing Model option lives) apply.
-      expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-      expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+      expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+      expect(screen.queryByTestId("new-chat-landing-agent-model-smart-routing")).toBeNull();
       expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
       const harness = screen.getByTestId("new-chat-landing-config-harness");
       expect(harness.textContent).toContain("Claude SDK");
@@ -10648,7 +10849,7 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     draftSmartRouting("ag_debby");
     pickSelectOption("new-chat-landing-config-harness", "Codex");
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain("Codex");
-    // A brain pick never adds rows, so the row set is the same either way.
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
     expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-config-harness")).toHaveTextContent("Agent SDK");
   });
