@@ -299,6 +299,11 @@ def register_hooks_routes(
         # permission card with the gated tool name and distinguish
         # simultaneous prompts from different tools.
         extras: dict[str, Any] = {"tool_name": tool_name}
+        # Only Claude's PermissionRequest contract can end the turn from the
+        # deny itself (``decision.interrupt``); the web offers its abort
+        # control only where this is stamped.
+        if is_claude:
+            extras["interruptible"] = True
         if cwd is not None:
             extras["cwd"] = cwd
         if permission_mode is not None:
@@ -400,6 +405,12 @@ def register_hooks_routes(
 
         behavior = "allow" if result.action == "accept" else "deny"
         decision: dict[str, Any] = {"behavior": behavior}
+        if (
+            is_claude
+            and result.action == "cancel"
+            and (result.meta or {}).get("interrupt") is True
+        ):
+            decision["interrupt"] = True
         # A decline can carry feedback typed into the web card (the
         # ExitPlanMode "Reject with feedback" flow). Claude's
         # PermissionRequest decision contract surfaces it via

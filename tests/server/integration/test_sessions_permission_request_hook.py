@@ -104,6 +104,7 @@ async def _post_approval(
     elicitation_id: str,
     action: str,
     content: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> httpx.Response:
     """
     Resolve a published elicitation through the session event API.
@@ -120,6 +121,8 @@ async def _post_approval(
     data: dict[str, Any] = {"elicitation_id": elicitation_id, "action": action}
     if content is not None:
         data["content"] = content
+    if meta is not None:
+        data["_meta"] = meta
     return await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -203,6 +206,51 @@ async def test_permission_request_hook_allow_round_trip(
             "hookEventName": "PermissionRequest",
             "decision": {"behavior": "allow"},
         }
+    }
+
+
+@pytest.mark.parametrize(
+    ("vendor", "meta", "expected_interrupt"),
+    [
+        ("claude", {"interrupt": True}, True),
+        ("claude", None, False),
+        ("kimi", {"interrupt": True}, False),
+        ("devin", {"interrupt": True}, False),
+    ],
+)
+async def test_permission_request_hook_cancel_interrupt_is_claude_only(
+    client: httpx.AsyncClient,
+    vendor: str,
+    meta: dict[str, Any] | None,
+    expected_interrupt: bool,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        "test-permission-cancel-interrupt",
+        executor={"type": "omnigent", "config": {"harness": f"{vendor}-native"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("AskUserQuestion")
+    if vendor != "claude":
+        payload["_omnigent_elicitation_id"] = f"elicit_{vendor}_" + "0" * 32
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert event["params"].get("interruptible") is (True if vendor == "claude" else None)
+    verdict = await _post_approval(
+        client, session_id, event["elicitation_id"], "cancel", meta=meta
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    decision = response.json()["hookSpecificOutput"]["decision"]
+    assert decision == {
+        "behavior": "deny",
+        **({"interrupt": True} if expected_interrupt else {}),
     }
 
 

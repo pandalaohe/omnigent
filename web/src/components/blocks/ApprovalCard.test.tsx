@@ -783,22 +783,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     });
   });
 
-  it("declines before interrupting when the abort control is used", async () => {
-    // Order is the whole point of this control. The decline resolves the
-    // parked hook wait, so the agent learns the question was refused and the
-    // card flips to a verdict; interrupting first severs that wait with no
-    // answer and leaves the card reading unanswered. The decline spy resolves
-    // on a later microtask so a missing ``await`` shows up as the wrong order
-    // rather than passing by luck.
+  it("submits one interrupting cancel without calling the interrupt API", async () => {
     const original = useChatStore.getState();
-    const calls: string[] = [];
-    const submitSpy = vi.fn(async () => {
-      await Promise.resolve();
-      calls.push("decline");
-    });
-    const stopSpy = vi.fn(async () => {
-      calls.push("interrupt");
-    });
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    const stopSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ submitApproval: submitSpy, stop: stopSpy } as Partial<
       ReturnType<typeof useChatStore.getState>
     >);
@@ -813,52 +801,32 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         requestedSchema={{}}
         status="pending"
         response={null}
+        interruptible={true}
       />,
     );
 
     fireEvent.click(screen.getByTestId("ask-user-question-abort"));
     await vi.waitFor(() => {
-      expect(calls).toEqual(["decline", "interrupt"]);
+      expect(submitSpy).toHaveBeenCalledTimes(1);
     });
-    // "cancel", not "decline": the user is abandoning the turn, not refusing
-    // this one tool. Both map to deny for the hook; the card's pill differs.
-    expect(submitSpy).toHaveBeenCalledWith("elic_abort", "cancel", undefined, undefined, undefined);
+    expect(submitSpy).toHaveBeenCalledWith(
+      "elic_abort",
+      "cancel",
+      undefined,
+      { interrupt: true },
+      undefined,
+    );
+    expect(stopSpy).not.toHaveBeenCalled();
     useChatStore.setState({
       submitApproval: original.submitApproval,
       stop: original.stop,
     } as Partial<ReturnType<typeof useChatStore.getState>>);
   });
 
-  it("interrupts the question's own session, not the chat it is rendered in", async () => {
-    // A sub-agent's question is mirrored into its PARENT's chat, and the
-    // block names the child as its target. The verdict already routes to the
-    // child; interrupting the active conversation would cut the parent's
-    // turn, which nobody asked to stop, and leave the child running.
-    const original = useChatStore.getState();
-    useChatStore.setState({
-      conversationId: "conv_parent",
-      blocks: [
-        {
-          type: "elicitation",
-          ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
-          elicitationId: "elic_child",
-          targetSessionId: "conv_child",
-          message: "Claude wants to call AskUserQuestion",
-          phase: "pre_tool_use",
-          policyName: "claude_native_permission",
-          contentPreview: sampleSinglePreview,
-          requestedSchema: {},
-          status: "pending",
-          response: null,
-        },
-      ],
-      submitApproval: vi.fn().mockResolvedValue(undefined),
-      stop: vi.fn().mockResolvedValue(undefined),
-    } as Partial<ReturnType<typeof useChatStore.getState>>);
-
+  it("omits abort when the card is not interruptible", () => {
     render(
       <ApprovalCard
-        elicitationId="elic_child"
+        elicitationId="elic_not_interruptible"
         message="Claude wants to call AskUserQuestion"
         phase="pre_tool_use"
         policyName="claude_native_permission"
@@ -869,14 +837,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    fireEvent.click(screen.getByTestId("ask-user-question-abort"));
-    await vi.waitFor(() => {
-      expect(useChatStore.getState().stop).toHaveBeenCalledWith("conv_child");
-    });
-    useChatStore.setState({
-      submitApproval: original.submitApproval,
-      stop: original.stop,
-    } as Partial<ReturnType<typeof useChatStore.getState>>);
+    expect(screen.queryByTestId("ask-user-question-abort")).toBeNull();
   });
 
   it("wraps the action row and keeps the abort control's full accessible name", () => {
@@ -895,6 +856,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         requestedSchema={{}}
         status="pending"
         response={null}
+        interruptible={true}
       />,
     );
 
@@ -922,6 +884,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         requestedSchema={{}}
         status="pending"
         response={null}
+        interruptible={true}
         onSubmit={vi.fn()}
       />,
     );
@@ -1599,6 +1562,24 @@ describe("ApprovalCard — cancel verdict", () => {
 
     expect(screen.getByText(/Cancelled/)).toBeDefined();
     expect(screen.queryByText(/Rejected/)).toBeNull();
+  });
+
+  it("renders an interrupting cancel as Interrupted", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_interrupted"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="AskUserQuestion({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "cancel", _meta: { interrupt: true } }}
+      />,
+    );
+
+    expect(screen.getByText("Interrupted")).toBeDefined();
+    expect(screen.queryByText("Cancelled")).toBeNull();
   });
 });
 

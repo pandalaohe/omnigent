@@ -147,6 +147,7 @@ export type RenderItem =
         execPolicyAmendment: string[] | null;
       } | null;
       allowAllEdits?: boolean;
+      interruptible?: boolean;
       allowAutoMode?: boolean;
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
@@ -1635,6 +1636,7 @@ function buildAssistantItems(
         exitPlanMode: b.exitPlanMode,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
+        interruptible: b.interruptible,
         allowAutoMode: b.allowAutoMode,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,

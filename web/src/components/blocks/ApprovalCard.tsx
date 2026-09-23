@@ -156,6 +156,7 @@ interface ApprovalCardProps {
    * mode switch would be a no-op.
    */
   allowAllEdits?: boolean;
+  interruptible?: boolean;
   /**
    * Eligible Claude-native tool prompts: when true, the card offers an
    * "Approve & switch to auto mode" button — accept plus a session-scoped
@@ -201,6 +202,7 @@ export function ApprovalCard({
   exitPlanMode,
   codexCommand,
   allowAllEdits,
+  interruptible,
   allowAutoMode,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
@@ -224,13 +226,12 @@ export function ApprovalCard({
         void store.submitApproval(id, action, content, meta);
       }
     });
-  // Decline the question and cut the turn it blocks. Only available on the
-  // in-chat path: aborting needs the session whose turn is waiting, and the
-  // Inbox renders cards for sessions other than the active one behind its own
-  // submitter — there the control would interrupt whichever conversation the
-  // chat store happens to be showing, so it is not offered.
+  // Abort the question and the turn it blocks. Offered only where the
+  // producer stamped ``interruptible`` (its cancel verdict stops the turn with
+  // no further model request) and only on the in-chat path: the Inbox renders
+  // cards for other sessions behind its own submitter.
   const abortTurn =
-    onSubmit === undefined
+    onSubmit === undefined && interruptible
       ? () => {
           void useChatStore
             .getState()
@@ -522,9 +523,8 @@ export function ApprovalCard({
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
       label = "Resolved elsewhere";
     } else if (response.action === "cancel") {
-      // Dismissed without deciding — neither approved nor rejected.
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
-      label = "Cancelled";
+      label = response["_meta"]?.interrupt === true ? "Interrupted" : "Cancelled";
     } else if (submittedAnswers !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Submitted";
@@ -768,6 +768,7 @@ export function ElicitationCard({
       exitPlanMode={item.exitPlanMode}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
+      interruptible={item.interruptible}
       allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
