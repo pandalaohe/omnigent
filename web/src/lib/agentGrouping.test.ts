@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import {
   isAcpHarnessAgent,
+  isSdkAgent,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
@@ -92,5 +93,21 @@ describe("isAcpHarnessAgent", () => {
     expect(isAcpHarnessAgent({ harness: "claude-native" })).toBe(false); // native harness
     expect(isAcpHarnessAgent({ harness: null })).toBe(false);
     expect(isAcpHarnessAgent(null)).toBe(false);
+  });
+});
+
+describe("isSdkAgent", () => {
+  it("recognizes only standalone SDK product rows with their expected harness", () => {
+    const rows = [
+      agent({ name: "codex-sdk", harness: "codex" }),
+      agent({ name: "claude-sdk", harness: "claude-sdk" }),
+      agent({ name: "polly", harness: "claude-sdk" }),
+      agent({ name: "debby", harness: "claude-sdk" }),
+      agent({ id: "ca_custom", name: "custom", harness: "claude-sdk" }),
+      agent({ name: "claude-native-ui", harness: "claude-native" }),
+      agent({ name: "grok", harness: "grok", acpHarness: true }),
+      agent({ name: "codex-sdk", harness: "claude-sdk" }),
+    ];
+    expect(rows.filter(isSdkAgent).map((row) => row.name)).toEqual(["codex-sdk", "claude-sdk"]);
   });
 });
