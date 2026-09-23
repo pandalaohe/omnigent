@@ -17,6 +17,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes.sessions.routes_handoff import register_handoff_routes
 from omnigent.server.routes.sessions.routes_peer import register_peer_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -67,6 +68,7 @@ def handoff_env(db_uri: str) -> dict[str, Any]:
         get_host=lambda hid: host if hid == host.host_id else None,
     )
     host_registry = SimpleNamespace(get=lambda hid: None)
+    offline_ids: set[str] = set()
     app = FastAPI()
     app.state.peer_message_store = peers
     app.state.host_store = host_store
@@ -96,7 +98,9 @@ def handoff_env(db_uri: str) -> dict[str, Any]:
         conversation_store=conversations,
         permission_store=permissions,
         auth_provider=UnifiedAuthProvider(source="header"),
-        liveness_lookup=None,
+        liveness_lookup=lambda ids: {
+            sid: SessionLiveness(False, False) for sid in ids if sid in offline_ids
+        },
         runner_tunnel_tokens=None,
         feature_flags=flags,
         peer_message_store=peers,
@@ -140,6 +144,7 @@ def handoff_env(db_uri: str) -> dict[str, Any]:
         "host_store": host_store,
         "host_registry": host_registry,
         "event_state": event_state,
+        "offline_ids": offline_ids,
         "conversations": conversations,
         "permissions": permissions,
     }
@@ -258,6 +263,119 @@ async def test_report_once_and_result_reaches_sender(handoff_env: dict[str, Any]
         record = env["handoffs"].get(hid)
         assert record is not None and record.result_peer_id is not None
         assert env["peers"].get(record.result_peer_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_offline_result_is_deferred_for_24_hours(handoff_env: dict[str, Any]) -> None:
+    from omnigent.db.utils import now_epoch
+
+    env = handoff_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        start = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json={"project": "Target", "task": "Review code"},
+            headers=_headers(env["sender_token"]),
+        )
+        hid = start.json()["handoff_id"]
+        env["offline_ids"].add(env["sender"].id)
+        result = await client.post(
+            f"/v1/handoffs/{hid}/report",
+            json={"status": "completed", "summary": "Done"},
+            headers=_headers(env["receiver_token"]),
+        )
+    assert result.status_code == 200, result.text
+    record = env["handoffs"].get(hid)
+    assert record is not None and record.result_state == "sent"
+    peer = env["peers"].get(record.result_peer_id)
+    assert peer is not None and peer.state == "pending"
+    assert peer.expires_at >= now_epoch() + 86390
+
+
+@pytest.mark.asyncio
+async def test_closed_receiver_records_failed_stop(handoff_env: dict[str, Any]) -> None:
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+
+    env = handoff_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        start = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json={"project": "Target", "task": "Review code"},
+            headers=_headers(env["sender_token"]),
+        )
+        hid = start.json()["handoff_id"]
+        env["conversations"].set_labels(env["receiver"].id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+        stopped = await client.post(
+            f"/v1/handoffs/{hid}/cancel", headers=_headers(env["sender_token"])
+        )
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json()["stop_state"] == "failed"
+    assert env["handoffs"].get(hid).stop_state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_oversize_result_rejected_before_report_commit(handoff_env: dict[str, Any]) -> None:
+    env = handoff_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        start = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json={"project": "Target", "task": "Review code"},
+            headers=_headers(env["sender_token"]),
+        )
+        hid = start.json()["handoff_id"]
+        oversized = await client.post(
+            f"/v1/handoffs/{hid}/report",
+            json={"status": "completed", "summary": "Done", "done": ["x" * 500] * 32},
+            headers=_headers(env["receiver_token"]),
+        )
+        unchanged = env["handoffs"].get(hid)
+        retry = await client.post(
+            f"/v1/handoffs/{hid}/report",
+            json={"status": "completed", "summary": "Short result"},
+            headers=_headers(env["receiver_token"]),
+        )
+    assert oversized.status_code == 400, oversized.text
+    assert oversized.json()["error"]["code"] == "invalid_input"
+    assert "16000" in oversized.json()["error"]["message"]
+    assert unchanged is not None and unchanged.state == "delivered"
+    assert unchanged.reported_at is None and unchanged.result_peer_id is None
+    assert retry.status_code == 200 and retry.json()["result_state"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_completed_back_notice_omits_empty_reason(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = handoff_env
+    notices: list[str] = []
+
+    async def notice(_session_id: str, line: str) -> None:
+        notices.append(line)
+
+    monkeypatch.setattr(env["app"].state.peer_sweeper, "notify_line", notice)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        start = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json={"project": "Target", "task": "Review code"},
+            headers=_headers(env["sender_token"]),
+        )
+        hid = start.json()["handoff_id"]
+        report = await client.post(
+            f"/v1/handoffs/{hid}/report",
+            json={"status": "completed", "summary": "Done"},
+            headers=_headers(env["receiver_token"]),
+        )
+    assert report.status_code == 200
+    assert notices[-1] == (
+        f'[System: hand-off {hid} to session {env["receiver"].id} "receiver" completed]'
+    )
 
 
 @pytest.mark.asyncio
@@ -411,10 +529,20 @@ async def test_start_resolution_reasons(
 async def test_create_derived_session_once_and_advance_is_idempotent(
     handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from omnigent.db.utils import now_epoch
+
     env = handoff_env
     from omnigent.server.routes.sessions import routes_handoff
 
     calls: list[str] = []
+    lease_seconds: list[int] = []
+    real_create = env["handoffs"].create
+
+    def capture_lease(record: Any) -> Any:
+        lease_seconds.append(record.lease_until - now_epoch())
+        return real_create(record)
+
+    monkeypatch.setattr(env["handoffs"], "create", capture_lease)
 
     async def create_session(*_args: Any, conversation_id: str, **_kwargs: Any) -> Any:
         calls.append(conversation_id)
@@ -444,6 +572,7 @@ async def test_create_derived_session_once_and_advance_is_idempotent(
     record = env["handoffs"].get(hid)
     assert record is not None
     assert calls == [record.receiver_session_id]
+    assert len(lease_seconds) == 1 and 290 <= lease_seconds[0] <= 300
     assert (
         env["conversations"]
         .get_conversation(record.receiver_session_id)
@@ -481,7 +610,7 @@ async def test_sweeper_advances_crashed_creating_record(
         expires_at=now + 3600,
         host_id="1" * 32,
         root="/repo",
-        lease_until=None,
+        lease_until=now - 1,
         git_plan={
             "agent_id": env["agent_id"],
             "project_name": "Target",
@@ -515,6 +644,31 @@ async def test_sweeper_advances_crashed_creating_record(
     updated = env["handoffs"].get(hid)
     assert updated is not None and updated.state == "delivered"
     assert env["peers"].get(updated.brief_peer_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_expired_creating_git_lease_fails_as_interrupted(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.db.utils import now_epoch
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    record = _record(env, state="creating", branch="review-branch")
+    record.create_session = True
+    record.receiver_session_id = routes_handoff.derived_handoff_session_id(record.id)
+    record.lease_until = now_epoch() - 1
+    record.git_plan["git"] = {"branch_name": "review-branch", "base_branch": "main"}
+    env["handoffs"].create(record)
+
+    async def must_not_create(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("interrupted worktree creation must not run twice")
+
+    monkeypatch.setattr(routes_handoff, "_create_session_from_existing_agent", must_not_create)
+    await _run_pass(env)
+    updated = env["handoffs"].get(record.id)
+    assert updated is not None and updated.state == "failed"
+    assert updated.reason.startswith("create_interrupted:")
 
 
 @pytest.mark.asyncio
@@ -593,7 +747,7 @@ async def test_receiver_revocation_requests_stop(handoff_env: dict[str, Any]) ->
     assert updated is not None
     assert updated.state == "cancel_requested"
     assert updated.reason == "revoked"
-    assert updated.stop_state == "sent"
+    assert updated.stop_state == "failed"
 
 
 @pytest.mark.asyncio
@@ -763,6 +917,108 @@ async def test_sweeper_sends_open_brief_once(handoff_env: dict[str, Any]) -> Non
     await _run_pass(env)
     assert env["peers"].get(record.brief_peer_id) is not None
     assert env["peers"].count_for_ref(record.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_brief_exception_after_s1_delivery_still_delivers(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = handoff_env
+    record = _record(env, receiver_id=env["receiver"].id)
+    env["handoffs"].create(record)
+
+    def reply_lookup_fails(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("reply lookup failed after delivery")
+
+    monkeypatch.setattr(env["peers"], "list_for_session", reply_lookup_fails)
+    await _run_pass(env)
+    updated = env["handoffs"].get(record.id)
+    brief = env["peers"].get(record.brief_peer_id)
+    assert brief is not None and brief.state == "delivered"
+    assert updated is not None and updated.state == "delivered"
+    assert env["peers"].count_for_ref(record.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_handoff_brief_requires_strict_init_only_for_brief(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.db.utils import now_epoch
+    from omnigent.entities import SessionPeerMessage
+
+    env = handoff_env
+    handoff = _record(env, receiver_id=env["receiver"].id)
+    env["handoffs"].create(handoff)
+    now = now_epoch()
+    records = [
+        SessionPeerMessage(
+            id=peer_id,
+            sender_session_id=env["sender"].id,
+            receiver_session_id=env["receiver"].id,
+            ref=handoff.id,
+            text="brief" if peer_id == handoff.brief_peer_id else "other message",
+            state="pending",
+            correlation_id=handoff.id,
+            created_at=now,
+            expires_at=now + 3600,
+        )
+        for peer_id in (handoff.brief_peer_id, uuid.uuid4().hex)
+    ]
+    sweeper = env["app"].state.peer_sweeper
+    sweeper._app = env["app"]
+    strict_flags: list[bool] = []
+
+    async def deliver(*_args: Any, **kwargs: Any) -> tuple[str, None]:
+        strict_flags.append(kwargs.get("require_init_success", False))
+        return "delivered", None
+
+    monkeypatch.setattr(sweeper, "_deliver", deliver)
+    for peer_record in records:
+        env["peers"].create(peer_record)
+        await sweeper._process_due(peer_record, now)
+    assert strict_flags == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_deferred_s1_text_ref_delivers_without_strict_init(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.db.utils import now_epoch
+
+    env = handoff_env
+    env["offline_ids"].add(env["receiver"].id)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        sent = await client.post(
+            f"/v1/sessions/{env['receiver'].id}/peer-messages",
+            json={
+                "sender_session_id": env["sender"].id,
+                "text": "ordinary message",
+                "correlation_id": "scc-a5-5bec34",
+                "wait_seconds": 60,
+            },
+            headers=_headers(env["sender_token"]),
+        )
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["disposition"] == "pending"
+    peer_id = sent.json()["peer_id"]
+    env["offline_ids"].remove(env["receiver"].id)
+    sweeper = env["app"].state.peer_sweeper
+    sweeper._app = env["app"]
+    delivery_kwargs: list[dict[str, Any]] = []
+
+    async def deliver(*_args: Any, **kwargs: Any) -> tuple[str, None]:
+        delivery_kwargs.append(kwargs)
+        return "delivered", None
+
+    monkeypatch.setattr(sweeper, "_deliver", deliver)
+    record = env["peers"].get(peer_id)
+    assert record is not None and record.ref == "scc-a5-5bec34"
+    await sweeper._process_due(record, now_epoch())
+    assert env["peers"].get(peer_id).state == "delivered"
+    assert len(delivery_kwargs) == 1
+    assert "require_init_success" not in delivery_kwargs[0]
 
 
 @pytest.mark.asyncio
@@ -979,6 +1235,46 @@ async def test_fresh_branch_create_passes_git_plan(
     assert captured[0].git.base_branch == "main"
     assert captured[0].workspace == "/repo"
     assert captured[0].project_id == env["project"].id
+    record = env["handoffs"].get(response.json()["handoff_id"])
+    assert record is not None
+    assert "Workspace: /repo-worktrees/review-branch · branch review-branch" in record.brief
+    assert record.brief in env["peers"].get(record.brief_peer_id).text
+
+
+@pytest.mark.asyncio
+async def test_create_existing_branch_conflict_returns_needs_input(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    monkeypatch.setattr(env["host_registry"], "get", lambda _hid: SimpleNamespace())
+
+    async def worktrees(**_kwargs: Any) -> list[dict[str, Any]]:
+        return [{"branch": "main", "path": "/repo"}]
+
+    async def branch_conflict(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("branch 'review-branch' already exists")
+
+    monkeypatch.setattr(routes_handoff, "list_worktrees_on_host", worktrees)
+    monkeypatch.setattr(routes_handoff, "_create_session_from_existing_agent", branch_conflict)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        start = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json={
+                "project": "Target",
+                "task": "Review code",
+                "branch": "review-branch",
+                "base_branch": "main",
+            },
+            headers=_headers(env["sender_token"]),
+        )
+    assert start.status_code == 200, start.text
+    assert start.json()["disposition"] == "needs_input"
+    assert start.json()["reason"] == "branch_exists"
+    assert env["handoffs"].get(start.json()["handoff_id"]).state == "failed"
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -51,6 +52,7 @@ from omnigent.server.routes._sessions.orchestration import _create_session_from_
 from omnigent.server.routes.sessions.routes_peer import (
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
+    PEER_QUEUE_LIFETIME,
     PeerRoutes,
     _runner_authorized_for_sender,
     effective_owner_id,
@@ -63,6 +65,7 @@ _logger = logging.getLogger(__name__)
 _OWNER_LOCKS: dict[str, asyncio.Lock] = {}
 _UNFINISHED = ("creating", "open", "delivered", "cancel_requested")
 _REPORTABLE = (*_UNFINISHED, "expired")
+_HANDOFF_LEASE_S = 300
 
 
 class HandoffStartRequest(BaseModel):
@@ -301,7 +304,8 @@ def register_handoff_routes(
             else (record.git_plan or {}).get("title")
         )
         title = (title or record.receiver_session_id).replace('"', "'")
-        line = f'[System: hand-off {record.id} to session {record.receiver_session_id} "{title}" {record.state} ({record.reason or ""})]'
+        suffix = f" ({record.reason})" if record.reason else ""
+        line = f'[System: hand-off {record.id} to session {record.receiver_session_id} "{title}" {record.state}{suffix}]'
         try:
             await sweeper.notify_line(record.sender_session_id, line)
         except Exception:
@@ -334,6 +338,14 @@ def register_handoff_routes(
 
             app = getattr(sweeper, "_app", None) or SimpleNamespace(state=app_state)
             request = PeerSweeper._synthetic_request(receiver_id, app)
+        options: dict[str, Any] = {
+            "deferred_until": record.expires_at
+            if kind == "brief"
+            else now_epoch() + PEER_QUEUE_LIFETIME,
+            "require_init_success": kind == "brief",
+        }
+        if kind == "brief":
+            options["acting_user_id"] = record.owner_user_id
         response = await peer.send(
             sender=sender,
             receiver_id=receiver_id,
@@ -342,15 +354,7 @@ def register_handoff_routes(
             peer_id=peer_id,
             system=True,
             request=request,
-            **(
-                {
-                    "deferred_until": record.expires_at,
-                    "require_init_success": True,
-                    "acting_user_id": record.owner_user_id,
-                }
-                if kind == "brief"
-                else {}
-            ),
+            **options,
         )
         state = (
             response.get("state")
@@ -368,7 +372,9 @@ def register_handoff_routes(
         request: Request | None = None,
         back_notice: bool = False,
     ) -> SessionHandoff:
-        if not holds_lease and not await asyncio.to_thread(store.claim, hid, now_epoch(), 120):
+        if not holds_lease and not await asyncio.to_thread(
+            store.claim, hid, now_epoch(), _HANDOFF_LEASE_S
+        ):
             return await get_record(hid)
         try:
             for _ in range(30):
@@ -516,7 +522,18 @@ def register_handoff_routes(
                             "omnigent.handoff.from": record.sender_session_id,
                         },
                     )
-                    if await transition(record, "open", None) and back_notice:
+                    receiver = await asyncio.to_thread(
+                        conversation_store.get_conversation, record.receiver_session_id
+                    )
+                    plan = record.git_plan or {}
+                    brief = format_handoff_brief(
+                        record,
+                        plan.get("project_name", record.project_id),
+                        receiver.workspace,
+                        receiver.git_branch,
+                        (record.disclosure or {}).get("dirty_paths"),
+                    )
+                    if await transition(record, "open", None, brief=brief) and back_notice:
                         await notice(await get_record(hid))
                     continue
                 if record.state == "open":
@@ -531,8 +548,13 @@ def register_handoff_routes(
                             request=request,
                         )
                     except Exception as exc:
-                        state = "failed"
-                        reason = str(exc)
+                        brief = (
+                            await asyncio.to_thread(peer_store.get, record.brief_peer_id)
+                            if peer_store
+                            else None
+                        )
+                        state = brief.state if brief else "failed"
+                        reason = brief.reason if brief else str(exc)
                     else:
                         brief = (
                             await asyncio.to_thread(peer_store.get, record.brief_peer_id)
@@ -573,7 +595,7 @@ def register_handoff_routes(
                         record.id,
                         (record.state,),
                         result_state="failed"
-                        if state in ("failed", "refused", "refused_by_user", "expired")
+                        if state in ("failed", "rejected", "refused", "refused_by_user", "expired")
                         else "sent",
                     )
                     continue
@@ -586,7 +608,7 @@ def register_handoff_routes(
                         else "cancelled"
                     )
                     try:
-                        await send_state(
+                        state, _ = await send_state(
                             record,
                             kind="stop",
                             sender_id=record.sender_session_id,
@@ -601,7 +623,12 @@ def register_handoff_routes(
                         )
                         break
                     await asyncio.to_thread(
-                        store.set_fields, record.id, (record.state,), stop_state="sent"
+                        store.set_fields,
+                        record.id,
+                        (record.state,),
+                        stop_state="failed"
+                        if state in ("failed", "rejected", "refused", "refused_by_user", "expired")
+                        else "sent",
                     )
                     continue
                 break
@@ -619,11 +646,12 @@ def register_handoff_routes(
                     and record.lease_until is not None
                     and record.lease_until < now
                 )
-                if not await asyncio.to_thread(store.claim, record.id, now, 120):
+                if not await asyncio.to_thread(store.claim, record.id, now, _HANDOFF_LEASE_S):
                     continue
                 try:
                     if (
                         expired_lease
+                        and (record.git_plan or {}).get("git")
                         and await asyncio.to_thread(
                             conversation_store.get_conversation, record.receiver_session_id
                         )
@@ -643,6 +671,13 @@ def register_handoff_routes(
 
     if sweeper is not None:
         sweeper.set_handoff_pass(_pass)
+        sweeper.set_handoff_brief_check(
+            lambda message: (
+                _store_id(message.ref)
+                and (handoff := store.get(message.ref)) is not None
+                and handoff.brief_peer_id == message.id
+            )
+        )
 
     async def runner_auth(request: Request, session_id: str) -> Any:
         if not _store_id(session_id):
@@ -1009,9 +1044,15 @@ def register_handoff_routes(
                 git_plan=plan,
                 parent_handoff_id=parent.id if parent else None,
                 disclosure=disclosure,
-                lease_until=now + 120,
+                lease_until=now_epoch() + _HANDOFF_LEASE_S,
             )
-            record.brief = format_handoff_brief(record, project.name, workspace, branch, dirty)
+            record.brief = format_handoff_brief(
+                record,
+                project.name,
+                selected.workspace if selected else workspace,
+                selected.git_branch if selected else branch,
+                dirty,
+            )
             if len(record.brief) > 16000:
                 raise OmnigentError(
                     "hand-off brief exceeds 16000 characters", code=ErrorCode.INVALID_INPUT
@@ -1021,6 +1062,14 @@ def register_handoff_routes(
             result = await advance(hid, holds_lease=True, request=request)
         finally:
             await asyncio.to_thread(store.release, hid)
+        if (
+            result.state == "failed"
+            and result.reason
+            and (result.git_plan or {}).get("git")
+            and result.reason.startswith("create_failed:")
+            and "already exists" in result.reason.lower()
+        ):
+            return await view(result, "needs_input") | {"reason": "branch_exists"}
         return await view(result, "failed" if result.state == "failed" else "started")
 
     @router.get("/sessions/{sender_id}/handoffs", include_in_schema=False, response_model=None)
@@ -1084,7 +1133,9 @@ def register_handoff_routes(
                 unsent = (
                     record.state == "open"
                     and brief is None
-                    and await asyncio.to_thread(store.claim, record.id, now_epoch(), 120)
+                    and await asyncio.to_thread(
+                        store.claim, record.id, now_epoch(), _HANDOFF_LEASE_S
+                    )
                 )
                 if unsent:
                     try:
@@ -1138,6 +1189,18 @@ def register_handoff_routes(
                 return JSONResponse(status_code=409, content=await view(record))
             outcome = body.model_dump()
             target = "cancelled" if record.cancel_requested_at is not None else body.status
+            project_name = (record.git_plan or {}).get("project_name", record.project_id)
+            if (
+                len(
+                    format_handoff_result(
+                        replace(record, state=target, outcome=outcome), project_name
+                    )
+                )
+                > 16000
+            ):
+                raise OmnigentError(
+                    "hand-off result exceeds 16000 characters", code=ErrorCode.INVALID_INPUT
+                )
             if await transition(
                 record,
                 target,

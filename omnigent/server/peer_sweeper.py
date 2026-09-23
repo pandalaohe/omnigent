@@ -115,10 +115,14 @@ class PeerSweeper:
         self._app: Any | None = None
         self._task: asyncio.Task[None] | None = None
         self._handoff_pass: Callable[[int], Awaitable[None]] | None = None
+        self._handoff_brief_check: Callable[[SessionPeerMessage], bool] | None = None
 
     def set_handoff_pass(self, fn: Callable[[int], Awaitable[None]] | None) -> None:
         """Install the hand-off recovery pass run after peer records each tick."""
         self._handoff_pass = fn
+
+    def set_handoff_brief_check(self, fn: Callable[[SessionPeerMessage], bool] | None) -> None:
+        self._handoff_brief_check = fn
 
     async def notify_line(
         self, sender_session_id: str, line: str, *, app: Any | None = None
@@ -285,6 +289,11 @@ class PeerSweeper:
         state, _runner_online = await self._true_state(receiver)
         if state != "idle":
             return
+        strict_init = (
+            await asyncio.to_thread(self._handoff_brief_check, record)
+            if self._handoff_brief_check is not None
+            else False
+        )
         moved = await asyncio.to_thread(
             self._store.transition, record.id, "delivering", None, (origin_state,)
         )
@@ -321,6 +330,7 @@ class PeerSweeper:
                 record.id,
                 record.text,
                 acting_user_id=receiver_owner,
+                **({"require_init_success": True} if strict_init else {}),
             )
         except Exception:
             # ``_deliver`` already maps its own expected failures to a

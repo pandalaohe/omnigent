@@ -35,9 +35,21 @@ class SysSessionHandoffTool(Tool):
                             "type": "string",
                             "enum": ["start", "status", "cancel"],
                             "default": "start",
+                            "description": (
+                                "Start a hand-off, check status, or cancel one. Defaults to start."
+                            ),
                         },
-                        "project": {"type": "string", "minLength": 1},
-                        "task": {"type": "string", "minLength": 1, "maxLength": 8000},
+                        "project": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Required for start: registered project name or id.",
+                        },
+                        "task": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 8000,
+                            "description": "Required for start: one bounded request.",
+                        },
                         "constraints": {"type": "string"},
                         "expected_outcome": {"type": "string"},
                         "artifacts": {
@@ -58,21 +70,14 @@ class SysSessionHandoffTool(Tool):
                             "default": 1440,
                         },
                         "allow_onward": {"type": "boolean", "default": False},
-                        "handoff_id": {"type": "string", "minLength": 1},
+                        "handoff_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": (
+                                "Required for cancel; optional for status to list recent hand-offs"
+                            ),
+                        },
                     },
-                    "allOf": [
-                        {
-                            "if": {"properties": {"action": {"const": "start"}}},
-                            "then": {"required": ["project", "task"]},
-                        },
-                        {
-                            "if": {
-                                "properties": {"action": {"const": "cancel"}},
-                                "required": ["action"],
-                            },
-                            "then": {"required": ["handoff_id"]},
-                        },
-                    ],
                     "additionalProperties": False,
                 },
             },

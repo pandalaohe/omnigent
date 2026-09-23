@@ -134,3 +134,12 @@ def test_handoff_tools_follow_peer_flag_for_every_spec_and_relay() -> None:
         s["name"] for s in build_native_relay_tool_schemas(None, peer_messaging_enabled=True)
     } >= _HANDOFF
     assert not _HANDOFF & {s["name"] for s in build_native_relay_tool_schemas(None)}
+
+
+def test_handoff_tool_parameters_avoid_top_level_combinators() -> None:
+    schemas = ToolManager(_no_spawn_spec(), peer_messaging_enabled=True).get_tool_schemas()
+    parameters = {
+        schema["function"]["name"]: schema["function"]["parameters"] for schema in schemas
+    }
+    for name in _HANDOFF:
+        assert not {"allOf", "anyOf", "oneOf"} & parameters[name].keys()
