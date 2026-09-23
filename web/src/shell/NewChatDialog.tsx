@@ -248,9 +248,11 @@ import {
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isAcpHarnessAgent,
+  isSdkAgent,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
+import { rankHarnessRows } from "@/lib/harnessRanking";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
@@ -851,6 +853,14 @@ function harnessWarningMessage(
   reason: string | null,
   harness: string | null | undefined,
 ): ReactNode {
+  if (reason === "platform-unsupported") {
+    return (
+      <>
+        {agentName} runs a native terminal, which {hostName} (Windows) can&apos;t host — pick an SDK
+        agent for this host.
+      </>
+    );
+  }
   const isCodex = !!harness && isCodexHarness(harness);
   if (reason === "needs-auth" && isCodex) {
     return (
@@ -918,7 +928,7 @@ function HarnessSetupNotice({
       data-testid="new-chat-landing-harness-warning"
     >
       <TriangleAlertIcon className="size-3.5 shrink-0" />
-      {featureEnabled ? (
+      {featureEnabled && reason !== "platform-unsupported" ? (
         <>
           <span>
             {agentName} isn&apos;t ready on {hostName}.
@@ -1533,6 +1543,7 @@ export function AgentHarnessPicker({
   const pendingConfigAgentId = useRef<string | null>(null);
   const queryClient = useQueryClient();
   const info = useServerInfo();
+  const { recentHarnesses } = useRecentHarnesses();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerSdk = triggerDetails.find((detail) => detail.label === "SDK");
@@ -1730,34 +1741,18 @@ export function AgentHarnessPicker({
     );
   };
 
-  // Opt-in "hide unconfigured harnesses" filter (Settings › Appearance). When
-  // on, drop harness rows that can't launch on the selected host. Fails open:
-  // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
-  // nothing is hidden in those cases, and unrecognized harnesses stay visible.
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
-    const ready: AvailableAgent[] = [];
-    const more: AvailableAgent[] = [];
-    const primaryOrder = ["claude", "cursor", "codex"];
-    const secondaryOrder = ["opencode", "pi"];
-    for (const agent of harnessEntries) {
-      const selected = agent.id === effectiveAgentId;
-      const readiness = harnessReadinessOnHost(agent.harness, host);
-      if (!selected && hideUnconfigured && !readiness.selectable && readiness.fallbackRelevant)
-        continue;
-      const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      if (primaryOrder.includes(key) || agent.id === promotedHarnessId) {
-        ready.push(agent);
-      } else more.push(agent);
-    }
-    const rank = (agent: AvailableAgent, order: string[]) => {
-      const index = order.indexOf(nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "");
-      return index < 0 ? order.length : index;
-    };
-    ready.sort((first, second) => rank(first, primaryOrder) - rank(second, primaryOrder));
-    more.sort((first, second) => rank(first, secondaryOrder) - rank(second, secondaryOrder));
-    return { readyHarnessEntries: ready, moreHarnessEntries: more };
-  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
+    const { primary, more } = rankHarnessRows({
+      entries: harnessEntries,
+      host,
+      recentHarnesses,
+      hideUnconfigured,
+      selectedId: effectiveAgentId,
+      promotedId: promotedHarnessId,
+    });
+    return { readyHarnessEntries: primary, moreHarnessEntries: more };
+  }, [harnessEntries, host, recentHarnesses, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
@@ -1771,6 +1766,8 @@ export function AgentHarnessPicker({
     () => partitionAgentsByKind(agentEntries),
     [agentEntries],
   );
+  const sdkEntries = bundleEntries.filter(isSdkAgent);
+  const composedEntries = bundleEntries.filter((entry) => !isSdkAgent(entry));
 
   // Existing custom / pending agents fold into a "Custom agents" submenu so a
   // long roster doesn't crowd the recommended picks. When there are none, the
@@ -2053,9 +2050,14 @@ export function AgentHarnessPicker({
               <DropdownMenuSeparator />
             </>
           )}
-          {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
+          {sdkEntries.length > 0 && (
+            <>
+              <PickerSectionHeader>SDK</PickerSectionHeader>
+              {sdkEntries.map(renderEntry)}
+            </>
+          )}
           <PickerSectionHeader>Agents</PickerSectionHeader>
-          {bundleEntries.map(renderEntry)}
+          {composedEntries.map(renderEntry)}
           {/* Existing custom agents fold into a "Custom agents" submenu (with
             the pending upload and the create action). With no custom agents the
             submenu would hold only "Create custom agent", so we surface that as
@@ -5871,10 +5873,9 @@ export function NewChatLandingScreen() {
         writeLastCreatedWorkspace(selectedHostId, workspaceValue);
         addRecent(workspaceValue);
       }
-      // Remember the launched harness so the picker promotes it out of "More"
-      // next time. Recorded only on a successful create, so a harness the user
-      // merely browsed past never earns a primary slot.
-      if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
+      const launchedHarness =
+        selectedNativeHarness ?? (isAcpHarnessAgent(selectedAgent) ? selectedAgent?.harness : null);
+      if (launchedHarness) addRecentHarness(launchedHarness);
       // SDK invocations resolve on the runner after create; native CLIs
       // receive plain text. An inline attachment makes the prompt more than
       // its text, so a skill match on that text would drop the files.

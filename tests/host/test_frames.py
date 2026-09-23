@@ -519,6 +519,27 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
 
 
+def test_hello_frame_platform_round_trip() -> None:
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="windows-host",
+        platform="win32",
+    )
+    encoded = encode_host_frame(original)
+    assert json.loads(encoded)["platform"] == "win32"
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.platform == "win32"
+
+    legacy = HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="old-host")
+    legacy_encoded = encode_host_frame(legacy)
+    assert "platform" not in json.loads(legacy_encoded)
+    legacy_decoded = decode_host_frame(legacy_encoded)
+    assert isinstance(legacy_decoded, HostHelloFrame)
+    assert legacy_decoded.platform is None
+
+
 def test_connection_error_frame_round_trip() -> None:
     """Connection errors preserve the server stage and exception message."""
     original = HostConnectionErrorFrame(

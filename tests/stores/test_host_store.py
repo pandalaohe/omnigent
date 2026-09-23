@@ -248,12 +248,14 @@ def test_upsert_persists_configured_harnesses(host_store: HostStore) -> None:
         name="laptop",
         user_id="alice@example.com",
         configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
+        platform="win32",
     )
 
     fetched = host_store.get_host("e8d515c60f315ca35b4109564e238669")
     assert fetched is not None
     # Exact equality: the False bit is the actionable "warn" value.
     assert fetched.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+    assert fetched.platform == "win32"
 
 
 def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
@@ -271,6 +273,7 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
         name="laptop2",
         user_id="alice@example.com",
         configured_harnesses={"codex": False},
+        platform="linux",
     )
     # Reconnect with fresh values — the user ran `omnigent setup`.
     host_store.upsert_on_connect(
@@ -278,10 +281,12 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
         name="laptop2",
         user_id="alice@example.com",
         configured_harnesses={"codex": True},
+        platform="darwin",
     )
     fetched = host_store.get_host("54e092213a38acc19cfd13ffb160a2b7")
     assert fetched is not None
     assert fetched.configured_harnesses == {"codex": True}
+    assert fetched.platform == "darwin"
 
     # Reconnect without the map: back to unknown, not the stale value.
     host_store.upsert_on_connect(
@@ -292,6 +297,7 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
     fetched = host_store.get_host("54e092213a38acc19cfd13ffb160a2b7")
     assert fetched is not None
     assert fetched.configured_harnesses is None
+    assert fetched.platform is None
 
 
 def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> None:
@@ -302,6 +308,7 @@ def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> No
         name="laptop-live",
         user_id="alice@example.com",
         configured_harnesses={"pi": False},
+        platform="win32",
     )
 
     host_store.update_harness_readiness(host_id, {"pi": True})
@@ -309,6 +316,7 @@ def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> No
     fetched = host_store.get_host(host_id)
     assert fetched is not None
     assert fetched.configured_harnesses == {"pi": True}
+    assert fetched.platform == "win32"
     assert fetched.status == "online"
 
 
@@ -418,6 +426,7 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
         host_id="b1b5efd7dfc33b5a6241f1866ffb00e6",
         name="dev-laptop",
         user_id="dana@example.com",
+        platform="darwin",
     )
 
     assert updated.host_id == "b1b5efd7dfc33b5a6241f1866ffb00e6"
@@ -434,6 +443,7 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     rotated = host_store.get_host("b1b5efd7dfc33b5a6241f1866ffb00e6")
     assert rotated is not None
     assert rotated.default_workspace == "D:\\AIProgram\\Projects"
+    assert rotated.platform == "darwin"
 
 
 def test_reown_host_id_across_owner_change_preserves_conversation_binding(
@@ -476,12 +486,14 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
         name="laptop",
         user_id="local",
         allow_host_id_reown=True,
+        platform="linux",
     )
 
     assert reowned.host_id == "a0c8ab2431b35377abb4232febeded94"
     assert reowned.user_id == "local"
     assert reowned.status == "online"
     assert reowned.default_workspace == "/Users/admin/Projects"
+    assert reowned.platform == "linux"
     # The conversation binding survives the owner change (host_id unchanged).
     rebound = conversations.get_conversation(conv.id)
     assert rebound is not None
@@ -960,11 +972,13 @@ def test_managed_columns_survive_connect(db_uri: str) -> None:
         name="managed-m4",
         user_id="alice@example.com",
         managed_token="raw-launch-token-4",
+        platform="linux",
     )
 
     assert connected.status == "online"
     assert connected.sandbox_provider == "modal"
     assert connected.sandbox_id == "sb-m4"
+    assert connected.platform == "linux"
     # The credential still resolves after connect.
     assert (
         store.resolve_launch_token("d55a61010459cea88ed2af0fe916139b", "raw-launch-token-4")

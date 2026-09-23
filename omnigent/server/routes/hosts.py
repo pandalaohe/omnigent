@@ -809,6 +809,7 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    "platform": host.platform,
                     "default_workspace": host.default_workspace,
                     # Root enumeration is a Host capability. Missing hello
                     # metadata (older Host or another replica) fails closed so
@@ -861,6 +862,7 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "platform": host.platform,
             "default_workspace": host.default_workspace,
             "filesystem_roots": bool(
                 (live_connection := host_registry.get(host.host_id))

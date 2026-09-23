@@ -23,10 +23,21 @@ export const BUILTIN_AGENTS = new Set([
   "qwen-native-ui", // Qwen Code
   "kimi-native-ui", // Kimi
   "codex-sdk",
+  "claude-sdk",
   "devin-native-ui", // Devin
   "polly",
   "debby",
 ]);
+
+export const SDK_PRODUCT_AGENTS: ReadonlyMap<string, string> = new Map([
+  ["codex-sdk", "codex"],
+  ["claude-sdk", "claude-sdk"],
+]);
+
+/** A standalone SDK product has both its built-in identity and expected harness. */
+export function isSdkAgent(agent: Pick<AvailableAgent, "name" | "harness">): boolean {
+  return SDK_PRODUCT_AGENTS.get(agent.name) === agent.harness;
+}
 
 // Fallback only: builtin ACP CLI harness ids for servers whose harness catalog
 // doesn't report `capabilities.integration_mode`. NOT the source of truth — a
@@ -72,6 +83,7 @@ export const AGENT_DISPLAY_ORDER = [
   "Qwen Code",
   "Kimi",
   "Codex SDK",
+  "Claude SDK",
   "Polly",
   "Debby",
 ];

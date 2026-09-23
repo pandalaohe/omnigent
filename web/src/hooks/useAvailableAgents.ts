@@ -57,6 +57,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   // nessie is no longer seeded, but older deployments retain their row.
   nessie: "Nessie",
   "codex-sdk": "Codex SDK",
+  "claude-sdk": "Claude SDK",
   polly: "Polly",
   debby: "Debby",
 };

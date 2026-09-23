@@ -62,6 +62,7 @@ def _websocket_scope(path: str) -> dict[str, object]:
 def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
+    platform: str | None = None,
     gateway_inference: dict[str, bool] | None = None,
     filesystem_roots: bool = False,
 ) -> str:
@@ -82,6 +83,7 @@ def _make_hello(
             frame_protocol_version=1,
             name=name,
             configured_harnesses=configured_harnesses,
+            platform=platform,
             gateway_inference=gateway_inference,
             filesystem_roots=filesystem_roots,
         )
@@ -146,6 +148,7 @@ async def _connect_host(
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
+    platform: str | None = None,
     gateway_inference: dict[str, bool] | None = None,
     filesystem_roots: bool = False,
 ) -> ApplicationCommunicator:
@@ -171,10 +174,11 @@ async def _connect_host(
         {
             "type": "websocket.receive",
             "text": _make_hello(
-                name,
-                configured_harnesses,
-                gateway_inference,
-                filesystem_roots,
+                name=name,
+                configured_harnesses=configured_harnesses,
+                platform=platform,
+                gateway_inference=gateway_inference,
+                filesystem_roots=filesystem_roots,
             ),
         },
     )
@@ -435,6 +439,7 @@ async def test_patch_host_default_workspace_reports_concurrent_owner_change(
 
 async def test_hosts_api_surfaces_configured_harnesses(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
 ) -> None:
     """
     Verify the readiness map a host reports in its hello is persisted
@@ -450,9 +455,12 @@ async def test_hosts_api_surfaces_configured_harnesses(
         app,
         registry,
         configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
+        platform="win32",
     )
+    other_app, other_registry, _other_hs, _other_cs = _build_host_api_app(db_uri)
+    assert other_registry.get(_HOST_ID) is None
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(transport=ASGITransport(app=other_app), base_url="http://test") as client:
         listing = await client.get("/v1/hosts")
         single = await client.get(f"/v1/hosts/{_HOST_ID}")
 
@@ -465,6 +473,8 @@ async def test_hosts_api_surfaces_configured_harnesses(
     }
     assert single.status_code == 200
     assert single.json()["configured_harnesses"] == {"claude-sdk": True, "codex": "needs-auth"}
+    assert listing.json()["hosts"][0]["platform"] == "win32"
+    assert single.json()["platform"] == "win32"
 
 
 async def test_hosts_api_configured_harnesses_null_for_older_host(
@@ -486,6 +496,7 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
 
     assert resp.status_code == 200
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
+    assert resp.json()["hosts"][0]["platform"] is None
 
 
 async def test_hosts_api_gates_filesystem_roots_on_host_capability(

@@ -1435,6 +1435,68 @@ def test_codex_sdk_seed_is_distinct_and_uses_host_defaults(seed_stores: _SeedSto
     assert loaded.spec.executor.auth is None
 
 
+def test_claude_sdk_seed_is_idempotent(seed_stores: _SeedStores) -> None:
+    from omnigent.db.utils import builtin_agent_id
+
+    for _ in range(2):
+        server_app._ensure_default_claude_sdk_agent(
+            seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+        )
+    agent = seed_stores.agent_store.get_by_name("claude-sdk")
+    assert agent is not None
+    assert agent.id == builtin_agent_id("claude-sdk")
+    assert agent.version == 1
+    loaded = seed_stores.agent_cache.load(agent.id, agent.bundle_location)
+    assert loaded.spec.executor.harness_kind == "claude-sdk"
+
+
+def test_claude_sdk_seed_skips_foreign_template(
+    seed_stores: _SeedStores, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.db.utils import builtin_agent_id
+
+    foreign_id = "f" * 32
+    foreign_location = f"{foreign_id}/original"
+    seed_stores.agent_store.create(foreign_id, "claude-sdk", foreign_location)
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        server_app._ensure_default_claude_sdk_agent(
+            seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+        )
+
+    agent = seed_stores.agent_store.get_by_name("claude-sdk")
+    assert agent is not None
+    assert agent.id == foreign_id
+    assert agent.bundle_location == foreign_location
+    assert agent.version == 1
+    assert seed_stores.agent_store.get(builtin_agent_id("claude-sdk")) is None
+    assert foreign_id in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_claude_sdk_startup_discovery(seed_stores: _SeedStores) -> None:
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.server.routes.builtin_agents import create_builtin_agents_router
+
+    server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    app = FastAPI()
+    app.include_router(
+        create_builtin_agents_router(seed_stores.agent_store, seed_stores.agent_cache),
+        prefix="/v1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/v1/agents", params={"limit": 100})
+
+    assert response.status_code == 200
+    claude_sdk = next(agent for agent in response.json()["data"] if agent["name"] == "claude-sdk")
+    assert claude_sdk["id"] == builtin_agent_id("claude-sdk")
+    assert claude_sdk["builtin"] is True
+    assert claude_sdk["harness"] == "claude-sdk"
+
+
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:
     """
     A second seed call is a no-op — it must not register a duplicate.

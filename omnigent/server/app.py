@@ -511,6 +511,7 @@ _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _CODEX_SDK_AGENT_NAME = "codex-sdk"
+_CLAUDE_SDK_AGENT_NAME = "claude-sdk"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 
@@ -576,6 +577,7 @@ def _error_audit_extra(
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
 _CODEX_SDK_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "codex-sdk.yaml"
+_CLAUDE_SDK_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "claude-sdk.yaml"
 
 
 class _FastAPICallNext(Protocol):
@@ -939,6 +941,7 @@ def _ensure_default_agents(
     _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_sdk_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_claude_sdk_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -1231,6 +1234,37 @@ def _ensure_default_codex_sdk_agent(
         agent_cache,
         name=_CODEX_SDK_AGENT_NAME,
         bundle_bytes=_build_codex_sdk_bundle(),
+    )
+
+
+def _build_claude_sdk_bundle() -> bytes:
+    """Package the SDK configuration under the standard config.yaml entry."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = Path(tmpdir)
+        (bundle_dir / "config.yaml").write_bytes(_CLAUDE_SDK_BUNDLE_SOURCE.read_bytes())
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_claude_sdk_agent(
+    agent_store: AgentStore, artifact_store: ArtifactStore, agent_cache: Any
+) -> None:
+    """Seed the Claude SDK builtin unless a non-builtin template owns the name."""
+    from omnigent.db.utils import builtin_agent_id
+
+    if not _CLAUDE_SDK_BUNDLE_SOURCE.is_file():
+        return
+    existing = agent_store.get_by_name(_CLAUDE_SDK_AGENT_NAME)
+    if existing is not None and existing.id != builtin_agent_id(_CLAUDE_SDK_AGENT_NAME):
+        _logger.warning("Skipping Claude SDK seed: template %s owns the name", existing.id)
+        return
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_CLAUDE_SDK_AGENT_NAME,
+        bundle_bytes=_build_claude_sdk_bundle(),
     )
 
 

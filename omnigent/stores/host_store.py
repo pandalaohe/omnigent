@@ -89,6 +89,8 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param platform: Host process platform from the last hello. ``None``
+        means the host has not reported it.
     """
 
     host_id: str
@@ -100,6 +102,7 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    platform: str | None = None
     default_workspace: str | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
@@ -199,6 +202,7 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        platform=row.platform,
         default_workspace=row.default_workspace,
         cli_retention_policy=_parse_cli_retention_policy(row.cli_retention_policy),
         cli_retention_revision=row.cli_retention_revision,
@@ -291,6 +295,7 @@ class HostStore:
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
+        platform: str | None = None,
         managed_token: str | None = None,
     ) -> Host:
         """
@@ -331,6 +336,8 @@ class HostStore:
             Written on every connect — including ``None`` from an older
             host that doesn't report it, which correctly resets any
             stale value back to "unknown".
+        :param platform: Host process platform from ``host.hello``. An
+            older host reports ``None``, clearing any stale value.
         :param managed_token: Raw launch token for a managed host. When set,
             registration atomically revalidates the current credential instead
             of performing the external-host upsert path.
@@ -363,6 +370,7 @@ class HostStore:
                             status=encode_host_status("online"),
                             updated_at=now,
                             configured_harnesses=harnesses_json,
+                            platform=platform,
                         )
                     ),
                 )
@@ -395,6 +403,7 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                row.platform = platform
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -411,6 +420,7 @@ class HostStore:
                     generation=generation,
                     now=now,
                     configured_harnesses_json=harnesses_json,
+                    platform=platform,
                 )
                 if reowned is not None:
                     return reowned
@@ -434,6 +444,7 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
+                    platform,
                 )
                 return _row_to_host(row)
 
@@ -450,6 +461,7 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                platform=platform,
                 cli_retention_revision=0,
             )
             session.add(row)
@@ -464,6 +476,7 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        platform: str | None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -484,6 +497,7 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
+        :param platform: Platform reported with the reconnecting hello.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -544,6 +558,7 @@ class HostStore:
             sandbox_id=sandbox_id,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
+            platform=platform,
             default_workspace=default_workspace,
             cli_retention_policy=cli_retention_policy,
             cli_retention_revision=cli_retention_revision,
@@ -677,6 +692,7 @@ class HostStore:
         generation: str | None,
         now: int,
         configured_harnesses_json: str | None = None,
+        platform: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -701,6 +717,7 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
+        :param platform: Platform reported with the connecting hello.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -728,6 +745,7 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                platform=platform,
             )
         )
         return Host(
@@ -741,6 +759,7 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            platform=platform,
             default_workspace=existing.default_workspace,
             cli_retention_policy=_parse_cli_retention_policy(existing.cli_retention_policy),
             cli_retention_revision=existing.cli_retention_revision,
