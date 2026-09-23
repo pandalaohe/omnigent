@@ -4662,7 +4662,7 @@ async def _create_clear_replacement_session(
     )
     labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
 
-    create_body = {"agent_id": agent_id, "labels": labels}
+    create_body: dict[str, object] = {"agent_id": agent_id, "labels": labels}
     project_id = old.get("project_id")
     if isinstance(project_id, str):
         create_body.update({"project_id": project_id, "workspace": None, "git": None})
