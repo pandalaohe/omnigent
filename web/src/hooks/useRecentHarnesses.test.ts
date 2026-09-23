@@ -25,6 +25,14 @@ describe("useRecentHarnesses", () => {
     expect(stored()).toEqual(["pi-native"]);
   });
 
+  it("updates another mounted consumer when a harness is recorded", () => {
+    const writer = renderHook(() => useRecentHarnesses());
+    const reader = renderHook(() => useRecentHarnesses());
+
+    act(() => writer.result.current.addRecentHarness("pi-native"));
+    expect(reader.result.current.recentHarnesses).toEqual(["pi-native"]);
+  });
+
   it("moves a repeat launch to the front instead of duplicating it", () => {
     const { result } = renderHook(() => useRecentHarnesses());
     act(() => result.current.addRecentHarness("pi-native"));

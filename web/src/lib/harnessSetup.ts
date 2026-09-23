@@ -97,7 +97,7 @@ export function harnessReadinessOnHost(
       description: "Connect an online host before starting a session.",
     });
   }
-  if (host.platform === "win32" && nativeCodingAgentForHarness(harness)) {
+  if (harnessUnavailableReasonOnHost(harness, host) === "platform-unsupported") {
     return harnessReadinessResult("unavailable", "platform-unsupported", true, {
       label: "Not supported on Windows hosts",
       description:
@@ -165,7 +165,11 @@ export function harnessUnavailableReasonOnHost(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): string | null {
-  if (!harness || !host?.configured_harnesses) return null;
+  if (!harness) return null;
+  if (host?.platform === "win32" && nativeCodingAgentForHarness(harness)) {
+    return "platform-unsupported";
+  }
+  if (!host?.configured_harnesses) return null;
   const availability = host.configured_harnesses[harness];
   if (availability === false) {
     if (isCodexHarness(harness)) return "binary-missing";
@@ -253,7 +257,8 @@ export function harnessInstallableOnHost(
     isFeatureEnabled(info, "harness_install") &&
     !!harness &&
     info.installable_harnesses.includes(harness) &&
-    host?.status === "online"
+    host?.status === "online" &&
+    harnessUnavailableReasonOnHost(harness, host) !== "platform-unsupported"
   );
 }
 
@@ -310,7 +315,8 @@ export function harnessAuthableOnHost(
     info !== "loading" &&
     isFeatureEnabled(info, "harness_install") &&
     harnessCredentialFamily(harness) !== null &&
-    host?.status === "online"
+    host?.status === "online" &&
+    harnessUnavailableReasonOnHost(harness, host) !== "platform-unsupported"
   );
 }
 

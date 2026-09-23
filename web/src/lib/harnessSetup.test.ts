@@ -98,6 +98,34 @@ const QWEN_STEPS: SetupStepWire[] = [
 ];
 
 describe("harnessUnavailableReasonOnHost", () => {
+  it("reports native Windows harnesses before consulting the readiness map", () => {
+    const windows = {
+      ...hostWith({ "claude-native": true, codex: true, "claude-sdk": true, grok: true }),
+      platform: "win32",
+    };
+    expect(harnessUnavailableReasonOnHost("claude-native", windows)).toBe(
+      "platform-unsupported",
+    );
+    expect(harnessUnavailableReasonOnHost("opencode-native", windows)).toBe(
+      "platform-unsupported",
+    );
+    expect(
+      harnessUnavailableReasonOnHost("claude-native", {
+        ...windows,
+        configured_harnesses: null,
+      }),
+    ).toBe(
+      "platform-unsupported",
+    );
+    for (const harness of ["codex", "claude-sdk", "grok"]) {
+      expect(harnessUnavailableReasonOnHost(harness, windows)).toBe(null);
+    }
+    expect(harnessUnavailableReasonOnHost("claude-native", { ...windows, platform: null })).toBe(
+      null,
+    );
+    expect(harnessUnconfiguredOnHost("claude-native", windows)).toBe(true);
+  });
+
   it("classifies structured reasons and generic unconfigured", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "binary-missing" }))).toBe(
       "binary-missing",
@@ -285,6 +313,20 @@ describe("harnessInstallableOnHost", () => {
     ).toBe(false);
     expect(harnessInstallableOnHost("loading", "codex", online)).toBe(false);
   });
+
+  it("does not offer installation for a native harness on Windows", () => {
+    expect(
+      harnessInstallableOnHost(
+        info(),
+        "codex-native",
+        {
+          ...online,
+          platform: "win32",
+          configured_harnesses: { "codex-native": false },
+        },
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("harnessCredentialFamily", () => {
@@ -347,6 +389,20 @@ describe("harnessAuthableOnHost", () => {
       false,
     );
     expect(harnessAuthableOnHost("loading", "codex", online)).toBe(false);
+  });
+
+  it("does not offer authentication for a native harness on Windows", () => {
+    expect(
+      harnessAuthableOnHost(
+        info(),
+        "claude-native",
+        {
+          ...online,
+          platform: "win32",
+          configured_harnesses: { "claude-native": "needs-auth" },
+        },
+      ),
+    ).toBe(false);
   });
 });
 

@@ -5162,6 +5162,40 @@ describe("NewChatLandingScreen", () => {
     expect(sdk).not.toHaveAttribute("aria-disabled");
   });
 
+  it("shows the platform notice and stops probing a retained native selection after a Windows host switch", () => {
+    mockHosts([{ ...host("online"), configured_harnesses: { "claude-native": true } } as Host]);
+    renderLanding({ harness_install_enabled: true, installable_harnesses: ["claude-native"] });
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "claude-native", true, {
+      poll: true,
+    });
+
+    mockHosts([
+      {
+        ...host("online"),
+        platform: "win32",
+        configured_harnesses: { "claude-native": true },
+      } as Host,
+    ]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Continue on Windows" },
+    });
+
+    expect(screen.getByTestId("new-chat-landing-harness-warning")).toHaveTextContent(
+      "Claude Code runs a native terminal, which machine-1 (Windows) can't host — pick an SDK agent for this host.",
+    );
+    expect(screen.queryByTestId("new-chat-landing-harness-setup")).toBeNull();
+    expect(
+      useHostModelOptionsMock.mock.calls
+        .filter(([, harness]) => harness === "claude-native")
+        .at(-1),
+    ).toEqual([
+      "host_1",
+      "claude-native",
+      false,
+      { poll: true },
+    ]);
+  });
+
   it("puts the recently launched usable harness first", () => {
     localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["opencode-native"]));
     mockHosts([

@@ -928,7 +928,7 @@ function HarnessSetupNotice({
       data-testid="new-chat-landing-harness-warning"
     >
       <TriangleAlertIcon className="size-3.5 shrink-0" />
-      {featureEnabled ? (
+      {featureEnabled && reason !== "platform-unsupported" ? (
         <>
           <span>
             {agentName} isn&apos;t ready on {hostName}.
