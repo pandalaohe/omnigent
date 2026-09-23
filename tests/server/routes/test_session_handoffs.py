@@ -672,6 +672,41 @@ async def test_expired_creating_git_lease_fails_as_interrupted(
 
 
 @pytest.mark.asyncio
+async def test_expired_creating_existing_worktree_bind_advances(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.db.utils import now_epoch
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    record = _record(env, state="creating", branch="review-branch")
+    record.create_session = True
+    record.receiver_session_id = routes_handoff.derived_handoff_session_id(record.id)
+    record.lease_until = now_epoch() - 1
+    record.git_plan["git"] = {"branch_name": "review-branch", "existing_worktree": True}
+    record.git_plan["workspace"] = "/repo-worktrees/review-branch"
+    env["handoffs"].create(record)
+
+    async def create_session(*args: Any, conversation_id: str, **_kwargs: Any) -> Any:
+        body = args[3]
+        env["conversations"].create_conversation(
+            conversation_id=conversation_id,
+            agent_id=env["agent_id"],
+            project_id=env["project"].id,
+            host_id="1" * 32,
+            workspace=body.workspace,
+            git_branch="review-branch",
+        )
+        return SimpleNamespace(id=conversation_id)
+
+    monkeypatch.setattr(routes_handoff, "_create_session_from_existing_agent", create_session)
+    await _run_pass(env)
+    updated = env["handoffs"].get(record.id)
+    assert updated is not None and updated.state == "delivered"
+    assert env["peers"].get(updated.brief_peer_id) is not None
+
+
+@pytest.mark.asyncio
 async def test_cancel_held_brief_expires_peer_record(handoff_env: dict[str, Any]) -> None:
     env = handoff_env
     env["conversations"].set_labels(env["receiver"].id, {"peer_inbound": "hold"})
@@ -1242,6 +1277,69 @@ async def test_fresh_branch_create_passes_git_plan(
 
 
 @pytest.mark.asyncio
+async def test_maximum_accepted_brief_survives_workspace_rerender(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    branch = "review-branch"
+    workspace = f"/repo-worktrees/{branch}"
+    limit = 16000 - getattr(routes_handoff, "_BRIEF_WORKSPACE_ALLOWANCE", 0)
+    sample = _record(env, branch=branch)
+    sample.git_plan["source"] = {"task": "x" * 8000, "constraints": "x"}
+    sample_brief = routes_handoff.format_handoff_brief(sample, "Target", "/repo", branch, None)
+    constraints = "x" * (limit - len(sample_brief) + 1)
+    assert len(constraints) > 0
+    monkeypatch.setattr(env["host_registry"], "get", lambda _hid: SimpleNamespace())
+
+    async def worktrees(**_kwargs: Any) -> list[dict[str, Any]]:
+        return [{"branch": "main", "path": "/repo"}]
+
+    async def create_session(*_args: Any, conversation_id: str, **_kwargs: Any) -> Any:
+        env["conversations"].create_conversation(
+            conversation_id=conversation_id,
+            agent_id=env["agent_id"],
+            project_id=env["project"].id,
+            host_id="1" * 32,
+            workspace=workspace,
+            git_branch=branch,
+        )
+        return SimpleNamespace(id=conversation_id)
+
+    monkeypatch.setattr(routes_handoff, "list_worktrees_on_host", worktrees)
+    monkeypatch.setattr(routes_handoff, "_create_session_from_existing_agent", create_session)
+    body = {
+        "project": "Target",
+        "task": "x" * 8000,
+        "constraints": constraints,
+        "branch": branch,
+        "base_branch": "main",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        oversized = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json={**body, "constraints": constraints + "x"},
+            headers=_headers(env["sender_token"]),
+        )
+        accepted = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json=body,
+            headers=_headers(env["sender_token"]),
+        )
+    assert oversized.status_code == 400, oversized.text
+    assert oversized.json()["error"]["code"] == "invalid_input"
+    assert str(limit) in oversized.json()["error"]["message"]
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["state"] == "delivered"
+    record = env["handoffs"].get(accepted.json()["handoff_id"])
+    assert record is not None and len(record.brief) <= 16000
+    assert env["peers"].get(record.brief_peer_id) is not None
+
+
+@pytest.mark.asyncio
 async def test_create_existing_branch_conflict_returns_needs_input(
     handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1275,6 +1373,44 @@ async def test_create_existing_branch_conflict_returns_needs_input(
     assert start.json()["disposition"] == "needs_input"
     assert start.json()["reason"] == "branch_exists"
     assert env["handoffs"].get(start.json()["handoff_id"]).state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_long_branch_create_conflict_returns_needs_input(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    branch = "b" * 80
+    monkeypatch.setattr(env["host_registry"], "get", lambda _hid: SimpleNamespace())
+
+    async def worktrees(**_kwargs: Any) -> list[dict[str, Any]]:
+        return [{"branch": "main", "path": "/repo"}]
+
+    async def branch_conflict(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(f"worktree creation failed: branch '{branch}' already exists")
+
+    monkeypatch.setattr(routes_handoff, "list_worktrees_on_host", worktrees)
+    monkeypatch.setattr(routes_handoff, "_create_session_from_existing_agent", branch_conflict)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        start = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json={
+                "project": "Target",
+                "task": "Review code",
+                "branch": branch,
+                "base_branch": "main",
+            },
+            headers=_headers(env["sender_token"]),
+        )
+    assert start.status_code == 200, start.text
+    assert start.json()["disposition"] == "needs_input"
+    assert start.json()["reason"] == "branch_exists"
+    record = env["handoffs"].get(start.json()["handoff_id"])
+    assert record is not None and record.reason.startswith("create_failed: branch_exists:")
 
 
 @pytest.mark.asyncio

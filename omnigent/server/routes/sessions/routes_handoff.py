@@ -66,6 +66,7 @@ _OWNER_LOCKS: dict[str, asyncio.Lock] = {}
 _UNFINISHED = ("creating", "open", "delivered", "cancel_requested")
 _REPORTABLE = (*_UNFINISHED, "expired")
 _HANDOFF_LEASE_S = 300
+_BRIEF_WORKSPACE_ALLOWANCE = 1024
 
 
 class HandoffStartRequest(BaseModel):
@@ -495,9 +496,12 @@ def register_handoff_routes(
                                 conversation_store.get_conversation, record.receiver_session_id
                             )
                             if receiver is None:
+                                detail = str(exc)
+                                if plan.get("git") and "already exists" in detail.lower():
+                                    detail = f"branch_exists: {detail}"
                                 if (
                                     await transition(
-                                        record, "failed", f"create_failed: {exc}"[:128]
+                                        record, "failed", f"create_failed: {detail}"[:128]
                                     )
                                     and back_notice
                                 ):
@@ -649,9 +653,11 @@ def register_handoff_routes(
                 if not await asyncio.to_thread(store.claim, record.id, now, _HANDOFF_LEASE_S):
                     continue
                 try:
+                    git_options = (record.git_plan or {}).get("git") or {}
                     if (
                         expired_lease
-                        and (record.git_plan or {}).get("git")
+                        and git_options
+                        and not git_options.get("existing_worktree")
                         and await asyncio.to_thread(
                             conversation_store.get_conversation, record.receiver_session_id
                         )
@@ -1053,9 +1059,11 @@ def register_handoff_routes(
                 selected.git_branch if selected else branch,
                 dirty,
             )
-            if len(record.brief) > 16000:
+            brief_limit = 16000 - _BRIEF_WORKSPACE_ALLOWANCE
+            if len(record.brief) > brief_limit:
                 raise OmnigentError(
-                    "hand-off brief exceeds 16000 characters", code=ErrorCode.INVALID_INPUT
+                    f"hand-off brief exceeds {brief_limit} characters",
+                    code=ErrorCode.INVALID_INPUT,
                 )
             await asyncio.to_thread(store.create, record)
         try:
@@ -1066,8 +1074,7 @@ def register_handoff_routes(
             result.state == "failed"
             and result.reason
             and (result.git_plan or {}).get("git")
-            and result.reason.startswith("create_failed:")
-            and "already exists" in result.reason.lower()
+            and result.reason.startswith("create_failed: branch_exists:")
         ):
             return await view(result, "needs_input") | {"reason": "branch_exists"}
         return await view(result, "failed" if result.state == "failed" else "started")
