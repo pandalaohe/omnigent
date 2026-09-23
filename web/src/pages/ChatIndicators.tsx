@@ -1,8 +1,10 @@
-import { Loader2Icon, WifiOffIcon } from "lucide-react";
+import { Loader2Icon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import { runnerLogRunawayNotice } from "@/lib/runnerLogRunaway";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
@@ -42,6 +44,36 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
       className={cn("mx-auto w-full", CHAT_COLUMN_WIDTH)}
     >
       <ErrorBanner message={status.error ?? ""} source="" code="" title="Sandbox launch failed" />
+    </div>
+  );
+}
+
+/**
+ * Warning band for a session whose runner is writing logs abnormally fast
+ * (the host reported a runaway; the server stamped the session label).
+ * Self-gates to null when the session carries no flag. Sits at the top of
+ * the chat view so the warning is visible without scrolling.
+ */
+export function RunnerLogRunawayBanner({
+  labels,
+  fallbackLabels,
+}: {
+  labels: Record<string, string> | undefined;
+  fallbackLabels?: Record<string, string> | undefined;
+}) {
+  const notice = runnerLogRunawayNotice(labels ?? fallbackLabels);
+  if (notice === null) return null;
+  return (
+    <div
+      data-testid="runner-log-runaway-banner"
+      role="status"
+      className={cn("mx-auto mb-4 w-full px-6", CHAT_COLUMN_WIDTH)}
+    >
+      <Alert>
+        <TriangleAlertIcon aria-hidden />
+        <AlertTitle>Runner log growth warning</AlertTitle>
+        <AlertDescription>{notice}</AlertDescription>
+      </Alert>
     </div>
   );
 }

@@ -109,6 +109,7 @@ class HostFrameKind(str, Enum):
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
+    RUNNER_LOG_RUNAWAY = "host.runner_log_runaway"
     RUNNER_STATUS = "host.runner_status"
     RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
@@ -360,6 +361,33 @@ class HostRunnerExitedFrame:
 
     runner_id: str
     error: str
+
+
+@dataclass
+class HostRunnerLogRunawayFrame:
+    """Host → server: a live runner's log is growing abnormally fast.
+
+    One-way advisory report (no result frame). The host daemon samples each
+    live runner's log size; when one writes more than the runaway threshold
+    within the sliding hour window, the daemon reports it once per crossing
+    so the server can warn the session's user that the runner may be stuck
+    in an error loop. Carries no file path — a log path can contain the
+    user's directories.
+
+    :param runner_id: The runner whose log is growing, e.g.
+        ``"runner_abc123..."``.
+    :param session_id: Session the runner serves, or ``None`` when the
+        launch frame predates it.
+    :param bytes_last_hour: Bytes the runner wrote in the sliding hour
+        window, e.g. ``7340032``.
+    :param observed_at: ISO-8601 UTC instant of the report, e.g.
+        ``"2026-09-23T09:25:00+00:00"``.
+    """
+
+    runner_id: str
+    session_id: str | None
+    bytes_last_hour: int
+    observed_at: str
 
 
 @dataclass
@@ -1314,6 +1342,7 @@ HostFrame = (
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostRunnerLogRunawayFrame
     | HostRunnerStatusFrame
     | HostRunnerStatusResultFrame
     | HostStatFrame
@@ -1480,6 +1509,16 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostRunnerLogRunawayFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUNNER_LOG_RUNAWAY.value,
+                "runner_id": frame.runner_id,
+                "session_id": frame.session_id,
+                "bytes_last_hour": frame.bytes_last_hour,
+                "observed_at": frame.observed_at,
             }
         )
     if isinstance(frame, HostRunnerStatusFrame):
@@ -1977,6 +2016,8 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.RUNNER_LOG_RUNAWAY:
+            return _decode_runner_log_runaway(msg)
         case HostFrameKind.RUNNER_STATUS:
             return _decode_runner_status(msg)
         case HostFrameKind.RUNNER_STATUS_RESULT:
@@ -2201,6 +2242,23 @@ def _decode_runner_exited(msg: _JsonObject) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+    )
+
+
+def _decode_runner_log_runaway(msg: _JsonObject) -> HostRunnerLogRunawayFrame:
+    """Decode a host.runner_log_runaway advisory frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.runner_log_runaway frame.
+    """
+    bytes_last_hour = msg.get("bytes_last_hour")
+    if not isinstance(bytes_last_hour, int) or isinstance(bytes_last_hour, bool):
+        raise ValueError("frame field must be an int: 'bytes_last_hour'")
+    return HostRunnerLogRunawayFrame(
+        runner_id=_required_str(msg, "runner_id"),
+        session_id=_optional_nullable_str(msg, "session_id"),
+        bytes_last_hour=bytes_last_hour,
+        observed_at=_required_str(msg, "observed_at"),
     )
 
 

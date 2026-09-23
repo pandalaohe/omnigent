@@ -3,9 +3,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import type { Conversation } from "@/hooks/useConversations";
+import { type ConversationsInfiniteData, mergeItemsIntoPages } from "@/lib/sessionListCache";
 import { BubbleView } from "./ChatPage";
 import {
   ConnectionIndicator,
+  RunnerLogRunawayBanner,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
 } from "./ChatIndicators";
@@ -39,6 +42,86 @@ describe("SandboxFailedIndicator", () => {
     render(<SandboxFailedIndicator status={{ stage: "failed", error: null }} />);
     expect(screen.getByTestId("error-headline")).toHaveTextContent("Sandbox launch failed");
     expect(screen.queryByText(/Sandbox launch failed:/)).not.toBeInTheDocument();
+  });
+});
+
+describe("RunnerLogRunawayBanner", () => {
+  it("shows the warning with the reported rate when the session is flagged", () => {
+    // WHY: the user must learn WHY the session's disk is filling before the
+    // runner's error loop gets out of hand, so the banner names the rate.
+    render(
+      <RunnerLogRunawayBanner
+        labels={{
+          "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
+          "omnigent.runner_log_runaway_mb": "7",
+        }}
+      />,
+    );
+    expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
+    expect(screen.getByText(/writing logs unusually fast \(7 MB in the last hour\)/)).toBeInTheDocument();
+    expect(screen.getByText(/may be stuck in an error loop/)).toBeInTheDocument();
+  });
+
+  it("renders nothing for an unflagged session", () => {
+    const { container } = render(<RunnerLogRunawayBanner labels={{}} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("still warns without the rate when the MB label is missing", () => {
+    render(
+      <RunnerLogRunawayBanner
+        labels={{ "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00" }}
+      />,
+    );
+    expect(screen.getByText(/writing logs unusually fast —/)).toBeInTheDocument();
+  });
+
+  it("uses the live list labels when the session snapshot has no warning", () => {
+    const row: Conversation = {
+      id: "conv_test",
+      object: "conversation",
+      title: "Test",
+      created_at: 0,
+      updated_at: 0,
+      labels: {},
+      permission_level: null,
+      status: "idle",
+    };
+    const cache: ConversationsInfiniteData = {
+      pages: [{ data: [row], first_id: row.id, last_id: row.id, has_more: false }],
+      pageParams: [undefined],
+    };
+    const { data: updated } = mergeItemsIntoPages(
+      cache,
+      new Map([
+        [row.id, {
+          id: row.id,
+          labels: {
+            "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
+            "omnigent.runner_log_runaway_mb": "7",
+          },
+        }],
+      ]),
+      { searchQuery: "", includeArchived: false },
+      row.id,
+    );
+    render(
+      <RunnerLogRunawayBanner
+        labels={updated?.pages[0].data[0].labels}
+        fallbackLabels={{}}
+      />,
+    );
+    expect(screen.getByTestId("runner-log-runaway-banner")).toHaveTextContent("7 MB in the last hour");
+  });
+
+  it("uses the session snapshot when the list row is unavailable", () => {
+    render(
+      <RunnerLogRunawayBanner
+        labels={undefined}
+        fallbackLabels={{ "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00" }}
+      />,
+    );
+    expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
   });
 });
 

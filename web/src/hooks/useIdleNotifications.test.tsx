@@ -346,6 +346,74 @@ describe("useIdleNotifications elicitation transitions", () => {
   });
 });
 
+describe("useIdleNotifications runner-log runaway transitions", () => {
+  const FLAG = "omnigent.runner_log_runaway";
+  const MB = "omnigent.runner_log_runaway_mb";
+  const BODY =
+    "This session's runner is writing logs unusually fast (7 MB in the last hour)" +
+    " — it may be stuck in an error loop.";
+
+  function runawayConv(id: string, flag?: string, mb = "7"): Conversation {
+    return {
+      ...conv(id, "running"),
+      labels: flag === undefined ? {} : { [FLAG]: flag, [MB]: mb },
+    };
+  }
+
+  it("notifies once when a session's runaway flag appears", () => {
+    setConversations([runawayConv("a")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([runawayConv("a", "2026-09-23T09:25:00Z")]);
+    rerender();
+
+    expect(showMock).toHaveBeenCalledOnce();
+    expect(showMock.mock.calls[0][0]).toMatchObject({
+      title: "a",
+      body: BODY,
+      tag: "omnigent:session:a",
+    });
+  });
+
+  it("does not re-notify while the flag value is unchanged", () => {
+    setConversations([runawayConv("a")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([runawayConv("a", "2026-09-23T09:25:00Z")]);
+    rerender();
+    showMock.mockClear();
+
+    // A poll refresh carrying the same value is the same detection.
+    rerender();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("notifies again for a new flag value (a fresh detection)", () => {
+    setConversations([runawayConv("a", "2026-09-23T09:25:00Z")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([runawayConv("a", "2026-09-23T09:25:00Z")]);
+    rerender();
+    showMock.mockClear();
+
+    setConversations([runawayConv("a", "2026-09-23T10:25:00Z")]);
+    rerender();
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not notify on a fresh load with an already-set flag", () => {
+    setConversations([runawayConv("a", "2026-09-23T09:25:00Z")]);
+    renderHook(() => useIdleNotifications());
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("does not notify a runaway flag on a session whose runner is offline", () => {
+    setConversations([runawayConv("a")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([{ ...runawayConv("a", "2026-09-23T09:25:00Z"), runner_online: false }]);
+    rerender();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("useIdleNotifications offline-runner suppression", () => {
   it("does NOT notify a transition on a session whose runner is offline (stale reconciliation)", async () => {
     // A dead-runner session flipping running -> failed is the server

@@ -433,6 +433,37 @@ def test_debug_logs_runner_session_reads_new_and_legacy_dirs(
     assert "runner-conv_abc-old.log" in result.output
 
 
+def test_debug_logs_ignores_rotated_archives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copytruncate archive (``runner-….log.1``) must not break ``debug logs``.
+
+    The retention sweep rotates a live log to ``<name>.1``; the globs must
+    keep resolving the live file (the archive is its copy, so it adds
+    nothing) and must never error on the extra files.
+    """
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_dir))
+    runner_dir = data_dir / "logs" / "runner"
+    runner_dir.mkdir(parents=True)
+    live = runner_dir / "runner-conv_abc-20260101-000000-000000.log"
+    live.write_text("live\n", encoding="utf-8")
+    (runner_dir / f"{live.name}.1").write_text("rotated\n", encoding="utf-8")
+
+    listed = CliRunner().invoke(cli, ["debug", "logs", "--type", "runner", "--list"])
+    assert listed.exit_code == 0, listed.output
+    assert live.name in listed.output
+    assert f"{live.name}.1" not in listed.output
+
+    tailed = CliRunner().invoke(
+        cli,
+        ["debug", "logs", "--type", "runner", "--session", "conv_abc", "-n", "0"],
+    )
+    assert tailed.exit_code == 0, tailed.output
+    assert "live" in tailed.output
+
+
 def test_debug_logs_host_daemon_alias_reads_host_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

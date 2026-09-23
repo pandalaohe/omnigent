@@ -50,6 +50,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerLogRunawayFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
     HostSkillsFrame,
@@ -899,6 +900,50 @@ def test_runner_exited_frame_missing_error_raises() -> None:
     """
     with pytest.raises(ValueError, match="missing required string field"):
         decode_host_frame('{"kind": "host.runner_exited", "runner_id": "runner_abc123"}')
+
+
+def test_runner_log_runaway_frame_round_trip() -> None:
+    """
+    Verify HostRunnerLogRunawayFrame survives encode → decode.
+
+    The advisory must arrive with the exact runner, session, byte count,
+    and observation instant — a lossy round-trip would mislabel the
+    session the web warns about.
+    """
+    original = HostRunnerLogRunawayFrame(
+        runner_id="runner_abc123",
+        session_id="conv_xyz",
+        bytes_last_hour=7 * 1024 * 1024,
+        observed_at="2026-09-23T09:25:00+00:00",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunnerLogRunawayFrame)
+    assert decoded.runner_id == "runner_abc123"
+    assert decoded.session_id == "conv_xyz"
+    assert decoded.bytes_last_hour == 7 * 1024 * 1024
+    assert decoded.observed_at == "2026-09-23T09:25:00+00:00"
+
+
+def test_runner_log_runaway_frame_round_trip_without_session() -> None:
+    """A frame from a session-less launch carries ``session_id=None``."""
+    original = HostRunnerLogRunawayFrame(
+        runner_id="runner_abc123",
+        session_id=None,
+        bytes_last_hour=6 * 1024 * 1024,
+        observed_at="2026-09-23T09:25:00+00:00",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunnerLogRunawayFrame)
+    assert decoded.session_id is None
+
+
+def test_runner_log_runaway_frame_missing_bytes_raises() -> None:
+    """A frame without the byte count is malformed and rejected."""
+    with pytest.raises(ValueError, match="bytes_last_hour"):
+        decode_host_frame(
+            '{"kind": "host.runner_log_runaway", "runner_id": "runner_abc123",'
+            ' "observed_at": "2026-09-23T09:25:00+00:00"}'
+        )
 
 
 def test_runner_status_frame_round_trip() -> None:

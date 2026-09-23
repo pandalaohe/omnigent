@@ -49,6 +49,7 @@ from omnigent.host.frames import (
     HostPostBindHookResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerLogRunawayFrame,
     HostRunnerStatusResultFrame,
     HostSkillsResultFrame,
     HostStatResultFrame,
@@ -70,6 +71,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
@@ -77,6 +79,13 @@ _logger = logging.getLogger(__name__)
 SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
+
+# Session labels carrying a ``host.runner_log_runaway`` report. The timestamp
+# makes the flag value change per detection, so the web's transition diff can
+# dedupe notifications by session id + value; the MB label carries the amount
+# the banner displays.
+RUNNER_LOG_RUNAWAY_LABEL_KEY = "omnigent.runner_log_runaway"
+RUNNER_LOG_RUNAWAY_MB_LABEL_KEY = "omnigent.runner_log_runaway_mb"
 
 
 def create_host_tunnel_router(
@@ -90,6 +99,7 @@ def create_host_tunnel_router(
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -131,6 +141,10 @@ def create_host_tunnel_router(
     :param runner_exit_reports: Shared store for ``host.runner_exited``
         reports, read by the runner status endpoint. ``None`` (e.g.
         minimal test wiring) drops the reports.
+    :param conversation_store: Store used to flag a session whose runner
+        reported runaway log growth (``host.runner_log_runaway``); the label
+        reaches the web over the session-updates stream. ``None`` (e.g.
+        minimal test wiring) drops the flag.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -340,6 +354,7 @@ def create_host_tunnel_router(
                     runner_exit_reports,
                     on_runner_exited,
                     on_host_update,
+                    conversation_store,
                 ),
                 name=f"host-receive:{host_id}",
             )
@@ -493,6 +508,35 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
         await ws.send_text(data)
 
 
+async def _mark_runner_log_runaway_sessions(
+    conversation_store: ConversationStore,
+    runner_id: str,
+    bytes_last_hour: int,
+    observed_at: str,
+) -> None:
+    """Flag every session bound to a runner reporting runaway log growth.
+
+    The label value is the report instant, so a fresh detection changes the
+    value and the web's transition diff can fire one notification per new
+    value; the MB label carries the amount for the banner copy.
+
+    :param conversation_store: Store holding the runner-bound sessions.
+    :param runner_id: Runner the host reported, e.g. ``"runner_abc123..."``.
+    :param bytes_last_hour: Bytes the runner wrote in the last hour.
+    :param observed_at: ISO-8601 report instant, e.g.
+        ``"2026-09-23T09:25:00+00:00"``.
+    """
+    sessions = await asyncio.to_thread(
+        conversation_store.list_conversations_by_runner_id, runner_id
+    )
+    labels = {
+        RUNNER_LOG_RUNAWAY_LABEL_KEY: observed_at,
+        RUNNER_LOG_RUNAWAY_MB_LABEL_KEY: str(max(1, round(bytes_last_hour / (1024 * 1024)))),
+    }
+    for session in sessions:
+        await asyncio.to_thread(conversation_store.set_labels, session.id, labels)
+
+
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -502,6 +546,7 @@ async def _receive_loop(
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
+    conversation_store: ConversationStore | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -519,6 +564,8 @@ async def _receive_loop(
         when a ``host.runner_exited`` frame arrives; ``None`` skips it.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
+    :param conversation_store: Store used to flag a session whose runner
+        reported runaway log growth; ``None`` drops the flag.
     """
     while True:
         message = await ws.receive()
@@ -643,6 +690,33 @@ async def _receive_loop(
                 # connecting its tunnel has no runner-tunnel disconnect
                 # event, so this report is the only failure signal.
                 await on_runner_exited(frame.runner_id, frame.error)
+            continue
+
+        if isinstance(frame, HostRunnerLogRunawayFrame):
+            # One-way advisory: the runner's log is growing fast, which usually
+            # means an error loop. Flag every session the runner serves so the
+            # web can warn; the label is picked up by the session-updates
+            # stream like any other session change.
+            _logger.warning(
+                "Host %s reported runner %s log runaway: %d bytes (observed_at=%s)",
+                host_id,
+                frame.runner_id,
+                frame.bytes_last_hour,
+                frame.observed_at,
+                extra=debug_event(
+                    "runner_log_runaway",
+                    host_id=host_id,
+                    runner_id=frame.runner_id,
+                    session_id=frame.session_id,
+                ),
+            )
+            if conversation_store is not None:
+                await _mark_runner_log_runaway_sessions(
+                    conversation_store,
+                    frame.runner_id,
+                    frame.bytes_last_hour,
+                    frame.observed_at,
+                )
             continue
 
         if isinstance(frame, HostRunnerStatusResultFrame):

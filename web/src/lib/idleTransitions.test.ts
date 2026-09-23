@@ -1,11 +1,14 @@
 import { describe, it, expect } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import { RUNNER_LOG_RUNAWAY_LABEL_KEY } from "@/lib/runnerLogRunaway";
 import {
   buildElicitationMap,
+  buildRunnerLogRunawayMap,
   buildStatusMap,
   computeUnreadBadgeIds,
   detectIdleTransitions,
   detectNewElicitations,
+  detectNewRunnerLogRunaways,
   type ConversationStatus,
 } from "./idleTransitions";
 
@@ -185,6 +188,71 @@ describe("buildElicitationMap", () => {
     // fresh load and never fire.
     const map = buildElicitationMap([convE("a")]);
     expect(map.get("a")).toBe(0);
+  });
+});
+
+describe("detectNewRunnerLogRunaways", () => {
+  function convRunaway(id: string, flag: string | undefined): Conversation {
+    return conv(id, "running", {
+      labels: flag === undefined ? {} : { [RUNNER_LOG_RUNAWAY_LABEL_KEY]: flag },
+    });
+  }
+
+  it("detects a first observed flag on a session the client already knew", () => {
+    const prev = new Map([["a", ""]]);
+    const result = detectNewRunnerLogRunaways(prev, [convRunaway("a", "2026-09-23T09:25:00Z")]);
+    expect(result.map((c) => c.id)).toEqual(["a"]);
+  });
+
+  it("detects a new flag value (a fresh report)", () => {
+    const prev = new Map([["a", "2026-09-23T09:25:00Z"]]);
+    const result = detectNewRunnerLogRunaways(prev, [convRunaway("a", "2026-09-23T10:25:00Z")]);
+    expect(result.map((c) => c.id)).toEqual(["a"]);
+  });
+
+  it("ignores an unchanged flag value (session id + value dedupe)", () => {
+    const prev = new Map([["a", "2026-09-23T09:25:00Z"]]);
+    const result = detectNewRunnerLogRunaways(prev, [convRunaway("a", "2026-09-23T09:25:00Z")]);
+    expect(result).toEqual([]);
+  });
+
+  it("ignores a session with no prior snapshot (fresh load)", () => {
+    // A page load that already sees a flagged session must not alert; only a
+    // transition this client observed does.
+    const result = detectNewRunnerLogRunaways(new Map(), [
+      convRunaway("a", "2026-09-23T09:25:00Z"),
+    ]);
+    expect(result).toEqual([]);
+  });
+
+  it("ignores unflagged sessions", () => {
+    const prev = new Map([["a", ""]]);
+    expect(detectNewRunnerLogRunaways(prev, [convRunaway("a", undefined)])).toEqual([]);
+  });
+
+  it("ignores archived sessions", () => {
+    const prev = new Map([["a", ""]]);
+    const archived = convRunaway("a", "2026-09-23T09:25:00Z");
+    archived.archived = true;
+    expect(detectNewRunnerLogRunaways(prev, [archived])).toEqual([]);
+  });
+});
+
+describe("buildRunnerLogRunawayMap", () => {
+  function convRunaway(id: string, flag?: string): Conversation {
+    return conv(id, "idle", {
+      labels: flag === undefined ? {} : { [RUNNER_LOG_RUNAWAY_LABEL_KEY]: flag },
+    });
+  }
+
+  it("keys each session's flag value by id", () => {
+    const map = buildRunnerLogRunawayMap([
+      convRunaway("a", "2026-09-23T09:25:00Z"),
+      convRunaway("b"),
+    ]);
+    expect(map.get("a")).toBe("2026-09-23T09:25:00Z");
+    // An unflagged session seeds as "" so a later flag still diffs as new.
+    expect(map.get("b")).toBe("");
   });
 });
 

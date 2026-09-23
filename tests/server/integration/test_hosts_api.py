@@ -1707,6 +1707,62 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
     assert received == [("runner_x", "exited with code 1")]
 
 
+async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> None:
+    """
+    A ``host.runner_log_runaway`` frame flags every session on that runner.
+
+    The host samples log growth; the server turns a report into session
+    labels that the session-updates stream pushes to the web, which shows
+    the warning banner. A failure here means a runaway runner stays silent
+    until the user notices the disk filling.
+    """
+    from omnigent.host.frames import HostRunnerLogRunawayFrame
+    from omnigent.server.routes.host_tunnel import (
+        RUNNER_LOG_RUNAWAY_LABEL_KEY,
+        RUNNER_LOG_RUNAWAY_MB_LABEL_KEY,
+    )
+
+    registry = HostRegistry()
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    hot = conv_store.create_conversation(agent_id=None, runner_id="runner_hot")
+    cool = conv_store.create_conversation(agent_id=None, runner_id="runner_cool")
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, host_store, conversation_store=conv_store),
+        prefix="/v1",
+    )
+
+    _comm = await _connect_host(app, registry)
+    await _comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostRunnerLogRunawayFrame(
+                    runner_id="runner_hot",
+                    session_id=hot.id,
+                    bytes_last_hour=7 * 1024 * 1024,
+                    observed_at="2026-09-23T09:25:00+00:00",
+                )
+            ),
+        }
+    )
+    # The receive loop processes the frame asynchronously — wait until the
+    # labels land (a hang here means the frame was dropped).
+    async with asyncio.timeout(2.0):
+        while RUNNER_LOG_RUNAWAY_LABEL_KEY not in (
+            conv_store.get_conversation(hot.id).labels or {}
+        ):
+            await asyncio.sleep(0.01)
+
+    labels = conv_store.get_conversation(hot.id).labels
+    assert labels[RUNNER_LOG_RUNAWAY_LABEL_KEY] == "2026-09-23T09:25:00+00:00"
+    assert labels[RUNNER_LOG_RUNAWAY_MB_LABEL_KEY] == "7"
+    # A session bound to another runner keeps no flag.
+    assert RUNNER_LOG_RUNAWAY_LABEL_KEY not in (conv_store.get_conversation(cool.id).labels or {})
+
+
 async def test_host_cli_retention_policy_defaults_and_cas_update(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
