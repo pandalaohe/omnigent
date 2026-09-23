@@ -15,7 +15,8 @@
 // all-default dialog stores an empty config.
 
 import { ChevronDownIcon } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -33,6 +34,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
@@ -48,7 +50,7 @@ import {
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
-import type { ProjectConfig } from "@/lib/projectsApi";
+import { getProjectCollaboration, type ProjectConfig } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
@@ -61,20 +63,28 @@ function Field({
   label,
   hint,
   htmlFor,
+  switchRow = false,
   children,
 }: {
   label: string;
   hint?: string;
   htmlFor?: string;
+  switchRow?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-      <label htmlFor={htmlFor} className="flex flex-col pt-1.5">
+    <div
+      className={
+        switchRow
+          ? "grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3 sm:grid-cols-[minmax(0,1fr)_18rem]"
+          : "grid min-w-0 grid-cols-1 gap-1.5 sm:grid-cols-[minmax(0,1fr)_18rem] sm:gap-4"
+      }
+    >
+      <label htmlFor={htmlFor} className="flex min-w-0 flex-col pt-1.5">
         <span className="font-medium text-ui">{label}</span>
         {hint && <span className="text-muted-foreground text-sm">{hint}</span>}
       </label>
-      <div className="sm:w-64">{children}</div>
+      <div className="min-w-0 w-full">{children}</div>
     </div>
   );
 }
@@ -145,6 +155,18 @@ export function ProjectSettingsDialog({
   // a native harness with a model choice; NONE stores no default (unset key).
   const [model, setModel] = useState<string>(NONE);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState("defaults");
+  const tabsId = useId();
+  const { data: collaborationStatus } = useQuery({
+    queryKey: ["project-collaboration", projectId],
+    queryFn: () => getProjectCollaboration(projectId!),
+    enabled: open && showCollaboration,
+    retry: false,
+  });
+
+  useEffect(() => {
+    if (open) setActiveTab("defaults");
+  }, [open]);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
   // DialogContent, so their dismiss (pick an option / click the body while
@@ -322,21 +344,59 @@ export function ProjectSettingsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         onClick={(e) => e.stopPropagation()}
-        className="max-h-[85vh] overflow-y-auto sm:max-w-lg"
+        className="flex w-[calc(100%-1rem)] max-w-[calc(100%-1rem)] flex-col gap-0 overflow-hidden rounded-2xl p-0 max-h-[85vh] sm:max-w-[45rem] sm:rounded-[30px]"
         // Keep a nested dropdown's dismiss (pick an option, or click the modal
         // body while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.
         onPointerDownOutside={guardDialogDismiss}
         onInteractOutside={guardDialogDismiss}
       >
-        <DialogHeader>
+        <DialogHeader className="shrink-0 border-b px-5 pt-5 sm:px-6 sm:pt-6">
           <DialogTitle>Project settings</DialogTitle>
           <DialogDescription>
-            Defaults for new sessions in <span className="font-medium">{projectName}</span>. Each is
-            a starting point you can change per session; leave a field blank for no default.
+            Defaults and collaboration for <b>{projectName}</b>.
           </DialogDescription>
+          {showCollaboration && (
+            <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+              <TabsList variant="line" className="mt-3 -mb-px w-full justify-start gap-4 px-0">
+                <TabsTrigger
+                  value="defaults"
+                  id={`${tabsId}-defaults-tab`}
+                  aria-controls="project-settings-defaults-form"
+                  className="flex-none px-2 pb-3"
+                >
+                  Session defaults
+                </TabsTrigger>
+                <TabsTrigger
+                  value="collaboration"
+                  id={`${tabsId}-collaboration-tab`}
+                  aria-controls={`${tabsId}-collaboration-panel`}
+                  className="flex-none px-2 pb-3"
+                >
+                  Collaboration
+                  {collaborationStatus?.enabled && (
+                    <span className="rounded-full bg-primary/10 px-1.5 text-xs text-primary">
+                      On
+                    </span>
+                  )}
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
+          )}
         </DialogHeader>
-        <form onSubmit={onSubmit} className="flex flex-col gap-4">
+        <form
+          id="project-settings-defaults-form"
+          role={showCollaboration ? "tabpanel" : undefined}
+          aria-labelledby={showCollaboration ? `${tabsId}-defaults-tab` : undefined}
+          tabIndex={showCollaboration ? 0 : undefined}
+          onSubmit={onSubmit}
+          hidden={activeTab !== "defaults"}
+          className={
+            activeTab === "defaults"
+              ? "flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden px-5 py-5 sm:px-6"
+              : "hidden"
+          }
+        >
           <Field label="Host" hint="Where new sessions run by default">
             <Select
               value={hostId}
@@ -408,7 +468,12 @@ export function ProjectSettingsDialog({
                   disabled={isLoading}
                   className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
+                  <span
+                    className={
+                      workspace ? "min-w-0 truncate font-mono" : "truncate text-muted-foreground"
+                    }
+                    title={workspace || undefined}
+                  >
                     {workspace || "Browse…"}
                   </span>
                   <ChevronDownIcon
@@ -420,8 +485,8 @@ export function ProjectSettingsDialog({
                 {workspaceOpen && (
                   <>
                     {/* Click-away: a transparent full-modal backdrop that
-                          closes the browser (keeping the current path) on any
-                          click outside it. */}
+                    closes the browser (keeping the current path) on any
+                    click outside it. */}
                     <button
                       type="button"
                       aria-label="Close directory browser"
@@ -447,6 +512,7 @@ export function ProjectSettingsDialog({
                 className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 placeholder="/path/to/repo"
                 value={workspace}
+                title={workspace || undefined}
                 onChange={(e) => setWorkspace(e.target.value)}
                 disabled={isLoading}
               />
@@ -454,10 +520,11 @@ export function ProjectSettingsDialog({
           </Field>
 
           <Field
+            switchRow
             label="Random worktree"
             hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
           >
-            <div className="flex sm:justify-end">
+            <div className="flex justify-end">
               <Switch
                 data-testid="project-settings-worktree"
                 checked={useWorktree}
@@ -588,29 +655,51 @@ export function ProjectSettingsDialog({
               {(updateConfig.error as Error).message}
             </p>
           )}
-
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              disabled={updateConfig.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              data-testid="project-settings-save"
-              loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed}
-            >
-              Save
-            </Button>
-          </DialogFooter>
         </form>
         {showCollaboration && projectId !== null && (
-          <ProjectCollaborationSection projectId={projectId} />
+          <div
+            id={`${tabsId}-collaboration-panel`}
+            role="tabpanel"
+            aria-labelledby={`${tabsId}-collaboration-tab`}
+            tabIndex={0}
+            hidden={activeTab !== "collaboration"}
+            className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-5 py-5 sm:px-6"
+          >
+            <ProjectCollaborationSection projectId={projectId} />
+          </div>
         )}
+        <DialogFooter className="m-0 shrink-0 rounded-none border-t bg-popover px-5 py-4 sm:px-6 sm:py-4">
+          {activeTab === "defaults" ? (
+            <>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => onOpenChange(false)}
+                disabled={updateConfig.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                form="project-settings-defaults-form"
+                data-testid="project-settings-save"
+                loading={updateConfig.isPending}
+                disabled={isLoading || loadFailed}
+              >
+                Save
+              </Button>
+            </>
+          ) : (
+            <>
+              <span className="mr-auto self-center text-sm text-muted-foreground">
+                Changes here save immediately.
+              </span>
+              <Button type="button" onClick={() => onOpenChange(false)}>
+                Done
+              </Button>
+            </>
+          )}
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

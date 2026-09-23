@@ -33,6 +33,7 @@ from tests.e2e_ui.conftest import fetch_with_retry
 
 _HOST_ID = "host_e2e_collab"
 _BAD_WORKSPACE = "/does/not/exist"
+_LONG_URL = "https://example.com/" + "very-long-segment/" * 15 + "web.git"
 _BAD_PATH_MESSAGE = "host stat failed for path '/does/not/exist': No such file or directory"
 
 
@@ -247,6 +248,8 @@ def test_collaboration_enable_repo_and_rejected_binding(
 
     _open_project_settings(page, project)
 
+    page.get_by_role("tab", name="Collaboration").click()
+
     # The collaboration switch starts OFF (revision 1 in the stub).
     toggle = page.get_by_test_id("project-collaboration-enabled")
     expect(toggle).to_be_visible()
@@ -255,22 +258,28 @@ def test_collaboration_enable_repo_and_rejected_binding(
     # Flip it ON — the PATCH carries the loaded revision.
     toggle.click()
     expect(toggle).to_have_attribute("data-state", "checked")
-    expect(page.get_by_test_id("project-collaboration-repo-add")).to_be_enabled()
+    expect(page.get_by_test_id("project-collaboration-repo-open")).to_be_enabled()
     assert patch_bodies[0] == {"enabled": True, "expected_revision": 1}
 
     # Register a repository (manifest left blank → the server default applies).
+    page.get_by_test_id("project-collaboration-repo-open").click()
     page.get_by_test_id("project-collaboration-repo-name").fill("web")
-    page.get_by_test_id("project-collaboration-repo-url").fill("https://example.com/web.git")
+    page.get_by_test_id("project-collaboration-repo-url").fill(_LONG_URL)
     page.get_by_test_id("project-collaboration-repo-add").click()
     expect(page.get_by_test_id("project-collaboration-repo-remove-web")).to_be_visible()
+    dialog = page.get_by_role("dialog", name="Project settings")
+    for width in (400, 768, 1024, 1440):
+        page.set_viewport_size({"width": width, "height": 900})
+        assert dialog.evaluate("node => node.scrollWidth <= node.clientWidth")
 
     # A binding whose workspace the host rejects: the server's message shows
     # verbatim and no binding row appears.
+    page.get_by_test_id("project-collaboration-binding-open").click()
     page.get_by_test_id("project-collaboration-binding-workspace").fill(_BAD_WORKSPACE)
     page.get_by_test_id("project-collaboration-binding-add").click()
     expect(page.get_by_test_id("project-collaboration-error")).to_have_text(_BAD_PATH_MESSAGE)
     expect(
-        page.get_by_test_id(f"project-collaboration-binding-verify-{_HOST_ID}-primary")
+        page.get_by_test_id(f"project-collaboration-binding-verify-{_HOST_ID}-web")
     ).to_have_count(0)
 
     # Exact request contract: the enable PATCH, the repository PUT body, and
@@ -280,14 +289,14 @@ def test_collaboration_enable_repo_and_rejected_binding(
         {
             "path": f"/v1/projects/{project_id}/repositories/web",
             "body": {
-                "remote_url": "https://example.com/web.git",
+                "remote_url": _LONG_URL,
                 "default_branch": "main",
             },
         }
     ]
     assert binding_puts == [
         {
-            "path": f"/v1/projects/{project_id}/hosts/{_HOST_ID}/bindings/primary",
+            "path": f"/v1/projects/{project_id}/hosts/{_HOST_ID}/bindings/web",
             "body": {
                 "workspace": _BAD_WORKSPACE,
                 "repository_name": "web",
@@ -311,3 +320,4 @@ def test_collaboration_section_absent_when_feature_is_off(
 
     _open_project_settings(page, project)
     expect(page.get_by_test_id("project-collaboration-section")).to_have_count(0)
+    expect(page.get_by_role("tablist")).to_have_count(0)

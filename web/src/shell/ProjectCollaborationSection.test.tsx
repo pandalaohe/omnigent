@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 
 import { ProjectCollaborationSection } from "./ProjectCollaborationSection";
 import {
@@ -24,10 +25,25 @@ vi.mock("@/lib/projectsApi", () => ({
   setProjectCollaborationEnabled: vi.fn(),
   verifyProjectHostBinding: vi.fn(),
 }));
+vi.mock("./WorkspacePicker", () => ({
+  isNavigablePath: (path: string) => path.startsWith("/"),
+  HostWorkspacePicker: ({ onNavigate }: { onNavigate: (path: string) => void }) => (
+    <div>
+      <input data-testid="mock-checkout-picker-input" />
+      <button type="button" onClick={() => onNavigate("/picked/path")}>
+        Choose folder
+      </button>
+      <button type="button" onClick={() => onNavigate("/entered/path")}>
+        Open folder with Enter
+      </button>
+    </div>
+  ),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({
     data: [
       { host_id: "h1", name: "Laptop", owner: "me", status: "online" },
+      { host_id: "h2", name: "Desktop", owner: "me", status: "online" },
       {
         host_id: "sandbox-1",
         name: "Sandbox",
@@ -75,7 +91,7 @@ function binding(overrides: Record<string, unknown> = {}) {
     id: "b_1",
     project_id: "p_1",
     host_id: "h1",
-    name: "primary",
+    name: "web",
     is_primary: true,
     repository_id: "r_1",
     workspace: "/repo",
@@ -86,6 +102,20 @@ function binding(overrides: Record<string, unknown> = {}) {
     updated_at: null,
     ...overrides,
   };
+}
+
+async function openRepoForm() {
+  await waitFor(() =>
+    expect(screen.getByTestId("project-collaboration-repo-open")).toBeInTheDocument(),
+  );
+  fireEvent.click(screen.getByTestId("project-collaboration-repo-open"));
+}
+
+async function openBindingForm() {
+  await waitFor(() =>
+    expect(screen.getByTestId("project-collaboration-binding-open")).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByTestId("project-collaboration-binding-open"));
 }
 
 function renderSection() {
@@ -155,9 +185,7 @@ describe("ProjectCollaborationSection", () => {
     getMock.mockResolvedValue(collaboration());
     putRepoMock.mockResolvedValue(repo());
     renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-repo-add")).toBeInTheDocument(),
-    );
+    await openRepoForm();
 
     fireEvent.change(screen.getByTestId("project-collaboration-repo-name"), {
       target: { value: "web" },
@@ -175,12 +203,36 @@ describe("ProjectCollaborationSection", () => {
     expect(putRepoMock.mock.calls[0]![2]).not.toHaveProperty("context_manifest_path");
   });
 
-  it("adds a binding with host, name, and body", async () => {
+  it("shows a rejected repository add inside its form while the checkout form is open", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()] }));
+    putRepoMock.mockRejectedValueOnce(new Error("Repository rejected"));
+    renderSection();
+    await openRepoForm();
+    await openBindingForm();
+    fireEvent.change(screen.getByTestId("project-collaboration-repo-url"), {
+      target: { value: "https://example.com/other.git" },
+    });
+    const repoForm = screen.getByTestId("project-collaboration-repo-add").closest("form");
+    const checkoutForm = screen.getByTestId("project-collaboration-binding-add").closest("form");
+    fireEvent.submit(repoForm!);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-error")).toHaveTextContent(
+        "Repository rejected",
+      ),
+    );
+    const errors = screen.getAllByTestId("project-collaboration-error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].closest("form")).toBe(repoForm);
+    expect(checkoutForm).not.toContainElement(errors[0]);
+  });
+
+  it("sends the repository name for a blank checkout name", async () => {
     const added = {
       id: "b_1",
       project_id: "p_1",
       host_id: "h1",
-      name: "primary",
+      name: "web",
       is_primary: true,
       repository_id: "r_1",
       workspace: "/repo",
@@ -197,15 +249,13 @@ describe("ProjectCollaborationSection", () => {
       .mockResolvedValue(collaboration({ repositories: [repo()], bindings: [added] }));
     putBindingMock.mockResolvedValue(added);
     renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-binding-add")).toBeInTheDocument(),
-    );
+    await openBindingForm();
 
     // Sandbox hosts are never binding targets.
     const hostOptions = Array.from(
       (screen.getByTestId("project-collaboration-binding-host") as HTMLSelectElement).options,
     ).map((o) => o.value);
-    expect(hostOptions).toEqual(["h1"]);
+    expect(hostOptions).toEqual(["h1", "h2"]);
 
     fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
       target: { value: "/repo" },
@@ -213,20 +263,17 @@ describe("ProjectCollaborationSection", () => {
     fireEvent.submit(screen.getByTestId("project-collaboration-binding-add").closest("form")!);
 
     await waitFor(() => expect(putBindingMock).toHaveBeenCalled());
-    expect(putBindingMock).toHaveBeenCalledWith("p_1", "h1", "primary", {
+    expect(putBindingMock).toHaveBeenCalledWith("p_1", "h1", "web", {
       workspace: "/repo",
       repository_name: "web",
       is_primary: true,
     });
     // The refetched binding renders under its host's group.
     await waitFor(() =>
-      expect(
-        screen.getByTestId("project-collaboration-binding-verify-h1-primary"),
-      ).toBeInTheDocument(),
+      expect(screen.getByTestId("project-collaboration-binding-verify-h1-web")).toBeInTheDocument(),
     );
-    // Host select option + the binding's host group header.
-    expect(screen.getAllByText("Laptop")).toHaveLength(2);
-    expect(screen.getByText("web · /repo")).toBeInTheDocument();
+    expect(screen.getByText("Laptop")).toBeInTheDocument();
+    expect(screen.getByText("web repository · checkout name: web")).toBeInTheDocument();
   });
 
   it("warns with exit code and output when the post-bind command fails", async () => {
@@ -240,9 +287,7 @@ describe("ProjectCollaborationSection", () => {
       .mockResolvedValue(collaboration({ repositories: [repo()], bindings: [added] }));
     putBindingMock.mockResolvedValue(added);
     renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-binding-add")).toBeInTheDocument(),
-    );
+    await openBindingForm();
 
     fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
       target: { value: "/repo" },
@@ -258,9 +303,7 @@ describe("ProjectCollaborationSection", () => {
     expect(warning).toHaveTextContent("exit code 3");
     expect(warning).toHaveTextContent("boom");
     await waitFor(() =>
-      expect(
-        screen.getByTestId("project-collaboration-binding-verify-h1-primary"),
-      ).toBeInTheDocument(),
+      expect(screen.getByTestId("project-collaboration-binding-verify-h1-web")).toBeInTheDocument(),
     );
   });
 
@@ -273,9 +316,7 @@ describe("ProjectCollaborationSection", () => {
       .mockResolvedValue(collaboration({ repositories: [repo()], bindings: [added] }));
     putBindingMock.mockResolvedValue(added);
     renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-binding-add")).toBeInTheDocument(),
-    );
+    await openBindingForm();
 
     fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
       target: { value: "/repo" },
@@ -283,9 +324,7 @@ describe("ProjectCollaborationSection", () => {
     fireEvent.submit(screen.getByTestId("project-collaboration-binding-add").closest("form")!);
 
     await waitFor(() =>
-      expect(
-        screen.getByTestId("project-collaboration-binding-verify-h1-primary"),
-      ).toBeInTheDocument(),
+      expect(screen.getByTestId("project-collaboration-binding-verify-h1-web")).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("project-collaboration-hook-warning")).not.toBeInTheDocument();
   });
@@ -304,12 +343,10 @@ describe("ProjectCollaborationSection", () => {
     );
     renderSection();
     await waitFor(() =>
-      expect(
-        screen.getByTestId("project-collaboration-binding-verify-h1-primary"),
-      ).toBeInTheDocument(),
+      expect(screen.getByTestId("project-collaboration-binding-verify-h1-web")).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByTestId("project-collaboration-binding-verify-h1-primary"));
+    fireEvent.click(screen.getByTestId("project-collaboration-binding-verify-h1-web"));
 
     await waitFor(() =>
       expect(screen.getByTestId("project-collaboration-hook-warning")).toHaveTextContent(
@@ -328,9 +365,7 @@ describe("ProjectCollaborationSection", () => {
         }),
     );
     renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-repo-add")).toBeInTheDocument(),
-    );
+    await openRepoForm();
 
     fireEvent.change(screen.getByTestId("project-collaboration-repo-name"), {
       target: { value: "web" },
@@ -349,7 +384,7 @@ describe("ProjectCollaborationSection", () => {
     expect(screen.getByTestId("project-collaboration-repo-add")).toBeDisabled();
     resolveAdd!(repo());
     await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-repo-name")).toBeEnabled(),
+      expect(screen.queryByTestId("project-collaboration-repo-name")).not.toBeInTheDocument(),
     );
   });
 
@@ -364,9 +399,7 @@ describe("ProjectCollaborationSection", () => {
         }),
     );
     renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-binding-add")).toBeInTheDocument(),
-    );
+    await openBindingForm();
 
     fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
       target: { value: "/repo" },
@@ -381,7 +414,7 @@ describe("ProjectCollaborationSection", () => {
       id: "b_1",
       project_id: "p_1",
       host_id: "h1",
-      name: "primary",
+      name: "web",
       is_primary: true,
       repository_id: "r_1",
       workspace: "/repo",
@@ -392,7 +425,9 @@ describe("ProjectCollaborationSection", () => {
       updated_at: null,
     });
     await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-binding-workspace")).toBeEnabled(),
+      expect(
+        screen.queryByTestId("project-collaboration-binding-workspace"),
+      ).not.toBeInTheDocument(),
     );
   });
 
@@ -413,7 +448,7 @@ describe("ProjectCollaborationSection", () => {
       id: "b_1",
       project_id: "p_1",
       host_id: "h1",
-      name: "primary",
+      name: "web",
       is_primary: true,
       repository_id: "r_1",
       workspace: "/repo",
@@ -424,9 +459,7 @@ describe("ProjectCollaborationSection", () => {
       updated_at: null,
     });
     renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-binding-repo")).toBeInTheDocument(),
-    );
+    await openBindingForm();
 
     fireEvent.change(screen.getByTestId("project-collaboration-binding-repo"), {
       target: { value: "api" },
@@ -444,7 +477,7 @@ describe("ProjectCollaborationSection", () => {
     fireEvent.submit(screen.getByTestId("project-collaboration-binding-add").closest("form")!);
 
     await waitFor(() => expect(putBindingMock).toHaveBeenCalled());
-    expect(putBindingMock).toHaveBeenCalledWith("p_1", "h1", "primary", {
+    expect(putBindingMock).toHaveBeenCalledWith("p_1", "h1", "web", {
       workspace: "/repo",
       repository_name: "web",
       is_primary: true,
@@ -456,9 +489,7 @@ describe("ProjectCollaborationSection", () => {
     getMock.mockResolvedValue(collaboration({ repositories: [repo()] }));
     putBindingMock.mockRejectedValueOnce(new ApiError(message, 400, "invalid_input"));
     renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-binding-add")).toBeInTheDocument(),
-    );
+    await openBindingForm();
 
     fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
       target: { value: "/does/not/exist" },
@@ -468,8 +499,11 @@ describe("ProjectCollaborationSection", () => {
     await waitFor(() =>
       expect(screen.getByTestId("project-collaboration-error")).toHaveTextContent(message),
     );
+    expect(screen.getByTestId("project-collaboration-error").closest("form")).toBe(
+      screen.getByTestId("project-collaboration-binding-add").closest("form"),
+    );
     expect(
-      screen.queryByTestId("project-collaboration-binding-verify-h1-primary"),
+      screen.queryByTestId("project-collaboration-binding-verify-h1-web"),
     ).not.toBeInTheDocument();
   });
 
@@ -513,6 +547,137 @@ describe("ProjectCollaborationSection", () => {
     expect(lines[0]).toHaveTextContent(/no primary binding/);
     expect(lines[1]).toHaveTextContent(/Laptop/);
     expect(lines[1]).toHaveTextContent(/no longer registered/);
+  });
+
+  it("hints only when two checkouts on the same host share a folder", async () => {
+    getMock
+      .mockResolvedValueOnce(
+        collaboration({
+          repositories: [repo()],
+          bindings: [binding(), binding({ id: "b_2", name: "extra", workspace: "/repo\\" })],
+        }),
+      )
+      .mockResolvedValueOnce(
+        collaboration({
+          repositories: [repo()],
+          bindings: [
+            binding(),
+            binding({ id: "b_2", host_id: "h2", name: "extra", workspace: "/repo/" }),
+          ],
+        }),
+      );
+    renderSection();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-duplicate-folder")).toHaveTextContent(
+        "Same folder as “web”",
+      ),
+    );
+    cleanup();
+    renderSection();
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("project-collaboration-binding-verify-h2-extra"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("project-collaboration-duplicate-folder")).not.toBeInTheDocument();
+  });
+
+  it("preserves the primary flag when replacing the host's default checkout", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    putBindingMock.mockResolvedValue(binding());
+    renderSection();
+    await openBindingForm();
+    expect(screen.getByTestId("project-collaboration-binding-replace-warning")).toHaveTextContent(
+      "A checkout named “web” already exists on Laptop and will be replaced.",
+    );
+    expect(screen.getByTestId("project-collaboration-binding-primary")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
+      target: { value: "/replacement" },
+    });
+    fireEvent.submit(screen.getByTestId("project-collaboration-binding-add").closest("form")!);
+    await waitFor(() => expect(putBindingMock).toHaveBeenCalled());
+    expect(putBindingMock).toHaveBeenCalledWith("p_1", "h1", "web", {
+      workspace: "/replacement",
+      repository_name: "web",
+      is_primary: true,
+    });
+  });
+
+  it("disables the primary switch when another checkout is already the host default", async () => {
+    getMock.mockResolvedValue(
+      collaboration({ repositories: [repo()], bindings: [binding({ name: "main" })] }),
+    );
+    renderSection();
+    await openBindingForm();
+    expect(screen.getByTestId("project-collaboration-binding-primary")).toBeDisabled();
+    expect(screen.getByText("“main” is this host's default checkout.")).toBeInTheDocument();
+  });
+
+  it("does not submit the checkout form when Enter is pressed in Browse", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()] }));
+    renderSection();
+    await openBindingForm();
+    fireEvent.change(screen.getByTestId("project-collaboration-binding-workspace"), {
+      target: { value: "/repo" },
+    });
+    fireEvent.click(screen.getByTestId("project-collaboration-binding-browse"));
+    await userEvent.type(screen.getByTestId("mock-checkout-picker-input"), "{Enter}");
+    expect(putBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a folder when Enter activates a button in Browse", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()] }));
+    renderSection();
+    await openBindingForm();
+    fireEvent.click(screen.getByTestId("project-collaboration-binding-browse"));
+    const folderButton = screen.getByRole("button", { name: "Open folder with Enter" });
+    folderButton.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(screen.getByTestId("project-collaboration-binding-workspace")).toHaveValue(
+      "/entered/path",
+    );
+  });
+
+  it("shows why checkout actions are disabled before a repository exists", async () => {
+    getMock.mockResolvedValue(collaboration());
+    renderSection();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-binding-open")).toBeDisabled(),
+    );
+    expect(screen.getByText("Add a repository first.")).toBeVisible();
+  });
+
+  it("fills the folder by browsing and allows editing it afterward", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()] }));
+    renderSection();
+    await openBindingForm();
+    const input = screen.getByTestId("project-collaboration-binding-workspace");
+    fireEvent.change(input, { target: { value: "/typed" } });
+    fireEvent.click(screen.getByTestId("project-collaboration-binding-browse"));
+    fireEvent.click(screen.getByText("Choose folder"));
+    expect(input).toHaveValue("/picked/path");
+    fireEvent.change(input, { target: { value: "/edited/path" } });
+    expect(input).toHaveValue("/edited/path");
+  });
+
+  it("auto-fills the repository name until it is edited", async () => {
+    getMock.mockResolvedValue(collaboration());
+    renderSection();
+    await openRepoForm();
+    fireEvent.change(screen.getByTestId("project-collaboration-repo-url"), {
+      target: { value: "git@example.com:team/api.git" },
+    });
+    expect(screen.getByTestId("project-collaboration-repo-name")).toHaveValue("api");
+    fireEvent.change(screen.getByTestId("project-collaboration-repo-name"), {
+      target: { value: "service" },
+    });
+    fireEvent.change(screen.getByTestId("project-collaboration-repo-url"), {
+      target: { value: "https://example.com/other.git" },
+    });
+    expect(screen.getByTestId("project-collaboration-repo-name")).toHaveValue("service");
   });
 
   it("shows a load error with no controls when the fetch fails", async () => {

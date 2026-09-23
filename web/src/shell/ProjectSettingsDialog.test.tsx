@@ -90,18 +90,21 @@ const createMock = vi.mocked(createProject);
 
 function renderDialog(projectId: string | null = "p_1") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const onOpenChange = vi.fn();
+  const view = (open: boolean) => (
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <ProjectSettingsDialog
-          open
-          onOpenChange={vi.fn()}
+          open={open}
+          onOpenChange={onOpenChange}
           projectId={projectId}
           projectName="Work"
         />
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(view(true));
+  return { ...result, onOpenChange, rerenderOpen: (open: boolean) => result.rerender(view(open)) };
 }
 
 beforeEach(() => {
@@ -345,7 +348,7 @@ describe("ProjectSettingsDialog", () => {
     expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(true);
 
     // Even if a submit is forced, onSubmit bails — no clearing PATCH is sent.
-    fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
+    fireEvent.submit(document.getElementById("project-settings-defaults-form")!);
     expect(updateMock).not.toHaveBeenCalled();
   });
 
@@ -394,9 +397,11 @@ describe("ProjectSettingsDialog", () => {
     expect(screen.queryByTestId("project-collaboration-section")).not.toBeInTheDocument();
     expect(screen.queryByTestId("project-collaboration-enabled")).not.toBeInTheDocument();
     expect(getCollaborationMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    expect(document.getElementById("project-settings-defaults-form")).not.toHaveAttribute("role");
   });
 
-  it("shows the collaboration section when the project_assignments feature is on", async () => {
+  it("connects each tab to its labelled panel when collaboration is enabled", async () => {
     serverInfoMock.mockReturnValue({
       managed_sandboxes_enabled: false,
       sandbox_provider: null,
@@ -411,15 +416,89 @@ describe("ProjectSettingsDialog", () => {
       problems: [],
     });
     renderDialog();
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs).toHaveLength(2);
+    for (const tab of tabs) {
+      const panel = document.getElementById(tab.getAttribute("aria-controls")!);
+      expect(panel).toHaveAttribute("role", "tabpanel");
+      expect(panel).toHaveAttribute("aria-labelledby", tab.id);
+      expect(panel).toHaveAttribute("tabindex", "0");
+    }
+  });
+
+  it("shows tab-specific actions and preserves the defaults draft", async () => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: false,
+      sandbox_provider: null,
+      features: { project_assignments: true },
+    });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    getCollaborationMock.mockResolvedValue({
+      enabled: false,
+      revision: 1,
+      repositories: [],
+      bindings: [],
+      problems: [],
+    });
+    const { rerenderOpen } = renderDialog();
     await waitFor(() =>
       expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
         false,
       ),
     );
 
-    expect(screen.getByTestId("project-collaboration-section")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Collaboration" }), { button: 0 });
     await waitFor(() =>
       expect(screen.getByTestId("project-collaboration-enabled")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("project-settings-save")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Session defaults" }), { button: 0 });
+    expect(screen.getByTestId("project-settings-save")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-worktree")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Collaboration" }), { button: 0 });
+    rerenderOpen(false);
+    rerenderOpen(true);
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Session defaults" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    expect(screen.getByTestId("project-settings-save")).toBeInTheDocument();
+  });
+
+  it("preserves the repository draft when switching away from Collaboration", async () => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: false,
+      sandbox_provider: null,
+      features: { project_assignments: true },
+    });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    getCollaborationMock.mockResolvedValue({
+      enabled: false,
+      revision: 1,
+      repositories: [],
+      bindings: [],
+      problems: [],
+    });
+    renderDialog();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Collaboration" }), { button: 0 });
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-repo-open")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-collaboration-repo-open"));
+    fireEvent.change(screen.getByTestId("project-collaboration-repo-url"), {
+      target: { value: "https://example.com/draft.git" },
+    });
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Session defaults" }), { button: 0 });
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Collaboration" }), { button: 0 });
+    expect(screen.getByTestId("project-collaboration-repo-url")).toHaveValue(
+      "https://example.com/draft.git",
     );
   });
 });
