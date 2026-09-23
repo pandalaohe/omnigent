@@ -23,6 +23,9 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_STARTUP_DELAY_S = 3.0
 _DEFAULT_LOCK_RETRY_S = 0.5
+# A long-lived host sees no runner lifecycle events for hours, so a periodic
+# self-trigger keeps orphan cleanup running while the host stays up.
+_DEFAULT_PERIODIC_INTERVAL_S = 600.0
 
 MaintenanceStage = tuple[str, Callable[[], Awaitable[object]]]
 _LockOutcome = Literal["acquired", "busy", "failed"]
@@ -83,18 +86,21 @@ class HostMaintenanceJanitor:
         lock_path: Path,
         startup_delay_s: float = _DEFAULT_STARTUP_DELAY_S,
         lock_retry_s: float = _DEFAULT_LOCK_RETRY_S,
+        periodic_interval_s: float = _DEFAULT_PERIODIC_INTERVAL_S,
         stage_skip_reasons: Mapping[str, Collection[str]] | None = None,
     ) -> None:
         self._stages = tuple(stages)
         self._lock_path = lock_path
         self._startup_delay_s = startup_delay_s
         self._lock_retry_s = lock_retry_s
+        self._periodic_interval_s = periodic_interval_s
         self._stage_skip_reasons = {
             stage_name: frozenset(reasons)
             for stage_name, reasons in (stage_skip_reasons or {}).items()
         }
         self._pending_reasons: set[str] = set()
         self._startup_task: asyncio.Task[None] | None = None
+        self._periodic_task: asyncio.Task[None] | None = None
         self._task: asyncio.Task[None] | None = None
         self._started = False
         self._closing = False
@@ -127,10 +133,13 @@ class HostMaintenanceJanitor:
 
         async def _reconcile_codex_processes() -> object:
             from omnigent.harnesses.codex_native.process_registry import (
+                reap_orphaned_codex_model_probes,
                 reconcile_codex_native_process_registry,
             )
 
-            return await _run_sync_stage(reconcile_codex_native_process_registry)
+            reconciled = await _run_sync_stage(reconcile_codex_native_process_registry)
+            orphaned_probes = await _run_sync_stage(reap_orphaned_codex_model_probes)
+            return {"registry": reconciled, "orphaned_probes": orphaned_probes}
 
         async def _reap_terminals() -> object:
             from omnigent.inner.terminal import reap_orphaned_terminals
@@ -154,13 +163,17 @@ class HostMaintenanceJanitor:
         )
 
     def start(self) -> None:
-        """Schedule one delayed startup pass without waiting for it."""
+        """Schedule one delayed startup pass and the periodic self-trigger."""
         if self._closing or self._started:
             return
         self._started = True
         self._startup_task = asyncio.create_task(
             self._trigger_after_startup_delay(),
             name="host-global-maintenance-startup-delay",
+        )
+        self._periodic_task = asyncio.create_task(
+            self._trigger_periodically(),
+            name="host-global-maintenance-periodic",
         )
 
     def trigger(self, reason: str) -> None:
@@ -179,8 +192,15 @@ class HostMaintenanceJanitor:
             )
 
     async def shutdown(self) -> None:
-        """Cancel delayed and active work during host shutdown."""
+        """Cancel delayed, periodic, and active work during host shutdown."""
         self._closing = True
+        periodic_task = self._periodic_task
+        if periodic_task is not None:
+            if not periodic_task.done():
+                periodic_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await periodic_task
+            self._periodic_task = None
         startup_task = self._startup_task
         if startup_task is not None:
             if not startup_task.done():
@@ -206,6 +226,15 @@ class HostMaintenanceJanitor:
             self.trigger("host_startup")
         finally:
             self._startup_task = None
+
+    async def _trigger_periodically(self) -> None:
+        """Self-trigger cleanup every :attr:`_periodic_interval_s` while running."""
+        try:
+            while not self._closing:
+                await asyncio.sleep(self._periodic_interval_s)
+                self.trigger("host_periodic")
+        finally:
+            self._periodic_task = None
 
     async def _drain_pending(self) -> None:
         try:

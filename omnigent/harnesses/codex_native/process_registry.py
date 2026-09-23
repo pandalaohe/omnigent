@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,24 @@ _logger = logging.getLogger(__name__)
 _REGISTRY_FILE = "process-registry.json"
 _OWNER_LOCK_DIR = "process-owners"
 _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
+# Seconds to wait after SIGTERM before escalating a process group to SIGKILL.
+_PROCESS_GROUP_GRACE_S = 1.5
+_PROCESS_GROUP_POLL_S = 0.05
+# Model-probe tag family and how long a probe may run before an
+# orphaned-to-init process counts as stranded:
+# app_server._MODEL_CATALOG_PROBE_TIMEOUT_SECONDS (30 s) plus a wide margin.
+_MODEL_PROBE_TAG_PREFIX = "codex-model-probe-"
+_MODEL_PROBE_ORPHAN_MIN_AGE_S = 300.0
+
+
+def _model_probe_tag_prefix() -> str:
+    root = str(_codex_native_state_root().resolve()).encode("utf-8")
+    return f"{_MODEL_PROBE_TAG_PREFIX}{hashlib.sha256(root).hexdigest()[:8]}-"
+
+
+def codex_model_probe_session_tag() -> str:
+    """Create a probe tag scoped to this native state root."""
+    return f"{_model_probe_tag_prefix()}{uuid.uuid4().hex}"
 
 
 @dataclass(frozen=True)
@@ -191,7 +210,7 @@ def unregister_codex_native_process(
         _write_registry(path, entries)
 
 
-def reconcile_codex_native_process_registry(*, registry_path: Path | None = None) -> None:
+def reconcile_codex_native_process_registry(*, registry_path: Path | None = None) -> int:
     """
     Reap crash-leftover native Codex children recorded by prior runs.
 
@@ -200,9 +219,10 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     fallback.
 
     :param registry_path: Test override for the registry file path.
-    :returns: None.
+    :returns: Number of reaped process trees.
     """
     path = registry_path or codex_native_process_registry_path()
+    reaped = 0
     with _registry_lock(path):
         survivors: list[CodexNativeProcessEntry] = []
         for entry in _read_registry(path):
@@ -214,12 +234,25 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 survivors.append(entry)
                 continue
             if not matches_entry:
+                # The recorded leader is gone, but the tree it wrapped can
+                # outlive it: reap a tagged survivor in the same group before
+                # dropping the entry.
+                result = _reap_tagged_group_survivors(entry)
+                if result is None:
+                    survivors.append(entry)
+                    continue
+                if result:
+                    reaped += 1
+                    _reap_tmux_session(entry.tmux_session_name)
                 continue
-            if not _terminate_process_group(entry):
+            result = _terminate_process_group(entry)
+            if not result:
                 survivors.append(entry)
                 continue
+            reaped += 1
             _reap_tmux_session(entry.tmux_session_name)
         _write_registry(path, survivors)
+    return reaped
 
 
 @contextlib.contextmanager
@@ -380,7 +413,7 @@ def _process_matches_entry(entry: CodexNativeProcessEntry) -> bool | None:
     cmdline = _process_cmdline(entry.pid)
     if not cmdline:
         return None
-    return codex_native_session_tag_cmdline_arg(entry.session_tag) in cmdline
+    return codex_native_session_tag_cmdline_arg(entry.session_tag) in cmdline.split()
 
 
 def _process_start_identity(pid: int) -> str | None:
@@ -410,7 +443,57 @@ def _process_start_identity(pid: int) -> str | None:
 def _process_cmdline_has_tag(pid: int, session_tag: str) -> bool:
     needle = codex_native_session_tag_cmdline_arg(session_tag)
     cmdline = _process_cmdline(pid)
-    return needle in cmdline
+    return needle in cmdline.split()
+
+
+def _ps_output(columns: str) -> str | None:
+    """Run ``ps`` with *columns*; return None when the snapshot fails."""
+    try:
+        # macOS ps passes raw argv bytes through, so decode leniently: one
+        # foreign process with non-UTF-8 argv must not crash the reaper.
+        proc = subprocess.run(
+            ["ps", "-axww", "-o", columns],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+        )
+        return proc.stdout if proc.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _ps_rows(columns: str, field_count: int) -> list[list[str]] | None:
+    """Parse ``ps -o <columns>`` output into *field_count* whitespace-split rows."""
+    rows: list[list[str]] = []
+    output = _ps_output(columns)
+    if output is None:
+        return None
+    for line in output.splitlines():
+        fields = line.split(None, field_count - 1)
+        if len(fields) == field_count:
+            rows.append(fields)
+    return rows
+
+
+def _parse_ps_elapsed_seconds(value: str) -> float | None:
+    """Parse a ``ps -o etime=`` value (``[[dd-]hh:]mm:ss``) into seconds."""
+    text = value.strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        day_text, _, text = text.partition("-")
+        if not day_text.isdigit():
+            return None
+        days = int(day_text)
+    parts = text.split(":")
+    if len(parts) not in (2, 3) or not all(part.isdigit() for part in parts):
+        return None
+    hours = int(parts[0]) if len(parts) == 3 else 0
+    minutes, seconds = int(parts[-2]), int(parts[-1])
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
 def _process_cmdline(pid: int) -> str:
@@ -437,13 +520,90 @@ def _process_cmdline(pid: int) -> str:
 def _terminate_process_group(entry: CodexNativeProcessEntry) -> bool:
     if not _process_group_matches_entry(entry):
         return False
+    return _reap_tagged_group_survivors(entry) is True
+
+
+def _tagged_process_group_members(
+    pgid: int, session_tag: str, *, prefix: bool = False
+) -> list[int] | None:
+    """Return same-UID group members carrying a whole teardown-tag token."""
+    if os.name != "posix" or pgid <= 1 or pgid == os.getpgrp():
+        return []
+    needle = codex_native_session_tag_cmdline_arg(session_tag)
+    rows = _ps_rows("pid=,pgid=,uid=,command=", 4)
+    if rows is None:
+        return None
+    members: list[int] = []
+    for pid_text, pgid_text, uid_text, command in rows:
+        try:
+            pid, member_pgid, uid = int(pid_text), int(pgid_text), int(uid_text)
+        except ValueError:
+            continue
+        tokens = command.split()
+        tagged = any(token.startswith(needle) for token in tokens) if prefix else needle in tokens
+        if member_pgid == pgid and uid == os.getuid() and tagged:
+            members.append(pid)
+    return members
+
+
+def _reap_tagged_group_survivors(
+    entry: CodexNativeProcessEntry,
+    *,
+    prefix: bool = False,
+    grace_s: float | None = None,
+) -> bool | None:
+    """
+    Reap a tagged member that outlived the entry's recorded group leader.
+
+    :param entry: Registry entry whose recorded pid is already dead.
+    :returns: True when a signalled group is confirmed gone, False when no
+        tagged member remains, or None when observation or signalling fails.
+    """
+    if os.name != "posix" or entry.pgid <= 1 or entry.pgid == os.getpgrp():
+        return False
+    members = _tagged_process_group_members(entry.pgid, entry.session_tag, prefix=prefix)
+    if members is None:
+        return None
+    if not members:
+        return False
     try:
         os.killpg(entry.pgid, signal.SIGTERM)
     except ProcessLookupError:
-        return True
+        members = _tagged_process_group_members(entry.pgid, entry.session_tag, prefix=prefix)
+        return None if members is None else not members
     except (PermissionError, OSError):
-        return False
-    return True
+        return None
+    deadline = time.monotonic() + (grace_s if grace_s is not None else _PROCESS_GROUP_GRACE_S)
+    while time.monotonic() < deadline:
+        members = _tagged_process_group_members(entry.pgid, entry.session_tag, prefix=prefix)
+        if members is None:
+            return None
+        if not members:
+            return True
+        time.sleep(_PROCESS_GROUP_POLL_S)
+    # This snapshot is the authorization for KILL, even if the leader died.
+    members = _tagged_process_group_members(entry.pgid, entry.session_tag, prefix=prefix)
+    if members is None:
+        return None
+    if not members:
+        return True
+    try:
+        os.killpg(entry.pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        members = _tagged_process_group_members(entry.pgid, entry.session_tag, prefix=prefix)
+        return None if members is None else not members
+    except (PermissionError, OSError):
+        return None
+    deadline = time.monotonic() + 1.0
+    while True:
+        members = _tagged_process_group_members(entry.pgid, entry.session_tag, prefix=prefix)
+        if members is None:
+            return None
+        if not members:
+            return True
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_PROCESS_GROUP_POLL_S)
 
 
 def _process_group_matches_entry(entry: CodexNativeProcessEntry) -> bool:
@@ -518,26 +678,9 @@ def reap_codex_native_processes_for_state_dir(
     if os.name != "posix":
         return 0
     needle = str(state_dir)
-    try:
-        # macOS ps passes raw argv bytes through, so decode leniently: one
-        # foreign process with non-UTF-8 argv must not crash the reaper.
-        listing = subprocess.run(
-            ["ps", "-axww", "-o", "pid=,pgid=,command="],
-            check=False,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5.0,
-        ).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return 0
     own_pgid = os.getpgid(0)
     victims: dict[int, int] = {}
-    for line in listing.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) != 3:
-            continue
-        pid_text, pgid_text, command = parts
+    for pid_text, pgid_text, command in _ps_rows("pid=,pgid=,command=", 3) or []:
         try:
             pid, pgid = int(pid_text), int(pgid_text)
         except ValueError:
@@ -568,3 +711,65 @@ def reap_codex_native_processes_for_state_dir(
         state_dir.name,
     )
     return len(victims)
+
+
+def reap_orphaned_codex_model_probes(
+    *,
+    min_age_s: float = _MODEL_PROBE_ORPHAN_MIN_AGE_S,
+    grace_s: float = _PROCESS_GROUP_GRACE_S,
+) -> int:
+    """
+    Kill model-probe trees orphaned to init that outlived the probe budget.
+
+    Registry-independent backstop for probes whose registry entry was lost.
+    The scan requires ppid 1, this state root's model-probe tag prefix, the
+    current user, and an age past the probe's bounded budget.
+
+    :param min_age_s: Minimum process age in seconds before a match counts
+        as stranded, e.g. ``300.0``.
+    :param grace_s: Seconds to wait after SIGTERM before escalating the
+        survivors to SIGKILL, e.g. ``1.5``.
+    :returns: Number of selected processes whose tagged groups are confirmed gone.
+    """
+    if os.name != "posix":
+        return 0
+    tag_prefix = _model_probe_tag_prefix()
+    needle = f"{_TAG_ARG_PREFIX}{tag_prefix}"
+    own_uid = os.getuid()
+    own_pgid = os.getpgrp()
+    victims: dict[int, int] = {}
+    rows = _ps_rows("pid=,ppid=,pgid=,uid=,etime=,command=", 6)
+    if rows is None:
+        return 0
+    for pid_text, ppid_text, pgid_text, uid_text, etime_text, command in rows:
+        try:
+            pid, ppid, pgid, uid = (
+                int(pid_text),
+                int(ppid_text),
+                int(pgid_text),
+                int(uid_text),
+            )
+        except ValueError:
+            continue
+        if ppid != 1 or uid != own_uid or pid == os.getpid():
+            continue
+        if (
+            pgid <= 1
+            or pgid == own_pgid
+            or not any(token.startswith(needle) for token in command.split())
+        ):
+            continue
+        age_s = _parse_ps_elapsed_seconds(etime_text)
+        if age_s is None or age_s < min_age_s:
+            continue
+        victims[pid] = pgid
+    if not victims:
+        return 0
+    reaped = 0
+    for pgid in sorted(set(victims.values())):
+        entry = CodexNativeProcessEntry(0, pgid, None, tag_prefix)
+        if _reap_tagged_group_survivors(entry, prefix=True, grace_s=grace_s):
+            reaped += sum(group == pgid for group in victims.values())
+    if reaped:
+        _logger.warning("reaped %d orphaned codex model-probe process(es)", reaped)
+    return reaped
