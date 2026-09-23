@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import type { Host } from "@/hooks/useHosts";
 import { rankHarnessRows, type RankHarnessRowsInput } from "@/lib/harnessRanking";
+import { harnessReadinessOnHost } from "@/lib/harnessSetup";
 
 function agent(name: string, harness: string, displayName: string): AvailableAgent {
   return {
@@ -82,6 +83,17 @@ describe("rankHarnessRows", () => {
     });
     expect(names(result.primary)).toEqual(["Claude Code", "Codex"]);
     expect(names(result.more)).toContain("Pi");
+  });
+
+  it("leaves a ready native harness under Other on Windows", () => {
+    const windows = { ...host({ "claude-native": true, grok: true }), platform: "win32" };
+    const result = rank({ entries: [claude, grok], host: windows });
+    expect(harnessReadinessOnHost(claude.harness, windows)).toMatchObject({
+      state: "unavailable",
+      reason: "platform-unsupported",
+    });
+    expect(names(result.primary)).toEqual(["Grok Build"]);
+    expect(names(result.more)).toEqual(["Claude Code"]);
   });
 
   it("leaves every row under Other when the host has no readiness map", () => {

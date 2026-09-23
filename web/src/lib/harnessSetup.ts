@@ -11,6 +11,7 @@
 import { isAutoHarness, type SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 
 /** Whether a step is satisfied, still needed, or not locally determinable. */
 export type SetupStepStatus = "done" | "todo" | "unknown";
@@ -43,6 +44,7 @@ export type HarnessReadinessReason =
   | "readiness-unknown"
   | "harness-unavailable"
   | "host-unavailable"
+  | "platform-unsupported"
   | "binary-missing"
   | "needs-auth"
   | "unconfigured"
@@ -93,6 +95,13 @@ export function harnessReadinessOnHost(
     return harnessReadinessResult("unavailable", "host-unavailable", false, {
       label: "Host unavailable",
       description: "Connect an online host before starting a session.",
+    });
+  }
+  if (host.platform === "win32" && nativeCodingAgentForHarness(harness)) {
+    return harnessReadinessResult("unavailable", "platform-unsupported", true, {
+      label: "Not supported on Windows hosts",
+      description:
+        "Native terminal harnesses need tmux/PTY on the host. Use an SDK agent (Codex SDK, Claude SDK) on this host.",
     });
   }
 
@@ -214,9 +223,11 @@ export function harnessUnconfiguredOnHost(
  * pre-feature UI. When the feature is ON the picker shows a single "needs
  * setup" label instead (the specific reason + fix live in the setup dialog),
  * so callers pass ``collapsed`` to get that. Keeping both here means the
- * flag-off path renders byte-for-byte the original text.
+ * flag-off path renders byte-for-byte the original text. A platform block
+ * stays explicit in either mode because setup cannot make it runnable.
  */
 export function harnessWarningBadgeText(reason: string | null, collapsed = false): string {
+  if (reason === "platform-unsupported") return "not on Windows";
   if (collapsed) return "needs setup";
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";

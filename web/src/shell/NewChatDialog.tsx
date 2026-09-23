@@ -853,6 +853,14 @@ function harnessWarningMessage(
   reason: string | null,
   harness: string | null | undefined,
 ): ReactNode {
+  if (reason === "platform-unsupported") {
+    return (
+      <>
+        {agentName} runs a native terminal, which {hostName} (Windows) can&apos;t host — pick an SDK
+        agent for this host.
+      </>
+    );
+  }
   const isCodex = !!harness && isCodexHarness(harness);
   if (reason === "needs-auth" && isCodex) {
     return (

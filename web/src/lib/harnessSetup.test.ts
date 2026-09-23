@@ -6,6 +6,7 @@ import {
   harnessCredentialFamily,
   harnessInstallableOnHost,
   harnessReadinessOnHost,
+  harnessWarningBadgeText,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   resolveSetupSteps,
@@ -155,6 +156,41 @@ describe("harnessUnconfiguredOnHost", () => {
 });
 
 describe("harnessReadinessOnHost", () => {
+  it("blocks native terminals on Windows before consulting readiness", () => {
+    const windows = { ...hostWith({ "claude-native": true }), platform: "win32" };
+    expect(harnessReadinessOnHost("claude-native", windows)).toEqual({
+      state: "unavailable",
+      reason: "platform-unsupported",
+      selectable: false,
+      fallbackRelevant: true,
+      explanation: {
+        label: "Not supported on Windows hosts",
+        description:
+          "Native terminal harnesses need tmux/PTY on the host. Use an SDK agent (Codex SDK, Claude SDK) on this host.",
+      },
+    });
+    expect(harnessReadinessOnHost("opencode-native", windows).reason).toBe("platform-unsupported");
+    expect(harnessReadinessOnHost("claude-native", { ...windows, status: "offline" }).reason).toBe(
+      "host-unavailable",
+    );
+  });
+
+  it("leaves SDK, ACP, and unknown-platform hosts outside the Windows gate", () => {
+    const windows = hostWith({ codex: true, "claude-sdk": true, grok: true });
+    windows.platform = "win32";
+    for (const harness of ["codex", "claude-sdk", "grok"]) {
+      expect(harnessReadinessOnHost(harness, windows).reason).toBe("ready");
+    }
+    for (const platform of [null, undefined, "darwin"]) {
+      expect(
+        harnessReadinessOnHost("claude-native", {
+          ...hostWith({ "claude-native": true }),
+          platform,
+        }).reason,
+      ).toBe("ready");
+    }
+  });
+
   it("keeps ready and legacy-unknown harnesses selectable", () => {
     expect(harnessReadinessOnHost("codex-native", hostWith({ "codex-native": true }))).toEqual({
       state: "available",
@@ -218,6 +254,13 @@ describe("harnessReadinessOnHost", () => {
       label: "Harness is not installed",
       description: "Install this harness on the selected host before using it.",
     });
+  });
+});
+
+describe("harnessWarningBadgeText", () => {
+  it("keeps the platform reason visible with either badge mode", () => {
+    expect(harnessWarningBadgeText("platform-unsupported")).toBe("not on Windows");
+    expect(harnessWarningBadgeText("platform-unsupported", true)).toBe("not on Windows");
   });
 });
 
