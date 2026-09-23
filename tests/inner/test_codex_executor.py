@@ -48,6 +48,7 @@ from omnigent.inner.executor import (
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.server.schemas import ElicitationResult
 
 
 def _run(coro):
@@ -4510,6 +4511,303 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
         assert codex_spawn_model(model) == model, "not codex's own spelling"
 
     _run(_t())
+
+
+@pytest.mark.parametrize(
+    ("approval_mode", "approval_policy", "sandbox_type"),
+    [
+        (None, None, None),
+        ("default", "on-request", "workspaceWrite"),
+        ("full-access", "never", "dangerFullAccess"),
+        ("read-only", "on-request", "readOnly"),
+    ],
+)
+async def test_codex_turn_start_applies_approval_mode(
+    approval_mode: str | None, approval_policy: str | None, sandbox_type: str | None
+) -> None:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    session.__dict__["_proc"] = _FakeProcess()
+    session.thread_id = "thread-1"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+    async def _complete() -> None:
+        await asyncio.sleep(0.01)
+        session._events.put_nowait(
+            {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+        )
+
+    complete_task = asyncio.create_task(_complete())
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+            approval_mode=approval_mode,
+        )
+    ]
+    await complete_task
+    assert isinstance(events[-1], TurnComplete)
+    assert session._request.await_args is not None
+    turn_params = session._request.await_args.args[1]
+    if approval_mode is None:
+        assert "approvalPolicy" not in turn_params
+        assert "sandboxPolicy" not in turn_params
+    else:
+        assert turn_params["approvalPolicy"] == approval_policy
+        assert turn_params["sandboxPolicy"] == {"type": sandbox_type}
+
+
+@pytest.mark.parametrize(
+    ("method", "request_params", "action", "expected_result"),
+    [
+        (
+            "item/commandExecution/requestApproval",
+            {"turnId": "turn-1", "command": "pwd"},
+            "accept",
+            {"decision": "accept"},
+        ),
+        (
+            "item/commandExecution/requestApproval",
+            {"turnId": "turn-1", "command": "pwd"},
+            "decline",
+            {"decision": "decline"},
+        ),
+        (
+            "item/commandExecution/requestApproval",
+            {"turnId": "turn-1", "command": "pwd"},
+            None,
+            {"decision": "decline"},
+        ),
+        (
+            "item/commandExecution/requestApproval",
+            {"turnId": "turn-1", "command": "pwd"},
+            "no-result",
+            {"decision": "decline"},
+        ),
+        (
+            "item/permissions/requestApproval",
+            {"turnId": "turn-1", "permissions": {"network": {"enabled": True}}},
+            "accept",
+            {"permissions": {"network": {"enabled": True}}, "scope": "turn"},
+        ),
+        ("unknown/request", {"turnId": "turn-1"}, None, None),
+        (
+            "item/commandExecution/requestApproval",
+            {"turnId": "old-turn", "command": "pwd"},
+            "accept",
+            {"decision": "decline"},
+        ),
+        ("item/commandExecution/requestApproval", [], None, -32602),
+        ("mcpServer/elicitation/request", {"mode": [], "message": "Choose"}, None, -32602),
+    ],
+)
+async def test_codex_server_request_is_answered_and_turn_completes(
+    method: str,
+    request_params: Any,
+    action: str | None,
+    expected_result: dict[str, Any] | int | None,
+) -> None:
+    seen = []
+
+    async def _elicit(params):
+        seen.append(params)
+        if action == "accept":
+            return ElicitationResult(action="accept")
+        if action == "decline":
+            return ElicitationResult(action="decline")
+        return None
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+        raw_elicitation_handler=_elicit if action is not None else None,
+    )
+    session.start = AsyncMock()
+    fake_proc = _FakeProcess()
+    session.__dict__["_proc"] = fake_proc
+    session.thread_id = "thread-1"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+    request_message = {"id": 42, "method": method, "params": request_params}
+    stale_queued_request = (
+        isinstance(request_params, dict) and request_params.get("turnId") == "old-turn"
+    )
+    if stale_queued_request:
+        session._events.put_nowait(request_message)
+
+    async def _inject_events() -> None:
+        await asyncio.sleep(0.01)
+        if not stale_queued_request:
+            session._events.put_nowait(request_message)
+        session._events.put_nowait(
+            {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+        )
+
+    inject_task = asyncio.create_task(_inject_events())
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+    await inject_task
+    assert isinstance(events[-1], TurnComplete)
+    assert len(fake_proc.stdin.writes) == 1
+    reply = json.loads(fake_proc.stdin.writes[0])
+    assert reply["id"] == 42
+    if expected_result is None or isinstance(expected_result, int):
+        assert reply["error"]["code"] == (expected_result or -32601)
+    else:
+        assert reply["result"] == expected_result
+    if action is not None and request_params["turnId"] == "turn-1":
+        assert len(seen) == 1
+        assert seen[0].phase == (
+            "codex_permissions_approval"
+            if method == "item/permissions/requestApproval"
+            else "codex_command_approval"
+        )
+    else:
+        assert seen == []
+
+
+@pytest.mark.parametrize("request_turn_id", ["turn-1", "old-turn"])
+async def test_codex_tail_declines_queued_approval_request(request_turn_id: str) -> None:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    fake_proc = _FakeProcess()
+    session.__dict__["_proc"] = fake_proc
+    session.thread_id = "thread-1"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+    async def _inject_events() -> None:
+        await asyncio.sleep(0.01)
+        session._events.put_nowait(
+            {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+        )
+        session._events.put_nowait(
+            {
+                "id": 42,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"turnId": request_turn_id, "command": "pwd"},
+            }
+        )
+        session._events.put_nowait(
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "answer-1",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "done",
+                    },
+                },
+            }
+        )
+
+    inject_task = asyncio.create_task(_inject_events())
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+    await inject_task
+    assert isinstance(events[-1], TurnComplete)
+    assert len(fake_proc.stdin.writes) == 1
+    assert json.loads(fake_proc.stdin.writes[0]) == {"id": 42, "result": {"decision": "decline"}}
+
+
+async def test_codex_server_request_encoding_failure_gets_one_invalid_params_reply() -> None:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    fake_proc = _FakeProcess()
+    session.__dict__["_proc"] = fake_proc
+    message = {
+        "id": 42,
+        "method": "item/commandExecution/requestApproval",
+        "params": {"turnId": "turn-1", "command": "pwd"},
+    }
+    with patch(
+        "omnigent.server.routes._codex_elicitation.CodexElicitationRequest.build_response",
+        side_effect=ValueError("bad verdict"),
+    ):
+        assert await session._answer_server_request(message, None)
+    assert len(fake_proc.stdin.writes) == 1
+    assert json.loads(fake_proc.stdin.writes[0]) == {
+        "id": 42,
+        "error": {"code": -32602, "message": "bad verdict"},
+    }
+
+
+async def test_codex_server_request_send_failure_does_not_reply_twice() -> None:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    fake_proc = _FakeProcess()
+    session.__dict__["_proc"] = fake_proc
+    fake_proc.stdin.drain = AsyncMock(side_effect=RuntimeError("write failed"))
+    message = {
+        "id": 42,
+        "method": "item/commandExecution/requestApproval",
+        "params": {"turnId": "turn-1", "command": "pwd"},
+    }
+    with pytest.raises(RuntimeError, match="write failed"):
+        await session._answer_server_request(message, None)
+    assert len(fake_proc.stdin.writes) == 1
+
+
+async def test_codex_executor_passes_raw_bridge_and_turn_approval_mode() -> None:
+    fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+    factory_args = {}
+
+    def _factory(**kwargs):
+        factory_args.update(kwargs)
+        return fake_session
+
+    async def _elicit(_params):
+        return ElicitationResult(action="decline")
+
+    executor = CodexExecutor(
+        codex_path="/bin/echo",
+        app_session_factory=_factory,  # type: ignore[arg-type]
+    )
+    executor._raw_elicitation_handler = _elicit
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "hi", "session_id": "s1"}],
+            [],
+            "",
+            ExecutorConfig(approval_mode="read-only"),
+        )
+    ]
+    assert isinstance(events[-1], TurnComplete)
+    assert factory_args["raw_elicitation_handler"] is _elicit
+    assert fake_session.calls[0]["approval_mode"] == "read-only"
 
 
 # ── Gateway-auth error surfacing (issue: codex SDK head swallows 401s) ──────
