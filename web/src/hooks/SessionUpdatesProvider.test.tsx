@@ -458,6 +458,224 @@ describe("SessionUpdatesProvider list invalidation", () => {
   });
 });
 
+// Every forced ["conversations"] refetch is a full list fetch — served by the
+// search backend on unified-search deployments — so frames the cache patch
+// fully absorbs must not schedule one.
+describe("SessionUpdatesProvider push-patch refetch policy", () => {
+  const conversationsInvalidations = (calls: unknown[][]) =>
+    calls.filter(([arg]) => {
+      const key = (arg as { queryKey?: unknown[] } | undefined)?.queryKey;
+      return Array.isArray(key) && key[0] === "conversations";
+    });
+
+  it("patches a pushed title change in place without refetching the list", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), title: "renamed" }] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      const cached = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(cached!.pages[0].data[1]!.title).toBe("renamed");
+      expect(conversationsInvalidations(invalidate.mock.calls)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconciles a title change with the server while a search list is cached", () => {
+    // A renamed row may start or stop matching a cached search variant — the
+    // server matches over title AND item content, so only it can decide.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      client.setQueryData(["conversations", "ren", false], {
+        pages: [{ data: [], first_id: null, last_id: null, has_more: false }],
+        pageParams: [undefined],
+      } satisfies ConversationsInfiniteData);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), title: "renamed" }] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      // The fork's scheduleInvalidate passes a snapshot-filter predicate, so
+      // match on the key prefix rather than the exact argument object.
+      expect(conversationsInvalidations(invalidate.mock.calls).length).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces background timestamp bumps into one delayed list invalidation", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/c/conv_a"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), updated_at: 5 }] }));
+      act(() => vi.advanceTimersByTime(250));
+      expect(conversationsInvalidations(invalidate.mock.calls)).toHaveLength(0);
+      act(() => vi.advanceTimersByTime(4_750));
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), updated_at: 6 }] }));
+      act(() => vi.advanceTimersByTime(5_000));
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), updated_at: 7 }] }));
+      act(() => vi.advanceTimersByTime(4_999));
+
+      const cached = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(cached!.pages[0].data[1]!.updated_at).toBe(0);
+      expect(conversationsInvalidations(invalidate.mock.calls)).toHaveLength(0);
+      act(() => vi.advanceTimersByTime(1));
+      expect(conversationsInvalidations(invalidate.mock.calls)).toHaveLength(1);
+      act(() => vi.advanceTimersByTime(15_000));
+      expect(conversationsInvalidations(invalidate.mock.calls)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // scheduleInvalidate fires all three list keys together, so the storm is
+  // "any of them" — an absorbed frame must produce none.
+  const listInvalidations = (calls: unknown[][]) =>
+    calls.filter(([arg]) => {
+      const key = (arg as { queryKey?: unknown[] } | undefined)?.queryKey;
+      return (
+        Array.isArray(key) &&
+        (key[0] === "conversations" ||
+          key[0] === "project-sessions" ||
+          key[0] === "archived-project-names")
+      );
+    });
+
+  it("patches usage labels while deferring order reconciliation", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/c/conv_a"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [
+            // Background activity bump leaves the fetched order intact.
+            { ...conv("conv_b"), updated_at: 7 },
+            // The active row's usage flush rewrites its context labels; the
+            // label is display metadata, not membership.
+            { ...conv("conv_a"), labels: { "omnigent.last_context_tokens": "1234" } },
+          ],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      const cached = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(cached!.pages[0].data.find((row) => row.id === "conv_b")!.updated_at).toBe(0);
+      expect(cached!.pages[0].data.find((row) => row.id === "conv_a")!.labels).toEqual({
+        "omnigent.last_context_tokens": "1234",
+      });
+      expect(listInvalidations(invalidate.mock.calls)).toEqual([]);
+      act(() => vi.advanceTimersByTime(14_700));
+      expect(listInvalidations(invalidate.mock.calls)).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels delayed order reconciliation when an archive triggers membership invalidation", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), updated_at: 5 }] }));
+      act(() => vi.advanceTimersByTime(100));
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), archived: true }] }));
+      act(() => vi.advanceTimersByTime(249));
+      expect(listInvalidations(invalidate.mock.calls)).toHaveLength(0);
+      act(() => vi.advanceTimersByTime(1));
+      expect(listInvalidations(invalidate.mock.calls)).toHaveLength(3);
+      act(() => vi.advanceTimersByTime(15_000));
+      expect(listInvalidations(invalidate.mock.calls)).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never refetches the list for child sessions watched through the tree cache", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      // A search-scoped list keeps `insertNewRowsIntoPages` from placing the
+      // child rows, so the only thing standing between them and
+      // scheduleInvalidate is the missing-id carve-out.
+      client.setQueryData(["conversations", "q", false], {
+        pages: [{ data: [conv("conv_a")], first_id: "conv_a", last_id: "conv_a", has_more: false }],
+        pageParams: [undefined],
+      } satisfies ConversationsInfiniteData);
+      renderProvider(client, ["/"]);
+      // conv_child is watched only through the tree cache; its frame omits
+      // parent_session_id. conv_child2 is known only from its parent pointer.
+      client.setQueryData(["conversation", "conv_a", "child_sessions"], [{ id: "conv_child" }]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [
+            { ...conv("conv_child"), status: "running" },
+            { ...conv("conv_child2"), parent_session_id: "conv_a", status: "running" },
+          ],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      // The parent's child-sessions cache is still refreshed (not a list key).
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["conversation", "conv_a", "child_sessions"],
+      });
+      expect(listInvalidations(invalidate.mock.calls)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still refetches the list when a row is archived", () => {
+    // Negative control for the absorbed frames above: an archive flip changes
+    // list membership the client can't place, so the refetch must survive.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), archived: true }] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      expect(listInvalidations(invalidate.mock.calls).length).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("SessionUpdatesProvider projects_changed frames", () => {
   it("invalidates the project-row caches when another client changes a project", () => {
     // A project rename/create/delete in another client arrives only as a

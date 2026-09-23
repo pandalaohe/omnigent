@@ -104,16 +104,17 @@ export function isSessionInsidePollingWindow(
   return updatedAtSeconds >= Math.floor(nowMs / 1000) - activeWindowHours * 60 * 60;
 }
 
-/** Native Server stays on the chat by default; title mode moves it to the open sidebar. */
+/** Whether the fork's optional header mode hides the floating native server pill. */
 export function shouldHideNativeServerSwitcher({
-  frontmost,
   sidebarOpen,
   headerMode,
+  serverSwitcherHidden,
 }: {
   frontmost: boolean;
   sidebarOpen: boolean;
   headerMode: NativeMobileHeaderMode;
+  serverSwitcherHidden: boolean;
 }): boolean {
-  if (headerMode === "server") return !frontmost;
+  if (headerMode === "server") return serverSwitcherHidden;
   return !sidebarOpen;
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import { mergeItemsIntoPages } from "./sessionListCache";
 import {
   dedupeSessionRows,
   mergeScopeRows,
@@ -19,6 +20,21 @@ const row = (id: string, updated_at: number): Conversation => ({
 });
 
 describe("scope merge", () => {
+  it("keeps the complete loaded prefix when a cursor row receives a newer timestamp", () => {
+    const mine = [row("m1", 100), row("m2", 80), row("m3", 60)];
+    const shared = [row("s1", 90), row("s2", 70)];
+    const cached = { pages: [sessionRowsPage(mine, true)], pageParams: [undefined] };
+    const { data: patched, orderStale } = mergeItemsIntoPages(
+      cached,
+      new Map([["m3", { id: "m3", updated_at: 200 }]]),
+      { searchQuery: "", includeArchived: false },
+    );
+
+    expect(orderStale).toBe(true);
+    expect(
+      mergeScopeRows(patched!.pages[0].data, shared, true, false, "m3").rows.map((r) => r.id),
+    ).toEqual(["m1", "s1", "m2", "s2", "m3"]);
+  });
   it("buffers rows below the shallower tail until both scopes advance", () => {
     const mine = [row("m1", 100), row("m2", 80), row("m3", 20)];
     const shared = [row("s1", 90), row("s2", 70)];

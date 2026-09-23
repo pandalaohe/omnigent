@@ -6,13 +6,20 @@ const nativeBridge = vi.hoisted(() => ({
   setNativeServerSwitcherHidden: vi.fn(),
 }));
 
-vi.mock("@/lib/nativeBridge", () => ({
-  isIOSShell: () => true,
-  setNativeServerSwitcherHidden: nativeBridge.setNativeServerSwitcherHidden,
-}));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => {
+  // Keep the real `supportsNativeServerPicker` (it reads the stubbed
+  // `window.omnigentNative`); only force the shell checks the hook needs.
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    isIOSShell: () => true,
+    setNativeServerSwitcherHidden: nativeBridge.setNativeServerSwitcherHidden,
+  };
+});
 
 import {
   isSurfaceFrontmost,
+  serverSwitcherHiddenForSurface,
   useAppShellSidebarOpen,
   useNativeServerSwitcherForMainSurface,
 } from "./useNativeServerSwitcher";
@@ -150,5 +157,44 @@ describe("useAppShellSidebarOpen", () => {
 
     act(() => shell.removeAttribute("data-sidebar-open"));
     await waitFor(() => expect(result.current).toBe(false));
+  });
+});
+
+// Server selection moved into the sidebar picker on shells that host it, so
+// the floating pill must never be requested over the main surface there — it
+// used to crowd the chat header's title and floating controls on a notched
+// iPhone. Shells without the picker bridge (older iOS builds) keep the pill
+// as their only selection affordance, following the frontmost signal.
+describe("serverSwitcherHiddenForSurface", () => {
+  function setIOSBridge(withServerPicker: boolean): void {
+    (window as unknown as Record<string, unknown>).omnigentNative = {
+      kind: "ios",
+      setBadgeCount: () => {},
+      notify: () => Promise.resolve(false),
+      setServerSwitcherHidden: () => {},
+      ...(withServerPicker
+        ? {
+            getServerPicker: () => Promise.resolve(null),
+            switchServer: () => Promise.resolve(),
+            openServerSetup: () => {},
+          }
+        : {}),
+    };
+  }
+
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentNative;
+  });
+
+  it("keeps the pill hidden over a frontmost surface on a shell with the sidebar picker", () => {
+    setIOSBridge(true);
+    expect(serverSwitcherHiddenForSurface(true)).toBe(true);
+    expect(serverSwitcherHiddenForSurface(false)).toBe(true);
+  });
+
+  it("follows the frontmost signal on a shell without the sidebar picker", () => {
+    setIOSBridge(false);
+    expect(serverSwitcherHiddenForSurface(true)).toBe(false);
+    expect(serverSwitcherHiddenForSurface(false)).toBe(true);
   });
 });

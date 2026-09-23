@@ -138,7 +138,13 @@ export function useNativeServerSwitcherForMainSurface(
   useEffect(() => {
     if (!isIOSShell()) return;
     setNativeServerSwitcherHidden(
-      !active || shouldHideNativeServerSwitcher({ frontmost, sidebarOpen, headerMode }),
+      !active ||
+        shouldHideNativeServerSwitcher({
+          frontmost,
+          sidebarOpen,
+          headerMode,
+          serverSwitcherHidden: serverSwitcherHiddenForSurface(frontmost),
+        }),
     );
   }, [active, frontmost, headerMode, sidebarOpen]);
   useEffect(() => {

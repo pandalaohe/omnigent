@@ -1544,11 +1544,10 @@ describe("useRenameConversation cache patching", () => {
         includeArchived,
       ]);
       const row = data!.pages[0].data.find((c) => c.id === "conv_x")!;
-      // Title AND updated_at must both land: the title is what the user
-      // sees; updated_at drives the sidebar's client-side sort and the
-      // unseen tracker's baseline comparison.
+      // The title updates immediately, while list ordering keeps the fetched
+      // timestamp until a server list refresh replaces the row.
       expect(row.title).toBe("New name");
-      expect(row.updated_at).toBe(200);
+      expect(row.updated_at).toBe(100);
     }
     // Unrelated rows must survive the patch untouched.
     const base = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
