@@ -1171,6 +1171,7 @@ async def test_patch_host_default_workspace_403_wrong_owner(
     assert stored is not None
     assert stored.default_workspace is None
 
+
 @pytest.mark.parametrize("user,status", [(None, 401), ("bob@test.com", 403)])
 async def test_host_skills_requires_owner(
     multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
@@ -2390,6 +2391,70 @@ async def test_host_cli_retention_reset_real_heartbeat_cancel_absorbs_and_cleans
     # count: without it this task would still report cancelling() == 1 here.
     assert asyncio.current_task() is not None
     assert asyncio.current_task().cancelling() == 0  # type: ignore[union-attr]
+
+
+async def test_host_cli_retention_reset_overlapping_external_cancel_propagates(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An external cancel overlapping the heartbeat's own cancel must survive.
+
+    ``_renew_host_claim`` sets the heartbeat signal, then cancels the owner
+    task. A client disconnect or enclosing timeout in the same step lands a
+    second cancel on that task, so ``cancelling()`` reaches 2. The handler's
+    single ``uncancel()`` only clears the heartbeat's request; the external
+    cancel must keep propagating instead of being swallowed as a 200.
+    """
+    from omnigent.server.cli_retention import CliRetentionHostLease
+
+    app, registry, host_store, conv_store = host_api_app
+    _comm = await _connect_host(app, registry)
+    await _put_cli_retention_policy_v1(app)
+
+    conv = await asyncio.to_thread(conv_store.create_conversation)
+    await asyncio.to_thread(conv_store.set_host_id, conv.id, _HOST_ID, "/tmp/ws")
+    await asyncio.to_thread(conv_store.set_runner_id, conv.id, "runner-1")
+
+    posts: list = []
+    coordinator = _heartbeat_cancel_coordinator(host_store, conv_store, posts)
+    reset_app = _reset_app_for_coordinator(registry, host_store, conv_store, coordinator)
+
+    calls = 0
+    request_task: asyncio.Task | None = None
+    original_ensure_owned = CliRetentionHostLease.ensure_owned
+
+    async def _heartbeat_plus_external_cancel(self):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return await original_ensure_owned(self)
+        # Mirror _renew_host_claim's owner cancel, then deliver the
+        # overlapping external cancel (shutdown, client disconnect) to the
+        # same request task in the same step.
+        self.lost.set()
+        self.heartbeat_cancelled.set()
+        assert request_task is not None
+        request_task.cancel()
+        request_task.cancel()
+        await asyncio.sleep(0)
+        return None
+
+    monkeypatch.setattr(CliRetentionHostLease, "ensure_owned", _heartbeat_plus_external_cancel)
+    async with AsyncClient(
+        transport=ASGITransport(app=reset_app), base_url="http://test"
+    ) as client:
+        request_task = asyncio.create_task(
+            client.request(
+                "DELETE",
+                f"/v1/hosts/{_HOST_ID}/cli-retention",
+                json={"expected_revision": 1},
+            )
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+    # The external cancel won: the best-effort pass never ran.
+    assert posts == []
 
 
 async def test_host_cli_retention_reset_external_cancel_after_lease_loss_propagates(
