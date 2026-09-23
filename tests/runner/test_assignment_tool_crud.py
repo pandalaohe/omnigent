@@ -160,6 +160,83 @@ async def test_cancel_without_reason_posts_empty_object() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("final_state", ["succeeded", "failed"])
+async def test_complete_result_guides_only_successful_assignment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, final_state: str
+) -> None:
+    from omnigent.runner import assignment_tools
+
+    class _CompleteClient(_RecordingClient):
+        async def get(self, url: str, **_kwargs: Any) -> _Resp:
+            if url.startswith("/v1/sessions/"):
+                return _Resp(body={"project_id": "project", "host_id": "host"})
+            return _Resp(
+                body={
+                    "inputs": [
+                        {
+                            "repository_name": "root",
+                            "is_execution_root": True,
+                            "remote_url": "https://example.com/repo.git",
+                        }
+                    ]
+                }
+            )
+
+        async def post(self, url: str, **kwargs: Any) -> _Resp:
+            self.calls.append(("POST", url, kwargs.get("json")))
+            if url.endswith("/complete"):
+                return _Resp(
+                    body={
+                        "state": "publishing",
+                        "outputs": [
+                            {
+                                "repository_name": "root",
+                                "ref": "refs/omnigent/output/root",
+                            }
+                        ],
+                    }
+                )
+            return _Resp(body={"state": final_state})
+
+    async def _commit(*_args: Any) -> str:
+        return "a" * 40
+
+    async def _publish(*_args: Any, **_kwargs: Any) -> tuple[str, None]:
+        return "a" * 40, None
+
+    monkeypatch.setattr(assignment_tools, "_resolve_commit", _commit)
+    monkeypatch.setattr(assignment_tools, "_publish_ref", _publish)
+    client = _CompleteClient()
+    out = json.loads(
+        await execute_assignment_tool(
+            "sys_assignment_complete",
+            json.dumps(
+                {
+                    "assignment_id": _ASSIGNMENT_ID,
+                    "summary": "Done",
+                    "outputs": [
+                        {
+                            "repository_name": "root",
+                            "commit": "a" * 40,
+                        }
+                    ],
+                }
+            ),
+            conversation_id=_CONV,
+            runner_workspace=tmp_path,
+            server_client=client,  # type: ignore[arg-type]
+        )
+    )
+    assert out["state"] == final_state
+    if final_state == "succeeded":
+        assert "finished" in out["next_step"]
+        assert "no further tool calls" in out["next_step"]
+        assert "closed" in out["next_step"]
+    else:
+        assert "next_step" not in out
+
+
+@pytest.mark.asyncio
 async def test_missing_args_error_before_http() -> None:
     client = _RecordingClient()
     for tool_name, args in [

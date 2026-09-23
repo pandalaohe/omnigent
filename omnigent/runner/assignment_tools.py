@@ -834,6 +834,12 @@ async def _complete(
         return _server_error(finished)
     result = finished.json()
     if isinstance(result, dict):
+        if result.get("state") == "succeeded":
+            result = {
+                **result,
+                "next_step": "The assignment is finished. End your turn now with no further "
+                "tool calls; the session will be closed.",
+            }
         if result.get("state") == "failed" and error_text:
             result = {**result, "error": error_text}
         return json.dumps(result)

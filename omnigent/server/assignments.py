@@ -61,6 +61,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_repository_store import ProjectRepositoryStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 _logger = logging.getLogger(__name__)
 
@@ -72,6 +73,8 @@ _RUNNER_CONNECT_TIMEOUT_S = 30.0
 
 _ACTIVE_CHECK_S = 30
 _LEASE_S = 90
+# Bounds how long a succeeded release waits for its final turn.
+_TURN_END_GRACE_S = 600
 
 
 def next_check_at(created_at: int, now: int) -> int:
@@ -139,6 +142,15 @@ def _attempt_runner_id(attempt: AssignmentAttempt, conv: Conversation | None) ->
     return None
 
 
+def _session_mid_turn(conv: Conversation | None) -> bool:
+    if conv is None:
+        return False
+    from omnigent.server.routes._sessions.common import _session_status_cache
+    from omnigent.server.routes._sessions.orchestration import _MID_TURN_STATUSES
+
+    return _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES
+
+
 @dataclass(frozen=True)
 class _ClaimableDestination:
     """A waiting row's evaluated destination; claimable when no reason blocks."""
@@ -187,6 +199,9 @@ def build_initial_event_text(
         "Work only in the directories above, commit the work there, then call "
         f'sys_assignment_complete with assignment_id "{assignment.id}", `outputs` '
         "(repository_name and commit for each repository changed) and a `summary`.",
+        "Calling sys_assignment_complete is the last work step: dispatch any onward "
+        "assignment with sys_assignment_dispatch before it. The session is closed after "
+        "this turn ends.",
     ]
     return "\n".join(lines)
 
@@ -232,6 +247,7 @@ class AssignmentCoordinator:
         self._runner_session_initializer = runner_session_initializer
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._host_tasks: dict[str, asyncio.Task[None]] = {}
+        self._release_holds: dict[str, tuple[int, int | None]] = {}
         self._scan_task: asyncio.Task[None] | None = None
 
     def trigger(self, assignment_id: str) -> None:
@@ -465,14 +481,23 @@ class AssignmentCoordinator:
             return False
         if self._host_registry.get(host_id) is None:
             return False
-        from omnigent.server.routes.sessions import _stop_session_host_runner_outcome
+        from omnigent.server.routes.sessions import (
+            _intentional_stop_sessions,
+            _stop_session_host_runner_outcome,
+        )
 
+        had = session_id in _intentional_stop_sessions
+        _intentional_stop_sessions.add(session_id)
+        outcome: str | None = None
         try:
             outcome = await _stop_session_host_runner_outcome(
                 session_id, host_id, runner_id, self._host_registry
             )
         except Exception:  # noqa: BLE001
             return False
+        finally:
+            if not had and outcome != "acked":
+                _intentional_stop_sessions.discard(session_id)
         return outcome in ("acked", "unknown_runner")
 
     async def _evaluate_waiting(self, assignment: Assignment) -> None:
@@ -563,11 +588,8 @@ class AssignmentCoordinator:
                 return f"host_offline:{dest_host_id}"
             if not host_supports_assignments(conn):
                 return f"host_unsupported:{dest_host_id}"
-            binding = await asyncio.to_thread(
-                self._binding_store.get_by_name,
-                project_id=assignment.project_id,
-                host_id=dest_host_id,
-                name=assignment.binding_name,
+            binding = await self._resolve_binding(
+                assignment.project_id, dest_host_id, assignment.binding_name
             )
             if binding is None or not binding.enabled:
                 return f"binding_missing:{assignment.binding_name}"
@@ -584,26 +606,41 @@ class AssignmentCoordinator:
         except Exception:  # noqa: BLE001
             _logger.warning("Assignment host listing failed for %s", assignment.id, exc_info=True)
             return "no_eligible_host"
+        first_failure: str | None = None
         for host in hosts:
             host_id_value = host.host_id
             conn = self._host_registry.get(host_id_value)
             if conn is None or not host_supports_assignments(conn):
                 continue
-            binding = await asyncio.to_thread(
-                self._binding_store.get_by_name,
-                project_id=assignment.project_id,
-                host_id=host_id_value,
-                name=assignment.binding_name,
+            binding = await self._resolve_binding(
+                assignment.project_id, host_id_value, assignment.binding_name
             )
             if binding is None or not binding.enabled:
                 continue
             sources = await self._check_binding_and_inputs(assignment, host_id_value, binding)
             if isinstance(sources, str):
-                return sources
+                if first_failure is None:
+                    first_failure = sources
+                continue
             return _ClaimableDestination(
                 host_id=host_id_value, conn=conn, binding=binding, sources=sources
             )
-        return "no_eligible_host"
+        return first_failure or "no_eligible_host"
+
+    async def _resolve_binding(
+        self, project_id: str, host_id: str, binding_name: str
+    ) -> ProjectHostBinding | None:
+        if binding_name == "primary":
+            bindings = await asyncio.to_thread(
+                self._binding_store.list_by_host, project_id=project_id, host_id=host_id
+            )
+            return next((binding for binding in bindings if binding.is_primary), None)
+        return await asyncio.to_thread(
+            self._binding_store.get_by_name,
+            project_id=project_id,
+            host_id=host_id,
+            name=binding_name,
+        )
 
     async def _enabled_bindings_for_repo(
         self, project_id: str, host_id: str, repo_id: str
@@ -1113,11 +1150,15 @@ class AssignmentCoordinator:
         :param assignment: The terminal row with a pending release.
         """
         if assignment.next_check_at is None:
+            self._release_holds.pop(assignment.id, None)
             return
+        if assignment.state != "succeeded":
+            self._release_holds.pop(assignment.id, None)
         now = int(time.time())
         if assignment.next_check_at > now:
             return
         if assignment.resolved_host_id is None:
+            self._release_holds.pop(assignment.id, None)
             await asyncio.to_thread(
                 self._assignment_store.reschedule,
                 assignment.id,
@@ -1151,18 +1192,55 @@ class AssignmentCoordinator:
             )
         session_id: str | None = None
         confirmed_runner: str | None = None
+        conv: Conversation | None = None
         if attempt is not None:
             session_id = _attempt_session_id(attempt)
             conv = await asyncio.to_thread(
                 self._conversation_store.get_conversation,
                 session_id,
             )
+        if assignment.state == "succeeded":
+            started, idle_seen = self._release_holds.get(assignment.id, (now, None))
+            start = (attempt.ended_at if attempt is not None else None) or started
+            if now - start >= _TURN_END_GRACE_S:
+                self._release_holds.pop(assignment.id, None)
+            elif _session_mid_turn(conv):
+                self._release_holds[assignment.id] = (started, None)
+                await asyncio.to_thread(
+                    self._assignment_store.reschedule,
+                    assignment.id,
+                    expected_state=assignment.state,
+                    expected_active_attempt_id=assignment.active_attempt_id,
+                    next_check_at=now + _ACTIVE_CHECK_S,
+                )
+                return
+            elif idle_seen is None or now - idle_seen < _ACTIVE_CHECK_S:
+                self._release_holds[assignment.id] = (started, idle_seen or now)
+                await asyncio.to_thread(
+                    self._assignment_store.reschedule,
+                    assignment.id,
+                    expected_state=assignment.state,
+                    expected_active_attempt_id=assignment.active_attempt_id,
+                    next_check_at=now + _ACTIVE_CHECK_S,
+                )
+                return
+            else:
+                self._release_holds.pop(assignment.id, None)
+        if attempt is not None:
+            if conv is not None and session_id is not None:
+                await asyncio.to_thread(
+                    self._conversation_store.set_labels,
+                    session_id,
+                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                )
             # A relaunch replaces the session's runner, so the stop
             # must name the session's current runner, not the attempt's.
             session_runner = conv.runner_id if conv is not None else None
             confirmed_runner = session_runner
-            if session_runner is not None and not await self._stop_confirmed(
-                assignment, attempt, session_runner, session_id
+            if (
+                session_runner is not None
+                and session_id is not None
+                and not await self._stop_confirmed(assignment, attempt, session_runner, session_id)
             ):
                 return
         sources: dict[str, str] = {}

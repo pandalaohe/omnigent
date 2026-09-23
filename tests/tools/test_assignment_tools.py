@@ -127,3 +127,23 @@ def test_descriptions_state_the_commit_rule() -> None:
         description = cls.description()
         assert "ommitted" in description
         assert "nothing is committed for you" in description
+
+
+def test_assignment_tool_contract_describes_completion_and_primary_binding() -> None:
+    from omnigent.tools.builtins.assignments import (
+        SysAssignmentCompleteTool,
+        SysAssignmentDispatchTool,
+    )
+
+    complete = SysAssignmentCompleteTool.description()
+    assert "last work step" in complete
+    assert "sys_assignment_dispatch" in complete
+    assert "before" in complete
+    assert "session is closed after" in complete
+
+    props = SysAssignmentDispatchTool().get_schema()["function"]["parameters"]["properties"]
+    binding = props["binding_name"]["description"]
+    assert "Omit" in binding
+    assert "primary binding" in binding
+    assert "whatever" in binding
+    assert "exact" in binding

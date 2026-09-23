@@ -332,8 +332,9 @@ class SysAssignmentDispatchTool(Tool):
                         "binding_name": {
                             "type": "string",
                             "description": (
-                                "Which binding of the destination host to run in. "
-                                "Defaults to 'primary'."
+                                "Omit this or pass 'primary' to use the destination host's "
+                                "primary binding, whatever its name. Any other value names "
+                                "a binding exactly."
                             ),
                         },
                         "model_override": {
@@ -374,7 +375,9 @@ class SysAssignmentCompleteTool(Tool):
             "Report a received assignment's work complete: commit the work in "
             "the prepared directories first, then call with each changed "
             "repository and a summary. Only committed work is sent — nothing "
-            "is committed for you."
+            "is committed for you. Completing is the last work step: dispatch "
+            "any onward assignment with sys_assignment_dispatch before it. The "
+            "session is closed after this turn ends."
         )
 
     def get_schema(self) -> dict[str, Any]:
