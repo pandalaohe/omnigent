@@ -36,6 +36,7 @@ from omnigent.inner.codex_goal_command import (
     goal_objective_length_error,
 )
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
     TextChunk,
@@ -4452,13 +4453,13 @@ class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
             self.assertEqual(dir_used, expected)
 
 
-def test_run_turn_cli_config_passes_no_model_to_thread_create():
-    """On the cli-config path (model_provider_override set), model=None is passed
-    to thread/create so the codex binary uses its own configured model rather than
-    forwarding an unresolvable alias (e.g. gpt-5.6) to the Databricks UC API."""
+def test_run_turn_cli_config_uses_binary_default_until_model_picked():
+    """Keep a spec alias out of cli-config turns, but honor the next explicit pick."""
 
     async def _t():
-        fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+        fake_session = _FakeAppSession(
+            [[TurnComplete(response="done")], [TurnComplete(response="done")]]
+        )
         executor = CodexExecutor(
             codex_path="/bin/echo",
             model="gpt-5.6",
@@ -4472,6 +4473,14 @@ def test_run_turn_cli_config_passes_no_model_to_thread_create():
         ):
             pass
         assert fake_session.calls[0]["model"] is None
+        async for _ in executor.run_turn(
+            [{"role": "user", "content": "hi", "session_id": "s1"}],
+            [],
+            "",
+            ExecutorConfig(model="picked"),
+        ):
+            pass
+        assert fake_session.calls[1]["model"] == "picked"
 
     _run(_t())
 

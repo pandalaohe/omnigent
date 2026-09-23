@@ -11508,9 +11508,9 @@ async def _fetch_model_options(
     agent_store: AgentStore | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Resolve the Web UI model-picker options for a native session.
+    Resolve the Web UI model-picker options for a session.
 
-    Three shapes:
+    Catalog sources:
 
     * **codex-native / cursor-native / kiro-native** — a *live* catalog only
       the bound runner can read from the installed CLI. This stays
@@ -11524,6 +11524,8 @@ async def _fetch_model_options(
       With no runner bound and a cold cache (server restart while the
       session slept), the session's host resolves a pre-launch preview
       instead — the same source the new-session picker uses.
+    * **claude-sdk / codex** — the session's host resolves the catalog;
+      SDK runners do not serve model options.
     * **acp** — the deployment's curated provider ``models:`` shortlist from
       the session's explicit provider (provider default first). Local to the
       server, so a cold cache re-resolves inline with no runner round trip.
@@ -11557,6 +11559,23 @@ async def _fetch_model_options(
         # resolved from the spec instead of a runner-owned catalog.
         if _resolve_harness_impl_is_acp(conv, agent_store):
             return await _load_acp_model_options(session_id, conv, agent_store)
+        from omnigent.harness_aliases import canonicalize_harness
+
+        harness = canonicalize_harness(_resolve_harness(conv, agent_store=agent_store))
+        if harness in {"claude-sdk", "codex"} and conv.host_id is not None:
+            cached = _model_options_cache.get(session_id)
+            if cached is not None:
+                return cached
+            if session_id not in _model_options_inflight:
+                task = asyncio.create_task(
+                    _load_model_options_from_host(session_id, conv.host_id, harness)
+                )
+                _model_options_inflight[session_id] = task
+
+                def _clear_sdk_options_inflight(_task: asyncio.Task[None]) -> None:
+                    _model_options_inflight.pop(session_id, None)
+
+                task.add_done_callback(_clear_sdk_options_inflight)
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -11573,7 +11592,9 @@ async def _fetch_model_options(
             and conv.host_id is not None
             and session_id not in _model_options_inflight
         ):
-            task = asyncio.create_task(_load_model_options_from_host(session_id, conv.host_id))
+            task = asyncio.create_task(
+                _load_model_options_from_host(session_id, conv.host_id, "claude-native")
+            )
             _model_options_inflight[session_id] = task
 
             def _clear_host_options_inflight(_task: asyncio.Task[None]) -> None:

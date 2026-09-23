@@ -831,6 +831,7 @@ _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 class _ClaudeClientState:
     client: _ClaudeClient
     model: str | None
+    effort: str | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
 
@@ -1936,6 +1937,7 @@ class ClaudeSDKExecutor(Executor):
             state = _ClaudeClientState(
                 client=client,
                 model=model,
+                effort=getattr(options, "effort", None),
                 loop=asyncio.get_running_loop(),
                 task=current_task,
             )
@@ -2482,6 +2484,16 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
+        try:
+            reasoning_effort = validate_effort(
+                cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
+            )
+        except ValueError as exc:
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
+            return
+        state = self._clients.get(session_key)
+        if state is not None and state.effort != reasoning_effort:
+            await self._close_live_client(session_key)
         resume_session = session_key in self._clients
         prompt = self._build_prompt(
             messages,
@@ -2652,13 +2664,6 @@ class ClaudeSDKExecutor(Executor):
         # branch).
         if resolved.setting_sources is not None:
             options_kwargs["setting_sources"] = resolved.setting_sources
-        try:
-            reasoning_effort = validate_effort(
-                cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
-            )
-        except ValueError as exc:
-            yield ExecutorError(message=describe_exception(exc), retryable=False)
-            return
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort
         # Databricks opus/fable endpoints reject thinking.type="enabled"

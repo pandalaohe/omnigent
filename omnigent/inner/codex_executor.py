@@ -48,7 +48,12 @@ from omnigent.models.codex_model_vocabulary import (
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.spec.types import RetryPolicy
-from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
+from omnigent.util.reasoning_effort import (
+    CODEX_EFFORTS,
+    CODEX_NATIVE_EFFORTS,
+    EFFORT_ALIASES,
+    validate_effort,
+)
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -3999,13 +4004,12 @@ class CodexExecutor(Executor):
         # cfg.model (per-request /model override) wins over the spec default.
         # An unresolved default comes from the active provider catalog.
         # On the cli-config path (model_provider_override set) the codex binary
-        # owns its own model list via its config.toml — omnigent does not pass a
-        # model override to thread/create, letting the binary use its configured
-        # default. Passing an unresolvable alias (e.g. gpt-5.6) would cause the
-        # binary to call UC and get a validation error.
+        # owns its own model list via its config.toml. Without a per-turn pick,
+        # let the binary use its configured default instead of passing a spec
+        # alias (e.g. gpt-5.6) that UC may reject.
         model = cfg.model or self._model_override
         if self._model_provider_override is not None:
-            model = None
+            model = cfg.model
         elif model is None:
             if self._gateway_uses_databricks_profile:
                 resolution = await run_sync_on_thread(
@@ -4030,7 +4034,7 @@ class CodexExecutor(Executor):
         )
         try:
             reasoning_effort = validate_effort(
-                cfg.extra.get("reasoning_effort"), "codex", CODEX_EFFORTS
+                cfg.extra.get("reasoning_effort"), "codex", CODEX_NATIVE_EFFORTS
             )
         except ValueError as exc:
             yield ExecutorError(message=describe_exception(exc), retryable=False)

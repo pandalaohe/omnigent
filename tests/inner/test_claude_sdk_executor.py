@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     TextChunk,
     ToolCallComplete,
@@ -2231,6 +2232,113 @@ class TestSkillsFilterTranslation(unittest.TestCase):
 
 
 class TestStreamEventStreaming(unittest.TestCase):
+    def test_effort_rebuilds_client_before_prompt_and_model_only_reuses_it(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        clients = []
+        prompts = []
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+                    self.closed = False
+                    self.model_changes = []
+                    clients.append(self)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    prompts.append(prompt)
+
+                async def receive_response(self):
+                    yield _ResultMessage("claude-session-a", "done")
+
+                async def set_model(self, model):
+                    self.model_changes.append(model)
+
+                async def disconnect(self):
+                    self.closed = True
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+
+            async def _allow_elicitation(_tool_name, _tool_input):
+                return True
+
+            executor._elicitation_handler = _allow_elicitation
+            original_build_prompt = executor._build_prompt
+
+            def _checked_prompt(messages, *, resume_session):
+                if len(prompts) == 2:
+                    self.assertTrue(clients[0].closed)
+                    self.assertFalse(resume_session)
+                return original_build_prompt(messages, resume_session=resume_session)
+
+            first = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+            second = [
+                *first,
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "follow up", "session_id": "session-a"},
+            ]
+            third = [
+                *second,
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "new effort", "session_id": "session-a"},
+            ]
+            fourth = [
+                *third,
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "new model", "session_id": "session-a"},
+            ]
+            with (
+                patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
+                patch.object(executor, "_build_prompt", side_effect=_checked_prompt),
+            ):
+                for messages, effort, model in [
+                    (first, "high", None),
+                    (second, "high", None),
+                    (third, "max", None),
+                    (fourth, "max", "picked"),
+                ]:
+                    events = [
+                        event
+                        async for event in executor.run_turn(
+                            messages,
+                            [],
+                            "",
+                            ExecutorConfig(model=model, extra={"reasoning_effort": effort}),
+                        )
+                    ]
+                    self.assertIsInstance(events[-1], TurnComplete)
+
+            self.assertEqual(prompts[1], "follow up")
+            self.assertIn("hello", prompts[2])
+            self.assertIn("follow up", prompts[2])
+            self.assertEqual([client.options.effort for client in clients], ["high", "max"])
+            self.assertEqual(clients[1].options.can_use_tool, executor._can_use_tool_gate)
+            self.assertEqual(prompts[3], "new model")
+            self.assertEqual(clients[1].model_changes, ["picked"])
+
+        _run(_t())
+
     def test_live_clients_are_reused_per_omnigent_session(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 

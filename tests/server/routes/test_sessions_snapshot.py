@@ -2020,10 +2020,10 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
-    host_queries: list[str] = []
+    host_queries: list[tuple[str, str]] = []
 
-    async def _fake_host_options(host_id: str) -> list[dict[str, object]] | None:
-        host_queries.append(host_id)
+    async def _fake_host_options(host_id: str, harness: str) -> list[dict[str, object]] | None:
+        host_queries.append((host_id, harness))
         return [{"id": "opus", "displayName": "Opus"}]
 
     monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
@@ -2054,9 +2054,61 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
         conv_store,  # type: ignore[arg-type]
         session_id,
     )
-    assert host_queries == ["host_abc"]
+    assert host_queries == [("host_abc", "claude-native")]
     assert [m.id for m in snapshot.model_options] == ["opus"]
     assert session_id in _mod._model_options_stale
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex", "claude-sdk"])
+async def test_session_snapshot_fills_sdk_catalog_from_host(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    from httpx import AsyncClient
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions.orchestration import _fetch_model_options
+
+    session_id = f"conv_host_catalog_{harness}"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_stale.discard(session_id)
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    host_queries: list[tuple[str, str]] = []
+    release_host = asyncio.Event()
+
+    async def _fake_host_options(host_id: str, requested_harness: str) -> list[dict[str, object]]:
+        host_queries.append((host_id, requested_harness))
+        await release_host.wait()
+        return [{"id": "picked", "displayName": "Picked"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="host_abc",
+        harness_override=harness,
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")], conversations={session_id: conv}
+    )
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert first.model_options == []
+    async with AsyncClient() as runner_client:
+        assert await _fetch_model_options(runner_client, session_id, conv) == []
+        release_host.set()
+        await _drain_model_options(session_id)
+        snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        assert host_queries == [("host_abc", harness)]
+        assert [option.id for option in snapshot.model_options] == ["picked"]
+        cached = await _fetch_model_options(runner_client, session_id, conv)
+        assert [option["id"] for option in cached] == ["picked"]
+    assert session_id not in _mod._model_options_stale
 
 
 @pytest.mark.asyncio

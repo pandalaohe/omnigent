@@ -13,10 +13,10 @@ EFFORT_CLEAR_VALUES = frozenset({"default", "off", "reset"})
 
 # Fold a value to a canonical one, but only where the target ladder lacks it:
 # ``validate_effort`` applies an alias only when the raw value is unsupported
-# but the canonical one is. On the SDK/Responses codex ladder (``CODEX_EFFORTS``,
-# capped at ``xhigh``) the ChatGPT app's ``ultra`` / retired ``max`` fold to
-# ``xhigh``; ladders that carry them (codex-native ``CODEX_NATIVE_EFFORTS``,
-# Anthropic's ``max``) keep them unchanged.
+# but the canonical one is. When normalizing the copied ChatGPT-app config
+# default against ``CODEX_EFFORTS`` (capped at ``xhigh``), ``ultra`` / retired
+# ``max`` fold to ``xhigh``; explicit codex turns use ``CODEX_NATIVE_EFFORTS``
+# and keep those values unchanged.
 EFFORT_ALIASES: dict[str, str] = {"ultra": "xhigh", "max": "xhigh"}
 
 OPENAI_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})

@@ -34,14 +34,9 @@ async def test_claude_sdk_rejects_none_before_sdk_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_codex_coerces_max_to_xhigh() -> None:
-    """The deprecated ``max`` alias is coerced to ``xhigh`` for codex.
-
-    codex's ladder tops out at ``xhigh`` (no ``max``); ``EFFORT_ALIASES``
-    coerces the deprecated value rather than rejecting it. The app-session
-    factory is stubbed so the turn never spawns a real codex process — it
-    only needs to record the ``reasoning_effort`` it was started with.
-    """
+@pytest.mark.parametrize("effort", ["max", "ultra"])
+async def test_codex_preserves_explicit_max_and_ultra(effort: str) -> None:
+    """Codex SDK forwards explicit effort to the app-server turn unchanged."""
     calls: list[dict] = []
 
     class _FakeAppSession:
@@ -62,11 +57,11 @@ async def test_codex_coerces_max_to_xhigh() -> None:
             messages=[{"role": "user", "content": "hi"}],
             tools=[],
             system_prompt="",
-            config=ExecutorConfig(model="test-model", extra={"reasoning_effort": "max"}),
+            config=ExecutorConfig(model="test-model", extra={"reasoning_effort": effort}),
         )
     ]
     assert not any(isinstance(e, ExecutorError) for e in events)
-    assert calls[0]["reasoning_effort"] == "xhigh"
+    assert calls[0]["reasoning_effort"] == effort
 
 
 @pytest.mark.asyncio
