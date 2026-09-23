@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import socket
 import sys
 import tempfile
@@ -48,7 +49,9 @@ from omnigent.harnesses.codex_native.launch_args import (
 )
 from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
+    _tagged_process_group_members,
     acquire_codex_native_process_owner_lock,
+    codex_model_probe_session_tag,
     codex_native_session_tag_cmdline_arg,
     reconcile_codex_native_process_registry,
     register_codex_native_process,
@@ -115,6 +118,12 @@ _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _CONTEXT_CATALOG_TIMEOUT_SECONDS = 2.0
 _MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
 _MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
+# ``codex`` is a wrapper that can exit on SIGTERM while the tree it started
+# keeps running, so teardown finishes on the recorded process group: SIGTERM,
+# wait out the grace, then SIGKILL whatever is left.
+_PROCESS_GROUP_TERM_GRACE_SECONDS = 5.0
+_PROCESS_GROUP_KILL_GRACE_SECONDS = 1.0
+_PROCESS_GROUP_REAP_POLL_SECONDS = 0.05
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
@@ -166,6 +175,7 @@ class _CodexModelDiscoveryProcess:
     stderr_tail: asyncio.Task[str]
     session_tag: str | None = None
     owner_lock: CodexNativeProcessOwnerLock | None = None
+    process_group_id: int | None = None
 
 
 def _string_object_dict(value: object) -> _JsonObject | None:
@@ -1251,7 +1261,7 @@ async def _start_codex_model_discovery_process(
     # A crashed host never runs probe teardown, so reconcile here: the next
     # probe reaps a previous host's orphaned discovery tree.
     await asyncio.to_thread(reconcile_codex_native_process_registry)
-    session_tag = f"codex-model-probe-{uuid.uuid4().hex}"
+    session_tag = codex_model_probe_session_tag()
     argv = _build_native_codex_app_server_argv(
         codex_argv0=Path(codex_path).name,
         session_tag=session_tag,
@@ -1274,10 +1284,11 @@ async def _start_codex_model_discovery_process(
         if owner_lock is not None:
             owner_lock.close()
         raise
+    process_group_id = _process_group_id(process)
     if owner_lock is not None:
         register_codex_native_process(
             pid=process.pid,
-            pgid=_process_group_id(process),
+            pgid=process_group_id,
             session_tag=session_tag,
             owner_lock_path=owner_lock.path,
         )
@@ -1291,6 +1302,7 @@ async def _start_codex_model_discovery_process(
         stderr_tail=stderr_tail,
         session_tag=session_tag,
         owner_lock=owner_lock,
+        process_group_id=process_group_id,
     )
 
 
@@ -1322,22 +1334,45 @@ async def _stop_codex_model_discovery_process(discovery: _CodexModelDiscoveryPro
     """Terminate a discovery process and finish draining its stderr pipe."""
     try:
         process = discovery.process
-        _proc.terminate_tree(process)
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5.0)
-        except TimeoutError:
-            _proc.kill_tree(process)
-            await process.wait()
-        await discovery.stderr_tail
+        if process.returncode is None:
+            if os.name == "posix":
+                await _reap_process_group_survivors(
+                    discovery.process_group_id, discovery.session_tag
+                )
+            else:
+                _proc.terminate_tree(process)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except TimeoutError:
+                if os.name != "posix":
+                    _proc.kill_tree(process)
+                    await process.wait()
     finally:
         # Lock always released so an orphan is never mistaken for a sibling;
-        # entry kept unless the child exited so reconcile can still reap it.
+        # the entry is kept unless the child exited AND its process group is
+        # empty, so reconcile can still reap a tree the wrapper left behind.
+        group_empty = False
         try:
-            if discovery.session_tag is not None and discovery.process.returncode is not None:
-                unregister_codex_native_process(discovery.session_tag)
+            group_empty = await _reap_process_group_survivors(
+                discovery.process_group_id, discovery.session_tag
+            )
         finally:
-            if discovery.owner_lock is not None:
-                discovery.owner_lock.close()
+            try:
+                if (
+                    discovery.session_tag is not None
+                    and discovery.process.returncode is not None
+                    and group_empty
+                ):
+                    unregister_codex_native_process(discovery.session_tag)
+            finally:
+                if discovery.owner_lock is not None:
+                    discovery.owner_lock.close()
+                try:
+                    await asyncio.wait({discovery.stderr_tail}, timeout=1.0)
+                finally:
+                    discovery.stderr_tail.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await discovery.stderr_tail
 
 
 def _allocate_loopback_port() -> int:
@@ -1859,6 +1894,7 @@ class CodexNativeAppServer:
     model_catalog_rows: list[_JsonObject] | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
+    process_group_id: int | None = None
     codex_cli_version: tuple[int, int, int] | None = None
     trust_project: bool = False
     trust_all_hooks: bool = False
@@ -2042,10 +2078,11 @@ class CodexNativeAppServer:
                 self.process_owner_lock.close()
                 self.process_owner_lock = None
             raise
+        self.process_group_id = _process_group_id(self.proc)
         if self.process_owner_lock is not None:
             register_codex_native_process(
                 pid=self.proc.pid,
-                pgid=_process_group_id(self.proc),
+                pgid=self.process_group_id,
                 session_tag=self.process_registry_tag,
                 owner_lock_path=self.process_owner_lock.path,
             )
@@ -2232,43 +2269,57 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
-        if self.proc is not None and self.proc.returncode is None:
-            _terminate_process_tree(self.proc)
-            try:
-                await asyncio.wait_for(self.proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                _kill_process_tree(self.proc)
-                await self.proc.wait()
-        if self.process_registry_tag is not None:
-            unregister_codex_native_process(self.process_registry_tag)
-        if self.process_owner_lock is not None:
-            self.process_owner_lock.close()
+        group_empty = False
         try:
-            if self.stderr_task is not None and self._stderr_diagnostics is not None:
-                # The process has exited; allow buffered output to reach EOF.
-                # A descendant can still hold the pipe open, so bound the wait.
-                await asyncio.wait({self.stderr_task}, timeout=1.0)
+            if self.proc is not None and self.proc.returncode is None:
+                if os.name == "posix":
+                    await _reap_process_group_survivors(
+                        self.process_group_id, self.process_registry_tag
+                    )
+                else:
+                    _terminate_process_tree(self.proc)
+                try:
+                    await asyncio.wait_for(self.proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    if os.name != "posix":
+                        _kill_process_tree(self.proc)
+                        await self.proc.wait()
+            # The npm wrapper can exit while the tree it started survives, so
+            # the recorded group decides when the registry entry is gone.
+            group_empty = await _reap_process_group_survivors(
+                self.process_group_id, self.process_registry_tag
+            )
         finally:
+            if self.process_registry_tag is not None and group_empty:
+                unregister_codex_native_process(self.process_registry_tag)
+            if self.process_owner_lock is not None:
+                self.process_owner_lock.close()
             try:
-                if self.stderr_task is not None:
-                    self.stderr_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await self.stderr_task
-                if self.context_catalog_task is not None:
-                    self.context_catalog_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await self.context_catalog_task
+                if self.stderr_task is not None and self._stderr_diagnostics is not None:
+                    # A descendant can hold the pipe open, so bound the wait.
+                    await asyncio.wait({self.stderr_task}, timeout=1.0)
             finally:
-                diagnostics, self._stderr_diagnostics = self._stderr_diagnostics, None
-                self.proc = None
-                self.stderr_task = None
-                self.context_catalog_task = None
-                self.process_registry_tag = None
-                self.process_owner_lock = None
-                if diagnostics is not None:
-                    diagnostics.finish()
-                    with contextlib.suppress(Exception):
-                        await asyncio.to_thread(diagnostics.close)
+                try:
+                    if self.stderr_task is not None:
+                        self.stderr_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await self.stderr_task
+                    if self.context_catalog_task is not None:
+                        self.context_catalog_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await self.context_catalog_task
+                finally:
+                    diagnostics, self._stderr_diagnostics = self._stderr_diagnostics, None
+                    self.proc = None
+                    self.stderr_task = None
+                    self.context_catalog_task = None
+                    self.process_registry_tag = None
+                    self.process_owner_lock = None
+                    self.process_group_id = None
+                    if diagnostics is not None:
+                        diagnostics.finish()
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(diagnostics.close)
 
     async def _populate_context_catalog(self, source_home: Path) -> None:
         """Best-effort host model metadata for truthful compact progress."""
@@ -4549,6 +4600,70 @@ def _process_group_id(process: asyncio.subprocess.Process) -> int:
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             return os.getpgid(process.pid)
     return process.pid
+
+
+async def _reap_process_group_survivors(pgid: int | None, session_tag: str | None) -> bool:
+    """
+    Reap a spawned child's recorded process group.
+
+    ``codex`` resolves to a wrapper that exits on SIGTERM while the tree it
+    started can keep running, so waiting on the spawned process alone reads a
+    live tree as gone. Callers keep the registry entry until this reports the
+    group empty.
+
+    :param pgid: Recorded process group id, or None when unknown.
+    :param session_tag: Exact teardown tag embedded in child argv.
+    :returns: True when no tagged same-UID member remains.
+    """
+    if os.name != "posix":
+        return True
+    if pgid is None or session_tag is None:
+        return False
+    if pgid <= 1 or pgid == os.getpgrp():
+        return False
+    members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
+    if members is None:
+        return False
+    if not members:
+        return True
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
+        return members == []
+    except (PermissionError, OSError):
+        return False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _PROCESS_GROUP_TERM_GRACE_SECONDS
+    while loop.time() < deadline:
+        members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
+        if members is None:
+            return False
+        if not members:
+            return True
+        await asyncio.sleep(_PROCESS_GROUP_REAP_POLL_SECONDS)
+    members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
+    if members is None:
+        return False
+    if not members:
+        return True
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
+        return members == []
+    except (PermissionError, OSError):
+        return False
+    deadline = loop.time() + _PROCESS_GROUP_KILL_GRACE_SECONDS
+    while True:
+        members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
+        if members is None:
+            return False
+        if not members:
+            return True
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(_PROCESS_GROUP_REAP_POLL_SECONDS)
 
 
 def _kill_process_tree(process: asyncio.subprocess.Process) -> None:

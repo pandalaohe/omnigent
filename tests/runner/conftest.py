@@ -20,6 +20,7 @@ from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
+from tests.conftest import _TEST_OMNIGENT_DATA_DIR
 from tests.runner.helpers import NullServerClient
 
 # The real store-backed catalog resolver, captured before the autouse fixture
@@ -33,6 +34,43 @@ REAL_CODEX_REPROBED_LAUNCH_CATALOG = codex_native_app_server.codex_reprobed_laun
 
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+# Env vars the suite pins in tests/conftest.py before any Omnigent import;
+# the hermetic fixture below clears inherited vars but must keep these.
+_SUITE_ENV_PINS = {
+    "OMNIGENT_AUTH_PROVIDER": "header",
+    "OMNIGENT_DATA_DIR": str(_TEST_OMNIGENT_DATA_DIR),
+    "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+    "OMNIGENT_LOCAL_SINGLE_USER": "1",
+}
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_omnigent_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Clear inherited ``OMNIGENT_*`` vars and isolate the config home.
+
+    A shell that runs the suite from inside an omnigent-managed session (or a
+    developer's own exports) leaks runner vars such as
+    ``OMNIGENT_RUNNER_WORKSPACE`` into session creation, and a real
+    ``~/.omnigent/config.yaml`` injects subscription providers into expected
+    model rows. Tests that need a var set it themselves after this fixture.
+    """
+    for name in tuple(os.environ):
+        if name.startswith("OMNIGENT_"):
+            monkeypatch.delenv(name)
+    for name, value in _SUITE_ENV_PINS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv(
+        "OMNIGENT_CONFIG_HOME", str(tmp_path_factory.mktemp("omnigent-config-home"))
+    )
+    # Ambient credential detection reads the developer's real home (a Claude
+    # CLI login under ``~/.claude`` or the macOS Keychain) and would inject a
+    # subscription ``source`` into expected model rows. These tests resolve
+    # providers from their own fixtures, never from the developer's machine.
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
 
 
 @pytest.fixture(autouse=True)

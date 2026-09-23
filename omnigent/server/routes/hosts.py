@@ -1068,6 +1068,11 @@ def create_hosts_router(
         body: ResetCliRetentionPolicyRequest,
     ) -> CliRetentionPolicyResponse:
         """CAS the Host back to legacy TTL behavior and unmanage live CLIs."""
+        # Baseline for the heartbeat's own owner cancel below: if cancelling()
+        # is still above it after the single uncancel(), a second, external
+        # cancel landed in the same step and must keep propagating.
+        reset_task = asyncio.current_task()
+        cancelling_baseline = reset_task.cancelling() if reset_task is not None else 0
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
@@ -1141,6 +1146,10 @@ def create_hosts_router(
                             task = asyncio.current_task()
                             if task is not None:
                                 task.uncancel()
+                                if task.cancelling() > cancelling_baseline:
+                                    # A second cancel (e.g. an enclosing
+                                    # timeout or shutdown) is still pending.
+                                    raise
                             _logger.warning(
                                 "CLI retention lease lost after policy reset for Host %s; "
                                 "completing cleanup best-effort",

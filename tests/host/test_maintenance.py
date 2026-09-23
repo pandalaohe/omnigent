@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -77,6 +78,12 @@ async def test_host_janitor_uses_absolute_unresolved_harness_tmp_parent(
         "omnigent.runtime.harnesses.process_manager.sweep_orphaned_harness_processes",
         _sweep,
     )
+    # The probe backstop scans real ps output; never let a unit test reap a
+    # developer's processes.
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_orphaned_codex_model_probes",
+        lambda: 0,
+    )
     janitor = HostMaintenanceJanitor.for_host(harness_tmp_parent=configured_root)
 
     janitor.trigger("runner_exited")
@@ -105,6 +112,10 @@ async def test_runner_lifecycle_trigger_reaps_native_bridge_dirs(
         "omnigent.harnesses.codex_native.process_registry.reconcile_codex_native_process_registry",
         lambda: None,
     )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_orphaned_codex_model_probes",
+        lambda: 0,
+    )
     monkeypatch.setattr("omnigent.inner.terminal.reap_orphaned_terminals", lambda: None)
     monkeypatch.setattr(
         "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
@@ -120,6 +131,79 @@ async def test_runner_lifecycle_trigger_reaps_native_bridge_dirs(
     await janitor.shutdown()
 
     assert bridge_sweeps == [1]
+
+
+async def test_codex_stage_logs_reaped_process_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The codex stage reports what it reaped instead of cleaned_items=None."""
+
+    async def _sweep_harness_processes(*, tmp_parent: Path | None = None) -> None:
+        assert tmp_parent is not None
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.sweep_orphaned_harness_processes",
+        _sweep_harness_processes,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reconcile_codex_native_process_registry",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_orphaned_codex_model_probes",
+        lambda: 1,
+    )
+    monkeypatch.setattr("omnigent.inner.terminal.reap_orphaned_terminals", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: 0,
+    )
+    janitor = HostMaintenanceJanitor.for_host(harness_tmp_parent=tmp_path / "harness-sockets")
+    janitor._lock_path = tmp_path / "maintenance.lock"
+
+    with caplog.at_level(logging.INFO):
+        janitor.trigger("runner_exited")
+        task = janitor._task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=5.0)
+        await janitor.shutdown()
+
+    assert (
+        "stage=codex_process_registry cleaned_items={'registry': 2, 'orphaned_probes': 1}"
+        in caplog.text
+    )
+
+
+async def test_start_fires_periodic_self_trigger(tmp_path: Path) -> None:
+    """A long-lived host self-triggers cleanup on the periodic interval."""
+    calls = 0
+    second_pass = asyncio.Event()
+
+    async def _stage() -> int:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            second_pass.set()
+        return 0
+
+    janitor = HostMaintenanceJanitor(
+        stages=(("stage", _stage),),
+        lock_path=tmp_path / "maintenance.lock",
+        startup_delay_s=60,
+        periodic_interval_s=0.01,
+    )
+
+    janitor.start()
+    try:
+        # The startup pass is 60 s away, so only the periodic timer can run.
+        await asyncio.wait_for(second_pass.wait(), timeout=5.0)
+    finally:
+        await janitor.shutdown()
+
+    assert calls >= 2
+    assert janitor._periodic_task is None
 
 
 async def test_triggers_during_cleanup_coalesce_into_one_follow_up(tmp_path: Path) -> None:
