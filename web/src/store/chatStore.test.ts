@@ -1868,6 +1868,163 @@ describe("chatStore — switchTo", () => {
     expect(cards[0]!.ctx.itemId).toBe("fc_ask:answer");
   });
 
+  it.each([{ withLiveCard: true }, { withLiveCard: false }])(
+    "keeps an answered question card above the reply when the reconnect backfill rebuilds it (live copy: $withLiveCard)",
+    async ({ withLiveCard }) => {
+      // The card was answered live, so it sits between the
+      // AskUserQuestion call and the reply that follows it; with the live
+      // copy out of the window it belongs immediately after the call.
+      // Either way the call + result persisted across the disconnect, so
+      // the reconnect backfill rebuilds the card from the items — spliced
+      // with the rest of the gap it landed BELOW the reply, reading as if
+      // the question had been asked after the answer.
+      const questions = {
+        questions: [
+          { question: "Which library?", options: [{ label: "date-fns" }], multiSelect: false },
+        ],
+      };
+      const user = userMessage("resp_1", "pick one");
+      const fcAsk: ConversationItem = {
+        id: "fc_ask",
+        response_id: "resp_1",
+        type: "function_call",
+        status: "completed",
+        name: "AskUserQuestion",
+        arguments: JSON.stringify(questions),
+        call_id: "call_ask",
+      };
+      const fcoAsk: ConversationItem = {
+        id: "fco_ask",
+        response_id: "resp_1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_ask",
+        output: 'Your questions have been answered: "Which library?"="date-fns".',
+      };
+      const reply = assistantMessage("resp_1", "Using date-fns.");
+      seedSession("conv_card_order", [user, fcAsk, fcoAsk, reply]);
+      await useChatStore.getState().switchTo("conv_card_order");
+
+      const liveCard: ElicitationBlock = {
+        type: "elicitation",
+        ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+        elicitationId: "elicit_live_ask",
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { "Which library?": "date-fns" } },
+        askUserQuestion: questions,
+      };
+      useChatStore.setState({
+        blocks: [
+          ...itemsToBlocks([user]),
+          ...itemsToBlocks([fcAsk]),
+          ...(withLiveCard ? [liveCard] : []),
+          ...itemsToBlocks([fcoAsk]),
+          ...itemsToBlocks([reply]),
+        ],
+      });
+
+      // Switch away and back: the retained conversation reconciles against
+      // the snapshot, whose items rebuild the answered card.
+      await useChatStore.getState().switchTo("conv_other");
+      await useChatStore.getState().switchTo("conv_card_order");
+      await tick();
+
+      const blocks = useChatStore.getState().blocks;
+      const cards = blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+      // One card: a live copy can only be replaced, never left beside its
+      // rebuilt twin.
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.ctx.itemId).toBe("fc_ask:answer");
+      const replyAt = blocks.findIndex((b) => b.type === "text_done");
+      expect(replyAt).toBeGreaterThanOrEqual(0);
+      expect(blocks.indexOf(cards[0]!)).toBeLessThan(replyAt);
+      // The live copy's slot, else immediately after the call it gated.
+      expect(blocks.indexOf(cards[0]!)).toBe(2);
+    },
+  );
+
+  it("pairs repeated answered questions with their live cards in transcript order", async () => {
+    const questions = {
+      questions: [{ question: "Continue?", options: [{ label: "Yes" }], multiSelect: false }],
+    };
+    const turns = ["1", "2"].map((number) => {
+      const responseId = `resp_${number}`;
+      const user = userMessage(responseId, `prompt ${number}`);
+      const call: ConversationItem = {
+        id: `fc_ask_${number}`,
+        response_id: responseId,
+        type: "function_call",
+        status: "completed",
+        name: "AskUserQuestion",
+        arguments: JSON.stringify(questions),
+        call_id: `call_ask_${number}`,
+      };
+      const result: ConversationItem = {
+        id: `fco_ask_${number}`,
+        response_id: responseId,
+        type: "function_call_output",
+        status: "completed",
+        call_id: `call_ask_${number}`,
+        output: 'Your questions have been answered: "Continue?"="Yes".',
+      };
+      const reply = assistantMessage(responseId, `reply ${number}`);
+      const liveCard: ElicitationBlock = {
+        type: "elicitation",
+        ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId: null },
+        elicitationId: `elicit_live_ask_${number}`,
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { "Continue?": "Yes" } },
+        askUserQuestion: questions,
+      };
+      return { user, call, result, reply, liveCard };
+    });
+    seedSession(
+      "conv_repeated_card_order",
+      turns.flatMap(({ user, call, result, reply }) => [user, call, result, reply]),
+    );
+    await useChatStore.getState().switchTo("conv_repeated_card_order");
+    useChatStore.setState({
+      blocks: turns.flatMap(({ user, call, result, reply, liveCard }) => [
+        ...itemsToBlocks([user]),
+        ...itemsToBlocks([call]),
+        liveCard,
+        ...itemsToBlocks([result]),
+        ...itemsToBlocks([reply]),
+      ]),
+    });
+
+    await useChatStore.getState().switchTo("conv_other");
+    await useChatStore.getState().switchTo("conv_repeated_card_order");
+    await tick();
+
+    const blocks = useChatStore.getState().blocks;
+    const cards = blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards.map((b) => b.ctx.itemId)).toEqual(["fc_ask_1:answer", "fc_ask_2:answer"]);
+    for (const [index, card] of cards.entries()) {
+      const responseId = `resp_${index + 1}`;
+      const userAt = blocks.findIndex(
+        (b) => b.type === "user_message" && b.ctx.responseId === responseId,
+      );
+      const replyAt = blocks.findIndex(
+        (b) => b.type === "text_done" && b.ctx.responseId === responseId,
+      );
+      expect(userAt).toBeGreaterThanOrEqual(0);
+      expect(replyAt).toBeGreaterThanOrEqual(0);
+      expect(blocks.indexOf(card)).toBeGreaterThan(userAt);
+      expect(blocks.indexOf(card)).toBeLessThan(replyAt);
+    }
+  });
+
   it("hydrates only the initial window and flags that older history remains", async () => {
     // Longer than the initial window so the loaded window is a strict subset.
     const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
@@ -10603,6 +10760,102 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each(["second only", "both"])(
+    "keeps repeated question cards in their turns when the backfill rebuilds %s",
+    async (rebuilt) => {
+      const questions = {
+        questions: [{ question: "Continue?", options: [{ label: "Yes" }], multiSelect: false }],
+      };
+      const turns = ["1", "2"].map((number) => {
+        const responseId = `resp_${number}`;
+        const user = userMessage(responseId, `prompt ${number}`);
+        const call: ConversationItem = {
+          id: `fc_ask_${number}`,
+          response_id: responseId,
+          type: "function_call",
+          status: "completed",
+          name: "AskUserQuestion",
+          arguments: JSON.stringify(questions),
+          call_id: `call_ask_${number}`,
+        };
+        const result: ConversationItem = {
+          id: `fco_ask_${number}`,
+          response_id: responseId,
+          type: "function_call_output",
+          status: "completed",
+          call_id: `call_ask_${number}`,
+          output: 'Your questions have been answered: "Continue?"="Yes".',
+        };
+        const reply = assistantMessage(responseId, `reply ${number}`);
+        const liveCard: ElicitationBlock = {
+          type: "elicitation",
+          ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId: null },
+          elicitationId: `elicit_live_ask_${number}`,
+          message: "Claude wants to call **AskUserQuestion**",
+          phase: "pre_tool_use",
+          policyName: "claude_native_permission",
+          contentPreview: "",
+          requestedSchema: {},
+          status: "responded",
+          response: { action: "accept", content: { "Continue?": "Yes" } },
+          askUserQuestion: questions,
+        };
+        return { user, call, result, reply, liveCard };
+      });
+      const items = turns.flatMap(({ user, call, result, reply }) => [user, call, result, reply]);
+      seedSession("conv_repeated_gap", rebuilt === "both" ? items : items.slice(4));
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_repeated_gap",
+        abortController: controller,
+        blocks: turns.flatMap(({ user, call, result, reply, liveCard }, index) => [
+          ...itemsToBlocks([user]),
+          ...itemsToBlocks([call]),
+          ...(rebuilt === "second only" || index === 1 ? [liveCard] : []),
+          ...itemsToBlocks([result]),
+          ...itemsToBlocks([reply]),
+        ]),
+      });
+
+      const loop = startStreamPump("conv_repeated_gap", controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sinks).toHaveLength(1);
+      sinks[0]!.error();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+
+      const blocks = useChatStore.getState().blocks;
+      const cards = blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+      expect(cards).toHaveLength(2);
+      expect(cards.map((b) => b.ctx.itemId ?? b.elicitationId)).toEqual([
+        rebuilt === "both" ? "fc_ask_1:answer" : "elicit_live_ask_1",
+        "fc_ask_2:answer",
+      ]);
+      for (const [index, card] of cards.entries()) {
+        const responseId = `resp_${index + 1}`;
+        const callAt = blocks.findIndex(
+          (b) =>
+            b.type === "tool_group" &&
+            b.executions.some((e) => e.callId === `call_ask_${index + 1}`),
+        );
+        const replyAt = blocks.findIndex(
+          (b) => b.type === "text_done" && b.ctx.responseId === responseId,
+        );
+        expect(callAt).toBeGreaterThanOrEqual(0);
+        expect(replyAt).toBeGreaterThanOrEqual(0);
+        expect(blocks.indexOf(card)).toBeGreaterThan(callAt);
+        expect(blocks.indexOf(card)).toBeLessThan(replyAt);
+      }
+
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(1);
+      controller.abort();
+      await loop;
+    },
+  );
 
   it("restores the durable todo snapshot after a reconnect gap", async () => {
     seedSession("conv_reconnect_todos", []);
