@@ -117,6 +117,11 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
+from omnigent.sdk_permission_modes import (
+    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODES,
+)
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -160,6 +165,7 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
+    CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
     validate_session_agent,
     validate_session_model_metadata,
 )
@@ -10234,6 +10240,44 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    sdk_permission_labels: dict[str, str] = {}
+    if body.permission_mode is not None or body.approval_mode is not None:
+        if body.sub_agent_name is not None or body.parent_session_id is not None:
+            raise OmnigentError(
+                "permission_mode and approval_mode are only supported for top-level sessions",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        resolved_harness = await asyncio.to_thread(
+            _create_resolved_harness, agent, harness_override, agent_cache
+        )
+        if body.permission_mode is not None:
+            if resolved_harness != "claude-sdk":
+                raise OmnigentError(
+                    "permission_mode is only supported for claude-sdk sessions, "
+                    f"not {resolved_harness!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.permission_mode not in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES:
+                raise OmnigentError(
+                    "permission_mode must be one of "
+                    f"{sorted(CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            sdk_permission_labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = body.permission_mode
+        if body.approval_mode is not None:
+            if resolved_harness != "codex":
+                raise OmnigentError(
+                    "approval_mode is only supported for codex sessions, "
+                    f"not {resolved_harness!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.approval_mode not in CODEX_SDK_APPROVAL_MODES:
+                raise OmnigentError(
+                    f"approval_mode must be one of {sorted(CODEX_SDK_APPROVAL_MODES)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            sdk_permission_labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = body.approval_mode
+
     inference_snapshot = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
@@ -10573,6 +10617,9 @@ async def _create_session_from_existing_agent(
         from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 
         initial_labels[AUTO_HARNESS_LABEL_KEY] = "1"
+
+    if sdk_permission_labels:
+        initial_labels.update(sdk_permission_labels)
 
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}

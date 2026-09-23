@@ -186,7 +186,12 @@ class ExecutorAdapter(HarnessApp):
         if request.max_output_tokens is not None:
             extra["max_tokens"] = int(request.max_output_tokens)
         # model_override is the per-request override; takes precedence over the spec default.
-        config = ExecutorConfig(model=request.model_override, extra=extra)
+        config = ExecutorConfig(
+            model=request.model_override,
+            permission_mode=request.permission_mode,
+            approval_mode=request.approval_mode,
+            extra=extra,
+        )
         tools = _normalize_tool_schemas(request.tools or [])
         system_prompt = request.instructions or ""
         # Install stable bridges once on first use — the SDK closure-captures them from the first

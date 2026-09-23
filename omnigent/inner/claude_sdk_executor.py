@@ -39,6 +39,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
+from functools import partial
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
@@ -832,6 +833,7 @@ class _ClaudeClientState:
     client: _ClaudeClient
     model: str | None
     effort: str | None = None
+    permission_mode: str | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
 
@@ -1938,6 +1940,7 @@ class ClaudeSDKExecutor(Executor):
                 client=client,
                 model=model,
                 effort=getattr(options, "effort", None),
+                permission_mode=getattr(options, "permission_mode", None),
                 loop=asyncio.get_running_loop(),
                 task=current_task,
             )
@@ -2418,6 +2421,8 @@ class ClaudeSDKExecutor(Executor):
         tool_name: str,
         tool_input: ToolArgs,
         perm_ctx: object,
+        *,
+        permission_mode: str | None = None,
     ) -> object:
         """
         Unified ``options.can_use_tool`` callback for the claude-sdk path.
@@ -2441,6 +2446,8 @@ class ClaudeSDKExecutor(Executor):
             ``"mcp__github__issue_write"``.
         :param tool_input: Arguments dict for the tool call.
         :param perm_ctx: :class:`claude_agent_sdk.ToolPermissionContext`.
+        :param permission_mode: This client's mode, or the executor default
+            for a direct call.
         :returns: A :class:`~claude_agent_sdk.PermissionResult`.
         """
         from claude_agent_sdk import PermissionResultAllow
@@ -2451,7 +2458,9 @@ class ClaudeSDKExecutor(Executor):
             return policy_result
         # Policy allowed (or no policy gate). Under bypassPermissions we
         # never prompt; otherwise defer to the elicitation gate.
-        if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
+        if (
+            permission_mode or self._permission_mode
+        ) == "bypassPermissions" or self._elicitation_handler is None:
             return PermissionResultAllow()
         return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
 
@@ -2491,8 +2500,13 @@ class ClaudeSDKExecutor(Executor):
         except ValueError as exc:
             yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
+        permission_mode = (
+            cfg.permission_mode if cfg.permission_mode is not None else self._permission_mode
+        )
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort:
+        if state is not None and (
+            state.effort != reasoning_effort or state.permission_mode != permission_mode
+        ):
             await self._close_live_client(session_key)
         resume_session = session_key in self._clients
         prompt = self._build_prompt(
@@ -2540,7 +2554,7 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode in ("auto", "bypassPermissions"):
+        if permission_mode in ("auto", "bypassPermissions"):
             # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")
@@ -2641,7 +2655,7 @@ class ClaudeSDKExecutor(Executor):
             "system_prompt": system_prompt or None,
             "mcp_servers": mcp_servers if mcp_servers else {},
             "allowed_tools": allowed_tools,
-            "permission_mode": self._permission_mode,
+            "permission_mode": permission_mode,
             "max_turns": cfg.extra.get("max_turns"),
             "env": env,
             "settings": settings_payload,
@@ -2709,7 +2723,9 @@ class ClaudeSDKExecutor(Executor):
             getattr(self, "_policy_evaluator", None) is not None
             or self._elicitation_handler is not None
         ):
-            options.can_use_tool = self._can_use_tool_gate
+            options.can_use_tool = partial(
+                self._can_use_tool_gate, permission_mode=permission_mode
+            )
 
         self._install_subagent_router_hook(sdk, options, model)
         self._install_framework_context_hook(sdk, options, session_key)

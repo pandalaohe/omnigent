@@ -195,6 +195,10 @@ from omnigent.runtime.prompt import (
     raw_author_instructions,
     session_startup_extras,
 )
+from omnigent.sdk_permission_modes import (
+    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+)
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -3136,10 +3140,6 @@ def create_runner_app(
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
     # effort only from the forwarded turn body, which is built field by field.
     _session_reasoning_effort: dict[str, str] = {}
-    # session_id → project-assignments flag from the init snapshot. Kept
-    # beside the other snapshot dicts: the raw envelope cache is TTL'd.
-    # Aliased to the module-level ref so dispatch paths can read the flag
-    # with only a conversation id.
     _session_project_assignments_enabled = _session_project_assignments_enabled_ref
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
@@ -3158,6 +3158,8 @@ def create_runner_app(
         """
         return [value] if value and value.strip() else []
 
+    _session_permission_mode: dict[str, str] = {}
+    _session_approval_mode: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     # session_id → worktree path, from the session-init envelope or the REST
@@ -4117,6 +4119,10 @@ def create_runner_app(
         # A re-init may flip the flag: drop the cached tool surface so the
         # next turn rebuilds it with the new value.
         _session_tool_schemas.pop(session_id, None)
+        if permission_mode := snapshot.labels.get(CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY):
+            _session_permission_mode[session_id] = permission_mode
+        if approval_mode := snapshot.labels.get(CODEX_SDK_APPROVAL_MODE_LABEL_KEY):
+            _session_approval_mode[session_id] = approval_mode
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
         return _SessionInitContext(envelope=envelope)
 
@@ -5562,6 +5568,8 @@ def create_runner_app(
         _session_project_assignments_enabled.pop(session_id, None)
         _session_peer_messaging_enabled.pop(session_id, None)
         _session_global_instructions.pop(session_id, None)
+        _session_permission_mode.pop(session_id, None)
+        _session_approval_mode.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -9399,6 +9407,12 @@ def create_runner_app(
                     harness_name,
                     format_supported(_supported) if _supported else "no effort override",
                 )
+        if harness_name == "claude-sdk" and (
+            permission_mode := _session_permission_mode.get(conv)
+        ):
+            harness_body["permission_mode"] = permission_mode
+        if harness_name == "codex" and (approval_mode := _session_approval_mode.get(conv)):
+            harness_body["approval_mode"] = approval_mode
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
         else:
@@ -11086,6 +11100,15 @@ def create_runner_app(
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
+            if harness == "claude-sdk":
+                mode = body.get("permission_mode") if isinstance(body, dict) else None
+                if not isinstance(mode, str) or not mode:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "invalid_input", "detail": "Invalid permission_mode"},
+                    )
+                _session_permission_mode[conversation_id] = mode
+                return JSONResponse(content={"permission_mode": mode})
             if harness in ("claude-native", "devin-native"):
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if mode is not None and not isinstance(mode, str):
@@ -11115,6 +11138,15 @@ def create_runner_app(
 
         if body_type == "codex_approval_mode_change":
             harness = _session_harness_name(conversation_id)
+            if harness == "codex":
+                mode = body.get("approval_mode") if isinstance(body, dict) else None
+                if not isinstance(mode, str) or not mode:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "invalid_input", "detail": "Invalid approval_mode"},
+                    )
+                _session_approval_mode[conversation_id] = mode
+                return JSONResponse(content={"approval_mode": mode})
             if harness == "codex-native":
                 mode = body.get("approval_mode") if isinstance(body, dict) else None
                 if not isinstance(mode, str) or not mode:

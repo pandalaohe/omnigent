@@ -1048,6 +1048,8 @@ class CreateResponseRequest(BaseModel):
         ``previous_response_id``.
     :param reasoning: Reasoning configuration,
         e.g. ``{"effort": "medium"}``.
+    :param permission_mode: Per-turn Claude SDK permission mode, when set.
+    :param approval_mode: Per-turn Codex SDK approval preset, when set.
     :param model_override: Optional per-request LLM model override,
         e.g. ``"openai/gpt-5.4-mini"``. Distinct from ``model``
         (agent name). Substitutes for the spec's ``llm.model`` for
@@ -1104,6 +1106,8 @@ class CreateResponseRequest(BaseModel):
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
+    permission_mode: str | None = None
+    approval_mode: str | None = None
     # Per-request LLM model override (distinct from ``model``, which
     # carries the agent name). See class docstring for semantics.
     model_override: str | None = None
@@ -1446,6 +1450,8 @@ class _SessionCreateRequestBase(BaseModel):
     :param title: Optional human-readable title for the session,
         e.g. ``"debugging auth flow"``.
     :param labels: Initial guardrails labels to set on the session.
+    :param permission_mode: Claude SDK permission mode for this session.
+    :param approval_mode: Codex SDK approval preset for this session.
     :param parent_session_id: Parent session for sub-agent spawns.
         When set, the server inherits the parent's ``runner_id``
         affinity and sets ``parent_conversation_id`` on the child
@@ -1592,6 +1598,8 @@ class _SessionCreateRequestBase(BaseModel):
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    permission_mode: str | None = None
+    approval_mode: str | None = None
     smart_routing_message: str | None = None
 
     @model_validator(mode="after")
@@ -2368,6 +2376,8 @@ class UpdateSessionRequest(BaseModel):
         fields here the switch is applied by the live TUI, so a failure
         to reach the mode is surfaced as an error rather than persisted.
         Omitted leaves unchanged.
+        Claude SDK sessions accept all Claude Code launch modes, applied from
+        the next turn.
     :param approval_mode: Codex-native approval mode to switch a running
         session to, one of ``"ask-for-approval"``, ``"approve-for-me"``,
         ``"full-access"``, ``"read-only"`` — Codex's own ``/permissions``
@@ -2378,6 +2388,8 @@ class UpdateSessionRequest(BaseModel):
         reach the mode surfaces as an error. The confirmed mode is stored on the
         read-back label only (Codex owns the durable approval state), so it is
         not written to ``terminal_launch_args``. Omitted leaves unchanged.
+        Codex SDK sessions accept ``"default"``, ``"full-access"``, and
+        ``"read-only"``, applied from the next turn.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.

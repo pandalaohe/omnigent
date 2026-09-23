@@ -104,6 +104,8 @@ class ExecutorConfig:
     temperature: float = 0.0
     max_tokens: int = 100000
     extra: ExecutorExtra = field(default_factory=dict)
+    permission_mode: str | None = None
+    approval_mode: str | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -1772,6 +1772,8 @@ async def test_executor_adapter_builds_config_from_request() -> None:
             assert config is not None
             captured["model"] = config.model
             captured["extra"] = dict(config.extra)
+            captured["permission_mode"] = config.permission_mode
+            captured["approval_mode"] = config.approval_mode
             yield TurnComplete(response="ok")
 
     adapter = ExecutorAdapter(executor_factory=lambda: _CaptureExecutor())
@@ -1784,11 +1786,15 @@ async def test_executor_adapter_builds_config_from_request() -> None:
         model="my_coding_agent",  # agent routing name, not an LLM
         input="hi",
         reasoning={"effort": "medium"},
+        permission_mode="plan",
+        approval_mode="read-only",
         max_output_tokens=65536,
     )
     await adapter.run_turn(request, ctx)
     assert captured["extra"] == {"reasoning_effort": "medium", "max_tokens": 65536}
     assert captured["model"] is None
+    assert captured["permission_mode"] == "plan"
+    assert captured["approval_mode"] == "read-only"
 
 
 @pytest.mark.asyncio

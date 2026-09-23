@@ -194,6 +194,76 @@ async def test_create_session_without_title_returns_none(
     assert session["title"] is None
 
 
+@pytest.mark.parametrize(
+    ("harness", "field", "value", "label_key"),
+    [
+        ("claude-sdk", "permission_mode", "plan", "omnigent.claude_sdk.permission_mode"),
+        ("codex", "approval_mode", "read-only", "omnigent.codex_sdk.approval_mode"),
+    ],
+)
+async def test_create_sdk_permission_label(
+    client: httpx.AsyncClient, harness: str, field: str, value: str, label_key: str
+) -> None:
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    response = await client.post("/v1/sessions", json={"agent_id": agent["id"], field: value})
+    assert response.status_code == 201, response.text
+    assert response.json()["labels"][label_key] == value
+
+
+async def test_create_sdk_permission_uses_harness_override(client: httpx.AsyncClient) -> None:
+    agent = await create_test_agent(client)
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": "codex",
+            "approval_mode": "read-only",
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["labels"]["omnigent.codex_sdk.approval_mode"] == "read-only"
+
+
+@pytest.mark.parametrize(
+    ("harness", "field", "value", "detail"),
+    [
+        ("claude-native", "approval_mode", "full-access", "claude-native"),
+        ("claude-sdk", "permission_mode", "unsafe", "permission_mode must be one of"),
+    ],
+)
+async def test_create_rejects_unsupported_sdk_permission(
+    client: httpx.AsyncClient, harness: str, field: str, value: str, detail: str
+) -> None:
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    response = await client.post("/v1/sessions", json={"agent_id": agent["id"], field: value})
+    assert response.status_code == 400, response.text
+    assert detail in response.text
+
+
+async def test_create_rejects_sdk_permission_for_sub_agent(client: httpx.AsyncClient) -> None:
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        sub_agents=[{"name": "worker"}],
+    )
+    parent = await _create_session(client, agent["id"])
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "sub_agent_name": "worker",
+            "permission_mode": "plan",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "top-level sessions" in response.text
+
+
 async def test_first_message_schedules_background_semantic_title(
     client: httpx.AsyncClient,
     app: Any,
@@ -12091,6 +12161,184 @@ async def test_patch_approval_mode_forwards_and_persists_label(
     assert mode_events[0]["approval_mode"] == "full-access"
 
 
+@pytest.mark.parametrize(
+    ("harness", "field", "value", "label_key", "event_type", "sse_type"),
+    [
+        (
+            "claude-sdk",
+            "permission_mode",
+            "bypassPermissions",
+            "omnigent.claude_sdk.permission_mode",
+            "permission_mode_change",
+            "session.permission_mode",
+        ),
+        (
+            "codex",
+            "approval_mode",
+            "full-access",
+            "omnigent.codex_sdk.approval_mode",
+            "codex_approval_mode_change",
+            "session.codex_approval_mode",
+        ),
+    ],
+)
+@pytest.mark.parametrize("runner_status", [200, 204, 503])
+async def test_patch_sdk_permission_forward_controls_label(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    field: str,
+    value: str,
+    label_key: str,
+    event_type: str,
+    sse_type: str,
+    runner_status: int,
+) -> None:
+    from omnigent.runtime import set_runner_client
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    session = await _create_session(client, agent["id"])
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, event: published.append((sid, event)),
+    )
+    forwards: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            return httpx.Response(204)
+        forwards.append(json.loads(request.content))
+        if runner_status == 204:
+            return httpx.Response(204)
+        return httpx.Response(runner_status, json={field: value})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+    set_runner_client(fake_runner)
+    try:
+        response = await client.patch(f"/v1/sessions/{session['id']}", json={field: value})
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert forwards == [{"type": event_type, field: value}]
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    if runner_status == 200:
+        assert response.status_code == 200, response.text
+        assert response.json()["labels"][label_key] == value
+        assert snapshot.json()["labels"][label_key] == value
+        assert [event[field] for _, event in published if event["type"] == sse_type] == [value]
+    else:
+        assert response.status_code >= 400, response.text
+        if runner_status == 204:
+            assert response.status_code == 503, response.text
+            assert "not applied" in response.text
+        assert label_key not in snapshot.json()["labels"]
+        assert all(event["type"] != sse_type for _, event in published)
+
+
+@pytest.mark.parametrize(
+    ("harness", "field", "value", "label_key"),
+    [
+        (
+            "claude-sdk",
+            "permission_mode",
+            "plan",
+            "omnigent.claude_sdk.permission_mode",
+        ),
+        (
+            "codex",
+            "approval_mode",
+            "read-only",
+            "omnigent.codex_sdk.approval_mode",
+        ),
+    ],
+)
+async def test_silent_patch_does_not_apply_sdk_permission(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    field: str,
+    value: str,
+    label_key: str,
+) -> None:
+    from omnigent.runtime import set_runner_client
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    session = await _create_session(client, agent["id"])
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, event: published.append((sid, event)),
+    )
+    forwards: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            return httpx.Response(204)
+        forwards.append(json.loads(request.content))
+        return httpx.Response(200, json={field: value})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+    set_runner_client(fake_runner)
+    try:
+        response = await client.patch(
+            f"/v1/sessions/{session['id']}", json={field: value, "silent": True}
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert response.status_code == 200, response.text
+    assert forwards == []
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert label_key not in response.json()["labels"]
+    assert label_key not in snapshot.json()["labels"]
+    assert published == []
+
+
+@pytest.mark.parametrize(
+    ("harness", "field", "value", "label_key"),
+    [
+        ("claude-sdk", "permission_mode", "plan", "omnigent.claude_sdk.permission_mode"),
+        ("codex", "approval_mode", "read-only", "omnigent.codex_sdk.approval_mode"),
+    ],
+)
+async def test_patch_sdk_permission_without_runner_stores_for_init(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    field: str,
+    value: str,
+    label_key: str,
+) -> None:
+    from omnigent.runtime import set_runner_client
+
+    set_runner_client(None)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    session = await _create_session(client, agent["id"])
+    forward = AsyncMock(side_effect=AssertionError("no runner should be forwarded to"))
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner", forward
+    )
+
+    response = await client.patch(f"/v1/sessions/{session['id']}", json={field: value})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["labels"][label_key] == value
+    forward.assert_not_awaited()
+
+
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
 async def test_patch_approval_mode_requires_live_runner_before_persisting(
     client: httpx.AsyncClient,
@@ -12618,12 +12866,13 @@ async def test_patch_permission_mode_rejects_non_claude_session(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``permission_mode`` is rejected for sessions that aren't claude-native.
+    ``permission_mode`` is rejected for sessions outside the Claude harnesses.
 
-    Only Claude Code has the shift+tab cycle the switch drives, so accepting
-    the field elsewhere would persist a mode label no runner can honor.
+    A Codex SDK session has its own approval preset field.
     """
-    agent = await create_test_agent(client)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex"}}
+    )
     session = await _create_session(client, agent["id"])
 
     resp = await client.patch(
