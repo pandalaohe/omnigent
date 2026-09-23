@@ -2919,6 +2919,7 @@ export function useUpdateProjectConfig() {
           : [...prev, summary];
       });
       void queryClient.invalidateQueries({ queryKey: ["project-config"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-host-roots", project.id] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });

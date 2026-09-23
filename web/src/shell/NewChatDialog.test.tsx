@@ -3142,6 +3142,38 @@ describe("NewChatLandingScreen", () => {
     expect(body).not.toHaveProperty("workspace");
   });
 
+  it("refreshes a restored untouched root seed before creating a project session", async () => {
+    mockProjectPlacement(
+      {
+        roots: [{ host_id: "host_1", workspace: "/old", source: "config" }],
+        default_host_id: "host_1",
+        default_host_reason: "config",
+      },
+      { host_id: "host_1", workspace: "/old" },
+    );
+    const first = renderLanding({}, "/?project=Alpha");
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /old",
+    );
+    first.unmount();
+
+    mockProjectPlacement(
+      {
+        roots: [{ host_id: "host_1", workspace: "/new", source: "config" }],
+        default_host_id: "host_1",
+        default_host_reason: "config",
+      },
+      { host_id: "host_1", workspace: "/new" },
+    );
+    renderLanding({}, "/?project=Alpha");
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /new",
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body).not.toHaveProperty("workspace");
+  });
+
   it("keeps an offline config host instead of substituting the last host", () => {
     localStorage.setItem("omnigent:last-host-choice", "host_1");
     mockHosts([host("online"), host("offline", 2)]);

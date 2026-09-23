@@ -73,6 +73,7 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey });
+    void queryClient.invalidateQueries({ queryKey: ["project-host-roots", projectId] });
   };
 
   const toggleMutation = useMutation({

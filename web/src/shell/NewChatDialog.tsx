@@ -3081,9 +3081,9 @@ export function NewChatLandingScreen() {
       return;
     }
     seededHostRef.current = selectedHostId;
-    if (workspace === "") {
+    if (workspace === "" || workspaceFromConfigRef.current) {
       workspaceFromConfigRef.current = true;
-      if (root) setWorkspace(root.workspace);
+      setWorkspace(root?.workspace ?? "");
     }
   }, [
     prefillSettled,

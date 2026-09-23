@@ -30,6 +30,7 @@ import {
   useDeleteProject,
   useProjects,
   useProjectConfig,
+  useProjectHostRoots,
   useProjectSessions,
   useRenameProject,
   useUpdateProjectConfig,
@@ -2510,6 +2511,44 @@ describe("useProjects", () => {
 });
 
 describe("useUpdateProjectConfig cache seeding", () => {
+  it("refetches host roots under a promoted project's new id after saving config", async () => {
+    const oldRoots = {
+      roots: [{ host_id: "h1", workspace: "/old", source: "config" }],
+      default_host_id: "h1",
+      default_host_reason: "config",
+    };
+    const newRoots = {
+      ...oldRoots,
+      roots: [{ host_id: "h1", workspace: "/new", source: "config" }],
+    };
+    fetchMock
+      .mockResolvedValueOnce(mockResponse(oldRoots))
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", name: "Work" }))
+      .mockResolvedValueOnce(
+        mockResponse({ id: "p_new", name: "Work", config: { workspace: "/new" } }),
+      )
+      .mockResolvedValueOnce(mockResponse(newRoots));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(
+      () => ({ roots: useProjectHostRoots("p_new"), save: useUpdateProjectConfig() }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.roots.data).toEqual(oldRoots));
+
+    result.current.save.mutate({ id: null, name: "Work", config: { workspace: "/new" } });
+    await waitFor(() => expect(result.current.save.isSuccess).toBe(true));
+    await waitFor(() => expect(result.current.roots.data).toEqual(newRoots));
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/projects/p_new/host-roots",
+      "/v1/projects",
+      "/v1/projects/p_new",
+      "/v1/projects/p_new/host-roots",
+    ]);
+  });
+
   it("seeds the fresh config + upserts the projects list on success (no stale read)", async () => {
     // The composer prefill settles once from the cache, so a save must write
     // the fresh value in — not merely invalidate — or the next visit within the
