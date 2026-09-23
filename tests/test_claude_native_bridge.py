@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -1016,6 +1017,143 @@ def test_read_transcript_items_since_mirrors_thinking_as_reasoning(tmp_path: Pat
     )
     assert reasoning.response_id == answer.response_id
     assert current_response_id == answer.response_id
+
+
+def _synthetic_thinking_signature(label: str) -> str:
+    """Build a Claude thinking signature carrying *label*.
+
+    Same wire shape as the CLI's: base64 over protobuf
+    top(field 2) -> inner(field 1) -> metadata(field 8) = label. Synthesized
+    on purpose — real signatures carry an encrypted payload and must not be
+    copied into the repo.
+    """
+
+    def varint(value: int) -> bytes:
+        out = bytearray()
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            out.append(byte | (0x80 if value else 0))
+            if not value:
+                return bytes(out)
+
+    def length_delimited(number: int, payload: bytes) -> bytes:
+        return bytes([(number << 3) | 2]) + varint(len(payload)) + payload
+
+    metadata = length_delimited(8, label.encode("utf-8"))
+    inner = length_delimited(1, metadata)
+    return base64.b64encode(b"\x08\x04" + length_delimited(2, inner)).decode("ascii")
+
+
+def test_read_transcript_items_since_mirrors_narration_thinking_as_message(
+    tmp_path: Path,
+) -> None:
+    """
+    Narration thinking mirrors as assistant text; private thinking stays reasoning.
+
+    Claude Code renders some thinking blocks to the user as the turn's
+    narration and marks them in the block's ``signature``; those must reach
+    the chat as assistant prose rather than a collapsed reasoning section.
+    A signature that is missing, undecodable, or labeled otherwise keeps the
+    reasoning mirror.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    narration_signature = base64.b64decode(_synthetic_thinking_signature("narration"))
+    field_zero_signature = base64.b64encode(b"\x00\x00" + narration_signature).decode("ascii")
+    oversized_field_signature = base64.b64encode(
+        b"\x80\x80\x80\x80\x10\x00" + narration_signature
+    ).decode("ascii")
+    truncated_signature = base64.b64encode(narration_signature + b"\x12\x80").decode("ascii")
+    malformed_inner_signature = base64.b64encode(narration_signature + b"\x12\x02\x00\x00").decode(
+        "ascii"
+    )
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "weighing the options privately",
+                            "signature": _synthetic_thinking_signature("thinking"),
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "C2 — here is what I found.",
+                            "signature": _synthetic_thinking_signature("narration"),
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "opaque payload",
+                            "signature": base64.b64encode(b"\xff\xfe\xfd").decode("ascii"),
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "field zero payload",
+                            "signature": field_zero_signature,
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "oversized field payload",
+                            "signature": oversized_field_signature,
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "truncated payload",
+                            "signature": truncated_signature,
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "malformed inner payload",
+                            "signature": malformed_inner_signature,
+                        },
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == [
+        "reasoning",
+        "message",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+    ]
+    private, narration, garbage, field_zero, oversized_field, truncated, malformed_inner = items
+    assert private.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "weighing the options privately"}],
+    }
+    assert narration.data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "C2 — here is what I found."}],
+    }
+    assert garbage.data["content"] == [{"type": "reasoning_text", "text": "opaque payload"}]
+    assert field_zero.data["content"] == [{"type": "reasoning_text", "text": "field zero payload"}]
+    assert oversized_field.data["content"] == [
+        {"type": "reasoning_text", "text": "oversized field payload"}
+    ]
+    assert truncated.data["content"] == [{"type": "reasoning_text", "text": "truncated payload"}]
+    assert malformed_inner.data["content"] == [
+        {"type": "reasoning_text", "text": "malformed inner payload"}
+    ]
+    assert current_response_id == narration.response_id
 
 
 def test_read_transcript_items_since_skips_unreadable_thinking(tmp_path: Path) -> None:

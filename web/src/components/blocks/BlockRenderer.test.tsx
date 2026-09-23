@@ -563,6 +563,30 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("All done here.")).toBeDefined();
     });
 
+    it.each(["AskUserQuestion", "ExitPlanMode"])(
+      "keeps the prose before a trailing %s call visible when the next bubble carries the card",
+      (toolName) => {
+        // A turn that ends by asking the user: the text immediately before
+        // the call is the bubble's answer, and the card in the NEXT bubble
+        // renders the question. Folded as process the reader sees only
+        // "Worked for" — the turn appears to have answered nothing.
+        const items: RenderItem[] = [
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "C2 — I need your call here.", final: true },
+          tool(2, toolName),
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" continued />
+          </FileViewerContext.Provider>,
+        );
+        expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+        expect(screen.getByText("C2 — I need your call here.")).toBeDefined();
+        // The question call itself is work: it folds with the trace.
+        expect(screen.queryByText(/tool_2/)).toBeNull();
+      },
+    );
+
     it("starts a response containing a user interjection expanded", () => {
       const items: RenderItem[] = [
         { kind: "text", itemId: "m0", text: "Checking.", final: true },
