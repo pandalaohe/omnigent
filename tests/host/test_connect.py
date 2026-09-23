@@ -60,6 +60,7 @@ from omnigent.host.frames import (
     HostPostBindHookFrame,
     HostPostBindHookResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerLogRunawayFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
     HostSkillsFrame,
@@ -1463,6 +1464,99 @@ async def test_live_host_keeps_quota_refresh_alive_after_unexpected_probe_error(
 
     assert attempts >= 2
     assert host._codex_rate_limits == snapshot
+    _cleanup_host(host)
+
+
+async def test_live_host_reports_a_runaway_runner_log_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live runner whose log grows past the threshold is reported once.
+
+    The loop samples sizes on its own cadence; a burst over the sliding
+    hour window must send exactly one ``host.runner_log_runaway`` frame,
+    and continuing to grow above the threshold must not repeat it.
+    """
+    from omnigent.host.maintenance import RunnerLogRunawayTracker as _Tracker
+
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_LOG_RUNAWAY_INTERVAL_S", 0.01)
+    first_sample = asyncio.Event()
+
+    class _SignallingTracker(_Tracker):
+        """Tracker that signals the first sample so the test can grow the log."""
+
+        def observe(
+            self,
+            runner_id: str,
+            size_bytes: int,
+            now: float,
+            file_id: tuple[int, int] | None = None,
+        ) -> int | None:
+            """Record the sample, then release the test's first-sample wait."""
+            result = super().observe(runner_id, size_bytes, now, file_id)
+            first_sample.set()
+            return result
+
+    monkeypatch.setattr("omnigent.host.connect.RunnerLogRunawayTracker", _SignallingTracker)
+
+    host = _make_host_process()
+    log_path = tmp_path / "runner-conv_x-20260101-000000-000000.log"
+    log_path.write_bytes(b"")
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    host._runners["runner_runaway"] = _RunnerHandle(
+        proc=proc, log_path=log_path, session_id="conv_x"
+    )
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._runner_log_runaway_loop(ws))
+    try:
+        await asyncio.wait_for(first_sample.wait(), timeout=2.0)
+        os.truncate(log_path, 6 * 1024 * 1024)
+        async with asyncio.timeout(2.0):
+            while not ws.sent:
+                await asyncio.sleep(0.01)
+        # Several more samples with the rate still above the threshold.
+        await asyncio.sleep(0.05)
+    finally:
+        await _cancel(task)
+        host._runners.pop("runner_runaway", None)
+        proc.terminate()
+        proc.wait(timeout=5.0)
+
+    assert len(ws.sent) == 1
+    frame = decode_host_frame(ws.sent[0])
+    assert isinstance(frame, HostRunnerLogRunawayFrame)
+    assert frame.runner_id == "runner_runaway"
+    assert frame.session_id == "conv_x"
+    assert frame.bytes_last_hour >= 6 * 1024 * 1024
+    # The payload carries no file path, which may contain user directories.
+    assert str(tmp_path) not in ws.sent[0]
+    _cleanup_host(host)
+
+
+@pytest.mark.parametrize("sample_first", [True, False])
+async def test_host_rotation_accounts_for_unsampled_runner_log_bytes(
+    tmp_path: Path, sample_first: bool
+) -> None:
+    host = _make_host_process()
+    log_path = tmp_path / "runner-conv_x-20260101-000000-000000.log"
+    log_path.touch()
+    info = log_path.stat()
+    file_id = (info.st_dev, info.st_ino)
+    host._runners["runner_runaway"] = SimpleNamespace(log_path=log_path)  # type: ignore[assignment]
+    tracker = host._runner_log_runaway_tracker
+
+    assert tracker.observe("runner_runaway", 99 * 1024 * 1024, time.monotonic(), file_id) is None
+    if sample_first:
+        assert tracker.observe("runner_runaway", 0, time.monotonic(), file_id) is None
+    host._note_runner_log_rotated(log_path, 103 * 1024 * 1024, file_id)
+    if not sample_first:
+        assert tracker.observe("runner_runaway", 0, time.monotonic(), file_id) is None
+    assert (
+        tracker.observe("runner_runaway", 3 * 1024 * 1024, time.monotonic(), file_id)
+        == 7 * 1024 * 1024
+    )
+    host._runners.clear()
     _cleanup_host(host)
 
 
@@ -5649,9 +5743,18 @@ async def test_run_starts_and_shuts_down_host_maintenance(
 
     janitor = _RecordingJanitor()
     janitor_roots: list[Path | None] = []
+    janitor_live_paths: list[object] = []
+    janitor_rotation_callbacks: list[object] = []
 
-    def _for_host(*, harness_tmp_parent: Path | None = None) -> _RecordingJanitor:
+    def _for_host(
+        *,
+        harness_tmp_parent: Path | None = None,
+        live_runner_log_paths: object = None,
+        on_runner_log_rotated: object = None,
+    ) -> _RecordingJanitor:
         janitor_roots.append(harness_tmp_parent)
+        janitor_live_paths.append(live_runner_log_paths)
+        janitor_rotation_callbacks.append(on_runner_log_rotated)
         return janitor
 
     monkeypatch.setattr(HostMaintenanceJanitor, "for_host", _for_host)
@@ -5663,6 +5766,9 @@ async def test_run_starts_and_shuts_down_host_maintenance(
 
     assert calls == ["acquire", "start", "shutdown", "cleanup_runners", "release"]
     assert janitor_roots == [host._harness_tmp_parent]
+    # The runner-log sweep must be able to exclude this host's live logs.
+    assert janitor_live_paths == [host._live_runner_log_paths]
+    assert callable(janitor_rotation_callbacks[0])
     assert host._maintenance_janitor is None
 
 

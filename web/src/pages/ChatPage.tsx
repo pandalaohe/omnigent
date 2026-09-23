@@ -294,7 +294,7 @@ import {
 } from "@/components/goal";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { ConnectionIndicator } from "./ChatIndicators";
+import { ConnectionIndicator, RunnerLogRunawayBanner } from "./ChatIndicators";
 import { Transcript } from "@/components/chat/Transcript";
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
@@ -1234,6 +1234,8 @@ export function ChatPage() {
       subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
       wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
+      sessionLabels={activeConv?.labels}
+      fallbackSessionLabels={activeSession?.labels}
     />
   );
 
@@ -1537,6 +1539,13 @@ interface MainAgentSurfaceProps {
   subAgentLabel: string | null;
   /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
   wrapperLabel: string | null;
+  /**
+   * The active session's live list labels, e.g.
+   * ``{"omnigent.runner_log_runaway": "2026-…"}``. Drives the runaway-log
+   * warning banner above the transcript.
+   */
+  sessionLabels: Record<string, string> | undefined;
+  fallbackSessionLabels: Record<string, string> | undefined;
 }
 
 /**
@@ -1674,6 +1683,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   subagentRoutingEligible,
   subAgentLabel,
   wrapperLabel,
+  sessionLabels,
+  fallbackSessionLabels,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
   // Streaming-hot subscriptions and the bubble pipeline live in <Transcript>.
@@ -1932,6 +1943,10 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       {terminalSurfaces}
       {!showTerminal && (
         <>
+          {/* A runner writing logs abnormally fast is a session-level
+          condition, so the warning sits above the transcript rather than in
+          the message stream. Self-gates to null for unflagged sessions. */}
+          <RunnerLogRunawayBanner labels={sessionLabels} fallbackLabels={fallbackSessionLabels} />
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}

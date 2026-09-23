@@ -12,6 +12,7 @@
 
 import type { Conversation } from "@/hooks/useConversations";
 import { getConversationForegroundStatus } from "@/hooks/useSessionState";
+import { RUNNER_LOG_RUNAWAY_LABEL_KEY } from "@/lib/runnerLogRunaway";
 
 // Statuses that mean "the agent stopped working and is waiting on the
 // user" — the moment worth surfacing. "running" is excluded (still
@@ -78,6 +79,42 @@ export function detectNewElicitations(
     const current = conversation.pending_elicitations_count ?? 0;
     const prior = previous.get(conversation.id);
     return prior !== undefined && current > prior;
+  });
+}
+
+/**
+ * Snapshot of each conversation's runaway-log flag value, keyed by id.
+ *
+ * Unflagged sessions seed as `""` (not absent), so a session that gets
+ * flagged after this client first saw it still diffs as a change.
+ */
+export function buildRunnerLogRunawayMap(conversations: Conversation[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const conversation of conversations) {
+    map.set(conversation.id, conversation.labels?.[RUNNER_LOG_RUNAWAY_LABEL_KEY] ?? "");
+  }
+  return map;
+}
+
+/**
+ * Conversations whose runaway-log flag value changed since the previous
+ * snapshot — i.e. the host reported a new detection (the value is the
+ * report instant, so a re-report is a new value).
+ *
+ * Requiring a previous entry means a fresh page load with an already-set
+ * flag fires nothing, mirroring the idle/elicitation fresh-load behavior;
+ * an unchanged value never re-fires, which is the session-id + value dedupe.
+ */
+export function detectNewRunnerLogRunaways(
+  previous: Map<string, string>,
+  conversations: Conversation[],
+): Conversation[] {
+  return conversations.filter((conversation) => {
+    if (conversation.archived) return false;
+    const current = conversation.labels?.[RUNNER_LOG_RUNAWAY_LABEL_KEY] ?? "";
+    if (current === "") return false;
+    const prior = previous.get(conversation.id);
+    return prior !== undefined && prior !== current;
   });
 }
 

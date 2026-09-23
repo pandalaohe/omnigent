@@ -21,6 +21,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
@@ -100,6 +101,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerLogRunawayFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
     HostSkillsFrame,
@@ -121,7 +123,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
-from omnigent.host.maintenance import HostMaintenanceJanitor
+from omnigent.host.maintenance import HostMaintenanceJanitor, RunnerLogRunawayTracker
 from omnigent.host.post_bind_hook import PostBindHookRunner
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
@@ -279,6 +281,10 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 # Collect adopted children every two seconds. Process discovery runs off-loop;
 # exit-status collection uses nonblocking waits.
 _ORPHAN_REAP_INTERVAL_S = 2.0
+
+# Sample each live runner's log size on this cadence and report a runner whose
+# log grows past the runaway threshold within the sliding hour window.
+_RUNNER_LOG_RUNAWAY_INTERVAL_S = 300.0
 
 
 def _install_child_subreaper() -> bool:
@@ -1174,6 +1180,7 @@ class HostProcess:
         # Host-owned machine-global cleanup. Runner exits trigger background
         # passes; runner startup never waits for them.
         self._maintenance_janitor: HostMaintenanceJanitor | None = None
+        self._runner_log_runaway_tracker = RunnerLogRunawayTracker()
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -1233,6 +1240,28 @@ class HostProcess:
         self._lifecycle_lock = lifecycle_lock
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
+
+    def _live_runner_log_paths(self) -> set[Path]:
+        """Return the log path of every runner this host process owns.
+
+        Read on the event loop (the thread that mutates ``_runners``) and
+        handed to the maintenance janitor's runner-log sweep, which must
+        never delete a live runner's file.
+
+        :returns: Current runner log paths, e.g.
+            ``{Path("~/.omnigent/logs/runner/runner-ab12.log")}``.
+        """
+        return {handle.log_path for handle in self._runners.values()}
+
+    def _note_runner_log_rotated(
+        self, path: Path, copied_size: int, file_id: tuple[int, int]
+    ) -> None:
+        for runner_id, handle in self._runners.items():
+            if handle.log_path == path:
+                self._runner_log_runaway_tracker.note_rotated(
+                    runner_id, copied_size, time.monotonic(), file_id
+                )
+                break
 
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
@@ -3847,8 +3876,13 @@ class HostProcess:
                 self._lifecycle_monitor_loop(), name="host-lifecycle-monitor"
             )
         try:
+            loop = asyncio.get_running_loop()
             self._maintenance_janitor = HostMaintenanceJanitor.for_host(
-                harness_tmp_parent=self._harness_tmp_parent
+                harness_tmp_parent=self._harness_tmp_parent,
+                live_runner_log_paths=self._live_runner_log_paths,
+                on_runner_log_rotated=lambda path, size, file_id: loop.call_soon_threadsafe(
+                    self._note_runner_log_rotated, path, size, file_id
+                ),
             )
             self._maintenance_janitor.start()
         except Exception:
@@ -4398,6 +4432,9 @@ class HostProcess:
         rate_limits_task = asyncio.create_task(
             self._codex_rate_limits_loop(ws), name="host-codex-rate-limits"
         )
+        runaway_task = asyncio.create_task(
+            self._runner_log_runaway_loop(ws), name="host-runner-log-runaway"
+        )
         # Warm the pre-launch model listings once a server can actually ask
         # for them, so the first picker open is served from cache instead of
         # waiting on a harness probe. Cache-fresh reconnects are a no-op.
@@ -4444,6 +4481,9 @@ class HostProcess:
             rate_limits_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await rate_limits_task
+            runaway_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await runaway_task
             prewarm_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await prewarm_task
@@ -4535,6 +4575,51 @@ class HostProcess:
         """Return whether this Host has a ready Codex CLI to inspect."""
         readiness = self._configured_harnesses or {}
         return any(readiness.get(harness) is True for harness in CODEX_CANONICAL_HARNESSES)
+
+    async def _runner_log_runaway_loop(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+    ) -> None:
+        """Report live runners whose logs grow fast enough to look stuck.
+
+        An error-looping runner can write its traceback to the log thousands
+        of times an hour. The retention sweep bounds the file, not the loop,
+        so tell the server and let it warn the session's user. Reports are
+        one per crossing: the tracker re-arms only after the windowed rate
+        falls back to or below the threshold.
+        """
+        tracker = self._runner_log_runaway_tracker
+        while True:
+            try:
+                tracker.retain(set(self._runners))
+                now = time.monotonic()
+                for runner_id, handle in list(self._runners.items()):
+                    try:
+                        info = handle.log_path.stat()
+                    except OSError:
+                        continue
+                    bytes_last_hour = tracker.observe(
+                        runner_id, info.st_size, now, (info.st_dev, info.st_ino)
+                    )
+                    if bytes_last_hour is None:
+                        continue
+                    await ws.send(
+                        encode_host_frame(
+                            HostRunnerLogRunawayFrame(
+                                runner_id=runner_id,
+                                session_id=handle.session_id,
+                                bytes_last_hour=bytes_last_hour,
+                                observed_at=datetime.now(timezone.utc).isoformat(
+                                    timespec="seconds"
+                                ),
+                            )
+                        )
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - advisory telemetry must not stop sampling
+                _logger.debug("Runner log runaway sampling failed", exc_info=True)
+            await asyncio.sleep(_RUNNER_LOG_RUNAWAY_INTERVAL_S)
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""

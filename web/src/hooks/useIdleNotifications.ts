@@ -3,11 +3,14 @@ import { useLoadedConversations } from "@/hooks/useSidebarData";
 // dock/taskbar badge. Rides the existing conversations poll (no new backend
 // signal).
 //
-// Notifications fire on two "attention" TRANSITIONS, diffed against the
+// Notifications fire on "attention" TRANSITIONS, diffed against the
 // previous snapshot:
 //   * a turn finishing — status `running` -> `idle`/`failed`
 //   * a new elicitation — `pending_elicitations_count` increased (the agent
 //     is asking the user for input)
+//   * a new runner-log runaway report — the session's
+//     `omnigent.runner_log_runaway` label changed (the runner may be stuck
+//     in an error loop)
 //
 // A turn-end is DEFERRED by a short settle window. Agents that work in steps
 // emit a `running` -> `idle` edge per step and then resume, so each step would
@@ -53,12 +56,15 @@ import {
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import {
   buildElicitationMap,
+  buildRunnerLogRunawayMap,
   buildStatusMap,
   computeUnreadBadgeIds,
   type ConversationStatus,
   detectIdleTransitions,
   detectNewElicitations,
+  detectNewRunnerLogRunaways,
 } from "@/lib/idleTransitions";
+import { runnerLogRunawayNotice } from "@/lib/runnerLogRunaway";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { getConversationForegroundStatus } from "@/hooks/useSessionState";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
@@ -125,6 +131,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
   const { data } = useLoadedConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
+  const prevRunaways = useRef<Map<string, string>>(new Map());
   // Last badge state sent to the shell, as a `count|navigatePath|title|body` key.
   // `null` (nothing sent yet) makes the FIRST computation send unconditionally —
   // including 0 — so a badge left over in the Electron main process from before
@@ -288,8 +295,10 @@ export function useIdleNotifications(activeConversationId?: string): void {
 
     const idle = detectIdleTransitions(prevStatus.current, conversations);
     const newElicitations = detectNewElicitations(prevElicitations.current, conversations);
+    const newRunaways = detectNewRunnerLogRunaways(prevRunaways.current, conversations);
     prevStatus.current = buildStatusMap(conversations);
     prevElicitations.current = buildElicitationMap(conversations);
+    prevRunaways.current = buildRunnerLogRunawayMap(conversations);
 
     const windowFocused = windowFocusedRef.current;
     const grantedOrNative = isNativeShell() || getNotificationPermission() === "granted";
@@ -375,6 +384,18 @@ export function useIdleNotifications(activeConversationId?: string): void {
           timers.delete(conversation.id);
         }
         notify(conversation, ELICITATION_BODY, navigate);
+      }
+      // A new runaway-log report: the runner is probably stuck in an error
+      // loop. One notification per new flag value (the server stamps the
+      // report instant, so a repeat report is a new value).
+      for (const conversation of newRunaways) {
+        if (windowFocused && conversation.id === activeConversationId) continue;
+        // Same offline-runner guard as above: a dead runner writes nothing,
+        // so a stale flag on an offline session must not alert.
+        if (conversation.runner_online === false) continue;
+        const notice = runnerLogRunawayNotice(conversation.labels);
+        if (notice === null) continue;
+        notify(conversation, notice, navigate);
       }
     }
   }, [data, navigate, activeConversationId]);
