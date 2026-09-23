@@ -313,6 +313,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import { effectiveWorktree, type NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
+import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import {
   currentFusionCombo,
   fusionModelLabel,
@@ -3750,25 +3751,15 @@ export function NewChatLandingScreen() {
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
   useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
-  const pickerEffortOptions = supportsPermissionMode
-    ? CLAUDE_NATIVE_EFFORTS
-    : selectedNativeHarness === "devin-native"
-      ? // Devin encodes effort as a model-variant suffix, and the rung set is
-        // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a
-        // different Fusion model), so derive it from the selected model's catalog
-        // entry rather than offering a fixed ladder the model can't honor.
-        codexEffortLevelsForModel(
-          devinModelOptions,
-          pickedModel || devinModelOptions.find((option) => option.isDefault)?.id,
-        ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-      : selectedNativeHarness === "pi-native"
-        ? PI_NATIVE_EFFORTS
-        : selectedNativeHarness === "codex-native"
-          ? codexEffortLevelsForModel(
-              codexModelOptions,
-              pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-            ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-          : [];
+  const pickerEffortRows =
+    selectedNativeHarness === "devin-native" ? devinModelOptions : codexModelOptions;
+  const pickerEffortOptions = (
+    effortLevelsFor(
+      selectedNativeHarness,
+      pickerEffortRows,
+      pickedModel || pickerEffortRows.find((option) => option.isDefault)?.id,
+    ) ?? []
+  ).map((value) => ({ value, label: normalizeEffortLabel(value) }));
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;
     setPickerEdits({
@@ -3812,13 +3803,12 @@ export function NewChatLandingScreen() {
     }
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
     const effort =
-      selectedNativeHarness === "codex-native" &&
-      !codexEffortLevelsForModel(
+      reconcileEffortOnModelChange(
+        selectedNativeHarness,
         codexModelOptions,
         picked || codexModelOptions.find((option) => option.isDefault)?.id,
-      ).includes(pickedEffort)
-        ? ""
-        : pickedEffort;
+        pickedEffort,
+      ) ?? "";
     setPickedModel(picked);
     setPickedEffort(effort);
     setCostControlMode(null);

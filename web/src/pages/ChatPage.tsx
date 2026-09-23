@@ -99,7 +99,8 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
 import { createSideChat, retrySession } from "@/lib/sessionsApi";
-import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
+import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
@@ -117,6 +118,7 @@ import {
   nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
+  nativeCodingAgentForWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import {
@@ -4758,20 +4760,6 @@ export function unboundSessionResumableInApp(params: {
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 
-/** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
-const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-
-/** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
-const PI_NATIVE_EFFORT_LEVELS = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
-
 type NativeModelPickerKind =
   "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
 
@@ -4870,22 +4858,8 @@ export function effortLevelsForConv(
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
-  switch (effectiveWrapperLabel(conv)) {
-    case "claude-code-native-ui":
-      return CLAUDE_NATIVE_EFFORT_LEVELS;
-    case "devin-native-ui":
-      // Devin encodes effort as a model-variant suffix, and the rung set is
-      // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a different
-      // Fusion model), so derive it from the selected model's catalog entry —
-      // its `supportedReasoningEfforts` — rather than a fixed ladder.
-      return codexEffortLevelsForModel(codexModelOptions, currentModel);
-    case "codex-native-ui":
-      return codexEffortLevelsForModel(codexModelOptions, currentModel);
-    case "pi-native-ui":
-      return PI_NATIVE_EFFORT_LEVELS;
-    default:
-      return EFFORT_LEVELS;
-  }
+  const harness = nativeCodingAgentForWrapper(effectiveWrapperLabel(conv))?.harness;
+  return effortLevelsFor(harness, codexModelOptions, currentModel) ?? EFFORT_LEVELS;
 }
 
 /**
@@ -5161,9 +5135,11 @@ function SessionHarnessPicker({
           modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
         );
   const availableEfforts =
-    modelPickerKind === "codex"
-      ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
-      : effortLevels;
+    effortLevelsFor(
+      modelPickerKind === "codex" ? "codex-native" : null,
+      codexModelOptions,
+      pickerSelectedModel,
+    ) ?? effortLevels;
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
@@ -5204,9 +5180,12 @@ function SessionHarnessPicker({
       });
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (
-        modelPickerKind === "codex" &&
-        selectedEffort !== null &&
-        !codexEffortLevelsForModel(codexModelOptions, modelId).includes(selectedEffort)
+        reconcileEffortOnModelChange(
+          modelPickerKind === "codex" ? "codex-native" : null,
+          codexModelOptions,
+          modelId,
+          selectedEffort,
+        ) !== selectedEffort
       )
         await store.setEffort(null);
       if (
