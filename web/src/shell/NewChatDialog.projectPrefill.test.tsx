@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   useConversations as useTestConversations,
   useProjectConfig,
+  useProjectHostRoots,
   useProjects,
 } from "@/hooks/useConversations";
 
@@ -41,7 +42,7 @@ import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import type { ProjectConfig } from "@/lib/projectsApi";
+import type { ProjectConfig, ProjectHostRoots } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -49,10 +50,6 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-// A `?project=` visit prefills the composer from the project's STORED config
-// (host / working directory / agent / worktree). A field the config leaves
-// unset falls through to the composer's generic defaults (last host, recent
-// workspace, last-used agent). These tests pin those seeding rules.
 const navigateMock = vi.fn();
 
 const RECENT_KEY = "omnigent:recent-workspaces";
@@ -118,6 +115,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: vi.fn(),
   useProjectConfig: vi.fn(),
+  useProjectHostRoots: vi.fn(),
   // The landing reads useConversations to decide hasNoSessions (the empty-state
   // import affordance); stub it so it doesn't fire an authenticatedFetch that
   // lands at mock.calls[0] and skews these create-POST call assertions.
@@ -157,6 +155,18 @@ function setProjectConfig(config: ProjectConfig | undefined, isLoading = false):
   vi.mocked(useProjectConfig).mockReturnValue({ data: config, isLoading } as ReturnType<
     typeof useProjectConfig
   >);
+}
+
+function rootsForConfig(config: ProjectConfig | undefined): ProjectHostRoots {
+  const hostId = config?.host_id;
+  const configHostId = hostId && hostId !== "__sandbox__" ? hostId : null;
+  return {
+    roots: configHostId && config?.workspace
+      ? [{ host_id: configHostId, workspace: config.workspace, source: "config" }]
+      : [],
+    default_host_id: configHostId,
+    default_host_reason: configHostId ? "config" : "none",
+  };
 }
 
 function setProjects(
@@ -319,6 +329,23 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
   return JSON.parse(init.body as string) as Record<string, unknown>;
 }
 
+async function expectNoProjectRoot(): Promise<void> {
+  expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
+    "aria-label",
+    "Working directory: Not selected",
+  );
+  fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+    target: { value: "hello" },
+  });
+  const submit = screen.getByTestId("new-chat-landing-submit");
+  expect(submit).toBeDisabled();
+  fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+  expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+    "This project has no directory on",
+  );
+  expect(vi.mocked(authenticatedFetch)).not.toHaveBeenCalled();
+}
+
 beforeEach(() => {
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
@@ -330,8 +357,6 @@ beforeEach(() => {
   // one test's parked draft can't seed the next one.
   resetLandingDraft();
   localStorage.clear();
-  // A recent on the host that the generic seeding would use when the config
-  // sets no workspace.
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [RECENT_WORKSPACE] }));
   setHostsAndAgents();
   setRepoIsGit();
@@ -341,6 +366,14 @@ beforeEach(() => {
   ]);
   // No stored config by default.
   setProjectConfig({});
+  vi.mocked(useProjectHostRoots).mockImplementation((id) => {
+    const config = id === null ? undefined : vi.mocked(useProjectConfig)(id).data;
+    return {
+      data: id === null ? undefined : rootsForConfig(config),
+      isLoading: false,
+      isError: false,
+    } as ReturnType<typeof useProjectHostRoots>;
+  });
 });
 
 function setHostsAndAgents(): void {
@@ -553,24 +586,31 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.git).toBeNull();
   });
 
-  it("falls back to the generic defaults when the project has no config", async () => {
+  it("leaves the directory empty when the project has no config", async () => {
     setProjectConfig({});
     renderLanding();
 
-    const body = await submitAndReadBody();
-    expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(RECENT_WORKSPACE);
-    expect(body.agent_id).toBe("ag_hello");
-    expect(body.git).toBeNull();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
+        "aria-label",
+        expect.stringContaining("corey-laptop"),
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Hello World");
+    await expectNoProjectRoot();
   });
 
-  it("seeds only the host from config, leaving the workspace to the generic default", async () => {
+  it("seeds the config host but leaves its missing root empty", async () => {
     setProjectConfig({ host_id: "host_1" });
     renderLanding();
 
-    const body = await submitAndReadBody();
-    expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(RECENT_WORKSPACE);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
+        "aria-label",
+        expect.stringContaining("corey-laptop"),
+      ),
+    );
+    await expectNoProjectRoot();
   });
 
   it("waits for the projects list before settling, so a config agent isn't lost to a race", async () => {
@@ -578,7 +618,7 @@ describe("NewChatLandingScreen project prefill", () => {
     // null. The prefill must WAIT rather than settle from the generic default,
     // or the stored default agent would never apply.
     setProjects(undefined, true); // still loading
-    setProjectConfig({ host_id: "host_1", agent_id: "ag_other" });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
     const { rerender } = renderLanding();
 
     // Projects finish loading → config resolves and the agent seeds.
@@ -682,21 +722,28 @@ describe("NewChatLandingScreen project prefill", () => {
     expect("workspace" in body).toBe(false);
   });
 
-  it("keeps the configured workspace when the config host is offline (host falls back)", async () => {
+  it("keeps the offline config host and its root selected without creating", async () => {
     vi.mocked(useHosts).mockReturnValue({
       data: [host(), host({ host_id: "host_off", name: "sleepy", status: "offline" })],
     } as ReturnType<typeof useHosts>);
     setProjectConfig({ host_id: "host_off", workspace: "/somewhere" });
     renderLanding();
 
-    const body = await submitAndReadBody();
-    // The offline host falls back to the generic default, but the project's
-    // workspace hint must not be displaced by the host's recent path (which
-    // can belong to another project).
-    expect(body.host_id).toBe("host_1");
-    // The workspace hint held (still the config value) → omitted; the server
-    // default-fills it. A displaced hint would ride as an explicit recent path.
-    expect("workspace" in body).toBe(false);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
+        "aria-label",
+        expect.stringContaining("sleepy"),
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
+      "aria-label",
+      "Working directory: /somewhere",
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "hello" },
+    });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(vi.mocked(authenticatedFetch)).not.toHaveBeenCalled();
   });
 
   // A repo with a main work tree plus one linked worktree. `git worktree list`
@@ -730,51 +777,24 @@ describe("NewChatLandingScreen project prefill", () => {
     });
   }
 
-  it("forks fresh from the project default when the last-used workspace is a worktree", async () => {
-    // The most-recent workspace is a linked worktree. Without the fork-fresh
-    // redirect the composer would land in it (bind mode) and never apply the
-    // project's default base branch. With a default set it must instead seed
-    // the MAIN repo, auto-name a branch, and fork off that default.
+  it("does not use a recent worktree as a missing project root even with a base branch", async () => {
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
     setWorktreeRepo();
     setProjectConfig({ host_id: "host_1", base_branch: "develop" });
     renderLanding();
 
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("gamma"),
-    );
-    const body = await submitAndReadBody();
-    // Redirected to the main repo, not the linked worktree.
-    expect(body.workspace).toBe(MAIN_REPO);
-    const git = body.git as { branch_name: string; base_branch?: string; existing_worktree?: true };
-    // A brand-new worktree (create, not a bind) forked off the project default.
-    expect(git.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
-    expect(git.base_branch).toBe("develop");
-    expect(git.existing_worktree).toBeUndefined();
+    await expectNoProjectRoot();
+    expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument();
   });
 
-  it("keeps landing in the last-used worktree when the project has no default base branch", async () => {
-    // No default base branch → the fork-fresh redirect stays off, preserving the
-    // prior behavior: land directly in the recent worktree (git bind mode).
+  it("does not bind a recent worktree when the project has no root", async () => {
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
     setWorktreeRepo();
     setProjectConfig({ host_id: "host_1" });
     renderLanding();
 
-    const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
-    const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
-    await waitFor(() => expect(workspaceTrigger).toHaveAttribute("title", LINKED_WORKTREE));
-    expect(workspaceTrigger).toHaveTextContent("gamma");
-    expect(worktreeTrigger).toHaveTextContent("feature/x");
-    expect(worktreeTrigger).toHaveAttribute("title", "Existing worktree branch: feature/x");
-    const body = await submitAndReadBody();
-    // Bound straight to the worktree dir; the worktree's branch rides along and
-    // no base branch is set (it's a bind, not a fork).
-    expect(body.workspace).toBe(LINKED_WORKTREE);
-    const git = body.git as { branch_name: string; base_branch?: string; existing_worktree?: true };
-    expect(git.existing_worktree).toBe(true);
-    expect(git.branch_name).toBe("feature/x");
-    expect(git.base_branch).toBeUndefined();
+    await expectNoProjectRoot();
+    expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument();
   });
 
   it("does not fork-fresh when the project config supplies its own workspace", async () => {
@@ -857,7 +877,7 @@ describe("NewChatLandingScreen project prefill", () => {
 
   it("seeds the create body's model_override from the project's stored default model", async () => {
     setClaudeAgentAndModels();
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "opus" });
     renderLanding();
 
     await waitFor(() =>
@@ -878,7 +898,7 @@ describe("NewChatLandingScreen project prefill", () => {
       HARNESS_OPTIONS_KEY,
       JSON.stringify({ "claude-native": { model: "sonnet" } }),
     );
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "opus" });
     renderLanding();
 
     await waitFor(() =>
@@ -898,7 +918,7 @@ describe("NewChatLandingScreen project prefill", () => {
       HARNESS_OPTIONS_KEY,
       JSON.stringify({ "claude-native": { model: "sonnet" } }),
     );
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "retired-model" });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "retired-model" });
     renderLanding();
 
     await waitFor(() =>
@@ -915,7 +935,7 @@ describe("NewChatLandingScreen project prefill", () => {
     // interactive; a pick the user already committed via the config modal
     // must survive that async arrival.
     setClaudeAgentAndModels();
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID });
     const { rerender } = renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
@@ -931,7 +951,7 @@ describe("NewChatLandingScreen project prefill", () => {
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
 
     // The project default (Opus) lands afterwards — it must not reseed.
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "opus" });
     rerender(<NewChatLandingScreen />);
 
     const body = await submitAndReadBody();
@@ -945,7 +965,7 @@ describe("NewChatLandingScreen project prefill", () => {
     // routing-seed effect early-returns for the valid pin — so the create pins
     // the model and does NOT also send routing (which would silently drop it).
     setClaudeAgentAndModels();
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID });
     const { unmount } = renderRoutingLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
@@ -964,7 +984,7 @@ describe("NewChatLandingScreen project prefill", () => {
 
     // Remount for the SAME project, now with a stored model default. The
     // restored routing draft must not shadow the pin.
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "opus" });
     renderRoutingLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
@@ -977,11 +997,7 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.cost_control_mode_override).not.toBe("on");
   });
 
-  it("still seeds the recent workspace when the worktree probe errors", async () => {
-    // A non-400 failure from /worktrees leaves the hook's data undefined for
-    // good. The seed must fall back to the candidate as-is (treat the probe
-    // error as "no redirect") rather than blocking on data that never arrives
-    // and leaving the working directory blank forever.
+  it("does not use a recent workspace when the project has no root and the probe errors", async () => {
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
     vi.mocked(useHostWorktrees).mockReturnValue({
       data: undefined,
@@ -991,15 +1007,7 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1", base_branch: "develop" });
     renderLanding();
 
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
-        "feature-x",
-      ),
-    );
-    const body = await submitAndReadBody();
-    // Seeded the recent path as-is; no redirect, no fabricated fork.
-    expect(body.workspace).toBe(LINKED_WORKTREE);
-    expect(body.git).toBeUndefined();
+    await expectNoProjectRoot();
   });
 });
 

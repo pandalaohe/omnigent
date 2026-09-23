@@ -331,6 +331,7 @@ import {
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   useProjectConfig,
+  useProjectHostRoots,
   useProjects,
   moveConversationToProject,
   PROJECT_LABEL_KEY,
@@ -2199,8 +2200,7 @@ export function NewChatLandingScreen() {
     () => readNewChatPickerOptionsCache(pickerCacheKey),
     [pickerCacheKey],
   );
-  // Project prefill source: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree).
+  // Project config supplies agent/worktree hints; host roots supply placement.
   // `?project=` carries the project NAME, so resolve it to the first-class id
   // the config endpoint needs; a label-only folder (id null) or plain visit
   // has no config to read. Resolved before the agent catalog below so the
@@ -2215,6 +2215,11 @@ export function NewChatLandingScreen() {
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
+  const {
+    data: projectHostRoots,
+    isLoading: projectHostRootsLoading,
+    isError: projectHostRootsError,
+  } = useProjectHostRoots(configProjectId);
   // Normalize into the machine's shape. `undefined` = still loading (the machine
   // waits so a generic default can't win the race); `{}` = nothing to wait for
   // (plain visit / label-only folder / genuinely empty config), so it settles
@@ -2598,10 +2603,8 @@ export function NewChatLandingScreen() {
   const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
   // Source tracking for the create's field-omission contract: true while the
-  // slot's value is the untouched seed the project-prefill effect wrote from
-  // the config. ANY other write — a picker selection, browsing, a host
-  // switch, a generic default — flips it false, so a user re-picking even the
-  // exact config value counts as explicit and is SENT with the create.
+  // slot holds an untouched agent config or project root seed. Any user pick,
+  // including an identical value, clears the corresponding ref and is sent.
   const agentFromConfigRef = useRef<boolean>(restoredDraft?.agentFromConfig ?? false);
   const workspaceFromConfigRef = useRef<boolean>(restoredDraft?.workspaceFromConfig ?? false);
   const [branchName, setBranchName] = useState<string>(() => restoredDraft?.branchName ?? "");
@@ -2835,10 +2838,10 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // State machine driving the project prefill: a location seed (host +
-  // workspace from config) plus an independent agent seed. The generic
+  // State machine driving the project prefill: a location seed from host roots
+  // plus an independent agent seed. The generic
   // host/workspace defaults below hold off until it settles so they can't win
-  // the race against the project's stored values.
+  // the race against the project's placement.
   const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
     initialPrefillState(projectParam),
   );
@@ -2916,6 +2919,7 @@ export function NewChatLandingScreen() {
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
     if (!prefillSettled) return;
+    if (configProjectId !== null && projectHostRoots?.default_host_reason !== "none") return;
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
 
@@ -2964,6 +2968,8 @@ export function NewChatLandingScreen() {
     managedSandboxesEnabled,
     info,
     prefillSettled,
+    configProjectId,
+    projectHostRoots,
     defaultSandboxProvider,
   ]);
 
@@ -2971,10 +2977,12 @@ export function NewChatLandingScreen() {
   // the working-directory field is pre-filled and the user can send in one
   // click. Derived from the same home listing the picker uses (entries carry
   // absolute paths); only fetched when there's no recent to fall back to.
-  // A host with a pinned default workspace needs no home fallback — the
-  // default is the seed, and listing home would only race it.
+  // A project root must not be replaced by the host's unrelated home directory.
   const needsHomeFallback =
-    selectedHostId !== null && lastCreatedWorkspace === null && recent.length === 0;
+    configProjectId === null &&
+    selectedHostId !== null &&
+    lastCreatedWorkspace === null &&
+    recent.length === 0;
   const {
     data: homeListing,
     isLoading: homeListingLoading,
@@ -3021,6 +3029,7 @@ export function NewChatLandingScreen() {
   // armed until the host is seeded (the once-per-host guard), and skipped for
   // sandboxes (no host worktrees).
   const forkFreshArmed =
+    configProjectId === null &&
     prefillSettled &&
     selectedHostId !== null &&
     !sandboxSelected &&
@@ -3061,12 +3070,37 @@ export function NewChatLandingScreen() {
     autoSeedCandidate,
   ]);
 
+  useEffect(() => {
+    if (!prefillSettled || configProjectId === null || !projectHostRoots) return;
+    if (sandboxSelected || selectedHostId === null) return;
+    const root = projectHostRoots.roots.find((item) => item.host_id === selectedHostId);
+    if (seededHostRef.current === selectedHostId) {
+      if (workspaceFromConfigRef.current && workspace !== (root?.workspace ?? "")) {
+        setWorkspace(root?.workspace ?? "");
+      }
+      return;
+    }
+    seededHostRef.current = selectedHostId;
+    if (workspace === "") {
+      workspaceFromConfigRef.current = true;
+      if (root) setWorkspace(root.workspace);
+    }
+  }, [
+    prefillSettled,
+    configProjectId,
+    projectHostRoots,
+    sandboxSelected,
+    selectedHostId,
+    workspace,
+  ]);
+
   // Seed the working directory once per host, into an empty field only, so an
   // explicit pick isn't clobbered. Prefer the most-recent path; else the
   // derived home (which can arrive a render later, hence the dep). Holds
   // off while a project prefill is deciding on a workspace of its own.
   useEffect(() => {
     if (!prefillSettled) return;
+    if (configProjectId !== null) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
     if (autoSeedCandidate === null) return;
@@ -3102,6 +3136,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     autoSeedCandidate,
     prefillSettled,
+    configProjectId,
     forkFreshMainPath,
     workspace,
     branchName,
@@ -4600,9 +4635,8 @@ export function NewChatLandingScreen() {
   // Existing worktrees stay visible while a new branch name is drafted. The
   // two actions are deliberately separate: radio selection binds an existing
   // worktree; the text field requests a new one.
-  // Project prefill: seed host / workspace / agent from the project's stored
-  // config, then settle so the generic defaults fill any slot the config left
-  // unset. An opt-in worktree is generated by the dedicated effect below once
+  // Project prefill: seed host / workspace from roots and agent from config.
+  // An opt-in worktree is generated by the dedicated effect below once
   // the workspace is in place.
   useEffect(() => {
     if (prefill.project !== projectParam || prefillDone(prefill)) return;
@@ -4618,6 +4652,7 @@ export function NewChatLandingScreen() {
       selectedHostId,
       lastAgentId: readLastAgentId(),
       config: prefillConfig,
+      roots: configProjectId === null ? null : projectHostRoots,
     });
     if (step === null) return;
     const { writes } = step;
@@ -4638,8 +4673,6 @@ export function NewChatLandingScreen() {
     if (writes.workspace !== undefined) {
       setWorkspace((cur) => {
         if (cur !== "") return cur;
-        // Config-sourced seed into an empty slot (locationStep only ever
-        // writes the config workspace); idempotent under a re-run.
         workspaceFromConfigRef.current = true;
         return writes.workspace!;
       });
@@ -4657,6 +4690,8 @@ export function NewChatLandingScreen() {
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    configProjectId,
+    projectHostRoots,
     defaultSandboxProvider,
   ]);
 
@@ -4908,11 +4943,12 @@ export function NewChatLandingScreen() {
       (projectParam !== "" &&
         (projectListLoading ||
           projectConfigLoading ||
+          projectHostRootsLoading ||
           ((!prefillSettled || prefill.project !== projectParam) && !hostsError))) ||
       (workspaceReadyTarget !== workspaceTarget &&
         ((selectedHostId !== null &&
           workspaceTrimmed === "" &&
-          (autoSeedCandidate !== null ||
+          ((configProjectId === null && autoSeedCandidate !== null) ||
             (needsHomeFallback && (homeListingLoading || homeListingIsPlaceholder)))) ||
           (worktreesEnabled && (hostWorktreesLoading || hostWorktreesArePlaceholder)))));
   // Directory and worktree defaults settle independently of the model catalog.
@@ -4955,9 +4991,8 @@ export function NewChatLandingScreen() {
       writeNewChatWorkspaceCache(pickerCacheKey, workspacePreview);
     }
   }, [pickerCacheKey, workspaceLoading, workspaceMetadataReady, workspacePreview]);
-  const storedWorkspacePreview = workspaceLoading
-    ? readNewChatWorkspaceCache(pickerCacheKey)
-    : null;
+  const storedWorkspacePreview =
+    workspaceLoading && configProjectId === null ? readNewChatWorkspaceCache(pickerCacheKey) : null;
   const cachedWorkspace =
     storedWorkspacePreview &&
     (selectedHostId === null || selectedHostId === storedWorkspacePreview.hostId) &&
@@ -4982,6 +5017,37 @@ export function NewChatLandingScreen() {
     }
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
+  const selectedHostDisplayName = selectedHost
+    ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
+    : null;
+  const projectHostUnavailable =
+    configProjectId !== null &&
+    selectedHostId === null &&
+    !sandboxSelected &&
+    projectHostRoots !== undefined &&
+    (projectHostRoots.default_host_reason === "config" ||
+      projectHostRoots.default_host_reason === "single_root") &&
+    projectHostRoots.default_host_id !== null &&
+    !allHosts.some((host) => host.host_id === projectHostRoots.default_host_id);
+  const projectRootMissing =
+    configProjectId !== null &&
+    projectHostRoots !== undefined &&
+    selectedHostId !== null &&
+    workspaceTrimmed === "" &&
+    !projectHostRoots.roots.some((root) => root.host_id === selectedHostId);
+  const projectLocationError = projectHostRootsError
+    ? "This project's directories could not be loaded. Try again."
+    : projectHostUnavailable
+      ? "This project's host is not available. Choose a host."
+      : configProjectId !== null &&
+          projectHostRoots?.default_host_reason === "ambiguous" &&
+          selectedHostId === null &&
+          !sandboxSelected
+        ? "This project has a directory on several hosts. Choose a host."
+        : projectRootMissing
+          ? `This project has no directory on ${selectedHostDisplayName ?? selectedHostId}. Choose a folder, or set one in project settings.`
+          : null;
+
   const canSubmit =
     (message.trim().length > 0 || files.length > 0) &&
     !pickerLoading &&
@@ -4989,6 +5055,7 @@ export function NewChatLandingScreen() {
     !pendingSkillCompletion &&
     pickerSelectionError === null &&
     sandboxCatalogError === null &&
+    projectLocationError === null &&
     selectedAgent != null &&
     // A library agent runs from its uploaded bundle, which needs a connected
     // computer; a managed sandbox cannot launch it.
@@ -5002,36 +5069,35 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : pendingSkillCompletion
-      ? "Loading skills…"
-      : pickerLoading || workspaceLoading
-        ? "Loading session configuration…"
-        : pickerSelectionError || sandboxCatalogError
-          ? (pickerSelectionError ?? sandboxCatalogError)
-          : sandboxSelected && sandboxRepoOverCap
-            ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-                maxSandboxRepos === 1 ? "repository" : "repositories"
-              } — remove the extras`
-            : sandboxSelected && !sandboxRepoValid
-              ? "Please enter a valid repository URL"
-              : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                ? "Selected host is unavailable. Reconnect it or choose another host."
-                : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                  ? "Please choose a host and working directory"
-                  : configuredAgentUnavailable && selectedAgent == null
-                    ? "This project's configured agent is unavailable — pick an agent to continue"
-                    : sandboxSelected && effectiveAgentId?.startsWith("ca_")
-                      ? "Custom agents require a connected computer"
-                      : message.trim().length === 0 && files.length === 0
-                        ? "Enter a message to get started"
-                        : null;
+    : projectLocationError !== null
+      ? projectLocationError
+      : pendingSkillCompletion
+        ? "Loading skills…"
+        : pickerLoading || workspaceLoading
+          ? "Loading session configuration…"
+          : pickerSelectionError || sandboxCatalogError
+            ? (pickerSelectionError ?? sandboxCatalogError)
+            : sandboxSelected && sandboxRepoOverCap
+              ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+                  maxSandboxRepos === 1 ? "repository" : "repositories"
+                } — remove the extras`
+              : sandboxSelected && !sandboxRepoValid
+                ? "Please enter a valid repository URL"
+                : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                  ? "Selected host is unavailable. Reconnect it or choose another host."
+                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                    ? "Please choose a host and working directory"
+                    : configuredAgentUnavailable && selectedAgent == null
+                      ? "This project's configured agent is unavailable — pick an agent to continue"
+                      : sandboxSelected && effectiveAgentId?.startsWith("ca_")
+                        ? "Custom agents require a connected computer"
+                        : message.trim().length === 0 && files.length === 0
+                          ? "Enter a message to get started"
+                          : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
     sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
-  const selectedHostDisplayName = selectedHost
-    ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
-    : null;
   // The Arca box's row in the host list, known only from the host id stored
   // when Run on Arca connected it (a host's name is its machine hostname —
   // no reliable relationship to the arca instance name, so no matching).
@@ -5501,12 +5567,8 @@ export function NewChatLandingScreen() {
       const localProject =
         selectedProject !== "" ? { id: createProjectId, name: selectedProject } : undefined;
       let rememberedProjectId = createProjectId;
-      // Server-side default-fill: a slot still holding its untouched project-
-      // config seed (per the source refs) is OMITTED so the server fills it
-      // from the config. Any user interaction — even re-picking the exact
-      // config value — cleared the ref, so an explicit choice is always SENT
-      // (the server treats it as authoritative and only warns on mismatch).
-      // The value-equality guard covers seeds later displaced without a write.
+      // The server fills untouched agent config and host root seeds. A user
+      // pick clears the source ref even when the picked value is identical.
       const agentFromProjectConfig =
         createProjectId !== null &&
         agentFromConfigRef.current &&
@@ -5517,6 +5579,12 @@ export function NewChatLandingScreen() {
         workspaceFromConfigRef.current &&
         prefillConfig?.workspace != null &&
         workspaceValue === prefillConfig.workspace;
+      const workspaceFromProjectRoot =
+        createProjectId !== null &&
+        workspaceFromConfigRef.current &&
+        projectHostRoots?.roots.some(
+          (root) => root.host_id === selectedHostId && root.workspace === workspaceValue,
+        );
       // When filing into a project by LABEL, stamp its legacy `omni_project`
       // label at create so the session is BORN FILED. The sidebar dual-reads
       // project membership from this label OR the first-class `project_id` the
@@ -5659,9 +5727,8 @@ export function NewChatLandingScreen() {
                 }
               : {
                   host_id: selectedHostId,
-                  // Config-seeded workspace on a `project_id` create: omitted
-                  // so the server default-fills it (see agent_id above).
-                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceValue }),
+                  // The server fills an untouched root seed for this host.
+                  ...(workspaceFromProjectRoot ? {} : { workspace: workspaceValue }),
                   // Create a new worktree, or bind an existing one
                   // (`existing_worktree` records the branch for the sidebar +
                   // delete flow without creating anything), or neither. Always
@@ -6098,6 +6165,12 @@ export function NewChatLandingScreen() {
           className={cn("relative flex flex-col gap-0", COMPOSER_COLUMN_WIDTH)}
           data-testid="new-chat-landing-composer-surface"
         >
+          <div
+            className="mb-1.5 px-2 text-xs text-muted-foreground"
+            data-testid="new-chat-landing-project-line"
+          >
+            Project: <span className="text-foreground">{selectedProject || "No Project"}</span>
+          </div>
           {sandboxSelected && (
             <ComposerWorkspaceBar data-testid="new-chat-landing-workspace-controls">
               {/* Sandbox repository chip — the sandbox counterpart of the

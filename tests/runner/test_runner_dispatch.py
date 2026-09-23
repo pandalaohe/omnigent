@@ -7697,6 +7697,7 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
                     "agent_id": "ag_x",
                     "agent_name": "researcher",
                     "status": "idle",
+                    "project_id": "project",
                 },
             )
         return httpx.Response(404, json={"error": str(request.url)})
@@ -7722,6 +7723,7 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     assert handle["conversation_id"] == "conv_child"
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
+    assert handle["project_id"] == "project"
 
 
 @pytest.mark.asyncio
@@ -7827,6 +7829,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
                     "session_id": "conv_child",
                     "agent_id": "ag_new",
                     "agent_name": "helper",
+                    "project_id": "project",
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
@@ -7876,6 +7879,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     # not the caller's args — the orchestrator needs the NEW agent's id.
     assert handle["agent_id"] == "ag_new"
     assert handle["agent_name"] == "helper"
+    assert handle["project_id"] == "project"
 
 
 @pytest.mark.asyncio

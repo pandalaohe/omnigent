@@ -783,7 +783,7 @@ def register_core_routes(
         # tracker entry registered here (see post_event). Config
         # problems and malformed repo workspaces still fail the POST
         # synchronously.
-        launch_host_id = body.host_id
+        launch_host_id = resp.host_id
         if body.host_type == "managed" and resp.runner_id is None:
             await _schedule_managed_launch(
                 request,
@@ -872,10 +872,14 @@ def register_core_routes(
             resolve_project_session_create,
         )
 
+        request_fields_set = parsed_metadata.model_fields_set
         project_resolution = await resolve_project_session_create(
             body=parsed_metadata,
             user_id=user_id,
             project_store=project_store,
+            binding_store=getattr(request.app.state, "project_host_binding_store", None),
+            feature_flags=getattr(request.app.state, "feature_flags", None),
+            host_store=getattr(request.app.state, "host_store", None),
         )
         parsed_metadata = project_resolution.body
         creation_metadata(
@@ -894,6 +898,21 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
+            if "project_id" not in request_fields_set and project_store is not None:
+                parent_conv = conversation_store.get_conversation(
+                    parsed_metadata.parent_session_id
+                )
+                parent_project_id = parent_conv.project_id if parent_conv is not None else None
+                if (
+                    parent_project_id is not None
+                    and await asyncio.to_thread(
+                        project_store.get, parent_project_id, user_id=user_id
+                    )
+                    is not None
+                ):
+                    parsed_metadata = parsed_metadata.model_copy(
+                        update={"project_id": parent_project_id}
+                    )
 
         bundle_bytes = await bundle.read()
         # Validate the bundle BEFORE any row exists: the external-host

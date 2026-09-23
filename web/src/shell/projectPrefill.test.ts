@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import type { ProjectHostRoots } from "@/lib/projectsApi";
 import { initialPrefillState, projectPrefillStep } from "./projectPrefill";
 
 const hosts: Host[] = [
@@ -13,7 +14,9 @@ const hosts: Host[] = [
   { host_id: "host_2", name: "desktop", owner: "corey", status: "online" },
 ];
 
-function inputs(overrides: Partial<Parameters<typeof projectPrefillStep>[1]> = {}) {
+function inputs(
+  overrides: Partial<Parameters<typeof projectPrefillStep>[1]> = {},
+): Parameters<typeof projectPrefillStep>[1] {
   return {
     hosts,
     agents: [{ id: "ag_hello" }],
@@ -22,6 +25,7 @@ function inputs(overrides: Partial<Parameters<typeof projectPrefillStep>[1]> = {
     selectedHostId: null,
     lastAgentId: null,
     config: {},
+    roots: null as ProjectHostRoots | null | undefined,
     ...overrides,
   };
 }
@@ -40,7 +44,16 @@ function runToDone(stepInputs: ReturnType<typeof inputs>) {
   return { state, writes };
 }
 
-describe("projectPrefill config seeding", () => {
+const roots: ProjectHostRoots = {
+  roots: [
+    { host_id: "host_1", workspace: "/repo/alpha", source: "binding" },
+    { host_id: "host_2", workspace: "/repo/beta", source: "config" },
+  ],
+  default_host_id: "host_2",
+  default_host_reason: "config",
+};
+
+describe("projectPrefill location seeding", () => {
   it("waits while the config is still loading", () => {
     const step = projectPrefillStep(initialPrefillState("Alpha"), inputs({ config: undefined }));
     expect(step).toBeNull();
@@ -49,7 +62,7 @@ describe("projectPrefill config seeding", () => {
   it("keeps the location phase open while the host list is still loading", () => {
     const step = projectPrefillStep(
       initialPrefillState("Alpha"),
-      inputs({ hosts: undefined, config: { hostId: "host_1" } }),
+      inputs({ hosts: undefined, roots }),
     );
     // The agent track can settle independently, but the host seed must wait
     // for the host list, so the location phase stays open (no host write).
@@ -58,63 +71,71 @@ describe("projectPrefill config seeding", () => {
     expect(step!.writes.hostId).toBeUndefined();
   });
 
-  it("seeds host + workspace from config", () => {
-    const { state, writes } = runToDone(
-      inputs({ config: { hostId: "host_2", workspace: "/repo/beta" } }),
-    );
+  it("waits for project roots before choosing a host", () => {
+    const step = projectPrefillStep(initialPrefillState("Alpha"), inputs({ roots: undefined }));
+    expect(step!.state.phase).toBe("location");
+    expect(step!.writes.hostId).toBeUndefined();
+  });
+
+  it("seeds the default host and its root", () => {
+    const { state, writes } = runToDone(inputs({ roots }));
     expect(writes.hostId).toBe("host_2");
     expect(writes.workspace).toBe("/repo/beta");
     expect(state.phase).toBe("settled");
     expect(state.agentSeeded).toBe(true);
   });
 
-  it("seeds only the host when config has a host but no workspace", () => {
-    const { writes } = runToDone(inputs({ config: { hostId: "host_2" } }));
-    expect(writes.hostId).toBe("host_2");
-    expect(writes.workspace).toBeUndefined();
-  });
-
-  it("settles with no location writes when the config is empty", () => {
+  it("settles a label-only folder without a host root", () => {
     const { state, writes } = runToDone(inputs({ config: {} }));
     expect(state.phase).toBe("settled");
     expect(writes.hostId).toBeUndefined();
     expect(writes.workspace).toBeUndefined();
   });
 
-  it("drops an offline / missing config host but keeps the configured workspace", () => {
-    const { writes } = runToDone(inputs({ config: { hostId: "host_off", workspace: "/x" } }));
-    // The offline config host is ignored (the generic host default takes
-    // over), but the workspace hint survives — otherwise a generic recent
-    // path, possibly another project's, would fill the field.
-    expect(writes.hostId).toBeUndefined();
-    expect(writes.workspace).toBe("/x");
-  });
-
-  it("seeds a configured workspace even when the config names no host", () => {
-    const { writes } = runToDone(inputs({ config: { workspace: "/x" } }));
-    expect(writes.hostId).toBeUndefined();
-    expect(writes.workspace).toBe("/x");
-  });
-
-  it("does not seed a config host the user has already switched away from", () => {
+  it("keeps an offline config host and its own root", () => {
     const { writes } = runToDone(
-      inputs({ config: { hostId: "host_2", workspace: "/repo/beta" }, selectedHostId: "host_1" }),
+      inputs({ hosts: [hosts[0], { ...hosts[1], status: "offline" }], roots }),
+    );
+    expect(writes.hostId).toBe("host_2");
+    expect(writes.workspace).toBe("/repo/beta");
+  });
+
+  it("leaves an unavailable default host and its directory empty", () => {
+    const { writes } = runToDone(inputs({ hosts: [hosts[0]], roots }));
+    expect(writes.hostId).toBeUndefined();
+    expect(writes.workspace).toBeUndefined();
+  });
+
+  it("leaves an ambiguous project without a host", () => {
+    const { writes } = runToDone(
+      inputs({ roots: { ...roots, default_host_id: null, default_host_reason: "ambiguous" } }),
     );
     expect(writes.hostId).toBeUndefined();
     expect(writes.workspace).toBeUndefined();
   });
 
-  it("does not seed a config host when the sandbox is selected", () => {
+  it("uses an explicitly selected host's root", () => {
+    const { writes } = runToDone(inputs({ roots, selectedHostId: "host_1" }));
+    expect(writes.hostId).toBeUndefined();
+    expect(writes.workspace).toBe("/repo/alpha");
+  });
+
+  it("does not seed a directory when the selected host has no root", () => {
     const { writes } = runToDone(
-      inputs({ config: { hostId: "host_1", workspace: "/repo" }, sandboxSelected: true }),
+      inputs({ roots: { ...roots, roots: [roots.roots[1]] }, selectedHostId: "host_1" }),
     );
+    expect(writes.workspace).toBeUndefined();
+  });
+
+  it("does not replace a user's sandbox pick with the project host root", () => {
+    const { writes } = runToDone(inputs({ roots, sandboxSelected: true }));
     expect(writes.hostId).toBeUndefined();
     expect(writes.workspace).toBeUndefined();
   });
 
   it("selects the sandbox from a stored sandbox default", () => {
     const { state, writes } = runToDone(
-      inputs({ config: { hostId: SANDBOX_HOST_CHOICE }, managedSandboxesEnabled: true }),
+      inputs({ config: { hostId: SANDBOX_HOST_CHOICE }, roots, managedSandboxesEnabled: true }),
     );
     // The sandbox sentinel is not a real host id, so it seeds via selectSandbox.
     expect(writes.selectSandbox).toBe(true);
@@ -124,7 +145,7 @@ describe("projectPrefill config seeding", () => {
 
   it("drops a stored sandbox default when the server no longer offers sandboxes", () => {
     const { writes } = runToDone(
-      inputs({ config: { hostId: SANDBOX_HOST_CHOICE }, managedSandboxesEnabled: false }),
+      inputs({ config: { hostId: SANDBOX_HOST_CHOICE }, roots, managedSandboxesEnabled: false }),
     );
     expect(writes.selectSandbox).toBeUndefined();
     expect(writes.hostId).toBeUndefined();
@@ -134,6 +155,7 @@ describe("projectPrefill config seeding", () => {
     const { writes } = runToDone(
       inputs({
         config: { hostId: SANDBOX_HOST_CHOICE },
+        roots,
         managedSandboxesEnabled: true,
         sandboxSelected: true,
       }),
@@ -145,6 +167,7 @@ describe("projectPrefill config seeding", () => {
     const { writes } = runToDone(
       inputs({
         config: { hostId: SANDBOX_HOST_CHOICE },
+        roots,
         managedSandboxesEnabled: true,
         selectedHostId: "host_1",
       }),

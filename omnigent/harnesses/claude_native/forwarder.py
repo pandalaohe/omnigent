@@ -4662,13 +4662,21 @@ async def _create_clear_replacement_session(
     )
     labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
 
-    create_resp = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
-    )
+    create_body = {"agent_id": agent_id, "labels": labels}
+    project_id = old.get("project_id")
+    if isinstance(project_id, str):
+        create_body.update({"project_id": project_id, "workspace": None, "git": None})
+    create_resp = await client.post("/v1/sessions", json=create_body)
+    if isinstance(project_id, str) and create_resp.status_code == 404:
+        error = create_resp.json().get("error")
+        if isinstance(error, dict) and error.get("code") == "not_found":
+            _logger.info(
+                "Project %s was removed before clear replacement; retrying unfiled", project_id
+            )
+            create_body.pop("project_id")
+            create_body.pop("workspace")
+            create_body.pop("git")
+            create_resp = await client.post("/v1/sessions", json=create_body)
     create_resp.raise_for_status()
     created = _parse_json_response(create_resp, context="clear-replacement session create")
     new_session_id = created.get("id")

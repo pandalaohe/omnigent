@@ -19,9 +19,19 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
+from omnigent.server.feature_flags import FeatureFlags
+from omnigent.server.project_placement import (
+    bindings_apply,
+    default_host,
+    host_roots,
+    load_bindings,
+    load_eligible_host_ids,
+    root_on_host,
+)
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
-from omnigent.stores.host_store import host_is_live
+from omnigent.stores.host_store import HostStore, host_is_live
+from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
 
@@ -41,6 +51,10 @@ async def resolve_project_session_create(
     body: Any,
     user_id: str | None,
     project_store: ProjectStore | None,
+    binding_store: ProjectHostBindingStore | None = None,
+    feature_flags: FeatureFlags | None = None,
+    host_store: HostStore | None = None,
+    fill_host: bool = False,
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
@@ -65,9 +79,47 @@ async def resolve_project_session_create(
 
     config = project.config
     updates: dict[str, Any] = {}
-    for field in ("agent_id", "workspace", "git"):
+    for field in ("agent_id", "git"):
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
+    bindings = await load_bindings(binding_store, project.id)
+    gates_on = bindings_apply(project, feature_flags)
+    if (
+        fill_host
+        and "host_id" not in fields_set
+        and "workspace" not in fields_set
+        and body.parent_session_id is None
+        and "host_type" not in fields_set
+    ):
+        roots = host_roots(project, bindings, gates_on=gates_on)
+        eligible = await load_eligible_host_ids(
+            host_store, user_id, (root.host_id for root in roots)
+        )
+        chosen = default_host(project, roots, eligible_host_ids=eligible)
+        if chosen.reason == "ambiguous":
+            names = ", ".join(
+                root.host_id for root in roots if eligible is None or root.host_id in eligible
+            )
+            raise OmnigentError(
+                f"Project '{project.name}' has a directory on several hosts "
+                f"({names}). Pass host_id.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if chosen.host_id is not None:
+            updates["host_id"] = chosen.host_id
+    if "workspace" not in fields_set:
+        host_id = updates.get("host_id", body.host_id)
+        if host_id is not None:
+            root = root_on_host(project, bindings, host_id, gates_on=gates_on)
+            if root is None:
+                raise OmnigentError(
+                    f"Project '{project.name}' has no directory on host '{host_id}'. "
+                    "Pass workspace, or set this host's directory in the project settings.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            updates["workspace"] = root.workspace
+        elif "workspace" in config and "workspace" in body.__class__.model_fields:
+            updates["workspace"] = config["workspace"]
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as

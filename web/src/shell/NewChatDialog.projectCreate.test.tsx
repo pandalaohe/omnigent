@@ -20,6 +20,7 @@ import {
   useConversations as useTestConversations,
   moveConversationToProject,
   useProjectConfig,
+  useProjectHostRoots,
   useProjects,
 } from "@/hooks/useConversations";
 
@@ -48,7 +49,7 @@ import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import type { ProjectConfig } from "@/lib/projectsApi";
+import type { ProjectConfig, ProjectHostRoots } from "@/lib/projectsApi";
 import { showToast } from "@/components/ui/toast";
 import { customAgentBundle, useCustomAgents } from "@/lib/customAgentsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -160,6 +161,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: vi.fn(),
   useProjectConfig: vi.fn(),
+  useProjectHostRoots: vi.fn(),
   moveConversationToProject: vi.fn(),
   // The landing reads useConversations to decide hasNoSessions (the empty-state
   // import affordance); stub it so it doesn't fire an authenticatedFetch that
@@ -198,6 +200,18 @@ function setProjectConfig(config: ProjectConfig | undefined, isLoading = false):
   vi.mocked(useProjectConfig).mockReturnValue({ data: config, isLoading } as ReturnType<
     typeof useProjectConfig
   >);
+}
+
+function rootsForConfig(config: ProjectConfig | undefined): ProjectHostRoots {
+  const hostId = config?.host_id;
+  const configHostId = hostId && hostId !== "__sandbox__" ? hostId : null;
+  return {
+    roots: configHostId && config?.workspace
+      ? [{ host_id: configHostId, workspace: config.workspace, source: "config" }]
+      : [],
+    default_host_id: configHostId,
+    default_host_reason: configHostId ? "config" : "none",
+  };
 }
 
 function setProjects(
@@ -319,6 +333,14 @@ beforeEach(() => {
   setRepoIsGit();
   setProjects([{ id: "proj_alpha", name: "Alpha" }]);
   setProjectConfig({});
+  vi.mocked(useProjectHostRoots).mockImplementation((id) => {
+    const config = id === null ? undefined : vi.mocked(useProjectConfig)(id).data;
+    return {
+      data: id === null ? undefined : rootsForConfig(config),
+      isLoading: false,
+      isError: false,
+    } as ReturnType<typeof useProjectHostRoots>;
+  });
 });
 
 afterEach(() => {

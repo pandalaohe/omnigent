@@ -9464,10 +9464,15 @@ async def _create_session_from_existing_agent(
         resolve_project_session_create,
     )
 
+    request_fields_set = body.model_fields_set
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
         project_store=project_store,
+        binding_store=getattr(request.app.state, "project_host_binding_store", None),
+        feature_flags=getattr(request.app.state, "feature_flags", None),
+        host_store=getattr(request.app.state, "host_store", None),
+        fill_host=True,
     )
     body = project_resolution.body
     creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
@@ -9791,10 +9796,21 @@ async def _create_session_from_existing_agent(
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
+    child_project_id: str | None = None
     if body.parent_session_id is not None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
+            if (
+                "project_id" not in request_fields_set
+                and parent_conv.project_id is not None
+                and project_store is not None
+                and await asyncio.to_thread(
+                    project_store.get, parent_conv.project_id, user_id=user_id
+                )
+                is not None
+            ):
+                child_project_id = parent_conv.project_id
             # Defense-in-depth: don't inherit a runner the
             # caller doesn't own.
             if (
@@ -9968,7 +9984,7 @@ async def _create_session_from_existing_agent(
             workspace=canonical_workspace,
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
-            project_id=project_resolution.project_id,
+            project_id=project_resolution.project_id or child_project_id,
             **snapshot_kwargs,
         )
     except NameAlreadyExistsError as exc:

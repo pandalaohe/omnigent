@@ -3888,6 +3888,7 @@ def _finalize_created_session(
             "agent_name": data.get("agent_name"),
             "title": title if isinstance(title, str) else None,
             "status": data.get("status") or "created",
+            "project_id": data.get("project_id"),
         }
     )
 
@@ -4240,6 +4241,7 @@ async def _session_create_from_config_path(
             "id": child_session_id,
             "agent_name": data.get("agent_name"),
             "status": "created",
+            "project_id": data.get("project_id"),
         },
         conversation_id=conversation_id,
         agent_id=created_agent_id,

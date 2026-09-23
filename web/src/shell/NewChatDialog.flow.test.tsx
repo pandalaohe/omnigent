@@ -18,6 +18,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
 }));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
+import type { ProjectConfig } from "@/lib/projectsApi";
 
 vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
 
@@ -70,6 +71,7 @@ const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
 let searchParams = new URLSearchParams();
 let projects: { id: string | null; name: string }[] = [];
+let projectConfig: ProjectConfig | null = null;
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 // Prompt history is scoped per conversation; the landing composer writes under
@@ -197,7 +199,20 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: () => ({ data: projects }),
-  useProjectConfig: () => ({ data: null, isLoading: false }),
+  useProjectConfig: () => ({ data: projectConfig, isLoading: false }),
+  useProjectHostRoots: () => ({
+    data: projectConfig?.host_id && projectConfig.host_id !== "__sandbox__"
+      ? {
+          roots: projectConfig.workspace
+            ? [{ host_id: projectConfig.host_id, workspace: projectConfig.workspace, source: "config" }]
+            : [],
+          default_host_id: projectConfig.host_id,
+          default_host_reason: "config",
+        }
+      : { roots: [], default_host_id: null, default_host_reason: "none" },
+    isLoading: false,
+    isError: false,
+  }),
   // Same reason as useProjects above: the landing reads useConversations for
   // hasNoSessions, so stub it to avoid an authenticatedFetch skewing calls[0].
   useConversations: () => ({ data: undefined }),
@@ -424,6 +439,7 @@ beforeEach(() => {
   localStorage.clear();
   searchParams = new URLSearchParams();
   projects = [];
+  projectConfig = null;
   vi.mocked(useHostModelOptions).mockReturnValue({
     data: [
       { id: "opus", displayName: "Opus" },
@@ -453,6 +469,7 @@ describe("NewChatLandingScreen create flow", () => {
   it("keeps project placement on the provisional and rekeyed conversation", async () => {
     searchParams = new URLSearchParams("project=Alpha");
     projects = [{ id: "proj_alpha", name: "Alpha" }];
+    projectConfig = { host_id: "host_1", workspace: SEEDED_WORKSPACE };
     beginLocalConversationMock.mockReturnValue({
       tempConvId: "temp:1234567890abcdef1234567890abcdef",
       pendingMsgTempId: "pend_1",

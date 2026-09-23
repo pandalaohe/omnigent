@@ -2479,13 +2479,21 @@ async def _create_thread_replacement_session(
     if CODEX_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
-    create_resp = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
-    )
+    create_body = {"agent_id": agent_id, "labels": labels}
+    project_id = old.get("project_id")
+    if isinstance(project_id, str):
+        create_body.update({"project_id": project_id, "workspace": None, "git": None})
+    create_resp = await client.post("/v1/sessions", json=create_body)
+    if isinstance(project_id, str) and create_resp.status_code == 404:
+        error = create_resp.json().get("error")
+        if isinstance(error, dict) and error.get("code") == "not_found":
+            _logger.info(
+                "Project %s was removed before thread replacement; retrying unfiled", project_id
+            )
+            create_body.pop("project_id")
+            create_body.pop("workspace")
+            create_body.pop("git")
+            create_resp = await client.post("/v1/sessions", json=create_body)
     create_resp.raise_for_status()
     created = create_resp.json()
     new_session_id = created.get("id")

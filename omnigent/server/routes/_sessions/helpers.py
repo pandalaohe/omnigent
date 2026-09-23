@@ -10278,6 +10278,7 @@ def _persist_stored_session_bundle(
         session_id=created.conversation.id,
         agent_id=agent_id,
         agent_name=agent_name,
+        project_id=created.conversation.project_id,
     )
 
 

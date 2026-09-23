@@ -1852,11 +1852,13 @@ class CreatedSessionResponse(BaseModel):
         from the uploaded bundle, e.g. ``"ag_abc123"``.
     :param agent_name: Agent name loaded from the uploaded bundle's
         spec, e.g. ``"code-assistant"``.
+    :param project_id: Owned project containing the new session, or ``None``.
     """
 
     session_id: str
     agent_id: str
     agent_name: str
+    project_id: str | None = None
 
 
 class SessionLabelsResponse(BaseModel):

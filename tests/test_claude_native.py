@@ -31,6 +31,7 @@ from websockets.frames import Close
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
+from omnigent.harnesses.claude_native import forwarder as claude_native_forwarder
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
@@ -12120,3 +12121,41 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
     dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
 
     assert claude_native.resolve_native_claude_config(spec=spec, refresh_models=False) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted_project", [False, True])
+async def test_clear_replacement_preserves_project_or_retries_unfiled(
+    tmp_path: Path, deleted_project: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    bridge_dir.mkdir(parents=True)
+    (bridge_dir / "bridge.json").write_text('{"bridge_id":"bridge"}')
+    creates: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"agent_id": "agent", "project_id": "project"})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            creates.append(json.loads(request.content))
+            if deleted_project and len(creates) == 1:
+                return httpx.Response(404, json={"error": {"code": "not_found"}})
+            return httpx.Response(201, json={"id": "replacement"})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        result = await claude_native_forwarder._create_clear_replacement_session(
+            client=client, old_session_id="old", bridge_dir=bridge_dir
+        )
+
+    assert result == "replacement"
+    assert creates[0]["project_id"] == "project"
+    assert creates[0]["workspace"] is None
+    assert creates[0]["git"] is None
+    if deleted_project:
+        assert len(creates) == 2
+        assert set(creates[1]) == {"agent_id", "labels"}
+    else:
+        assert len(creates) == 1

@@ -63,8 +63,10 @@ import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
   getProject as apiGetProject,
+  getProjectHostRoots as apiGetProjectHostRoots,
   listProjects as apiListProjects,
   type ProjectConfig,
+  type ProjectHostRoots,
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
@@ -2863,6 +2865,15 @@ export function useProjectConfig(id: string | null) {
   return useQuery<ProjectConfig>({
     queryKey: ["project-config", id],
     queryFn: async () => (await apiGetProject(id as string)).config ?? {},
+    enabled: id !== null,
+    staleTime: 30_000,
+  });
+}
+
+export function useProjectHostRoots(id: string | null) {
+  return useQuery<ProjectHostRoots>({
+    queryKey: ["project-host-roots", id],
+    queryFn: () => apiGetProjectHostRoots(id as string),
     enabled: id !== null,
     staleTime: 30_000,
   });

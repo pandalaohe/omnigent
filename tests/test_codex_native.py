@@ -12803,3 +12803,42 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted_project", [False, True])
+async def test_thread_replacement_preserves_project_or_retries_unfiled(
+    tmp_path: Path, deleted_project: bool
+) -> None:
+    creates: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"agent_id": "agent", "project_id": "project"})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            creates.append(json.loads(request.content))
+            if deleted_project and len(creates) == 1:
+                return httpx.Response(404, json={"error": {"code": "not_found"}})
+            return httpx.Response(201, json={"id": "replacement"})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        result = await codex_native_forwarder._create_thread_replacement_session(
+            client=client,
+            old_session_id="old",
+            bridge_dir=tmp_path,
+            app_server_url="ws://test",
+            new_thread_id="thread",
+        )
+
+    assert result == "replacement"
+    assert creates[0]["project_id"] == "project"
+    assert creates[0]["workspace"] is None
+    assert creates[0]["git"] is None
+    if deleted_project:
+        assert len(creates) == 2
+        assert set(creates[1]) == {"agent_id", "labels"}
+    else:
+        assert len(creates) == 1

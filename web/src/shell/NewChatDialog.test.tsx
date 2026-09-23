@@ -79,6 +79,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import type { ProjectConfig, ProjectHostRoots } from "@/lib/projectsApi";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { NEW_SESSION_TARGET_STORAGE_KEY } from "@/lib/newSessionTarget";
 import {
@@ -245,17 +246,20 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // The composer's project chip lists projects via useProjects; stub it to an
 // empty list so it doesn't fire its own authenticatedFetch (which would skew
 // the create-POST call-count / call-order assertions below).
-const { useConversationsMock, useProjectsMock, useProjectConfigMock } = vi.hoisted(() => ({
-  useConversationsMock: vi.fn(),
-  useProjectsMock: vi.fn(),
-  useProjectConfigMock: vi.fn(),
-}));
+const { useConversationsMock, useProjectsMock, useProjectConfigMock, useProjectHostRootsMock } =
+  vi.hoisted(() => ({
+    useConversationsMock: vi.fn(),
+    useProjectsMock: vi.fn(),
+    useProjectConfigMock: vi.fn(),
+    useProjectHostRootsMock: vi.fn(),
+  }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: useProjectsMock,
   useProjectConfig: useProjectConfigMock,
+  useProjectHostRoots: useProjectHostRootsMock,
   // The landing reads useConversations for hasNoSessions; stub it so it doesn't
   // fire an authenticatedFetch that skews create-POST call assertions.
   useConversations: useConversationsMock,
@@ -1205,6 +1209,11 @@ function setupLandingMocks() {
   useProjectsMock.mockReturnValue({ ...SUCCESS_QUERY_STATE, data: [] });
   useProjectConfigMock.mockReset();
   useProjectConfigMock.mockReturnValue(DISABLED_QUERY_RESULT);
+  useProjectHostRootsMock.mockReset();
+  useProjectHostRootsMock.mockReturnValue({
+    ...SUCCESS_QUERY_STATE,
+    data: { roots: [], default_host_id: null, default_host_reason: "none" },
+  });
   useHostModelOptionsMock.mockReset();
   vi.mocked(useSandboxModelOptions).mockReturnValue({
     data: {
@@ -1286,6 +1295,15 @@ function setupLandingMocks() {
         : CLAUDE_MODEL_OPTIONS_RESULT,
   );
   mockAgents(DEFAULT_LANDING_AGENTS);
+}
+
+function mockProjectPlacement(roots: ProjectHostRoots, config: ProjectConfig = {}) {
+  useProjectsMock.mockReturnValue({
+    ...SUCCESS_QUERY_STATE,
+    data: [{ id: "proj_alpha", name: "Alpha" }],
+  });
+  useProjectConfigMock.mockReturnValue({ ...SUCCESS_QUERY_STATE, data: config });
+  useProjectHostRootsMock.mockReturnValue({ ...SUCCESS_QUERY_STATE, data: roots });
 }
 
 function mockClaudeModels(
@@ -1868,6 +1886,10 @@ describe("NewChatLandingScreen initial picker loading", () => {
       ...SUCCESS_QUERY_STATE,
       data: { host_id: "host_2", agent_id: "a1", model: "fable" },
     });
+    useProjectHostRootsMock.mockReturnValue({
+      ...SUCCESS_QUERY_STATE,
+      data: { roots: [], default_host_id: "host_2", default_host_reason: "config" },
+    });
     editDraft("Waiting for the pinned agent");
     expect(expectLoading()).toBe(loading);
     expect(useAvailableAgentsMock).toHaveBeenCalledWith({ pinnedAgentIds: ["a1"] });
@@ -2406,6 +2428,14 @@ describe("NewChatLandingScreen cached picker preview", () => {
         data: [{ id: "proj_alpha", name: "Alpha" }],
       });
       useProjectConfigMock.mockReturnValue(projectConfig);
+      useProjectHostRootsMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: {
+          roots: [{ host_id: "host_1", workspace: "/Users/corey/repo", source: "config" }],
+          default_host_id: "host_1",
+          default_host_reason: "config",
+        },
+      });
       const { unmount } = renderLanding({}, "/?project=Alpha");
       unmount();
       resetLandingDraft();
@@ -3091,6 +3121,201 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
   });
 
+  it("shows the project and seeds its default host root without sending the untouched workspace", async () => {
+    mockHosts([host("online"), host("online", 2)]);
+    mockProjectPlacement({
+      roots: [{ host_id: "host_2", workspace: "/project/root", source: "binding" }],
+      default_host_id: "host_2",
+      default_host_reason: "single_root",
+    });
+    renderLanding({}, "/?project=Alpha");
+
+    expect(screen.getByTestId("new-chat-landing-project-line")).toHaveTextContent("Project: Alpha");
+    expect(screen.getByRole("heading", { name: "Alpha" })).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/);
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /project/root",
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.host_id).toBe("host_2");
+    expect(body).not.toHaveProperty("workspace");
+  });
+
+  it("keeps an offline config host instead of substituting the last host", () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    mockHosts([host("online"), host("offline", 2)]);
+    mockProjectPlacement(
+      {
+        roots: [{ host_id: "host_2", workspace: "/offline/root", source: "config" }],
+        default_host_id: "host_2",
+        default_host_reason: "config",
+      },
+      { host_id: "host_2", workspace: "/offline/root" },
+    );
+    renderLanding({}, "/?project=Alpha");
+
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+      "Host: machine-2, Offline",
+    );
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /offline/root",
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+  });
+
+  it("waits for roots before the generic host choice can run", () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    mockHosts([host("online"), host("online", 2)]);
+    mockProjectPlacement({
+      roots: [{ host_id: "host_2", workspace: "/project/root", source: "config" }],
+      default_host_id: "host_2",
+      default_host_reason: "config",
+    });
+    useProjectHostRootsMock.mockReturnValue({ ...PENDING_QUERY_STATE, data: undefined });
+    renderLanding({}, "/?project=Alpha");
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+      /No host selected/,
+    );
+    useProjectHostRootsMock.mockReturnValue({
+      ...SUCCESS_QUERY_STATE,
+      data: {
+        roots: [{ host_id: "host_2", workspace: "/project/root", source: "config" }],
+        default_host_id: "host_2",
+        default_host_reason: "config",
+      },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start" },
+    });
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/);
+  });
+
+  it.each([
+    {
+      reason: "config" as const,
+      roots: [{ host_id: "host_2", workspace: "/missing/root", source: "config" as const }],
+      defaultHost: "host_2",
+      message: "This project's host is not available. Choose a host.",
+    },
+    {
+      reason: "ambiguous" as const,
+      roots: [
+        { host_id: "host_1", workspace: "/one", source: "binding" as const },
+        { host_id: "host_2", workspace: "/two", source: "binding" as const },
+      ],
+      defaultHost: null,
+      message: "This project has a directory on several hosts. Choose a host.",
+    },
+  ])(
+    "leaves the host empty when the project default is $reason",
+    async ({ reason, roots, defaultHost, message }) => {
+      localStorage.setItem("omnigent:last-host-choice", "host_1");
+      mockHosts([host("online"), ...(reason === "ambiguous" ? [host("online", 2)] : [])]);
+      mockProjectPlacement({ roots, default_host_id: defaultHost, default_host_reason: reason });
+      renderLanding({}, "/?project=Alpha");
+
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        /No host selected/,
+      );
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.pointerMove(screen.getByTestId("new-chat-landing-submit").parentElement!, {
+        pointerType: "mouse",
+      });
+      expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+        message,
+      );
+    },
+  );
+
+  it("re-seeds the root on host switch and leaves an unrooted host empty", async () => {
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_3: ["/unrelated/recent"] }));
+    mockHosts([host("online"), host("online", 2), host("online", 3)]);
+    mockProjectPlacement({
+      roots: [
+        { host_id: "host_1", workspace: "/one", source: "binding" },
+        { host_id: "host_2", workspace: "/two", source: "binding" },
+      ],
+      default_host_id: "host_1",
+      default_host_reason: "config",
+    });
+    renderLanding({}, "/?project=Alpha");
+
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /one",
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_2"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+        "Working directory: /two",
+      ),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_3"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+        "Working directory: Not selected",
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.pointerMove(screen.getByTestId("new-chat-landing-submit").parentElement!, {
+      pointerType: "mouse",
+    });
+    expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+      "This project has no directory on machine-3. Choose a folder, or set one in project settings.",
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-workspace-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("recent-workspace-select-0"));
+    const { body } = await submitAndReadBody();
+    expect(body.workspace).toBe("/unrelated/recent");
+  });
+
+  it("sends a folder the user picks instead of the project root", async () => {
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: ["/chosen/folder"] }));
+    mockProjectPlacement({
+      roots: [{ host_id: "host_1", workspace: "/project/root", source: "config" }],
+      default_host_id: "host_1",
+      default_host_reason: "config",
+    });
+    renderLanding({}, "/?project=Alpha");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-workspace-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("recent-workspace-select-0"));
+    const { body } = await submitAndReadBody();
+    expect(body.workspace).toBe("/chosen/folder");
+  });
+
+  it("keeps No Project's recent directory and payload", async () => {
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-project-line")).toHaveTextContent(
+      "Project: No Project",
+    );
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      "Working directory: /Users/corey/repo",
+    );
+    const { body } = await submitAndReadBody();
+    expect(body).not.toHaveProperty("project_id");
+    expect(body.workspace).toBe("/Users/corey/repo");
+  });
+
+  it("keeps a sandbox-config project on the sandbox despite a host root", async () => {
+    mockProjectPlacement(
+      {
+        roots: [{ host_id: "host_1", workspace: "/bound", source: "binding" }],
+        default_host_id: null,
+        default_host_reason: "none",
+      },
+      { host_id: "__sandbox__" },
+    );
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Alpha");
+    const { body } = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.host_type).toBe("managed");
+    expect(body.workspace).toBeNull();
+  });
+
   it("does not replace a missing remembered host with the first cached host", async () => {
     localStorage.setItem("omnigent:last-host-choice", "host_2");
     // The shared query cache can render an older host list first while a
@@ -3268,7 +3493,11 @@ describe("NewChatLandingScreen", () => {
 
     expect(screen.getByTestId("new-chat-landing")).toHaveClass("pb-24");
     expect(landingContent).toHaveClass("max-w-[800px]", "md:px-10");
-    expect(composerSurface.firstElementChild).toBe(workspaceControls);
+    expect(composerSurface.firstElementChild).toBe(
+      screen.getByTestId("new-chat-landing-project-line"),
+    );
+    expect(screen.getByTestId("new-chat-landing-project-line")).toHaveTextContent("No Project");
+    expect(composerSurface.children[1]).toBe(workspaceControls);
     expect(workspaceControls).toContainElement(workspace);
     expect(workspaceControls.nextElementSibling).toBe(composer.closest("form"));
     expect(composerSurface).toHaveClass("gap-0");
@@ -7043,7 +7272,7 @@ describe("NewChatLandingScreen", () => {
     // project in the hero heading rather than a tray chip.
     renderLanding({}, "/?project=docs");
 
-    await waitFor(() => expect(screen.getByText("docs")).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "docs" })).toBeTruthy());
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "write the docs" },
@@ -7098,7 +7327,7 @@ describe("NewChatLandingScreen", () => {
       .mockResolvedValue({ ok: true, json: async () => ({ id: "conv_new" }) } as Response);
     renderLanding({}, "/?project=Sprint%2042");
 
-    await waitFor(() => expect(screen.getByText("Sprint 42")).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Sprint 42" })).toBeTruthy());
 
     // Creating a session files it under that pre-filled project.
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {

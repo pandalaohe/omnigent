@@ -964,7 +964,7 @@ class SysSessionCreateTool(Tool):
     An optional ``message`` is queued as the child's first user turn;
     an optional ``title`` labels the session.
 
-    Returns a handle ``{conversation_id, agent_id, title, status}``. The
+    Returns a handle ``{conversation_id, agent_id, title, status, project_id}``. The
     session runs asynchronously — use ``sys_session_get_history`` /
     ``sys_session_get_info`` to monitor it, or ``sys_session_send`` (with
     the returned ``conversation_id``) to drive it further.
@@ -1000,8 +1000,11 @@ class SysSessionCreateTool(Tool):
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions). "
-            "Returns {conversation_id, agent_id, title, status}; the "
+            "session (you cannot create top-level or sibling sessions); "
+            "it joins your session's project, if any (the result's `project_id`; "
+            "null means No Project), and runs in your working directory — "
+            "it cannot target another project or host. "
+            "Returns {conversation_id, agent_id, title, status, project_id}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
             "with sys_session_send."

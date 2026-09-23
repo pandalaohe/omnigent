@@ -94,6 +94,24 @@ export async function getProject(id: string): Promise<Project> {
   return (await res.json()) as Project;
 }
 
+export interface ProjectHostRoot {
+  host_id: string;
+  workspace: string;
+  source: "binding" | "config";
+}
+
+export interface ProjectHostRoots {
+  roots: ProjectHostRoot[];
+  default_host_id: string | null;
+  default_host_reason: "config" | "single_root" | "ambiguous" | "none";
+}
+
+export async function getProjectHostRoots(id: string): Promise<ProjectHostRoots> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/host-roots`);
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as ProjectHostRoots;
+}
+
 /**
  * Create a project, optionally with initial `config` defaults. Rejects with the
  * server's message on a duplicate name (409) so callers can surface it inline.

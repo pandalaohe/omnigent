@@ -1417,6 +1417,13 @@ def test_timer_tools_registered_when_enabled() -> None:
     assert "sys_timer_cancel" in names
 
 
+def test_session_create_description_discloses_project_membership() -> None:
+    from omnigent.tools.builtins.spawn import SysSessionCreateTool
+
+    assert "the result's `project_id`; null means No Project" in SysSessionCreateTool.description()
+    assert "it cannot target another project or host" in SysSessionCreateTool.description()
+
+
 def test_unknown_builtin_logs_warning_and_skips(caplog: pytest.LogCaptureFixture) -> None:
     spec = AgentSpec(
         spec_version=1,

@@ -13758,6 +13758,52 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/host-roots": {
+      "get": {
+        "description": "Return eligible roots and the project's default host.\n\n**Returns:** Eligible roots and the default host choice.",
+        "operationId": "get_project_host_roots_v1_projects__project_id__host_roots_get",
+        "parameters": [
+          {
+            "description": "Owner-scoped project id.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Project Host Roots V1 Projects  Project Id  Host Roots Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Host Roots",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/projects/{project_id}/hosts/{host_id}/bindings/{name}": {
       "delete": {
         "description": "Delete a host binding.\n\n**Returns:** `{\"id\": ..., \"object\": \"project_host_binding.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or binding is not found / not owned.",

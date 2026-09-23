@@ -111,6 +111,7 @@ from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.project_collaboration import (
     create_project_collaboration_router,
 )
+from omnigent.server.routes.project_host_roots import create_project_host_roots_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
@@ -2009,6 +2010,7 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.project_host_binding_store = project_host_binding_store
     if host_store is not None:
         host_registry.launch_authorizer = partial(
             host_store.admit_launch, require_account_owner=runner_account_store is not None
@@ -3653,6 +3655,11 @@ def create_app(
                 project_store=project_store,
                 auth_provider=auth_provider,
             ),
+            prefix="/v1",
+            tags=["projects"],
+        )
+        app.include_router(
+            create_project_host_roots_router(project_store, auth_provider),
             prefix="/v1",
             tags=["projects"],
         )
