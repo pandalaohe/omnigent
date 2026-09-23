@@ -16,9 +16,7 @@ export const RUNNER_LOG_RUNAWAY_MB_LABEL_KEY = "omnigent.runner_log_runaway_mb";
  *
  * @param labels - The session's labels, e.g. `{"omnigent.runner_log_runaway": "2026-…"}`.
  */
-export function runnerLogRunawayNotice(
-  labels: Record<string, string> | undefined,
-): string | null {
+export function runnerLogRunawayNotice(labels: Record<string, string> | undefined): string | null {
   if (!labels?.[RUNNER_LOG_RUNAWAY_LABEL_KEY]) return null;
   const raw = labels[RUNNER_LOG_RUNAWAY_MB_LABEL_KEY];
   const parsed = raw !== undefined && raw !== "" ? Number(raw) : Number.NaN;

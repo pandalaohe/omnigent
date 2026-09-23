@@ -58,7 +58,9 @@ describe("RunnerLogRunawayBanner", () => {
       />,
     );
     expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
-    expect(screen.getByText(/writing logs unusually fast \(7 MB in the last hour\)/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/writing logs unusually fast \(7 MB in the last hour\)/),
+    ).toBeInTheDocument();
     expect(screen.getByText(/may be stuck in an error loop/)).toBeInTheDocument();
   });
 
@@ -94,23 +96,25 @@ describe("RunnerLogRunawayBanner", () => {
     const { data: updated } = mergeItemsIntoPages(
       cache,
       new Map([
-        [row.id, {
-          id: row.id,
-          labels: {
-            "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
-            "omnigent.runner_log_runaway_mb": "7",
+        [
+          row.id,
+          {
+            id: row.id,
+            labels: {
+              "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
+              "omnigent.runner_log_runaway_mb": "7",
+            },
           },
-        }],
+        ],
       ]),
       { searchQuery: "", includeArchived: false },
     );
     render(
-      <RunnerLogRunawayBanner
-        labels={updated?.pages[0].data[0].labels}
-        fallbackLabels={{}}
-      />,
+      <RunnerLogRunawayBanner labels={updated?.pages[0].data[0].labels} fallbackLabels={{}} />,
     );
-    expect(screen.getByTestId("runner-log-runaway-banner")).toHaveTextContent("7 MB in the last hour");
+    expect(screen.getByTestId("runner-log-runaway-banner")).toHaveTextContent(
+      "7 MB in the last hour",
+    );
   });
 
   it("uses the session snapshot when the list row is unavailable", () => {
