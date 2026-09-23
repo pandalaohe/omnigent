@@ -753,6 +753,7 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.session_handoff_store import SessionHandoffStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
@@ -824,6 +825,7 @@ def create_sessions_router(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     feature_flags: FeatureFlags | None = None,
     peer_message_store: PeerMessageStore | None = None,
+    session_handoff_store: SessionHandoffStore | None = None,
     app_state: Any | None = None,
     user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
 ) -> APIRouter:
@@ -893,6 +895,7 @@ def create_sessions_router(
     :param background_title_coordinator: Optional app-owned coordinator for
         semantic title generation after first-turn forwarding. ``None`` disables
         background titles in focused router tests.
+    :param session_handoff_store: Store for durable session hand-off records.
     :param app_state: The owning FastAPI app's ``.state``, threaded to
         ``register_peer_routes`` so it can stash the constructed peer
         sweeper for the lifespan to start/stop. ``None`` in routers built
@@ -999,6 +1002,8 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         feature_flags=feature_flags,
         peer_message_store=peer_message_store,
+        session_handoff_store=session_handoff_store,
+        project_store=project_store,
         app_state=app_state,
     )
 

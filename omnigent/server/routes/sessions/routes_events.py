@@ -276,6 +276,8 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.session_handoff_store import SessionHandoffStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -798,9 +800,15 @@ def register_events_routes(
     runner_tunnel_tokens: frozenset[str] | None = None,
     feature_flags: FeatureFlags | None = None,
     peer_message_store: PeerMessageStore | None = None,
+    session_handoff_store: SessionHandoffStore | None = None,
+    project_store: ProjectStore | None = None,
     app_state: Any | None = None,
 ) -> None:
-    """Register the events, stream, and delete routes on router."""
+    """Register the events, stream, and delete routes on router.
+
+    :param session_handoff_store: Durable hand-off records for the hand-off routes.
+    :param project_store: Project lookups for the hand-off routes.
+    """
 
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
@@ -944,8 +952,15 @@ def register_events_routes(
         body: SessionEventInput,
         *,
         acting_user_id: Any = _ACTING_USER_ID_UNSET,
+        require_init_success: bool = False,
     ) -> dict[str, bool | str | None]:
-        return await _post_event_impl(request, session_id, body, acting_user_id=acting_user_id)
+        return await _post_event_impl(
+            request,
+            session_id,
+            body,
+            acting_user_id=acting_user_id,
+            require_init_success=require_init_success,
+        )
 
     from omnigent.server.routes.sessions.routes_peer import register_peer_routes
 
@@ -971,6 +986,7 @@ def register_events_routes(
         in_flight: contextlib.ExitStack | None = None,
         *,
         acting_user_id: Any = _ACTING_USER_ID_UNSET,
+        require_init_success: bool = False,
     ) -> dict[str, bool | str | None]:
         """
         Submit a session event (input message, tool output,
@@ -2743,7 +2759,7 @@ def register_events_routes(
                             created_by=created_by,
                             host_error_code=host_error_code,
                         )
-                        return {"queued": True, "item_id": item_id}
+                        return {"queued": True, "item_id": item_id, "forwarded": False}
                     relaunched_runner_id = launch_attempt.runner_id
                     relaunched_launch_acknowledged = launch_attempt.acknowledged
                     if launch_attempt.error or launch_attempt.error_code:
@@ -2844,7 +2860,7 @@ def register_events_routes(
                     runner_router,
                     created_by=created_by,
                 )
-                return {"queued": True, "item_id": item_id}
+                return {"queued": True, "item_id": item_id, "forwarded": False}
             # Raise so the Omnigent server doesn't persist an item the
             # harness will never see. Other event paths (interrupt,
             # approval) are best-effort and silently skip when no
@@ -2998,6 +3014,7 @@ def register_events_routes(
                 conversation_store,
                 initializer=getattr(request.app.state, "runner_session_initializer", None),
                 suppress_recovery_turn=True,
+                require_success=require_init_success,
             )
         await _ensure_runner_relay_ready(
             session_id,

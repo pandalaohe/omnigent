@@ -26,6 +26,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.session_handoff_store.sqlalchemy_store import SqlAlchemySessionHandoffStore
 
 
 def _build_app(db_uri: str, tmp_path: Path, *, flag_on: bool, with_store: bool) -> Any:
@@ -33,7 +34,8 @@ def _build_app(db_uri: str, tmp_path: Path, *, flag_on: bool, with_store: bool) 
     flags = resolve_feature_flags(
         {"OMNIGENT_FEATURES": "session_peer_messaging"} if flag_on else {}
     )
-    return create_app(
+    handoff_store = SqlAlchemySessionHandoffStore(db_uri)
+    app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=SqlAlchemyConversationStore(db_uri),
@@ -44,7 +46,10 @@ def _build_app(db_uri: str, tmp_path: Path, *, flag_on: bool, with_store: bool) 
         auth_provider=UnifiedAuthProvider(source="header"),
         feature_flags=flags,
         peer_message_store=SqlAlchemyPeerMessageStore(db_uri) if with_store else None,
+        session_handoff_store=handoff_store,
     )
+    assert app.state.session_handoff_store is handoff_store
+    return app
 
 
 def test_flag_on_with_store_starts_and_stops_sweeper(

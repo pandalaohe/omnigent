@@ -85,7 +85,7 @@ def _build_peer_app(
         return await request_validation_exception_handler(request, exc)
 
     router = APIRouter()
-    register_peer_routes(
+    app.state.peer_send = register_peer_routes(
         router,
         post_event_impl=post_event_impl,
         conversation_store=conversation_store,
@@ -153,6 +153,7 @@ def peer_env(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     perm_store.grant(ALICE, sender.id, LEVEL_OWNER)
     perm_store.grant(ALICE, receiver.id, LEVEL_OWNER)
     fake = _FakePostEvent()
+    post_kwargs: list[dict[str, Any]] = []
     offline_ids: set[str] = set()
     host_online_ids: set[str] = set()
     peer_module._PEER_ADMISSION._pair_sends.clear()
@@ -162,7 +163,7 @@ def peer_env(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def _fake_post_event_impl(
         request: Any, session_id: str, body: Any, **kwargs: Any
     ) -> Any:
-        del kwargs
+        post_kwargs.append(kwargs)
         return await fake(request, session_id, body)
 
     async def _fake_runner_client(
@@ -196,6 +197,7 @@ def peer_env(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return {
         "app": app,
         "fake": fake,
+        "post_kwargs": post_kwargs,
         "offline_ids": offline_ids,
         "host_online_ids": host_online_ids,
         "sender": sender,
@@ -1273,3 +1275,168 @@ async def test_send_denied_for_unrelated_user(
         headers=_headers(BOB, peer_env["sender_token"]),
     )
     assert resp.status_code in (403, 404), resp.text
+
+
+async def test_system_send_bypasses_thread_limit(peer_env: dict[str, Any]) -> None:
+    """A mandatory system message is admitted even when its ref is full."""
+    from omnigent.entities import SessionPeerMessage
+
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+    ref = f"full-{uuid.uuid4().hex}"
+    for index in range(PEER_THREAD_LIMIT):
+        peer_env["peer_store"].create(
+            SessionPeerMessage(
+                id=uuid.uuid4().hex,
+                sender_session_id=sender.id,
+                receiver_session_id=receiver.id,
+                ref=ref,
+                text=f"prior {index}",
+                state="delivered",
+                created_at=1,
+                expires_at=2,
+            )
+        )
+    result = await peer_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text="required result",
+        correlation_id=ref,
+        system=True,
+    )
+    assert result["disposition"] == "delivered"
+
+
+async def test_peer_id_returns_existing_without_delivery(peer_env: dict[str, Any]) -> None:
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+    peer_id = uuid.uuid4().hex
+    send = peer_env["app"].state.peer_send
+    first = await send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text="one",
+        correlation_id=None,
+        peer_id=peer_id,
+        system=True,
+    )
+    second = await send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text="other",
+        correlation_id=None,
+        peer_id=peer_id,
+        system=True,
+    )
+    assert first["peer_id"] == peer_id
+    assert second == {
+        "disposition": "existing",
+        "peer_id": peer_id,
+        "ref": first["ref"],
+        "state": "delivered",
+        "reason": None,
+    }
+    assert len(peer_env["fake"].calls) == 1
+
+
+async def test_deferred_until_sets_queued_expiry(peer_env: dict[str, Any]) -> None:
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+    sessions_module._session_status_cache[receiver.id] = "running"
+    try:
+        expiry = 2_000_000_000
+        result = await peer_env["app"].state.peer_send(
+            sender=sender,
+            receiver_id=receiver.id,
+            text="queued system",
+            correlation_id=None,
+            system=True,
+            deferred_until=expiry,
+        )
+    finally:
+        sessions_module._session_status_cache.pop(receiver.id, None)
+    assert result["disposition"] == "queued"
+    assert peer_env["peer_store"].get(result["peer_id"]).expires_at == expiry
+    peer_env["offline_ids"].add(receiver.id)
+    pending = await peer_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text="offline system",
+        correlation_id=None,
+        system=True,
+        deferred_until=expiry,
+    )
+    assert pending["disposition"] == "pending"
+    assert peer_env["peer_store"].get(pending["peer_id"]).expires_at == expiry
+
+
+async def test_side_chat_receiver_refused(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
+
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+    peer_env["conv_store"].set_labels(receiver.id, {SIDE_CHAT_LABEL_KEY: "true"})
+    response = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": "hello"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert response.json()["reason"] == "side_chat"
+    assert peer_env["fake"].calls == []
+
+
+async def test_not_forwarded_fails_inline(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+    peer_env["fake"].outcome = {"queued": True, "item_id": "failed-item", "forwarded": False}
+    response = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": "failure"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    result = response.json()
+    assert result["disposition"] == "failed"
+    assert result["reason"] == "not_forwarded"
+    assert peer_env["peer_store"].get(result["peer_id"]).state == "failed"
+
+
+async def test_strict_init_failure_rejected(peer_env: dict[str, Any]) -> None:
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+    peer_env["fake"].error = OmnigentError(
+        "The recovered runner did not finish session initialization.",
+        code=ErrorCode.RUNNER_UNAVAILABLE,
+    )
+    result = await peer_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text="strict",
+        correlation_id=None,
+        system=True,
+        require_init_success=True,
+    )
+    assert result["disposition"] == "failed"
+    assert result["reason"].startswith("init_failed: The recovered runner")
+    assert peer_env["peer_store"].get(result["peer_id"]).state == "failed"
+    assert peer_env["post_kwargs"][-1]["require_init_success"] is True
+
+
+async def test_system_uncertain_keeps_delivering(
+    peer_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+    probes = 0
+
+    def _native_at_delivery(_conv: Any) -> bool:
+        nonlocal probes
+        probes += 1
+        return probes >= 3
+
+    monkeypatch.setattr(peer_module, "_is_native_terminal_session", _native_at_delivery)
+    result = await peer_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text="uncertain system",
+        correlation_id=None,
+        system=True,
+    )
+    assert result["disposition"] == "uncertain"
+    assert peer_env["peer_store"].get(result["peer_id"]).state == "delivering"

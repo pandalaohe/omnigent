@@ -39,6 +39,8 @@ from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation
 from omnigent.server.routes.sessions.routes_peer import (
+    _PEER_INBOUND_LABEL,
+    _PEER_INBOUND_REFUSE,
     effective_owner_id,
     format_peer_back_notice,
 )
@@ -112,6 +114,27 @@ class PeerSweeper:
         self._flush_locks: dict[str, asyncio.Lock] = {}
         self._app: Any | None = None
         self._task: asyncio.Task[None] | None = None
+        self._handoff_pass: Callable[[int], Awaitable[None]] | None = None
+
+    def set_handoff_pass(self, fn: Callable[[int], Awaitable[None]] | None) -> None:
+        """Install the hand-off recovery pass run after peer records each tick."""
+        self._handoff_pass = fn
+
+    async def notify_line(
+        self, sender_session_id: str, line: str, *, app: Any | None = None
+    ) -> None:
+        """Post one line through the sender's parked notice queue."""
+        sender = await asyncio.to_thread(
+            self._conversation_store.get_conversation, sender_session_id
+        )
+        if (
+            sender is None
+            or is_session_closed(sender.labels, sender.title)
+            or sender.archived_at is not None
+        ):
+            return
+        self._parked.setdefault(sender.id, []).append(line)
+        await self._maybe_flush(sender, app if app is not None else self._app)
 
     async def start(self, app: Any) -> None:
         """Reconcile crash-orphaned ``delivering`` records, then start the loop."""
@@ -173,6 +196,11 @@ class PeerSweeper:
             except Exception:
                 _logger.exception("Peer sweeper failed to process record %s", record.id)
         await self._reconcile_stale_delivering(now)
+        if self._handoff_pass is not None:
+            try:
+                await self._handoff_pass(now)
+            except Exception:
+                _logger.exception("Peer sweeper hand-off pass failed")
         for sender_id in list(self._parked.keys()):
             if not self._parked.get(sender_id):
                 continue
@@ -208,6 +236,43 @@ class PeerSweeper:
             if moved:
                 await self._notify_for(record, "failed", "closed", receiver_title, self._app)
             return
+        if (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_REFUSE:
+            moved = await asyncio.to_thread(
+                self._store.transition,
+                record.id,
+                "refused_by_user",
+                "receiver_refuses",
+                (record.state,),
+            )
+            if moved:
+                await self._notify_for(
+                    record, "refused_by_user", "receiver_refuses", receiver_title, self._app
+                )
+            return
+        if self._permission_store is not None:
+            sender = await asyncio.to_thread(
+                self._conversation_store.get_conversation, record.sender_session_id
+            )
+            if sender is not None:
+                sender_owner = effective_owner_id(
+                    sender, self._conversation_store, self._permission_store
+                )
+                receiver_owner = effective_owner_id(
+                    receiver, self._conversation_store, self._permission_store
+                )
+                if sender_owner is None or sender_owner != receiver_owner:
+                    moved = await asyncio.to_thread(
+                        self._store.transition,
+                        record.id,
+                        "failed",
+                        "not_same_owner",
+                        (record.state,),
+                    )
+                    if moved:
+                        await self._notify_for(
+                            record, "failed", "not_same_owner", receiver_title, self._app
+                        )
+                    return
         if record.state == "held":
             # Held records only expire (above) or get released by the
             # action route (held -> pending); the sweeper never delivers
@@ -269,10 +334,17 @@ class PeerSweeper:
             # only the closed check above ends a record from here.
             await self._revert_delivering(record, origin_state, reason or "not_ready")
             return
+        if result_state == "rejected":
+            moved = await asyncio.to_thread(
+                self._store.transition, record.id, "failed", reason, ("delivering",)
+            )
+            if moved:
+                await self._notify_for(record, "failed", reason, receiver_title, self._app)
+            return
         if result_state == "uncertain":
             # The runner may have accepted the input despite the lost/absent
-            # confirmation (a lost native forward, or an SDK relaunch refused
-            # with queued:true) — a blind retry would double-deliver. Leave
+            # confirmation (a lost native forward) — a blind retry would
+            # double-deliver. Leave
             # the record in `delivering`; `_reconcile_stale_delivering`
             # settles it once the grace elapses by searching the receiver's
             # transcript for this record's `msg=` marker.
@@ -316,15 +388,6 @@ class PeerSweeper:
         receiver_title: str | None,
         app: Any,
     ) -> None:
-        sender = await asyncio.to_thread(
-            self._conversation_store.get_conversation, record.sender_session_id
-        )
-        if (
-            sender is None
-            or is_session_closed(sender.labels, sender.title)
-            or sender.archived_at is not None
-        ):
-            return
         line = format_peer_back_notice(
             peer_id=record.id,
             receiver_session_id=record.receiver_session_id,
@@ -332,8 +395,7 @@ class PeerSweeper:
             state=state,
             reason=reason,
         )
-        self._parked.setdefault(sender.id, []).append(line)
-        await self._maybe_flush(sender, app)
+        await self.notify_line(record.sender_session_id, line, app=app)
 
     async def _maybe_flush(self, sender: Conversation, app: Any) -> None:
         if not self._parked.get(sender.id):

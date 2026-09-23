@@ -694,3 +694,54 @@ async def test_tick_reconciles_delivering_record_once_grace_elapses() -> None:
     ]
     await h.sweeper._tick()
     assert _row(h.store, record.id).state == "delivered"
+
+
+async def test_rejected_delivery_ends_failed_without_retry(harness: _Harness) -> None:
+    record = harness.seed_record(state="pending")
+    harness.deliver.outcomes["receiver"] = ("rejected", "not_forwarded")
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "failed"
+    assert _row(harness.store, record.id).reason == "not_forwarded"
+    await harness.sweeper._tick()
+    assert len(harness.deliver.calls) == 1
+
+
+async def test_deferred_rechecks_inbound_refuse_even_when_held(harness: _Harness) -> None:
+    record = harness.seed_record(state="held")
+    harness.add_conv(_conv("receiver", labels={"peer_inbound": "refuse"}))
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "refused_by_user"
+    assert _row(harness.store, record.id).reason == "receiver_refuses"
+
+
+async def test_deferred_rechecks_owner(harness: _Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.server import peer_sweeper
+
+    record = harness.seed_record(state="pending")
+    harness.sweeper._permission_store = cast(Any, object())
+    monkeypatch.setattr(peer_sweeper, "effective_owner_id", lambda conv, *_: conv.id)
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "failed"
+    assert _row(harness.store, record.id).reason == "not_same_owner"
+    assert harness.deliver.calls == []
+
+
+async def test_handoff_pass_awaited_and_failure_does_not_stop_tick(harness: _Harness) -> None:
+    observed: list[int] = []
+
+    async def failing_pass(now: int) -> None:
+        observed.append(now)
+        raise RuntimeError("handoff pass failed")
+
+    harness.sweeper.set_handoff_pass(failing_pass)
+    harness.sweeper._parked["sender"] = ["notice after failure"]
+    await harness.sweeper._tick()
+    await harness.sweeper._tick()
+    assert observed == [harness._now, harness._now]
+    assert harness.post_event.calls[0]["text"] == "notice after failure"
+
+
+async def test_notify_line_uses_sender_notice_path(harness: _Harness) -> None:
+    await harness.sweeper.notify_line("sender", "hand-off result ready")
+    assert harness.post_event.calls[0]["session_id"] == "sender"
+    assert harness.post_event.calls[0]["text"] == "hand-off result ready"

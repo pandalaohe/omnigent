@@ -5293,6 +5293,9 @@ async def _auto_create_codex_terminal(
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
+    from omnigent.runner.app import get_session_peer_messaging_enabled
+    from omnigent.runtime.prompt import PEER_SESSION_GRANT
+
     _codex_developer_instructions = (
         "\n\n".join(
             x
@@ -5301,6 +5304,7 @@ async def _auto_create_codex_terminal(
                     agent_spec, global_instructions=global_instructions
                 ),
                 _codex_routing_note,
+                PEER_SESSION_GRANT if get_session_peer_messaging_enabled(session_id) else None,
             ]
             if x
         )

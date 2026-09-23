@@ -2417,6 +2417,69 @@ class SqlAssignmentMessage(OmnigentBase):
     )
 
 
+class SqlSessionHandoff(OmnigentBase):
+    """Durable hand-off between sessions in one workspace."""
+
+    __tablename__ = "session_handoffs"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    sender_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    receiver_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    create_session: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    root: Mapped[str | None] = mapped_column(Text, nullable=True)
+    git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    git_plan: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    brief_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    brief: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    allow_onward: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    parent_handoff_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    disclosure: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    brief_peer_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    result_peer_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    result_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    stop_peer_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    stop_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    lease_until: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    cancel_requested_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reported_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_session_handoffs_owner_state", "workspace_id", "owner_user_id", "state"),
+        Index(
+            "ix_session_handoffs_sender_created", "workspace_id", "sender_session_id", "created_at"
+        ),
+        Index(
+            "ix_session_handoffs_receiver_state", "workspace_id", "receiver_session_id", "state"
+        ),
+        Index("ix_session_handoffs_state_expires", "workspace_id", "state", "expires_at"),
+        Index(
+            "ix_session_handoffs_branch_state",
+            "workspace_id",
+            "host_id",
+            "root",
+            "git_branch",
+            "state",
+            mysql_length={"root": 191},
+        ),
+    )
+
+
 class SqlSessionPeerMessage(OmnigentBase):
     """
     SQLAlchemy model for the ``session_peer_messages`` table.

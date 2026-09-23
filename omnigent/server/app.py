@@ -170,6 +170,7 @@ from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_repository_store import ProjectRepositoryStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.stores.session_handoff_store import SessionHandoffStore
 
 _logger = logging.getLogger(__name__)
 
@@ -1404,6 +1405,7 @@ def create_app(
     project_host_binding_store: ProjectHostBindingStore | None = None,
     assignment_store: AssignmentStore | None = None,
     peer_message_store: PeerMessageStore | None = None,
+    session_handoff_store: SessionHandoffStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1478,6 +1480,7 @@ def create_app(
         records. Wired onto ``app.state`` and into the peer-message
         routes; ``None`` leaves ``POST .../peer-messages`` failing
         with a clear 500.
+    :param session_handoff_store: Store for durable session hand-off records.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -2017,6 +2020,7 @@ def create_app(
     # diagnostics can verify that the production app wires the route
     # and WSTunnelTransport to the same session registry.
     app.state.peer_message_store = peer_message_store
+    app.state.session_handoff_store = session_handoff_store
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.cli_retention_coordinator = cli_retention_coordinator
@@ -3519,6 +3523,7 @@ def create_app(
             background_title_coordinator=background_title_coordinator,
             feature_flags=resolved_feature_flags,
             peer_message_store=peer_message_store,
+            session_handoff_store=session_handoff_store,
             app_state=app.state,
             # Lets the native hook routes read the session owner's
             # approval-timeout setting; absent → defaults.

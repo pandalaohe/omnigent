@@ -39,7 +39,7 @@ from omnigent.runner.resource_registry import (
     CODEX_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, PEER_SESSION_GRANT
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -413,6 +413,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     ],
 )
 @pytest.mark.parametrize("cancel_launch", [False, True])
+@pytest.mark.parametrize("peer_enabled", [False, True])
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -420,6 +421,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     permission_args: list[str],
     retain_subscription: bool,
     cancel_launch: bool,
+    peer_enabled: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -442,6 +444,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     from omnigent.runner import app as runner_app_mod
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
+    monkeypatch.setitem(
+        runner_app_mod._session_peer_messaging_enabled_ref, session_id, peer_enabled
+    )
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -745,6 +750,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["reconcile_process_registry"] is False
     assert build_calls[0]["developer_instructions"] == (
         f"Be a concise, careful coding assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nG"
+        + (f"\n\n{PEER_SESSION_GRANT}" if peer_enabled else "")
     )
     assert len(launched_specs) == 1
     launched = launched_specs[0]
@@ -808,6 +814,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "bridge_dir": bridge_dir,
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
+            "owned_app_server": app_server,
             "client": retained_client if retain_subscription else None,
             "owned_app_server": app_server,
         }

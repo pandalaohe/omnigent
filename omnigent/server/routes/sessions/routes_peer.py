@@ -21,10 +21,11 @@ import re
 import secrets
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
@@ -57,7 +58,7 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
+from omnigent.stores.conversation_store import PROJECT_LABEL_KEY, SIDE_CHAT_LABEL_KEY
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed, title_without_closed_marker
@@ -246,6 +247,26 @@ _PEER_ADMISSION = _PeerAdmission()
 _ACTING_USER_ID_NOT_GIVEN: Any = object()
 
 
+class PeerSend(Protocol):
+    """Internal peer delivery callable returned by route registration."""
+
+    async def __call__(
+        self,
+        *,
+        sender: Conversation,
+        receiver_id: str,
+        text: str,
+        correlation_id: str | None,
+        wait_seconds: int = 0,
+        peer_id: str | None = None,
+        system: bool = False,
+        deferred_until: int | None = None,
+        require_init_success: bool = False,
+        request: Request | None = None,
+        acting_user_id: Any = _ACTING_USER_ID_NOT_GIVEN,
+    ) -> dict[str, Any]: ...
+
+
 def format_peer_back_notice(
     *,
     peer_id: str,
@@ -396,7 +417,7 @@ def register_peer_routes(
     runner_router: RunnerRouter | None = None,
     agent_store: AgentStore | None = None,
     app_state: Any | None = None,
-) -> None:
+) -> PeerSend:
     """Register the peer-messaging routes on the sessions router.
 
     :param router: The sessions router to register on.
@@ -552,6 +573,7 @@ def register_peer_routes(
         text: str,
         *,
         acting_user_id: Any = _ACTING_USER_ID_NOT_GIVEN,
+        require_init_success: bool = False,
     ) -> tuple[str, str | None]:
         """Deliver one peer message via the events path.
 
@@ -560,18 +582,13 @@ def register_peer_routes(
         inline send route and the sweeper both need once they've decided
         to deliver. Shared so inline and deferred delivery are one path.
 
-        A native forward can lose the response after the runner already
-        accepted the input, and an SDK receiver whose relaunch is refused
-        gets back ``{queued: true, ...}`` without anything forwarded — both
-        are UNCERTAIN (something may have landed), not a definite failure, so
-        a caller must never retry one blindly (double delivery). Only
-        ``RUNNER_UNAVAILABLE`` means nothing was forwarded.
+        A native forward can lose its response after the runner accepted
+        the input, so an uncertain result must not be retried blindly.
+        An explicit ``forwarded: false`` is definitive rejection.
 
         :param peer_id: This delivery's own record id, threaded into the
             envelope's ``msg=`` field for restart reconciliation.
-        :returns: ``("delivered", None)``, ``("failed", "offline")`` (nothing
-            forwarded — safe to retry), or ``("uncertain", "not_ready")``
-            (something may have landed — the caller must not retry blindly).
+        :returns: The delivery disposition and its reason, if any.
         """
         native_receiver = await asyncio.to_thread(_is_native_terminal_session, receiver)
         envelope = format_peer_envelope(
@@ -587,6 +604,8 @@ def register_peer_routes(
         kwargs: dict[str, Any] = {}
         if acting_user_id is not _ACTING_USER_ID_NOT_GIVEN:
             kwargs["acting_user_id"] = acting_user_id
+        if require_init_success:
+            kwargs["require_init_success"] = True
         try:
             delivery = await deliver_impl(
                 request,
@@ -601,6 +620,11 @@ def register_peer_routes(
                 **kwargs,
             )
         except OmnigentError as exc:
+            if require_init_success and exc.message in (
+                "The recovered runner did not finish session initialization.",
+                "The runner did not accept this session's saved inference configuration",
+            ):
+                return "rejected", f"init_failed: {exc.message}"
             if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
                 return "failed", "offline"
             _logger.warning(
@@ -616,6 +640,8 @@ def register_peer_routes(
                 extra={"session_id": receiver.id},
             )
             return "uncertain", "not_ready"
+        if isinstance(delivery, dict) and delivery.get("forwarded") is False:
+            return "rejected", "not_forwarded"
         if (
             native_receiver
             and isinstance(delivery, dict)
@@ -637,20 +663,6 @@ def register_peer_routes(
         body: PeerSendRequest,
     ) -> dict[str, Any]:
         """Send a chat-style message from one session to another."""
-        sender_id = body.sender_session_id
-        # Admission runs under the sender's lock and reserves (timestamp +
-        # text hash) before any await on stores or the runner, so two
-        # identical concurrent sends admit exactly once.
-        async with _PEER_ADMISSION._lock_for(sender_id):
-            return await _send_peer_message_locked(request, receiver_id, body)
-
-    async def _send_peer_message_locked(
-        request: Request,
-        receiver_id: str,
-        body: PeerSendRequest,
-    ) -> dict[str, Any]:
-        """Run the send policy chain; caller holds the sender lock."""
-        sender_id = body.sender_session_id
         if not flags.enabled(Feature.SESSION_PEER_MESSAGING):
             return {
                 "disposition": "refused",
@@ -664,10 +676,12 @@ def register_peer_routes(
                 "Peer messaging is not configured on this server",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        sender = await asyncio.to_thread(conversation_store.get_conversation, sender_id)
+        sender = await asyncio.to_thread(
+            conversation_store.get_conversation, body.sender_session_id
+        )
         if sender is None:
             raise OmnigentError(
-                f"Unknown sender session {sender_id!r}",
+                f"Unknown sender session {body.sender_session_id!r}",
                 code=ErrorCode.UNAUTHORIZED,
             )
         if not _runner_authorized_for_sender(request, sender, runner_tunnel_tokens):
@@ -698,10 +712,133 @@ def register_peer_routes(
             await _require_access_and_level(
                 user_id, receiver_id, LEVEL_EDIT, permission_store, conversation_store
             )
+        return await peer_send(
+            sender=sender,
+            receiver_id=receiver_id,
+            text=body.text,
+            correlation_id=body.correlation_id,
+            wait_seconds=body.wait_seconds,
+            request=request,
+        )
+
+    async def peer_send(
+        *,
+        sender: Conversation,
+        receiver_id: str,
+        text: str,
+        correlation_id: str | None,
+        wait_seconds: int = 0,
+        peer_id: str | None = None,
+        system: bool = False,
+        deferred_until: int | None = None,
+        require_init_success: bool = False,
+        request: Request | None = None,
+        acting_user_id: Any = _ACTING_USER_ID_NOT_GIVEN,
+    ) -> dict[str, Any]:
+        """Run S1 policy and delivery with optional system-message controls."""
+        if request is None:
+            from omnigent.server.peer_sweeper import PeerSweeper
+
+            request = PeerSweeper._synthetic_request(receiver_id, app_state)
+        body = PeerSendRequest(
+            sender_session_id=sender.id,
+            text=text,
+            correlation_id=correlation_id,
+            wait_seconds=wait_seconds,
+        )
+        async with _PEER_ADMISSION._lock_for(sender.id):
+            try:
+                return await _send_peer_message_locked(
+                    request,
+                    sender,
+                    receiver_id,
+                    body,
+                    peer_id=peer_id,
+                    system=system,
+                    deferred_until=deferred_until,
+                    require_init_success=require_init_success,
+                    acting_user_id=acting_user_id,
+                )
+            except IntegrityError:
+                if peer_id is None or peer_message_store is None:
+                    raise
+                existing = await asyncio.to_thread(peer_message_store.get, peer_id)
+                if existing is None:
+                    raise
+                return {
+                    "disposition": "existing",
+                    "peer_id": existing.id,
+                    "ref": existing.ref,
+                    "state": existing.state,
+                    "reason": existing.reason,
+                }
+
+    async def _send_peer_message_locked(
+        request: Request,
+        sender: Conversation,
+        receiver_id: str,
+        body: PeerSendRequest,
+        *,
+        peer_id: str | None,
+        system: bool,
+        deferred_until: int | None,
+        require_init_success: bool,
+        acting_user_id: Any,
+    ) -> dict[str, Any]:
+        """Run the send policy chain under the sender lock."""
+        sender_id = sender.id
+        if not flags.enabled(Feature.SESSION_PEER_MESSAGING):
+            return {
+                "disposition": "refused",
+                "reason": "feature_disabled",
+                "peer_id": None,
+                "ref": body.correlation_id or "",
+                "receiver": {"id": receiver_id},
+            }
+        if peer_message_store is None:
+            raise OmnigentError(
+                "Peer messaging is not configured on this server",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        if peer_id is not None:
+            existing = await asyncio.to_thread(peer_message_store.get, peer_id)
+            if existing is not None:
+                return {
+                    "disposition": "existing",
+                    "peer_id": existing.id,
+                    "ref": existing.ref,
+                    "state": existing.state,
+                    "reason": existing.reason,
+                }
+        receiver = await asyncio.to_thread(conversation_store.get_conversation, receiver_id)
+        if receiver is None:
+            raise _session_not_found()
+        if permission_store is not None:
+            sender_owner = await asyncio.to_thread(
+                effective_owner_id, sender, conversation_store, permission_store
+            )
+            receiver_owner = await asyncio.to_thread(
+                effective_owner_id, receiver, conversation_store, permission_store
+            )
+            if sender_owner is None or receiver_owner is None or sender_owner != receiver_owner:
+                return {
+                    "disposition": "refused",
+                    "reason": "not_same_owner",
+                    "peer_id": None,
+                    "ref": body.correlation_id or "",
+                }
         if receiver.parent_conversation_id is not None:
             return {
                 "disposition": "refused",
                 "reason": "is_subagent",
+                "peer_id": None,
+                "ref": body.correlation_id or "",
+                "receiver": _receiver_summary(receiver, runner_online=None),
+            }
+        if SIDE_CHAT_LABEL_KEY in (receiver.labels or {}):
+            return {
+                "disposition": "refused",
+                "reason": "side_chat",
                 "peer_id": None,
                 "ref": body.correlation_id or "",
                 "receiver": _receiver_summary(receiver, runner_online=None),
@@ -715,16 +852,20 @@ def register_peer_routes(
                 "receiver": _receiver_summary(receiver, runner_online=None),
             }
         thread_count = 0
-        if body.correlation_id is not None:
+        if not system and body.correlation_id is not None:
             thread_count = await asyncio.to_thread(
                 peer_message_store.count_for_ref, body.correlation_id
             )
-        verdict = _PEER_ADMISSION.reserve(
-            sender_id,
-            receiver_id,
-            body.text,
-            body.correlation_id,
-            thread_count=thread_count,
+        verdict = (
+            None
+            if system
+            else _PEER_ADMISSION.reserve(
+                sender_id,
+                receiver_id,
+                body.text,
+                body.correlation_id,
+                thread_count=thread_count,
+            )
         )
         if verdict is not None:
             disposition, _, reason = verdict.partition(":")
@@ -735,7 +876,7 @@ def register_peer_routes(
                 "ref": body.correlation_id or "",
                 "receiver": _receiver_summary(receiver, runner_online=None),
             }
-        admitted = True
+        admitted = not system
         terminal_verdict: str | None = None
         record: SessionPeerMessage | None = None
         runner_online: bool | None = None
@@ -765,7 +906,7 @@ def register_peer_routes(
             queued = await asyncio.to_thread(
                 peer_message_store.create,
                 SessionPeerMessage(
-                    id=_new_record_id(body.correlation_id),
+                    id=peer_id or _new_record_id(body.correlation_id),
                     sender_session_id=sender_id,
                     receiver_session_id=receiver_id,
                     ref=ref,
@@ -773,7 +914,7 @@ def register_peer_routes(
                     state="queued",
                     correlation_id=body.correlation_id,
                     created_at=now,
-                    expires_at=now + PEER_QUEUE_LIFETIME,
+                    expires_at=deferred_until or now + PEER_QUEUE_LIFETIME,
                 ),
             )
             return await _queued_response_for_record(queued, runner_online)
@@ -797,7 +938,7 @@ def register_peer_routes(
                 record = await asyncio.to_thread(
                     peer_message_store.create,
                     SessionPeerMessage(
-                        id=_new_record_id(body.correlation_id),
+                        id=peer_id or _new_record_id(body.correlation_id),
                         sender_session_id=sender_id,
                         receiver_session_id=receiver_id,
                         ref=ref,
@@ -805,7 +946,7 @@ def register_peer_routes(
                         state="held",
                         correlation_id=body.correlation_id,
                         created_at=now,
-                        expires_at=now + PEER_HOLD_LIFETIME,
+                        expires_at=deferred_until or now + PEER_HOLD_LIFETIME,
                     ),
                 )
                 reply_to = await _mark_reply_locked(record, body.correlation_id)
@@ -823,13 +964,13 @@ def register_peer_routes(
                 receiver_state, runner_online = await _true_state(receiver)
                 if receiver_state in ("offline", "not_ready"):
                     reason = receiver_state
-                    if body.wait_seconds == 0:
+                    if body.wait_seconds == 0 and deferred_until is None:
                         terminal_verdict = f"failed:{reason}"
                     else:
                         record = await asyncio.to_thread(
                             peer_message_store.create,
                             SessionPeerMessage(
-                                id=_new_record_id(body.correlation_id),
+                                id=peer_id or _new_record_id(body.correlation_id),
                                 sender_session_id=sender_id,
                                 receiver_session_id=receiver_id,
                                 ref=ref,
@@ -838,7 +979,7 @@ def register_peer_routes(
                                 correlation_id=body.correlation_id,
                                 reason=reason,
                                 created_at=now,
-                                expires_at=now + body.wait_seconds,
+                                expires_at=deferred_until or now + body.wait_seconds,
                             ),
                         )
                         reply_to = await _mark_reply_locked(record, body.correlation_id)
@@ -862,7 +1003,7 @@ def register_peer_routes(
             delivering = await asyncio.to_thread(
                 peer_message_store.create,
                 SessionPeerMessage(
-                    id=_new_record_id(body.correlation_id),
+                    id=peer_id or _new_record_id(body.correlation_id),
                     sender_session_id=sender_id,
                     receiver_session_id=receiver_id,
                     ref=ref,
@@ -870,7 +1011,7 @@ def register_peer_routes(
                     state="delivering",
                     correlation_id=body.correlation_id,
                     created_at=now,
-                    expires_at=now + PEER_QUEUE_LIFETIME,
+                    expires_at=deferred_until or now + PEER_QUEUE_LIFETIME,
                 ),
             )
             record = delivering
@@ -890,14 +1031,30 @@ def register_peer_routes(
                 )
                 return await _queued_response_for_record(record, runner_online)
             result_state, reason = await _deliver(
-                request, sender, receiver, record.ref, record.id, body.text
+                request,
+                sender,
+                receiver,
+                record.ref,
+                record.id,
+                body.text,
+                acting_user_id=acting_user_id,
+                require_init_success=require_init_success,
             )
-            # The inline route always reports a terminal outcome to the
-            # sender; only the sweeper's retry needs to distinguish
-            # "uncertain" (native forward may have landed) from a definite
-            # failure, so collapse it onto the existing "failed" disposition
-            # here rather than surface a new one.
-            stored_state = "failed" if result_state == "uncertain" else result_state
+            # System sends keep an uncertain record in delivering so marker
+            # reconciliation can settle a forward that may have landed.
+            stored_state = (
+                "failed"
+                if result_state == "rejected" or (result_state == "uncertain" and not system)
+                else result_state
+            )
+            if stored_state == "uncertain":
+                return {
+                    "disposition": "uncertain",
+                    "reason": reason,
+                    "peer_id": record.id,
+                    "ref": record.ref,
+                    "receiver": _receiver_summary(receiver, runner_online=runner_online),
+                }
             await asyncio.to_thread(
                 peer_message_store.transition,
                 record.id,
@@ -1172,6 +1329,7 @@ def register_peer_routes(
         )
     if app_state is not None:
         app_state.peer_sweeper = sweeper
+    return peer_send
 
 
 __all__ = [
@@ -1183,6 +1341,7 @@ __all__ = [
     "PEER_SENDER_LIMIT",
     "PEER_SENDER_WINDOW_S",
     "PEER_THREAD_LIMIT",
+    "PeerSend",
     "PostEventImpl",
     "effective_owner_id",
     "format_peer_back_notice",
