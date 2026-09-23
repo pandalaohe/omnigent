@@ -460,7 +460,9 @@ async def test_hosts_api_surfaces_configured_harnesses(
     other_app, other_registry, _other_hs, _other_cs = _build_host_api_app(db_uri)
     assert other_registry.get(_HOST_ID) is None
 
-    async with AsyncClient(transport=ASGITransport(app=other_app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=other_app), base_url="http://test"
+    ) as client:
         listing = await client.get("/v1/hosts")
         single = await client.get(f"/v1/hosts/{_HOST_ID}")
 

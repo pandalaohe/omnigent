@@ -24,7 +24,10 @@ const pi = agent("pi-native-ui", "pi-native", "Pi");
 const kiro = agent("kiro-native-ui", "kiro-native", "Kiro");
 const grok = agent("grok", "grok", "Grok Build");
 
-function host(configured: Record<string, boolean | string> | null, status: Host["status"] = "online"): Host {
+function host(
+  configured: Record<string, boolean | string> | null,
+  status: Host["status"] = "online",
+): Host {
   return {
     host_id: "host_1",
     name: "laptop",
@@ -134,7 +137,11 @@ describe("rankHarnessRows", () => {
       "cursor-native": "needs-auth",
       "codex-native": true,
     });
-    const hidden = rank({ entries: [claude, cursor, codex], host: unavailableHost, hideUnconfigured: true });
+    const hidden = rank({
+      entries: [claude, cursor, codex],
+      host: unavailableHost,
+      hideUnconfigured: true,
+    });
     expect([...hidden.primary, ...hidden.more]).not.toContain(cursor);
 
     const selected = rank({

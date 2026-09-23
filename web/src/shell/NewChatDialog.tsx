@@ -1752,7 +1752,14 @@ export function AgentHarnessPicker({
       promotedId: promotedHarnessId,
     });
     return { readyHarnessEntries: primary, moreHarnessEntries: more };
-  }, [harnessEntries, host, recentHarnesses, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
+  }, [
+    harnessEntries,
+    host,
+    recentHarnesses,
+    hideUnconfigured,
+    effectiveAgentId,
+    promotedHarnessId,
+  ]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive

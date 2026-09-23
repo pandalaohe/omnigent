@@ -5188,12 +5188,7 @@ describe("NewChatLandingScreen", () => {
       useHostModelOptionsMock.mock.calls
         .filter(([, harness]) => harness === "claude-native")
         .at(-1),
-    ).toEqual([
-      "host_1",
-      "claude-native",
-      false,
-      { poll: true },
-    ]);
+    ).toEqual(["host_1", "claude-native", false, { poll: true }]);
   });
 
   it("puts the recently launched usable harness first", () => {

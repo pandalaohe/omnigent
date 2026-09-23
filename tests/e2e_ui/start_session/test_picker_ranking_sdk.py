@@ -101,7 +101,8 @@ async def _open_picker(page: Page) -> None:
 
 async def _precedes(first: Locator, second: Locator) -> bool:
     return await first.evaluate(
-        "(node, other) => Boolean(node.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_FOLLOWING)",
+        "(node, other) => Boolean(node.compareDocumentPosition(other)"
+        " & Node.DOCUMENT_POSITION_FOLLOWING)",
         await second.element_handle(),
     )
 
@@ -203,7 +204,8 @@ async def _drive_recency(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
             await page.get_by_test_id("new-chat-landing-submit").click()
             await page.wait_for_function(
-                'JSON.parse(localStorage.getItem("omnigent:recent-harnesses") || "[]")[0] === "opencode-native"'
+                'JSON.parse(localStorage.getItem("omnigent:recent-harnesses") || "[]")[0]'
+                ' === "opencode-native"'
             )
             assert create_bodies and create_bodies[0]["agent_id"] == "ag_opencode_e2e"
 
@@ -240,9 +242,13 @@ async def _drive_unknown(base_url: str, session_id: str) -> None:
                 "(node, other) => node.nextElementSibling === other", await more.element_handle()
             )
             for agent_id in ("ag_claude_e2e", "ag_codex_e2e", "ag_cursor_e2e", "ag_opencode_e2e"):
-                await expect(page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")).to_have_count(0)
+                await expect(
+                    page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
+                ).to_have_count(0)
             await more.click()
             for agent_id in ("ag_claude_e2e", "ag_codex_e2e", "ag_cursor_e2e", "ag_opencode_e2e"):
-                await expect(page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")).to_be_visible()
+                await expect(
+                    page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
+                ).to_be_visible()
         finally:
             await browser.close()
