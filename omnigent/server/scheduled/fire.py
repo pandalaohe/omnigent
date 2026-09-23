@@ -58,9 +58,15 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.sdk_permission_modes import (
+    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODES,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.routes._session_create_validation import (
+    CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
@@ -697,23 +703,22 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
-_PERMISSION_MODE_HARNESS = "claude-native"
-
-
-async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
-    """Derive the native-terminal ``--permission-mode`` args for a task.
+async def _permission_mode_harness(deps: FireDeps, task: ScheduledTask) -> str | None:
+    """Resolve the harness for native launch args or SDK permission labels.
 
     Mirrors how the interactive New Chat dialog builds ``terminal_launch_args``:
     a set permission mode becomes ``["--permission-mode", <value>]``, which the
-    runner appends to Claude Code's argv. ``None`` (agent default) sets nothing.
+    runner appends to Claude Code's argv. SDK modes instead become labels on the
+    session. ``None`` (agent default) sets nothing.
 
     Fail-safe on harness: only Claude Code accepts ``--permission-mode``, so the
     flag is injected ONLY when the task's agent is confirmed ``claude-native``.
     If the harness can't be resolved (no cache / bundle / a load error), the flag
     is omitted rather than injected — a session that just uses the agent's own
-    default is strictly safer than one launched with an unknown flag. This makes
-    the Claude-only guarantee hold regardless of whether the create/update/fire
-    capability gates ran, so a mis-stamped non-Claude row can never break a fire.
+    default is strictly safer than one launched with an unknown flag. The SDK
+    label is likewise omitted without a confirmed matching harness and mode.
+    This guarantee holds regardless of whether the create/update/fire capability
+    gates ran, so a mis-stamped row cannot break a fire or apply a wrong SDK mode.
     """
     if task.permission_mode is None:
         return None
@@ -731,19 +736,17 @@ async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> l
         harness = canonicalize_harness(raw_harness) or raw_harness
     except Exception:
         _logger.exception(
-            "scheduled fire: could not resolve harness for task %s; omitting --permission-mode",
+            "scheduled fire: could not resolve harness for task %s; omitting permission mode",
             task.id,
         )
         return None
-    if harness != _PERMISSION_MODE_HARNESS:
-        return None
-    return ["--permission-mode", task.permission_mode]
+    return harness
 
 
 async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
     """Read ``executor.reasoning_effort`` from the task's agent spec.
 
-    Fail-safe like :func:`_permission_mode_launch_args`: a task with no explicit
+    Fail-safe like :func:`_permission_mode_harness`: a task with no explicit
     effort inherits the spec default, and any load failure yields ``None`` (the
     harness default) rather than breaking the fire. The spec value is validated
     at spec load, so it needs no re-validation here.
@@ -822,13 +825,20 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
+    harness = await _permission_mode_harness(deps, task)
+    permission_mode = task.permission_mode
+    launch_args = (
+        ["--permission-mode", permission_mode]
+        if harness == "claude-native" and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
+        else None
+    )
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
-        terminal_launch_args=await _permission_mode_launch_args(deps, task),
+        terminal_launch_args=launch_args,
     )
     reasoning_effort = task.reasoning_effort
     if reasoning_effort is None:
@@ -848,6 +858,18 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     # the override reload above) so the labels land on the conversation returned
     # to the launch/dispatch caller, not a stale pre-label reload of it.
     labels = await _presentation_labels(deps, task)
+    if (
+        harness == "claude-sdk"
+        and permission_mode is not None
+        and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
+    ):
+        labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = permission_mode
+    elif (
+        harness == "codex"
+        and permission_mode is not None
+        and permission_mode in CODEX_SDK_APPROVAL_MODES
+    ):
+        labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = permission_mode
     if labels:
         await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
         conv.labels.update(labels)
@@ -1001,9 +1023,10 @@ async def _validate_fire_session_inputs(
         )
         validate_session_permission_mode(task.permission_mode)
         # NB: the harness gate for permission_mode is enforced fail-safe in
-        # _permission_mode_launch_args (the flag is injected only for a confirmed
-        # claude-native agent), so a mis-stamped non-Claude row degrades to "no
-        # flag" rather than failing the whole fire here.
+        # _permission_mode_harness and _create_session (the flag is injected only
+        # for a confirmed claude-native agent, while SDK labels require a matching
+        # harness and vocabulary), so a mis-stamped row degrades to no override
+        # rather than failing the whole fire here.
         if validate_workspace:
             if task.host_id is None or task.workspace is None:
                 return (

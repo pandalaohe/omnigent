@@ -25,8 +25,7 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
-// dropdown source). Returning no data makes it fall back to the static Claude
-// alias list, which is what a no-host-pinned scheduled task uses anyway.
+// dropdown source). Returning no data leaves no-host Claude aliases available.
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: undefined })),
@@ -116,6 +115,22 @@ vi.mock("@/shell/NewChatDialog", () => ({
       >
         pick polly
       </button>
+      <button
+        type="button"
+        data-testid="pick-agent-codex"
+        onClick={() =>
+          onSelectAgent({
+            id: "ag_codex",
+            name: "codex-agent",
+            display_name: "Codex agent",
+            description: null,
+            harness: "codex",
+            skills: [],
+          })
+        }
+      >
+        pick codex agent
+      </button>
       <button type="button" data-testid="picker-open" onClick={() => onOpenChange?.(true)}>
         open
       </button>
@@ -127,7 +142,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
 }));
 
 // nativeAgentHasCapability(claude-native, "permissionMode") must be true so the
-// model/effort knobs map onto the payload; polly (claude-sdk) has no knobs.
+// model/effort knobs map onto the payload; Polly has no native capability.
 vi.mock("@/lib/nativeCodingAgents", async (orig) => {
   const actual = await orig<typeof NativeCodingAgentsModule>();
   return {
@@ -155,6 +170,14 @@ const AGENTS: AvailableAgent[] = [
     harness: "claude-native",
     skills: [],
   },
+  {
+    id: "ag_codex",
+    name: "codex-agent",
+    display_name: "Codex agent",
+    description: null,
+    harness: "codex",
+    skills: [],
+  },
 ];
 
 const mutateAsync = vi.fn();
@@ -163,6 +186,9 @@ const updateMutateAsync = vi.fn();
 beforeEach(() => {
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
+  vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({
+    data: undefined,
+  } as ReturnType<typeof hostsHook.useHostModelOptions>);
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
     data: AGENTS,
   } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
@@ -284,7 +310,7 @@ describe("agent picker readiness (needs-setup badges)", () => {
 
     const picker = screen.getByTestId("agent-picker-stub");
     expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui,jcode,grok");
-    expect(picker).toHaveAttribute("data-agent-entries", "polly");
+    expect(picker).toHaveAttribute("data-agent-entries", "polly,codex-agent");
   });
 });
 
@@ -457,6 +483,9 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         prompt: "Updated prompt",
         rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=30",
         timezone: "America/Los_Angeles",
+        modelOverride: null,
+        reasoningEffort: null,
+        permissionMode: null,
       },
     });
   });
@@ -861,20 +890,97 @@ describe("CreateScheduledTaskDialog submit", () => {
 });
 
 describe("CreateScheduledTaskDialog model + effort controls", () => {
-  it("renders model + effort for a capable (Claude-native) agent, hides them for a plain agent", () => {
+  it("renders model, effort, and permission for Claude native and SDK agents", async () => {
     renderDialog();
-    // Default effective agent is the capable claude-native harness → controls show.
     expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
 
-    // Switch to Polly (claude-sdk, no permissionMode capability) → controls hide.
     fireEvent.click(screen.getByTestId("pick-agent-polly"));
-    expect(screen.queryByTestId("task-model-effort-field")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
-    // The "uses defaults" hint returns when the controls are hidden.
-    expect(
-      screen.getByText("Uses this agent's default model, effort, and permission settings"),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("task-model-trigger")).toBeInTheDocument();
+    expect(screen.getByTestId("task-effort-trigger")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Bypass permissions" })).toBeInTheDocument();
+  });
+
+  it("shows Codex SDK presets and only default model and effort without a host", async () => {
+    renderDialog();
+    fireEvent.click(screen.getByTestId("pick-agent-codex"));
+    expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    expect(await screen.findAllByRole("option")).toHaveLength(1);
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    expect(await screen.findAllByRole("option")).toHaveLength(1);
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Agent default" })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "Default" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("option", { name: "Read only" }));
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("read-only");
+  });
+
+  it("shows saved Codex model and effort when no host catalog is available", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_codex",
+          modelOverride: "gpt-5.5",
+          reasoningEffort: "xhigh",
+        })}
+      />,
+    );
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("gpt-5.5");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("xHigh");
+  });
+
+  it("uses pinned host Codex SDK model rows and their effort levels", async () => {
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "model-one",
+          displayName: "Model One",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+        },
+        {
+          id: "model-two",
+          displayName: "Model Two",
+          supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+        },
+      ],
+    } as ReturnType<typeof hostsHook.useHostModelOptions>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_codex",
+          hostId: "host_1",
+          modelOverride: "model-one",
+          reasoningEffort: "high",
+        })}
+      />,
+    );
+    expect(hostsHook.useHostModelOptions).toHaveBeenCalledWith("host_1", "codex", true);
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model One");
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "High" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Model Two" }));
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Default");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      modelOverride: "model-two",
+      reasoningEffort: null,
+    });
   });
 
   it("sends the selected model + effort on create for a capable agent", async () => {
@@ -898,6 +1004,49 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(arg.modelOverride).toBe("opus");
     expect(arg.reasoningEffort).toBe("high");
     expect(arg.permissionMode).toBe("acceptEdits");
+  });
+
+  it("sends Claude SDK model, effort, and permission on create", async () => {
+    renderDialog();
+    fireEvent.click(screen.getByTestId("pick-agent-polly"));
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Bypass permissions" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+      modelOverride: "opus",
+      reasoningEffort: "high",
+      permissionMode: "bypassPermissions",
+    });
+  });
+
+  it("sends Claude SDK model, effort, and permission on update", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_1",
+          modelOverride: "opus",
+          reasoningEffort: "high",
+          permissionMode: "bypassPermissions",
+        })}
+      />,
+    );
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      modelOverride: "opus",
+      reasoningEffort: "high",
+      permissionMode: "bypassPermissions",
+    });
   });
 
   it("omits model + effort + permission on create when left at Default", async () => {

@@ -7,15 +7,14 @@
 // disproportionate for a saved scheduled task). It reuses the SHARED source of
 // truth for the option lists: CLAUDE_NATIVE_MODELS (the version-agnostic model
 // aliases) and CLAUDE_NATIVE_EFFORTS + the MODEL_SELECT_DEFAULT /
-// EFFORT_SELECT_NONE sentinels from HarnessConfigControls, so the choices never
-// drift from the interactive dialog.
+// EFFORT_SELECT_NONE sentinels from HarnessConfigControls for Claude, and the
+// selected host's catalog for Codex SDK, so choices stay in step with New Chat.
 //
 // The parent gates rendering on the selected agent's capability
-// (nativeAgentHasCapability(agent, "permissionMode") — the Claude-native flag
-// that also carries the model/effort surface), exactly like interactive. Both
-// controls default to "unselected" ("" = agent default), which the parent omits
-// from the create/update body so the fire path uses the agent's configured
-// model + effort.
+// (nativeAgentHasCapability(agent, "permissionMode") for Claude native) or its
+// SDK harness (Claude SDK / Codex SDK), exactly like interactive. Both controls
+// default to "unselected" ("" = agent default), which the parent omits from the
+// create/update body so the fire path uses the agent's configured model + effort.
 
 import { Label } from "@/components/scheduled/Label";
 import {
@@ -32,6 +31,9 @@ import {
 } from "@/components/HarnessConfigControls";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { CLAUDE_NATIVE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
+import { normalizeEffortLabel } from "@/lib/composerModelLabel";
+import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
+import { sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import { useHostModelOptions } from "@/hooks/useHosts";
 
 /** Sentinel Select value for "no permission override" (use the agent default).
@@ -43,6 +45,7 @@ export function ModelEffortFields({
   model,
   effort,
   permissionMode,
+  harness,
   hostId,
   onModelChange,
   onEffortChange,
@@ -55,6 +58,7 @@ export function ModelEffortFields({
   effort: string;
   /** Selected permission mode, or "" = agent default (nothing overridden). */
   permissionMode: string;
+  harness: "claude-native" | "claude-sdk" | "codex";
   /** Pinned host id, or "" when unset (task resolves a host at fire time). */
   hostId: string;
   onModelChange: (model: string) => void;
@@ -67,16 +71,37 @@ export function ModelEffortFields({
   // When a host is pinned, use its live-resolved model options (mirrors the
   // interactive dialog on a connected host). With no host pinned — the common
   // case, since scheduled tasks resolve a host at fire time — fall back to the
-  // static Claude aliases so the picker is always populated.
+  // static Claude aliases so the picker is always populated for Claude. Codex
+  // has no static list; a saved choice remains visible until a host resolves it.
   const { data: hostModelOptions } = useHostModelOptions(
     hostId === "" ? null : hostId,
-    "claude-native",
+    harness,
     hostId !== "",
   );
+  const rows = hostId === "" ? [] : (hostModelOptions ?? []);
   const modelOptions =
-    hostModelOptions && hostModelOptions.length > 0
-      ? hostModelOptions.map((o) => ({ id: o.id, label: o.displayName ?? o.id }))
-      : CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }));
+    rows.length > 0
+      ? rows.map((o) => ({ id: o.id, label: o.displayName ?? o.id }))
+      : harness === "codex"
+        ? []
+        : CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }));
+  if (model !== "" && !modelOptions.some((option) => option.id === model)) {
+    modelOptions.push({ id: model, label: model });
+  }
+  const levels = effortLevelsFor(harness, rows, model);
+  const effortOptions =
+    harness === "codex"
+      ? (levels ?? []).map((value) => ({ value, label: normalizeEffortLabel(value) }))
+      : levels === null
+        ? [...CLAUDE_NATIVE_EFFORTS]
+        : CLAUDE_NATIVE_EFFORTS.filter((option) => levels.includes(option.value));
+  if (effort !== "" && !effortOptions.some((option) => option.value === effort)) {
+    effortOptions.push({ value: effort, label: normalizeEffortLabel(effort) });
+  }
+  const permissionOptions =
+    harness === "claude-native"
+      ? CLAUDE_NATIVE_PERMISSION_MODES
+      : (sdkPermissionOptions(harness) ?? []);
 
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
@@ -87,7 +112,15 @@ export function ModelEffortFields({
             value={model === "" ? MODEL_SELECT_DEFAULT : model}
             componentId="tasks.scheduled.model"
             valueHasNoPii
-            onValueChange={(v) => onModelChange(v === MODEL_SELECT_DEFAULT ? "" : v)}
+            onValueChange={(v) => {
+              const nextModel = v === MODEL_SELECT_DEFAULT ? "" : v;
+              onModelChange(nextModel);
+              if (harness === "codex" && effort !== "") {
+                onEffortChange(
+                  reconcileEffortOnModelChange(harness, rows, nextModel, effort) ?? "",
+                );
+              }
+            }}
             onOpenChange={onSelectOpenChange}
           >
             <SelectTrigger id="task-model" data-testid="task-model-trigger" className="w-full">
@@ -126,7 +159,7 @@ export function ModelEffortFields({
               className="w-(--radix-select-trigger-width)"
             >
               <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-              {CLAUDE_NATIVE_EFFORTS.map((e) => (
+              {effortOptions.map((e) => (
                 <SelectItem key={e.value} value={e.value}>
                   {e.label}
                 </SelectItem>
@@ -157,8 +190,10 @@ export function ModelEffortFields({
             align="start"
             className="w-(--radix-select-trigger-width)"
           >
-            <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
-            {CLAUDE_NATIVE_PERMISSION_MODES.map((m) => (
+            <SelectItem value={PERMISSION_SELECT_DEFAULT}>
+              {harness === "codex" ? "Agent default" : "Default"}
+            </SelectItem>
+            {permissionOptions.map((m) => (
               <SelectItem key={m.value} value={m.value}>
                 {m.label}
               </SelectItem>

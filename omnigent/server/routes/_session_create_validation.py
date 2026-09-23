@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.sdk_permission_modes import CODEX_SDK_APPROVAL_MODES
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.project_placement import (
@@ -177,26 +178,24 @@ CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
 )
 
 
-# The only harness that accepts a ``--permission-mode`` launch arg — the same
-# ``permissionMode`` capability the web dialog gates its permission control on.
-# Other native CLIs (codex / cursor / …) use different flags, so injecting
-# ``--permission-mode`` there would be an unknown flag that breaks the launch.
-_PERMISSION_MODE_HARNESS = "claude-native"
-
-
+# Only claude-native accepts the ``--permission-mode`` launch arg; SDK harnesses
+# carry matching permission modes as labels. Other native CLIs (codex / cursor /
+# …) use different flags, so injecting ``--permission-mode`` there would be an
+# unknown flag that breaks the launch.
 async def validate_permission_mode_agent_support(
     *,
     permission_mode: str | None,
     agent: Any,
     agent_cache: AgentCache | None,
 ) -> None:
-    """Reject a ``permission_mode`` on an agent whose harness has no such flag.
+    """Reject a ``permission_mode`` unsupported by the agent's harness.
 
     Mirrors the web dialog's capability gate on the server so the REST endpoint
-    and agent tools enforce the same rule the UI does: only a ``claude-native``
-    agent may carry a ``permission_mode``. Without this, a task on a codex /
-    cursor agent could persist a mode the fire path would inject as an unknown
-    ``--permission-mode`` flag, breaking the launch.
+    and agent tools enforce the same rule the UI does: ``claude-native`` and
+    ``claude-sdk`` agents use the Claude launch vocabulary, while ``codex`` SDK
+    agents use approval presets. Without this, a task on a codex / cursor agent
+    could persist a mode that would be an unknown ``--permission-mode`` flag on
+    that native CLI; a mismatched SDK mode would have no valid label semantics.
 
     This is an early, friendly 4xx at persist time. A ``None`` mode is always
     allowed (nothing to gate). When the harness cannot be resolved (no bundle /
@@ -204,7 +203,8 @@ async def validate_permission_mode_agent_support(
     already passed the vocabulary allowlist, and the fire path's launch-arg
     derivation is itself harness-gated fail-safe (it injects ``--permission-mode``
     ONLY for a confirmed ``claude-native`` agent, omitting it otherwise), so a
-    non-Claude mode can never actually reach the launch args regardless.
+    non-Claude mode can never actually reach the launch args regardless. SDK
+    labels are stamped only for a confirmed harness and matching vocabulary.
     """
     if permission_mode is None or agent is None:
         return
@@ -224,10 +224,18 @@ async def validate_permission_mode_agent_support(
         # don't turn an unrelated load error into a permission_mode rejection.
         _logger.exception("Failed to load agent spec for permission_mode gating")
         return
-    if harness != _PERMISSION_MODE_HARNESS:
+    if harness is None:
+        return
+    modes = (
+        CODEX_SDK_APPROVAL_MODES
+        if harness == "codex"
+        else CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
+        if harness in ("claude-native", "claude-sdk")
+        else frozenset()
+    )
+    if permission_mode not in modes:
         raise OmnigentError(
-            f"permission_mode is only supported for {_PERMISSION_MODE_HARNESS} agents, "
-            f"not {harness!r}",
+            f"permission_mode {permission_mode!r} is not supported for {harness!r} agents",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -237,16 +245,18 @@ def validate_session_permission_mode(permission_mode: str | None) -> str | None:
 
     A scheduled task fires a fresh native session each run, so the whole launch
     vocabulary is allowed (including the launch-only ``dontAsk`` /
-    ``bypassPermissions``). The value reaches the native CLI as the
-    ``--permission-mode`` argv element the fire path derives, so reject anything
-    outside the known set before a row persists it.
+    ``bypassPermissions``). For Claude native, the value reaches the native CLI
+    as the ``--permission-mode`` argv element the fire path derives; Claude SDK
+    uses the same vocabulary in a session label, and Codex SDK accepts its own
+    approval presets. Reject anything outside these known sets before a row
+    persists it; the resolved harness is checked separately.
     """
     if permission_mode is None:
         return None
-    if permission_mode not in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES:
+    allowed = CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES | CODEX_SDK_APPROVAL_MODES
+    if permission_mode not in allowed:
         raise OmnigentError(
-            f"invalid permission_mode: {permission_mode!r} (expected one of "
-            f"{sorted(CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES)})",
+            f"invalid permission_mode: {permission_mode!r} (expected one of {sorted(allowed)})",
             code=ErrorCode.INVALID_INPUT,
         )
     return permission_mode

@@ -92,15 +92,17 @@ export function CreateScheduledTaskDialog({
   // `*-native-ui` agent's id, exactly what the interactive dialog sends.
   //
   // Scheduled tasks create sessions from the selected agent. Model + effort are
-  // offered for native coding agents that support them (see `showModelEffort`
-  // below), reusing lightweight scheduled-local pickers rather than the
-  // interactive dialog's 26-prop HarnessConfigModal (bound to smart-routing /
-  // cost-control / per-turn model loading — disproportionate for a saved task).
+  // offered for native coding agents and SDK agents that support them (see
+  // `showModelEffort` below), reusing lightweight scheduled-local pickers rather
+  // than the interactive dialog's 26-prop HarnessConfigModal (bound to
+  // smart-routing / cost-control / per-turn model loading — disproportionate
+  // for a saved task).
   // "" = unselected → `model_override` / `reasoning_effort` / `permission_mode`
   // are omitted so the fire path uses the agent's configured defaults. Permission
-  // mode is offered for native coding agents that support it (Claude Code); each
-  // fire launches a fresh session, so the whole launch vocabulary is valid —
-  // including the launch-only `dontAsk` / `bypassPermissions`.
+  // mode is offered for Claude Code, Claude SDK, and Codex SDK agents; each fire
+  // launches a fresh session, so the whole Claude launch vocabulary is valid —
+  // including the launch-only `dontAsk` / `bypassPermissions` — while Codex SDK
+  // uses its approval presets.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
@@ -139,8 +141,8 @@ export function CreateScheduledTaskDialog({
   function handleSelectAgent(agent: AvailableAgent) {
     setPickedAgentId(agent.id);
     // Keep the per-agent settings in step with the pick: they don't transfer
-    // across harnesses (a model id is provider-bound; permission mode is
-    // Claude-only), so a switch drops them, mirroring the server's clear on a
+    // across harnesses (model ids and permission vocabularies are harness-bound),
+    // so a switch drops them, mirroring the server's clear on a
     // rebind. Landing back on the task's own agent is NOT a switch, so restore
     // the values the dialog opened with — otherwise re-picking the current agent
     // (or switching away and back) would wipe them with no rebind to justify it.
@@ -152,13 +154,19 @@ export function CreateScheduledTaskDialog({
 
   // Model + effort are surfaced only for native coding agents that carry the
   // model/effort surface — the same `permissionMode` capability the interactive
-  // dialog gates its Model/Effort/Permissions block on (Claude Code). Agents
-  // without it (plain SDK agents like Polly, or native harnesses with no
+  // dialog gates its Model/Effort/Permissions block on (Claude Code) — and for
+  // Claude SDK and Codex SDK agents. Agents without it (native harnesses with no
   // model-picker surface) show no model/effort controls, exactly like
   // interactive. Resolved from the full agent list so a task bound to an agent
   // the picker hides still gates on its real capabilities.
   const modelEffortAgent = agents?.find((a) => a.id === effectiveAgentId);
-  const showModelEffort = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
+  const nativePermissionMode = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
+  const modelEffortHarness: "claude-native" | "claude-sdk" | "codex" | null = nativePermissionMode
+    ? "claude-native"
+    : modelEffortAgent?.harness === "claude-sdk" || modelEffortAgent?.harness === "codex"
+      ? modelEffortAgent.harness
+      : null;
+  const showModelEffort = modelEffortHarness !== null;
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
   // The agent picker and host/schedule Selects portal dropdowns OUTSIDE DialogContent.
@@ -491,12 +499,14 @@ export function CreateScheduledTaskDialog({
             )}
           </div>
 
-          {/* Model + reasoning effort + permission mode — only for native
-              coding agents that carry the model/effort surface (Claude Code).
-              Unselected controls fall back to the agent's configured defaults. */}
+          {/* Model + reasoning effort + permission mode — for native coding
+              agents that carry the model/effort surface (Claude Code) and
+              Claude SDK / Codex SDK agents. Unselected controls fall back to
+              the agent's configured defaults. */}
           {showModelEffort && (
             <div data-testid="task-model-effort-field">
               <ModelEffortFields
+                harness={modelEffortHarness}
                 model={pickedModel}
                 effort={pickedEffort}
                 permissionMode={pickedPermission}
@@ -507,9 +517,10 @@ export function CreateScheduledTaskDialog({
                 onSelectOpenChange={handleSelectOpenChange}
               />
               <p className="mt-1.5 text-sm text-muted-foreground">
-                Leave on Default to use the agent&apos;s configured model, effort, and permission
-                mode. Automations run unattended, so a prompting mode (Manual or Plan) will wait for
-                approval that never comes.
+                Leave these controls on their defaults to use the agent&apos;s configured model,
+                effort, and permission mode. Automations run unattended, so prompting modes (Manual
+                or Plan for Claude; Default or Read only for Codex SDK) will wait for approval that
+                never comes.
               </p>
             </div>
           )}

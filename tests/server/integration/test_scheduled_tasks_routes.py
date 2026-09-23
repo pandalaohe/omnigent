@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -347,6 +349,52 @@ async def test_create_rejects_invalid_permission_mode(
     assert resp.status_code == 400, resp.text
 
 
+@pytest.mark.parametrize(
+    ("harness", "permission_mode", "status"),
+    [
+        ("claude-sdk", "bypassPermissions", 200),
+        ("codex", "read-only", 200),
+        ("codex", "acceptEdits", 400),
+        ("claude-native", "read-only", 400),
+        (None, "read-only", 200),
+    ],
+)
+async def test_permission_mode_matches_scheduled_agent_harness(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+    permission_mode: str,
+    status: int,
+) -> None:
+    _make_user(db_uri)
+    agent_id = builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+    if harness != "claude-native":
+        agent_id = uuid4().hex
+        SqlAlchemyAgentStore(db_uri).create(agent_id, f"test-{harness}", "test/bundle")
+        executor = SimpleNamespace(type=harness, config={"harness": harness})
+        loaded = SimpleNamespace(spec=SimpleNamespace(executor=executor))
+        monkeypatch.setattr(AgentCache, "load", lambda *_: loaded)
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            agent_id=agent_id,
+            permission_mode=permission_mode,
+            model_override="model-one",
+            reasoning_effort="high",
+        ),
+        headers=_headers(),
+    )
+    assert resp.status_code == status, resp.text
+    if status == 200:
+        assert resp.json()["permission_mode"] == permission_mode
+        assert resp.json()["model_override"] == "model-one"
+        assert resp.json()["reasoning_effort"] == "high"
+    else:
+        assert harness is not None and harness in resp.text
+
+
 async def test_create_rejects_relative_workspace(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -624,9 +672,8 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
 ) -> None:
     """A switch drops per-agent settings the new harness can't use.
 
-    ``permission_mode`` is a Claude-only flag and a model id is provider-bound,
-    so carrying them onto a codex task would break the fire with an unknown
-    ``--permission-mode`` / a model its CLI has never heard of.
+    The stored Claude mode and model are not valid for codex-native, so a
+    rebind clears both before that harness fires.
     """
     from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
@@ -731,7 +778,7 @@ async def test_update_agent_switch_keeps_settings_resent_in_the_same_patch(
 async def test_update_agent_switch_gates_permission_mode_on_the_new_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """A Claude-only mode sent with a switch to codex is rejected, not persisted."""
+    """A Claude launch mode sent with a switch to codex-native is rejected."""
     from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
@@ -787,13 +834,10 @@ async def test_update_rejects_null_agent(auth_client: httpx.AsyncClient, db_uri:
 async def test_create_rejects_permission_mode_for_non_claude_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """A valid mode on a non-Claude agent is rejected (server capability gate).
+    """A Claude mode on a codex-native agent is rejected.
 
-    The web dialog only shows the permission control for Claude Code; the server
-    enforces the same gate so a codex/cursor/etc. task can't persist a mode the
-    fire path would inject as an unknown ``--permission-mode`` flag. The value
-    itself is a valid Claude mode — the rejection is purely about the agent's
-    harness.
+    The value is valid for Claude, but codex-native has no matching launch
+    flag or SDK label; the rejection depends on the bound harness.
     """
     from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 

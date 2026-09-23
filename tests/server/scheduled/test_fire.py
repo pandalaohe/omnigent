@@ -542,6 +542,48 @@ async def test_permission_mode_becomes_terminal_launch_args() -> None:
 
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["terminal_launch_args"] == ["--permission-mode", "acceptEdits"]
+    assert (
+        conv_store.label_writes.get("conv_1", {}).get("omnigent.claude_sdk.permission_mode")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "permission_mode", "label_key"),
+    [
+        ("claude-sdk", "bypassPermissions", "omnigent.claude_sdk.permission_mode"),
+        ("codex", "read-only", "omnigent.codex_sdk.approval_mode"),
+    ],
+)
+async def test_sdk_permission_mode_stamped_on_fired_session(
+    harness: str, permission_mode: str, label_key: str
+) -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                permission_mode=permission_mode,
+                model_override="model-one",
+                reasoning_effort="high",
+            )
+        }
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness=harness),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["terminal_launch_args"] is None
+    assert conv_store.label_writes["conv_1"][label_key] == permission_mode
+    assert conv_store.updated[0]["model_override"] == "model-one"
+    assert conv_store.updated[0]["reasoning_effort"] == "high"
 
 
 @pytest.mark.asyncio
@@ -565,21 +607,26 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 
 
 @pytest.mark.asyncio
-async def test_permission_mode_omitted_for_non_claude_agent() -> None:
-    """A mis-stamped non-Claude row degrades to no --permission-mode flag.
+@pytest.mark.parametrize(
+    ("harness", "permission_mode"),
+    [("codex-native", "bypassPermissions"), ("codex", "acceptEdits")],
+)
+async def test_permission_mode_omitted_for_non_claude_agent(
+    harness: str, permission_mode: str
+) -> None:
+    """A mode with the wrong harness vocabulary reaches neither flag nor label.
 
-    The injection is harness-gated fail-safe: even if a permission_mode somehow
-    persisted on a codex/cursor task, the fire must NOT inject the unknown flag
-    (which would break the launch) — it launches with the agent's own default.
+    A stale or mis-stamped row cannot break a native CLI or override an SDK's
+    permission preset with a value that harness does not support.
     """
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=permission_mode)})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _claude_agent_deps(store, conv_store, harness="codex-native"),
+        _claude_agent_deps(store, conv_store, harness=harness),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -587,6 +634,7 @@ async def test_permission_mode_omitted_for_non_claude_agent() -> None:
 
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["terminal_launch_args"] is None
+    assert "omnigent.codex_sdk.approval_mode" not in conv_store.label_writes.get("conv_1", {})
 
 
 def _effort_agent_deps(
