@@ -964,7 +964,7 @@ def register_events_routes(
 
     from omnigent.server.routes.sessions.routes_peer import register_peer_routes
 
-    register_peer_routes(
+    peer = register_peer_routes(
         router,
         post_event_impl=_peer_post_event,
         conversation_store=conversation_store,
@@ -976,6 +976,27 @@ def register_events_routes(
         peer_message_store=peer_message_store,
         runner_router=runner_router,
         agent_store=agent_store,
+        app_state=app_state,
+    )
+    from omnigent.server.routes.sessions.routes_handoff import register_handoff_routes
+
+    register_handoff_routes(
+        router,
+        peer=peer,
+        handoff_store=session_handoff_store,
+        project_store=project_store,
+        conversation_store=conversation_store,
+        agent_store=agent_store,
+        runner_router=runner_router,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+        runner_tunnel_tokens=runner_tunnel_tokens,
+        feature_flags=feature_flags,
+        host_registry=host_registry,
+        agent_cache=agent_cache,
+        file_store=file_store,
+        artifact_store=artifact_store,
+        background_title_coordinator=background_title_coordinator,
         app_state=app_state,
     )
 

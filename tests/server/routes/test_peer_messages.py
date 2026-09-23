@@ -98,7 +98,7 @@ def _build_peer_app(
         runner_router=None,
         agent_store=agent_store,
         app_state=app.state,
-    )
+    ).send
     app.include_router(router, prefix="/v1")
     return app
 

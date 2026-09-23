@@ -713,6 +713,37 @@ async def test_patch_rejects_client_supplied_sandbox_labels(
         assert key not in conv.labels
 
 
+async def test_json_create_rejects_handoff_label(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="handoff-label-agent", bundle_location="test:///bundle")
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_id, "labels": {"omnigent.handoff.id": "forged"}},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_input"
+
+
+async def test_patch_rejects_handoff_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    response = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.handoff.future": "forged"}},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_input"
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert "omnigent.handoff.future" not in conv.labels
+
+
 async def test_patch_rejects_client_supplied_side_chat_thread_id_label(
     client: httpx.AsyncClient,
     session_id: str,

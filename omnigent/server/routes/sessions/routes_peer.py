@@ -20,8 +20,8 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import Callable
-from typing import Any, Protocol
+from collections.abc import Awaitable, Callable
+from typing import Any, NamedTuple, Protocol
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -267,6 +267,11 @@ class PeerSend(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class PeerRoutes(NamedTuple):
+    send: PeerSend
+    true_state: Callable[[Conversation], Awaitable[tuple[str, bool | None]]]
+
+
 def format_peer_back_notice(
     *,
     peer_id: str,
@@ -417,7 +422,7 @@ def register_peer_routes(
     runner_router: RunnerRouter | None = None,
     agent_store: AgentStore | None = None,
     app_state: Any | None = None,
-) -> PeerSend:
+) -> PeerRoutes:
     """Register the peer-messaging routes on the sessions router.
 
     :param router: The sessions router to register on.
@@ -1329,7 +1334,7 @@ def register_peer_routes(
         )
     if app_state is not None:
         app_state.peer_sweeper = sweeper
-    return peer_send
+    return PeerRoutes(peer_send, _true_state)
 
 
 __all__ = [
@@ -1341,6 +1346,7 @@ __all__ = [
     "PEER_SENDER_LIMIT",
     "PEER_SENDER_WINDOW_S",
     "PEER_THREAD_LIMIT",
+    "PeerRoutes",
     "PeerSend",
     "PostEventImpl",
     "effective_owner_id",

@@ -9935,6 +9935,7 @@ async def _create_session_from_existing_agent(
     artifact_store: ArtifactStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     project_store: ProjectStore | None = None,
+    conversation_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -10591,6 +10592,7 @@ async def _create_session_from_existing_agent(
         )
         with creation_stage("create_persistence_ms"):
             conv = conversation_store.create_conversation(
+                conversation_id=conversation_id,
                 agent_id=agent.id,
                 title=body.title,
                 parent_conversation_id=body.parent_session_id,

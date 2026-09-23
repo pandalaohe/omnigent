@@ -2021,6 +2021,7 @@ def create_app(
     # and WSTunnelTransport to the same session registry.
     app.state.peer_message_store = peer_message_store
     app.state.session_handoff_store = session_handoff_store
+    app.state.project_host_binding_store = project_host_binding_store
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.cli_retention_coordinator = cli_retention_coordinator

@@ -10302,6 +10302,12 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    handoff_key = next((key for key in labels if key.startswith("omnigent.handoff.")), None)
+    if handoff_key is not None:
+        raise OmnigentError(
+            f"label {handoff_key!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
