@@ -16,7 +16,8 @@ describe("effortLevelsFor", () => {
     ["codex-native", ["low", "high"]],
     ["devin-native", ["low", "high"]],
     ["pi-native", ["none", "minimal", "low", "medium", "high", "xhigh", "max"]],
-    ["claude-sdk", null],
+    ["claude-sdk", ["low", "medium", "high", "xhigh", "max"]],
+    ["codex", ["low", "high"]],
     [null, null],
   ])("returns the ladder for %s", (harness, expected) => {
     expect(effortLevelsFor(harness, rows, "model-a")).toEqual(expected);
@@ -24,6 +25,8 @@ describe("effortLevelsFor", () => {
 
   it("uses the selected model's efforts and leaves unknown models empty", () => {
     expect(effortLevelsFor("codex-native", rows, "model-b")).toEqual(["medium"]);
+    expect(effortLevelsFor("codex", rows, "model-b")).toEqual(["medium"]);
+    expect(effortLevelsFor("codex", rows, null)).toEqual([]);
     expect(effortLevelsFor("devin-native", rows, null)).toEqual([]);
   });
 });
@@ -34,6 +37,9 @@ describe("reconcileEffortOnModelChange", () => {
     ["codex-native", "model-b", "high", null],
     ["codex-native", null, "high", null],
     ["codex-native", "model-b", null, null],
+    ["codex", "model-a", "high", "high"],
+    ["codex", "model-b", "high", null],
+    ["codex", null, "high", null],
     ["devin-native", "model-b", "high", "high"],
     ["claude-native", "model-b", "high", "high"],
     ["pi-native", "model-b", "high", "high"],

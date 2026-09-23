@@ -9890,11 +9890,13 @@ describe("chatStore — session configuration scope", () => {
 
   interface SnapshotOverrides {
     labels?: Record<string, string>;
+    harness?: string;
     reasoning_effort?: string | null;
     model_override?: string | null;
     cost_control_mode_override?: "on" | "off" | null;
     parent_session_id?: string | null;
     model_options?: Record<string, unknown>[];
+    inference_configured?: boolean;
   }
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
@@ -9910,11 +9912,13 @@ describe("chatStore — session configuration scope", () => {
           created_at: 0,
           items: [],
           labels: overrides.labels ?? {},
+          harness: overrides.harness,
           reasoning_effort: overrides.reasoning_effort ?? null,
           model_override: overrides.model_override ?? null,
           cost_control_mode_override: overrides.cost_control_mode_override ?? null,
           parent_session_id: overrides.parent_session_id ?? null,
           model_options: overrides.model_options ?? [],
+          inference_configured: overrides.inference_configured,
         });
       }
       return defaultFetchHandler(input, init);
@@ -10507,6 +10511,35 @@ describe("chatStore — session configuration scope", () => {
     expect(patchCallsFor("conv_codex_supported")).toEqual([{ reasoning_effort: "high" }]);
     expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
   });
+
+  it.each(["claude-sdk", "codex"])("PATCHes effort on an active %s session", async (harness) => {
+    const id = `conv_${harness}_effort`;
+    seedSession(id, []);
+    withSnapshot(id, { labels: {}, harness });
+    await useChatStore.getState().switchTo(id);
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setEffort("high");
+
+    expect(patchCallsFor(id)).toEqual([{ reasoning_effort: "high" }]);
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+  });
+
+  it.each(["claude-sdk", "codex"])(
+    "does not PATCH effort on a configured %s session",
+    async (harness) => {
+      const id = `conv_${harness}_configured_effort`;
+      seedSession(id, []);
+      withSnapshot(id, { labels: {}, harness, inference_configured: true });
+      await useChatStore.getState().switchTo(id);
+      fetchMock.mockClear();
+
+      await useChatStore.getState().setEffort("high");
+
+      expect(patchCallsFor(id)).toEqual([]);
+      expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    },
+  );
 
   it("hydrates Codex Plan mode from the session label", async () => {
     seedSession("conv_plan", []);

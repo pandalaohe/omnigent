@@ -10,8 +10,7 @@ import {
 // picker). Wrapper labels are authoritative; the resolved harness is the fallback
 // for any session with no presentation label — chat-first custom Codex agents,
 // and sessions created before their harness was renamed (the ACP-era Devin rows).
-// Label-less sessions on a NON-native harness still fail closed, and so does a
-// label-less sub-agent child.
+// Other label-less harnesses still fail closed, as does a native sub-agent child.
 
 const NATIVE = "claude-code-native-ui";
 
@@ -59,6 +58,38 @@ describe("effortLevelsForConv", () => {
     ]);
   });
 
+  it("uses SDK harness ladders only without a wrapper label", () => {
+    const catalog = [
+      {
+        id: "gpt-6",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "high" },
+          { reasoningEffort: "max" },
+          { reasoningEffort: "ultra" },
+        ],
+      },
+    ];
+    expect(effortLevelsForConv({ labels: {}, harness: "claude-sdk" })).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(effortLevelsForConv({ labels: {}, harness: "codex" }, catalog, "gpt-6")).toEqual([
+      "high",
+      "max",
+      "ultra",
+    ]);
+    expect(
+      effortLevelsForConv(
+        { labels: { "omnigent.wrapper": "other" }, harness: "codex" },
+        catalog,
+        "gpt-6",
+      ),
+    ).toEqual(["low", "medium", "high"]);
+  });
+
   it("falls back to the base ladder when labels / conv are absent", () => {
     // WHY: a null conv (pre-hydration) or label-less row must fail to the
     // safe base ladder, not crash.
@@ -99,6 +130,22 @@ describe("shouldShowModelPicker", () => {
     expect(modelPickerKindForConv({ labels: {}, harness: "acp" }, catalog)).toBe("acp");
   });
 
+  it("shows the SDK picker for unlabelled SDK sessions", () => {
+    for (const harness of ["claude-sdk", "codex"]) {
+      expect(modelPickerKindForConv({ labels: {}, harness })).toBe("sdk");
+      expect(shouldShowModelPicker({ labels: {}, harness })).toBe(true);
+      expect(modelPickerKindForConv({ labels: {}, harness, inferenceConfigured: true })).toBe(
+        "configured",
+      );
+      expect(
+        modelPickerKindForConv({ labels: { "omnigent.wrapper": "other" }, harness }),
+      ).toBeNull();
+      const child = { labels: {}, harness, parentSessionId: "parent" };
+      expect(modelPickerKindForConv(child)).toBe("sdk");
+      expect(shouldShowEffortPicker(child)).toBe(true);
+    }
+  });
+
   it("hides the ACP picker until there are models to choose between", () => {
     const conv = { labels: {}, harness: "acp" };
     expect(shouldShowModelPicker(conv)).toBe(false);
@@ -114,11 +161,20 @@ describe("shouldShowModelPicker", () => {
     }
   });
 
+  it("keeps configured SDK sessions on the configured picker without effort controls", () => {
+    for (const harness of ["claude-sdk", "codex"]) {
+      const conv = { labels: {}, harness, inferenceConfigured: true };
+      expect(modelPickerKindForConv(conv)).toBe("configured");
+      expect(shouldShowEffortPicker(conv)).toBe(false);
+      expect(effortLevelsForConv(conv)).toEqual(["low", "medium", "high"]);
+    }
+  });
+
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
     // A label-less session resolves its wrapper label from the harness
     // (nativeCodingAgentForHarness), so the negative cases pin harnesses that
     // map to no picker family.
-    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: "openai-agents" })).toBe(false);
     expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
     expect(shouldShowModelPicker({ labels: {}, harness: null })).toBe(false);
     // WHY: a wrapper-looking string is not a resolved harness, and
@@ -131,9 +187,15 @@ describe("shouldShowModelPicker", () => {
 });
 
 describe("shouldShowEffortPicker", () => {
-  it("shows effort controls only for claude-native sessions", () => {
-    // WHY: delegates to supportsEffortControl — only claude-native exposes a
-    // Web UI effort dial.
+  it("shows effort controls for unlabelled SDK sessions only", () => {
+    for (const harness of ["claude-sdk", "codex"]) {
+      expect(shouldShowEffortPicker({ labels: {}, harness })).toBe(true);
+      expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "other" }, harness })).toBe(
+        false,
+      );
+    }
+  });
+  it("shows effort controls for claude-native sessions", () => {
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": NATIVE } })).toBe(true);
   });
 
@@ -226,6 +288,6 @@ describe("label-less native sessions (e.g. created before a harness rename)", ()
 
   it("still fails closed for a label-less non-native harness", () => {
     expect(modelPickerKindForConv({ labels: {}, harness: "openai-agents" })).toBeNull();
-    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
   });
 });
