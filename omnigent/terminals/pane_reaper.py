@@ -79,6 +79,9 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
 _DEFAULT_IDLE_TIMEOUT_S = 60 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
+RETENTION_LEASE_S = 1200
+PENDING_RETIRE_MAX_AGE_S = 3600
+PENDING_RETIRE_CLOSE_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,24 @@ class PaneRef:
     terminal_name: str
     socket_path: Path
     instance: Any | None = None
+
+
+class NativePaneStillAlive(RuntimeError):
+    def __init__(self, instance: Any, probe: bool | None) -> None:
+        super().__init__("native pane still alive before retention release")
+        self.instance = instance
+        self.probe = probe
+
+
+@dataclass
+class _RetireRecord:
+    instance: Any
+    conversation_id: str
+    terminal_name: str
+    first_seen: float
+    tail_token: str | None
+    warned: bool = False
+    cleanup_warned: bool = False
 
 
 def resolve_native_pane_idle_timeout_s() -> float:
@@ -143,7 +164,7 @@ class NativePaneReaper:
     :param reap: ``async`` pane-scoped teardown — closes only this one native
         terminal, leaving the session resumable.
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
-        knob; ``<= 0`` disables reaping.
+        knob; ``<= 0`` disables legacy idle reaping.
     :param reaper_interval_s: Seconds between scans.
     """
 
@@ -155,6 +176,8 @@ class NativePaneReaper:
         reap: Callable[[PaneRef], Awaitable[None]],
         idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
+        runtime_token: Callable[[str], str] | None = None,
+        finish_retired: Callable[[str, str, str], Awaitable[str | None]] | None = None,
     ) -> None:
         self._list_native_panes = list_native_panes
         self._is_busy = is_busy
@@ -163,22 +186,55 @@ class NativePaneReaper:
             idle_timeout_s if idle_timeout_s is not None else resolve_native_pane_idle_timeout_s()
         )
         self._reaper_interval_s = reaper_interval_s
+        self._runtime_token = runtime_token
+        self._finish_retired = finish_retired
         # conversation_id -> monotonic time it was last observed busy.
         self._last_busy_at: dict[str, float] = {}
         # Server-managed sessions use the configurable pool policy. Their
         # panes are still observed here, but the legacy per-pane TTL may not
         # close them independently.
-        self._managed_conversations: set[str] = set()
+        self._managed_conversations: dict[str, float] = {}
+        self._pending_retire: dict[int, _RetireRecord] = {}
         self._task: asyncio.Task[None] | None = None
         self._started = False
 
     def manage(self, conversation_id: str) -> None:
         """Hand one conversation's automatic close decision to the Server pool."""
-        self._managed_conversations.add(conversation_id)
+        self._managed_conversations[conversation_id] = time.monotonic() + RETENTION_LEASE_S
 
     def unmanage(self, conversation_id: str) -> None:
         """Return a conversation to the legacy timeout policy."""
-        self._managed_conversations.discard(conversation_id)
+        self._managed_conversations.pop(conversation_id, None)
+
+    def _is_managed(self, conversation_id: str, now: float) -> bool:
+        expiry = self._managed_conversations.get(conversation_id)
+        if expiry is None:
+            return False
+        if expiry <= now:
+            self._managed_conversations.pop(conversation_id, None)
+            _logger.info(
+                "native pane retention lease expired for conversation %s", conversation_id
+            )
+            return False
+        return True
+
+    def _record_pending(self, pane: PaneRef, instance: Any) -> None:
+        self._pending_retire.setdefault(
+            id(instance),
+            _RetireRecord(
+                instance,
+                pane.conversation_id,
+                pane.terminal_name,
+                time.monotonic(),
+                self._runtime_token(pane.conversation_id) if self._runtime_token else None,
+            ),
+        )
+
+    def _owes_tail(self, conversation_id: str) -> bool:
+        return any(
+            record.conversation_id == conversation_id and record.tail_token is not None
+            for record in self._pending_retire.values()
+        )
 
     def note_activity(self, conversation_id: str) -> None:
         """Re-arm the idle clock when Runner lifecycle evidence observes work."""
@@ -187,7 +243,11 @@ class NativePaneReaper:
     def has_managed_panes(self) -> bool:
         """Return whether a retained pane should keep its Runner alive."""
         live = {pane.conversation_id for pane in self._list_native_panes()}
-        self._managed_conversations.intersection_update(live)
+        for conversation_id in list(self._managed_conversations):
+            if not self._is_managed(conversation_id, time.monotonic()):
+                continue
+            if conversation_id not in live:
+                self._managed_conversations.pop(conversation_id, None)
         return bool(self._managed_conversations)
 
     def _pane_for_conversation(self, conversation_id: str) -> PaneRef | None:
@@ -209,7 +269,7 @@ class NativePaneReaper:
         """Describe one managed pane using the same busy evidence as teardown."""
         pane = self._pane_for_conversation(conversation_id)
         if pane is None:
-            self._managed_conversations.discard(conversation_id)
+            self._managed_conversations.pop(conversation_id, None)
             return None
         now = time.monotonic()
         busy = await self._is_busy(pane)
@@ -235,10 +295,12 @@ class NativePaneReaper:
         """Release one still-eligible pane selected from a prior snapshot."""
         pane = self._pane_for_conversation(conversation_id)
         if pane is None:
+            if self._owes_tail(conversation_id):
+                return "failed"
             # No pane to tear down, but the management and clock entries
             # still retire: a pane that vanished between selection and
             # release must read gone, not retained, like release_now.
-            self._managed_conversations.discard(conversation_id)
+            self._managed_conversations.pop(conversation_id, None)
             self._last_busy_at.pop(conversation_id, None)
             return "absent"
         now = time.monotonic()
@@ -255,13 +317,26 @@ class NativePaneReaper:
         if await self._is_busy(pane):
             self._last_busy_at[conversation_id] = time.monotonic()
             return "busy"
-        was_managed = conversation_id in self._managed_conversations
-        self._managed_conversations.discard(conversation_id)
+        saved_expiry = (
+            self._managed_conversations.get(conversation_id)
+            if self._is_managed(conversation_id, now)
+            else None
+        )
+        self._managed_conversations.pop(conversation_id, None)
         try:
             await self._reap(pane)
+        except NativePaneStillAlive as exc:
+            self._record_pending(pane, exc.instance)
+            if saved_expiry is not None:
+                self._managed_conversations[conversation_id] = max(
+                    saved_expiry, self._managed_conversations.get(conversation_id, saved_expiry)
+                )
+            return "failed"
         except Exception:
-            if was_managed:
-                self._managed_conversations.add(conversation_id)
+            if saved_expiry is not None:
+                self._managed_conversations[conversation_id] = max(
+                    saved_expiry, self._managed_conversations.get(conversation_id, saved_expiry)
+                )
             _logger.exception(
                 "native pane retention release failed for conversation %s",
                 conversation_id,
@@ -274,16 +349,31 @@ class NativePaneReaper:
         """Unconditionally close one pane for an explicit lifecycle action."""
         pane = self._pane_for_conversation(conversation_id)
         if pane is None:
-            self._managed_conversations.discard(conversation_id)
+            if self._owes_tail(conversation_id):
+                return "failed"
+            self._managed_conversations.pop(conversation_id, None)
             self._last_busy_at.pop(conversation_id, None)
             return "absent"
-        was_managed = conversation_id in self._managed_conversations
-        self._managed_conversations.discard(conversation_id)
+        saved_expiry = (
+            self._managed_conversations.get(conversation_id)
+            if self._is_managed(conversation_id, time.monotonic())
+            else None
+        )
+        self._managed_conversations.pop(conversation_id, None)
         try:
             await self._reap(pane)
+        except NativePaneStillAlive as exc:
+            self._record_pending(pane, exc.instance)
+            if saved_expiry is not None:
+                self._managed_conversations[conversation_id] = max(
+                    saved_expiry, self._managed_conversations.get(conversation_id, saved_expiry)
+                )
+            return "failed"
         except Exception:
-            if was_managed:
-                self._managed_conversations.add(conversation_id)
+            if saved_expiry is not None:
+                self._managed_conversations[conversation_id] = max(
+                    saved_expiry, self._managed_conversations.get(conversation_id, saved_expiry)
+                )
             _logger.exception(
                 "native pane explicit release failed for conversation %s",
                 conversation_id,
@@ -348,7 +438,11 @@ class NativePaneReaper:
                 await asyncio.sleep(self._reaper_interval_s)
             except asyncio.CancelledError:
                 return
-            # ``<= 0`` disables reaping entirely (mirrors the SDK reaper guard).
+            try:
+                await self._retire_pending()
+            except Exception:
+                _logger.exception("native pane reaper: pending retirement failed")
+            # ``<= 0`` disables legacy idle reaping.
             if self._idle_timeout_s <= 0:
                 continue
             try:
@@ -361,7 +455,7 @@ class NativePaneReaper:
         now = time.monotonic()
         busy_convs = {p.conversation_id for p in panes if await self._is_busy(p)}
         for pane in self._classify(now, panes, busy_convs):
-            if pane.conversation_id in self._managed_conversations:
+            if self._is_managed(pane.conversation_id, time.monotonic()):
                 continue
             # Re-check immediately before teardown: selection happened above with
             # possibly-stale signals, and a turn / client / autonomous run may
@@ -369,7 +463,7 @@ class NativePaneReaper:
             if await self._is_busy(pane):
                 self._last_busy_at[pane.conversation_id] = time.monotonic()
                 continue
-            if pane.conversation_id in self._managed_conversations:
+            if self._is_managed(pane.conversation_id, time.monotonic()):
                 continue
             _logger.info(
                 "reaping idle native pane for conversation %s (%s; idle > %.0fs)",
@@ -382,7 +476,53 @@ class NativePaneReaper:
             self._last_busy_at.pop(pane.conversation_id, None)
             try:
                 await self._reap(pane)
+            except NativePaneStillAlive as exc:
+                self._record_pending(pane, exc.instance)
             except Exception:
                 _logger.exception(
                     "native pane reaper: reap failed for conversation %s", pane.conversation_id
                 )
+
+    async def _retire_pending(self) -> None:
+        listed = self._list_native_panes()
+        for key, record in list(self._pending_retire.items()):
+            if any(pane.instance is record.instance for pane in listed):
+                self._pending_retire.pop(key, None)
+                continue
+            probe = await record.instance.probe_alive()
+            if probe is not False:
+                if time.monotonic() - record.first_seen < PENDING_RETIRE_MAX_AGE_S:
+                    continue
+                try:
+                    await record.instance.kill_server()
+                    probe = await record.instance.probe_alive()
+                except Exception:
+                    probe = None
+                if probe is not False:
+                    if not record.warned:
+                        _logger.warning(
+                            "native pane retirement could not confirm death for conversation %s",
+                            record.conversation_id,
+                        )
+                        record.warned = True
+                    continue
+            try:
+                await asyncio.wait_for(
+                    record.instance.close(), timeout=PENDING_RETIRE_CLOSE_TIMEOUT_S
+                )
+            except Exception:
+                if not record.cleanup_warned:
+                    _logger.exception(
+                        "native pane retirement cleanup failed for %s", record.conversation_id
+                    )
+                    record.cleanup_warned = True
+            if record.tail_token is None or self._finish_retired is None:
+                self._pending_retire.pop(key, None)
+                continue
+            new_token = await self._finish_retired(
+                record.conversation_id, record.terminal_name, record.tail_token
+            )
+            if new_token is None:
+                self._pending_retire.pop(key, None)
+            else:
+                record.tail_token = new_token

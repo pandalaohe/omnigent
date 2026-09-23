@@ -9,15 +9,20 @@ from pathlib import Path
 
 import pytest
 
+import omnigent.inner.terminal as terminal_mod
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _IDLE_TIMEOUT_ENV,
+    PENDING_RETIRE_MAX_AGE_S,
+    RETENTION_LEASE_S,
     NativePaneReaper,
+    NativePaneStillAlive,
     PaneRef,
     resolve_native_pane_idle_timeout_s,
 )
@@ -166,6 +171,339 @@ async def test_retention_release_failure_keeps_pane_managed_for_retry() -> None:
     )
     assert reaper.has_managed_panes() is True
     assert f"{reaper._last_busy_at['conv_a']:.9f}" == activity_token
+
+
+async def test_retention_lease_renews_and_expiry_restores_legacy_scan(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.terminals import pane_reaper
+
+    clock = [100.0]
+    monkeypatch.setattr(pane_reaper.time, "monotonic", lambda: clock[0])
+    f = _Fakes()
+    f.panes = [_pane("conv_a")]
+    reaper = _make(f, timeout=3600)
+    reaper._last_busy_at["conv_a"] = clock[0] - 7200
+    for _ in range(30):
+        reaper.manage("conv_a")
+        clock[0] += 60
+        await reaper._scan_once()
+    assert f.reaped == []
+    assert reaper.has_managed_panes()
+    clock[0] += RETENTION_LEASE_S + 1
+    with caplog.at_level("INFO"):
+        assert not reaper.has_managed_panes()
+        await reaper._scan_once()
+    assert f.reaped == ["conv_a"]
+    assert sum("retention lease expired" in row.message for row in caplog.records) == 1
+
+
+async def test_expired_lease_keeps_recently_busy_pane(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.terminals import pane_reaper
+
+    clock = [100.0]
+    monkeypatch.setattr(pane_reaper.time, "monotonic", lambda: clock[0])
+    f = _Fakes()
+    f.panes = [_pane("conv_a")]
+    reaper = _make(f, timeout=3600)
+    reaper.manage("conv_a")
+    clock[0] += 1260
+    reaper._last_busy_at["conv_a"] = clock[0] - 600
+    await reaper._scan_once()
+    assert f.reaped == []
+
+
+async def test_failed_release_restores_saved_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.terminals import pane_reaper
+
+    clock = [100.0]
+    monkeypatch.setattr(pane_reaper.time, "monotonic", lambda: clock[0])
+    f = _Fakes()
+    f.panes = [_pane("conv_a")]
+    reaper = _make(f)
+    reaper.manage("conv_a")
+    expiry = reaper._managed_conversations["conv_a"]
+    reaper._last_busy_at["conv_a"] = clock[0] - 100
+
+    async def fail(_pane: PaneRef) -> None:
+        raise RuntimeError("close failed")
+
+    reaper._reap = fail
+    clock[0] += 19 * 60
+    assert await reaper.release_now("conv_a") == "failed"
+    assert reaper._managed_conversations["conv_a"] == expiry
+    clock[0] = expiry + 1
+    assert not reaper.has_managed_panes()
+
+
+@pytest.mark.parametrize("release_kind", ["now", "idle"])
+@pytest.mark.parametrize("raises", [False, True])
+async def test_failed_release_preserves_concurrent_renewal(
+    release_kind: str, raises: bool
+) -> None:
+    f = _Fakes()
+    f.panes = [_pane("conv_a")]
+    reaper = _make(f)
+    reaper.manage("conv_a")
+    saved_expiry = reaper._managed_conversations["conv_a"]
+    reaper._last_busy_at["conv_a"] = time.monotonic() - 100
+    token = f"{reaper._last_busy_at['conv_a']:.9f}"
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def fail(_pane: PaneRef) -> None:
+        entered.set()
+        await resume.wait()
+        if raises:
+            raise RuntimeError("close failed")
+        raise NativePaneStillAlive(object(), True)
+
+    reaper._reap = fail
+    if release_kind == "now":
+        releasing = asyncio.create_task(reaper.release_now("conv_a"))
+    else:
+        releasing = asyncio.create_task(
+            reaper.release_if_idle("conv_a", idle_threshold_s=1, expected_activity_token=token)
+        )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    reaper.manage("conv_a")
+    renewed_expiry = reaper._managed_conversations["conv_a"]
+    resume.set()
+    assert await releasing == "failed"
+    assert renewed_expiry > saved_expiry
+    assert reaper._managed_conversations["conv_a"] == renewed_expiry
+
+
+class _RetiringInstance:
+    def __init__(self, probes: list[bool | None]) -> None:
+        self.probes = probes
+        self.closed = 0
+        self.killed = 0
+        self.kill_error = False
+
+    async def probe_alive(self) -> bool | None:
+        return self.probes.pop(0) if len(self.probes) > 1 else self.probes[0]
+
+    async def kill_server(self) -> None:
+        self.killed += 1
+        if self.kill_error:
+            raise RuntimeError("kill failed")
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+async def _pending_reaper(instance: _RetiringInstance):
+    pane = PaneRef("conv_a", "terminal:codex:main", "codex", Path("/tmp/test.sock"), instance)
+    listed = [pane]
+    tails: list[tuple[str, str, str]] = []
+
+    async def reap(_pane: PaneRef) -> None:
+        raise NativePaneStillAlive(instance, True)
+
+    async def finish(conv: str, name: str, token: str) -> None:
+        tails.append((conv, name, token))
+
+    reaper = NativePaneReaper(
+        list_native_panes=lambda: list(listed),
+        is_busy=lambda _pane: asyncio.sleep(0, result=False),
+        reap=reap,
+        runtime_token=lambda _conv: "boot:1",
+        finish_retired=finish,
+        idle_timeout_s=0,
+        reaper_interval_s=0.01,
+    )
+    assert await reaper.release_now("conv_a") == "failed"
+    return reaper, listed, pane, tails
+
+
+async def test_pending_retirement_runs_with_legacy_ttl_disabled() -> None:
+    instance = _RetiringInstance([False])
+    reaper, listed, _pane_ref, tails = await _pending_reaper(instance)
+    listed.clear()
+    await reaper.start()
+    try:
+        for _ in range(100):
+            if tails:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await reaper.shutdown()
+    assert tails == [("conv_a", "codex", "boot:1")]
+    assert instance.closed == 1
+    assert not reaper._pending_retire
+
+
+@pytest.mark.parametrize("close_mode", ["hang", "error"])
+async def test_dead_pending_close_failure_still_runs_tail(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, close_mode: str
+) -> None:
+    from omnigent.terminals import pane_reaper
+
+    class _StuckClose(_RetiringInstance):
+        async def close(self) -> None:
+            self.closed += 1
+            if close_mode == "error":
+                raise RuntimeError("cleanup failed")
+            await asyncio.Event().wait()
+
+    instance = _StuckClose([False])
+    reaper, listed, _pane_ref, _tails = await _pending_reaper(instance)
+    listed.clear()
+    monkeypatch.setattr(pane_reaper, "PENDING_RETIRE_CLOSE_TIMEOUT_S", 0.01)
+    tails: list[str] = []
+
+    async def finish(_conv: str, _name: str, token: str) -> str | None:
+        tails.append(token)
+        return token if len(tails) == 1 else None
+
+    reaper._finish_retired = finish
+    with caplog.at_level("WARNING"):
+        await asyncio.wait_for(reaper._retire_pending(), timeout=0.2)
+        assert reaper._pending_retire
+        await asyncio.wait_for(reaper._retire_pending(), timeout=0.2)
+    assert tails == ["boot:1", "boot:1"]
+    assert instance.closed == 2
+    assert not reaper._pending_retire
+    assert sum("retirement cleanup failed" in row.message for row in caplog.records) == 1
+
+
+async def test_repeated_pending_close_timeouts_reap_tmux_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.terminals import pane_reaper
+
+    shared_lock = asyncio.Lock()
+    clients: list[_HeldClient] = []
+
+    class _HeldClient:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.killed = False
+            self.waited = False
+            self.exited = asyncio.Event()
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            async with shared_lock:
+                return b"", b""
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+            self.exited.set()
+
+        async def wait(self) -> int | None:
+            self.waited = True
+            await self.exited.wait()
+            return self.returncode
+
+    async def spawn(*_cmd: str, **_kwargs: object) -> _HeldClient:
+        client = _HeldClient()
+        clients.append(client)
+        return client
+
+    terminal = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path / "terminal",
+        running=True,
+    )
+
+    class _HangingClose(_RetiringInstance):
+        async def close(self) -> None:
+            self.closed += 1
+            await terminal.close()
+
+    instance = _HangingClose([False])
+    reaper, listed, _pane_ref, _tails = await _pending_reaper(instance)
+    listed.clear()
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(pane_reaper, "PENDING_RETIRE_CLOSE_TIMEOUT_S", 0.01)
+
+    async def keep_pending(_conv: str, _name: str, token: str) -> str:
+        return token
+
+    reaper._finish_retired = keep_pending
+    async with shared_lock:
+        for _ in range(3):
+            await asyncio.wait_for(reaper._retire_pending(), timeout=0.2)
+
+    assert instance.closed == 3
+    assert len(clients) == 3
+    assert all(client.killed and client.waited for client in clients)
+    assert not any(client.returncode is None for client in clients)
+
+
+async def test_pending_retirement_drops_only_relisted_instance() -> None:
+    instance = _RetiringInstance([True])
+    reaper, _listed, _pane_ref, tails = await _pending_reaper(instance)
+    await reaper._retire_pending()
+    assert not reaper._pending_retire
+    assert instance.killed == 0
+    assert tails == []
+
+
+async def test_successor_does_not_drop_orphan_record() -> None:
+    instance = _RetiringInstance([True, False])
+    reaper, listed, _pane_ref, tails = await _pending_reaper(instance)
+    listed[:] = [
+        PaneRef("conv_a", "terminal:codex:main", "codex", Path("/tmp/next.sock"), object())
+    ]
+    record = reaper._pending_retire[id(instance)]
+    record.first_seen -= PENDING_RETIRE_MAX_AGE_S + 1
+    await reaper._retire_pending()
+    assert instance.killed == 1
+    assert instance.closed == 1
+    assert tails == [("conv_a", "codex", "boot:1")]
+
+
+@pytest.mark.parametrize("post_kill_probe", [None, True])
+async def test_pending_retirement_waits_for_confirmed_death(
+    post_kill_probe: bool | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    instance = _RetiringInstance([True, post_kill_probe])
+    reaper, listed, _pane_ref, tails = await _pending_reaper(instance)
+    listed.clear()
+    reaper._pending_retire[id(instance)].first_seen -= PENDING_RETIRE_MAX_AGE_S + 1
+    with caplog.at_level("WARNING"):
+        await reaper._retire_pending()
+        await reaper._retire_pending()
+    assert instance.closed == 0
+    assert reaper._pending_retire
+    assert tails == []
+    assert sum("could not confirm death" in row.message for row in caplog.records) == 1
+
+
+async def test_pending_retirement_keeps_record_when_kill_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    instance = _RetiringInstance([True])
+    instance.kill_error = True
+    reaper, listed, _pane_ref, tails = await _pending_reaper(instance)
+    listed.clear()
+    reaper._pending_retire[id(instance)].first_seen -= PENDING_RETIRE_MAX_AGE_S + 1
+    with caplog.at_level("WARNING"):
+        await reaper._retire_pending()
+        await reaper._retire_pending()
+    assert instance.closed == 0
+    assert reaper._pending_retire
+    assert tails == []
+    assert sum("could not confirm death" in row.message for row in caplog.records) == 1
+
+
+async def test_absent_release_fails_while_pending_tail_is_owed() -> None:
+    instance = _RetiringInstance([True])
+    reaper, listed, _pane_ref, _tails = await _pending_reaper(instance)
+    listed.clear()
+    assert await reaper.release_now("conv_a") == "failed"
+    assert (
+        await reaper.release_if_idle(
+            "conv_a", idle_threshold_s=60, expected_activity_token="unused"
+        )
+        == "failed"
+    )
 
 
 # ── Env resolver ────────────────────────────────────────────────────────────

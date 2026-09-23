@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -382,6 +383,68 @@ async def test_runner_rejects_reset_older_than_observed_policy() -> None:
     assert session_id in pm.managed_for_retention
 
 
+async def test_stale_get_does_not_manage_or_snapshot() -> None:
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(process_manager=pm, server_client=NullServerClient())  # type: ignore[arg-type]
+    reaper = _FakePaneReaper()
+    snapshot = AsyncMock(wraps=reaper.retention_snapshot)
+    note_activity = Mock()
+    reaper.retention_snapshot = snapshot
+    reaper.note_activity = note_activity
+    app.state.native_pane_reaper = reaper
+    session_id = "session-stale-get"
+    async with _runner_client(app) as client:
+        reset = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/reset",
+            json={"host_id": "host-a", "policy_revision": 5},
+        )
+        stale = await client.get(
+            f"/v1/sessions/{session_id}/cli-retention",
+            params={"idle_threshold_seconds": 60, "host_id": "host-a", "policy_revision": 4},
+        )
+    assert reset.status_code == 200
+    assert stale.status_code == 409
+    assert stale.json() == {"session_id": session_id, "status": "stale_policy"}
+    assert reaper.managed == []
+    assert pm.managed_for_retention_calls == []
+    snapshot.assert_not_awaited()
+    note_activity.assert_not_called()
+
+
+async def test_cross_host_reset_rejects_without_unmanaging() -> None:
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(process_manager=pm, server_client=NullServerClient())  # type: ignore[arg-type]
+    reaper = _FakePaneReaper()
+    app.state.native_pane_reaper = reaper
+    session_id = "session-cross-host-reset"
+    async with _runner_client(app) as client:
+        await client.get(
+            f"/v1/sessions/{session_id}/cli-retention",
+            params={"idle_threshold_seconds": 60, "host_id": "host-b", "policy_revision": 1},
+        )
+        stale = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/reset",
+            json={"host_id": "host-a", "policy_revision": 7},
+        )
+    assert stale.status_code == 409
+    assert stale.json()["status"] == "stale_host"
+    assert session_id in reaper.managed
+    assert session_id in pm.managed_for_retention
+    assert app.state.cli_runtime_lifecycle.policy_matches(session_id, host_id="host-b", revision=1)
+
+
+async def test_reset_without_stored_host_is_accepted() -> None:
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    session_id = "session-after-restart"
+    async with _runner_client(app) as client:
+        reset = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/reset",
+            json={"host_id": "host-a", "policy_revision": 3},
+        )
+    assert reset.status_code == 200
+    assert reset.json()["status"] == "reset"
+
+
 class _AbsentHarnessProcessManager(_FakeProcessManager):
     """ProcessManager stub whose resident harness died before the release."""
 
@@ -504,3 +567,35 @@ async def test_runner_idle_release_cleans_up_when_pane_vanished_first() -> None:
     assert lifecycle.phase(session_id) == "absent"
     assert session_id not in reaper._managed_conversations
     assert session_id not in reaper._last_busy_at
+
+
+async def test_archive_release_does_not_run_tail_while_orphan_owes_it() -> None:
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(process_manager=pm, server_client=NullServerClient())  # type: ignore[arg-type]
+    lifecycle = app.state.cli_runtime_lifecycle
+    reaper = NativePaneReaper(
+        list_native_panes=list,
+        is_busy=_never_busy,
+        reap=_never_reap,
+        runtime_token=lifecycle.runtime_token,
+    )
+    app.state.native_pane_reaper = reaper
+    session_id = "session-owed-tail"
+    instance = object()
+    reaper._record_pending(
+        PaneRef(session_id, "terminal:codex:main", "codex", Path("/tmp/test.sock"), instance),
+        instance,
+    )
+    async with _runner_client(app) as client:
+        archive = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/archive-state",
+            json={"archive_scope_id": "root", "archive_revision": 1, "archived": True},
+        )
+        release = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/release",
+            json={"reason": "archive", "archive_scope_id": "root", "archive_revision": 1},
+        )
+    assert archive.status_code == 200
+    assert release.status_code == 500
+    assert release.json()["status"] == "failed"
+    assert pm.released == []
