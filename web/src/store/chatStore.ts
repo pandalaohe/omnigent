@@ -4480,6 +4480,128 @@ function withoutRebuiltUserInputCards(
   });
 }
 
+// Prefix `itemsToBlocks` puts on a rebuilt card's elicitation id, naming the
+// persisted tool call that gated the question / plan (`answered:<call_id>`).
+const ANSWERED_ELICITATION_PREFIX = "answered:";
+
+/**
+ * Splice the reconnect backfill's committed `unseen` blocks into the live
+ * transcript.
+ *
+ * The gap's items belong ahead of the active turn's replayed in-flight
+ * region (its itemId-less blocks, rebuilt by the pump at the tail). With no
+ * replay region yet they anchor AFTER the rid's last block: the rid's gap
+ * items are newer than its pre-gap committed blocks, so before-its-first
+ * would invert the bubble. No rid blocks at all: append; the later replay
+ * lands after.
+ *
+ * History-rebuilt question / plan cards are the exception. A card answered
+ * before the gap comes back rebuilt (the elicitation itself is never
+ * persisted), so anchored with the rest it rendered BELOW the reply that
+ * followed it. The rebuilt card instead takes the slot of the live copy it
+ * replaces (paired by its gated tool call) — or, with no live copy,
+ * lands immediately after that tool call — keeping the answer above
+ * the reply either way.
+ *
+ * @param liveBlocks - The blocks rendered before the gap.
+ * @param unseen - Backfilled blocks whose item ids are not rendered yet.
+ * @param rid - Streaming response id of the active turn, or null.
+ * @returns The spliced block list.
+ */
+function spliceReconnectBackfill(
+  liveBlocks: AnyBlock[],
+  unseen: AnyBlock[],
+  rid: string | null,
+): AnyBlock[] {
+  const claimedLive = new Set<number>();
+  const placements = new Map<AnyBlock, number>();
+  for (const b of unseen) {
+    if (b.type !== "elicitation" || !b.elicitationId.startsWith(ANSWERED_ELICITATION_PREFIX)) {
+      continue;
+    }
+    const callId = b.elicitationId.slice(ANSWERED_ELICITATION_PREFIX.length);
+    const callAt = liveBlocks.findIndex(
+      (c) => c.type === "tool_group" && c.executions.some((e) => e.callId === callId),
+    );
+    if (callAt === -1) continue;
+    const key = userInputElicitationKey(b);
+    let liveAt = -1;
+    for (
+      let i = callAt + 1;
+      i < liveBlocks.length && liveBlocks[i]!.type !== "user_message";
+      i += 1
+    ) {
+      const candidate = liveBlocks[i]!;
+      if (
+        candidate.type === "elicitation" &&
+        candidate.status === "responded" &&
+        key !== null &&
+        userInputElicitationKey(candidate) === key &&
+        !claimedLive.has(i)
+      ) {
+        liveAt = i;
+        break;
+      }
+    }
+    if (liveAt !== -1) claimedLive.add(liveAt);
+    placements.set(b, liveAt !== -1 ? liveAt : callAt + 1);
+  }
+  // Cards without a live gated call retain the per-key, transcript-order pairing.
+  const liveSlots = new Map<string, number[]>();
+  for (let i = 0; i < liveBlocks.length; i += 1) {
+    const b = liveBlocks[i]!;
+    if (b.type === "elicitation" && b.status === "responded" && !claimedLive.has(i)) {
+      const key = userInputElicitationKey(b);
+      if (key !== null) {
+        const slots = liveSlots.get(key);
+        if (slots) slots.push(i);
+        else liveSlots.set(key, [i]);
+      }
+    }
+  }
+  for (const b of unseen) {
+    if (b.type !== "elicitation" || placements.has(b)) continue;
+    const key = userInputElicitationKey(b);
+    const slot = key === null ? undefined : liveSlots.get(key)?.shift();
+    if (slot !== undefined) {
+      claimedLive.add(slot);
+      placements.set(b, slot);
+    }
+  }
+  const kept: AnyBlock[] = [];
+  const keptBefore: number[] = [];
+  for (let i = 0; i < liveBlocks.length; i += 1) {
+    keptBefore.push(kept.length);
+    if (!claimedLive.has(i)) kept.push(liveBlocks[i]!);
+  }
+  keptBefore.push(kept.length);
+  let at = -1;
+  if (rid !== null) {
+    at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
+    if (at === -1) {
+      const lastRid = kept.findLastIndex((b) => b.ctx.responseId === rid);
+      if (lastRid !== -1) at = lastRid + 1;
+    }
+  }
+  // Anchor each block before a kept index (`kept.length` → tail); several
+  // blocks sharing an anchor keep the backfill's transcript order.
+  const insertions = new Map<number, AnyBlock[]>();
+  for (const b of unseen) {
+    let target = at >= 0 ? at : kept.length;
+    const slot = placements.get(b);
+    if (slot !== undefined) target = keptBefore[slot]!;
+    const bucket = insertions.get(target);
+    if (bucket === undefined) insertions.set(target, [b]);
+    else bucket.push(b);
+  }
+  const nextBlocks: AnyBlock[] = [];
+  for (let i = 0; i < kept.length; i += 1) {
+    nextBlocks.push(...(insertions.get(i) ?? []), kept[i]!);
+  }
+  nextBlocks.push(...(insertions.get(kept.length) ?? []));
+  return nextBlocks;
+}
+
 /**
  * Snapshot the ids of currently rendered elicitation cards, split by
  * answerable state, BEFORE a snapshot fetch. `pending` cards are
@@ -4751,26 +4873,8 @@ async function reconcileOnReconnect(
     }
     let nextBlocks = currentBlocks;
     if (unseen.length > 0) {
-      // Splice the gap's committed items ahead of the active turn's
-      // replayed in-flight region (its itemId-less blocks, rebuilt by the
-      // pump at the tail). With no replay region yet, anchor AFTER the
-      // rid's last block: the rid's gap items are newer than its pre-gap
-      // committed blocks, so before-its-first would invert the bubble.
-      // No rid blocks at all: append; the later replay lands after.
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-      // A card answered before the gap whose call the gap persisted comes
-      // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(currentBlocks, unseen);
-      let at = -1;
-      if (rid) {
-        at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
-        if (at === -1) {
-          const lastRid = kept.findLastIndex((b) => b.ctx.responseId === rid);
-          if (lastRid !== -1) at = lastRid + 1;
-        }
-      }
-      nextBlocks =
-        at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
+      nextBlocks = spliceReconnectBackfill(currentBlocks, unseen, rid);
     }
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card

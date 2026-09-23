@@ -879,6 +879,34 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     } as Partial<ReturnType<typeof useChatStore.getState>>);
   });
 
+  it("wraps the action row and keeps the abort control's full accessible name", () => {
+    // On a phone-width card the four controls overflowed the right edge; the
+    // row now wraps. The narrow layout shows the short "Interrupt" label, so
+    // the full name has to survive on the control itself (accessible name and
+    // tooltip) rather than only in the visible text. Visual overflow itself
+    // cannot be asserted in jsdom — this covers the class and the name.
+    render(
+      <ApprovalCard
+        elicitationId="elic_wrap"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview={sampleSinglePreview}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    const abort = screen.getByTestId("ask-user-question-abort");
+    expect(abort.parentElement).toHaveClass("flex-wrap");
+    expect(abort).toHaveAttribute("aria-label", "Cancel & interrupt");
+    expect(abort).toHaveAttribute("title", "Cancel & interrupt");
+    expect(screen.getByRole("button", { name: "Cancel & interrupt" })).toBe(abort);
+    // The short label that replaces it on narrow widths.
+    expect(screen.getByText("Interrupt")).toBeDefined();
+  });
+
   it("omits the abort control when the card routes verdicts elsewhere", () => {
     // The Inbox renders cards for sessions other than the active one and
     // supplies its own submitter. An abort there would interrupt whichever

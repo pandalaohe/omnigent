@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import functools
 import hashlib
@@ -3093,7 +3094,9 @@ def read_transcript_items_since(
     while translating the user-visible semantic records into Omnigent
     item types the web UI already understands — ``thinking`` blocks
     become ``reasoning`` items so the chat surfaces the same
-    reasoning context the TUI shows. Some metadata is still
+    reasoning context the TUI shows, except the blocks the CLI marked
+    as user-facing narration, which become assistant messages. Some
+    metadata is still
     read for out-of-band mirroring rather than dropped outright — a
     ``custom-title`` record surfaces on
     :attr:`TranscriptReadResult.latest_custom_title`.
@@ -8739,6 +8742,106 @@ def _user_transcript_items_from_entry(
     return (None if saw_user_text else current_response_id), items
 
 
+def _read_varint(buf: bytes, index: int) -> tuple[int | None, int]:
+    """Read one protobuf varint, returning ``(value, next_index)``."""
+    value = 0
+    shift = 0
+    while index < len(buf):
+        byte = buf[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, index
+        shift += 7
+        if shift > 63:
+            break
+    return None, index
+
+
+def _protobuf_fields(buf: bytes) -> dict[int, list[int | bytes]] | None:
+    """
+    Decode one level of a protobuf wire message into ``{field: [values]}``.
+
+    Varint and length-delimited fields only — the whole shape Claude Code
+    writes inside a thinking signature. ``None`` for anything malformed, so
+    an unrecognized signature degrades to "no label" rather than raising.
+
+    :param buf: Raw protobuf bytes for one message level.
+    :returns: Field number → values, or ``None`` when unparseable.
+    """
+    fields: dict[int, list[int | bytes]] = {}
+    index = 0
+    while index < len(buf):
+        key, index = _read_varint(buf, index)
+        if key is None:
+            return None
+        number, wire = key >> 3, key & 0x7
+        if number == 0 or number > 536870911:
+            return None
+        if wire == 0:
+            value, index = _read_varint(buf, index)
+            if value is None:
+                return None
+        elif wire == 2:
+            length, index = _read_varint(buf, index)
+            if length is None or index + length > len(buf):
+                return None
+            value = buf[index : index + length]
+            index += length
+        else:
+            return None
+        fields.setdefault(number, []).append(value)
+    return fields
+
+
+#: ``signature`` label Claude Code stamps on the thinking blocks it renders
+#: as user-visible assistant narration; ordinary private thinking carries a
+#: different label (``thinking``).
+_NARRATION_SIGNATURE_LABEL = "narration"
+
+
+def _thinking_signature_label(signature: object) -> str | None:
+    """
+    Read the provenance label Claude Code encodes into a thinking block's
+    ``signature``.
+
+    The signature is base64 over a protobuf message whose field 2 wraps the
+    block metadata; the label sits at field 8 of that wrapper's field 1 —
+    ``narration`` for the thoughts the CLI shows the user as assistant
+    prose, ``thinking`` for the ordinary private ones.
+
+    :param signature: The block's ``signature`` value, of any wire type.
+    :returns: The decoded label, or ``None`` when the signature is missing,
+        undecodable, or not in the expected shape.
+    """
+    if not isinstance(signature, str) or not signature:
+        return None
+    try:
+        raw = base64.b64decode(signature + "=" * (-len(signature) % 4), validate=True)
+    except ValueError:
+        return None
+    top = _protobuf_fields(raw)
+    if top is None:
+        return None
+    label: str | None = None
+    for wrapped in top.get(2, []):
+        if not isinstance(wrapped, bytes):
+            continue
+        inner = _protobuf_fields(wrapped)
+        if inner is None:
+            return None
+        for metadata in inner.get(1, []):
+            if not isinstance(metadata, bytes):
+                continue
+            meta = _protobuf_fields(metadata)
+            if meta is None:
+                return None
+            for candidate in meta.get(8, []):
+                if isinstance(candidate, bytes) and label is None:
+                    label = candidate.decode("utf-8", "replace")
+    return label
+
+
 def _assistant_transcript_items_from_entry(
     entry: _JsonObject,
     *,
@@ -8825,20 +8928,34 @@ def _assistant_transcript_items_from_entry(
             # Mirror the thought as a reasoning item so the chat offers the
             # same expandable reasoning context the TUI renders. Redacted
             # thinking carries no readable text anywhere, so it stays dropped.
+            # Blocks the CLI rendered to the user as narration are assistant
+            # prose, not private reasoning, so they surface as plain text.
             thinking = block.get("thinking")
             if isinstance(thinking, str) and thinking.strip():
-                items.append(
-                    ClaudeTranscriptItem(
-                        source_id=_source_id(source_key, item_index, "reasoning"),
-                        item_type="reasoning",
-                        data={
-                            "agent": agent_name,
-                            "summary": [],
-                            "content": [{"type": "reasoning_text", "text": thinking}],
-                        },
-                        response_id=response_id,
+                if _thinking_signature_label(block.get("signature")) == _NARRATION_SIGNATURE_LABEL:
+                    items.append(
+                        _assistant_message_item(
+                            source_key=source_key,
+                            item_index=item_index,
+                            agent_name=agent_name,
+                            response_id=response_id,
+                            text=thinking,
+                            is_api_error=is_api_error,
+                        )
                     )
-                )
+                else:
+                    items.append(
+                        ClaudeTranscriptItem(
+                            source_id=_source_id(source_key, item_index, "reasoning"),
+                            item_type="reasoning",
+                            data={
+                                "agent": agent_name,
+                                "summary": [],
+                                "content": [{"type": "reasoning_text", "text": thinking}],
+                            },
+                            response_id=response_id,
+                        )
+                    )
             continue
         if block_type == "tool_use":
             tool_id = block.get("id")

@@ -441,11 +441,14 @@ interface TurnPartition {
   finalStart: number;
 }
 
-// Bookkeeping tools some harnesses append AFTER the turn's final
-// message (codex-native mirrors the turn's file diff as a trailing
-// `turn_diff` call). They must not stop the answer detection — they
-// fold into the process trace instead.
-const TRAILING_WRAPUP_TOOLS = new Set(["turn_diff"]);
+// Tools some harnesses append AFTER the turn's final message: codex-native
+// mirrors the turn's file diff as a trailing `turn_diff` call, and a turn
+// that asks the user a question (or hands them a plan) ends on the
+// AskUserQuestion / ExitPlanMode call whose card renders just after the
+// text. They must not stop the answer detection — the text immediately
+// before them is the turn's visible answer, and they fold into the process
+// trace instead.
+const TRAILING_WRAPUP_TOOLS = new Set(["turn_diff", "AskUserQuestion", "ExitPlanMode"]);
 
 /**
  * Whether a trailing item is wrap-up rather than part of the answer.
@@ -466,7 +469,8 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * visible exempt items, and the trailing final answer.
  *
  * `final` is the trailing run of text items — the turn's answer —
- * looking past any trailing bookkeeping tools (`turn_diff`), which
+ * looking past any trailing wrap-up tools (`turn_diff`, and the
+ * AskUserQuestion / ExitPlanMode call a question turn ends on), which
  * fold as process. Everything before the answer is process too —
  * including resolved approval cards, which are part of the work's
  * history and fold in document order — except items the user must
@@ -778,10 +782,7 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse
-            breaks
-            mode={isTextStreaming ? "streaming" : "static"}
-          >
+          <FilePathAwareMessageResponse breaks mode={isTextStreaming ? "streaming" : "static"}>
             {item.text}
           </FilePathAwareMessageResponse>
         </div>

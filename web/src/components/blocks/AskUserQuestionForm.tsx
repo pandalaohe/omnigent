@@ -355,7 +355,7 @@ export function AskUserQuestionForm({
         )}
       </fieldset>
 
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
           variant="outline"
@@ -408,9 +408,14 @@ export function AskUserQuestionForm({
             onClick={onAbort}
             data-testid="ask-user-question-abort"
             componentId="question.abort"
+            aria-label="Cancel & interrupt"
+            title="Cancel & interrupt"
           >
             <SquareIcon className="mr-1 size-3.5" />
-            Cancel &amp; interrupt
+            {/* Phone widths show the short label; the accessible name stays
+                the full one (aria-label above). */}
+            <span className="max-sm:hidden">Cancel &amp; interrupt</span>
+            <span className="sm:hidden">Interrupt</span>
           </Button>
         )}
       </div>
