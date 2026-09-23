@@ -171,6 +171,8 @@ class HostHelloFrame:
         treat ``None`` as "nothing is configured". Changes arrive in
         :class:`HostHarnessReadinessFrame`; launch-time checks remain
         authoritative.
+    :param platform: ``sys.platform`` from the host process. ``None``
+        means an older host did not report it.
     :param gateway_inference: Per-harness flag for whether that family's
         launch on this host resolves AI-Gateway-backed inference, e.g.
         ``{"claude-native": True, "codex": False}`` (see
@@ -199,6 +201,7 @@ class HostHelloFrame:
     name: str
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    platform: str | None = None
     gateway_inference: dict[str, bool] | None = None
     interactive_shells: list[str] | None = None
     telemetry_opt_out: bool = False
@@ -1399,6 +1402,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "name": frame.name,
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
+                **({"platform": frame.platform} if frame.platform is not None else {}),
                 "gateway_inference": frame.gateway_inference,
                 "interactive_shells": frame.interactive_shells,
                 "telemetry_opt_out": frame.telemetry_opt_out,
@@ -2083,6 +2087,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        platform=_optional_nullable_str(msg, "platform"),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         interactive_shells=(
             _optional_str_list(msg, "interactive_shells")

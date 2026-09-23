@@ -288,6 +288,7 @@ def create_host_tunnel_router(
                 user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
+                platform=frame.platform,
                 managed_token=managed_token,
             )
             host_persisted = True

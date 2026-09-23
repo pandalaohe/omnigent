@@ -27,6 +27,7 @@ export interface Host {
    * "nothing configured".
    */
   configured_harnesses?: Record<string, boolean | string> | null;
+  platform?: string | null;
   /**
    * Whether each harness family's launch on this host resolves an
    * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
