@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -1945,7 +1946,13 @@ def _revision6_release_case(
 async def test_succeeded_release_waits_for_two_idle_looks(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent.server.routes._sessions.common import _intentional_stop_sessions
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.common import (
+        _LAST_TASK_ERROR_CODE_LABEL_KEY,
+        _intentional_stop_sessions,
+        _session_status_cache,
+    )
+    from omnigent.server.schemas import ErrorDetail
     from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
     clock = {"now": 10_000}
@@ -1979,7 +1986,18 @@ async def test_succeeded_release_waits_for_two_idle_looks(
         assert conv.live_status != "failed"
         assert calls == ["stop", "release"]
         assert session_id in _intentional_stop_sessions
+        _session_status_cache[session_id] = "running"
+        error = ErrorDetail(code="runner_disconnected", message="runner went offline")
+        with patch.object(orchestration, "_publish_status") as publish:
+            await orchestration._mark_runner_sessions_offline_impl(
+                [conv], error, stores["conversation"]
+            )
+        publish.assert_not_called()
+        conv = stores["conversation"].get_conversation(session_id)
+        assert conv is not None and conv.live_status != "failed"
+        assert conv.labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY) != "runner_disconnected"
     finally:
+        _session_status_cache.pop(session_id, None)
         _intentional_stop_sessions.discard(session_id)
         await coordinator.shutdown()
 
@@ -2016,6 +2034,123 @@ async def test_succeeded_release_grace_is_bounded(
         assert conv is not None and conv.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
         assert calls == ["stop", "release"]
     finally:
+        _intentional_stop_sessions.discard(session_id)
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_succeeded_release_retries_stop_without_restarting_grace(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.server.routes.sessions as sessions_routes
+    from omnigent.server.routes._sessions.common import _intentional_stop_sessions
+
+    clock = {"now": 10_000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    stores, coordinator, assignment, attempt, calls = _revision6_release_case(
+        db_uri, monkeypatch, seed="rev6-retry-stop", ended_at=None
+    )
+    session_id = attempt.session_id
+    assert session_id is not None
+    outcomes = iter(("unavailable", "acked"))
+
+    async def _stop(*_args: Any, **_kwargs: Any) -> str:
+        calls.append("stop")
+        return next(outcomes)
+
+    monkeypatch.setattr(sessions_routes, "_stop_session_host_runner_outcome", _stop)
+    try:
+        stores["conversation"].set_session_live_status(session_id, "running")
+        await coordinator._evaluate_terminal_release(assignment)
+        row = stores["assignment"].get(assignment.id)
+        assert row is not None and row.next_check_at == 10_030
+
+        clock["now"] = 10_600
+        await coordinator._evaluate_terminal_release(row)
+        row = stores["assignment"].get(assignment.id)
+        assert row is not None and row.next_check_at == 10_030
+        assert calls == ["stop"]
+
+        clock["now"] = 10_630
+        await coordinator._evaluate_terminal_release(row)
+        row = stores["assignment"].get(assignment.id)
+        assert row is not None and row.next_check_at is None
+        assert calls == ["stop", "stop", "release"]
+        assert assignment.id not in coordinator._release_holds
+    finally:
+        _intentional_stop_sessions.discard(session_id)
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_row_without_pending_check_clears_release_hold(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"now": 10_000}
+    monkeypatch.setattr(assignments_mod.time, "time", lambda: clock["now"])
+    stores, coordinator, assignment, attempt, _calls = _revision6_release_case(
+        db_uri, monkeypatch, seed="rev6-finished-hold", ended_at=None
+    )
+    session_id = attempt.session_id
+    assert session_id is not None
+    try:
+        stores["conversation"].set_session_live_status(session_id, "running")
+        await coordinator._evaluate_terminal_release(assignment)
+        assert assignment.id in coordinator._release_holds
+        assert (
+            stores["assignment"].reschedule(
+                assignment.id,
+                expected_state="succeeded",
+                expected_active_attempt_id=attempt.id,
+                next_check_at=None,
+            )
+            is not None
+        )
+        await coordinator._evaluate(assignment.id)
+        assert assignment.id not in coordinator._release_holds
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runner_offline_sweep_fails_unmarked_running_session(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.common import (
+        _LAST_TASK_ERROR_CODE_LABEL_KEY,
+        _intentional_stop_sessions,
+        _session_status_cache,
+    )
+    from omnigent.server.schemas import ErrorDetail
+
+    stores, coordinator, _assignment, attempt, _calls = _revision6_release_case(
+        db_uri, monkeypatch, seed="rev6-sweep-control", ended_at=None
+    )
+    session_id = attempt.session_id
+    assert session_id is not None
+    try:
+        stores["conversation"].set_session_live_status(session_id, "running")
+        _session_status_cache[session_id] = "running"
+        _intentional_stop_sessions.discard(session_id)
+        conv = stores["conversation"].get_conversation(session_id)
+        assert conv is not None
+        error = ErrorDetail(code="runner_disconnected", message="runner went offline")
+        with patch.object(
+            orchestration, "_publish_status", wraps=orchestration._publish_status
+        ) as publish:
+            await orchestration._mark_runner_sessions_offline_impl(
+                [conv], error, stores["conversation"]
+            )
+        publish.assert_called_once_with(
+            session_id, "failed", error, failure_origin="runner_offline_sweep"
+        )
+        assert _session_status_cache[session_id] == "failed"
+        conv = stores["conversation"].get_conversation(session_id)
+        assert conv is not None
+        assert conv.labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY) == "runner_disconnected"
+    finally:
+        _session_status_cache.pop(session_id, None)
         _intentional_stop_sessions.discard(session_id)
         await coordinator.shutdown()
 
@@ -2062,7 +2197,13 @@ async def test_cancel_stops_mid_turn_then_closes_without_erasing_marker(
 ) -> None:
     import omnigent.server.routes.sessions as sessions_routes
     from omnigent.host.frames import HostAssignmentReleaseResultFrame
-    from omnigent.server.routes._sessions.common import _intentional_stop_sessions
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.common import (
+        _LAST_TASK_ERROR_CODE_LABEL_KEY,
+        _intentional_stop_sessions,
+        _session_status_cache,
+    )
+    from omnigent.server.schemas import ErrorDetail
     from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
     stores = _stores(db_uri)
@@ -2150,7 +2291,18 @@ async def test_cancel_stops_mid_turn_then_closes_without_erasing_marker(
         conv = stores["conversation"].get_conversation(session_id)
         assert conv is not None and conv.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
         assert conv.live_status != "failed"
+        _session_status_cache[session_id] = "running"
+        error = ErrorDetail(code="runner_disconnected", message="runner went offline")
+        with patch.object(orchestration, "_publish_status") as publish:
+            await orchestration._mark_runner_sessions_offline_impl(
+                [conv], error, stores["conversation"]
+            )
+        publish.assert_not_called()
+        conv = stores["conversation"].get_conversation(session_id)
+        assert conv is not None and conv.live_status != "failed"
+        assert conv.labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY) != "runner_disconnected"
     finally:
+        _session_status_cache.pop(session_id, None)
         _intentional_stop_sessions.discard(session_id)
         await coordinator.shutdown()
 

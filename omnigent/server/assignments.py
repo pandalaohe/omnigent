@@ -409,6 +409,8 @@ class AssignmentCoordinator:
         assignment = await asyncio.to_thread(self._assignment_store.get, assignment_id)
         if assignment is None:
             return
+        if assignment.state != "succeeded" or assignment.next_check_at is None:
+            self._release_holds.pop(assignment.id, None)
         if assignment.state in TERMINAL_STATES:
             if assignment.next_check_at is None:
                 return
@@ -1149,23 +1151,23 @@ class AssignmentCoordinator:
 
         :param assignment: The terminal row with a pending release.
         """
-        if assignment.next_check_at is None:
-            self._release_holds.pop(assignment.id, None)
-            return
         if assignment.state != "succeeded":
             self._release_holds.pop(assignment.id, None)
         now = int(time.time())
+        if assignment.next_check_at is None:
+            return
         if assignment.next_check_at > now:
             return
         if assignment.resolved_host_id is None:
-            self._release_holds.pop(assignment.id, None)
-            await asyncio.to_thread(
+            released = await asyncio.to_thread(
                 self._assignment_store.reschedule,
                 assignment.id,
                 expected_state=assignment.state,
                 expected_active_attempt_id=assignment.active_attempt_id,
                 next_check_at=None,
             )
+            if released is not None:
+                self._release_holds.pop(assignment.id, None)
             return
         host_id = assignment.resolved_host_id
         conn = self._host_registry.get(host_id)
@@ -1202,30 +1204,27 @@ class AssignmentCoordinator:
         if assignment.state == "succeeded":
             started, idle_seen = self._release_holds.get(assignment.id, (now, None))
             start = (attempt.ended_at if attempt is not None else None) or started
-            if now - start >= _TURN_END_GRACE_S:
-                self._release_holds.pop(assignment.id, None)
-            elif _session_mid_turn(conv):
-                self._release_holds[assignment.id] = (started, None)
-                await asyncio.to_thread(
-                    self._assignment_store.reschedule,
-                    assignment.id,
-                    expected_state=assignment.state,
-                    expected_active_attempt_id=assignment.active_attempt_id,
-                    next_check_at=now + _ACTIVE_CHECK_S,
-                )
-                return
-            elif idle_seen is None or now - idle_seen < _ACTIVE_CHECK_S:
-                self._release_holds[assignment.id] = (started, idle_seen or now)
-                await asyncio.to_thread(
-                    self._assignment_store.reschedule,
-                    assignment.id,
-                    expected_state=assignment.state,
-                    expected_active_attempt_id=assignment.active_attempt_id,
-                    next_check_at=now + _ACTIVE_CHECK_S,
-                )
-                return
-            else:
-                self._release_holds.pop(assignment.id, None)
+            if now - start < _TURN_END_GRACE_S:
+                if _session_mid_turn(conv):
+                    self._release_holds[assignment.id] = (started, None)
+                    await asyncio.to_thread(
+                        self._assignment_store.reschedule,
+                        assignment.id,
+                        expected_state=assignment.state,
+                        expected_active_attempt_id=assignment.active_attempt_id,
+                        next_check_at=now + _ACTIVE_CHECK_S,
+                    )
+                    return
+                if idle_seen is None or now - idle_seen < _ACTIVE_CHECK_S:
+                    self._release_holds[assignment.id] = (started, idle_seen or now)
+                    await asyncio.to_thread(
+                        self._assignment_store.reschedule,
+                        assignment.id,
+                        expected_state=assignment.state,
+                        expected_active_attempt_id=assignment.active_attempt_id,
+                        next_check_at=now + _ACTIVE_CHECK_S,
+                    )
+                    return
         if attempt is not None:
             if conv is not None and session_id is not None:
                 await asyncio.to_thread(
@@ -1349,13 +1348,15 @@ class AssignmentCoordinator:
             )
             return
         if result.status == "ok":
-            await asyncio.to_thread(
+            released = await asyncio.to_thread(
                 self._assignment_store.reschedule,
                 assignment.id,
                 expected_state=assignment.state,
                 expected_active_attempt_id=assignment.active_attempt_id,
                 next_check_at=None,
             )
+            if released is not None:
+                self._release_holds.pop(assignment.id, None)
             return
         if result.status == "partial":
             parts = []
@@ -1376,13 +1377,15 @@ class AssignmentCoordinator:
                     idempotency_key=None,
                 ),
             )
-            await asyncio.to_thread(
+            released = await asyncio.to_thread(
                 self._assignment_store.reschedule,
                 assignment.id,
                 expected_state=assignment.state,
                 expected_active_attempt_id=assignment.active_attempt_id,
                 next_check_at=None,
             )
+            if released is not None:
+                self._release_holds.pop(assignment.id, None)
             return
         _logger.warning("Assignment release returned %r for %s", result.status, assignment.id)
         await asyncio.to_thread(
@@ -1410,13 +1413,15 @@ class AssignmentCoordinator:
                 idempotency_key=None,
             ),
         )
-        await asyncio.to_thread(
+        released = await asyncio.to_thread(
             self._assignment_store.reschedule,
             assignment.id,
             expected_state=assignment.state,
             expected_active_attempt_id=assignment.active_attempt_id,
             next_check_at=None,
         )
+        if released is not None:
+            self._release_holds.pop(assignment.id, None)
 
     async def _place(
         self,
