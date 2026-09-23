@@ -1,0 +1,8 @@
+spec_version: 1
+name: claude-sdk
+description: Claude in chat using the host Claude login and default model.
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+instructions: You are a coding assistant. Help the user complete their task.
