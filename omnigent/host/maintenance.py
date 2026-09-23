@@ -247,7 +247,7 @@ def sweep_runner_logs(
     *,
     live_paths: Collection[Path] = (),
     now: float | None = None,
-    on_rotated: Callable[[Path, int, tuple[int, int]], None] | None = None,
+    on_rotated: Callable[[Path, int, tuple[int, int]], object] | None = None,
 ) -> dict[str, int]:
     """Apply the runner-log retention policy to *log_dir*.
 
@@ -499,7 +499,7 @@ class HostMaintenanceJanitor:
         *,
         harness_tmp_parent: Path | None = None,
         live_runner_log_paths: Callable[[], Collection[Path]] | None = None,
-        on_runner_log_rotated: Callable[[Path, int, tuple[int, int]], None] | None = None,
+        on_runner_log_rotated: Callable[[Path, int, tuple[int, int]], object] | None = None,
     ) -> HostMaintenanceJanitor:
         """Build the machine-global cleanup stages for a host daemon.
 
