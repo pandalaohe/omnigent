@@ -256,6 +256,7 @@ import {
   CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   CLAUDE_NATIVE_PERMISSION_MODES,
 } from "@/lib/claudePermissionMode";
+import { sdkInitialPermissionMode, sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import {
   AGY_NATIVE_DEFAULT_SKIP_MODE,
   AGY_NATIVE_SKIP_MODES,
@@ -3597,6 +3598,8 @@ export function NewChatLandingScreen() {
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
+      const sdkModes = sdkPermissionOptions(sdkHarness);
+      const sdkMode = sdkHarness === "claude-sdk" ? permissionMode : approvalMode;
       return [
         { label: "SDK", value: brainHarnessLabelsAll[active] ?? active },
         ...(sdkHarness
@@ -3615,6 +3618,14 @@ export function NewChatLandingScreen() {
               },
               ...(pickedEffort
                 ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }]
+                : []),
+              ...(sdkModes
+                ? [
+                    {
+                      label: "Permission mode",
+                      value: sdkModes.find((mode) => mode.value === sdkMode)?.label ?? sdkMode,
+                    },
+                  ]
                 : []),
               ...sourceRows(sdkModelOptions),
             ]
@@ -4164,20 +4175,28 @@ export function NewChatLandingScreen() {
   );
   const directModeOptions = smartRoutingHarnessSelected
     ? []
-    : supportsPermissionMode
-      ? CLAUDE_NATIVE_PERMISSION_MODES
-      : supportsApprovalMode
-        ? selectedNativeHarness === "codex-native"
-          ? codexCreateApprovalOptions()
-          : CODEX_NATIVE_APPROVAL_MODES
-        : supportsCursorMode
-          ? CURSOR_NATIVE_EXEC_MODES
-          : supportsAgySkipPermissions
-            ? AGY_NATIVE_SKIP_MODES
-            : supportsDevinPermission
-              ? DEVIN_NATIVE_PERMISSION_MODES
-              : [];
+    : sdkHarness !== null
+      ? (sdkPermissionOptions(sdkHarness) ?? [])
+      : supportsPermissionMode
+        ? CLAUDE_NATIVE_PERMISSION_MODES
+        : supportsApprovalMode
+          ? selectedNativeHarness === "codex-native"
+            ? codexCreateApprovalOptions()
+            : CODEX_NATIVE_APPROVAL_MODES
+          : supportsCursorMode
+            ? CURSOR_NATIVE_EXEC_MODES
+            : supportsAgySkipPermissions
+              ? AGY_NATIVE_SKIP_MODES
+              : supportsDevinPermission
+                ? DEVIN_NATIVE_PERMISSION_MODES
+                : [];
   const selectDirectMode = (mode: string) => {
+    if (sdkHarness !== null) {
+      if (sdkHarness === "claude-sdk") setPermissionMode(mode);
+      else setApprovalMode(mode);
+      rememberPickerOptions(sdkHarness, { mode });
+      return;
+    }
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
     else if (supportsApprovalMode) {
@@ -4286,6 +4305,10 @@ export function NewChatLandingScreen() {
         ? projectDefaultModel
         : null;
     if (sdkHarness !== null) {
+      const sdkModes = sdkPermissionOptions(sdkHarness)!;
+      const sdkMode = resolve(sdkModes, sdkInitialPermissionMode(sdkHarness)!);
+      if (sdkHarness === "claude-sdk") setPermissionMode(sdkMode);
+      else setApprovalMode(sdkMode);
       const model =
         stored.model != null &&
         (hostSdkModelOptions === undefined ||
@@ -5749,6 +5772,8 @@ export function NewChatLandingScreen() {
               // The SDK catalog's default belongs to the host, not the bound agent.
               llmModel: sdkHarness !== null ? null : resolvedDefaultModel,
               reasoningEffort: normalizedReasoningEffort,
+              claudePermissionMode: sdkHarness === "claude-sdk" ? permissionMode : undefined,
+              codexApprovalMode: sdkHarness === "codex" ? approvalMode : undefined,
               // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
               // usually-null pickedHarness for a native agent — so the temp page
               // adapter can re-derive the native model/effort/permission identity.
@@ -5860,6 +5885,8 @@ export function NewChatLandingScreen() {
             // harness keeps its own configured/default value.
             model_override: normalizedModelOverride ?? undefined,
             reasoning_effort: normalizedReasoningEffort ?? undefined,
+            ...(sdkHarness === "claude-sdk" ? { permission_mode: permissionMode } : {}),
+            ...(sdkHarness === "codex" ? { approval_mode: approvalMode } : {}),
             cost_control_mode_override: costControlOverride,
             // Top-level Smart Routing sends the same "auto" sentinel the bundle
             // path does; the server tells them apart by the bound agent being a
@@ -5937,9 +5964,9 @@ export function NewChatLandingScreen() {
       if (!smartRoutingHarnessSelected && !customTemplate) {
         const launchedOptions = createdHarnessOptions({
           harness: selectionHarness,
-          supportsPermissionMode: agentSupportsPermissionMode,
+          supportsPermissionMode: agentSupportsPermissionMode || sdkHarness === "claude-sdk",
           supportsDevinMode,
-          supportsApprovalMode: agentSupportsApprovalMode,
+          supportsApprovalMode: agentSupportsApprovalMode || sdkHarness === "codex",
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker:
@@ -7158,21 +7185,25 @@ export function NewChatLandingScreen() {
                       <ComposerPermissionPicker
                         label={visiblePermissionRow.label}
                         value={visiblePermissionRow.value}
-                        harness={selectedNativeHarness}
+                        harness={selectionHarness}
                         selectedValue={
-                          selectedNativeHarness === "claude-native"
+                          sdkHarness === "claude-sdk"
                             ? permissionMode
-                            : selectedNativeHarness === "codex-native"
-                              ? bypassSandbox
-                                ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
-                                : approvalMode
-                              : selectedNativeHarness === "cursor-native"
-                                ? cursorExecMode
-                                : selectedNativeHarness === "antigravity-native"
-                                  ? agySkipMode
-                                  : selectedNativeHarness === "devin-native"
-                                    ? devinPermissionMode
-                                    : undefined
+                            : sdkHarness === "codex"
+                              ? approvalMode
+                              : selectedNativeHarness === "claude-native"
+                                ? permissionMode
+                                : selectedNativeHarness === "codex-native"
+                                  ? bypassSandbox
+                                    ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+                                    : approvalMode
+                                  : selectedNativeHarness === "cursor-native"
+                                    ? cursorExecMode
+                                    : selectedNativeHarness === "antigravity-native"
+                                      ? agySkipMode
+                                      : selectedNativeHarness === "devin-native"
+                                        ? devinPermissionMode
+                                        : undefined
                         }
                         loading={pickerLoading}
                         interactiveWhileLoading={interactiveWhileLoading}

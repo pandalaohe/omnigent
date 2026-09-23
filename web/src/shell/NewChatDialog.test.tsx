@@ -10515,6 +10515,68 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     );
   }
 
+  it.each([
+    ["Claude SDK", "claude-sdk", "Auto", "permission_mode", "auto"],
+    ["Codex", "codex", "Default", "approval_mode", "default"],
+  ])("shows and sends the %s permission default", async (label, harness, chip, field, mode) => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: `conv_${harness}_permission` }),
+    } as Response);
+    renderLanding();
+    if (harness === "codex") {
+      openAgentConfig("ag_debby");
+      pickSelectOption("new-chat-landing-config-harness", label);
+      saveConfig();
+    }
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      `Permission mode: ${chip}`,
+    );
+    openPermissions();
+    expect(screen.getByTestId("new-chat-landing-permission-option-default")).toBeVisible();
+    if (harness === "claude-sdk") {
+      expect(
+        screen.getByTestId("new-chat-landing-permission-option-bypassPermissions"),
+      ).toBeVisible();
+    } else {
+      expect(screen.getByTestId("new-chat-landing-permission-option-read-only")).toBeVisible();
+    }
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.harness_override).toBe(harness === "codex" ? "codex" : undefined);
+    expect(body[field]).toBe(mode);
+  });
+
+  it("keeps SDK permission picks separate when switching the Agent SDK harness", async () => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_permission_pick" }),
+    } as Response);
+    renderLanding();
+    pickPermissionOption("bypassPermissions");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Bypass permissions",
+    );
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Codex");
+    saveConfig();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Default",
+    );
+    pickPermissionOption("read-only");
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Claude SDK");
+    saveConfig();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Bypass permissions",
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.permission_mode).toBe("bypassPermissions");
+    expect(body.approval_mode).toBeUndefined();
+  });
+
   it("pins the Codex SDK host default row and its advertised Ultra effort", async () => {
     mockSdkModels();
     authenticatedFetchMock.mockResolvedValue({

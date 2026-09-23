@@ -4,7 +4,10 @@ import {
   modelPickerKindForConv,
   shouldShowEffortPicker,
   shouldShowModelPicker,
+  shouldShowPermissionModeControl,
+  shouldShowCodexApprovalModeControl,
 } from "./ChatPage";
+import { sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 
 // These pin the composer capability gates (effort levels, model picker, effort
 // picker). Wrapper labels are authoritative; the resolved harness is the fallback
@@ -13,6 +16,43 @@ import {
 // Other label-less harnesses still fail closed, as does a native sub-agent child.
 
 const NATIVE = "claude-code-native-ui";
+
+describe("permission controls", () => {
+  it("offers SDK modes for unwrapped SDK sessions and keeps native gates", () => {
+    const claude = { labels: {}, harness: "claude-sdk" };
+    const codex = { labels: {}, harness: "codex" };
+    expect(shouldShowPermissionModeControl(claude)).toBe(true);
+    expect(shouldShowCodexApprovalModeControl(claude)).toBe(false);
+    expect(sdkPermissionOptions(claude.harness)?.map((mode) => mode.value)).toEqual([
+      "default",
+      "auto",
+      "acceptEdits",
+      "plan",
+      "dontAsk",
+      "bypassPermissions",
+    ]);
+    expect(shouldShowCodexApprovalModeControl(codex)).toBe(true);
+    expect(shouldShowPermissionModeControl(codex)).toBe(false);
+    expect(sdkPermissionOptions(codex.harness)?.map((mode) => mode.value)).toEqual([
+      "default",
+      "full-access",
+      "read-only",
+    ]);
+    expect(shouldShowPermissionModeControl({ labels: { "omnigent.wrapper": NATIVE } })).toBe(true);
+    expect(
+      shouldShowCodexApprovalModeControl({ labels: { "omnigent.wrapper": "codex-native-ui" } }),
+    ).toBe(true);
+    expect(shouldShowPermissionModeControl({ ...claude, inferenceConfigured: true })).toBe(false);
+    expect(shouldShowCodexApprovalModeControl({ ...codex, inferenceConfigured: true })).toBe(false);
+    expect(
+      shouldShowPermissionModeControl({
+        harness: "claude-sdk",
+        labels: { "omnigent.wrapper": "other" },
+      }),
+    ).toBe(false);
+    expect(sdkPermissionOptions("other")).toBeNull();
+  });
+});
 
 describe("effortLevelsForConv", () => {
   it("returns the extended ladder (xhigh, max) for claude-code-native-ui", () => {

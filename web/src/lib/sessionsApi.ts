@@ -1076,6 +1076,7 @@ export async function updateSession(
      * (see `CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES`), and the PATCH
      * fails if the live TUI didn't actually land on it — so a resolved
      * promise means the mode really changed.
+     * Claude SDK sessions accept any launch mode, applied from the next turn.
      */
     claudePermissionMode?: string;
     /**
@@ -1085,6 +1086,8 @@ export async function updateSession(
      * Rejected by the server unless the session is codex-native, and the PATCH
      * fails unless the runner confirms Codex applied it via its `/permissions`
      * popup — so a resolved promise means the mode really changed.
+     * Codex SDK sessions accept `"default"`, `"full-access"`, or
+     * `"read-only"`, applied from the next turn.
      */
     codexApprovalMode?: string;
     costControlModeOverride?: "on" | "off" | null;

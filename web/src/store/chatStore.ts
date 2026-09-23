@@ -138,6 +138,7 @@ import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
+import { sdkPermissionModeFromSession } from "@/lib/sdkPermissionModes";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
@@ -307,6 +308,8 @@ export interface OptimisticSessionModel {
   llmModel?: string | null;
   /** The `reasoning_effort` the create POSTs, or `null`. */
   reasoningEffort?: string | null;
+  claudePermissionMode?: string;
+  codexApprovalMode?: string;
   /** Normalized brain/session harness (e.g. `"claude-sdk"`), NOT the picker's
    *  `*-native` id. Omit when unknown; the composer tolerates a null harness. */
   harness?: string | null;
@@ -367,6 +370,12 @@ export function beginLocalConversation(
           sessionModelOverride: model.modelOverride,
           sessionModelSeeded: true,
           sessionReasoningEffort: model.reasoningEffort ?? null,
+          ...(model.claudePermissionMode !== undefined
+            ? { claudePermissionMode: model.claudePermissionMode }
+            : {}),
+          ...(model.codexApprovalMode !== undefined
+            ? { codexApprovalMode: model.codexApprovalMode }
+            : {}),
           boundAgentId: model.boundAgentId ?? null,
           boundAgentName: model.boundAgentName ?? null,
           sessionHostId: model.hostId ?? null,
@@ -3045,11 +3054,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
-    // pane landed on — which may differ from what was asked.
+    // pane landed on (or, for SDK sessions, stored) — which may differ from
+    // what was asked.
     patchSet({ claudePermissionMode: mode });
     try {
       const session = await updateSession(conversationId, { claudePermissionMode: mode });
-      patchSet({ claudePermissionMode: claudePermissionModeFromSession(session) ?? "" });
+      patchSet({
+        claudePermissionMode:
+          sdkPermissionModeFromSession(session, "claude-sdk") ??
+          claudePermissionModeFromSession(session) ??
+          "",
+      });
     } catch (err) {
       patchSet({ claudePermissionMode: previous });
       throw err;
@@ -3063,11 +3078,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
-    // Codex thread landed on.
+    // Codex thread landed on (or, for SDK sessions, stored).
     patchSet({ codexApprovalMode: mode });
     try {
       const session = await updateSession(conversationId, { codexApprovalMode: mode });
-      patchSet({ codexApprovalMode: codexApprovalModeFromSession(session) ?? "" });
+      patchSet({
+        codexApprovalMode:
+          sdkPermissionModeFromSession(session, "codex") ??
+          codexApprovalModeFromSession(session) ??
+          "",
+      });
     } catch (err) {
       patchSet({ codexApprovalMode: previous });
       throw err;
@@ -3846,12 +3866,12 @@ function sessionBindingPatch(
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
-    claudePermissionMode: isNativeTerminalSessionFn(session)
-      ? (claudePermissionModeFromSession(session) ?? "")
-      : "",
-    codexApprovalMode: isCodexNativeSession(session)
-      ? (codexApprovalModeFromSession(session) ?? "")
-      : "",
+    claudePermissionMode:
+      sdkPermissionModeFromSession(session, "claude-sdk") ??
+      (isNativeTerminalSessionFn(session) ? (claudePermissionModeFromSession(session) ?? "") : ""),
+    codexApprovalMode:
+      sdkPermissionModeFromSession(session, "codex") ??
+      (isCodexNativeSession(session) ? (codexApprovalModeFromSession(session) ?? "") : ""),
     contextWindow: session.contextWindow ?? null,
     autoCompactTokenLimit: session.autoCompactTokenLimit ?? null,
     providerUsageLimits: session.providerUsageLimits ?? null,

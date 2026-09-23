@@ -283,6 +283,7 @@ import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { isSdkHarnessSession, supportsEffortControl } from "@/lib/sessionCapabilities";
+import { sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
@@ -3025,17 +3026,23 @@ function ComposerImpl(
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
   const devinPermissionControl = modelPickerKind === "devin";
-  const permissionOptions = showClaudePermissionMode
-    ? devinPermissionControl
-      ? DEVIN_NATIVE_PERMISSION_MODES
-      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
-    : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
+  const sdkPermissionControl = modelPickerKind === "sdk";
+  const permissionOptions =
+    (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
+    (showClaudePermissionMode
+      ? devinPermissionControl
+        ? DEVIN_NATIVE_PERMISSION_MODES
+        : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+      : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS);
   const permissionLabel = showClaudePermissionMode
     ? devinPermissionControl
       ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
         claudePermissionMode)
       : claudePermissionModeLabel(claudePermissionMode)
-    : codexApprovalModeLabel(codexApprovalMode);
+    : sdkPermissionControl
+      ? (permissionOptions.find((mode) => mode.value === codexApprovalMode)?.label ??
+        codexApprovalMode)
+      : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
     if (isReadOnly || unreachable || configBusyRef.current) return;
     configBusyRef.current = true;
@@ -4973,37 +4980,55 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
- * True when the claude-native permission-mode picker should be visible.
+ * True when the Claude permission-mode picker should be visible.
  *
- * Claude-native sessions only: the switch drives Claude Code's own
- * shift+tab cycle, which no other harness has.
+ * Native Claude switches through its shift+tab cycle; Claude SDK updates
+ * the session's next-turn permission mode.
  *
- * :param conv: Session-like object carrying `labels`; a missing session
- *     or missing labels fails closed.
- * :returns: True only for sessions running the claude-native wrapper.
+ * :param conv: Session-like object carrying its harness and labels;
+ *     a missing session fails closed.
+ * :returns: True for native Claude, Claude SDK, and Devin sessions.
  */
 export function shouldShowPermissionModeControl(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        inferenceConfigured?: boolean;
+      }
+    | null
+    | undefined,
 ): boolean {
   // Devin cycles its own rungs with Shift+Tab, which the runner drives, so it
   // gets the same control — with its own vocabulary (see `permissionOptions`).
-  return isClaudeNativeSession(conv) || modelPickerKindForConv(conv) === "devin";
+  return (
+    isClaudeNativeSession(conv) ||
+    modelPickerKindForConv(conv) === "devin" ||
+    (isSdkHarnessSession(conv) && conv?.harness === "claude-sdk")
+  );
 }
 
 /**
- * True when the codex-native approval-mode picker should be visible.
+ * True when the Codex approval-mode picker should be visible.
  *
- * Codex-native sessions only: the switch drives Codex's own approval/sandbox
- * presets (the ``/permissions`` popup), which no other harness has.
+ * Native Codex drives its ``/permissions`` popup; Codex SDK updates the
+ * session's next-turn approval mode.
  *
- * :param conv: Session-like object carrying `labels`; a missing session or
- *     missing labels fails closed.
- * :returns: True only for sessions running the codex-native wrapper.
+ * :param conv: Session-like object carrying its harness and labels;
+ *     a missing session fails closed.
+ * :returns: True for native Codex or Codex SDK sessions.
  */
 export function shouldShowCodexApprovalModeControl(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        inferenceConfigured?: boolean;
+      }
+    | null
+    | undefined,
 ): boolean {
-  return isCodexNativeSession(conv);
+  return isCodexNativeSession(conv) || (isSdkHarnessSession(conv) && conv?.harness === "codex");
 }
 
 /**
