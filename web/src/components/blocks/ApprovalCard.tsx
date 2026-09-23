@@ -40,6 +40,7 @@ import {
   ExternalLinkIcon,
   InfoIcon,
   MessageCircleQuestionMark,
+  SquareIcon,
   TerminalIcon,
   XIcon,
 } from "lucide-react";
@@ -226,7 +227,7 @@ export function ApprovalCard({
         void store.submitApproval(id, action, content, meta);
       }
     });
-  // Abort the question and the turn it blocks. Offered only where the
+  // Abort the elicitation and the turn it blocks. Offered only where the
   // producer stamped ``interruptible`` (its cancel verdict stops the turn with
   // no further model request) and only on the in-chat path: the Inbox renders
   // cards for other sessions behind its own submitter.
@@ -442,6 +443,20 @@ export function ApprovalCard({
         <XIcon className="mr-1 size-3.5" />
         Reject
       </Button>
+      {abortTurn && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={abortTurn}
+          componentId="approval.abort"
+          aria-label="Reject & interrupt"
+          title="Reject & interrupt"
+        >
+          <SquareIcon className="mr-1 size-3.5" />
+          <span className="max-sm:hidden">Reject &amp; interrupt</span>
+          <span className="sm:hidden">Interrupt</span>
+        </Button>
+      )}
     </div>
   );
   const codexCommandButtons = (
@@ -669,6 +684,7 @@ export function ApprovalCard({
               onAcceptAuto={submitAllowAllEdits}
               onAccept={() => submitBinary("accept")}
               onReject={submitPlanRejection}
+              onAbort={abortTurn}
             />
           </>
         ) : isAskUserQuestion ? (

@@ -254,6 +254,37 @@ async def test_permission_request_hook_cancel_interrupt_is_claude_only(
     }
 
 
+async def test_permission_request_hook_bash_cancel_interrupts_claude(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        "test-permission-bash-interrupt",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("Bash")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert event["params"]["interruptible"] is True
+    verdict = await _post_approval(
+        client, session_id, event["elicitation_id"], "cancel", meta={"interrupt": True}
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "deny",
+        "interrupt": True,
+    }
+
+
 @pytest.mark.parametrize("tool_name", ["Bash", "Write", "AskUserQuestion", "ExitPlanMode"])
 @pytest.mark.parametrize("action", ["accept", "decline"])
 @pytest.mark.parametrize(

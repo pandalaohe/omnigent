@@ -200,6 +200,43 @@ describe("ApprovalCard — binary approve/reject", () => {
   });
 });
 
+describe("ApprovalCard — Claude permission interrupt", () => {
+  const props = {
+    elicitationId: "elic_bash_abort",
+    message: "Claude wants to call **Bash**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"git status"})',
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("offers Reject & interrupt after Reject and calls declineAndInterrupt", () => {
+    const original = useChatStore.getState().declineAndInterrupt;
+    const abortSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ declineAndInterrupt: abortSpy });
+    try {
+      const { rerender } = render(<ApprovalCard {...props} interruptible />);
+
+      const abort = screen.getByRole("button", { name: "Reject & interrupt" });
+      expect(abort.previousElementSibling).toBe(screen.getByRole("button", { name: "Reject" }));
+      expect(abort).toHaveAttribute("aria-label", "Reject & interrupt");
+      expect(abort).toHaveAttribute("title", "Reject & interrupt");
+      expect(screen.getByText("Interrupt")).toBeDefined();
+      fireEvent.click(abort);
+
+      expect(abortSpy).toHaveBeenCalledExactlyOnceWith("elic_bash_abort", undefined);
+      rerender(<ApprovalCard {...props} interruptible={false} />);
+      expect(screen.queryByRole("button", { name: "Reject & interrupt" })).toBeNull();
+      rerender(<ApprovalCard {...props} interruptible onSubmit={vi.fn()} />);
+      expect(screen.queryByRole("button", { name: "Reject & interrupt" })).toBeNull();
+    } finally {
+      useChatStore.setState({ declineAndInterrupt: original });
+    }
+  });
+});
+
 describe("ApprovalCard — approve & switch to auto mode", () => {
   const props = {
     elicitationId: "elic_auto",
@@ -1376,6 +1413,40 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
 
   beforeEach(() => {
     useChatStore.setState({ conversationId: "conv_abc", blocks: [] });
+  });
+
+  it("offers Reject & interrupt beside the plan reject action", () => {
+    const original = useChatStore.getState().declineAndInterrupt;
+    const abortSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ declineAndInterrupt: abortSpy });
+    try {
+      render(
+        <ApprovalCard
+          elicitationId="elic_plan_abort"
+          status="pending"
+          response={null}
+          {...planProps}
+          interruptible
+        />,
+      );
+
+      const abort = screen.getByRole("button", { name: "Reject & interrupt" });
+      expect(abort.previousElementSibling).toBe(
+        screen.getByRole("button", { name: "Reject with feedback" }),
+      );
+      expect(abort).toHaveAttribute("aria-label", "Reject & interrupt");
+      expect(abort).toHaveAttribute("title", "Reject & interrupt");
+      fireEvent.click(screen.getByRole("button", { name: "Reject with feedback" }));
+      const feedbackAbort = screen.getByRole("button", { name: "Reject & interrupt" });
+      expect(feedbackAbort.previousElementSibling).toBe(
+        screen.getByRole("button", { name: "Reject plan" }),
+      );
+      fireEvent.click(feedbackAbort);
+
+      expect(abortSpy).toHaveBeenCalledExactlyOnceWith("elic_plan_abort", undefined);
+    } finally {
+      useChatStore.setState({ declineAndInterrupt: original });
+    }
   });
 
   it("renders the plan as markdown with the three plan-review actions", async () => {

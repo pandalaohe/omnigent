@@ -19,7 +19,7 @@
 // as assistant chat bubbles, so file paths and file links a plan names
 // open in the FileViewer just as they do in a message.
 
-import { CheckIcon, XIcon, ZapIcon } from "lucide-react";
+import { CheckIcon, SquareIcon, XIcon, ZapIcon } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
@@ -34,6 +34,7 @@ interface ExitPlanModeReviewProps {
   onAccept: () => void;
   /** Reject; `feedback` is the user's typed revision guidance (`""` when none). */
   onReject: (feedback: string) => void;
+  onAbort?: () => void;
 }
 
 export function ExitPlanModeReview({
@@ -41,9 +42,24 @@ export function ExitPlanModeReview({
   onAcceptAuto,
   onAccept,
   onReject,
+  onAbort,
 }: ExitPlanModeReviewProps) {
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
+  const abortButton = onAbort && (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={onAbort}
+      componentId="plan.abort"
+      aria-label="Reject & interrupt"
+      title="Reject & interrupt"
+    >
+      <SquareIcon className="mr-1 size-3.5" />
+      <span className="max-sm:hidden">Reject &amp; interrupt</span>
+      <span className="sm:hidden">Interrupt</span>
+    </Button>
+  );
 
   return (
     <div className="flex flex-col gap-2" data-testid="exit-plan-mode-review">
@@ -70,6 +86,7 @@ export function ExitPlanModeReview({
               <XIcon className="mr-1 size-3.5" />
               Reject plan
             </Button>
+            {abortButton}
             <Button size="sm" variant="ghost" onClick={() => setRejecting(false)}>
               Cancel
             </Button>
@@ -89,6 +106,7 @@ export function ExitPlanModeReview({
             <XIcon className="mr-1 size-3.5" />
             Reject with feedback
           </Button>
+          {abortButton}
         </div>
       )}
     </div>
