@@ -256,6 +256,7 @@ export interface ElicitationRequest {
    * mode switch is meaningful.
    */
   allowAllEdits?: boolean;
+  interruptible?: boolean;
   /**
    * Producer-supplied extra (eligible claude-native tool prompts): when
    * true, the ApprovalCard offers "Approve & switch to auto mode" —

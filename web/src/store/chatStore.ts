@@ -1086,12 +1086,7 @@ export interface ChatActions {
     agentId: string,
     opts?: SendOptions,
   ) => Promise<void>;
-  // The conversation to interrupt. Omitted targets the active one; a
-  // side-chat card passes its child id so the child's turn is the one cut.
-  stop: (conversationId?: string) => Promise<void>;
-  // Abort a pending question outright: decline it, then interrupt the turn
-  // it blocks, leaving the session alive. See the implementation for why the
-  // two must run in this order.
+  stop: () => Promise<void>;
   declineAndInterrupt: (elicitationId: string, conversationId?: string) => Promise<void>;
   switchTo: (conversationId: string | null) => Promise<void>;
   submitApproval: (
@@ -2417,8 +2412,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  stop: async (conversationId) => {
-    const sessionId = conversationId ?? get().conversationId;
+  stop: async () => {
+    const sessionId = get().conversationId;
     if (!sessionId || interruptRequestsInFlight.has(sessionId)) return;
     interruptRequestsInFlight.add(sessionId);
     // Keep the stream and lifecycle state live until the server confirms that
@@ -2440,27 +2435,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   declineAndInterrupt: async (elicitationId, conversationId) => {
-    // Resolve the turn to cut BEFORE anything awaits. It is the question's
-    // own session — a sub-agent's card is rendered in the parent's chat but
-    // the blocked turn is the child's, so the active conversation is the
-    // wrong target. Reading it after the await would also let a navigation
-    // mid-POST redirect the interrupt into whatever chat is now open.
-    const target =
-      elicitationTargetSession(elicitationId, conversationId) ??
-      conversationId ??
-      get().conversationId;
-    if (!target) return;
-    // Decline FIRST and await it. The decline is what resolves the parked
-    // hook wait, so the agent learns the question was refused and the card
-    // flips to a verdict. Interrupting first would sever that wait with no
-    // answer, leaving the question to the server's deferred clear — the
-    // card would read as unanswered rather than declined, which is the
-    // ambiguity this control exists to remove.
-    await get().submitApproval(elicitationId, "cancel", undefined, undefined, conversationId);
-    // Then cut the turn. ``stop`` posts an interrupt, never a session
-    // stop: for claude-native the latter hard-kills the tmux pane, and
-    // this control must leave the session alive.
-    await get().stop(target);
+    // One verdict, no Ctrl+C: the server turns it into a deny that carries
+    // Claude's hook ``interrupt``, so the harness ends the turn itself. A
+    // Ctrl+C sent after a deny arrives only once the agent has already made
+    // its next model request — the cost this control exists to avoid.
+    await get().submitApproval(
+      elicitationId,
+      "cancel",
+      undefined,
+      { interrupt: true },
+      conversationId,
+    );
   },
 
   switchTo: async (conversationId) => {

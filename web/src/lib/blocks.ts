@@ -675,6 +675,7 @@ export interface ElicitationBlock {
    * switch is a no-op.
    */
   allowAllEdits?: boolean;
+  interruptible?: boolean;
   /**
    * Eligible Claude-native tool prompts: when true, the card offers an
    * "Approve & switch to auto mode" button (accept + session-scoped
