@@ -805,6 +805,55 @@ class _ProcessWithStdout:
         return self.stdout, self.stderr
 
 
+@pytest.mark.parametrize("failure", ["cancel", "error"])
+async def test_tmux_reaps_client_when_communication_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    class _HangingClient:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.killed = 0
+            self.waited = 0
+            self.exited = asyncio.Event()
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            if failure == "error":
+                raise OSError(errno.EIO, "communication failed")
+            await asyncio.Event().wait()
+            return b"", b""
+
+        def kill(self) -> None:
+            self.killed += 1
+            self.returncode = -9
+            self.exited.set()
+
+        async def wait(self) -> int | None:
+            self.waited += 1
+            await self.exited.wait()
+            return self.returncode
+
+    client = _HangingClient()
+
+    async def spawn(*_cmd: str, **_kwargs: object) -> _HangingClient:
+        return client
+
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", spawn)
+    instance = TerminalInstance(
+        name="bash", session_key="s1", socket_path=tmp_path / "tmux.sock", private_dir=tmp_path
+    )
+
+    if failure == "error":
+        with pytest.raises(OSError, match="communication failed"):
+            await instance._tmux("kill-server")
+    else:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(instance._tmux("kill-server"), timeout=0.01)
+    assert client.killed == 1
+    assert client.waited == 1
+    assert client.returncode == -9
+
+
 @pytest.mark.parametrize(
     "error_number",
     [errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOMEM, errno.EMFILE, errno.ENFILE],

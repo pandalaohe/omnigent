@@ -1728,7 +1728,8 @@ async def test_release_keeps_unconfirmed_process_registered_for_retry(
     )
     conversation_id = "conv_stuck_release"
     manager._entries[conversation_id] = entry
-    manager._retention_managed.add(conversation_id)
+    manager.manage_for_retention(conversation_id)
+    saved_expiry = manager._retention_managed[conversation_id]
     monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.001)
     monkeypatch.setattr(pm_mod._proc, "terminate_tree", lambda _process: None)
     monkeypatch.setattr(pm_mod._proc, "kill_tree", lambda _process: None)
@@ -1736,6 +1737,7 @@ async def test_release_keeps_unconfirmed_process_registered_for_retry(
     assert await manager.release(conversation_id) is False
     assert manager._entries[conversation_id] is entry
     assert conversation_id in manager._retention_managed
+    assert manager._retention_managed[conversation_id] == saved_expiry
     assert endpoint.cleanup_calls == 0
 
 
@@ -1792,6 +1794,7 @@ async def test_failed_retention_close_keeps_activity_token_retryable(
     manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
     manager._entries["conv_retry"] = entry
     manager.manage_for_retention("conv_retry")
+    saved_expiry = manager._retention_managed["conv_retry"]
     activity_token = manager._retention_activity_token("conv_retry", entry)
 
     async def _failed_close(_entry: _SubprocessEntry) -> bool:
@@ -1810,6 +1813,105 @@ async def test_failed_retention_close_keeps_activity_token_retryable(
     )
     assert manager._entries["conv_retry"] is entry
     assert manager._retention_activity_token("conv_retry", entry) == activity_token
+    assert manager._retention_managed["conv_retry"] == saved_expiry
+
+
+@pytest.mark.parametrize("release_kind", ["explicit", "retention"])
+@pytest.mark.parametrize("raises", [False, True])
+async def test_failed_harness_release_preserves_concurrent_renewal(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch, release_kind: str, raises: bool
+) -> None:
+    class _Process:
+        returncode = None
+
+    entry = _SubprocessEntry(
+        process=_Process(),  # type: ignore[arg-type]
+        client=object(),  # type: ignore[arg-type]
+        endpoint=object(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    entry.last_used_at = time.monotonic() - 120
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._entries["conv_renew"] = entry
+    manager.manage_for_retention("conv_renew")
+    saved_expiry = manager._retention_managed["conv_renew"]
+    activity_token = manager._retention_activity_token("conv_renew", entry)
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def fail(_entry: _SubprocessEntry) -> bool:
+        entered.set()
+        await resume.wait()
+        if raises:
+            raise RuntimeError("close failed")
+        return False
+
+    monkeypatch.setattr(manager, "_close_entry", fail)
+    if release_kind == "explicit":
+        releasing = asyncio.create_task(manager.release("conv_renew"))
+    else:
+        releasing = asyncio.create_task(
+            manager.release_if_retention_idle(
+                "conv_renew", idle_threshold_s=60, expected_activity_token=activity_token
+            )
+        )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    manager.manage_for_retention("conv_renew")
+    renewed_expiry = manager._retention_managed["conv_renew"]
+    resume.set()
+    if raises:
+        with pytest.raises(RuntimeError, match="close failed"):
+            await releasing
+    elif release_kind == "explicit":
+        assert await releasing is False
+    else:
+        assert await releasing == "failed"
+    assert renewed_expiry > saved_expiry
+    assert manager._entries["conv_renew"] is entry
+    assert manager._retention_managed["conv_renew"] == renewed_expiry
+
+
+async def test_expired_harness_lease_returns_to_sdk_idle_reaper(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _Process:
+        returncode = None
+
+    manager = HarnessProcessManager(
+        tmp_parent=short_tmp_parent, idle_timeout_s=1, reaper_interval_s=0.01
+    )
+    entry = _SubprocessEntry(
+        process=_Process(),  # type: ignore[arg-type]
+        client=object(),  # type: ignore[arg-type]
+        endpoint=object(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    entry.last_used_at = time.monotonic() - 7200
+    manager._entries["conv_expired"] = entry
+    started = time.monotonic()
+    manager.manage_for_retention("conv_expired")
+    released: list[_SubprocessEntry] = []
+
+    async def close(value: _SubprocessEntry) -> bool:
+        released.append(value)
+        return True
+
+    monkeypatch.setattr(manager, "_close_entry", close)
+    with caplog.at_level("INFO"):
+        with monkeypatch.context() as clock:
+            clock.setattr(time, "monotonic", lambda: started + 1260)
+            assert not manager.has_retention_managed_sessions()
+        task = asyncio.create_task(manager._idle_reaper_loop())
+        try:
+            for _ in range(100):
+                if released:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            await task
+    assert released == [entry]
+    assert sum("retention lease expired" in row.message for row in caplog.records) == 1
 
 
 async def test_release_reaps_zygote_harness_with_cancelled_exit_poller(

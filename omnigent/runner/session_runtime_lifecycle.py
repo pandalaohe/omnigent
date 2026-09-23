@@ -50,9 +50,13 @@ class SessionRuntimeLock:
             self._release(exclusive=False)
 
     @asynccontextmanager
-    async def exclusive(self) -> AsyncIterator[None]:
+    async def exclusive(self, *, timeout: float | None = None) -> AsyncIterator[None]:
         """Hold the runtime as its owner, with no user overlapping."""
-        await self._acquire(exclusive=True)
+        if timeout is None:
+            await self._acquire(exclusive=True)
+        else:
+            async with asyncio.timeout(timeout):
+                await self._acquire(exclusive=True)
         try:
             yield
         finally:
@@ -202,6 +206,13 @@ class SessionRuntimeLifecycle:
         if state.policy_revision is None or revision > state.policy_revision:
             state.policy_revision = revision
         return True
+
+    def observe_reset(self, session_id: str, *, host_id: str, revision: int) -> bool:
+        """Accept a reset only from the host currently owning this policy scope."""
+        state = self._state(session_id)
+        if state.policy_host_id is not None and state.policy_host_id != host_id:
+            return False
+        return self.observe_policy(session_id, host_id=host_id, revision=revision)
 
     def policy_matches(self, session_id: str, *, host_id: str, revision: int) -> bool:
         state = self._state(session_id)

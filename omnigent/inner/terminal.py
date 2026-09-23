@@ -78,6 +78,7 @@ _OWNER_PID_FILENAME = "owner.pid"
 # Bound for each ``tmux kill-server`` in the orphan sweep; a wedged
 # tmux must not stall runner startup.
 _REAP_KILL_TIMEOUT_S = 10.0
+_PROBE_TIMEOUT_S = 5.0
 # Literal tmux empty option value. Passing this as an argv value clears
 # status segments and window formats; it is not an application sentinel.
 _TMUX_EMPTY_OPTION_VALUE = ""
@@ -2256,6 +2257,66 @@ class TerminalInstance:
             self.running = False
             return False
 
+    async def probe_alive(self) -> bool | None:
+        """Ask tmux whether this pane is alive, without trusting advisory state."""
+        proc = None
+        try:
+            async with asyncio.timeout(_PROBE_TIMEOUT_S):
+                proc = await asyncio.create_subprocess_exec(
+                    *self._tmux_base_cmd(),
+                    "list-panes",
+                    "-t",
+                    self.tmux_target,
+                    "-F",
+                    "#{pane_dead}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+        except TimeoutError:
+            if proc is not None:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(TimeoutError, OSError):
+                    await asyncio.wait_for(proc.wait(), timeout=0.1)
+            return None
+        except OSError:
+            return None
+        if proc.returncode != 0:
+            return (
+                False
+                if _tmux_reports_target_gone(stderr.decode(errors="replace").strip())
+                else None
+            )
+        panes = stdout.decode(errors="replace").split()
+        if panes == ["0"]:
+            return True
+        if panes == ["1"]:
+            return False
+        return None
+
+    async def kill_server(self) -> None:
+        """Kill this instance's tmux server without cleaning up its socket."""
+        proc = None
+        try:
+            async with asyncio.timeout(_PROBE_TIMEOUT_S):
+                proc = await asyncio.create_subprocess_exec(
+                    *self._tmux_base_cmd(),
+                    "kill-server",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+        except TimeoutError:
+            if proc is not None:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(TimeoutError, OSError):
+                    await asyncio.wait_for(proc.wait(), timeout=0.1)
+            raise
+        if proc.returncode != 0:
+            raise RuntimeError(stderr.decode(errors="replace"))
+
     async def _pane_is_dead_async(self) -> bool | None:
         """
         Async sibling of :meth:`_pane_is_dead` for the asyncio idle watcher.
@@ -2325,7 +2386,15 @@ class TerminalInstance:
             )
         except OSError as exc:
             raise _tmux_process_start_error(cmd, exc) from exc
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await proc.communicate()
+        except BaseException:
+            if proc.returncode is None:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(TimeoutError, OSError):
+                    await asyncio.wait_for(proc.wait(), timeout=1)
+            raise
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
 

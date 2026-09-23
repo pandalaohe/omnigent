@@ -181,6 +181,7 @@ async def test_reaping_absent_pane_retires_session_pieces_without_raising(
             socket_path=tmp_path / "tmux.sock",
             close=_close,
             is_alive=_dead,
+            probe_alive=_dead,
         ),
     )
 

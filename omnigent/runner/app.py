@@ -13577,6 +13577,7 @@ def create_runner_app(
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
+            NativePaneStillAlive,
             PaneRef,
         )
 
@@ -13627,12 +13628,10 @@ def create_runner_app(
                 raise RuntimeError("native pane generation changed before retention release")
             if outcome == "close_failed":
                 raise RuntimeError("native pane close failed before retention release")
-            if (
-                outcome == "absent"
-                and pane.instance is not None
-                and await pane.instance.is_alive()
-            ):
-                raise RuntimeError("native pane still alive before retention release")
+            if outcome == "absent" and pane.instance is not None:
+                probe = await pane.instance.probe_alive()
+                if probe is not False:
+                    raise NativePaneStillAlive(pane.instance, probe)
             # ``closed`` retires without probing (we closed it). ``absent``
             # probes ground truth above: upstream pops before awaiting the
             # close, so absence alone cannot tell gone from still-alive.
@@ -13648,6 +13647,10 @@ def create_runner_app(
             list_native_panes=_native_panes_for_reaper,
             is_busy=_native_pane_is_busy,
             reap=_reap_native_pane,
+            runtime_token=_cli_runtime_lifecycle.runtime_token,
+            finish_retired=lambda conversation_id, terminal_name, token: _finish_retired(
+                conversation_id, terminal_name, token
+            ),
         )
     else:
         app.state.native_pane_reaper = None
@@ -13673,6 +13676,33 @@ def create_runner_app(
         await asyncio.to_thread(shutdown_session_router, session_id)
         forget_spawn_family(session_id)
 
+    async def _finish_retired(session_id: str, terminal_name: str, token: str) -> str | None:
+        try:
+            async with _cli_runtime_lock(session_id).exclusive(timeout=1.0):
+                if any(pane.conversation_id == session_id for pane in _native_panes_for_reaper()):
+                    return None
+                if not _cli_runtime_lifecycle.claim_reclaim(
+                    session_id, expected_runtime_token=token
+                ):
+                    return None
+                try:
+                    await _native_runtime.teardown_codex_native_app_server(session_id)
+                    _publish_terminal_deleted_event(
+                        conversation_id=session_id,
+                        terminal_name=terminal_name,
+                        session_key="main",
+                        publish_event=_publish_event,
+                    )
+                    await _finish_cli_release(session_id)
+                except Exception:
+                    _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
+                    _logger.exception("native pane retirement tail failed for %s", session_id)
+                    return _cli_runtime_lifecycle.runtime_token(session_id)
+                _cli_runtime_lifecycle.finish_reclaim(session_id)
+                return None
+        except TimeoutError:
+            return token
+
     @app.get("/v1/sessions/{session_id}/cli-retention")
     async def get_session_cli_retention(
         session_id: str,
@@ -13681,11 +13711,15 @@ def create_runner_app(
         policy_revision: int = Query(ge=0),
     ) -> JSONResponse:
         """Return an idle snapshot and hand legacy pane TTL ownership to the pool."""
-        _cli_runtime_lifecycle.observe_policy(
+        if not _cli_runtime_lifecycle.observe_policy(
             session_id,
             host_id=host_id,
             revision=policy_revision,
-        )
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={"session_id": session_id, "status": "stale_policy"},
+            )
         reaper = app.state.native_pane_reaper
         snapshot = None
         protected = _session_has_cli_retention_protection(session_id)
@@ -13772,12 +13806,19 @@ def create_runner_app(
         # Exclusive: a retention reset re-owns the runtime, so no turn, no
         # handshake and no pane creation may be mid-flight across it.
         async with _cli_runtime_lock(session_id).exclusive():
-            if not _cli_runtime_lifecycle.observe_policy(
+            if not _cli_runtime_lifecycle.observe_reset(
                 session_id, host_id=host_id, revision=policy_revision
             ):
                 return JSONResponse(
                     status_code=409,
-                    content={"session_id": session_id, "status": "stale_policy"},
+                    content={
+                        "session_id": session_id,
+                        "status": (
+                            "stale_host"
+                            if _cli_runtime_lifecycle._state(session_id).policy_host_id != host_id
+                            else "stale_policy"
+                        ),
+                    },
                 )
             reaper = app.state.native_pane_reaper
             if reaper is not None:

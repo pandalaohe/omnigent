@@ -107,6 +107,7 @@ _SOCKET_MODE = 0o600
 # deployment-level capacity knob — operators may tune; specs MUST
 # NOT depend on a specific value.
 _DEFAULT_IDLE_TIMEOUT_S = 60 * 60  # 1 hour
+RETENTION_LEASE_S = 1200
 
 # How often the idle reaper wakes up to check for stale entries.
 # Picking 1/30th of the timeout keeps reaping reasonably prompt
@@ -607,7 +608,7 @@ class HarnessProcessManager:
         self._release_generations: dict[str, int] = {}
         # Sessions governed by the Server's idle-CLI pool keep their harness
         # subprocess until an explicit overflow/archive release arrives.
-        self._retention_managed: set[str] = set()
+        self._retention_managed: dict[str, float] = {}
         # Top-level lock for ``_entries`` / ``_spawn_locks`` dict
         # mutations themselves (the entries within are guarded by
         # their per-conv locks).
@@ -645,16 +646,28 @@ class HarnessProcessManager:
         self._on_harness_respawn = hook
 
     def manage_for_retention(self, conversation_id: str) -> None:
-        """Disable the legacy harness TTL for one Server-managed session."""
-        self._retention_managed.add(conversation_id)
+        """Lease the legacy harness TTL decision to the Server pool."""
+        self._retention_managed[conversation_id] = time.monotonic() + RETENTION_LEASE_S
 
     def unmanage_for_retention(self, conversation_id: str) -> None:
         """Return one session's harness subprocess to the legacy TTL."""
-        self._retention_managed.discard(conversation_id)
+        self._retention_managed.pop(conversation_id, None)
+
+    def _retention_expiry(self, conversation_id: str) -> float | None:
+        expiry = self._retention_managed.get(conversation_id)
+        if expiry is not None and expiry <= time.monotonic():
+            self._retention_managed.pop(conversation_id, None)
+            _logger.info("harness retention lease expired for conversation %s", conversation_id)
+            return None
+        return expiry
 
     def has_retention_managed_sessions(self) -> bool:
         """Return whether a retained harness should keep its Runner alive."""
-        self._retention_managed.intersection_update(self._entries)
+        for conversation_id in list(self._retention_managed):
+            if self._retention_expiry(conversation_id) is None:
+                continue
+            if conversation_id not in self._entries:
+                self._retention_managed.pop(conversation_id, None)
         return bool(self._retention_managed)
 
     def _retention_activity_token(
@@ -704,10 +717,10 @@ class HarnessProcessManager:
             async with self._registry_lock:
                 entry = self._entries.get(conversation_id)
                 if entry is None or entry.process.returncode is not None:
-                    self._retention_managed.discard(conversation_id)
+                    self._retention_managed.pop(conversation_id, None)
                     return "absent"
                 if cli_family_for_resident_harness(entry.harness) is None:
-                    self._retention_managed.discard(conversation_id)
+                    self._retention_managed.pop(conversation_id, None)
                     return "unsupported"
                 if conversation_id in self._in_flight_response_ids:
                     entry.last_used_at = time.monotonic()
@@ -719,14 +732,19 @@ class HarnessProcessManager:
                 if time.monotonic() - entry.last_used_at < idle_threshold_s:
                     return "not_eligible"
                 released = self._entries.pop(conversation_id)
-                self._retention_managed.discard(conversation_id)
+                saved_expiry = self._retention_expiry(conversation_id)
+                self._retention_managed.pop(conversation_id, None)
             try:
                 closed = await self._close_entry(released)
             except BaseException:
                 async with self._registry_lock:
                     if conversation_id not in self._entries:
                         self._entries[conversation_id] = released
-                        self._retention_managed.add(conversation_id)
+                        if saved_expiry is not None:
+                            self._retention_managed[conversation_id] = max(
+                                saved_expiry,
+                                self._retention_managed.get(conversation_id, saved_expiry),
+                            )
                 raise
             if closed:
                 async with self._registry_lock:
@@ -737,7 +755,11 @@ class HarnessProcessManager:
             async with self._registry_lock:
                 if conversation_id not in self._entries:
                     self._entries[conversation_id] = released
-                    self._retention_managed.add(conversation_id)
+                    if saved_expiry is not None:
+                        self._retention_managed[conversation_id] = max(
+                            saved_expiry,
+                            self._retention_managed.get(conversation_id, saved_expiry),
+                        )
             return "failed"
 
     @property
@@ -1251,7 +1273,7 @@ class HarnessProcessManager:
                         current is None
                         or current.last_used_at > only_if_idle_cutoff
                         or conversation_id in self._in_flight_response_ids
-                        or conversation_id in self._retention_managed
+                        or self._retention_expiry(conversation_id) is not None
                     ):
                         _logger.info(
                             "skipping idle reap for conversation %s: entry became "
@@ -1262,8 +1284,8 @@ class HarnessProcessManager:
                 # A conditional legacy-TTL release must observe pool ownership
                 # before clearing it. Explicit releases relinquish the marker
                 # with the same registry mutation that removes the process.
-                was_retention_managed = conversation_id in self._retention_managed
-                self._retention_managed.discard(conversation_id)
+                saved_expiry = self._retention_expiry(conversation_id)
+                self._retention_managed.pop(conversation_id, None)
                 entry = self._entries.pop(conversation_id, None)
                 if entry is None:
                     self._release_generations[conversation_id] = (
@@ -1280,8 +1302,11 @@ class HarnessProcessManager:
                 async with self._registry_lock:
                     if conversation_id not in self._entries:
                         self._entries[conversation_id] = entry
-                        if was_retention_managed:
-                            self._retention_managed.add(conversation_id)
+                        if saved_expiry is not None:
+                            self._retention_managed[conversation_id] = max(
+                                saved_expiry,
+                                self._retention_managed.get(conversation_id, saved_expiry),
+                            )
                 raise
             if closed:
                 async with self._registry_lock:
@@ -1294,8 +1319,11 @@ class HarnessProcessManager:
             async with self._registry_lock:
                 if conversation_id not in self._entries:
                     self._entries[conversation_id] = entry
-                    if was_retention_managed:
-                        self._retention_managed.add(conversation_id)
+                    if saved_expiry is not None:
+                        self._retention_managed[conversation_id] = max(
+                            saved_expiry,
+                            self._retention_managed.get(conversation_id, saved_expiry),
+                        )
             return False
 
     async def shutdown(self) -> None:
@@ -1687,7 +1715,7 @@ class HarnessProcessManager:
             # Snapshot under the lock; ``release`` runs outside so I/O can't block writers.
             async with self._registry_lock:
                 for conv_id, entry in self._entries.items():
-                    if conv_id in self._retention_managed:
+                    if self._retention_expiry(conv_id) is not None:
                         continue
                     if entry.last_used_at > cutoff:
                         continue
