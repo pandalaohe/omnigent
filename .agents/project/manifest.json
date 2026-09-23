@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "identity": {"id": "omnigent"},
+  "context": ["AGENTS.md", "LOCAL_MODS.md"]
+}
