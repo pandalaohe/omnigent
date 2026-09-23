@@ -103,7 +103,6 @@ describe("RunnerLogRunawayBanner", () => {
         }],
       ]),
       { searchQuery: "", includeArchived: false },
-      row.id,
     );
     render(
       <RunnerLogRunawayBanner
