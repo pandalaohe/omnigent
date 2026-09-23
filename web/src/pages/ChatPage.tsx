@@ -59,9 +59,13 @@ import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { validateAttachments } from "@/lib/attachments";
-import { useAppShellSidebarOpen, useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
-import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import {
+  serverSwitcherHiddenForSurface,
+  useAppShellSidebarOpen,
+  useSurfaceFrontmost,
+} from "@/hooks/useNativeServerSwitcher";
 import { shouldHideNativeServerSwitcher } from "@/lib/sessionNavigationPreferences";
+import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
@@ -1738,6 +1742,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
         frontmost: surfaceFrontmost,
         sidebarOpen,
         headerMode: nativeMobileHeaderMode,
+        serverSwitcherHidden: serverSwitcherHiddenForSurface(surfaceFrontmost),
       }),
     );
   }, [nativeMobileHeaderMode, sidebarOpen, surfaceFrontmost]);

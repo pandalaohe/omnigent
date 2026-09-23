@@ -86,13 +86,42 @@ describe("isSessionInsidePollingWindow", () => {
 });
 
 describe("shouldHideNativeServerSwitcher", () => {
-  it("keeps the official switcher on the frontmost chat", () => {
+  it("uses the computed shell gate in default mode", () => {
     expect(
-      shouldHideNativeServerSwitcher({ frontmost: true, sidebarOpen: false, headerMode: "server" }),
+      shouldHideNativeServerSwitcher({
+        frontmost: true,
+        sidebarOpen: false,
+        headerMode: "server",
+        serverSwitcherHidden: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldHideNativeServerSwitcher({
+        frontmost: false,
+        sidebarOpen: true,
+        headerMode: "server",
+        serverSwitcherHidden: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("shows the default-mode switcher when the computed gate allows it", () => {
+    expect(
+      shouldHideNativeServerSwitcher({
+        frontmost: true,
+        sidebarOpen: false,
+        headerMode: "server",
+        serverSwitcherHidden: false,
+      }),
     ).toBe(false);
     expect(
-      shouldHideNativeServerSwitcher({ frontmost: false, sidebarOpen: true, headerMode: "server" }),
-    ).toBe(true);
+      shouldHideNativeServerSwitcher({
+        frontmost: false,
+        sidebarOpen: true,
+        headerMode: "server",
+        serverSwitcherHidden: false,
+      }),
+    ).toBe(false);
   });
 
   it("moves the switcher off the chat and onto the open sidebar in title mode", () => {
@@ -101,6 +130,7 @@ describe("shouldHideNativeServerSwitcher", () => {
         frontmost: true,
         sidebarOpen: false,
         headerMode: "conversation-title",
+        serverSwitcherHidden: false,
       }),
     ).toBe(true);
     expect(
@@ -108,6 +138,7 @@ describe("shouldHideNativeServerSwitcher", () => {
         frontmost: false,
         sidebarOpen: true,
         headerMode: "conversation-title",
+        serverSwitcherHidden: true,
       }),
     ).toBe(false);
   });
