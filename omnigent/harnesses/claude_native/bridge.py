@@ -226,23 +226,23 @@ _TOOL_CALL_TIMEOUT_S = 300.0
 # (session history reads, shell) tripped it and crashed the bridge.
 _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
 # Re-attempt delays for the policy-eval relay, indexed by re-attempt
-# (entry 0 spaces attempt 2). Claude Code gives a PreToolUse command hook
-# 600s by default, so PreToolUse's ~141s of waits plus the attempts fit
-# inside that budget — long enough to ride out a multi-minute DNS outage
-# instead of forcing an approval card. No other event may share it:
-# UserPromptSubmit's hook budget is 30s and a timed-out hook does not
-# block, so those waits there would turn its fail-closed into fail-open.
-# The budget below stops the re-attempts so the last one still gets ~300s
-# of the 600s hook timeout; a read that hangs without its own timeout is
-# pre-existing and not bounded here.
+# (entry 0 spaces attempt 2). PreToolUse's waits are sized to fill the
+# shared ``TOOL_CALL_POLICY_RETRY_BUDGET_S`` (imported from
+# ``omnigent.native.native_policy_hook`` where the relay reads it), and
+# that budget — not the tuple — ends the re-attempts, so the last one
+# still starts inside Claude Code's 600s default PreToolUse hook timeout.
+# Long enough to ride out a multi-minute DNS outage instead of forcing an
+# approval card. No other event may share it: UserPromptSubmit's hook
+# budget is 30s and a timed-out hook does not block, so those waits there
+# would turn its fail-closed into fail-open. A read that hangs without its
+# own timeout is pre-existing and not bounded here.
 _POLICY_EVAL_RETRY_DELAYS_S: tuple[float, ...] = (0.4, 0.4)
 _PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S: tuple[float, ...] = (
     0.4,
     0.4,
     *(8.0,) * 5,
-    *(20.0,) * 5,
+    *(20.0,) * 13,
 )
-_PRE_TOOL_USE_POLICY_EVAL_RETRY_BUDGET_S = 300.0
 # Backstop per-request threads above any expected client tool-call fan-out.
 _MAX_CONCURRENT_MCP_REQUESTS = 64
 # Web-UI → Claude input now flows through tmux send-keys, not
@@ -6389,6 +6389,7 @@ def _tool_relay_handler_factory(
             # process where these modules are already loaded.
             from omnigent.native.native_policy_hook import (
                 _PRE_TOOL_USE,
+                TOOL_CALL_POLICY_RETRY_BUDGET_S,
                 evaluation_response_to_hook_output,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
@@ -6432,8 +6433,7 @@ def _tool_relay_handler_factory(
                     delay = delays[attempt - 1]
                     if (
                         hook_event == _PRE_TOOL_USE
-                        and time.monotonic() - started_at + delay
-                        > _PRE_TOOL_USE_POLICY_EVAL_RETRY_BUDGET_S
+                        and time.monotonic() - started_at + delay > TOOL_CALL_POLICY_RETRY_BUDGET_S
                     ):
                         break
                     time.sleep(delay)

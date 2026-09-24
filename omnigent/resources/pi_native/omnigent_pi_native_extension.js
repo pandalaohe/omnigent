@@ -30,11 +30,14 @@ const _PARK_ATTEMPT_TIMEOUT_MS = 240_000;
 const _PARK_TOTAL_BUDGET_MS = 86_400_000;
 // Budget for retrying genuinely transient transport errors (connect
 // refused / reset / 5xx) before failing CLOSED. Distinct from the long park
-// budget: a server that is actually down should resolve quickly (fail
-// closed) rather than hang, so the transient-error budget is short.
-const _TRANSIENT_RETRY_BUDGET_MS = 30_000;
+// budget: a genuine outage ends here, but the window matches the Python
+// TOOL_CALL_POLICY_RETRY_BUDGET_S / _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S in
+// omnigent/native/native_policy_hook.py — this extension only ever evaluates
+// PHASE_TOOL_CALL, so it gets the long tool-call budget (a few minutes rides
+// out a DNS/server blip rather than failing an in-flight call closed).
+const _TRANSIENT_RETRY_BUDGET_MS = 300_000;
 const _TRANSIENT_RETRY_INITIAL_BACKOFF_MS = 1_000;
-const _TRANSIENT_RETRY_MAX_BACKOFF_MS = 10_000;
+const _TRANSIENT_RETRY_MAX_BACKOFF_MS = 20_000;
 // A genuine connect error (refused / reset) throws fast — well under the
 // per-attempt park timeout. A legitimate long-poll abort only throws once
 // our own _PARK_ATTEMPT_TIMEOUT_MS timer fires (the server held the

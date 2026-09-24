@@ -643,6 +643,73 @@ def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
     assert 2 <= len(posts) <= 8, "retried within the budget, then gave up"
 
 
+def test_post_evaluate_with_retry_budget_follows_the_request_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A tool-call request rides the long budget; a prompt request keeps the short one.
+
+    The phase is what tells a tool-call gate (whose harness hook timeout is
+    long) from a prompt gate (whose 30s hook budget must not be outlived).
+    Time advances only through the faked sleeps, so the assertions are on
+    how far retrying travelled, never on wall time.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+
+    def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+    attempt_times: list[float] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            attempt_times.append(clock["t"])
+            return httpx.Response(503, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x",
+        {},
+        {"event": {"type": "PHASE_TOOL_CALL"}},
+        86400.0,
+        "evaluate-policy hook",
+    )
+    assert resp is None and error is not None
+    assert max(attempt_times) > native_policy_hook._EVALUATE_POLICY_RETRY_BUDGET_S, (
+        "a tool-call gate must keep retrying past the request-phase budget"
+    )
+    assert max(attempt_times) <= native_policy_hook.TOOL_CALL_POLICY_RETRY_BUDGET_S, (
+        "and stop starting attempts once its own budget is spent"
+    )
+
+    attempt_times.clear()
+    clock["t"] = 0.0
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x",
+        {},
+        {"event": {"type": "PHASE_REQUEST"}},
+        86400.0,
+        "evaluate-policy hook",
+    )
+    assert resp is None and error is not None
+    assert max(attempt_times) <= native_policy_hook._EVALUATE_POLICY_RETRY_BUDGET_S, (
+        "a request gate must fall back inside the short budget"
+    )
+
+
 def test_post_evaluate_with_retry_reauths_on_403_invalid_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

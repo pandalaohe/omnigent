@@ -11714,13 +11714,13 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
-    # Zero the relay's re-attempt waits (same lengths): PreToolUse now sits
-    # on the long schedule, whose real waits sum to ~141s.
+    # Zero every wait so the test never sleeps; the tuple lengths mirror the
+    # live schedules (PreToolUse's fills the shared TOOL_CALL retry budget).
     monkeypatch.setattr(claude_native_bridge, "_POLICY_EVAL_RETRY_DELAYS_S", (0.0, 0.0))
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
-        (0.0,) * 11,
+        (0.0,) * len(claude_native_bridge._PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S),
     )
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
@@ -11751,17 +11751,17 @@ async def test_hook_evaluate_pre_tool_use_rides_out_an_outage(
 ) -> None:
     """PreToolUse retries past the short schedule; UserPromptSubmit does not.
 
-    Seven straight failures exhaust the two 0.4s re-attempts, so the
-    eighth PreToolUse call's ALLOW must still be the answer. The same
-    outage on UserPromptSubmit — whose 30s hook budget cannot fit the
-    long PreToolUse waits — falls back to the fail-closed block after
-    three calls.
+    Seven straight failures are ridden out by PreToolUse's re-attempts
+    (zeroed here so the test is instant), so the eighth PreToolUse call's
+    ALLOW must still be the answer. The same outage on UserPromptSubmit —
+    whose 30s hook budget cannot fit the long PreToolUse waits — falls back
+    to the fail-closed block after three calls.
     """
     monkeypatch.setattr(claude_native_bridge, "_POLICY_EVAL_RETRY_DELAYS_S", (0.0, 0.0))
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
-        (0.0,) * 11,
+        (0.0,) * len(claude_native_bridge._PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S),
     )
     client = _ScriptedPolicyClient({"result": "POLICY_ACTION_ALLOW"}, fail_first=7)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
@@ -11805,9 +11805,9 @@ async def test_hook_evaluate_pre_tool_use_budget_stops_re_attempts(
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
-        (0.0,) * 12,
+        (0.0,) * len(claude_native_bridge._PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S),
     )
-    monkeypatch.setattr(claude_native_bridge, "_PRE_TOOL_USE_POLICY_EVAL_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr("omnigent.native.native_policy_hook.TOOL_CALL_POLICY_RETRY_BUDGET_S", 0.0)
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -11868,27 +11868,57 @@ async def test_curl_evaluate_policy_command_round_trips(
 
     # No relay env file (fresh session before its first dispatched turn,
     # or runner gone): stdin replays into the Python hook, which takes
-    # its direct-server path (unreachable here) and fails closed with
-    # its own shaping — the pre-curl behavior.
-    bare_dir = tmp_path / "no-relay"
-    bare_dir.mkdir()
-    args = augment_claude_args((), bridge_dir=bare_dir, ap_server_url="http://127.0.0.1:9")
-    (bare_dir / "bridge.json").write_text(
-        json.dumps({"active_session_id": "conv_no_relay"}), encoding="utf-8"
-    )
-    settings = _load_invocation_settings(args)
-    pre_entries = [entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry]
-    result = subprocess.run(
-        ["/bin/sh", "-c", pre_entries[0]["hooks"][0]["command"]],
-        input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
-    output = json.loads(result.stdout)
-    assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
-    assert output["hookSpecificOutput"]["permissionDecisionReason"]
+    # its direct-server path against a server answering a final 4xx — not
+    # a retryable outage, so the tool-call retry budget is not drained —
+    # and fails closed with its own ask shaping (the pre-curl behavior).
+    class _BadPolicyHandler(BaseHTTPRequestHandler):
+        """HTTP handler answering every policy POST with a final 400."""
+
+        def log_message(self, *args: Any) -> None:
+            del args
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+    bad_server = ThreadingHTTPServer(("127.0.0.1", 0), _BadPolicyHandler)
+    bad_thread = threading.Thread(target=bad_server.serve_forever, daemon=True)
+    bad_thread.start()
+    try:
+        bare_dir = tmp_path / "no-relay"
+        bare_dir.mkdir()
+        args = augment_claude_args(
+            (),
+            bridge_dir=bare_dir,
+            ap_server_url=f"http://127.0.0.1:{bad_server.server_address[1]}",
+        )
+        (bare_dir / "bridge.json").write_text(
+            json.dumps({"active_session_id": "conv_no_relay"}), encoding="utf-8"
+        )
+        settings = _load_invocation_settings(args)
+        pre_entries = [
+            entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry
+        ]
+        result = subprocess.run(
+            ["/bin/sh", "-c", pre_entries[0]["hooks"][0]["command"]],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert output["hookSpecificOutput"]["permissionDecisionReason"]
+    finally:
+        bad_server.shutdown()
+        bad_server.server_close()
+        bad_thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------

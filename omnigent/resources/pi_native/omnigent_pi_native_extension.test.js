@@ -473,11 +473,68 @@ async function testRunningIdleShareResponseId() {
   );
 }
 
+// Regression coverage for the tool-call transient-retry budget: a 5xx outage
+// that lasts past the old 30s window must still be ridden out, not failed
+// closed early. Time is faked (Date.now + the backoff sleep's setTimeout) so
+// the test never waits; the window mirrors TOOL_CALL_POLICY_RETRY_BUDGET_S in
+// omnigent/native/native_policy_hook.py.
+async function testToolCallRetryOutlastsTheShortBudget() {
+  const h = makeHarness({ captureEvents: true });
+  await h.handlers.session_start({}, {});
+
+  const realFetch = global.fetch;
+  const realNow = Date.now;
+  const realSetTimeout = global.setTimeout;
+  const clock = { t: 0 };
+  Date.now = () => clock.t;
+  global.setTimeout = (fn, ms) => {
+    if (ms <= 30_000) {
+      // A retry-backoff sleep: advance the fake clock, then resolve.
+      clock.t += ms;
+      queueMicrotask(fn);
+      return 0;
+    }
+    // Long internal timers (the 240s park abort) must not fire here.
+    return realSetTimeout(() => {}, ms);
+  };
+
+  const attemptTimes = [];
+  global.fetch = async () => {
+    attemptTimes.push(clock.t);
+    return { ok: false, status: 503 };
+  };
+
+  let verdict;
+  try {
+    verdict = await h.handlers.tool_call(
+      { toolCallId: "t1", toolName: "read_file", input: {} },
+      makeCtx({ idle: false }),
+    );
+  } finally {
+    global.fetch = realFetch;
+    Date.now = realNow;
+    global.setTimeout = realSetTimeout;
+  }
+
+  assert(
+    "a 5xx outage still fails the tool call closed",
+    !!verdict && verdict.block === true,
+    JSON.stringify(verdict),
+  );
+  const lastAttemptMs = attemptTimes[attemptTimes.length - 1];
+  assert(
+    "the retry loop outlives the old 30s transient budget",
+    lastAttemptMs > 30_000,
+    `lastAttemptMs=${lastAttemptMs} attempts=${attemptTimes.length}`,
+  );
+}
+
 (async () => {
   try {
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();
+    await testToolCallRetryOutlastsTheShortBudget();
     await testIdleInterruptDoesNotPoisonNextTurn();
     await testIdleInterruptFallbackNoIsIdle();
     await testMidTurnInterruptStillAborts();

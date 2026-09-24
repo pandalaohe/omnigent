@@ -31,14 +31,23 @@ from typing import NotRequired, TypedDict
 
 import httpx
 
-# How long to keep retrying transient 5xx / connect errors on the
-# policy evaluate POST before failing closed. Keeps the pre-execution
-# gate from blocking long on a sick server while still absorbing brief
-# DB hiccups on a hosted deployment. A gateway-severed held poll resets
-# it — see :func:`post_evaluate_with_retry`.
+# How long the request / result phases keep retrying transient 5xx /
+# connect errors on the policy evaluate POST before failing closed.
+# Keeps those gates from blocking long on a sick server while still
+# absorbing brief DB hiccups on a hosted deployment. A gateway-severed
+# held poll resets it — see :func:`post_evaluate_with_retry`.
 _EVALUATE_POLICY_RETRY_BUDGET_S = 30.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
+# The tool-call phase gets its own, much longer budget: every harness
+# registers a tool-call hook timeout far above it, so a call in flight can
+# ride out a multi-minute server outage instead of forcing an approval card.
+# The request / result phases keep the short budget above — a prompt or
+# result hook that times out is not the sole gate and blocking it longer
+# buys nothing. Public because the claude-native relay, which owns its own
+# retry loop, shares the budget.
+TOOL_CALL_POLICY_RETRY_BUDGET_S = 300.0
+_TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S = 20.0
 # Fast connect budget so an unreachable server fails into the retry
 # loop quickly rather than blocking on the day-long read timeout.
 _EVALUATE_POLICY_CONNECT_TIMEOUT_S = 5.0
@@ -64,6 +73,12 @@ _POST_TOOL_USE = "PostToolUse"
 # this hook is the sole REQUEST gate and covers both web-UI-injected and
 # direct-terminal prompts). It can block the prompt before the model runs.
 _USER_PROMPT_SUBMIT = "UserPromptSubmit"
+# The evaluation-request phase a ``PreToolUse`` (or a harness-specific
+# pre-tool-call event) maps to. :func:`post_evaluate_with_retry` keys its
+# retry budget on it, so producer and consumer share one name. Mirrors
+# ``omnigent.policies.types.FAIL_CLOSED_PHASES`` without importing the
+# policy package into this dependency-light hook seam.
+_PHASE_TOOL_CALL = "PHASE_TOOL_CALL"
 
 # Reason surfaced when a tool call is denied because its policy verdict
 # could not be obtained (server unreachable / non-2xx / empty or malformed
@@ -333,7 +348,7 @@ def hook_payload_to_evaluation_request(
     if hook_event == _PRE_TOOL_USE:
         return {
             "event": {
-                "type": "PHASE_TOOL_CALL",
+                "type": _PHASE_TOOL_CALL,
                 "target": "",
                 "data": {
                     "name": tool_name,
@@ -593,7 +608,11 @@ def post_evaluate_with_retry(
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
 
     Retries on 5xx HTTP responses and connection-level errors
-    (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`) within
+    (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`) within a
+    phase-dependent budget: the tool-call phase (``PHASE_TOOL_CALL``) gets
+    :data:`TOOL_CALL_POLICY_RETRY_BUDGET_S` with a
+    :data:`_TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S` cap, so a tool call rides
+    out a multi-minute server outage; every other phase keeps
     :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
     or ``None`` if the budget is exhausted or a non-retryable error occurs.
 
@@ -647,7 +666,14 @@ def post_evaluate_with_retry(
     # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
     elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
-    deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+    event = eval_request.get("event")
+    if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_CALL:
+        retry_budget_s = TOOL_CALL_POLICY_RETRY_BUDGET_S
+        max_backoff_s = _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
+    else:
+        retry_budget_s = _EVALUATE_POLICY_RETRY_BUDGET_S
+        max_backoff_s = _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
+    deadline = time.monotonic() + retry_budget_s
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     reauthed = False
@@ -754,12 +780,16 @@ def post_evaluate_with_retry(
             # The re-park mechanism working as intended, not a transient fault:
             # the budget and backoff are for fast failures, and the accepted
             # poll re-arms the one-shot re-mint for the next token lapse.
-            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            deadline = time.monotonic() + retry_budget_s
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             reauthed = False
             time.sleep(backoff_s)
             continue
-        if time.monotonic() + backoff_s >= deadline:
+        # The next attempt starts after this backoff sleeps, so it is within
+        # budget iff its start is; an attempt that starts inside the budget
+        # runs to completion, landing the fallback at most one attempt past
+        # it (each attempt's connect timeout is bounded).
+        if time.monotonic() + backoff_s > deadline:
             print(
                 f"omnigent {hook_label}: retry budget exhausted",
                 file=sys.stderr,
@@ -767,4 +797,4 @@ def post_evaluate_with_retry(
             return None, f"retry budget exhausted (last error: {last_error})"
         # Two-step backoff; not worth a retry library in this dependency-light hook.
         time.sleep(backoff_s)
-        backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+        backoff_s = min(backoff_s * 2, max_backoff_s)
