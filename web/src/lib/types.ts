@@ -540,6 +540,24 @@ export interface Session {
 }
 
 /**
+ * The directory that carries the session's git work: the recorded
+ * ``worktree`` when there is one (a project-entry session's working tree),
+ * else the launch ``workspace``. Git-reading surfaces (branch status, Fork /
+ * Resume prefills, side chat, delete-branch cleanup) read this, not the raw
+ * workspace; launch-directory surfaces (skills, file panel, permissions)
+ * stay on ``workspace``.
+ *
+ * @param session A session-like row carrying ``worktree`` / ``workspace``.
+ * @returns The effective worktree path, or ``null`` when neither is set.
+ */
+export function effectiveWorktree(session: {
+  worktree?: string | null;
+  workspace?: string | null;
+}): string | null {
+  return session.worktree ?? session.workspace ?? null;
+}
+
+/**
  * Stages of a managed-sandbox launch, in pipeline order. `cloning`
  * only occurs when the session requested a repository workspace;
  * `ready` and `failed` are terminal (`ready` is delivered via SSE

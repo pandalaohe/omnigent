@@ -686,6 +686,41 @@ describe("sessionsSharingDirectory", () => {
       offline: [],
       expected: ["f"],
     },
+    {
+      // An entry session matches the directory it actually works in (its
+      // recorded worktree), not the entry it was launched at.
+      name: "matches an entry session by its recorded worktree",
+      sessions: [
+        conv({
+          id: "w",
+          host_id: "host_1",
+          workspace: "/entry",
+          worktree: "/entry/.worktrees/repo/feature-x",
+        }),
+        conv({ id: "e", host_id: "host_1", workspace: "/entry" }),
+      ],
+      hostId: "host_1",
+      workspace: "/entry/.worktrees/repo/feature-x",
+      offline: [],
+      expected: ["w"],
+    },
+    {
+      // Picking the entry itself is not a shared directory: no entry-launched
+      // session works there (they work in their worktrees).
+      name: "does not count entry sessions when the entry is picked",
+      sessions: [
+        conv({
+          id: "w",
+          host_id: "host_1",
+          workspace: "/entry",
+          worktree: "/entry/.worktrees/repo/feature-x",
+        }),
+      ],
+      hostId: "host_1",
+      workspace: "/entry",
+      offline: [],
+      expected: [],
+    },
   ];
 
   it.each(cases)("$name", ({ sessions, hostId, workspace, offline, expected }) => {

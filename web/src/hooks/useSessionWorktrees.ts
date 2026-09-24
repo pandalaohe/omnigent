@@ -45,23 +45,24 @@ async function fetchSessionWorktrees(
 }
 
 /**
- * Live git worktrees for a session's workspace, preserving the not-a-repo
- * reason and refreshing at turn boundaries.
+ * Live git worktrees of a session's effective worktree (its recorded
+ * `worktree`, else its launch `workspace`), preserving the not-a-repo reason
+ * and refreshing at turn boundaries.
  *
- * No `placeholderData`: on a host/workspace switch the query must report
- * `undefined` (→ loading) rather than advertise the previous workspace's
+ * No `placeholderData`: on a host/worktree switch the query must report
+ * `undefined` (→ loading) rather than advertise the previous worktree's
  * worktrees as the new one's. A trailing invalidate refetches when the session
  * goes active → idle, so a branch the agent switched to during the turn is
  * picked up without a manual refresh.
  *
  * @param sessionId - Session id, for the turn-end invalidate (`null` disables it).
- * @param hostId - Host the workspace lives on (`null` disables the query).
- * @param workspace - Absolute workspace path (`null`/empty disables the query).
+ * @param hostId - Host the worktree lives on (`null` disables the query).
+ * @param worktree - Absolute effective worktree path (`null`/empty disables the query).
  */
 export function useSessionWorktrees(
   sessionId: string | null | undefined,
   hostId: string | null | undefined,
-  workspace: string | null | undefined,
+  worktree: string | null | undefined,
 ) {
   useTrailingInvalidate(
     sessionId ?? undefined,
@@ -70,10 +71,10 @@ export function useSessionWorktrees(
   );
   return useQuery({
     // sessionId leads the key so the trailing invalidate (prefix match) hits it;
-    // hostId + workspace are part of the key so a switch is a fresh entry.
-    queryKey: ["session-git-worktrees", sessionId ?? null, hostId ?? null, workspace ?? null],
-    queryFn: () => fetchSessionWorktrees(hostId as string, workspace as string),
-    enabled: !!hostId && !!workspace,
+    // hostId + worktree are part of the key so a switch is a fresh entry.
+    queryKey: ["session-git-worktrees", sessionId ?? null, hostId ?? null, worktree ?? null],
+    queryFn: () => fetchSessionWorktrees(hostId as string, worktree as string),
+    enabled: !!hostId && !!worktree,
     staleTime: 5_000,
   });
 }

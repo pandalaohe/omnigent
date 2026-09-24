@@ -3,6 +3,7 @@ import { useCallback } from "react";
 import { useGithubInfo } from "@/hooks/useGithub";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
+import { effectiveWorktree } from "@/lib/types";
 
 /** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
 const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
@@ -89,30 +90,37 @@ export interface ComposerGitStatus {
  * Resolve the session's live checkout branch and worktree status.
  *
  * The branch comes from the host's `git worktree list` (via
- * {@link useSessionWorktrees}), matched to the session's workspace — the real
- * checked-out branch, distinct from a PR head. {@link useGithubInfo} supplies
- * only PR/repo metadata: its `branch` field can be a PR head ref, so it is not
- * trusted for the live branch. `not-git` is set only on explicit evidence;
- * offline / ambiguous / an empty list stay `unknown` rather than claiming the
- * workspace is not a repo.
+ * {@link useSessionWorktrees}), matched to the session's effective worktree
+ * (`worktree` when recorded, else `workspace`) — the real checked-out branch,
+ * distinct from a PR head. {@link useGithubInfo} supplies only PR/repo
+ * metadata: its `branch` field can be a PR head ref, so it is not trusted for
+ * the live branch. `not-git` is set only on explicit evidence; offline /
+ * ambiguous / an empty list stay `unknown` rather than claiming the
+ * worktree is not a repo.
  *
  * @param sessionId - Server session id (`null` on the pre-session window).
- * @param hostId - Host the session's workspace lives on.
- * @param workspace - Absolute workspace path.
+ * @param hostId - Host the session's worktree lives on.
+ * @param workspace - Absolute launch directory; with `worktree` recorded it is
+ *   only the fallback (the session may be launched at a project entry).
+ * @param worktree - The session's recorded git working tree, when it differs
+ *   from the launch directory.
  * @param creationBranch - Static `session.gitBranch`, surfaced as history only.
  */
 export function useComposerGitStatus({
   sessionId,
   hostId,
   workspace,
+  worktree = null,
   creationBranch = null,
 }: {
   sessionId: string | null | undefined;
   hostId: string | null | undefined;
   workspace: string | null | undefined;
+  worktree?: string | null;
   creationBranch?: string | null;
 }): ComposerGitStatus {
-  const worktrees = useSessionWorktrees(sessionId, hostId, workspace);
+  const gitRoot = effectiveWorktree({ worktree, workspace });
+  const worktrees = useSessionWorktrees(sessionId, hostId, gitRoot);
   const github = useGithubInfo(sessionId ?? undefined);
   const info = github.data;
   const result = worktrees.data;
@@ -122,11 +130,11 @@ export function useComposerGitStatus({
   let isWorktree: boolean | null = null;
   let worktreePath: string | null = null;
 
-  if (!hostId || !workspace) {
+  if (!hostId || !gitRoot) {
     branchState = "unknown";
   } else if (worktrees.isPlaceholderData || result === undefined) {
-    // Placeholder = a stale prior-key result on a host/workspace switch; treat as
-    // still loading rather than advertise the old workspace's branch as live.
+    // Placeholder = a stale prior-key result on a host/worktree switch; treat as
+    // still loading rather than advertise the old worktree's branch as live.
     branchState = worktrees.isLoading || worktrees.isPlaceholderData ? "loading" : "unknown";
   } else if (result.status === "not_git") {
     branchState = "not-git";
@@ -134,7 +142,7 @@ export function useComposerGitStatus({
     // Ambiguous git failure, or an OK-but-empty list — neither proves non-git.
     branchState = "unknown";
   } else {
-    const matched = matchWorktree(result.worktrees, workspace);
+    const matched = matchWorktree(result.worktrees, gitRoot);
     if (matched === null) {
       branchState = "unknown";
     } else {

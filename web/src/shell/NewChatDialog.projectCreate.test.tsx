@@ -605,3 +605,107 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
   });
 });
+
+// A project's directory is its entry; branches come from the host's
+// registered checkout. The worktree picker lists the CHECKOUT's worktrees
+// (the branch control therefore names the source repository), "new branch"
+// keeps sending the entry — the server sources the worktree there — and
+// picking an existing worktree sends that path.
+const ENTRY = REPO;
+const ENTRY_CHECKOUT = "/Users/corey/projects/alpha-checkout";
+const CHECKOUT_WORKTREE = "/Users/corey/projects/alpha/.worktrees/alpha/feature-x";
+
+function entryRoots(checkout: string | null): ProjectHostRoots {
+  return {
+    roots: [{ host_id: "host_1", workspace: ENTRY, source: "entry", checkout }],
+    default_host_id: "host_1",
+    default_host_reason: "single_root",
+  };
+}
+
+function setEntryProject(checkout: string | null): void {
+  setProjectConfig({ host_id: "host_1", agent_id: "ag_other" });
+  vi.mocked(useProjectHostRoots).mockReturnValue({
+    data: entryRoots(checkout),
+    isLoading: false,
+    isError: false,
+  } as ReturnType<typeof useProjectHostRoots>);
+}
+
+// Stable references: a real `useHostWorktrees` (react-query) returns the same
+// array/row objects across renders while the data is unchanged, which is what
+// lets `activeWorktree`'s `useMemo` skip re-deriving. A mock that returns a
+// fresh literal on every call breaks that and free-runs the composer-context
+// effect that depends on it, so this returns the SAME objects every time.
+const CHECKOUT_WORKTREES: HostWorktree[] = [
+  { path: ENTRY_CHECKOUT, branch: "main", is_main: true, detached: false },
+  { path: CHECKOUT_WORKTREE, branch: "feature/x", is_main: false, detached: false },
+];
+const NO_WORKTREES: HostWorktree[] = [];
+
+/** Serve the checkout's worktrees for either of its directories; [] elsewhere. */
+function setCheckoutWorktrees(): void {
+  vi.mocked(useHostWorktrees).mockImplementation((hostId, path) => {
+    const known =
+      hostId === "host_1" && (path === ENTRY_CHECKOUT || path === CHECKOUT_WORKTREE);
+    return {
+      data: known ? CHECKOUT_WORKTREES : NO_WORKTREES,
+      isError: false,
+    } as ReturnType<typeof useHostWorktrees>;
+  });
+}
+
+describe("NewChatLandingScreen git controls on a project entry", () => {
+  it("lists the entry checkout's worktrees and sends the entry for a new branch", async () => {
+    setEntryProject(ENTRY_CHECKOUT);
+    setCheckoutWorktrees();
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    // The worktree picker queries the registered checkout, not the entry.
+    await waitFor(() =>
+      expect(vi.mocked(useHostWorktrees)).toHaveBeenCalledWith("host_1", ENTRY_CHECKOUT),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    // The checkout's linked worktree is offered.
+    expect(screen.getByRole("radio", { name: "Use worktree feature-x" })).toBeInTheDocument();
+    // Naming a new branch keeps the entry as the root seed (the server
+    // sources the worktree from the checkout and places the session there).
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/new" },
+    });
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
+    expect(body.git).toEqual({ branch_name: "feature/new" });
+  });
+
+  it("sends a picked existing worktree path with existing_worktree", async () => {
+    setEntryProject(ENTRY_CHECKOUT);
+    setCheckoutWorktrees();
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-x" }));
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.workspace).toBe(CHECKOUT_WORKTREE);
+    expect(body.git).toEqual({ branch_name: "feature/x", existing_worktree: true });
+  });
+
+  it("lists the picked directory itself when the entry has no checkout", async () => {
+    vi.mocked(useHostWorktrees).mockClear();
+    setEntryProject(null);
+    setRepoIsGit();
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    await waitFor(() => expect(vi.mocked(useHostWorktrees)).toHaveBeenCalledWith("host_1", ENTRY));
+    expect(vi.mocked(useHostWorktrees)).not.toHaveBeenCalledWith("host_1", ENTRY_CHECKOUT);
+  });
+});

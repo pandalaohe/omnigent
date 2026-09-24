@@ -130,6 +130,7 @@ function sessionSignature(sessions: readonly Conversation[]): string {
         row.git_branch,
         row.project_id,
         row.workspace,
+        row.worktree,
         row.archived,
         row.parent_session_id,
         row.owner,
@@ -292,6 +293,7 @@ function sameCard(left: Conversation, right: Conversation): boolean {
     (left.git_branch ?? null) === (right.git_branch ?? null) &&
     (left.project_id ?? null) === (right.project_id ?? null) &&
     (left.workspace ?? null) === (right.workspace ?? null) &&
+    (left.worktree ?? null) === (right.worktree ?? null) &&
     (left.archived ?? false) === (right.archived ?? false) &&
     left.labels?.omni_project === right.labels?.omni_project
   );

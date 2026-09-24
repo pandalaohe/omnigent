@@ -320,7 +320,7 @@ import {
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
-import type { NativeModelOption } from "@/lib/types";
+import { effectiveWorktree, type NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import {
   currentFusionCombo,
@@ -738,10 +738,11 @@ export function composerWorktreeHeaderState({
  * Existing sessions that would share an on-disk working directory with a new
  * session created in ``workspace`` on ``hostId``.
  *
- * Matches on host plus normalized workspace path: a session whose stored
- * ``workspace`` equals the picked directory works in that same directory.
- * Branch sessions live in isolated worktree dirs (a different ``workspace``),
- * so they only match when the user explicitly picked that worktree path.
+ * Matches on host plus normalized effective worktree: a session whose recorded
+ * ``worktree`` (else its ``workspace``) equals the picked directory works in
+ * that same directory. A project-entry session whose launch directory is the
+ * entry therefore only matches when the picked directory is its worktree, and
+ * entry sessions with different worktrees never conflict with each other.
  *
  * Only *connected* sessions count — ``isRunnerOnline(s.id)`` must hold. An
  * offline or unbound session has no live process that could write the
@@ -777,15 +778,17 @@ export function sessionsSharingDirectory(
   // they can't write. SessionListItem doesn't expose filesystem capability to
   // filter on; revisit (expose a flag + skip them) if headless agents with
   // working directories become common.
-  return sessions.filter(
-    (s) =>
+  return sessions.filter((s) => {
+    const dir = effectiveWorktree(s);
+    return (
       s.host_id === hostId &&
-      s.workspace != null &&
-      normalizeWorkspacePath(s.workspace) === target &&
+      dir != null &&
+      normalizeWorkspacePath(dir) === target &&
       // Only a session whose runner is actually online has a live process
       // that could write here — same connectivity signal as the sidebar.
-      isRunnerOnline(s.id),
-  );
+      isRunnerOnline(s.id)
+    );
+  });
 }
 
 /**
@@ -4492,11 +4495,13 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Only register loaded owned sessions on the selected host with a workspace
-  // for live directory-conflict checks.
+  // Only register loaded owned sessions on the selected host with a working
+  // tree for live directory-conflict checks.
   const conflictCandidates = useMemo(
     () =>
-      (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
+      (directorySessions ?? []).filter(
+        (s) => s.host_id === selectedHostId && effectiveWorktree(s) != null,
+      ),
     [directorySessions, selectedHostId],
   );
   const runnerHealth = useRunnerHealthRegistration(conflictCandidates);
@@ -4505,17 +4510,34 @@ export function NewChatLandingScreen() {
   const occupancyByDir = useMemo(() => {
     const counts = new Map<string, number>();
     for (const s of conflictCandidates) {
-      if (s.workspace == null || runnerHealth.get(s.id) !== true) continue;
-      const dir = normalizeWorkspacePath(s.workspace);
-      if (dir === null) continue;
-      counts.set(dir, (counts.get(dir) ?? 0) + 1);
+      const dir = effectiveWorktree(s);
+      if (dir == null || runnerHealth.get(s.id) !== true) continue;
+      const normalized = normalizeWorkspacePath(dir);
+      if (normalized === null) continue;
+      counts.set(normalized, (counts.get(normalized) ?? 0) + 1);
     }
     return counts;
   }, [conflictCandidates, runnerHealth]);
 
-  // Existing git worktrees of the picked directory's repo, for the
-  // worktree picker. Skipped for sandbox sessions (server-managed) and
-  // when no directory is picked. A non-git path resolves to [].
+  // Git worktrees are listed from the repository the branch comes from: when
+  // the picked directory is the project's entry, its registered checkout (the
+  // source the server branches from); otherwise the picked directory itself.
+  // A non-project visit, or an entry without a checkout, keeps the picked path.
+  const worktreeRepoPath = useMemo(() => {
+    const normalized = normalizeWorkspacePath(workspaceValue);
+    if (configProjectId === null || projectHostRoots === undefined || normalized === null) {
+      return workspaceValue;
+    }
+    const root = projectHostRoots.roots.find(
+      (item) =>
+        item.host_id === selectedHostId && normalizeWorkspacePath(item.workspace) === normalized,
+    );
+    return root?.source === "entry" && root.checkout ? root.checkout : workspaceValue;
+  }, [configProjectId, projectHostRoots, selectedHostId, workspaceValue]);
+
+  // Existing git worktrees of that repository, for the worktree picker.
+  // Skipped for sandbox sessions (server-managed) and when no directory is
+  // picked. A non-git path resolves to [].
   const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
   const {
     data: hostWorktrees,
@@ -4523,11 +4545,11 @@ export function NewChatLandingScreen() {
     isPlaceholderData: hostWorktreesArePlaceholder,
   } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
-    worktreesEnabled ? workspaceValue : null,
+    worktreesEnabled ? worktreeRepoPath : null,
   );
   const verifiedGitWorktrees = useVerifiedGitWorktrees({
     hostId: selectedHostId,
-    requestedPath: worktreesEnabled ? workspaceTrimmed : null,
+    requestedPath: worktreesEnabled ? worktreeRepoPath : null,
     worktrees: hostWorktrees,
     resolved: !hostWorktreesArePlaceholder && hostWorktrees !== undefined,
   });

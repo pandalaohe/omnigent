@@ -992,7 +992,8 @@ export async function setConversationArchiveLock(
  * DELETE /v1/sessions/{id} — exported for direct unit testing.
  *
  * `deleteBranch` opts into worktree cleanup (`?delete_branch=true`):
- * the server removes the worktree directory and deletes its branch.
+ * the server removes the session's effective worktree (its recorded
+ * `worktree`, else its launch directory) and deletes its branch.
  * See designs/SESSION_GIT_WORKTREE.md.
  */
 export async function deleteConversation(id: string, deleteBranch = false): Promise<void> {

@@ -186,6 +186,7 @@ import {
 } from "@/lib/newSessionTarget";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { retrySession } from "@/lib/sessionsApi";
+import { effectiveWorktree } from "@/lib/types";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -4255,6 +4256,10 @@ function ConversationRowImpl({
   const [forkOpen, setForkOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
+  // The directory a branch cleanup removes: the recorded worktree, else the
+  // session's launch directory. Shown in the delete offer; the gate above
+  // stays the recorded branch.
+  const branchWorktree = gitBranch !== null ? effectiveWorktree(conversation) : null;
   // Every row action gates on ownership alone — the sidebar carries no
   // effective-permission level, so rename/share/move/drag are owner-only and
   // non-owners get a read-only row. (Finer-grained edit/manage affordances
@@ -4995,7 +5000,7 @@ function ConversationRowImpl({
         <ForkSessionDialog
           sourceSessionId={conversation.id}
           sourceTitle={conversation.title}
-          sourceWorkspace={conversation.workspace}
+          sourceWorkspace={effectiveWorktree(conversation)}
           sourceHostId={conversation.host_id}
           sourceGitBranch={conversation.git_branch}
           open
@@ -5045,6 +5050,14 @@ function ConversationRowImpl({
                     <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
                       {gitBranch}
                     </code>
+                    {branchWorktree !== null && (
+                      <span
+                        data-testid="delete-branch-worktree-path"
+                        className="mt-0.5 block break-all font-mono text-xs text-muted-foreground"
+                      >
+                        {branchWorktree}
+                      </span>
+                    )}
                   </span>
                 </label>
               </div>
@@ -6398,9 +6411,19 @@ function BulkActionBar({
                         <td className="py-2 pr-3">
                           <span className="flex items-start gap-1.5">
                             <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-                            <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
-                              {c.git_branch}
-                            </code>
+                            <span className="min-w-0">
+                              <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
+                                {c.git_branch}
+                              </code>
+                              {effectiveWorktree(c) !== null && (
+                                <span
+                                  data-testid="bulk-delete-branch-worktree-path"
+                                  className="mt-0.5 block break-all font-mono text-xs text-muted-foreground"
+                                >
+                                  {effectiveWorktree(c)}
+                                </span>
+                              )}
+                            </span>
                           </span>
                         </td>
                         <td className="py-2 text-sm text-muted-foreground">

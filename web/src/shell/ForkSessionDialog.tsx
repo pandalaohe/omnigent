@@ -35,7 +35,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
-import type { Session } from "@/lib/types";
+import { effectiveWorktree, type Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import {
   nativeAgentHasCapability,
@@ -653,7 +653,8 @@ function ForkRunConfig({
  *
  * @param sourceSessionId - Session being forked.
  * @param sourceTitle - Source title, used to prefill the fork's name.
- * @param sourceWorkspace - Source workspace; presence marks a coding source
+ * @param sourceWorkspace - Source effective worktree (its recorded worktree,
+ *   else its launch directory); presence marks a coding source
  *   (shows the host/dir fields) and seeds the directory default.
  * @param sourceHostId - Source host; default host when it is online.
  * @param sourceGitBranch - Source git branch; drives the worktree prefill
@@ -744,8 +745,8 @@ export function ForkSessionForm({
     isCodingSource && selectedHostId !== null && selectedHostId !== sourceHostId;
 
   const sourceWorkspaceNorm = sourceWorkspace ? normalizeWorkspacePath(sourceWorkspace) : null;
-  // Source ran in a server-created git worktree (its workspace IS the
-  // worktree dir). Recover the repo the worktree was created from so the
+  // Source ran in a server-created git worktree (its effective worktree is
+  // the worktree dir). Recover the repo the worktree was created from so the
   // form can present the pair as "original repo + worktree" rather than
   // the worktree path as the working directory. Recognized from the path
   // convention alone: a fork bound into an existing worktree carries no
@@ -928,7 +929,7 @@ export function ForkSessionForm({
     () =>
       isCodingSource
         ? (directorySessions ?? []).filter(
-            (s) => s.host_id === selectedHostId && s.workspace != null,
+            (s) => s.host_id === selectedHostId && effectiveWorktree(s) != null,
           )
         : [],
     [isCodingSource, directorySessions, selectedHostId],
@@ -1479,8 +1480,9 @@ export function ForkSessionForm({
  *
  * @param sourceSessionId - Session being forked.
  * @param sourceTitle - Source title, used to prefill the fork's name.
- * @param sourceWorkspace - Source workspace; presence marks a coding source
- *   (shows the host/dir fields) and seeds the directory default.
+ * @param sourceWorkspace - Source effective worktree (its recorded worktree,
+ *   else its launch directory); presence marks a coding source (shows the
+ *   host/dir fields) and seeds the directory default.
  * @param sourceHostId - Source host; default host when it is online.
  * @param sourceGitBranch - Source git branch; drives the worktree prefill
  *   and the base ref for a renamed worktree branch.

@@ -209,6 +209,7 @@ describe("ExtensionViewHost", () => {
         unread: false,
         titleProvisional: false,
         workspace: `/workspace/${"w".repeat(128)}`,
+        worktree: null,
         gitBranch: null,
         projectId: null,
         createdAt: 1,

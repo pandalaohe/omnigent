@@ -19,6 +19,7 @@ import { setSessionHost } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
+import { effectiveWorktree } from "./types";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -906,18 +907,21 @@ export async function forkSession(
  *
  * When the source is on a git branch the fork launches in its OWN worktree
  * (`side-chat/<id>`, based on the source branch) so the side chat stays off the
- * parent's working tree; otherwise it launches in the source's workspace.
+ * parent's working tree; otherwise it launches in the source's effective
+ * worktree (its recorded worktree, else its launch directory) so the branch
+ * forks off the repository the source actually works in.
  *
  * @param sourceId - The parent conversation to fork, e.g. "conv_abc123".
  * @returns The new side-chat session id.
- * @throws Error when the source has no host/workspace to launch on, or when the
+ * @throws Error when the source has no host/worktree to launch on, or when the
  *   fork / runner launch fails, so the caller can surface it (a toast).
  */
 export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
   const source = await getSession(sourceId);
-  const { hostId, workspace, gitBranch } = source;
-  if (!hostId || !workspace) {
-    // No host/workspace to run on — fail before creating an orphan fork so the
+  const { hostId, gitBranch } = source;
+  const repoPath = effectiveWorktree(source);
+  if (!hostId || !repoPath) {
+    // No host/worktree to run on — fail before creating an orphan fork so the
     // caller shows an error instead of opening a dead tab.
     throw new Error("This session has no host to run a side chat on.");
   }
@@ -925,7 +929,7 @@ export async function createSideChat(sourceId: string): Promise<{ childSessionId
   await launchRunner(
     hostId,
     fork.id,
-    workspace,
+    repoPath,
     gitBranch ? { branchName: `side-chat/${fork.id.slice(-8)}`, baseBranch: gitBranch } : undefined,
   );
   return { childSessionId: fork.id };

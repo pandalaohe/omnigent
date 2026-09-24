@@ -33,6 +33,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
+import { effectiveWorktree } from "@/lib/types";
 
 /**
  * Dialog that binds an *unbound* session to a host + directory in-app via
@@ -43,15 +44,16 @@ import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
  *
  * - **Fork clone** (``sourceSessionId`` set): a fork of a session that had a
  *   working directory (``omnigent.fork.source_id`` label). Prefills from the
- *   *source* session — its host is the default, its workspace the default
- *   directory, and when it used a git worktree a branch is suggested so the
- *   clone diverges onto its own worktree. When the source's host is offline
+ *   *source* session — its host is the default, its effective worktree (its
+ *   recorded worktree, else its launch directory) the default directory, and
+ *   when it used a git worktree a branch is suggested so the clone diverges
+ *   onto its own worktree. When the source's host is offline
  *   there's nothing to launch on, so it falls back to the CLI reconnect
  *   command — the escape hatch ``ResumeChatDialog`` shows.
  *
  * - **Host-less session** (no ``sourceSessionId``): an imported session with
  *   no host/runner of its own. Prefills from ``prefill`` (the session's own
- *   recorded workspace/host) and defaults the host to the caller's current
+ *   recorded worktree/host) and defaults the host to the caller's current
  *   online machine, so the common case is one click.
  *
  * @param open - Whether the dialog is visible.
@@ -60,7 +62,7 @@ import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
  * @param sourceSessionId - Fork source (``omnigent.fork.source_id``) read for
  *   host/dir/branch prefill; ``null``/absent for a host-less session.
  * @param prefill - Defaults for the host-less case (the session's own
- *   host/workspace/branch). Ignored when ``sourceSessionId`` is set.
+ *   host/worktree/branch). Ignored when ``sourceSessionId`` is set.
  * @param serverUrl - Origin for the CLI fallback command.
  * @param wrapper - The session's ``omnigent.wrapper`` label (CLI fallback).
  * @param harness - The session's canonical harness; the CLI fallback uses it
@@ -112,9 +114,11 @@ export function ResumeWithDirectoryDialog({
   const sourceHostOnline = sourceHost?.status === "online";
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
 
-  // Unified prefill: a fork reads its source session; a host-less session
+  // Unified prefill: a fork reads its source session's effective worktree
+  // (its recorded worktree, else its launch directory); a host-less session
   // reads the ``prefill`` its own snapshot supplied.
-  const prefillWorkspace = hasSource ? source?.workspace : prefill?.workspace;
+  const sourceWorktree = hasSource ? effectiveWorktree(source ?? {}) : null;
+  const prefillWorkspace = hasSource ? sourceWorktree : prefill?.workspace;
   const prefillBranch = hasSource ? source?.gitBranch : prefill?.gitBranch;
   // Default host: the source's host (fork, only if online — otherwise the CLI
   // fallback fires) or, for a host-less session, its own recorded host when
@@ -188,7 +192,7 @@ export function ResumeWithDirectoryDialog({
     () =>
       open
         ? (directorySessions ?? []).filter(
-            (s) => s.host_id === selectedHostId && s.workspace != null,
+            (s) => s.host_id === selectedHostId && effectiveWorktree(s) != null,
           )
         : [],
     [open, directorySessions, selectedHostId],
@@ -207,10 +211,10 @@ export function ResumeWithDirectoryDialog({
   const showConflictHint = branchName.trim() === "" && conflictingSessions.length > 0;
 
   // Mismatched-directory warning: the transcript's file references were
-  // grounded in the source's directory ON the source's host. A different
-  // directory — or a different host, where even an identical path is a
-  // different machine — won't resolve them, so the agent must re-orient.
-  const sourceWorkspaceNorm = source?.workspace ? normalizeWorkspacePath(source.workspace) : null;
+  // grounded in the source's effective worktree ON the source's host. A
+  // different directory — or a different host, where even an identical path is
+  // a different machine — won't resolve them, so the agent must re-orient.
+  const sourceWorkspaceNorm = sourceWorktree ? normalizeWorkspacePath(sourceWorktree) : null;
   const hostMismatch =
     sourceHostId !== null && selectedHostId !== null && selectedHostId !== sourceHostId;
   const showMismatchWarning =

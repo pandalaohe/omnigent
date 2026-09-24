@@ -79,7 +79,12 @@ import {
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
-import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
+import {
+  effectiveWorktree,
+  type NativeModelOption,
+  type Session,
+  type SessionStatus,
+} from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
@@ -1275,9 +1280,10 @@ export function ChatPage() {
         isOwner={reconnectIsOwner}
         // Source prefill for the Clone tab's fork form. Mirrors AppShell's
         // ForkSessionDialog wiring; the title additionally falls back to the
-        // sidebar row, which ChatPage has at hand.
+        // sidebar row, which ChatPage has at hand. The directory is the
+        // source's effective worktree, what the fork will branch from.
         sourceTitle={activeConv?.title ?? activeSession?.title}
-        sourceWorkspace={activeSession?.workspace}
+        sourceWorkspace={effectiveWorktree(activeSession ?? {})}
         sourceHostId={activeSession?.hostId}
         sourceGitBranch={activeSession?.gitBranch}
       />
@@ -1287,11 +1293,11 @@ export function ChatPage() {
           onOpenChange={setResumeDirDialogOpen}
           sessionId={urlConvId}
           // Fork clone prefills from its source; a host-less session has none
-          // and prefills from its own recorded host/workspace/branch instead.
+          // and prefills from its own recorded host/worktree/branch instead.
           sourceSessionId={isUnboundFork ? forkSourceId : null}
           prefill={{
             hostId: activeSession?.hostId ?? null,
-            workspace: activeSession?.workspace ?? null,
+            workspace: effectiveWorktree(activeSession ?? {}),
             gitBranch: activeSession?.gitBranch ?? null,
           }}
           serverUrl={getCliServerUrl()}
@@ -3005,12 +3011,15 @@ function ComposerImpl(
     : hydratedComposerContext.workingDirectory.kind === "selected"
       ? hydratedComposerContext.workingDirectory.path
       : undefined;
-  // Live workspace/branch/PR status for the workspace bar (lane-3 shared hook):
-  // the branch comes from the host's `git worktree list`, never a PR head.
+  // Live worktree/branch/PR status for the workspace bar (lane-3 shared hook):
+  // git reads use the session's effective worktree (its recorded worktree,
+  // else this launch directory), and the branch comes from the host's
+  // `git worktree list`, never a PR head.
   const composerGit = useComposerGitStatus({
     sessionId: composerSessionId,
     hostId: composerSession?.hostId ?? null,
     workspace: composerWorkspace ?? null,
+    worktree: composerSession?.worktree ?? null,
     creationBranch: composerSession?.gitBranch ?? composerBranch ?? null,
   });
   const composerQueuedMessages = queuedMessages.filter(

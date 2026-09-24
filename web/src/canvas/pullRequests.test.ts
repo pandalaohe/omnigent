@@ -32,6 +32,9 @@ function session(id: string, gitBranch: string | null): Conversation {
     updated_at: 1,
     labels: {},
     permission_level: null,
+    // A branch-bearing session is bound to a working tree; the gate needs the
+    // directory as well as the branch.
+    workspace: "/repo",
     git_branch: gitBranch,
   };
 }
@@ -90,6 +93,8 @@ describe("usePullRequests", () => {
         session(`branch_${index}`, `feat/${index}`),
       ),
       session("plain", null),
+      // A branch with no working tree has no repository to resolve — no lookup.
+      { ...session("dirless", "feat/no-dir"), workspace: null },
     ];
 
     const { result } = renderHook(() => usePullRequests(sessions), { wrapper });
@@ -98,6 +103,7 @@ describe("usePullRequests", () => {
       expect(githubHook.fetchGithubInfo).toHaveBeenCalledTimes(PULL_REQUEST_CONCURRENCY),
     );
     expect(githubHook.fetchGithubInfo).not.toHaveBeenCalledWith("plain");
+    expect(githubHook.fetchGithubInfo).not.toHaveBeenCalledWith("dirless");
 
     gates.get("branch_0")!.resolve(
       info({

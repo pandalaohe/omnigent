@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useQueryClient } from "@tanstack/react-query";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { effectiveWorktree } from "@/lib/types";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
   PINNED_LABEL_KEY,
@@ -148,6 +149,10 @@ export function HeaderConversationMenu({
     if (isMobile) trackClick(componentId, "button");
   };
   const gitBranch = conversation.git_branch ?? null;
+  // The directory a branch cleanup removes: the recorded worktree, else the
+  // session's launch directory. Shown in the delete offer; the gate above
+  // stays the recorded branch.
+  const branchWorktree = gitBranch !== null ? effectiveWorktree(conversation) : null;
 
   currentConversationIdRef.current = conversation.id;
   currentLocationRef.current = location;
@@ -554,6 +559,14 @@ export function HeaderConversationMenu({
                   <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
                     {gitBranch}
                   </code>
+                  {branchWorktree !== null && (
+                    <span
+                      data-testid="header-delete-branch-worktree-path"
+                      className="mt-0.5 block break-all font-mono text-xs text-muted-foreground"
+                    >
+                      {branchWorktree}
+                    </span>
+                  )}
                 </span>
               </label>
             </div>

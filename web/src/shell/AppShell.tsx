@@ -3,6 +3,7 @@ import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState }
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
+import { effectiveWorktree } from "@/lib/types";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
@@ -2476,7 +2477,9 @@ export function AppShell() {
               key={`fork-session-dialog-${conversationId}`}
               sourceSessionId={conversationId}
               sourceTitle={activeSession?.title}
-              sourceWorkspace={activeSession?.workspace ?? parentConv?.workspace}
+              sourceWorkspace={
+                effectiveWorktree(activeSession ?? {}) ?? effectiveWorktree(parentConv ?? {})
+              }
               sourceHostId={activeSession?.hostId ?? parentConv?.host_id}
               sourceGitBranch={activeSession?.gitBranch}
               upToResponseId={forkUpToResponseId}

@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { fetchGithubInfo } from "@/hooks/useGithub";
+import { effectiveWorktree } from "@/lib/types";
 
 export const PULL_REQUEST_REFRESH_MS = 300_000;
 /** A failed lookup is retried this soon instead of waiting the full refresh window. */
@@ -112,11 +113,16 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
     const queue = queueRef.current;
     if (!queue) return;
     const now = Date.now();
-    const due = sessions.filter(
-      (session) =>
+    const due = sessions.filter((session) => {
+      // A pull request belongs to the branch checked out in the session's
+      // working tree — its recorded worktree, else its launch directory.
+      const gitRoot = effectiveWorktree(session);
+      return (
+        Boolean(gitRoot?.trim()) &&
         Boolean(session.git_branch?.trim()) &&
-        now - (checkedAtRef.current[session.id] ?? 0) >= PULL_REQUEST_REFRESH_MS,
-    );
+        now - (checkedAtRef.current[session.id] ?? 0) >= PULL_REQUEST_REFRESH_MS
+      );
+    });
     queue.replace(
       due.map((session) => ({
         key: session.id,

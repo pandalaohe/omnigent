@@ -10,6 +10,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
+import { effectiveWorktree } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import type { CanvasPullRequest } from "./pullRequests";
@@ -49,7 +50,10 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   const title = conversation.title || optimisticTitle || conversationDisplayLabel(conversation);
   const titleProvisional = !conversation.title && optimisticTitle !== undefined;
   const label = stateLabel(state, conversation.status);
-  const workspace = conversation.workspace?.trim() || "No working directory";
+  // The card's directory is the session's effective worktree: a
+  // project-entry session shows the working tree its branch lives in, not the
+  // entry it was launched at.
+  const workspace = effectiveWorktree(conversation)?.trim() || "No working directory";
 
   const openFromKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Enter" && event.key !== " ") return;
