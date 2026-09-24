@@ -10867,6 +10867,9 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = refreshed
+    # ``allow_host_fill=False``: the create route's host launch (and its
+    # revocation admission) runs after this response, so the response must
+    # not start a host fill.
     response = await _get_session_snapshot(
         conversation_store,
         conv.id,
@@ -10875,6 +10878,7 @@ async def _create_session_from_existing_agent(
         liveness_lookup=liveness_lookup,
         conversation=conv,
         request=request,
+        allow_host_fill=False,
     )
     return response, conv
 
@@ -11506,6 +11510,8 @@ async def _fetch_model_options(
     session_id: str,
     conv: Conversation,
     agent_store: AgentStore | None = None,
+    *,
+    allow_host_fill: bool = True,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a session.
@@ -11540,6 +11546,11 @@ async def _fetch_model_options(
     :param conv: Conversation row whose labels identify the wrapper.
     :param agent_store: Optional store for the ACP spec lookup; resolves
         from the runtime globals when ``None``.
+    :param allow_host_fill: When ``False``, never start the background
+        SDK host fill. The session-create response passes ``False``: its
+        host launch runs afterwards and may still be refused by the
+        revocation admission, so that response must not push a host frame.
+        Ordinary snapshots keep the fill.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -11566,7 +11577,7 @@ async def _fetch_model_options(
             cached = _model_options_cache.get(session_id)
             if cached is not None:
                 return cached
-            if session_id not in _model_options_inflight:
+            if allow_host_fill and session_id not in _model_options_inflight:
                 task = asyncio.create_task(
                     _load_model_options_from_host(session_id, conv.host_id, harness)
                 )
@@ -11957,6 +11968,7 @@ async def _get_session_snapshot(
     viewer_id: str | None = None,
     request: Request | None = None,
     include_usage: bool = True,
+    allow_host_fill: bool = True,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -11997,6 +12009,11 @@ async def _get_session_snapshot(
         overlays for this session before building the response. Browser
         reloads use this so a refresh re-reads current live-session
         capabilities instead of serving stale AP-process caches.
+    :param allow_host_fill: When ``False``, the snapshot starts no
+        background SDK host catalog fill (see
+        :func:`_fetch_model_options`). The session-create response passes
+        ``False`` because its host launch still has to pass the
+        revocation admission after this snapshot is built.
     :returns: The fully populated :class:`SessionResponse`.
     :raises OmnigentError: 404 if no session exists, 500 if the
         underlying conversation has no agent binding
@@ -12185,7 +12202,9 @@ async def _get_session_snapshot(
         if not conv.reported_model:
             llm_model = conv.model_override or catalog.get("default_model")
     else:
-        model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
+        model_options = await _fetch_model_options(
+            runner_client, session_id, conv, agent_store, allow_host_fill=allow_host_fill
+        )
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
