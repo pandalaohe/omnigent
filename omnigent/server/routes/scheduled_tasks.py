@@ -26,14 +26,22 @@ from omnigent.db.account_authority import account_generation, current_account_us
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.custom_agents_store import CustomAgentsStore
+from omnigent.server.library_agent_launch import (
+    is_library_agent_id,
+    library_agent_lead_harness,
+    load_library_agent_bundle,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_permission_mode_agent_support,
+    validate_permission_mode_harness_support,
     validate_session_agent,
     validate_session_model_metadata,
     validate_session_permission_mode,
+    validate_uploaded_bundle_host_workspace,
 )
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
@@ -226,6 +234,8 @@ def create_scheduled_tasks_router(
     permission_store: PermissionStore | None = None,
     agent_cache: Any | None = None,
     auth_provider: AuthProvider | None = None,
+    custom_agents_store: CustomAgentsStore | None = None,
+    artifact_store: Any | None = None,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -234,6 +244,11 @@ def create_scheduled_tasks_router(
     :param store: The shared :class:`ScheduledTaskStore`.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` disables auth (owner resolves to ``"local"``).
+    :param custom_agents_store: Owner-scoped saved-Agent library. When wired
+        together with *artifact_store*, a saved Agent (``ca_`` id) is a valid
+        task target; when ``None`` a ``ca_`` id is an unknown agent, as before.
+    :param artifact_store: Store holding saved-Agent bundle bytes, used to
+        validate a ``ca_`` target's lead harness and ``os_env.cwd`` boundary.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -247,6 +262,62 @@ def create_scheduled_tasks_router(
     def _scheduler(request: Request) -> Any | None:
         """The live scheduler off app state, or ``None`` if not running."""
         return getattr(request.app.state, "scheduled_task_scheduler", None)
+
+    def _is_library_agent(agent_id: str) -> bool:
+        """Whether *agent_id* is a saved Agent this router can resolve."""
+        return (
+            custom_agents_store is not None
+            and artifact_store is not None
+            and is_library_agent_id(agent_id)
+        )
+
+    async def _resolve_launch_agent(owner: str, agent_id: str) -> tuple[Any | None, Any | None]:
+        """Resolve a task's agent: an ``AgentStore`` row, or a library bundle spec.
+
+        Exactly one of the returned ``(agent, spec)`` is set. A saved Agent is
+        looked up in the OWNER's library, so another owner's (or a deleted)
+        ``ca_`` id raises the same 404 an unknown stored agent produces.
+        """
+        if _is_library_agent(agent_id):
+            store = custom_agents_store
+            assert store is not None  # gated by _is_library_agent
+            spec, _bundle = await load_library_agent_bundle(
+                custom_agents_store=store,
+                artifact_store=artifact_store,
+                owner=owner,
+                agent_id=agent_id,
+            )
+            return None, spec
+        agent = await validate_session_agent(
+            user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            agent_id=agent_id,
+            agent_store=agent_store,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
+        )
+        return agent, None
+
+    async def _gate_permission_mode(
+        agent: Any | None,
+        library_spec: Any | None,
+        permission_mode: str | None,
+    ) -> None:
+        """Gate a permission mode on the resolved agent's harness.
+
+        A saved Agent's harness comes from its parsed bundle spec; a stored
+        agent's is loaded through the agent cache.
+        """
+        if library_spec is not None:
+            validate_permission_mode_harness_support(
+                permission_mode=permission_mode,
+                harness=library_agent_lead_harness(library_spec),
+            )
+        else:
+            await validate_permission_mode_agent_support(
+                permission_mode=permission_mode,
+                agent=agent,
+                agent_cache=agent_cache,
+            )
 
     async def _validate_launch_inputs(
         request: Request,
@@ -273,16 +344,11 @@ def create_scheduled_tasks_router(
         A ``managed_sandbox`` target has no host/workspace to validate — the fire
         provisions a fresh sandbox — but the server must be able to launch one, so
         an unconfigured server rejects the task at create instead of failing every
-        fire.
+        fire. A saved library Agent is rejected on that target outright: its
+        bundle launches only on a connected computer.
         """
         user_id = None if owner == RESERVED_USER_LOCAL else owner
-        agent = await validate_session_agent(
-            user_id=user_id,
-            agent_id=agent_id,
-            agent_store=agent_store,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
-        )
+        agent, library_spec = await _resolve_launch_agent(owner, agent_id)
         validated_model, validated_effort = validate_session_model_metadata(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
@@ -291,12 +357,13 @@ def create_scheduled_tasks_router(
         # Claude SDK, or Codex SDK), mirroring the web dialog's capability gate.
         # A mode on the wrong harness could break a native fire (unknown
         # --permission-mode flag) or select an invalid SDK permission preset.
-        await validate_permission_mode_agent_support(
-            permission_mode=permission_mode,
-            agent=agent,
-            agent_cache=agent_cache,
-        )
+        await _gate_permission_mode(agent, library_spec, permission_mode)
         if execution_target == "managed_sandbox":
+            if library_spec is not None:
+                raise OmnigentError(
+                    "Custom agents require a connected computer",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             sandbox_config = getattr(request.app.state, "sandbox_config", None)
             if sandbox_config is None or not sandbox_config.managed_launch_supported:
                 raise OmnigentError(
@@ -327,15 +394,29 @@ def create_scheduled_tasks_router(
                 "host_id required when workspace is set",
                 code=ErrorCode.INVALID_INPUT,
             )
-        canonical_workspace = await validate_existing_host_workspace(
-            user_id=user_id,
-            host_id=host_id,
-            workspace=workspace,
-            agent=agent,
-            agent_cache=agent_cache,
-            host_store=getattr(request.app.state, "host_store", None),
-            host_registry=getattr(request.app.state, "host_registry", None),
-        )
+        if library_spec is not None:
+            # A saved Agent has no registry row to load its boundary from; the
+            # parsed bundle carries ``os_env.cwd``, exactly as an uploaded
+            # bundle create does.
+            os_env = getattr(library_spec, "os_env", None)
+            canonical_workspace = await validate_uploaded_bundle_host_workspace(
+                user_id=user_id,
+                host_id=host_id,
+                workspace=workspace,
+                spec_cwd=getattr(os_env, "cwd", None) if os_env is not None else None,
+                host_store=getattr(request.app.state, "host_store", None),
+                host_registry=getattr(request.app.state, "host_registry", None),
+            )
+        else:
+            canonical_workspace = await validate_existing_host_workspace(
+                user_id=user_id,
+                host_id=host_id,
+                workspace=workspace,
+                agent=agent,
+                agent_cache=agent_cache,
+                host_store=getattr(request.app.state, "host_store", None),
+                host_registry=getattr(request.app.state, "host_registry", None),
+            )
         return canonical_workspace, validated_model, validated_effort
 
     def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
@@ -575,18 +656,8 @@ def create_scheduled_tasks_router(
             # Gate a newly-SET mode on the (immutable) agent's harness. Clearing
             # to null needs no gate — the fire path injects nothing for null.
             if new_mode is not None:
-                agent = await validate_session_agent(
-                    user_id=owner_id,
-                    agent_id=target_agent_id,
-                    agent_store=agent_store,
-                    permission_store=permission_store,
-                    conversation_store=conversation_store,
-                )
-                await validate_permission_mode_agent_support(
-                    permission_mode=new_mode,
-                    agent=agent,
-                    agent_cache=agent_cache,
-                )
+                agent, library_spec = await _resolve_launch_agent(owner, target_agent_id)
+                await _gate_permission_mode(agent, library_spec, new_mode)
         target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
         # Reject pinning a host/workspace on a managed-sandbox task rather than

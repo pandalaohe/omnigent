@@ -226,6 +226,22 @@ async def validate_permission_mode_agent_support(
         return
     if harness is None:
         return
+    validate_permission_mode_harness_support(permission_mode=permission_mode, harness=harness)
+
+
+def validate_permission_mode_harness_support(
+    *,
+    permission_mode: str | None,
+    harness: str | None,
+) -> None:
+    """Reject a ``permission_mode`` its resolved *harness* does not support.
+
+    Split from :func:`validate_permission_mode_agent_support` so a caller that
+    already holds the parsed spec — the scheduled validation of a saved library
+    Agent's bundle — runs the same gate without a second agent-cache load.
+    """
+    if permission_mode is None or harness is None:
+        return
     modes = (
         CODEX_SDK_APPROVAL_MODES
         if harness == "codex"
