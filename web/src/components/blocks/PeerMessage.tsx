@@ -26,10 +26,10 @@ export function PeerMessageView({ message }: PeerMessageViewProps) {
     .join(" · ");
   const label = message.handoff
     ? message.handoff.kind === "brief"
-      ? `Hand-off · project ${message.handoff.project}`
+      ? `Hand-off · project ${message.handoff.project} · from ${badge}`
       : message.handoff.kind === "result"
-        ? `Hand-off result · ${message.handoff.status}`
-        : "Hand-off · stop requested"
+        ? `Hand-off result · ${message.handoff.status} · from ${badge}`
+        : `Hand-off · stop requested · from ${badge}`
     : `From session ${badge}`;
   return (
     <Message
