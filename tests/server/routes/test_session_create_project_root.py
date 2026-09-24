@@ -12,7 +12,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.entities import ProjectHostBinding
+from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_READ, UnifiedAuthProvider
@@ -81,11 +81,19 @@ async def _project(
 
 
 class Bindings:
-    def __init__(self, bindings: list[ProjectHostBinding]) -> None:
+    def __init__(
+        self,
+        bindings: list[ProjectHostBinding],
+        entries: list[ProjectHostEntry] | None = None,
+    ) -> None:
         self.bindings = bindings
+        self.entries = entries or []
 
     def list_by_project(self, project_id: str) -> list[ProjectHostBinding]:
         return [binding for binding in self.bindings if binding.project_id == project_id]
+
+    def list_entries(self, project_id: str) -> list[ProjectHostEntry]:
+        return [entry for entry in self.entries if entry.project_id == project_id]
 
 
 def _binding(project_id: str, host_id: str, workspace: str) -> ProjectHostBinding:
@@ -100,6 +108,10 @@ def _binding(project_id: str, host_id: str, workspace: str) -> ProjectHostBindin
         1,
         is_primary=True,
     )
+
+
+def _entry(project_id: str, host_id: str, workspace: str) -> ProjectHostEntry:
+    return ProjectHostEntry(project_id, host_id, workspace, 1)
 
 
 async def test_config_root_rejection_explicit_workspace_and_hostless_create(
@@ -206,7 +218,7 @@ async def test_ambiguous_host_fill_and_switch_gate(
     app.state.host_store = Hosts()
     root_response = await client.get(f"/v1/projects/{project_id}/host-roots", headers=_headers())
     assert root_response.json() == {
-        "roots": [{"host_id": "h1", "workspace": "/one", "source": "binding"}],
+        "roots": [{"host_id": "h1", "workspace": "/one", "source": "binding", "checkout": "/one"}],
         "default_host_id": "h1",
         "default_host_reason": "single_root",
     }
@@ -430,7 +442,7 @@ async def test_host_roots_endpoint_is_owner_scoped_and_not_flag_gated(
     response = await client.get(f"/v1/projects/{project_id}/host-roots", headers=_headers())
     assert response.status_code == 200, response.text
     assert response.json() == {
-        "roots": [{"host_id": "h1", "workspace": "/c", "source": "config"}],
+        "roots": [{"host_id": "h1", "workspace": "/c", "source": "config", "checkout": None}],
         "default_host_id": "h1",
         "default_host_reason": "config",
     }
@@ -459,3 +471,66 @@ async def test_sandbox_config_never_fills_a_bound_host(
     assert response.json()["host_id"] is None
     roots = await client.get(f"/v1/projects/{project_id}/host-roots", headers=_headers())
     assert roots.json()["default_host_reason"] == "none"
+
+
+async def test_project_entry_fills_create_and_host_roots(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    """An entry is the resolved workspace, and host-roots reports it plus checkout."""
+    project_id = await _project(
+        client, "entry-root", {"agent_id": AGENT_ID, "host_id": "h1", "workspace": "/c"}
+    )
+    app.state.project_host_binding_store = Bindings(
+        [_binding(project_id, "h1", "/b")],
+        [_entry(project_id, "h1", "/e"), _entry(project_id, "h2", "/e2")],
+    )
+    resolved = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(project_id=project_id, host_id="h1"),
+        user_id=ALICE,
+        project_store=app.state.project_store,
+        binding_store=app.state.project_host_binding_store,
+    )
+    assert resolved.body.workspace == "/e"
+    assert (resolved.entry, resolved.checkout) == ("/e", "/b")
+    # An explicit workspace still resolves the entry and checkout on the host
+    # for placement; the resolver keeps the caller's directory as sent.
+    explicit = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(
+            project_id=project_id, host_id="h1", workspace="/elsewhere"
+        ),
+        user_id=ALICE,
+        project_store=app.state.project_store,
+        binding_store=app.state.project_host_binding_store,
+    )
+    assert explicit.body.workspace == "/elsewhere"
+    assert (explicit.entry, explicit.checkout) == ("/e", "/b")
+    roots = await client.get(f"/v1/projects/{project_id}/host-roots", headers=_headers())
+    assert roots.json()["roots"] == [
+        {"host_id": "h1", "workspace": "/e", "source": "entry", "checkout": "/b"},
+        {"host_id": "h2", "workspace": "/e2", "source": "entry", "checkout": "/e2"},
+    ]
+
+
+async def test_entry_on_another_host_only_refuses_create(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    """Deleting a host's entry means "no directory on that host": never a fallback."""
+    project_id = await _project(
+        client, "entry-elsewhere", {"agent_id": AGENT_ID, "host_id": "h1", "workspace": "/c"}
+    )
+    app.state.project_host_binding_store = Bindings(
+        [_binding(project_id, "h2", "/b")],
+        [_entry(project_id, "h1", "/e")],
+    )
+    app.state.feature_flags = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
+    app.state.project_store.set_collaboration(
+        project_id, user_id=ALICE, enabled=True, expected_revision=0
+    )
+    response = await client.post(
+        "/v1/sessions", json={"project_id": project_id, "host_id": "h2"}, headers=_headers()
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "Project 'entry-elsewhere' has no directory on host 'h2'. Pass workspace, or set "
+        "this host's directory in the project settings."
+    )

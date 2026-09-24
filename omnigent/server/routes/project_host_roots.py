@@ -16,6 +16,7 @@ from omnigent.server.project_placement import (
     host_roots,
     load_bindings,
     load_eligible_host_ids,
+    load_entries,
 )
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.project_store import ProjectStore
@@ -45,8 +46,12 @@ def create_project_host_roots_router(
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         bindings = await load_bindings(request.app.state.project_host_binding_store, project_id)
+        entries = await load_entries(request.app.state.project_host_binding_store, project_id)
         roots = host_roots(
-            project, bindings, gates_on=bindings_apply(project, request.app.state.feature_flags)
+            project,
+            bindings,
+            gates_on=bindings_apply(project, request.app.state.feature_flags),
+            entries=entries,
         )
         eligible = await load_eligible_host_ids(
             request.app.state.host_store, user_id, (root.host_id for root in roots)

@@ -322,6 +322,7 @@ def _to_conversation(
         ),
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
+        worktree=meta.worktree if meta else None,
         archived=row.archived,
         archived_at=row.archived_at,
         archive_revision=row.archive_revision,
@@ -1114,6 +1115,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
+        worktree: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
@@ -1158,6 +1160,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             worktree, e.g. ``"feature/login"``. Set only when the
             session was created with a server-created worktree;
             ``None`` otherwise. See designs/SESSION_GIT_WORKTREE.md.
+        :param worktree: The session's working tree when it differs from
+            ``workspace`` (its launch directory), e.g. a worktree placed
+            inside the project entry. ``None`` for sessions whose launch
+            directory is their working tree (the common case).
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -1297,6 +1303,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     sub_agent_name=sub_agent_name,
                     workspace=workspace,
                     git_branch=git_branch,
+                    worktree=worktree,
                     terminal_launch_args=encoded_terminal_launch_args,
                     inference_snapshot=encoded_inference_snapshot,
                     project_id=project_id,
@@ -3845,6 +3852,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         if search_query and search_scope == "all":
             # Workspace/CWD is metadata-owned. Resolve its matching ids here,
             # then OR them with title/content matches in the AP query below.
+            # The working tree matches wherever the launch directory does, so a
+            # search for a worktree path finds an entry-started session too.
             with self._session("list_conversations") as meta_sess:
                 is_meta_postgres = (
                     meta_sess.bind is not None and meta_sess.bind.dialect.name == "postgresql"
@@ -3853,10 +3862,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     meta_sess.execute(
                         text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
                     )
+                path_pattern = _literal_like_pattern(search_query)
                 workspace_stmt = select(SqlConversationMetadata.id).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    func.lower(SqlConversationMetadata.workspace).like(
-                        _literal_like_pattern(search_query), escape="\\"
+                    or_(
+                        func.lower(SqlConversationMetadata.workspace).like(
+                            path_pattern, escape="\\"
+                        ),
+                        func.lower(SqlConversationMetadata.worktree).like(
+                            path_pattern, escape="\\"
+                        ),
                     ),
                 )
                 if qualifying_ids is not None:
@@ -5084,7 +5099,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def clear_host_binding(self, conversation_id: str) -> Conversation:
         """
-        NULL ``host_id``/``workspace``/``git_branch``/``runner_id`` together.
+        NULL ``host_id``/``workspace``/``worktree``/``git_branch``/``runner_id``
+        together.
 
         Single-transaction full unbind — see
         :meth:`ConversationStore.clear_host_binding`. ``host_id`` and
@@ -5106,6 +5122,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             meta.host_id = None
             meta.workspace = None
+            meta.worktree = None
             meta.git_branch = None
             meta.runner_id = None
             return meta
@@ -5175,6 +5192,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str,
         workspace: str | None = None,
         git_branch: str | None = None,
+        worktree: str | None = None,
     ) -> Conversation:
         """
         Set the host that launched (or should launch) the runner.
@@ -5201,6 +5219,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             together with ``host_id``/``workspace`` when binding an
             existing session to a freshly created worktree (the fork
             resume path). ``None`` (default) leaves it untouched.
+        :param worktree: Optional session working tree when it differs
+            from ``workspace``, e.g. a worktree placed inside the
+            project entry. Same None-means-unchanged semantics as
+            ``git_branch``.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
@@ -5221,6 +5243,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.workspace = workspace
             if git_branch is not None:
                 meta.git_branch = git_branch
+            if worktree is not None:
+                meta.worktree = worktree
             return meta
 
         meta = run_write_transaction(self._session_immediate, "set_host_id", write)
@@ -6302,8 +6326,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         exclude_conversation_id: str,
     ) -> bool:
         """
-        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+        Is another non-archived conversation working in this ``(host_id, workspace)``?
         See the protocol docstring for the semantics.
+
+        Compares each row's effective worktree ``worktree ?? workspace``: an
+        entry-started session whose worktree is ``workspace`` shares that
+        directory even though its launch directory is the entry, and counting
+        its launch directory would mark every entry session a sharer.
 
         Two queries, not one: ``host_id`` / ``workspace`` live on the metadata
         table (Omnigent DB) while ``archived`` lives on ``conversations`` (AP
@@ -6319,7 +6348,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationMetadata.workspace_id == current_workspace_id(),
                         SqlConversationMetadata.host_id == host_id,
-                        SqlConversationMetadata.workspace == workspace,
+                        func.coalesce(
+                            SqlConversationMetadata.worktree,
+                            SqlConversationMetadata.workspace,
+                        )
+                        == workspace,
                         SqlConversationMetadata.id != exclude_conversation_id,
                     )
                     .limit(_WORKSPACE_SHARER_SCAN_LIMIT)

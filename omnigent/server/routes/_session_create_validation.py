@@ -22,10 +22,12 @@ from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_u
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.project_placement import (
     bindings_apply,
+    checkout_on_host,
     default_host,
     host_roots,
     load_bindings,
     load_eligible_host_ids,
+    load_entries,
     root_on_host,
 )
 from omnigent.server.routes._auth_helpers import require_access
@@ -40,10 +42,18 @@ _logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ProjectCreateResolution:
-    """Project-aware request values after defaulting."""
+    """Project-aware request values after defaulting.
+
+    :param entry: The project's entry on the resolved host, or ``None``
+        (no entry, no host, or the sandbox host).
+    :param checkout: The repository a worktree would source from on the
+        resolved host (R-CHECKOUT), or ``None``.
+    """
 
     body: Any
     project_id: str | None = None
+    entry: str | None = None
+    checkout: str | None = None
 
 
 async def resolve_project_session_create(
@@ -83,6 +93,7 @@ async def resolve_project_session_create(
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
     bindings = await load_bindings(binding_store, project.id)
+    entries = await load_entries(binding_store, project.id)
     gates_on = bindings_apply(project, feature_flags)
     if (
         fill_host
@@ -91,7 +102,7 @@ async def resolve_project_session_create(
         and body.parent_session_id is None
         and "host_type" not in fields_set
     ):
-        roots = host_roots(project, bindings, gates_on=gates_on)
+        roots = host_roots(project, bindings, gates_on=gates_on, entries=entries)
         eligible = await load_eligible_host_ids(
             host_store, user_id, (root.host_id for root in roots)
         )
@@ -110,7 +121,7 @@ async def resolve_project_session_create(
     if "workspace" not in fields_set:
         host_id = updates.get("host_id", body.host_id)
         if host_id is not None:
-            root = root_on_host(project, bindings, host_id, gates_on=gates_on)
+            root = root_on_host(project, bindings, host_id, gates_on=gates_on, entries=entries)
             if root is None:
                 raise OmnigentError(
                     f"Project '{project.name}' has no directory on host '{host_id}'. "
@@ -142,7 +153,18 @@ async def resolve_project_session_create(
             code=ErrorCode.INVALID_INPUT,
         )
 
-    return ProjectCreateResolution(body=resolved, project_id=project_id)
+    # The entry and checkout on the resolved host, whether the workspace came
+    # from the project or the caller sent it explicitly; placement needs both.
+    entry: str | None = None
+    checkout: str | None = None
+    resolved_host_id = getattr(resolved, "host_id", None)
+    if resolved_host_id is not None and resolved_host_id != "__sandbox__":
+        entry = next((row.workspace for row in entries if row.host_id == resolved_host_id), None)
+        checkout = checkout_on_host(bindings, entries, resolved_host_id)
+
+    return ProjectCreateResolution(
+        body=resolved, project_id=project_id, entry=entry, checkout=checkout
+    )
 
 
 # Claude Code's ``--permission-mode`` launch vocabulary — every value the CLI

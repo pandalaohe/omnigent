@@ -111,6 +111,7 @@ from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.project_collaboration import (
     create_project_collaboration_router,
 )
+from omnigent.server.routes.project_entries import create_project_entries_router
 from omnigent.server.routes.project_host_roots import create_project_host_roots_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
@@ -3681,6 +3682,21 @@ def create_app(
                 host_store=host_store,
                 host_registry=host_registry,
                 feature_flags=resolved_feature_flags,
+            ),
+            prefix="/v1",
+            tags=["projects"],
+        )
+    # Per-host project entry directories — where a project's sessions open.
+    # Not feature-flag gated; mounted whenever the project and binding stores
+    # (entries share the binding store) are wired.
+    if project_store is not None and project_host_binding_store is not None:
+        app.include_router(
+            create_project_entries_router(
+                project_store,
+                project_host_binding_store,
+                auth_provider=auth_provider,
+                host_store=host_store,
+                host_registry=host_registry,
             ),
             prefix="/v1",
             tags=["projects"],

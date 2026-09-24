@@ -5,13 +5,17 @@ This store owns the ``project_host_bindings`` table. Rows are keyed by
 ``(project_id, host_id, name)`` and carry a ``revision`` the store bumps on
 every change; assignments pin the value they started against. At most one
 binding per ``(project_id, host_id)`` is primary.
+
+It also owns the ``project_host_entries`` table: one project directory per
+host, keyed by ``(project_id, host_id)``, with no revision. An entry is where
+a project's sessions open; bindings stay the repository source.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from omnigent.entities import ProjectHostBinding
+from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
 
 
@@ -180,5 +184,60 @@ class ProjectHostBindingStore(ABC):
 
         :param binding_id: Opaque binding identifier.
         :returns: ``True`` if removed; ``False`` if not found.
+        """
+        ...
+
+    @abstractmethod
+    def list_entries(self, project_id: str) -> list[ProjectHostEntry]:
+        """
+        List a project's entries ordered by ``host_id ASC``.
+
+        :param project_id: The project whose entries to return.
+        :returns: List of :class:`ProjectHostEntry` instances.
+        """
+        ...
+
+    @abstractmethod
+    def put_entry(self, project_id: str, host_id: str, workspace: str) -> ProjectHostEntry:
+        """
+        Register a host's entry path or move it.
+
+        Looks up the row by ``(project_id, host_id)``. A missing row is
+        inserted with ``updated_at`` NULL; an existing row whose workspace
+        differs is updated and stamped with a fresh ``updated_at``; an
+        identical row is returned unchanged.
+
+        :param project_id: The project the entry belongs to.
+        :param host_id: The host the directory lives on.
+        :param workspace: Absolute path as the host canonicalised it.
+        :returns: The inserted or updated :class:`ProjectHostEntry`.
+        :raises OmnigentError: ``NOT_FOUND`` when the project does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def delete_entry(self, project_id: str, host_id: str) -> bool:
+        """
+        Delete a host's entry. Idempotent.
+
+        :param project_id: The project the entry belongs to.
+        :param host_id: The host whose entry to remove.
+        :returns: ``True`` if removed; ``False`` if not found.
+        :raises OmnigentError: ``NOT_FOUND`` when the row exists but its
+            project does not.
+        """
+        ...
+
+    @abstractmethod
+    def entry_exists_at(self, host_id: str, workspace: str) -> bool:
+        """
+        Return whether any project has an entry at ``(host_id, workspace)``.
+
+        Tenant-scoped and project-agnostic: the guard that stops worktree
+        cleanup from removing a directory that is some project's entry.
+
+        :param host_id: The host holding the directory.
+        :param workspace: The canonical directory path to match.
+        :returns: ``True`` when an entry row names the pair.
         """
         ...

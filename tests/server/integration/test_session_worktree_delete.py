@@ -362,6 +362,72 @@ def _upsert_host_row(db_uri: str) -> None:
     HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
 
 
+def test_conversation_worktree_round_trip(db_uri: str) -> None:
+    """A created session keeps its launch directory and working tree distinct."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation(
+        agent_id=None,
+        host_id=_HOST_ID,
+        workspace="/Users/alice/entry",
+        worktree=_WORKTREE_PATH,
+        git_branch="feature/login",
+    )
+    loaded = conv_store.get_conversation(conv.id)
+    assert loaded is not None
+    assert loaded.workspace == "/Users/alice/entry"
+    assert loaded.worktree == _WORKTREE_PATH
+    assert loaded.git_branch == "feature/login"
+    legacy = conv_store.create_conversation(agent_id=None, host_id=_HOST_ID, workspace="/w")
+    assert conv_store.get_conversation(legacy.id).worktree is None
+
+
+def test_set_host_id_worktree_and_clear_host_binding(db_uri: str) -> None:
+    """``set_host_id``'s None means "leave it"; ``clear_host_binding`` nulls it."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation(agent_id=None)
+    bound = conv_store.set_host_id(
+        conv.id, _HOST_ID, workspace="/Users/alice/entry", worktree=_WORKTREE_PATH
+    )
+    assert (bound.workspace, bound.worktree) == ("/Users/alice/entry", _WORKTREE_PATH)
+    unchanged = conv_store.set_host_id(conv.id, _HOST_ID)
+    assert (unchanged.workspace, unchanged.worktree) == ("/Users/alice/entry", _WORKTREE_PATH)
+    moved = conv_store.set_host_id(conv.id, _HOST_ID, worktree="/elsewhere")
+    assert moved.worktree == "/elsewhere"
+    cleared = conv_store.clear_host_binding(conv.id)
+    assert (
+        cleared.host_id,
+        cleared.workspace,
+        cleared.worktree,
+        cleared.git_branch,
+        cleared.runner_id,
+    ) == (None, None, None, None, None)
+
+
+def test_has_other_live_session_matches_effective_worktree(db_uri: str) -> None:
+    """The sharing check compares ``worktree ?? workspace``, never the entry."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    entry_session = conv_store.create_conversation(
+        agent_id=None,
+        host_id=_HOST_ID,
+        workspace="/Users/alice/entry",
+        worktree=_WORKTREE_PATH,
+    )
+    legacy = conv_store.create_conversation(
+        agent_id=None, host_id=_HOST_ID, workspace=_WORKTREE_PATH
+    )
+    # The entry session's launch directory is not the directory being cleaned.
+    assert not conv_store.has_other_live_session_in_workspace(
+        host_id=_HOST_ID,
+        workspace="/Users/alice/entry",
+        exclude_conversation_id=legacy.id,
+    )
+    # Its worktree does count, whichever row is the one being excluded.
+    for exclude in (entry_session.id, legacy.id):
+        assert conv_store.has_other_live_session_in_workspace(
+            host_id=_HOST_ID, workspace=_WORKTREE_PATH, exclude_conversation_id=exclude
+        )
+
+
 class _OfflineRunnerRouter:
     """Runner router that reports every bound session's runner as offline."""
 

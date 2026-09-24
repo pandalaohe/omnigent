@@ -466,6 +466,7 @@ class ConversationStore(ABC):
         host_id: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
+        worktree: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
@@ -516,6 +517,10 @@ class ConversationStore(ABC):
             worktree, e.g. ``"feature/login"``. Set only when the
             session was created with a server-created worktree;
             ``None`` otherwise. See designs/SESSION_GIT_WORKTREE.md.
+        :param worktree: The session's working tree when it differs from
+            ``workspace`` (its launch directory), e.g. a worktree placed
+            inside the project entry. ``None`` for sessions whose launch
+            directory is their working tree (the common case).
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -1739,12 +1744,13 @@ class ConversationStore(ABC):
     def clear_host_binding(self, conversation_id: str) -> Conversation:
         """
         Revert a session to fully unbound: NULL ``host_id``,
-        ``workspace``, ``git_branch``, and ``runner_id`` together.
+        ``workspace``, ``worktree``, ``git_branch``, and ``runner_id``
+        together.
 
         Used to undo a failed per-session bind (``POST
         /v1/hosts/{id}/runners``) after the runner was atomically
         bound and the binding fields persisted, but the launch
-        failed and any worktree was rolled back. Clearing all four
+        failed and any worktree was rolled back. Clearing all five
         fields in one transaction keeps the row consistent with the
         host's actual state (no runner, no worktree) and, unlike
         :meth:`set_host_id` (which treats ``None`` as "leave
@@ -1797,6 +1803,7 @@ class ConversationStore(ABC):
         host_id: str,
         workspace: str | None = None,
         git_branch: str | None = None,
+        worktree: str | None = None,
     ) -> Conversation:
         """
         Set the host that launched (or should launch) the runner.
@@ -1824,6 +1831,9 @@ class ConversationStore(ABC):
             when binding an existing session to a freshly created
             worktree (the fork resume path). ``None`` leaves it
             untouched.
+        :param worktree: Optional session working tree when it differs
+            from ``workspace``, e.g. a worktree placed inside the
+            project entry. ``None`` leaves it untouched.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
@@ -2163,12 +2173,17 @@ class ConversationStore(ABC):
         exclude_conversation_id: str,
     ) -> bool:
         """
-        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+        Is another non-archived conversation working in this ``(host_id, workspace)``?
 
         Sessions routinely share one directory: a fork reusing the source's
         worktree, or several sessions attached to the same existing worktree
         via the picker. Worktree cleanup must not remove a directory a live
         session still runs in, so this is the "is it in use?" gate.
+
+        Each other row is compared by its effective worktree
+        ``worktree ?? workspace``: an entry-started session's launch directory
+        is the project entry, not the directory being cleaned up, so counting
+        it as a sharer would block every worktree cleanup.
 
         Archived sessions do not count. They run nothing, so removing the
         directory cannot wedge them, and counting them would mean a worktree

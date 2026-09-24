@@ -759,6 +759,10 @@ class SqlConversationMetadata(OmnigentBase):
     terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # The session's working tree when it differs from ``workspace`` (its launch
+    # directory): set when a git worktree was placed under the project entry.
+    # NULL for legacy rows and sessions that launch in their worktree.
+    worktree: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Live-state columns, written by the replica holding the runner
     # tunnel so any replica can serve the sidebar's live fields.
@@ -2019,6 +2023,46 @@ class SqlProjectHostBinding(OmnigentBase):
             "id",
         ),
     )
+
+
+class SqlProjectHostEntry(OmnigentBase):
+    """
+    SQLAlchemy model for the ``project_host_entries`` table.
+
+    One project's own directory on one host — the entry its sessions open in.
+    Entries are a project setting of their own, separate from the registered
+    repositories and host bindings: they work with collaboration off, and once
+    a project has one, it is its only root on that host. Host-native syntax is
+    preserved (POSIX, Windows drive, UNC).
+
+    :param project_id: The project this entry belongs to (relates to
+        ``projects.id``). No DB foreign key (Rule R032).
+    :param host_id: The host this entry lives on (relates to
+        ``hosts.host_id``). No DB foreign key (Rule R032).
+    :param workspace: Absolute path as the host canonicalised it, never as
+        typed.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None`` if
+        the row has never been updated.
+    """
+
+    __tablename__ = "project_host_entries"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    # Relates to projects.id. No DB foreign key (Rule R032); cascade is app-owned.
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relates to hosts.host_id. No DB foreign key (Rule R032).
+    host_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    workspace: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class SqlAssignment(OmnigentBase):

@@ -1,8 +1,9 @@
 """Tests for collaboration config and the repository/binding stores.
 
 Covers ``ProjectStore.set_collaboration`` (revision bump and conflict),
-repository upsert (revision bump on change only), and binding upsert (the
-one-primary invariant per ``(project, host)``).
+repository upsert (revision bump on change only), binding upsert (the
+one-primary invariant per ``(project, host)``), and the per-host project
+entries (upsert / list / delete / existence guard).
 """
 
 from __future__ import annotations
@@ -700,3 +701,95 @@ def test_binding_upsert_foreign_repository_rejected(
     assert exc.value.code == ErrorCode.INVALID_INPUT
     assert foreign_repo_id in exc.value.message
     assert binding_store.list_by_project(project_id) == []
+
+
+# ── entries ─────────────────────────────────────────────────────────────
+
+
+def test_entry_put_inserts_and_lists_ordered(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Entries key on (project, host): inserted per host, listed by host id."""
+    project_id = _create_project(project_store)
+    first = binding_store.put_entry(project_id, _uid("host-b"), "/w/b")
+    assert first.created_at > 0
+    assert first.updated_at is None
+    binding_store.put_entry(project_id, _uid("host-a"), "/w/a")
+    assert [entry.host_id for entry in binding_store.list_entries(project_id)] == [
+        _uid("host-a"),
+        _uid("host-b"),
+    ]
+    assert binding_store.list_entries(_uid("other")) == []
+    assert first == binding_store.put_entry(project_id, _uid("host-b"), "/w/b")
+
+
+def test_entry_put_change_moves_and_stamps_updated_at(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """A moved path is stored and stamped; the identical put is a no-op."""
+    project_id = _create_project(project_store)
+    host_id = _uid("host-a")
+    created = binding_store.put_entry(project_id, host_id, "/w")
+    moved = binding_store.put_entry(project_id, host_id, "/w-moved")
+    assert moved.workspace == "/w-moved"
+    assert moved.created_at == created.created_at
+    assert moved.updated_at is not None
+    unchanged = binding_store.put_entry(project_id, host_id, "/w-moved")
+    assert unchanged == moved
+
+
+def test_entry_delete_is_idempotent(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Delete removes the row once and reports absence afterwards."""
+    project_id = _create_project(project_store)
+    host_id = _uid("host-a")
+    binding_store.put_entry(project_id, host_id, "/w")
+    assert binding_store.delete_entry(project_id, host_id) is True
+    assert binding_store.delete_entry(project_id, host_id) is False
+    assert binding_store.list_entries(project_id) == []
+
+
+def test_entry_exists_at_is_tenant_scoped_and_project_agnostic(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """The guard matches host + workspace, whatever project owns the entry."""
+    mine = _create_project(project_store, "proj")
+    other = _create_project(project_store, "other", name="Q")
+    host_id = _uid("host-a")
+    binding_store.put_entry(other, host_id, "/entry")
+    assert binding_store.entry_exists_at(host_id, "/entry") is True
+    assert binding_store.entry_exists_at(host_id, "/elsewhere") is False
+    assert binding_store.entry_exists_at(_uid("host-b"), "/entry") is False
+    assert binding_store.list_entries(mine) == []
+
+
+def test_entry_put_missing_project_raises_not_found(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+) -> None:
+    """Upserting an entry on an unknown project writes no orphan row."""
+    missing = _uid("missing-proj")
+    with pytest.raises(OmnigentError) as exc:
+        binding_store.put_entry(missing, _uid("host-a"), "/w")
+    assert exc.value.code == ErrorCode.NOT_FOUND
+    assert missing in exc.value.message
+    assert binding_store.list_entries(missing) == []
+
+
+def test_entry_delete_missing_project_raises_not_found(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Deleting a row whose project is gone raises ``NOT_FOUND``, not ``False``."""
+    project_id = _create_project(project_store)
+    host_id = _uid("host-a")
+    binding_store.put_entry(project_id, host_id, "/w")
+    assert project_store.delete(project_id, user_id="alice@example.com") is True
+    with pytest.raises(OmnigentError) as exc:
+        binding_store.delete_entry(project_id, host_id)
+    assert exc.value.code == ErrorCode.NOT_FOUND
+    assert project_id in exc.value.message

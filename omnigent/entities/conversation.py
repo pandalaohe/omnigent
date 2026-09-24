@@ -220,6 +220,12 @@ class Conversation:
         ``git_branch IS NOT NULL`` is the gate for offering worktree
         cleanup on session delete. See
         designs/SESSION_GIT_WORKTREE.md.
+    :param worktree: The session's working tree when it differs from
+        its launch directory (``workspace``), e.g. a worktree placed
+        inside the project entry. ``None`` for legacy rows and for
+        sessions whose launch directory is their working tree; git
+        readers then fall back to ``workspace``. Never accepted from
+        clients: set only by server-side placement.
     :param archived: Whether the session is archived. Archived
         sessions are hidden from the default ``GET /v1/sessions``
         listing (and the sidebar), surfacing only when the caller
@@ -270,6 +276,7 @@ class Conversation:
     terminal_launch_args: list[str] | None = None
     workspace: str | None = None
     git_branch: str | None = None
+    worktree: str | None = None
     archived: bool = False
     archived_at: int | None = None
     archive_revision: int = 0

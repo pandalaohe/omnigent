@@ -2727,6 +2727,22 @@
         "title": "ElicitationResolvedEvent",
         "type": "object"
       },
+      "EntryPutRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PUT /v1/projects/{project_id}/entries/{host_id}`.",
+        "properties": {
+          "workspace": {
+            "description": "Absolute path on the host. Validated live via `host.stat`; the canonical path the host returns is stored.",
+            "title": "Workspace",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace"
+        ],
+        "title": "EntryPutRequest",
+        "type": "object"
+      },
       "ErrorData": {
         "description": "Data for a persisted error banner item.\n\nThese items mirror `response.error` events so clients can render\nthe same error banner after reconnect / refresh. They are listed in\n`NON_CONTENT_ITEM_TYPES` because they are operator-visible\ntranscript metadata, not content the next agent turn should receive.",
         "properties": {
@@ -13753,6 +13769,163 @@
           }
         },
         "summary": "Set Collaboration",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/entries": {
+      "get": {
+        "description": "Return the project's entry directory per host.\n\n**Returns:** `{\"entries\": [{\"host_id\", \"workspace\", \"updated_at\"}]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned by the caller.",
+        "operationId": "list_project_entries_v1_projects__project_id__entries_get",
+        "parameters": [
+          {
+            "description": "The project to inspect.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Project Entries V1 Projects  Project Id  Entries Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Project Entries",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/entries/{host_id}": {
+      "delete": {
+        "description": "Delete a host's entry directory.\n\n**Returns:** An empty 204 response.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or entry is not found / not owned by the caller.",
+        "operationId": "delete_project_entry_v1_projects__project_id__entries__host_id__delete",
+        "parameters": [
+          {
+            "description": "The project the entry belongs to.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The host whose entry to remove.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project Entry",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Validate and store a host's entry directory.\n\nThe typed path is validated live on the host; the canonical path the\nhost returns is what gets stored, never the typed one.\n\n**Parameters**\n\n- `body` \u2014 Workspace path on the host.\n\n**Returns:** The inserted or updated entry.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 for the sandbox host or a bad path, 409 when the host is offline.",
+        "operationId": "put_project_entry_v1_projects__project_id__entries__host_id__put",
+        "parameters": [
+          {
+            "description": "The project the entry belongs to.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The host the directory lives on.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EntryPutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Put Project Entry V1 Projects  Project Id  Entries  Host Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Project Entry",
         "tags": [
           "projects"
         ]

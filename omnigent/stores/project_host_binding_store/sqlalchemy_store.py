@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import (
     SqlProject,
     SqlProjectHostBinding,
+    SqlProjectHostEntry,
     SqlProjectRepository,
     current_workspace_id,
 )
@@ -19,7 +20,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
-from omnigent.entities import ProjectHostBinding
+from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_host_binding_store import (
     DuplicatePrimaryBindingError,
@@ -47,6 +48,24 @@ def _to_entity(row: SqlProjectHostBinding) -> ProjectHostBinding:
         is_primary=row.is_primary,
         enabled=row.enabled,
         path_verified_at=row.path_verified_at,
+        updated_at=row.updated_at,
+        workspace_id=row.workspace_id,
+    )
+
+
+def _entry_to_entity(row: SqlProjectHostEntry) -> ProjectHostEntry:
+    """
+    Convert a :class:`SqlProjectHostEntry` ORM row to a
+    :class:`ProjectHostEntry`.
+
+    :param row: The SQLAlchemy ORM row to convert.
+    :returns: A :class:`ProjectHostEntry` dataclass instance.
+    """
+    return ProjectHostEntry(
+        project_id=row.project_id,
+        host_id=row.host_id,
+        workspace=row.workspace,
+        created_at=row.created_at,
         updated_at=row.updated_at,
         workspace_id=row.workspace_id,
     )
@@ -336,3 +355,68 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             return True
 
         return run_write_transaction(self._session_immediate, "delete_binding", write)
+
+    def list_entries(self, project_id: str) -> list[ProjectHostEntry]:
+        """List a project's entries ordered by ``host_id ASC``."""
+        with self._session("project_entries.list") as session:
+            stmt = (
+                select(SqlProjectHostEntry)
+                .where(SqlProjectHostEntry.workspace_id == current_workspace_id())
+                .where(SqlProjectHostEntry.project_id == project_id)
+                .order_by(asc(SqlProjectHostEntry.host_id))
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_entry_to_entity(r) for r in rows]
+
+    def put_entry(self, project_id: str, host_id: str, workspace: str) -> ProjectHostEntry:
+        """Register a host's entry path or move it."""
+
+        def write(session: Session) -> ProjectHostEntry:
+            # Project row first: one lock order per project, and an unknown
+            # project is refused rather than left with an orphan entry.
+            _lock_project(session, project_id=project_id)
+            row = session.get(SqlProjectHostEntry, (current_workspace_id(), project_id, host_id))
+            if row is None:
+                row = SqlProjectHostEntry(
+                    project_id=project_id,
+                    host_id=host_id,
+                    workspace=workspace,
+                    created_at=now_epoch(),
+                    updated_at=None,
+                )
+                session.add(row)
+                session.flush()
+                return _entry_to_entity(row)
+            if row.workspace == workspace:
+                return _entry_to_entity(row)
+            row.workspace = workspace
+            row.updated_at = now_epoch()
+            session.flush()
+            return _entry_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "project_entries.put", write)
+
+    def delete_entry(self, project_id: str, host_id: str) -> bool:
+        """Delete a host's entry. Idempotent; ``False`` if not found."""
+
+        def write(session: Session) -> bool:
+            row = session.get(SqlProjectHostEntry, (current_workspace_id(), project_id, host_id))
+            if row is None:
+                return False
+            _lock_project(session, project_id=project_id)
+            session.delete(row)
+            return True
+
+        return run_write_transaction(self._session_immediate, "project_entries.delete", write)
+
+    def entry_exists_at(self, host_id: str, workspace: str) -> bool:
+        """Return whether any project has an entry at ``(host_id, workspace)``."""
+        with self._session("project_entries.exists_at") as session:
+            stmt = (
+                select(SqlProjectHostEntry.project_id)
+                .where(SqlProjectHostEntry.workspace_id == current_workspace_id())
+                .where(SqlProjectHostEntry.host_id == host_id)
+                .where(SqlProjectHostEntry.workspace == workspace)
+                .limit(1)
+            )
+            return session.execute(stmt).first() is not None

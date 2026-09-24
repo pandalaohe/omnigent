@@ -52,6 +52,7 @@ from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
 from omnigent.entities.project import Project
 from omnigent.entities.project_host_binding import ProjectHostBinding
+from omnigent.entities.project_host_entry import ProjectHostEntry
 from omnigent.entities.project_repository import ProjectRepository
 from omnigent.entities.scheduled_task import ScheduledTask, ScheduledTaskRun
 from omnigent.entities.session_resources import (
@@ -99,6 +100,7 @@ __all__ = [
     "Policy",
     "Project",
     "ProjectHostBinding",
+    "ProjectHostEntry",
     "ProjectRepository",
     "ProviderConnection",
     "ReasoningData",
