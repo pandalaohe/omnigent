@@ -101,6 +101,19 @@ describe("customAgentsApi", () => {
     );
     await expect(getCustomAgent(detail.id)).rejects.toThrow("Version conflict");
 
+    // The Agent routes' own envelope; the editor keys its reload off the status.
+    mocks.authenticatedFetch.mockResolvedValueOnce(
+      jsonResponse(
+        { error: { code: "conflict", message: "Custom Agent changed; reload before saving" } },
+        409,
+      ),
+    );
+    await expect(getCustomAgent(detail.id)).rejects.toMatchObject({
+      message: "Custom Agent changed; reload before saving",
+      status: 409,
+      code: "conflict",
+    });
+
     mocks.authenticatedFetch.mockResolvedValueOnce(
       new Response("upstream failed", { status: 502 }),
     );

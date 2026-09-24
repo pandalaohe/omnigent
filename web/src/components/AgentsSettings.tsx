@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { PlusIcon } from "lucide-react";
+
+import { AgentEditor } from "@/components/AgentEditor";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import {
@@ -14,9 +16,7 @@ import {
   CUSTOM_AGENTS_QUERY_KEY,
   createCustomAgent,
   deleteCustomAgent,
-  getCustomAgent,
   importCustomAgent,
-  updateCustomAgent,
   useCustomAgents,
   type CustomAgent,
 } from "@/lib/customAgentsApi";
@@ -91,6 +91,11 @@ export function AgentsSettings() {
       setBusy(false);
     }
   }
+
+  // A saved Agent's row opens the member editor; the catalog row carries the
+  // name/description the editor seeds from.
+  const editingSavedAgent =
+    editing?.custom === true ? catalog.data?.find((row) => row.id === editing.id) : undefined;
 
   return (
     <section aria-label="Agents" className="mx-auto w-full max-w-3xl space-y-7">
@@ -243,10 +248,18 @@ export function AgentsSettings() {
           await refresh();
         }}
       />
-      {editing && (
+      {editing && !editing.custom && (
         <AgentSettingsEditor
           key={editing.id}
           agent={editing}
+          onClose={() => setEditing(null)}
+          onSaved={refresh}
+        />
+      )}
+      {editingSavedAgent && (
+        <SavedAgentEditor
+          key={editingSavedAgent.id}
+          agent={editingSavedAgent}
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />
@@ -420,5 +433,35 @@ function AgentSettingsEditor({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Edit a saved Agent's roster plus its optional badge. */
+function SavedAgentEditor({
+  agent,
+  onClose,
+  onSaved,
+}: {
+  agent: CustomAgent;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [badge, setBadge] = useState<AgentBadgeValue | null>(
+    () => readAgentBadgePreferences().entries[agent.id] ?? null,
+  );
+  const [badgeValid, setBadgeValid] = useState(true);
+  return (
+    <AgentEditor
+      agent={agent}
+      onClose={onClose}
+      onSaved={async () => {
+        saveBadge(agent.id, badge);
+        await onSaved();
+      }}
+      extraFields={
+        <AgentBadgeEditor value={badge} onChange={setBadge} onValidityChange={setBadgeValid} />
+      }
+      submitDisabled={!badgeValid}
+    />
   );
 }

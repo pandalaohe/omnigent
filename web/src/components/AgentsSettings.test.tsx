@@ -76,7 +76,9 @@ const custom: CustomAgent = {
   name: "Reviewer",
   description: "Reviews changes",
   harness: "codex",
-  model: null,
+  // The editor's lead requires a model (the omnigent executor rejects a root
+  // without one), and this fixture drives the editor's Save.
+  model: "opus",
   members: null,
   version: 3,
   created_at: 2,

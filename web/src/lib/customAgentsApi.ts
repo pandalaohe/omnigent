@@ -35,13 +35,20 @@ export interface CustomAgentDetail extends CustomAgent {
 async function checked(response: Response): Promise<Response> {
   if (response.ok) return response;
   let message = `Agent request failed (${response.status})`;
+  let code: string | undefined;
   try {
     const body = await response.json();
-    if (typeof body.detail === "string") message = body.detail;
+    if (typeof body.error?.message === "string") {
+      message = body.error.message;
+      if (typeof body.error.code === "string") code = body.error.code;
+    } else if (typeof body.detail === "string") {
+      /* FastAPI's HTTPException shape, e.g. the multipart size/type rejects. */
+      message = body.detail;
+    }
   } catch {
     /* Keep the status when the server returns a non-JSON error. */
   }
-  throw new Error(message);
+  throw Object.assign(new Error(message), { status: response.status, code });
 }
 
 export async function listCustomAgents(): Promise<CustomAgent[]> {
