@@ -170,6 +170,22 @@
             "title": "Mcp Servers Editable",
             "type": "boolean"
           },
+          "members": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Roster projected from the bundle: the lead (root spec) first, then each sub-agent, each as `{name, description, harness, model, reasoning_effort, lead}` (see `omnigent.server.custom_agent_bundles.project_members`). `None` when the bundle cannot be loaded.",
+            "title": "Members"
+          },
           "name": {
             "description": "Human-readable agent name, e.g. `\"research-agent\"`.",
             "title": "Name",
@@ -11514,17 +11530,35 @@
             "application/json": {
               "schema": {
                 "additionalProperties": false,
+                "description": "Duplicate a source Agent: a session snapshot or a built-in row.",
                 "properties": {
+                  "source_agent_id": {
+                    "anyOf": [
+                      {
+                        "maxLength": 256,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Source Agent Id"
+                  },
                   "source_session_id": {
-                    "maxLength": 256,
-                    "minLength": 1,
-                    "title": "Source Session Id",
-                    "type": "string"
+                    "anyOf": [
+                      {
+                        "maxLength": 256,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Source Session Id"
                   }
                 },
-                "required": [
-                  "source_session_id"
-                ],
                 "title": "CustomAgentImport",
                 "type": "object"
               }

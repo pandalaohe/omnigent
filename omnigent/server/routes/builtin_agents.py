@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Query, Request
 
@@ -29,6 +30,7 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import Agent
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
+from omnigent.server.custom_agent_bundles import project_members
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
 from omnigent.stores import AgentStore
@@ -41,7 +43,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     Convert a runtime Agent entity to an API-layer AgentObject.
 
     Loads the spec from cache to populate ``mcp_servers``,
-    ``skills``, and (when the stored row has none) the
+    ``skills``, ``members``, and (when the stored row has none) the
     ``description``; on any load failure those fall back to empty /
     the stored value rather than failing the whole list — one
     unreadable bundle must not break discovery.
@@ -54,6 +56,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     mcp_servers: list[MCPServerSummary] = []
     skills: list[SkillSummary] = []
     terminals: list[str] = []
+    members: list[dict[str, Any]] | None = None
     harness: str | None = None
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
@@ -94,9 +97,12 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
+        # Joint-Agent roster (lead first, then sub-agents), the same
+        # projection custom agents report. None when unloadable.
+        members = project_members(loaded.spec)
     except Exception:  # noqa: BLE001 — spec load failure must not break the list
         _logger.debug(
-            "Failed to load spec for agent %s; mcp_servers/skills will be empty",
+            "Failed to load spec for agent %s; mcp_servers/skills/members will be empty",
             agent.id,
             exc_info=True,
         )
@@ -112,6 +118,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         mcp_servers_editable=False,
         skills=skills,
         terminals=terminals,
+        members=members,
         # Seeded built-ins use a deterministic, name-derived id; an
         # operator/user-registered template (e.g. ``--agent``) uses a
         # random id. The picker protects the former from being shadowed

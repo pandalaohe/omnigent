@@ -10,11 +10,19 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.formparsers import MultiPartException
 
+from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_OWNER,
@@ -74,8 +82,19 @@ class CustomAgentPatch(BaseModel):
 
 
 class CustomAgentImport(BaseModel):
+    """Duplicate a source Agent: a session snapshot or a built-in row."""
+
     model_config = ConfigDict(extra="forbid")
-    source_session_id: str = Field(min_length=1, max_length=256)
+    source_session_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_agent_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def exactly_one_source(self) -> CustomAgentImport:
+        # The two sources carry different ownership rules; exactly one must
+        # be named so the handler picks a branch without guessing.
+        if (self.source_session_id is None) == (self.source_agent_id is None):
+            raise ValueError("exactly one of source_session_id or source_agent_id is required")
+        return self
 
 
 def create_custom_agents_router(
@@ -249,27 +268,44 @@ def create_custom_agents_router(
             try:
                 body = CustomAgentImport.model_validate(await request.json())
             except (ValueError, ValidationError) as exc:
-                raise HTTPException(422, "source_session_id is required") from exc
-            user_id = require_user(request, auth_provider)
-            if auth_provider is not None and permission_store is None:
-                raise OmnigentError(
-                    "Session ownership checks unavailable", code=ErrorCode.FORBIDDEN
+                raise HTTPException(
+                    422, "exactly one of source_session_id or source_agent_id is required"
+                ) from exc
+            if body.source_session_id is not None:
+                user_id = require_user(request, auth_provider)
+                if auth_provider is not None and permission_store is None:
+                    raise OmnigentError(
+                        "Session ownership checks unavailable", code=ErrorCode.FORBIDDEN
+                    )
+                await require_access(
+                    user_id,
+                    body.source_session_id,
+                    LEVEL_OWNER,
+                    permission_store,
+                    conversation_store,
                 )
-            await require_access(
-                user_id, body.source_session_id, LEVEL_OWNER, permission_store, conversation_store
-            )
-            conv = await asyncio.to_thread(
-                conversation_store.get_conversation, body.source_session_id
-            )
-            agent = (
-                await asyncio.to_thread(agent_store.get, conv.agent_id)
-                if conv and conv.agent_id
-                else None
-            )
-            if agent is None or agent.session_id is None:
-                raise OmnigentError("Custom session Agent not found", code=ErrorCode.NOT_FOUND)
-            data = await asyncio.to_thread(artifact_bytes, agent.bundle_location)
-            source_session_id = body.source_session_id
+                conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, body.source_session_id
+                )
+                agent = (
+                    await asyncio.to_thread(agent_store.get, conv.agent_id)
+                    if conv and conv.agent_id
+                    else None
+                )
+                if agent is None or agent.session_id is None:
+                    raise OmnigentError("Custom session Agent not found", code=ErrorCode.NOT_FOUND)
+                data = await asyncio.to_thread(artifact_bytes, agent.bundle_location)
+                source_session_id = body.source_session_id
+            else:
+                # Only seeded built-ins carry the deterministic, name-derived
+                # id; session-scoped copies and uploads get random ids.
+                assert body.source_agent_id is not None
+                source_agent_id = body.source_agent_id
+                require_user(request, auth_provider)
+                agent = await asyncio.to_thread(agent_store.get, source_agent_id)
+                if agent is None or agent.id != builtin_agent_id(agent.name):
+                    raise OmnigentError("Built-in Agent not found", code=ErrorCode.NOT_FOUND)
+                data = await asyncio.to_thread(artifact_bytes, agent.bundle_location)
         else:
             raise HTTPException(415, "Use application/json or multipart/form-data")
         created = await asyncio.to_thread(persist_new, owner_id, data)

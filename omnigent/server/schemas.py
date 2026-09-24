@@ -329,6 +329,11 @@ class AgentObject(BaseModel):
         the launchable choices. Empty list when the spec
         declares no terminals or when the bundle cannot be
         loaded.
+    :param members: Roster projected from the bundle: the lead
+        (root spec) first, then each sub-agent, each as
+        ``{name, description, harness, model, reasoning_effort,
+        lead}`` (see :func:`omnigent.server.custom_agent_bundles.project_members`).
+        ``None`` when the bundle cannot be loaded.
     :param builtin: Whether this is a server-*seeded* built-in
         agent (deterministic, name-derived id) as opposed to an
         operator/user-registered template (random id, e.g. via
@@ -354,6 +359,7 @@ class AgentObject(BaseModel):
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
+    members: list[dict[str, Any]] | None = None
     builtin: bool = False
 
 

@@ -13,7 +13,7 @@ import pytest
 import yaml
 from starlette.requests import HTTPConnection
 
-from omnigent.db.utils import generate_agent_id
+from omnigent.db.utils import builtin_agent_id, generate_agent_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
@@ -1340,6 +1340,165 @@ async def test_import_requires_owner_and_retains_archive(
             content="{}",
         )
         assert bad_type.status_code == 415
+
+
+@pytest.mark.asyncio
+async def test_duplicate_builtin_agent_from_agent_id(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    alice = {"x-test-user": "alice"}
+    source = joint_bundle()
+    builtin_id = builtin_agent_id("polly")
+    location = bundle_location(builtin_id, source)
+    artifacts.put(location, source)
+    agents.create(builtin_id, "polly", location)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        builtin = next(
+            agent
+            for agent in (await client.get("/v1/agents", headers=alice)).json()["data"]
+            if agent["id"] == builtin_id
+        )
+        response = await client.post(
+            "/v1/custom-agents", headers=alice, json={"source_agent_id": builtin_id}
+        )
+        assert response.status_code == 201, response.text
+        copy = response.json()
+        assert copy["id"].startswith("ca_")
+        expected_members = [
+            {
+                "name": "custom-reviewer",
+                "description": "Lead reviewer",
+                "harness": "codex",
+                "model": "lead-model",
+                "reasoning_effort": "high",
+                "lead": True,
+            },
+            {
+                "name": "researcher",
+                "description": "Research support",
+                "harness": "claude-sdk",
+                "model": "research-model",
+                "reasoning_effort": "medium",
+                "lead": False,
+            },
+        ]
+        # The copy's projection is the built-in's own catalog projection.
+        assert builtin["members"] == expected_members
+        assert copy["members"] == builtin["members"]
+        # The bundle is copied byte-for-byte; no session label step runs.
+        contents = await client.get(f"/v1/custom-agents/{copy['id']}/contents", headers=alice)
+        assert contents.status_code == 200, contents.text
+        assert contents.content == source
+
+        patched = await client.patch(
+            f"/v1/custom-agents/{copy['id']}",
+            headers=alice,
+            json={"members": copy["members"], "version": copy["version"]},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["version"] == copy["version"] + 1
+        assert patched.json()["members"] == copy["members"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_builtin_agent_rejects_unknown_and_session_scoped_ids(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, agents, conversations, _permissions = make_app(db_uri, tmp_path)
+    alice = {"x-test-user": "alice"}
+    source = joint_bundle()
+    runtime_id = generate_agent_id()
+    location = bundle_location(runtime_id, source)
+    artifacts.put(location, source)
+    conversations.create_session_with_agent(
+        agent_id=runtime_id,
+        agent_name="custom-reviewer",
+        agent_bundle_location=location,
+        agent_description=None,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for source_agent_id in (generate_agent_id(), runtime_id):
+            response = await client.post(
+                "/v1/custom-agents", headers=alice, json={"source_agent_id": source_agent_id}
+            )
+            assert response.status_code == 404, response.text
+            assert response.json()["error"]["message"] == "Built-in Agent not found"
+
+        # A registered template with a random id (e.g. ``--agent``) is a
+        # template row, yet not a built-in.
+        template_id = generate_agent_id()
+        template_location = bundle_location(template_id, source)
+        artifacts.put(template_location, source)
+        agents.create(template_id, "operator-template", template_location)
+        response = await client.post(
+            "/v1/custom-agents", headers=alice, json={"source_agent_id": template_id}
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["message"] == "Built-in Agent not found"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_builtin_agent_rejects_orphaned_session_agent(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, agents, conversations, _permissions = make_app(db_uri, tmp_path)
+    alice = {"x-test-user": "alice"}
+    source = joint_bundle()
+    runtime_id = generate_agent_id()
+    location = bundle_location(runtime_id, source)
+    artifacts.put(location, source)
+    snapshot = conversations.create_session_with_agent(
+        agent_id=runtime_id,
+        agent_name="custom-reviewer",
+        agent_bundle_location=location,
+        agent_description=None,
+    )
+    # A session delete commits its conversation rows first; when the separate
+    # agent-cleanup transaction fails, the session-kind row survives with no
+    # conversation left to derive session_id from.
+    from sqlalchemy import delete as sa_delete
+
+    from omnigent.db.db_models import SqlConversation
+    from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+
+    engine = get_or_create_engine(db_uri)
+    with make_managed_session_maker(engine)() as session:
+        session.execute(
+            sa_delete(SqlConversation).where(SqlConversation.id == snapshot.conversation.id)
+        )
+    orphan = agents.get(runtime_id)
+    assert orphan is not None and orphan.session_id is None
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/custom-agents", headers=alice, json={"source_agent_id": runtime_id}
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["message"] == "Built-in Agent not found"
+        listed = await client.get("/v1/custom-agents", headers=alice)
+        assert listed.json()["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_import_source_requires_exactly_one_field(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    alice = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for payload in ({}, {"source_session_id": "conv_x", "source_agent_id": "ag_x"}):
+            response = await client.post("/v1/custom-agents", headers=alice, json=payload)
+            assert response.status_code == 422, response.text
+            assert "source_session_id" in response.json()["detail"]
+            assert "source_agent_id" in response.json()["detail"]
 
 
 def test_patch_block_scalar_keeps_following_yaml_and_empty_instructions() -> None:
