@@ -296,6 +296,7 @@ export function HarnessPickerEntry({
   open,
   onOpenChange,
   onSelect,
+  onEdit,
   configContent,
   editable = true,
   isMobile = false,
@@ -312,6 +313,10 @@ export function HarnessPickerEntry({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelect?: () => void;
+  /** The row's agent action. A row with a config flyout keeps the flyout — its
+   *  first item carries this action — and only a row without one invokes it
+   *  from the Edit affordance. */
+  onEdit?: () => void;
   configContent?: ReactNode;
   editable?: boolean;
   isMobile?: boolean;
@@ -331,6 +336,18 @@ export function HarnessPickerEntry({
     onSelect?.();
     closeMenu();
   };
+  // Only a row without a config flyout falls back to the caller's agent action.
+  const showEdit = editable || onEdit !== undefined;
+  const handleEdit = () => {
+    if (editable) {
+      onOpenChange(true);
+      return;
+    }
+    // Editing leaves the picker (a dialog owns the editor), so commit the
+    // row's pick and close the menu rather than drilling into a flyout.
+    selectAndClose();
+    onEdit?.();
+  };
   const isEditTarget = (target: EventTarget) =>
     target instanceof Element && target.closest("[data-harness-edit]") !== null;
   const rowProps = {
@@ -344,7 +361,9 @@ export function HarnessPickerEntry({
     "aria-disabled": disabled || undefined,
     "aria-description": editable
       ? "Enter to select; Right Arrow to edit configuration."
-      : undefined,
+      : onEdit
+        ? "Enter to select; Right Arrow to edit."
+        : undefined,
     textValue: row.label,
   };
   const content = (
@@ -354,7 +373,7 @@ export function HarnessPickerEntry({
         showDetails={showDetails}
         keyboardNavigation={!pointerInteraction}
       />
-      {editable && (
+      {showEdit && (
         <span
           data-harness-edit=""
           data-testid={editTestId}
@@ -468,20 +487,20 @@ export function HarnessPickerEntry({
             onClick={(event) => {
               if (disabled) {
                 event.preventDefault();
-              } else if (editable && isEditTarget(event.target)) {
+              } else if (showEdit && isEditTarget(event.target)) {
                 event.preventDefault();
-                onOpenChange(true);
+                handleEdit();
               }
             }}
             onKeyDown={(event) => {
               if (
-                editable &&
+                showEdit &&
                 !disabled &&
                 event.target === event.currentTarget &&
                 event.key === "ArrowRight"
               ) {
                 event.preventDefault();
-                onOpenChange(true);
+                handleEdit();
               }
             }}
           >

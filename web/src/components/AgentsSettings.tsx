@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { PlusIcon } from "lucide-react";
 
-import { AgentEditor } from "@/components/AgentEditor";
+import { AgentEditor, BuiltinAgentView, memberSettings } from "@/components/AgentEditor";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import {
@@ -25,7 +25,7 @@ import {
   type CustomAgent,
   type CustomAgentMember,
 } from "@/lib/customAgentsApi";
-import { isNativeCodingAgent, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
 import { AgentBadge } from "./AgentBadge";
 import { AgentBadgeEditor } from "./AgentBadgeEditor";
 import { Button } from "./ui/button";
@@ -52,17 +52,6 @@ function saveBadge(agentId: string, value: AgentBadgeValue | null) {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "The Agent could not be saved.";
-}
-
-/** AgentEditor's label resolution: catalog label, then the native registry, then the id. */
-function harnessLabel(labels: Record<string, string>, harness: string): string {
-  return labels[harness] ?? nativeCodingAgentForHarness(harness)?.displayName ?? harness;
-}
-
-function memberSettings(member: CustomAgentMember, labels: Record<string, string>): string {
-  return [harnessLabel(labels, member.harness), member.model ?? "Default", member.reasoning_effort]
-    .filter(Boolean)
-    .join(" · ");
 }
 
 /** One-line roster summary for a saved Agent; `members` arrives lead-first. */
@@ -138,7 +127,6 @@ export function AgentsSettings() {
     try {
       const copy = await duplicateBuiltinAgent(agent.id);
       await refresh();
-      setViewing(null);
       setEditing(copy);
     } catch (cause) {
       setError(errorText(cause));
@@ -359,63 +347,21 @@ export function AgentsSettings() {
           onSaved={refresh}
         />
       )}
-      <Dialog
-        open={viewing !== null}
-        onOpenChange={(open) => {
-          if (!open && duplicatingId === null) {
+      {viewing && (
+        <BuiltinAgentView
+          key={viewing.id}
+          agent={viewing}
+          onClose={() => {
             setViewing(null);
             setError(null);
-          }
-        }}
-      >
-        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>{viewing?.display_name}</DialogTitle>
-            <DialogDescription>Built-in · read-only</DialogDescription>
-          </DialogHeader>
-          {viewing?.members == null ? (
-            <p className="py-2 text-sm text-muted-foreground">Members unavailable</p>
-          ) : (
-            <div className="space-y-2">
-              {viewing.members.map((member) => (
-                <div
-                  key={member.name}
-                  data-testid="builtin-member-row"
-                  className="flex items-center gap-2 rounded-md border border-border p-2"
-                >
-                  <span className="min-w-0 flex-1 truncate text-sm">{member.name}</span>
-                  {member.lead && (
-                    <span className="shrink-0 rounded-full border border-border px-1.5 text-xs text-muted-foreground">
-                      Lead
-                    </span>
-                  )}
-                  <span className="shrink-0 text-xs text-muted-foreground">
-                    {memberSettings(member, harnessLabels)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-          {error && (
-            <p role="alert" className="text-sm text-destructive">
-              {error}
-            </p>
-          )}
-          <DialogFooter className="sm:items-center">
-            <p className="text-xs text-muted-foreground sm:mr-auto">
-              Built-in agents can't be changed. Duplicate {viewing?.display_name} to get a copy you
-              can edit.
-            </p>
-            <Button
-              variant="outline"
-              disabled={duplicatingId !== null}
-              onClick={() => viewing && void duplicateBuiltin(viewing)}
-            >
-              Duplicate to edit
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          }}
+          onDuplicated={async (copy) => {
+            await refresh();
+            setViewing(null);
+            setEditing(copy);
+          }}
+        />
+      )}
       <Dialog
         open={deleting !== null}
         onOpenChange={(open) => {

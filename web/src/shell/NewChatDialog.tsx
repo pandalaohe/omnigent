@@ -353,11 +353,15 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { AgentBadge } from "@/components/AgentBadge";
+import { AgentEditor, BuiltinAgentView } from "@/components/AgentEditor";
 import {
   AGENT_TEMPLATE_LABEL,
+  CUSTOM_AGENTS_QUERY_KEY,
   customAgentBundle,
   customAgentForPicker,
   useCustomAgents,
+  type CustomAgent,
+  type CustomAgentDetail,
 } from "@/lib/customAgentsApi";
 import { writeNewSessionTarget } from "@/lib/newSessionTarget";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
@@ -1384,6 +1388,8 @@ export function AgentHarnessPicker({
   cacheKey = null,
   host,
   onSelectAgent,
+  onEditSavedAgent,
+  onViewBuiltinAgent,
   pendingAgent,
   pendingAgentId,
   onSelectPending,
@@ -1420,6 +1426,10 @@ export function AgentHarnessPicker({
   cacheKey?: string | null;
   host: Host | undefined | null;
   onSelectAgent: (agent: AvailableAgent) => void;
+  /** Edit affordance for a saved (`ca_`) Agent row; omitted → no Edit. */
+  onEditSavedAgent?: (agent: AvailableAgent) => void;
+  /** Edit affordance for a built-in composed Agent row; omitted → no Edit. */
+  onViewBuiltinAgent?: (agent: AvailableAgent) => void;
   pendingAgent: AgentBundleInput | null;
   pendingAgentId: string;
   onSelectPending: () => void;
@@ -1615,7 +1625,42 @@ export function AgentHarnessPicker({
     setOpen(true);
   }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open]);
 
-  const renderEntry = (agent: AvailableAgent): ReactNode => {
+  // A row's Agent action: a saved (`ca_`) Agent opens the Settings editor, a
+  // built-in opens the read-only view that can duplicate it. Harness rows never
+  // take one, and a row that cannot be picked (unavailable, or a `ca_` row on a
+  // sandbox target) takes no action either.
+  const agentActionFor = (
+    agent: AvailableAgent,
+    group: "harness" | "agent",
+    unavailable: boolean,
+  ): { label: string; run: () => void } | undefined => {
+    if (group !== "agent" || unavailable || (sandboxSelected && agent.id.startsWith("ca_"))) {
+      return undefined;
+    }
+    if (agent.id.startsWith("ca_") && onEditSavedAgent) {
+      return { label: "Edit agent…", run: () => onEditSavedAgent(agent) };
+    }
+    if (agent.builtin === true && onViewBuiltinAgent) {
+      return { label: "View agent…", run: () => onViewBuiltinAgent(agent) };
+    }
+    return undefined;
+  };
+  const renderAgentAction = (
+    agentId: string,
+    action: { label: string; run: () => void },
+  ): ReactNode => (
+    <>
+      <DropdownMenuItem
+        data-testid={`new-chat-landing-agent-action-${agentId}`}
+        onSelect={() => action.run()}
+      >
+        {action.label}
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+    </>
+  );
+
+  const renderEntry = (agent: AvailableAgent, group: "harness" | "agent"): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
     const details = active
@@ -1625,7 +1670,8 @@ export function AgentHarnessPicker({
           .join(" ")
       : "";
     const summary = details || entrySummaries?.[agent.id] || "Default";
-    const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
+    const configEditable =
+      selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
     const readiness = harnessReadinessOnHost(agent.harness, host);
     // A saved Agent without a harness id launches from its bundle, so the
     // null-harness readiness verdict does not apply to it.
@@ -1633,6 +1679,8 @@ export function AgentHarnessPicker({
       !(agent.id.startsWith("ca_") && !agent.harness) &&
       !readiness.selectable &&
       readiness.fallbackRelevant;
+    const rowDisabled = unavailable || (sandboxSelected && agent.id.startsWith("ca_"));
+    const agentAction = agentActionFor(agent, group, unavailable);
     const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
     const warningMessage = harnessWarningMessage(
       agent.display_name,
@@ -1654,15 +1702,20 @@ export function AgentHarnessPicker({
           }
         }}
         onSelect={() => onSelectAgent(agent)}
-        configContent={active ? selectedConfigContent : null}
+        onEdit={agentAction?.run}
+        configContent={
+          active && configEditable ? (
+            <>
+              {agentAction && renderAgentAction(agent.id, agentAction)}
+              {selectedConfigContent}
+            </>
+          ) : null
+        }
         focusConfig={focusConfigAgentId === agent.id}
         onConfigFocused={() => {
           setFocusConfigAgentId((current) => (current === agent.id ? null : current));
         }}
         testId={`new-chat-landing-agent-${agent.id}`}
-        // A library agent is bound to its uploaded bundle, which only a
-        // connected computer can run — a managed sandbox has no path for it.
-        disabled={unavailable || (sandboxSelected && agent.id.startsWith("ca_"))}
         icon={
           <span className="flex items-center gap-1">
             <AgentBadge agentId={agent.id} />
@@ -1673,8 +1726,11 @@ export function AgentHarnessPicker({
         summary={summary}
         description={blurb}
         active={active}
-        editable={editable && !unavailable}
+        editable={configEditable && !rowDisabled}
         isMobile={isMobile}
+        // A library agent is bound to its uploaded bundle, which only a
+        // connected computer can run — a managed sandbox has no path for it.
+        disabled={rowDisabled}
         tooltip={unavailable ? warningMessage : undefined}
         tooltipTestId={unavailable ? `new-chat-landing-agent-tooltip-${agent.id}` : undefined}
         summaryTestId={`new-chat-landing-agent-summary-${agent.id}`}
@@ -1693,6 +1749,13 @@ export function AgentHarnessPicker({
       />
     );
   };
+  const selectedAgentAction = selectedEntry
+    ? agentActionFor(
+        selectedEntry,
+        agentEntries.some((entry) => entry.id === selectedEntry.id) ? "agent" : "harness",
+        selectedUnavailable,
+      )
+    : undefined;
 
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
@@ -1755,7 +1818,7 @@ export function AgentHarnessPicker({
   // the custom agents, the pending upload, and the create action.
   const customAgentsBody = (
     <>
-      {customEntries.map(renderEntry)}
+      {customEntries.map((agent) => renderEntry(agent, "agent"))}
       {pendingAgent && (
         <DropdownMenuItem
           key={pendingAgentId}
@@ -1899,6 +1962,9 @@ export function AgentHarnessPicker({
           backTestId="new-chat-landing-page-back"
           onBack={() => setMenuPage(null)}
         >
+          {selectedEntry &&
+            selectedAgentAction &&
+            renderAgentAction(selectedEntry.id, selectedAgentAction)}
           {selectedConfigContent}
         </HarnessPickerConfigPage>
       ) : showMore ? (
@@ -1916,7 +1982,7 @@ export function AgentHarnessPicker({
             <span className="truncate">Other...</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
-          {moreHarnessEntries.map(renderEntry)}
+          {moreHarnessEntries.map((agent) => renderEntry(agent, "harness"))}
         </div>
       ) : showCustom ? (
         // Mobile drill-in page for custom agents.
@@ -1970,7 +2036,7 @@ export function AgentHarnessPicker({
           {(readyHarnessEntries.length > 0 || moreHarnessEntries.length > 0) && (
             <>
               <PickerSectionHeader>Harnesses</PickerSectionHeader>
-              {readyHarnessEntries.map(renderEntry)}
+              {readyHarnessEntries.map((agent) => renderEntry(agent, "harness"))}
               {moreHarnessEntries.length > 0 &&
                 (isMobile ? (
                   // Touch: drill into a "More" page in place (with Back).
@@ -2008,7 +2074,7 @@ export function AgentHarnessPicker({
                       sideOffset={-4}
                       className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
                     >
-                      {moreHarnessEntries.map(renderEntry)}
+                      {moreHarnessEntries.map((agent) => renderEntry(agent, "harness"))}
                     </HarnessPickerSubContent>
                   </DropdownMenuSub>
                 ))}
@@ -2018,11 +2084,11 @@ export function AgentHarnessPicker({
           {sdkEntries.length > 0 && (
             <>
               <PickerSectionHeader>SDK</PickerSectionHeader>
-              {sdkEntries.map(renderEntry)}
+              {sdkEntries.map((agent) => renderEntry(agent, "agent"))}
             </>
           )}
           <PickerSectionHeader>Agents</PickerSectionHeader>
-          {composedEntries.map(renderEntry)}
+          {composedEntries.map((agent) => renderEntry(agent, "agent"))}
           {/* Existing custom agents fold into an "Other..." submenu (with
             the pending upload and the create action). With no custom agents the
             submenu would hold only "Create custom agent", so we surface that as
@@ -2270,6 +2336,10 @@ export function NewChatLandingScreen() {
   // tar.gz, and uses multipart POST instead of the normal JSON path.
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [pendingAgent, setPendingAgent] = useState<AgentBundleInput | null>(null);
+  // Picker Edit targets: a saved Agent opens the Settings editor on its
+  // catalog row, a built-in opens the read-only view that can duplicate it.
+  const [editingAgent, setEditingAgent] = useState<CustomAgent | null>(null);
+  const [viewingBuiltinAgent, setViewingBuiltinAgent] = useState<AvailableAgent | null>(null);
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
 
@@ -5288,6 +5358,30 @@ export function NewChatLandingScreen() {
     setPickedHarness(null);
   };
 
+  /** Re-read the saved-Agent list the picker renders, awaiting the refetch so
+   *  an editor can close on post-refresh data. */
+  const refreshSavedAgents = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: CUSTOM_AGENTS_QUERY_KEY }),
+    [queryClient],
+  );
+
+  /** Edit a saved Agent from the picker. The editor saves against the catalog
+   *  row (its `version` is what a PATCH's conflict check takes). */
+  const handleEditSavedAgent = (agent: AvailableAgent) => {
+    const saved = (customCatalog.data ?? []).find((row) => row.id === agent.id);
+    if (saved) setEditingAgent(saved);
+  };
+
+  /** A duplicated built-in: refresh the library, then edit the copy. A sandbox
+   *  target disables `ca_` rows, so moving the pick there would only block
+   *  Start — the copy is still created and opened for editing. */
+  const handleDuplicatedBuiltin = async (copy: CustomAgentDetail) => {
+    await refreshSavedAgents();
+    setViewingBuiltinAgent(null);
+    if (!sandboxSelected) handleSelectAgent(customAgentForPicker(copy));
+    setEditingAgent(copy);
+  };
+
   function selectHost(hostId: string) {
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
@@ -7191,6 +7285,8 @@ export function NewChatLandingScreen() {
                         cacheKey={pickerCacheKey}
                         host={harnessWarningHost}
                         onSelectAgent={handleSelectAgent}
+                        onEditSavedAgent={handleEditSavedAgent}
+                        onViewBuiltinAgent={setViewingBuiltinAgent}
                         pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                         pendingAgentId={PENDING_AGENT_ID}
                         onSelectPending={handleSelectPending}
@@ -7489,6 +7585,28 @@ export function NewChatLandingScreen() {
           handleSelectPending();
         }}
       />
+
+      {/* The Settings saved-Agent editor, opened from the picker's Edit. The
+          selection stays on whichever Agent the picker already holds. */}
+      {editingAgent && (
+        <AgentEditor
+          key={editingAgent.id}
+          agent={editingAgent}
+          onClose={() => setEditingAgent(null)}
+          onSaved={refreshSavedAgents}
+        />
+      )}
+
+      {/* Built-in read-only view — Edit on a built-in Agent row. Duplicating
+          selects the copy and opens the editor on it. */}
+      {viewingBuiltinAgent && (
+        <BuiltinAgentView
+          key={viewingBuiltinAgent.id}
+          agent={viewingBuiltinAgent}
+          onClose={() => setViewingBuiltinAgent(null)}
+          onDuplicated={handleDuplicatedBuiltin}
+        />
+      )}
     </div>
   );
 }

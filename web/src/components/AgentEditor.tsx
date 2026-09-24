@@ -14,9 +14,11 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useNewChatHostId } from "@/hooks/useHosts";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import {
+  duplicateBuiltinAgent,
   getCustomAgent,
   updateCustomAgent,
   type CustomAgent,
@@ -533,6 +535,104 @@ export function AgentEditor({
           </Button>
           <Button data-testid="agent-editor-save" disabled={!canSave} onClick={() => void save()}>
             {busy ? "Saving…" : "Save"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** AgentEditor's label resolution: catalog label, then the native registry, then the id. */
+function harnessLabel(labels: Record<string, string>, harness: string): string {
+  return labels[harness] ?? nativeCodingAgentForHarness(harness)?.displayName ?? harness;
+}
+
+/** One member's `harness · model · effort` line; the Settings roster summary reuses it. */
+export function memberSettings(member: CustomAgentMember, labels: Record<string, string>): string {
+  return [harnessLabel(labels, member.harness), member.model ?? "Default", member.reasoning_effort]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/**
+ * Read-only roster of a built-in Agent with the one action a built-in allows:
+ * duplicating it into an editable `ca_` copy. Settings and New Chat's picker
+ * open this same view, so a built-in reads identically in both.
+ */
+export function BuiltinAgentView({
+  agent,
+  onClose,
+  onDuplicated,
+}: {
+  agent: AvailableAgent;
+  onClose: () => void;
+  /** The created copy: the caller refreshes its list and opens the editor. */
+  onDuplicated: (copy: CustomAgentDetail) => void | Promise<void>;
+}) {
+  const harnessLabels = useBrainHarnessLabels();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function duplicate() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onDuplicated(await duplicateBuiltinAgent(agent.id));
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !busy) onClose();
+      }}
+    >
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{agent.display_name}</DialogTitle>
+          <DialogDescription>Built-in · read-only</DialogDescription>
+        </DialogHeader>
+        {agent.members == null ? (
+          <p className="py-2 text-sm text-muted-foreground">Members unavailable</p>
+        ) : (
+          <div className="space-y-2">
+            {agent.members.map((member) => (
+              <div
+                key={member.name}
+                data-testid="builtin-member-row"
+                className="flex items-center gap-2 rounded-md border border-border p-2"
+              >
+                <span className="min-w-0 flex-1 truncate text-sm">{member.name}</span>
+                {member.lead && (
+                  <span className="shrink-0 rounded-full border border-border px-1.5 text-xs text-muted-foreground">
+                    Lead
+                  </span>
+                )}
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {memberSettings(member, harnessLabels)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
+        <DialogFooter className="sm:items-center">
+          <p className="text-xs text-muted-foreground sm:mr-auto">
+            Built-in agents can't be changed. Duplicate {agent.display_name} to get a copy you can
+            edit.
+          </p>
+          <Button variant="outline" disabled={busy} onClick={() => void duplicate()}>
+            Duplicate to edit
           </Button>
         </DialogFooter>
       </DialogContent>
