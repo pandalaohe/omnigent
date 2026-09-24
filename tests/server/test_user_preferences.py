@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 from starlette.requests import HTTPConnection
 
+from omnigent.db.db_models import SqlPreference, workspace_scope
+from omnigent.db.utils import get_or_create_engine
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.app import create_app
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -129,6 +136,185 @@ def test_store_merges_one_namespace_and_keeps_users_isolated(db_uri: str) -> Non
 
     compact = store.patch_namespace("alice@example.com", "context_indicator", "compact")
     assert compact["settings"]["context_indicator"] == "compact"
+
+    with pytest.raises(UserPreferencesValidationError, match="unsupported preferences namespace"):
+        store.patch_namespace("alice@example.com", "not_allowed", {})
+
+
+def test_store_patches_of_sibling_namespaces_merge_across_instances(db_uri: str) -> None:
+    """Two stores patching different namespaces: the second envelope has both."""
+    first = SqlAlchemyUserPreferencesStore(db_uri)
+    second = SqlAlchemyUserPreferencesStore(db_uri)
+
+    first.patch_namespace("alice@example.com", "usage_context", {"visible": True})
+    merged = second.patch_namespace("alice@example.com", "context_indicator", "compact")
+
+    expected = {
+        "version": 1,
+        "settings": {
+            "usage_context": {"visible": True},
+            "context_indicator": "compact",
+        },
+    }
+    assert merged == expected
+    assert first.get("alice@example.com") == expected
+
+
+@pytest.mark.parametrize("create_if_missing", [True, False], ids=["external", "accounts"])
+def test_concurrent_patches_of_sibling_namespaces_serialize_per_user(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, create_if_missing: bool
+) -> None:
+    """A racing patch waits on the per-user lock, so it merges the committed one."""
+    from omnigent.server import user_preferences_store as store_module
+
+    first = SqlAlchemyUserPreferencesStore(db_uri)
+    if first._engine.dialect.name == "sqlite":
+        pytest.skip("SQLite already serializes writers with its database-wide write lock")
+    second = SqlAlchemyUserPreferencesStore(db_uri)
+    if not create_if_missing:
+        SqlAlchemyAccountStore(db_uri).create_user_with_password(
+            "alice@example.com", "test-password-hash"
+        )
+
+    entered = [threading.Event(), threading.Event()]
+    release = threading.Event()
+    read_settings = store_module._read_settings
+
+    def gated_read_settings(session: Session, user_id: str):
+        result = read_settings(session, user_id)
+        writer = int(threading.current_thread().name.rsplit("_", 1)[1])
+        entered[writer].set()
+        assert writer != 0 or release.wait(10)
+        return result
+
+    monkeypatch.setattr(store_module, "_read_settings", gated_read_settings)
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="writer") as pool:
+        first_patch = pool.submit(
+            first.patch_namespace,
+            "alice@example.com",
+            "usage_context",
+            {"visible": True},
+            create_if_missing=create_if_missing,
+        )
+        # Writer 0 pauses holding its write transaction open.
+        assert entered[0].wait(10)
+        second_patch = pool.submit(
+            second.patch_namespace,
+            "alice@example.com",
+            "context_indicator",
+            "compact",
+            create_if_missing=create_if_missing,
+        )
+        # Writer 1 must block on the account lock (accounts mode) or the
+        # version-row lock before it reads, so it cannot assemble an envelope
+        # missing the still-open patch.
+        assert not entered[1].wait(0.5)
+        release.set()
+        assert first_patch.result(timeout=10) == {
+            "version": 1,
+            "settings": {"usage_context": {"visible": True}},
+        }
+        assert second_patch.result(timeout=10) == {
+            "version": 1,
+            "settings": {
+                "usage_context": {"visible": True},
+                "context_indicator": "compact",
+            },
+        }
+
+
+def test_store_round_trips_namespaces_through_settings_rows(db_uri: str) -> None:
+    """Each namespace is one settings.<namespace> row; reads reassemble them."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    envelope = {
+        "version": 1,
+        "settings": {
+            "keyboard_shortcuts": {"enabled": True},
+            "context_indicator": "compact",
+        },
+    }
+    assert store.initialize("alice@example.com", envelope) == envelope
+
+    with Session(get_or_create_engine(db_uri)) as session:
+        rows = {
+            row.key: row.value
+            for row in session.scalars(
+                select(SqlPreference).where(SqlPreference.user_id == "alice@example.com")
+            )
+        }
+
+    assert rows == {
+        "settings.version": "1",
+        "settings.keyboard_shortcuts": '{"enabled":true}',
+        "settings.context_indicator": '"compact"',
+    }
+    assert store.get("alice@example.com") == envelope
+
+
+def test_store_patch_touches_only_its_namespace_row(db_uri: str) -> None:
+    """A namespace patch leaves sibling settings rows and project order alone."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.initialize(
+        "alice@example.com",
+        {"version": 1, "settings": {"usage_context": {"visible": True}}},
+    )
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.add(
+            SqlPreference(
+                workspace_id=0,
+                user_id="alice@example.com",
+                key="project_order",
+                value='{"sort_mode":"alphabetical"}',
+            )
+        )
+        session.commit()
+
+    store.patch_namespace("alice@example.com", "agent_badges", {"enabled": False})
+
+    with Session(get_or_create_engine(db_uri)) as session:
+        rows = {
+            row.key: row.value
+            for row in session.scalars(
+                select(SqlPreference).where(SqlPreference.user_id == "alice@example.com")
+            )
+        }
+    assert rows == {
+        "settings.version": "1",
+        "settings.usage_context": '{"visible":true}',
+        "settings.agent_badges": '{"enabled":false}',
+        "project_order": '{"sort_mode":"alphabetical"}',
+    }
+
+
+def test_store_size_limit_spans_namespaces(db_uri: str) -> None:
+    """The 64 KiB cap covers the merged envelope, not one namespace row."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    padding = "x" * (40 * 1024)
+    store.patch_namespace("alice@example.com", "usage_context", padding)
+
+    with pytest.raises(UserPreferencesValidationError, match="64 KiB"):
+        store.patch_namespace("alice@example.com", "keyboard_shortcuts", padding)
+
+    assert store.get("alice@example.com") == {
+        "version": 1,
+        "settings": {"usage_context": padding},
+    }
+
+
+def test_store_scopes_rows_to_the_current_workspace(db_uri: str) -> None:
+    """The same user id in another workspace never shares preferences."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    with workspace_scope(101):
+        store.patch_namespace("alice@example.com", "usage_context", {"visible": True})
+    with workspace_scope(102):
+        assert store.get("alice@example.com") is None
+        store.patch_namespace("alice@example.com", "usage_context", {"visible": False})
+    with workspace_scope(101):
+        assert store.get("alice@example.com") == {
+            "version": 1,
+            "settings": {"usage_context": {"visible": True}},
+        }
 
 
 def test_store_can_refuse_to_recreate_a_deleted_account(db_uri: str) -> None:

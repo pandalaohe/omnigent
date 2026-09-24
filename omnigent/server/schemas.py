@@ -83,6 +83,7 @@ UserPreferenceNamespace = Literal[
     "usage_context",
     "agent_badges",
     "approval_timeout",
+    "agent_pins",
 ]
 
 

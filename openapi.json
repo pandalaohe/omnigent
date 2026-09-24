@@ -10419,7 +10419,8 @@
                 "context_indicator",
                 "usage_context",
                 "agent_badges",
-                "approval_timeout"
+                "approval_timeout",
+                "agent_pins"
               ]
             },
             "title": "Settings",
@@ -13183,6 +13184,7 @@
                     "propertyNames": {
                       "enum": [
                         "agent_badges",
+                        "agent_pins",
                         "approval_timeout",
                         "context_indicator",
                         "keyboard_shortcuts",
@@ -13261,7 +13263,8 @@
                 "context_indicator",
                 "usage_context",
                 "agent_badges",
-                "approval_timeout"
+                "approval_timeout",
+                "agent_pins"
               ],
               "title": "Namespace",
               "type": "string"

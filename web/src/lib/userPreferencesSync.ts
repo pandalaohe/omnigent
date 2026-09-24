@@ -5,7 +5,8 @@ export type UserPreferenceNamespace =
   | "approval_timeout"
   | "context_indicator"
   | "usage_context"
-  | "agent_badges";
+  | "agent_badges"
+  | "agent_pins";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -43,6 +44,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     agent_badges: {
       storageKey: "omnigent:agent-badge-preferences",
       eventName: "omnigent:agent-badge-preferences-changed",
+    },
+    agent_pins: {
+      storageKey: "omnigent:agent-pins",
+      eventName: "omnigent:agent-pins-changed",
     },
   };
 
