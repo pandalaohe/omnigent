@@ -43,8 +43,8 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
 # model editing and running git in the worktree instead of the shared project
 # directory.
 WORKTREE_INSTRUCTION = (
-    "You started in the project directory `{workspace}`. Your working tree is "
-    "`{worktree}`: make code changes, run git and tests there; the project "
+    "You started in the project directory {workspace}. Your working tree is "
+    "{worktree}: make code changes, run git and tests there; the project "
     "directory holds shared project files."
 )
 
@@ -244,7 +244,8 @@ def worktree_instruction(workspace: str | None, worktree: str | None) -> str | N
     trailing separator is stripped, so a launch directory recorded with a
     trailing slash is not treated as a different tree. A session without a
     launch directory (or without a recorded tree) gets nothing: the line names
-    both paths, so neither may be blank.
+    both paths, so neither may be blank. Both paths are JSON-quoted into the
+    line, so punctuation or newlines in a directory name cannot break out of it.
 
     :param workspace: The session's launch directory (its project entry), or
         ``None`` when it has none.
@@ -259,7 +260,10 @@ def worktree_instruction(workspace: str | None, worktree: str | None) -> str | N
     worktree_path = worktree.strip()
     if _without_trailing_separator(workspace_path) == _without_trailing_separator(worktree_path):
         return None
-    return WORKTREE_INSTRUCTION.format(workspace=workspace_path, worktree=worktree_path)
+    return WORKTREE_INSTRUCTION.format(
+        workspace=json.dumps(workspace_path, ensure_ascii=False),
+        worktree=json.dumps(worktree_path, ensure_ascii=False),
+    )
 
 
 def session_startup_extras(

@@ -449,17 +449,50 @@ def test_worktree_instruction_gate_and_text() -> None:
 
     text = worktree_instruction("/entry", "/entry/.worktrees/repo/topic")
     assert text == WORKTREE_INSTRUCTION.format(
-        workspace="/entry", worktree="/entry/.worktrees/repo/topic"
+        workspace=json.dumps("/entry"),
+        worktree=json.dumps("/entry/.worktrees/repo/topic"),
     )
-    assert "`/entry`" in text
-    assert "`/entry/.worktrees/repo/topic`" in text
+    assert '"/entry"' in text
+    assert '"/entry/.worktrees/repo/topic"' in text
 
 
 def test_worktree_instruction_strips_trailing_separators_when_comparing() -> None:
     """A trailing separator is not a difference, on either side."""
     assert worktree_instruction("/entry/", "/entry/.worktrees/repo/topic") == (
-        WORKTREE_INSTRUCTION.format(workspace="/entry/", worktree="/entry/.worktrees/repo/topic")
+        WORKTREE_INSTRUCTION.format(
+            workspace=json.dumps("/entry/"),
+            worktree=json.dumps("/entry/.worktrees/repo/topic"),
+        )
     )
+
+
+def test_worktree_instruction_keeps_non_ascii_paths_verbatim() -> None:
+    """Both paths stay readable: JSON quoting must not escape non-ASCII
+    characters into ``\\uXXXX`` sequences."""
+    workspace = "/entry/项目"
+    worktree = "/entry/.worktrees/repo/项目"
+
+    text = worktree_instruction(workspace, worktree)
+
+    assert f'"{workspace}"' in text
+    assert f'"{worktree}"' in text
+    assert "\\u" not in text
+
+
+def test_worktree_instruction_quotes_paths_that_could_break_the_line() -> None:
+    """A path with a backtick and a newline cannot close a code span or split
+    the line: paths are JSON-quoted, and the template wraps none in backticks."""
+    worktree = "/entry/.worktrees/repo/top`ic\nnext"
+
+    text = worktree_instruction("/entry", worktree)
+
+    assert text == WORKTREE_INSTRUCTION.format(
+        workspace=json.dumps("/entry"), worktree=json.dumps(worktree)
+    )
+    assert "\n" not in text
+    assert "\\n" in text
+    assert "`" not in WORKTREE_INSTRUCTION
+    assert text.count("`") == 1
 
 
 def test_session_startup_extras_orders_worktree_before_global() -> None:

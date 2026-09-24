@@ -12,6 +12,7 @@ composed per-turn prompt.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from typing import Any
 
@@ -237,7 +238,10 @@ async def test_worktree_line_recorded_before_the_global_text(
         )
         composed = await _turn_instructions(client, harness_client, session_id)
 
-    line = WORKTREE_INSTRUCTION.format(workspace="/entry", worktree="/entry/.worktrees/repo/topic")
+    line = WORKTREE_INSTRUCTION.format(
+        workspace=json.dumps("/entry"),
+        worktree=json.dumps("/entry/.worktrees/repo/topic"),
+    )
     assert recorded == [f"{line}\n\nGLOBAL-MARKER"]
     assert composed.endswith(f"{line}\n\nGLOBAL-MARKER")
     assert composed.index(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION) < composed.index(line)
