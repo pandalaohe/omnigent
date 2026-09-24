@@ -28,6 +28,7 @@ import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
+import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
@@ -68,6 +69,7 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
+  const { data: customAgents } = useCustomAgents(open);
   const { data: hosts } = useHosts({ enabled: open });
   const info = useServerInfo();
   // Gates the "new sandbox each run" option: only servers that can actually
@@ -108,7 +110,31 @@ export function CreateScheduledTaskDialog({
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
-  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
+  // Saved library Agents join the picker as in New Chat. A session row backed by
+  // one gives way to it unless it is the edited task's agent or the current pick
+  // (a late catalog must not swap the pick); a kept row hides its library twin.
+  const agentList = useMemo(() => {
+    const libraryAgents = customAgents ?? [];
+    const liveTemplateIds = new Set(libraryAgents.map((agent) => agent.id));
+    const sourceAgents = (agents ?? []).filter(
+      (agent) =>
+        !agent.templateId ||
+        !liveTemplateIds.has(agent.templateId) ||
+        agent.id === editingTask?.agentId ||
+        agent.id === pickedAgentId,
+    );
+    const retainedTemplateIds = new Set(
+      sourceAgents
+        .map((agent) => agent.templateId)
+        .filter((id): id is string => id !== undefined && liveTemplateIds.has(id)),
+    );
+    return selectableSessionAgents([
+      ...sourceAgents,
+      ...libraryAgents
+        .filter((agent) => !retainedTemplateIds.has(agent.id))
+        .map(customAgentForPicker),
+    ]);
+  }, [agents, customAgents, editingTask?.agentId, pickedAgentId]);
   const harnessEntries = useMemo(
     () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
     [agentList],
@@ -137,6 +163,14 @@ export function CreateScheduledTaskDialog({
   // different one — the prefill starts equal to the task's own agent.
   const agentChanged =
     isEdit && effectiveAgentId !== null && effectiveAgentId !== editingTask?.agentId;
+
+  // The selected saved Agent's roster, lead first. Read from the catalog row —
+  // the picker's `AvailableAgent` carries no members; null → no line.
+  const selectedCustomAgent = (customAgents ?? []).find((a) => a.id === effectiveAgentId);
+  const customAgentMembers =
+    selectedCustomAgent?.members && selectedCustomAgent.members.length > 0
+      ? [...selectedCustomAgent.members].sort((a, b) => Number(b.lead) - Number(a.lead))
+      : null;
 
   function handleSelectAgent(agent: AvailableAgent) {
     setPickedAgentId(agent.id);
@@ -282,6 +316,11 @@ export function CreateScheduledTaskDialog({
   // the user gets inline feedback instead of a 400. In sandbox mode there is no
   // host/workspace pairing at all, so the rule doesn't apply.
   const workspaceWithoutHost = !sandboxMode && workspace.trim() !== "" && hostId === "";
+  // A saved Agent runs from its bundle on a connected computer (a server 400 on
+  // sandbox targets): the sandbox option is disabled while one is picked, and a
+  // pick beside an already-selected sandbox blocks submit until a host is chosen.
+  const libraryAgentSelected = effectiveAgentId?.startsWith("ca_") ?? false;
+  const sandboxAgentConflict = sandboxMode && libraryAgentSelected;
   // Block submit on an invalid schedule (bad interval, empty multi-select) so
   // the form never posts an RRULE the server's validate_rrule would 400.
   const scheduleInvalid = scheduleUnsupported || validateSchedule(schedule) !== null;
@@ -291,6 +330,7 @@ export function CreateScheduledTaskDialog({
     prompt.trim() !== "" &&
     (isEdit || effectiveAgentId !== null) &&
     !workspaceWithoutHost &&
+    !sandboxAgentConflict &&
     !scheduleInvalid &&
     !mutationPending;
 
@@ -487,6 +527,14 @@ export function CreateScheduledTaskDialog({
                 triggerLabelClassName="max-w-none text-ui"
               />
             </div>
+            {customAgentMembers && (
+              // Saved Agent roster: names only, lead first (Model / Effort are per-member).
+              <p className="text-sm text-muted-foreground" data-testid="task-agent-members">
+                {customAgentMembers
+                  .map((member) => (member.lead ? `${member.name} (Lead)` : member.name))
+                  .join(", ")}
+              </p>
+            )}
             {agentChanged && (
               <p className="text-sm text-muted-foreground">
                 Future runs use {agentLabel}; past runs keep the agent they ran with
@@ -580,7 +628,11 @@ export function CreateScheduledTaskDialog({
                   Resolve at fire time
                 </SelectItem>
                 {(managedSandboxesEnabled || sandboxMode) && (
-                  <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
+                  <SelectItem
+                    value={SANDBOX_HOST}
+                    disabled={libraryAgentSelected}
+                    data-testid="task-host-sandbox-option"
+                  >
                     {sandboxLabel}
                   </SelectItem>
                 )}
@@ -596,6 +648,11 @@ export function CreateScheduledTaskDialog({
                 ? "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
                 : "Leave unset to run on your connected host when the task fires."}
             </p>
+            {libraryAgentSelected && (managedSandboxesEnabled || sandboxMode) && (
+              <p className="text-sm text-muted-foreground" data-testid="task-host-sandbox-note">
+                Custom agents require a connected computer
+              </p>
+            )}
           </div>
 
           {!sandboxMode && hostId !== "" && (
