@@ -9398,11 +9398,95 @@ describe("NewChatLandingScreen Edit on Agent rows", () => {
   });
 });
 
+// Pinned Agents: the "Agents" group shows the stored pins at its top level
+// and folds every other Agent into the "Other..." submenu; nothing stored
+// yet means the shipped Polly + Debby default.
+
+describe("NewChatLandingScreen pinned Agents", () => {
+  const polly: AvailableAgent = {
+    id: "ag_polly",
+    name: "polly",
+    display_name: "Polly",
+    description: null,
+    harness: "claude-sdk",
+    skills: [],
+  };
+  const debby: AvailableAgent = {
+    id: "ag_debby",
+    name: "debby",
+    display_name: "Debby",
+    description: null,
+    harness: "claude-sdk",
+    skills: [],
+  };
+  const saved: AvailableAgent = {
+    id: "ca_reviewer",
+    name: "Reviewer",
+    display_name: "Reviewer",
+    description: null,
+    harness: "claude-sdk",
+    skills: [],
+    builtin: false,
+  };
+
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  function openPicker(): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  }
+
+  it("defaults to Polly + Debby on top and keeps a saved Agent inside Other...", () => {
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly, debby, saved]);
+    renderLanding();
+    openPicker();
+
+    expect(screen.getByTestId("new-chat-landing-agent-ag_polly")).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-agent-ag_debby")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-agent-ca_reviewer")).toBeNull();
+    const submenu = screen.getByTestId("new-chat-landing-custom-agents");
+    expect(submenu).toHaveTextContent("Other...");
+    fireEvent.click(submenu);
+    expect(screen.getByTestId("new-chat-landing-agent-ca_reviewer")).toBeInTheDocument();
+  });
+
+  it("promotes a stored pin and moves Polly into Other...", () => {
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: ["ca_reviewer"] }));
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly, debby, saved]);
+    renderLanding();
+    openPicker();
+
+    expect(screen.getByTestId("new-chat-landing-agent-ca_reviewer")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-agent-ag_polly")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(screen.getByTestId("new-chat-landing-agent-ag_polly")).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-agent-ag_debby")).toBeInTheDocument();
+  });
+
+  it("labels Other... with the selected submenu Agent", () => {
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [] }));
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly]);
+    renderLanding();
+    openPicker();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_polly"));
+    closeMenu();
+    openPicker();
+    expect(screen.getByTestId("new-chat-landing-custom-agents")).toHaveTextContent(
+      "Other... (Polly)",
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Mobile drill-in navigation
 //
 // Touch devices can't hover, so the desktop submenu flyouts ("More" for
-// needs-setup harnesses, custom-agent "Other...") are unreachable there. Below the
+// needs-setup harnesses, "Other...") are unreachable there. Below the
 // `md` breakpoint the picker swaps its contents in place: tapping the row
 // drills into that group's page with a Back row. jsdom's matchMedia mock
 // reports non-mobile, so these tests force the `max-width` query to match.
@@ -9513,8 +9597,8 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
   });
 
-  it("drills into the custom-agent Other page in place and returns via Back", () => {
-    // A custom (non-builtin) agent lands in the custom-agent group.
+  it("drills into the Other page in place and returns via Back", () => {
+    // An unpinned custom agent lands in the Other group.
     mockAgents([
       {
         id: "a1",
@@ -9539,6 +9623,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
     // Tapping drills into the page in place (Claude Code inline row is gone).
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(screen.getByTestId("new-chat-landing-page-back")).toHaveTextContent("Other");
     expect(screen.getByTestId("new-chat-landing-agent-ag_custom")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-agent-a1")).toBeNull();
     // Back returns to the main list.

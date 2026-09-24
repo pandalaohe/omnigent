@@ -241,6 +241,7 @@ import {
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
+import { resolvePinnedAgentIds, useAgentPins } from "@/lib/agentPins";
 import { rankHarnessRows } from "@/lib/harnessRanking";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -1782,9 +1783,10 @@ export function AgentHarnessPicker({
       ? `Other... (${selectedOtherHarness.display_name})`
       : "Other...";
 
-  // Split the agents group: built-in bundle agents (Polly / Debby) stay inline
-  // in the main list; user-registered custom agents fold into an "Other..."
-  // submenu so a long roster doesn't crowd out the recommended picks.
+  // Split the Agents group by the user's pins: pinned Agents (Polly + Debby
+  // by default) stay at the top level, in pin order; every other Agent folds
+  // into the "Other..." submenu so a long roster can't crowd out the picks.
+  const { storedIds: pinnedAgentIds } = useAgentPins();
   const { builtins: bundleEntries, customs: customEntries } = useMemo(
     () => partitionAgentsByKind(agentEntries),
     [agentEntries],
@@ -1792,13 +1794,27 @@ export function AgentHarnessPicker({
   const sdkEntries = bundleEntries.filter(isSdkAgent);
   const composedEntries = bundleEntries.filter((entry) => !isSdkAgent(entry));
 
-  // Existing custom / pending agents fold into an "Other..." submenu so a
-  // long roster doesn't crowd the recommended picks. When there are none, the
-  // submenu would hold only the create action — which is a poor place to
-  // discover it — so we surface "Create custom agent" as a top-level row
-  // instead (see below). The submenu therefore renders only when there is at
-  // least one custom / pending agent to group.
-  const hasCustomAgents = customEntries.length > 0 || pendingAgent != null;
+  // Split the Agents group by the user's pins: pinned Agents (Polly + Debby
+  // by default) stay at the top level, in pin order; every other Agent folds
+  // into the "Other..." submenu so a long roster can't crowd out the picks.
+  // The SDK section keeps its own rows, so pins resolve within this group.
+  const { storedIds: pinnedAgentIds } = useAgentPins();
+  const pinCandidates = useMemo(
+    () => [...composedEntries, ...customEntries],
+    [composedEntries, customEntries],
+  );
+  const { pinnedEntries, otherEntries } = useMemo(() => {
+    const pinnedIds = resolvePinnedAgentIds(pinnedAgentIds, pinCandidates);
+    const pinned = new Set(pinnedIds);
+    return {
+      pinnedEntries: pinnedIds
+        .map((id) => pinCandidates.find((agent) => agent.id === id))
+        .filter((agent): agent is AvailableAgent => agent !== undefined),
+      // Keep the built-ins-then-customs order so the submenu stays predictable.
+      otherEntries: pinCandidates.filter((agent) => !pinned.has(agent.id)),
+    };
+  }, [pinnedAgentIds, pinCandidates]);
+
   // "Create custom agent" is reachable on any non-sandbox target (a managed
   // sandbox has no create path for an uploaded bundle), unless the embedder
   // opts out (it has no create flow to route the action to).
@@ -1813,12 +1829,15 @@ export function AgentHarnessPicker({
       Create custom agent
     </DropdownMenuItem>
   ) : null;
-  const hasCustomGroup = hasCustomAgents || canCreateAgent;
-  // Shared body for the custom-agents submenu (desktop flyout + mobile page):
-  // the custom agents, the pending upload, and the create action.
-  const customAgentsBody = (
+  // The "Other..." submenu holds the unpinned Agents, the pending upload, and
+  // the create action. It shows whenever any of those exist, so on a fresh
+  // server creation stays in one stable place instead of an inline row.
+  const hasOtherAgents = otherEntries.length > 0 || pendingAgent != null;
+  const hasOtherGroup = hasOtherAgents || canCreateAgent;
+  // Shared body for the "Other..." submenu (desktop flyout + mobile page).
+  const otherAgentsBody = (
     <>
-      {customEntries.map((agent) => renderEntry(agent, "agent"))}
+      {otherEntries.map((agent) => renderEntry(agent, "agent"))}
       {pendingAgent && (
         <DropdownMenuItem
           key={pendingAgentId}
@@ -1835,14 +1854,19 @@ export function AgentHarnessPicker({
       )}
       {canCreateAgent && (
         <>
-          {hasCustomAgents && <DropdownMenuSeparator />}
+          {hasOtherAgents && <DropdownMenuSeparator />}
           {createAgentItem}
         </>
       )}
     </>
   );
+  const selectedOtherAgent = otherEntries.find((agent) => agent.id === effectiveAgentId);
+  const otherAgentLabel =
+    selectedOtherAgent && !autoHarnessActive
+      ? `Other... (${selectedOtherAgent.display_name})`
+      : "Other...";
   const showMore = isMobile && menuPage === "more" && moreHarnessEntries.length > 0;
-  const showCustom = isMobile && menuPage === "custom" && hasCustomGroup;
+  const showCustom = isMobile && menuPage === "custom" && hasOtherGroup;
   const showConfig = isMobile && menuPage === "config" && selectedConfigContent != null;
   // If the open page's group disappears (or the viewport grows to desktop),
   // fall back to the main list so a reopened menu never lands on an empty page.
@@ -1985,7 +2009,7 @@ export function AgentHarnessPicker({
           {moreHarnessEntries.map((agent) => renderEntry(agent, "harness"))}
         </div>
       ) : showCustom ? (
-        // Mobile drill-in page for custom agents.
+        // Mobile drill-in page for the Agents outside the pins.
         <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
           <DropdownMenuItem
             data-testid="new-chat-landing-page-back"
@@ -1999,7 +2023,7 @@ export function AgentHarnessPicker({
             <span className="truncate">Other</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
-          {customAgentsBody}
+          {otherAgentsBody}
         </div>
       ) : (
         <>
@@ -2087,16 +2111,16 @@ export function AgentHarnessPicker({
               {sdkEntries.map((agent) => renderEntry(agent, "agent"))}
             </>
           )}
+          {/* Agents group — the pinned Agents (Polly / Debby by default). */}
           <PickerSectionHeader>Agents</PickerSectionHeader>
-          {composedEntries.map((agent) => renderEntry(agent, "agent"))}
-          {/* Existing custom agents fold into an "Other..." submenu (with
-            the pending upload and the create action). With no custom agents the
-            submenu would hold only "Create custom agent", so we surface that as
-            a top-level row instead — otherwise creation is invisible on a fresh
-            server. A managed sandbox has no create path, so neither appears. */}
-          {hasCustomGroup &&
+          {pinnedEntries.map((agent) => renderEntry(agent, "agent"))}
+          {/* Every unpinned Agent folds into "Other..." with the pending upload
+            and the create action; the submenu also shows when it would hold
+            only the create action, so creation stays discoverable. A managed
+            sandbox has no create path, so neither appears. */}
+          {hasOtherGroup &&
             (isMobile ? (
-              // Touch: drill into the custom-agent page in place (with Back).
+              // Touch: drill into an "Other" page in place (with Back).
               <DropdownMenuItem
                 data-testid="new-chat-landing-custom-agents"
                 onSelect={(e) => {
@@ -2105,7 +2129,7 @@ export function AgentHarnessPicker({
                 }}
                 className="items-center"
               >
-                <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
+                <HarnessMenuNavigationLabel>{otherAgentLabel}</HarnessMenuNavigationLabel>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
               </DropdownMenuItem>
             ) : (
@@ -2115,19 +2139,16 @@ export function AgentHarnessPicker({
                   data-testid="new-chat-landing-custom-agents"
                   className="cursor-pointer items-center"
                 >
-                  <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
+                  <HarnessMenuNavigationLabel>{otherAgentLabel}</HarnessMenuNavigationLabel>
                 </DropdownMenuSubTrigger>
                 <HarnessPickerSubContent
                   sideOffset={-4}
                   className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
                 >
-                  {customAgentsBody}
+                  {otherAgentsBody}
                 </HarnessPickerSubContent>
               </DropdownMenuSub>
             ))}
-          {/* No custom agents to group: surface the create action directly so
-            it stays discoverable instead of hiding behind an empty submenu. */}
-          {!hasCustomGroup && createAgentItem}
         </>
       )}
     </HarnessPicker>

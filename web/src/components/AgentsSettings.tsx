@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { PlusIcon } from "lucide-react";
+import { PinIcon, PinOffIcon, PlusIcon } from "lucide-react";
 
 import { AgentEditor, BuiltinAgentView, memberSettings } from "@/components/AgentEditor";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -11,11 +11,18 @@ import {
   type AgentBadgeValue,
 } from "@/lib/agentBadgePreferences";
 import { isAcpHarnessAgent } from "@/lib/agentGrouping";
+import {
+  MAX_PINNED_AGENTS,
+  resolvePinnedAgentIds,
+  unpinAgent,
+  useAgentPins,
+} from "@/lib/agentPins";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { buildAgentBundle } from "@/lib/agentBundle";
 import {
   CUSTOM_AGENTS_QUERY_KEY,
   createCustomAgent,
+  customAgentForPicker,
   deleteCustomAgent,
   duplicateBuiltinAgent,
   getCustomAgent,
@@ -40,7 +47,53 @@ import {
   DialogFooter,
   DialogDescription,
 } from "./ui/dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { CreateAgentDialog } from "@/shell/CreateAgentDialog";
+
+const PIN_LIMIT_HINT = `Up to ${MAX_PINNED_AGENTS} Agents can be pinned`;
+
+// Pin toggle for one Agent row: toggles wait for both Agent lists, and
+// unpinned rows past the cap show a hint. A disabled button swallows pointer
+// events, so the tooltip hangs off a wrapper span.
+function PinToggle({
+  agentId,
+  name,
+  pinned,
+  canPin,
+  ready,
+  onToggle,
+}: {
+  agentId: string;
+  name: string;
+  pinned: boolean;
+  canPin: boolean;
+  ready: boolean;
+  onToggle: (agentId: string) => void;
+}) {
+  const capBlocked = !pinned && !canPin;
+  const disabled = capBlocked || !ready;
+  const button = (
+    <Button
+      variant="ghost"
+      size="sm"
+      aria-label={`${pinned ? "Unpin" : "Pin"} ${name}`}
+      aria-pressed={pinned}
+      disabled={disabled}
+      onClick={() => onToggle(agentId)}
+    >
+      {pinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+    </Button>
+  );
+  if (!capBlocked || !ready) return button;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex">{button}</span>
+      </TooltipTrigger>
+      <TooltipContent>{PIN_LIMIT_HINT}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 function saveBadge(agentId: string, value: AgentBadgeValue | null) {
   const preferences = readAgentBadgePreferences();
@@ -81,6 +134,33 @@ export function AgentsSettings() {
   const builtinAgents = (available.data ?? []).filter(
     (agent) => agent.builtin === true && !isNativeCodingAgent(agent) && !isAcpHarnessAgent(agent),
   );
+  // Pins address rows the way the picker does: a built-in by its /v1/agents
+  // id, a saved Agent by its `ca_` id via customAgentForPicker. Toggling
+  // writes the whole resolved list, materializing the Polly + Debby default.
+  const { storedIds: storedPinnedIds, setPinnedIds } = useAgentPins();
+  // Toggling writes the list resolved against the rows on screen, so it waits
+  // for both lists: saving a partial roster would drop pins it cannot see.
+  const pinsReady =
+    available.data !== undefined &&
+    !available.error &&
+    catalog.data !== undefined &&
+    !catalog.error;
+  const customAgentRows = catalog.data ?? [];
+  const pinCandidates = useMemo(
+    () => [...builtinAgents, ...customAgentRows.map(customAgentForPicker)],
+    [builtinAgents, customAgentRows],
+  );
+  const pinnedIds = useMemo(
+    () => resolvePinnedAgentIds(storedPinnedIds, pinCandidates),
+    [storedPinnedIds, pinCandidates],
+  );
+  const pinnedIdSet = useMemo(() => new Set(pinnedIds), [pinnedIds]);
+  const atPinLimit = pinnedIds.length >= MAX_PINNED_AGENTS;
+  function togglePin(agentId: string) {
+    setPinnedIds(
+      pinnedIdSet.has(agentId) ? pinnedIds.filter((id) => id !== agentId) : [...pinnedIds, agentId],
+    );
+  }
   const [createOpen, setCreateOpen] = useState(false);
   const [newBadge, setNewBadge] = useState<AgentBadgeValue | null>(null);
   const [newBadgeValid, setNewBadgeValid] = useState(true);
@@ -171,6 +251,14 @@ export function AgentsSettings() {
               <div className="truncate text-sm">{agent.display_name}</div>
               <div className="truncate text-xs text-muted-foreground">{builtinSubtitle(agent)}</div>
             </div>
+            <PinToggle
+              agentId={agent.id}
+              name={agent.display_name}
+              pinned={pinnedIdSet.has(agent.id)}
+              canPin={!atPinLimit}
+              ready={pinsReady}
+              onToggle={togglePin}
+            />
             <Button
               variant="ghost"
               size="sm"
@@ -261,6 +349,14 @@ export function AgentsSettings() {
                   )
                 )}
               </div>
+              <PinToggle
+                agentId={agent.id}
+                name={agent.name}
+                pinned={pinnedIdSet.has(agent.id)}
+                canPin={!atPinLimit}
+                ready={pinsReady}
+                onToggle={togglePin}
+              />
               <Button
                 variant="ghost"
                 size="sm"
@@ -394,6 +490,7 @@ export function AgentsSettings() {
                 setError(null);
                 try {
                   await deleteCustomAgent(deleting.id);
+                  unpinAgent(deleting.id);
                   await refresh();
                   setDeleting(null);
                 } catch (cause) {

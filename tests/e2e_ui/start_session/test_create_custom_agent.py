@@ -308,7 +308,7 @@ async def _drive_dialog_opens(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Open the agent dropdown, then the Custom agents submenu.
+            # Open the agent dropdown, then the Other submenu.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
             await page.get_by_test_id("new-chat-landing-custom-agents").click()
 
@@ -558,7 +558,7 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-agent-select").click()
             await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
 
-            # Switch to the connected host: the Custom agents submenu offers
+            # Switch to the connected host: the Other submenu offers
             # creation even when the private catalog is still empty.
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-host-chip").click()

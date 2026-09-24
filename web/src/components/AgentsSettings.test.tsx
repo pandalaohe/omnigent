@@ -9,11 +9,16 @@ import {
   writeAgentBadgePreferences,
 } from "@/lib/agentBadgePreferences";
 import type { CustomAgent, CustomAgentDetail, CustomAgentMember } from "@/lib/customAgentsApi";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { AgentsSettings } from "./AgentsSettings";
 
 const mocks = vi.hoisted(() => ({
-  available: [] as AvailableAgent[],
+  available: undefined as AvailableAgent[] | undefined,
+  availableLoading: false,
+  availableError: null as Error | null,
   catalog: [] as CustomAgent[],
+  catalogLoading: false,
+  catalogError: null as Error | null,
   refetch: vi.fn(),
   createCustomAgent: vi.fn(),
   deleteCustomAgent: vi.fn(),
@@ -26,18 +31,32 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/hooks/useAvailableAgents", () => ({
-  useAvailableAgents: () => ({ data: mocks.available, isLoading: false, error: null }),
+  useAvailableAgents: () => ({
+    data: mocks.available,
+    isLoading: mocks.availableLoading,
+    error: mocks.availableError,
+  }),
 }));
 
 vi.mock("@/lib/customAgentsApi", () => ({
   CUSTOM_AGENTS_QUERY_KEY: ["custom-agents"],
   useCustomAgents: () => ({
     data: mocks.catalog,
-    isLoading: false,
-    error: null,
+    isLoading: mocks.catalogLoading,
+    error: mocks.catalogError,
     refetch: mocks.refetch,
   }),
   createCustomAgent: mocks.createCustomAgent,
+  customAgentForPicker: (agent: CustomAgent) => ({
+    id: agent.id,
+    name: agent.name,
+    display_name: agent.name,
+    description: agent.description,
+    harness: agent.harness,
+    skills: [],
+    builtin: false,
+    created_at: agent.created_at,
+  }),
   deleteCustomAgent: mocks.deleteCustomAgent,
   duplicateBuiltinAgent: mocks.duplicateBuiltinAgent,
   getCustomAgent: mocks.getCustomAgent,
@@ -74,7 +93,7 @@ const builtin: AvailableAgent = {
 };
 
 const custom: CustomAgent = {
-  id: "ag_custom_reviewer",
+  id: "ca_custom_reviewer",
   name: "Reviewer",
   description: "Reviews changes",
   harness: "codex",
@@ -161,7 +180,9 @@ function renderSettings() {
   const invalidate = vi.spyOn(client, "invalidateQueries");
   const view = render(
     <QueryClientProvider client={client}>
-      <AgentsSettings />
+      <TooltipProvider>
+        <AgentsSettings />
+      </TooltipProvider>
     </QueryClientProvider>,
   );
   return { ...view, invalidate };
@@ -169,6 +190,10 @@ function renderSettings() {
 
 beforeEach(() => {
   localStorage.clear();
+  mocks.availableLoading = false;
+  mocks.availableError = null;
+  mocks.catalogLoading = false;
+  mocks.catalogError = null;
   mocks.available = [
     builtin,
     builtinPolly,
@@ -197,6 +222,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   vi.clearAllMocks();
 });
 
@@ -406,5 +432,106 @@ describe("AgentsSettings", () => {
     expect(screen.getByText("One member")).toBeInTheDocument();
     expect(screen.getByText("3 members · Crew (Lead), architect, reviewer")).toBeInTheDocument();
     expect(screen.getByText("Three members")).toBeInTheDocument();
+  });
+
+  it("pins and unpins Agents, materializing the Polly + Debby default", () => {
+    renderSettings();
+
+    // Nothing stored yet: the shipped pair reads as pinned.
+    expect(screen.getByRole("button", { name: "Unpin Polly" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "Unpin Debby" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Pin Reviewer" }));
+
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({
+      ids: ["ag_builtin_polly", "ag_builtin_debby", "ca_custom_reviewer"],
+    });
+    expect(screen.getByRole("button", { name: "Unpin Reviewer" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Unpin Polly" }));
+
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({
+      ids: ["ag_builtin_debby", "ca_custom_reviewer"],
+    });
+    expect(screen.getByRole("button", { name: "Pin Polly" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("disables the pin button of unpinned rows at the cap", () => {
+    mocks.catalog = [custom, { ...custom, id: "ca_second", name: "Second" }];
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Pin Reviewer" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pin Second" }));
+
+    // The third pin filled the cap, so the fourth row's button is disabled.
+    expect(screen.getByRole("button", { name: "Pin Second" })).toBeDisabled();
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({
+      ids: ["ag_builtin_polly", "ag_builtin_debby", "ca_custom_reviewer"],
+    });
+    // Pinned rows stay toggleable so a slot can be swapped.
+    expect(screen.getByRole("button", { name: "Unpin Polly" })).toBeEnabled();
+  });
+
+  it("removes a deleted saved Agent from the pins", async () => {
+    renderSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Pin Reviewer" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!).ids).toContain(
+      "ca_custom_reviewer",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Reviewer" }));
+    const deleteDialog = await screen.findByRole("dialog");
+    fireEvent.click(within(deleteDialog).getByRole("button", { name: "Delete Agent" }));
+    await waitFor(() => expect(mocks.deleteCustomAgent).toHaveBeenCalledWith(custom.id));
+
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({
+      ids: ["ag_builtin_polly", "ag_builtin_debby"],
+    });
+  });
+
+  it("disables the Pin buttons while the available list has no data yet", () => {
+    mocks.available = undefined;
+    renderSettings();
+
+    expect(screen.getByRole("button", { name: "Pin Reviewer" })).toBeDisabled();
+  });
+
+  it.each([
+    [
+      "the catalog is pending",
+      { catalogLoading: true, catalog: undefined },
+      ["Pin Debby", "Unpin Polly"],
+    ],
+    ["the catalog failed", { catalogError: new Error("offline") }, ["Pin Debby", "Unpin Polly"]],
+    [
+      "the built-in list is pending",
+      { availableLoading: true, available: undefined },
+      ["Pin Reviewer"],
+    ],
+    [
+      "the built-in list failed",
+      { availableError: new Error("offline") },
+      ["Pin Debby", "Unpin Polly"],
+    ],
+  ])("disables the Pin buttons while %s", (_label, state, disabledPins) => {
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: ["ag_builtin_polly"] }));
+    Object.assign(mocks, state);
+    renderSettings();
+
+    for (const name of disabledPins) {
+      expect(screen.getByRole("button", { name })).toBeDisabled();
+    }
   });
 });
