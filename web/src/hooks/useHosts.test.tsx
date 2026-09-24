@@ -3,6 +3,8 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { startTransition, Suspense, useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { sandboxHostChoice, SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+
 import {
   useDetectedCredentials,
   useCodexRateLimits,
@@ -10,6 +12,7 @@ import {
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
+  useNewChatHostId,
   useStoreCredential,
   CliRetentionRequestError,
   useHostCliRetention,
@@ -470,6 +473,34 @@ describe("Host CLI retention hooks", () => {
         message: "CLI retention policy changed",
       }).failure,
     ).toBe("conflict");
+  });
+});
+
+describe("useNewChatHostId", () => {
+  it("treats every stored sandbox choice as no host and falls back to the first online host", async () => {
+    fetchMock.mockResolvedValue(
+      mockResponse({
+        hosts: [
+          { host_id: "host_offline", name: "Old laptop", owner: "alice", status: "offline" },
+          { host_id: "host_online", name: "Laptop", owner: "alice", status: "online" },
+        ],
+      }),
+    );
+    try {
+      // The bare sentinel is what a provider-less sandbox stores; the
+      // per-provider form is what the host picker stores. Neither is a host
+      // id, so both must fall through rather than poll a nonexistent host.
+      window.localStorage.setItem("omnigent:last-host-choice", SANDBOX_HOST_CHOICE);
+      const bare = renderHook(() => useNewChatHostId(), { wrapper });
+      await waitFor(() => expect(bare.result.current).toBe("host_online"));
+      bare.unmount();
+
+      window.localStorage.setItem("omnigent:last-host-choice", sandboxHostChoice("lakebox"));
+      const perProvider = renderHook(() => useNewChatHostId(), { wrapper });
+      await waitFor(() => expect(perProvider.result.current).toBe("host_online"));
+    } finally {
+      window.localStorage.clear();
+    }
   });
 });
 

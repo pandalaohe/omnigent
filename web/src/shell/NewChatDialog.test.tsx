@@ -191,6 +191,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
+  useNewChatHostId: vi.fn(() => null),
   fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
@@ -9065,9 +9066,10 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
     fireEvent.click(createItem);
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeVisible());
-    for (const field of ["name", "description", "harness", "model", "instructions", "add-mcp"]) {
+    for (const field of ["name", "description", "instructions", "add-mcp"]) {
       expect(screen.getByTestId(`create-agent-${field}`)).toBeVisible();
     }
+    expect(screen.getByTestId("agent-member-trigger")).toBeVisible();
   });
 
   it("cancels a custom agent without replacing the selected agent", async () => {

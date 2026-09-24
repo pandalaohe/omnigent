@@ -48,8 +48,12 @@ vi.mock("@/lib/userPreferencesSync", () => ({
   queueUserPreferencePatch: mocks.queueUserPreferencePatch,
 }));
 vi.mock("@/lib/agentLabels", () => ({
-  BRAIN_HARNESS_LABELS: { codex: "Codex" },
-  useBrainHarnessLabels: () => ({ codex: "Codex" }),
+  BRAIN_HARNESS_LABELS: { "claude-sdk": "Claude SDK" },
+  useBrainHarnessLabels: () => ({ "claude-sdk": "Claude SDK" }),
+}));
+vi.mock("@/hooks/useHosts", () => ({
+  useNewChatHostId: () => null,
+  useHostModelOptions: () => ({ data: undefined }),
 }));
 vi.mock("@/lib/analytics", () => ({
   useOmnigentAnalytics: () => ({ trackValueChange: vi.fn() }),
@@ -73,6 +77,7 @@ const custom: CustomAgent = {
   description: "Reviews changes",
   harness: "codex",
   model: null,
+  members: null,
   version: 3,
   created_at: 2,
   updated_at: null,
@@ -201,9 +206,12 @@ describe("AgentsSettings", () => {
     fireEvent.change(within(dialog).getByTestId("create-agent-name"), {
       target: { value: "Reviewer" },
     });
-    fireEvent.change(within(dialog).getByTestId("create-agent-model"), {
-      target: { value: "gpt-default" },
+    fireEvent.pointerDown(within(dialog).getByTestId("agent-member-trigger"), {
+      button: 0,
+      pointerType: "mouse",
     });
+    fireEvent.click(screen.getByTestId("agent-member-model"));
+    fireEvent.click(await screen.findByTestId("agent-member-model-opus"));
     fireEvent.click(within(dialog).getByTestId("create-agent-submit"));
 
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("Agent name already exists");

@@ -35,10 +35,11 @@ from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 _HOST_ID = "host_e2e"
 
 # Text fields of the create-agent form that show a focus ring when focused.
+# The free-text Model field is gone; its manual model-id successor lives in
+# the member trigger's submenu and is checked separately below.
 _FOCUSABLE_FIELDS = [
     "create-agent-name",
     "create-agent-description",
-    "create-agent-model",
     "create-agent-instructions",
 ]
 
@@ -249,13 +250,11 @@ async def _drive_focus_ring(base_url: str) -> None:
             dialog = page.get_by_test_id("create-agent-dialog")
             await expect(dialog).to_be_visible(timeout=5_000)
 
-            # Focus each text field the way a user does and check the painted
-            # focus highlight is not chopped at the dialog body's edges.
             failures: list[str] = []
-            for testid in _FOCUSABLE_FIELDS:
-                field = page.get_by_test_id(testid)
-                await field.click()
-                await expect(field).to_be_focused()
+
+            async def check_focused_field(testid: str) -> None:
+                """Measure *testid*'s focused ring against its clipping ancestor."""
+                await expect(page.get_by_test_id(testid)).to_be_focused()
                 # Let the focus transition settle so the painted ring (and any
                 # recording of this journey) shows the steady focused state.
                 await page.wait_for_timeout(400)
@@ -273,6 +272,21 @@ async def _drive_focus_ring(base_url: str) -> None:
                         f"vs clip x-span [{result['clipLeft']:.1f}, {result['clipRight']:.1f}] "
                         f"of {result['clipper']})"
                     )
+
+            # Focus each text field the way a user does and check the painted
+            # focus highlight is not chopped at the dialog body's edges.
+            for testid in _FOCUSABLE_FIELDS:
+                await page.get_by_test_id(testid).click()
+                await check_focused_field(testid)
+
+            # The member trigger replaced the free-text Model field. Open its
+            # Model submenu, select "Other model…" to swap in the manual
+            # model-id entry (which takes focus), and check that entry's ring
+            # survives the submenu's own scroll clipping.
+            await page.get_by_test_id("agent-member-trigger").click()
+            await page.get_by_test_id("agent-member-model").click()
+            await page.get_by_test_id("agent-member-model-other").click()
+            await check_focused_field("agent-member-model-input")
 
             # Hold the final focused state briefly so a recording of the
             # journey ends on the observable outcome.

@@ -5,12 +5,24 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 export const CUSTOM_AGENTS_QUERY_KEY = ["custom-agents"] as const;
 export const AGENT_TEMPLATE_LABEL = "omnigent:agent-template-id";
 
+/** One member of a saved joint Agent; the lead is the Agent itself. */
+export interface CustomAgentMember {
+  name: string;
+  description: string | null;
+  harness: string;
+  model: string | null;
+  reasoning_effort: string | null;
+  lead: boolean;
+}
+
 export interface CustomAgent {
   id: string;
   name: string;
   description: string | null;
   harness: string | null;
   model: string | null;
+  /** Roster projected from the bundle: lead first, then each sub-agent. */
+  members: CustomAgentMember[] | null;
   version: number;
   created_at: number;
   updated_at: number | null;
@@ -103,7 +115,9 @@ export async function importCustomAgent(sessionId: string): Promise<CustomAgentD
 
 export async function updateCustomAgent(
   id: string,
-  changes: Pick<CustomAgentDetail, "name" | "description" | "instructions" | "version">,
+  changes: Pick<CustomAgentDetail, "name" | "description" | "instructions" | "version"> & {
+    members?: CustomAgentMember[] | null;
+  },
 ): Promise<CustomAgentDetail> {
   return (
     await checked(

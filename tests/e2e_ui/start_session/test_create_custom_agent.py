@@ -259,6 +259,25 @@ async def _wait_for_host_menu_closed(page) -> None:
     await expect(page.get_by_test_id("new-chat-landing-host-menu")).to_have_count(0)
 
 
+async def _choose_model(page, model_id: str) -> None:
+    """Pick *model_id* through the lead member's Model submenu.
+
+    The host stub answers an empty model catalog, so the row list can't offer
+    this pinned id — select the "Other model…" entry, type the id, and commit.
+    """
+    await page.get_by_test_id("agent-member-trigger").click()
+    await page.get_by_test_id("agent-member-model").click()
+    await page.get_by_test_id("agent-member-model-other").click()
+    field = page.get_by_test_id("agent-member-model-input")
+    await field.fill(model_id)
+    await field.press("Enter")
+    await expect(page.get_by_test_id("agent-member-agent-model-value")).to_have_text(model_id)
+    # Enter leaves the picker open; Escape dismisses it so the dialog footer
+    # stays clickable.
+    await page.keyboard.press("Escape")
+    await expect(field).to_be_hidden()
+
+
 # ── Tests ──────────────────────────────────────────────────────────
 
 
@@ -305,7 +324,7 @@ async def _drive_dialog_opens(base_url: str, session_id: str) -> None:
             # Verify form fields are present.
             await expect(page.get_by_test_id("create-agent-name")).to_be_visible()
             await expect(page.get_by_test_id("create-agent-description")).to_be_visible()
-            await expect(page.get_by_test_id("create-agent-harness")).to_be_visible()
+            await expect(page.get_by_test_id("agent-member-trigger")).to_be_visible()
             await expect(page.get_by_test_id("create-agent-instructions")).to_be_visible()
             await expect(page.get_by_test_id("create-agent-add-mcp")).to_be_visible()
         finally:
@@ -348,7 +367,7 @@ async def _drive_create_and_submit(base_url: str, session_id: str) -> None:
             # Fill in agent details.
             await page.get_by_test_id("create-agent-name").fill("test-agent")
             await page.get_by_test_id("create-agent-description").fill("A test agent")
-            await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+            await _choose_model(page, "claude-sonnet-4-20250514")
             await page.get_by_test_id("create-agent-instructions").fill(
                 "You are a test assistant."
             )
@@ -412,7 +431,7 @@ async def _drive_mcp_server(base_url: str, session_id: str) -> None:
 
             # Fill in agent name and model (both required).
             await page.get_by_test_id("create-agent-name").fill("mcp-agent")
-            await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+            await _choose_model(page, "claude-sonnet-4-20250514")
 
             # Add an MCP server.
             await page.get_by_test_id("create-agent-add-mcp").click()
@@ -598,7 +617,7 @@ async def _drive_saved_agent_blocked_on_sandbox(base_url: str, session_id: str) 
             await _open_create_agent(page)
             await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
             await page.get_by_test_id("create-agent-name").fill("pending-agent")
-            await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+            await _choose_model(page, "claude-sonnet-4-20250514")
             await page.get_by_test_id("create-agent-submit").click()
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
                 "pending-agent"

@@ -20,6 +20,7 @@ const detail: CustomAgentDetail = {
   description: null,
   harness: "codex",
   model: null,
+  members: null,
   version: 4,
   created_at: 1,
   updated_at: null,
