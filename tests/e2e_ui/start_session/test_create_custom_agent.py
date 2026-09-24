@@ -58,7 +58,11 @@ async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
 
 
 def _agents_body() -> str:
-    """Single Claude Code agent for the stub."""
+    """Single Claude Code agent for the stub.
+
+    ``harness: "claude-native"`` matches the built-in catalog shape: without a
+    harness id the picker treats the row as unrunnable and disables it.
+    """
     return json.dumps(
         {
             "data": [
@@ -67,7 +71,7 @@ def _agents_body() -> str:
                     "name": "claude-native-ui",
                     "display_name": "Claude Code",
                     "description": "Anthropic's coding agent",
-                    "harness": None,
+                    "harness": "claude-native",
                     "skills": [],
                 }
             ]
@@ -76,6 +80,11 @@ def _agents_body() -> str:
 
 
 def _hosts_body() -> str:
+    """One online host the composer picks, with the Claude harness ready.
+
+    ``configured_harnesses`` is the wire shape the picker's readiness gate
+    reads; without it the harness reads as unavailable.
+    """
     return json.dumps(
         {
             "hosts": [
@@ -84,6 +93,7 @@ def _hosts_body() -> str:
                     "name": "e2e-host",
                     "owner": "e2e",
                     "status": "online",
+                    "configured_harnesses": {"claude-native": True},
                 }
             ]
         }
@@ -237,6 +247,16 @@ async def _open_create_agent(page) -> None:
     await page.get_by_test_id("new-chat-landing-agent-select").click()
     await page.get_by_test_id("new-chat-landing-custom-agents").click()
     await page.get_by_test_id("new-chat-landing-create-agent").click()
+
+
+async def _wait_for_host_menu_closed(page) -> None:
+    """Wait out the host dropdown's exit animation after a target switch.
+
+    The host menu stays mounted while it animates out and returns focus to its
+    trigger when it unmounts; opening the agent picker before that point gets
+    the fresh menu dismissed by that close-refocus.
+    """
+    await expect(page.get_by_test_id("new-chat-landing-host-menu")).to_have_count(0)
 
 
 # ── Tests ──────────────────────────────────────────────────────────
@@ -464,8 +484,10 @@ async def _drive_cancel(base_url: str, session_id: str) -> None:
             await expect(dialog).to_be_hidden(timeout=5_000)
 
             # The agent chip should still show the original agent (Claude Code).
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Claude Code"
+            # Agent identity rides the accessible name: the visible text is the
+            # resolved model, which is empty on this stub host.
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+                "aria-label", re.compile("Claude Code")
             )
         finally:
             await browser.close()
@@ -522,6 +544,7 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
+            await _wait_for_host_menu_closed(page)
             await expect(page.get_by_test_id("new-chat-landing-host-chip")).not_to_have_attribute(
                 "aria-label", re.compile("Databricks Sandbox")
             )
@@ -571,6 +594,7 @@ async def _drive_saved_agent_blocked_on_sandbox(base_url: str, session_id: str) 
             # Switch to the connected host, then create and persist an Agent.
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
+            await _wait_for_host_menu_closed(page)
             await _open_create_agent(page)
             await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
             await page.get_by_test_id("create-agent-name").fill("pending-agent")
@@ -583,6 +607,7 @@ async def _drive_saved_agent_blocked_on_sandbox(base_url: str, session_id: str) 
             # Switch back to the sandbox: the saved pick stays visible but cannot run.
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id("new-chat-landing-sandbox-option").click()
+            await _wait_for_host_menu_closed(page)
             await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_have_attribute(
                 "aria-label", re.compile("Databricks Sandbox")
             )
