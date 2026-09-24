@@ -97,6 +97,7 @@ from omnigent.runner.subagent_routing import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
+    current_global_instructions_text,
     get_policy_store,
     inflight_text,
     pending_elicitations,
@@ -4809,6 +4810,7 @@ async def _ensure_runner_session_initialized(
             from omnigent.server.feature_flags import Feature, resolve_feature_flags
             from omnigent.version import VERSION
 
+            global_instructions = await asyncio.to_thread(current_global_instructions_text)
             resp = await runner_client.post(
                 "/v1/sessions",
                 json=build_runner_session_init_payload(
@@ -4822,6 +4824,7 @@ async def _ensure_runner_session_initialized(
                     peer_messaging_enabled=resolve_feature_flags().enabled(
                         Feature.SESSION_PEER_MESSAGING
                     ),
+                    global_instructions=global_instructions,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )

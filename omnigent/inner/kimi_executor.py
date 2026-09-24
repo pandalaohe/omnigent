@@ -707,7 +707,7 @@ class KimiExecutor(Executor):
         self,
         messages: list[Message],
         tools: list[ToolSpec],
-        system_prompt: str,  # noqa: ARG002 — kimi's own agent spec carries instructions
+        system_prompt: str,
         config: ExecutorConfig | None = None,  # noqa: ARG002 — per-turn override not yet plumbed
     ) -> AsyncIterator[ExecutorEvent]:
         if tools and not self._warned_tools_without_bridge:
@@ -736,6 +736,11 @@ class KimiExecutor(Executor):
         if not prompt_text:
             yield TurnComplete(response=None)
             return
+
+        # Prefix instructions on the first turn only; kimi has no --resume until
+        # a session id is captured (mirrors the non-native hermes executor).
+        if self._session_id is None and system_prompt:
+            prompt_text = f"{system_prompt}\n\n{prompt_text}"
 
         argv = self._build_argv(prompt_text=prompt_text)
         env = self._build_spawn_env()

@@ -69,6 +69,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
+from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -1294,18 +1295,20 @@ def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_passes_raw_instructions(
+async def test_auto_create_claude_terminal_passes_startup_instructions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Host-spawned launch emits ``--append-system-prompt`` with the agent's
-    raw author instructions.
+    startup text: raw author instructions, then the spec-level framework text,
+    then the session's global instructions last (a routed-spawn note, when the
+    session has one, keeps its place after the whole composed text).
 
     The managed-host wiring in ``runner/native/orchestration.py``
     (``augment_claude_args(..., append_system_prompt=
-    _native_startup_raw_instructions_from_spec(agent_spec))``), where
-    ``AgentSpec.instructions`` can become unreachable by claude-native.
+    _native_startup_instructions_from_spec(agent_spec, global_instructions=...))``),
+    where ``AgentSpec.instructions`` can become unreachable by claude-native.
     Drives the real ``_auto_create_claude_terminal`` →
     ``augment_claude_args`` integration rather than the helpers in isolation.
     """
@@ -1368,12 +1371,17 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
         lambda _sid, _evt: None,
         server_client=fake_client,
         agent_spec=agent_spec,
+        global_instructions="G",
     )
 
     args = captured["spec"].args
     assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
     idx = args.index("--append-system-prompt")
-    assert args[idx + 1] == "Be a concise, careful coding assistant."
+    assert args[idx + 1] == (
+        "Be a concise, careful coding assistant.\n\n"
+        + EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+        + "\n\nG"
+    )
 
 
 @pytest.mark.asyncio

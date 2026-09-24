@@ -98,6 +98,24 @@ class TestRowToItem:
         assert item is not None
         assert item.time_ms == 1_786_275_843_173
 
+    def test_turn_prompt_strips_agent_instructions_block(self) -> None:
+        # The executor wraps the session's first injected message with the
+        # launch-staged instructions (wrap_agent_instructions); the mirrored
+        # bubble must show only the user's real text.
+        from omnigent.native.native_bridge_common import wrap_agent_instructions
+
+        wrapped = wrap_agent_instructions("be terse", "the real question")
+        row = {
+            "type": "turn.prompt",
+            "input": [{"type": "text", "text": wrapped}],
+            "origin": {"kind": "user"},
+        }
+
+        item = _row_to_item(6, row)
+
+        assert item is not None
+        assert item.text == "the real question"
+
     def test_content_part_text_is_assistant(self) -> None:
         row = {
             "type": "context.append_loop_event",

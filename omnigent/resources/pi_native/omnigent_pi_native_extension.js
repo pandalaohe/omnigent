@@ -682,6 +682,21 @@ function textFromMessage(message) {
   );
 }
 
+// Mirrors native_bridge_common.strip_agent_instructions_block: the executor's
+// first-message instruction block must not reach the mirrored user turn, or
+// pending-input reconciliation never matches. Also strips an unterminated block.
+const AGENT_INSTRUCTIONS_OPEN_TAG = "<omnigent_agent_instructions>";
+const AGENT_INSTRUCTIONS_CLOSE_TAG = "</omnigent_agent_instructions>";
+const _AGENT_INSTRUCTIONS_BLOCK_RE = new RegExp(
+  `${AGENT_INSTRUCTIONS_OPEN_TAG}[\\s\\S]*?${AGENT_INSTRUCTIONS_CLOSE_TAG}|${AGENT_INSTRUCTIONS_OPEN_TAG}[\\s\\S]*`,
+);
+
+function stripAgentInstructionsBlock(text) {
+  return typeof text === "string"
+    ? text.replace(_AGENT_INSTRUCTIONS_BLOCK_RE, "")
+    : text;
+}
+
 function safeJsonStringify(value) {
   try {
     return JSON.stringify(value ?? {});
@@ -2097,7 +2112,8 @@ module.exports = function (pi) {
   pi.on("input", async (event, ctx) => {
     rememberContext(ctx);
     setOmnigentStatus(config, ctx, "running");
-    const text = event && typeof event.text === "string" ? event.text : "";
+    const rawText = event && typeof event.text === "string" ? event.text : "";
+    const text = stripAgentInstructionsBlock(rawText).trim();
     if (!text) return;
     await postEvent(config, {
       type: "external_conversation_item",

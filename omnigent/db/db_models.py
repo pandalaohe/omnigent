@@ -1464,6 +1464,52 @@ class SqlPolicy(OmnigentBase):
     )
 
 
+class SqlGlobalInstructionRevision(OmnigentBase):
+    """
+    SQLAlchemy model for the ``global_instruction_revisions`` table.
+
+    Append-only history of the server-wide global instructions text: one
+    row per save, the newest row in a workspace is the live value that
+    session initialization reads. Saves are rare and rows small, so there
+    is no pruning.
+
+    :param id: Opaque PK, e.g. ``"a1b2c3..."`` (bare 32-char hex uuid).
+    :param text: The instruction text. Empty is a valid save and means
+        "off". Stored compressed (CompressedText).
+    :param created_us: Unix epoch microseconds at row creation. Finer
+        than the seconds the entity and API expose so back-to-back
+        saves still order newest-first.
+    :param created_by: User ID of the admin who saved it, or ``None`` in
+        single-user mode.
+    """
+
+    __tablename__ = "global_instruction_revisions"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    text: Mapped[str] = mapped_column(CompressedText)
+    created_us: Mapped[int] = mapped_column(BigInteger)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        # Backs the store's "latest in workspace" read: created_us then id,
+        # both descending, so a backward index seek answers it.
+        Index(
+            "ix_global_instruction_revisions_latest",
+            "workspace_id",
+            "created_us",
+            "id",
+        ),
+    )
+
+
 class SqlHost(OmnigentBase):
     """
     SQLAlchemy model for the ``hosts`` table.

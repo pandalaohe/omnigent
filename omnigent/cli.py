@@ -4444,6 +4444,9 @@ def server(
 
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignmentStore
+    from omnigent.stores.global_instructions_store.sqlalchemy_store import (
+        SqlAlchemyGlobalInstructionsStore,
+    )
     from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
@@ -4462,6 +4465,7 @@ def server(
     conversation_store = SqlAlchemyConversationStore(db_uri, conv_db_uri)
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
+    global_instructions_store = SqlAlchemyGlobalInstructionsStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
@@ -4511,6 +4515,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        global_instructions_store=global_instructions_store,
         caps=caps,
     )
 
@@ -4650,6 +4655,7 @@ def server(
         conversation_store=conversation_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        global_instructions_store=global_instructions_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
         runner_tunnel_tokens=_runner_tunnel_tokens,

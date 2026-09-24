@@ -511,16 +511,6 @@ _AGENT_RULE_STAMP_KEY = "omnigent_session"
 #: and remove this session's agent rule (which lives in the workspace, not here).
 _WORKSPACE_HINT_FILE = "workspace.txt"
 
-#: A custom agent's instructions, staged for the first injected message when the
-#: rule channel is not safe to use for this workspace.
-_INSTRUCTIONS_PREAMBLE_FILE = "instructions_preamble.txt"
-AGENT_INSTRUCTIONS_OPEN_TAG = "<omnigent_agent_instructions>"
-AGENT_INSTRUCTIONS_CLOSE_TAG = "</omnigent_agent_instructions>"
-_AGENT_INSTRUCTIONS_HEADER = (
-    "These are your operating instructions for this session; follow them "
-    "throughout, not just for this message:"
-)
-
 
 #: Prior conversation a forked clone replays on its first message: written by the
 #: launch path, consumed once by the executor.
@@ -655,7 +645,7 @@ def write_devin_agent_rule(workspace: Path, instructions: str | None, *, session
     :param session_id: The Omnigent conversation id, stamped as the rule's owner.
     :returns: ``True`` when the instructions are live in the rule file. ``False``
         means the caller must deliver them another way (see
-        :func:`write_agent_instructions_preamble`).
+        :func:`omnigent.native.native_bridge_common.write_agent_instructions_preamble`).
     """
     # ponytail: this writes into the user's workspace — the only always-on
     # channel Devin exposes (rules are CWD-relative; there is no out-of-tree
@@ -750,57 +740,6 @@ def remove_devin_agent_rule_if_owned(workspace: Path, session_id: str) -> bool:
     with contextlib.suppress(OSError):
         rule_path.unlink(missing_ok=True)
     return True
-
-
-def write_agent_instructions_preamble(bridge_dir: Path, instructions: str) -> None:
-    """Stage instructions for the first injected message.
-
-    The fallback for workspaces where the rule channel is not session-scoped.
-    Unlike the rule this is not always-on, so it is a weaker delivery — used only
-    when the alternative is leaking instructions into other sessions.
-
-    :param bridge_dir: Per-session bridge directory.
-    :param instructions: Verbatim agent instructions; blank writes nothing.
-    """
-    if not instructions.strip():
-        return
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).write_text(instructions, encoding="utf-8")
-
-
-def read_agent_instructions_preamble(bridge_dir: Path) -> str | None:
-    """Return staged instructions, or ``None`` when there are none."""
-    try:
-        text = (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).read_text(encoding="utf-8")
-    except OSError:
-        return None
-    return text or None
-
-
-def clear_agent_instructions_preamble(bridge_dir: Path) -> None:
-    """Drop the staged instructions once they have been delivered."""
-    with contextlib.suppress(OSError):
-        (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).unlink()
-
-
-def wrap_agent_instructions(instructions: str, user_text: str) -> str:
-    """Frame staged instructions ahead of the session's first user message.
-
-    :param instructions: Verbatim agent instructions.
-    :param user_text: The message text this call prefixes.
-    :returns: The framed instructions followed by the user text.
-    """
-    body = instructions.strip()
-    body = body.replace(AGENT_INSTRUCTIONS_OPEN_TAG, "[omnigent_agent_instructions]").replace(
-        AGENT_INSTRUCTIONS_CLOSE_TAG, "[/omnigent_agent_instructions]"
-    )
-    return (
-        f"{AGENT_INSTRUCTIONS_OPEN_TAG}\n"
-        f"{_AGENT_INSTRUCTIONS_HEADER}\n\n"
-        f"{body}\n"
-        f"{AGENT_INSTRUCTIONS_CLOSE_TAG}\n\n"
-        f"{user_text}"
-    )
 
 
 def write_hook_wrapper(

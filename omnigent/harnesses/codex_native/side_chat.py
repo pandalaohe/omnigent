@@ -131,8 +131,9 @@ async def fork_ephemeral_side_thread(
 
     :param codex_client: Connected Codex app-server client.
     :param parent_thread_id: Codex thread id to fork from, e.g. ``"thread_abc"``.
-    :param developer_instructions: Reference-only boundary instructions for the
-        fork; ``None`` omits them.
+    :param developer_instructions: Instructions for the fork — the reference-only
+        boundary plus the session's applied startup text on the forwarder path;
+        ``None`` omits them.
     :returns: The new child Codex thread id, or ``None`` if the response carried
         no thread id.
     """
@@ -208,7 +209,8 @@ async def open_side_chat_on_client(
     :param codex_client: Connected Codex app-server client (built from bridge state).
     :param parent_thread_id: The active (main) Codex thread id to fork from.
     :param question: The ``/side`` question, submitted as the first turn.
-    :param developer_instructions: Reference-only boundary instructions.
+    :param developer_instructions: Instructions for the fork (the reference-only
+        boundary plus, on the forwarder path, the session's applied startup text).
     :returns: The child Codex thread id, or ``None`` if the fork failed.
     """
     child_thread_id = await fork_ephemeral_side_thread(

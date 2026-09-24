@@ -85,6 +85,11 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.llms.errors import PermanentLLMError
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
+)
 from omnigent.util.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort_or_llm_error
 
 _logger = logging.getLogger(__name__)
@@ -238,10 +243,18 @@ class AntigravityNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Antigravity native turn had no user text to send")
             return
+        # The instructions staged at launch frame the session's first message;
+        # they are cleared only after the injection lands, so a failure retries
+        # with them rather than losing the brief.
+        instructions = read_agent_instructions_preamble(self._bridge_dir)
+        if instructions:
+            text = wrap_agent_instructions(instructions, text)
         outcome = await self._deliver(text)
         if outcome is not None:
             yield ExecutorError(message=outcome)
         else:
+            if instructions:
+                clear_agent_instructions_preamble(self._bridge_dir)
             yield TurnComplete(response=None)
 
     async def _deliver(self, text: str) -> str | None:

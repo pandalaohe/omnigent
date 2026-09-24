@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         FileStore,
     )
     from omnigent.stores.comment_store import CommentStore
+    from omnigent.stores.global_instructions_store import GlobalInstructionsStore
     from omnigent.stores.policy_store import PolicyStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
@@ -37,6 +38,7 @@ def init(
     artifact_store: ArtifactStore | None = None,
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
+    global_instructions_store: GlobalInstructionsStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -61,6 +63,9 @@ def init(
     :param policy_store: The PolicyStore instance for
         session-scoped policies managed via the CRUD API.
         ``None`` when session policies are not configured.
+    :param global_instructions_store: The GlobalInstructionsStore
+        instance for the server-wide instruction text. ``None``
+        when global instructions are not configured.
     :param caps: Operator-configured execution ceiling.
         ``None`` uses :class:`RuntimeCaps` defaults.
     """
@@ -72,6 +77,7 @@ def init(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        global_instructions_store=global_instructions_store,
         caps=caps,
     )
 
@@ -154,6 +160,38 @@ def get_policy_store() -> PolicyStore | None:
     :returns: The PolicyStore set during :func:`init`, or ``None``.
     """
     return _globals._policy_store
+
+
+def get_global_instructions_store() -> GlobalInstructionsStore | None:
+    """
+    Return the GlobalInstructionsStore instance, or ``None`` if not configured.
+
+    Returns ``None`` (rather than raising) because
+    global_instructions_store is optional — session initialization
+    simply carries no global text when no store is available.
+
+    :returns: The GlobalInstructionsStore set during :func:`init`,
+        or ``None``.
+    """
+    return _globals._global_instructions_store
+
+
+def current_global_instructions_text() -> str | None:
+    """
+    Return the live global instructions text to inject, or ``None``.
+
+    ``None`` covers every "nothing to inject" case: no store
+    registered, no saved revision, or a blank text.
+
+    :returns: The current revision's text, or ``None``.
+    """
+    store = get_global_instructions_store()
+    if store is None:
+        return None
+    revision = store.current()
+    if revision is None or not revision.text.strip():
+        return None
+    return revision.text
 
 
 def get_agent_cache() -> AgentCache:

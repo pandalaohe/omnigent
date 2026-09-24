@@ -11788,6 +11788,66 @@ async def test_cross_path_resolution_contract(
 
 
 # ---------------------------------------------------------------------------
+# Gated harnesses never receive the fabricated fallback persona.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("harness", ["hermes", "kimi"])
+@pytest.mark.asyncio
+async def test_gated_harness_turn_omits_the_fabricated_fallback(harness: str) -> None:
+    """An unauthored gated harness is handed no fabricated "helpful assistant".
+
+    hermes and kimi prefix ``instructions`` onto the first user turn, where the
+    vendor CLI keeps it for the whole session.
+    """
+    conv = f"conv_gated_fallback_{harness}"
+    spec = AgentSpec(
+        spec_version=1,
+        name="unauthored",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recorder)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        created = await http.post(
+            "/v1/sessions",
+            json={"session_id": conv, "agent_id": "ag_unauthored"},
+        )
+        assert created.status_code == 201, created.text
+        posted = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_unauthored",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert posted.status_code == 202, posted.text
+        await _await_bg_turn_task(conv)
+
+    assert recorder.posted_bodies, "the turn never reached the harness"
+    sent = recorder.posted_bodies[-1].get("instructions")
+    assert "You are a helpful assistant." not in (sent or ""), (
+        f"{harness} was handed the fabricated fallback persona: {sent!r}"
+    )
+    # The gate drops the fallback seed, not the delivery: the framework text
+    # still rides along and the executor's first turn still gets prefixed.
+    assert isinstance(sent, str)
+    assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION in sent
+
+
+# ---------------------------------------------------------------------------
 # Unit tests for _response_failed_event source propagation
 # ---------------------------------------------------------------------------
 

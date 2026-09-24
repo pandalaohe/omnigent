@@ -64,6 +64,7 @@ import httpx
 
 from omnigent.harnesses.qwen_native.bridge import events_file_path
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.native.native_bridge_common import strip_agent_instructions_block
 
 _logger = logging.getLogger(__name__)
 
@@ -234,7 +235,10 @@ def _event_to_item(event: dict[str, object], agent_name: str) -> _MirrorItem | N
     message = event.get("message")
     if not isinstance(message, dict):
         return None
-    text = _ATTACHMENT_MARKER_RE.sub("", _text_from_content(message.get("content"))).strip()
+    text = _text_from_content(message.get("content"))
+    if etype == "user":
+        text = strip_agent_instructions_block(text)
+    text = _ATTACHMENT_MARKER_RE.sub("", text).strip()
     if not text:
         return None  # tool-only / thinking-only turn with no prose
     response_id = f"qwen:{uuid}"

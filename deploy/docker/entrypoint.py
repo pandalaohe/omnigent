@@ -376,6 +376,9 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.global_instructions_store.sqlalchemy_store import (
+        SqlAlchemyGlobalInstructionsStore,
+    )
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
@@ -401,6 +404,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     permission_store = SqlAlchemyPermissionStore(database_url)
     host_store = HostStore(database_url)
     policy_store = SqlAlchemyPolicyStore(database_url)
+    global_instructions_store = SqlAlchemyGlobalInstructionsStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
     project_store = SqlAlchemyProjectStore(database_url)
     project_repository_store = SqlAlchemyProjectRepositoryStore(database_url)
@@ -441,6 +445,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        global_instructions_store=global_instructions_store,
     )
 
     # Build the auth provider from the live env (header/oidc/accounts).
@@ -508,6 +513,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         comment_store=comment_store,
         permission_store=permission_store,
         policy_store=policy_store,
+        global_instructions_store=global_instructions_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         project_store=project_store,

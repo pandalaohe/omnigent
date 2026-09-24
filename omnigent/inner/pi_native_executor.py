@@ -23,6 +23,11 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
+)
 
 
 class PiNativeExecutor(Executor):
@@ -97,8 +102,16 @@ class PiNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Pi native turn had no user text to send")
             return
+        # The instructions staged at launch frame the session's first message;
+        # they are cleared only after the injection lands, so a failure retries
+        # with them rather than losing the brief.
+        instructions = read_agent_instructions_preamble(self._bridge_dir)
+        if instructions:
+            text = wrap_agent_instructions(instructions, text)
         self._refresh_auth_headers()
         enqueue_user_message(self._bridge_dir, text)
+        if instructions:
+            clear_agent_instructions_preamble(self._bridge_dir)
         yield TurnComplete(response=None)
 
     def _refresh_auth_headers(self) -> None:

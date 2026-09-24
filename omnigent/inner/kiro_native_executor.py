@@ -22,6 +22,11 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
+)
 
 
 class KiroNativeExecutor(Executor):
@@ -65,12 +70,19 @@ class KiroNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="kiro native turn had no user text to send")
             return
+        # The instructions staged at launch frame the first message; they are
+        # cleared only after the injection lands, so a failure retries with them.
+        instructions = read_agent_instructions_preamble(self._bridge_dir)
+        if instructions:
+            text = wrap_agent_instructions(instructions, text)
         try:
             async with self._inject_lock:
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
         except RuntimeError as exc:
             yield ExecutorError(message=describe_exception(exc))
             return
+        if instructions:
+            clear_agent_instructions_preamble(self._bridge_dir)
         yield TurnComplete(response=None)
 
 

@@ -105,6 +105,7 @@ from omnigent.server.routes.default_policies import create_default_policies_rout
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.extension_assets import create_extension_assets_router
 from omnigent.server.routes.extensions import create_extensions_router
+from omnigent.server.routes.global_instructions import create_global_instructions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -160,6 +161,7 @@ from omnigent.stores.conversation_store import (
     SessionConnectivity,
     runner_seen_is_fresh,
 )
+from omnigent.stores.global_instructions_store import GlobalInstructionsStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
@@ -1394,6 +1396,7 @@ def create_app(
     runner_tunnel_tokens: frozenset[str] | None = None,
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
+    global_instructions_store: GlobalInstructionsStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
     project_store: ProjectStore | None = None,
@@ -1448,6 +1451,9 @@ def create_app(
         (session-scoped and server-wide defaults). ``None``
         disables both the session policy and default policy
         CRUD endpoints.
+    :param global_instructions_store: Store for the server-wide
+        global instructions text and its revision history.
+        ``None`` disables the global instructions endpoints.
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
     :param scheduled_task_store: Store backing the recurring-task
@@ -3620,6 +3626,16 @@ def create_app(
             ),
             prefix="/v1",
             tags=["default_policies"],
+        )
+    if global_instructions_store is not None:
+        app.include_router(
+            create_global_instructions_router(
+                global_instructions_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["global_instructions"],
         )
     app.include_router(
         create_policy_registry_router(auth_provider=auth_provider),

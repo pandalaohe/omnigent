@@ -70,6 +70,7 @@ import httpx
 
 from omnigent.harnesses.hermes_native import status as hermes_native_status
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.native.native_bridge_common import strip_agent_instructions_block
 
 _logger = logging.getLogger(__name__)
 
@@ -560,9 +561,10 @@ def _message_to_items(
     """
     if not isinstance(role, str):
         return []
-    text = ""
-    if isinstance(content, str):
-        text = _ATTACHMENT_MARKER_RE.sub("", content).strip()
+    text = content if isinstance(content, str) else ""
+    if role == "user":
+        text = strip_agent_instructions_block(text)
+    text = _ATTACHMENT_MARKER_RE.sub("", text).strip()
     response_id = f"hermes:{msg_id}"
 
     if role == "user":

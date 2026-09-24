@@ -21,6 +21,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.kiro_native.bridge import write_forwarder_ready
+from omnigent.native.native_bridge_common import strip_agent_instructions_block
 
 _logger = logging.getLogger(__name__)
 
@@ -270,7 +271,10 @@ def parse_kiro_jsonl_line(line: str) -> KiroConversationMessage | None:
     message_id = data.get("message_id")
     if not isinstance(message_id, str) or not message_id:
         return None
-    text = _kiro_content_text(data.get("content")).strip()
+    text = _kiro_content_text(data.get("content"))
+    if role == "user":
+        text = strip_agent_instructions_block(text)
+    text = text.strip()
     if not text:
         return None
     return KiroConversationMessage(message_id=message_id, role=role, text=text)

@@ -52,6 +52,8 @@ import logging
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
+from omnigent.native.native_bridge_common import strip_agent_instructions_block
+
 _logger = logging.getLogger(__name__)
 
 # Omnigent ``agent`` label stamped on mirrored assistant/function-call items so
@@ -1008,7 +1010,7 @@ def map_step_to_events(
     # (#1155). The reader dedups USER_INPUT by its per-turn ``executionId``, so
     # this emits exactly once per turn.
     if step_type == _TYPE_USER_INPUT:
-        text = _user_input_text(step.get("userInput"))
+        text = strip_agent_instructions_block(_user_input_text(step.get("userInput"))).strip()
         if not text:
             return []
         return [_user_message_event(text=text)]

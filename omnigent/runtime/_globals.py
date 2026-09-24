@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         FileStore,
     )
     from omnigent.stores.comment_store import CommentStore
+    from omnigent.stores.global_instructions_store import GlobalInstructionsStore
     from omnigent.stores.policy_store import PolicyStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
@@ -36,6 +37,7 @@ _file_store: FileStore | None = None
 _artifact_store: ArtifactStore | None = None
 _comment_store: CommentStore | None = None
 _policy_store: PolicyStore | None = None
+_global_instructions_store: GlobalInstructionsStore | None = None
 _caps: RuntimeCaps = RuntimeCaps()
 
 # Server-resident tmux terminal registry. Initialized in
@@ -177,6 +179,7 @@ def init(
     artifact_store: ArtifactStore | None = None,
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
+    global_instructions_store: GlobalInstructionsStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -206,6 +209,10 @@ def init(
         ``None`` when session policies are not configured;
         the policy engine will only use spec-declared
         policies.
+    :param global_instructions_store: The GlobalInstructionsStore
+        instance for the server-wide instruction text. ``None``
+        when global instructions are not configured; sessions
+        initialize without them.
     :param caps: Operator-configured execution ceiling.
         ``None`` uses :class:`RuntimeCaps` defaults.
     """
@@ -214,6 +221,7 @@ def init(
     global _conversation_store, _agent_store
     global _agent_cache, _file_store, _artifact_store, _caps
     global _terminal_registry, _comment_store, _policy_store
+    global _global_instructions_store
     _conversation_store = conversation_store
     _agent_store = agent_store
     _agent_cache = agent_cache
@@ -221,6 +229,7 @@ def init(
     _artifact_store = artifact_store
     _comment_store = comment_store
     _policy_store = policy_store
+    _global_instructions_store = global_instructions_store
     _caps = caps if caps is not None else RuntimeCaps()
     # Tmux terminal registry: server-resident, conversation-scoped
     # ``inner.terminal.TerminalInstance`` map. See

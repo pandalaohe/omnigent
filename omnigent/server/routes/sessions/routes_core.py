@@ -48,6 +48,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
+    current_global_instructions_text,
     pending_elicitations,
     user_session_stream,
 )
@@ -592,7 +593,7 @@ def register_core_routes(
             )
         return runner_id, launch_failed
 
-    def _session_init_notify_body(
+    async def _session_init_notify_body(
         conv: Conversation,
         request: Request,
         *,
@@ -606,6 +607,9 @@ def register_core_routes(
         }
         if conv.agent_id is not None:
             try:
+                # Blocking store read; inside the try so a read failure still
+                # falls back to the id-only body.
+                global_instructions = await asyncio.to_thread(current_global_instructions_text)
                 init_body = build_runner_session_init_payload(
                     conv,
                     server_version=VERSION,
@@ -616,6 +620,7 @@ def register_core_routes(
                     peer_messaging_enabled=request.app.state.feature_flags.enabled(
                         Feature.SESSION_PEER_MESSAGING
                     ),
+                    global_instructions=global_instructions,
                 )
             except Exception:
                 # Must not fail the request; the fallback drops the seeded
@@ -754,7 +759,7 @@ def register_core_routes(
             # current session state; older runners ignore the extra key.
             # ``initial_items`` are already persisted and forwarded by now, so
             # suppress the runner's recovery turn or they run twice.
-            init_body = _session_init_notify_body(conv, request, suppress_recovery_turn=True)
+            init_body = await _session_init_notify_body(conv, request, suppress_recovery_turn=True)
             try:
                 await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
             except (httpx.HTTPError, ConnectionError):
@@ -2715,7 +2720,7 @@ def register_core_routes(
                     # from the spec, and the recovery turn that executes seeded
                     # initial_items ran on the spec's harness. Recovery stays
                     # enabled: on rebind it is what runs the pending kickoff.
-                    init_body = _session_init_notify_body(conv, request)
+                    init_body = await _session_init_notify_body(conv, request)
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",

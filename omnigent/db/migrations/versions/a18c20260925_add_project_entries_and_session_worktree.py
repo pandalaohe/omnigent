@@ -1,7 +1,7 @@
 """add project host entries and the session worktree column
 
-Revision ID: a17c20260924
-Revises: a16c20260923
+Revision ID: a18c20260925
+Revises: a17c20260924
 Create Date: 2026-09-24 00:00:00.000000
 
 Adds ``project_host_entries`` (one project directory per host, independent of
@@ -24,8 +24,8 @@ from alembic import op
 
 from omnigent.db.db_models import Uuid16
 
-revision: str = "a17c20260924"
-down_revision: str | None = "a16c20260923"
+revision: str = "a18c20260925"
+down_revision: str | None = "a17c20260924"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

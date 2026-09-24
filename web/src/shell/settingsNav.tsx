@@ -14,6 +14,7 @@ import {
   BlocksIcon,
   CpuIcon,
   DownloadIcon,
+  FileTextIcon,
   GaugeIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -47,6 +48,7 @@ export type SettingsSectionId =
   | "account"
   | "members"
   | "policies"
+  | "global-instructions"
   | "sharing"
   | "archived"
   | "cli"
@@ -65,6 +67,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "account",
   "members",
   "policies",
+  "global-instructions",
   "sharing",
   "archived",
   "cli",
@@ -147,11 +150,16 @@ export function settingsNavGroups(
   if (isAdmin) {
     // Members (manage other accounts) and Sharing (grant sessions to other
     // users) have no meaning in single-user mode — there are no other users —
-    // so drop both from the nav there. Policies stays: global policies apply
-    // to a solo user's own sessions too.
+    // so drop both from the nav there. Policies and Global instructions stay:
+    // both apply to a solo user's own sessions too.
     const adminItems: SettingsNavItem[] = [];
     if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
     adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
+    adminItems.push({
+      id: "global-instructions",
+      label: "Global instructions",
+      icon: FileTextIcon,
+    });
     if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });
     groups.push({ title: "Admin", items: adminItems });
   }

@@ -38,6 +38,11 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,11 @@ class QwenNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="qwen native turn had no user text to send")
             return
+        # The instructions staged at launch frame the first message; they are
+        # cleared only after the injection lands, so a failure retries with them.
+        instructions = read_agent_instructions_preamble(self._bridge_dir)
+        if instructions:
+            text = wrap_agent_instructions(instructions, text)
         try:
             await self._ensure_ready()
             async with self._inject_lock:
@@ -134,6 +144,8 @@ class QwenNativeExecutor(Executor):
         except RuntimeError as exc:
             yield ExecutorError(message=describe_exception(exc))
             return
+        if instructions:
+            clear_agent_instructions_preamble(self._bridge_dir)
         yield TurnComplete(response=None)
 
 
