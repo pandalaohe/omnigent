@@ -38,6 +38,25 @@ class EntryPutRequest(BaseModel):
     workspace: str
 
 
+def _is_managed_worktree_path(path: str) -> bool:
+    """Whether *path* lies inside an Omnigent-managed worktree area.
+
+    Assignment release and session cleanup remove those directories, so an
+    entry there could later be matched by a removal that never intended it.
+
+    :param path: Canonical path returned by the host.
+    :returns: ``True`` for a ``.worktrees`` component or an
+        ``.omnigent/worktrees`` pair, on either path separator.
+    """
+    components = path.replace("\\", "/").split("/")
+    if ".worktrees" in components:
+        return True
+    return any(
+        components[index] == ".omnigent" and components[index + 1] == "worktrees"
+        for index in range(len(components) - 1)
+    )
+
+
 def _entry_to_response(entry: ProjectHostEntry) -> dict[str, Any]:
     """Convert an entry entity to a response dict.
 
@@ -118,8 +137,8 @@ def create_project_entries_router(
         :param body: Workspace path on the host.
         :returns: The inserted or updated entry.
         :raises OmnigentError: 401 if unauthenticated, 404 if the project is
-            not found / not owned, 400 for the sandbox host or a bad path,
-            409 when the host is offline.
+            not found / not owned, 400 for the sandbox host, a bad path or a
+            path inside a worktree folder, 409 when the host is offline.
         """
         user_id = require_user(request, auth_provider)
         await _require_owned_project(project_id, user_id)
@@ -135,6 +154,12 @@ def create_project_entries_router(
             host_store=host_store,
             host_registry=host_registry,
         )
+        if _is_managed_worktree_path(canonical):
+            raise OmnigentError(
+                "a project directory cannot be inside a worktree folder "
+                "(.worktrees or .omnigent/worktrees)",
+                code=ErrorCode.INVALID_INPUT,
+            )
         entry = await asyncio.to_thread(
             binding_store.put_entry,
             project_id,

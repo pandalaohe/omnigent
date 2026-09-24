@@ -204,6 +204,80 @@ async def test_entry_put_bad_path_400(
     assert listed.json() == {"entries": []}
 
 
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        "/u/p/.worktrees/repo/topic",
+        "/u/p/.omnigent/worktrees/repo",
+        "D:\\p\\.omnigent\\worktrees\\asg\\root",
+    ],
+)
+async def test_entry_put_managed_worktree_path_400(
+    entries_client: httpx.AsyncClient,
+    live_host: dict[str, Any],
+    workspace: str,
+) -> None:
+    """A path inside an Omnigent-managed worktree area is refused untouched."""
+    project_id = await _make_project(entries_client)
+    live_host["replies"][workspace] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": workspace,
+    }
+    response = await entries_client.put(
+        f"/v1/projects/{project_id}/entries/{live_host['host_id']}",
+        json={"workspace": workspace},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_input"
+    listed = await entries_client.get(f"/v1/projects/{project_id}/entries")
+    assert listed.json() == {"entries": []}
+
+
+async def test_entry_put_managed_worktree_canonical_400(
+    entries_client: httpx.AsyncClient,
+    live_host: dict[str, Any],
+) -> None:
+    """The refusal reads the canonical path, not the typed one."""
+    project_id = await _make_project(entries_client)
+    live_host["replies"]["/data/link"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/private/u/p/.worktrees/repo/topic",
+    }
+    response = await entries_client.put(
+        f"/v1/projects/{project_id}/entries/{live_host['host_id']}",
+        json={"workspace": "/data/link"},
+    )
+    assert response.status_code == 400, response.text
+    listed = await entries_client.get(f"/v1/projects/{project_id}/entries")
+    assert listed.json() == {"entries": []}
+
+
+@pytest.mark.parametrize("workspace", ["/data/work", "/u/worktrees/p"])
+async def test_entry_put_plain_worktrees_name_stored(
+    entries_client: httpx.AsyncClient,
+    live_host: dict[str, Any],
+    workspace: str,
+) -> None:
+    """A normal path, and one where ``worktrees`` is a plain name, is stored."""
+    project_id = await _make_project(entries_client)
+    live_host["replies"][workspace] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": workspace,
+    }
+    response = await entries_client.put(
+        f"/v1/projects/{project_id}/entries/{live_host['host_id']}",
+        json={"workspace": workspace},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["workspace"] == workspace
+
+
 async def test_entry_put_sandbox_400(entries_client: httpx.AsyncClient) -> None:
     """The sandbox sentinel has no directory and is refused before any host call."""
     project_id = await _make_project(entries_client)
