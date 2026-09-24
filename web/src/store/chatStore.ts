@@ -4478,6 +4478,15 @@ function withoutRebuiltUserInputCards(
 // persisted tool call that gated the question / plan (`answered:<call_id>`).
 const ANSWERED_ELICITATION_PREFIX = "answered:";
 
+// An id key names one exact question instance, so its rebuilt copy proves the
+// live copy was answered even while that copy still reads pending.
+function isClaimableLiveCopy(block: AnyBlock): block is ElicitationBlock {
+  if (block.type !== "elicitation") return false;
+  if (block.status === "responded") return true;
+  const key = userInputElicitationKey(block);
+  return key !== null && key.startsWith("question-ids:");
+}
+
 /**
  * Splice the reconnect backfill's committed `unseen` blocks into the live
  * transcript.
@@ -4527,8 +4536,7 @@ function spliceReconnectBackfill(
     ) {
       const candidate = liveBlocks[i]!;
       if (
-        candidate.type === "elicitation" &&
-        candidate.status === "responded" &&
+        isClaimableLiveCopy(candidate) &&
         key !== null &&
         userInputElicitationKey(candidate) === key &&
         !claimedLive.has(i)
@@ -4544,7 +4552,7 @@ function spliceReconnectBackfill(
   const liveSlots = new Map<string, number[]>();
   for (let i = 0; i < liveBlocks.length; i += 1) {
     const b = liveBlocks[i]!;
-    if (b.type === "elicitation" && b.status === "responded" && !claimedLive.has(i)) {
+    if (isClaimableLiveCopy(b) && !claimedLive.has(i)) {
       const key = userInputElicitationKey(b);
       if (key !== null) {
         const slots = liveSlots.get(key);

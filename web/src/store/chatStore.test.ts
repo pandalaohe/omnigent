@@ -1948,6 +1948,78 @@ describe("chatStore — switchTo", () => {
     },
   );
 
+  it("drops a pending Codex question card when the reconnect backfill rebuilds the answered one", async () => {
+    // The TUI answered while the web still held the live pending card. The
+    // gap's backfill sees the call + output and rebuilds the answered copy;
+    // the id key proves both name the same question instance, so the pending
+    // copy must be replaced, not left beside it.
+    const questions = {
+      questions: [
+        {
+          id: "call_async:0",
+          question: "Pick a flavour",
+          options: [{ label: "Vanilla" }, { label: "Mint" }],
+          multiSelect: false,
+        },
+      ],
+    };
+    const user = userMessage("resp_1", "ask me");
+    const fcAsk: ConversationItem = {
+      id: "fc_async_q0",
+      response_id: "resp_1",
+      type: "function_call",
+      status: "completed",
+      name: "request_user_input_async",
+      arguments: JSON.stringify(questions),
+      call_id: "call_async:0",
+      model: "codex-native-ui",
+    };
+    const fcoAsk: ConversationItem = {
+      id: "fco_async_q0",
+      response_id: "resp_1",
+      type: "function_call_output",
+      status: "completed",
+      call_id: "call_async:0",
+      output: "Vanilla",
+    };
+    const reply = assistantMessage("resp_1", "Enjoy the vanilla.");
+    seedSession("conv_codex_card_order", [user, fcAsk, fcoAsk, reply]);
+    await useChatStore.getState().switchTo("conv_codex_card_order");
+
+    const liveCard: ElicitationBlock = {
+      type: "elicitation",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+      elicitationId: "elicit_codex_pending",
+      message: "",
+      phase: "pre_tool_use",
+      policyName: "codex_native_permission",
+      contentPreview: "",
+      requestedSchema: {},
+      status: "pending",
+      response: null,
+      askUserQuestion: questions,
+    };
+    useChatStore.setState({
+      blocks: [...itemsToBlocks([user]), ...itemsToBlocks([fcAsk]), liveCard],
+    });
+
+    // Switch away and back: the retained conversation reconciles against the
+    // snapshot, whose call + output rebuild the answered card (the output is
+    // part of the backfill, not the live blocks).
+    await useChatStore.getState().switchTo("conv_other");
+    await useChatStore.getState().switchTo("conv_codex_card_order");
+    await tick();
+
+    const blocks = useChatStore.getState().blocks;
+    const cards = blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("responded");
+    expect(cards[0]!.ctx.itemId).toBe("fc_async_q0:answer");
+    const replyAt = blocks.findIndex((b) => b.type === "text_done");
+    expect(replyAt).toBeGreaterThanOrEqual(0);
+    expect(blocks.indexOf(cards[0]!)).toBeLessThan(replyAt);
+  });
+
   it("pairs repeated answered questions with their live cards in transcript order", async () => {
     const questions = {
       questions: [{ question: "Continue?", options: [{ label: "Yes" }], multiSelect: false }],
