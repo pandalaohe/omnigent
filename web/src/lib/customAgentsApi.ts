@@ -120,6 +120,19 @@ export async function importCustomAgent(sessionId: string): Promise<CustomAgentD
   ).json();
 }
 
+/** Copy a built-in Agent into the library as an editable `ca_` Agent. */
+export async function duplicateBuiltinAgent(id: string): Promise<CustomAgentDetail> {
+  return (
+    await checked(
+      await authenticatedFetch("/v1/custom-agents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_agent_id: id }),
+      }),
+    )
+  ).json();
+}
+
 export async function updateCustomAgent(
   id: string,
   changes: Pick<CustomAgentDetail, "name" | "description" | "instructions" | "version"> & {

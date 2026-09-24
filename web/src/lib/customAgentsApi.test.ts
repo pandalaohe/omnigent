@@ -7,6 +7,7 @@ vi.mock("./identity", () => ({ authenticatedFetch: mocks.authenticatedFetch }));
 import {
   createCustomAgent,
   deleteCustomAgent,
+  duplicateBuiltinAgent,
   getCustomAgent,
   importCustomAgent,
   listCustomAgents,
@@ -93,6 +94,17 @@ describe("customAgentsApi", () => {
       "/v1/custom-agents/ag_custom%2Fone",
       { method: "DELETE" },
     );
+  });
+
+  it("duplicates a built-in Agent by its source id", async () => {
+    mocks.authenticatedFetch.mockResolvedValue(jsonResponse(detail));
+
+    await expect(duplicateBuiltinAgent("ag_builtin_polly")).resolves.toEqual(detail);
+    expect(mocks.authenticatedFetch).toHaveBeenCalledWith("/v1/custom-agents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_agent_id: "ag_builtin_polly" }),
+    });
   });
 
   it("surfaces server detail errors and falls back to the HTTP status", async () => {

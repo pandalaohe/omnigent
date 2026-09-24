@@ -264,11 +264,34 @@ describe("AgentEditor", () => {
   });
 
   it("requires a model for the lead", async () => {
-    renderEditor(legacyDetail);
+    renderEditor(crewDetail);
     await awaitLoaded();
+    openTrigger(within(leadRow()).getByTestId("agent-member-trigger"));
+    fireEvent.click(screen.getByTestId("agent-member-model"));
+    fireEvent.click(await screen.findByTestId("agent-member-model-default"));
 
     expect(screen.getByText(/Pick a model/)).toBeInTheDocument();
     expect(saveButton()).toBeDisabled();
+  });
+
+  it("saves a name-only edit when the lead loaded without a model", async () => {
+    renderEditor(legacyDetail);
+    await awaitLoaded();
+    fireEvent.change(screen.getByTestId("agent-editor-name"), {
+      target: { value: "release-crew-2" },
+    });
+
+    expect(saveButton()).not.toBeDisabled();
+    fireEvent.click(saveButton());
+
+    await waitFor(() =>
+      expect(mocks.updateCustomAgent).toHaveBeenCalledWith(agent.id, {
+        name: "release-crew-2",
+        description: "Ships releases",
+        instructions: "Ship small changes.",
+        version: 5,
+      }),
+    );
   });
 
   it("shows Unsaved changes only while the form differs", async () => {

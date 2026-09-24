@@ -8,7 +8,7 @@ import {
   readAgentBadgePreferences,
   writeAgentBadgePreferences,
 } from "@/lib/agentBadgePreferences";
-import type { CustomAgent, CustomAgentDetail } from "@/lib/customAgentsApi";
+import type { CustomAgent, CustomAgentDetail, CustomAgentMember } from "@/lib/customAgentsApi";
 import { AgentsSettings } from "./AgentsSettings";
 
 const mocks = vi.hoisted(() => ({
@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   refetch: vi.fn(),
   createCustomAgent: vi.fn(),
   deleteCustomAgent: vi.fn(),
+  duplicateBuiltinAgent: vi.fn(),
   getCustomAgent: vi.fn(),
   importCustomAgent: vi.fn(),
   updateCustomAgent: vi.fn(),
@@ -38,6 +39,7 @@ vi.mock("@/lib/customAgentsApi", () => ({
   }),
   createCustomAgent: mocks.createCustomAgent,
   deleteCustomAgent: mocks.deleteCustomAgent,
+  duplicateBuiltinAgent: mocks.duplicateBuiltinAgent,
   getCustomAgent: mocks.getCustomAgent,
   importCustomAgent: mocks.importCustomAgent,
   updateCustomAgent: mocks.updateCustomAgent,
@@ -90,25 +92,104 @@ const customDetail: CustomAgentDetail = {
   instructions: "Review carefully.",
 };
 
+const importable: AvailableAgent = {
+  id: "ag_session_writer",
+  name: "writer",
+  display_name: "Writer",
+  description: "Writes release notes",
+  harness: "codex",
+  skills: [],
+  sessionId: "session_writer",
+};
+
+const leadMember: CustomAgentMember = {
+  name: "polly",
+  description: "Plans the work",
+  harness: "claude-sdk",
+  model: "opus",
+  reasoning_effort: null,
+  lead: true,
+};
+
+const builtinPolly: AvailableAgent = {
+  id: "ag_builtin_polly",
+  name: "polly",
+  display_name: "Polly",
+  description: "Multi-agent coding",
+  harness: "claude-sdk",
+  skills: [],
+  builtin: true,
+  members: [
+    leadMember,
+    {
+      name: "codex",
+      description: "Writes code",
+      harness: "codex-native",
+      model: null,
+      reasoning_effort: "high",
+      lead: false,
+    },
+    { ...leadMember, name: "reviewer", model: "sonnet", lead: false },
+  ],
+};
+
+const builtinDebby: AvailableAgent = {
+  id: "ag_builtin_debby",
+  name: "debby",
+  display_name: "Debby",
+  description: "Multi-agent debate",
+  harness: "claude-sdk",
+  skills: [],
+  builtin: true,
+  members: [{ ...leadMember, name: "debby" }],
+};
+
+const builtinClaudeNative: AvailableAgent = {
+  id: "ag_builtin_claude_native",
+  name: "claude-native-ui",
+  display_name: "Claude Code",
+  description: "Anthropic's terminal coding agent",
+  harness: "claude-native",
+  skills: [],
+  builtin: true,
+};
+
 function renderSettings() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   });
-  return render(
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const view = render(
     <QueryClientProvider client={client}>
       <AgentsSettings />
     </QueryClientProvider>,
   );
+  return { ...view, invalidate };
 }
 
 beforeEach(() => {
   localStorage.clear();
-  mocks.available = [builtin];
+  mocks.available = [
+    builtin,
+    builtinPolly,
+    builtinDebby,
+    importable,
+    { ...importable, id: "ag_catalog_clone", sessionId: "session_clone", templateId: custom.id },
+    {
+      ...importable,
+      id: "ag_orphaned_clone",
+      display_name: "Orphaned clone",
+      sessionId: "session_orphaned",
+      templateId: "ca_deleted",
+    },
+  ];
   mocks.catalog = [custom];
   mocks.getCustomAgent.mockResolvedValue(customDetail);
   mocks.updateCustomAgent.mockResolvedValue(customDetail);
   mocks.deleteCustomAgent.mockResolvedValue(undefined);
   mocks.createCustomAgent.mockResolvedValue(customDetail);
+  mocks.duplicateBuiltinAgent.mockResolvedValue(customDetail);
+  mocks.importCustomAgent.mockResolvedValue(customDetail);
   mocks.buildAgentBundle.mockResolvedValue(
     new File(["bundle"], "agent.tar.gz", { type: "application/gzip" }),
   );
@@ -224,5 +305,106 @@ describe("AgentsSettings", () => {
     await waitFor(() =>
       expect(screen.queryByTestId("create-agent-dialog")).not.toBeInTheDocument(),
     );
+  });
+
+  it("lists built-in Agents with View and Duplicate actions", () => {
+    renderSettings();
+
+    expect(screen.getByText("Polly")).toBeInTheDocument();
+    expect(screen.getByText("Multi-agent coding · 3 members · read-only")).toBeInTheDocument();
+    expect(screen.getByText("Debby")).toBeInTheDocument();
+    expect(screen.getByText("Multi-agent debate · read-only")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View Polly" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Duplicate Polly" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "View Debby" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Duplicate Debby" })).toBeEnabled();
+  });
+
+  it("keeps harness-backed built-ins out of the Built-in group", () => {
+    mocks.available = [builtinPolly, builtinClaudeNative];
+    renderSettings();
+
+    const builtins = screen.getByRole("heading", { name: "Built-in" }).parentElement;
+    expect(builtins).not.toBeNull();
+    expect(within(builtins!).getByText("Polly")).toBeInTheDocument();
+    expect(within(builtins!).queryByText("Claude Code")).not.toBeInTheDocument();
+  });
+
+  it("shows a built-in's roster, lead first, in a read-only dialog", async () => {
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "View Polly" }));
+    const dialog = await screen.findByRole("dialog");
+
+    expect(within(dialog).getByText("Polly")).toBeInTheDocument();
+    expect(within(dialog).getByText("Built-in · read-only")).toBeInTheDocument();
+    const rows = within(dialog).getAllByTestId("builtin-member-row");
+    expect(rows).toHaveLength(3);
+    expect(within(rows[0]).getByText("polly")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("Lead")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("Claude SDK · opus")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("codex")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("Codex · Default · high")).toBeInTheDocument();
+    expect(within(rows[1]).queryByText("Lead")).not.toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        "Built-in agents can't be changed. Duplicate Polly to get a copy you can edit.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("duplicates a built-in into an editable copy and opens the editor on it", async () => {
+    const copy: CustomAgentDetail = { ...customDetail, id: "ca_polly_copy", name: "Polly" };
+    mocks.duplicateBuiltinAgent.mockResolvedValue(copy);
+    const { invalidate } = renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "View Polly" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Duplicate to edit" }));
+
+    await waitFor(() =>
+      expect(mocks.duplicateBuiltinAgent).toHaveBeenCalledWith("ag_builtin_polly"),
+    );
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["custom-agents"] }));
+    await waitFor(() => expect(mocks.getCustomAgent).toHaveBeenCalledWith("ca_polly_copy"));
+    expect(await screen.findByTestId("agent-editor")).toBeInTheDocument();
+  });
+
+  it("reports a duplicate failure in the error line", async () => {
+    mocks.duplicateBuiltinAgent.mockRejectedValue(new Error("Built-in agents are read-only"));
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate Polly" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Built-in agents are read-only");
+  });
+
+  it("summarises saved Agent rosters with one or many members", () => {
+    mocks.catalog = [
+      {
+        ...custom,
+        id: "ca_solo",
+        name: "Solo",
+        description: "One member",
+        members: [{ ...leadMember, name: "Solo", reasoning_effort: "high" }],
+      },
+      {
+        ...custom,
+        id: "ca_crew",
+        name: "Crew",
+        description: "Three members",
+        members: [
+          { ...leadMember, name: "Crew" },
+          { ...leadMember, name: "architect", lead: false },
+          { ...leadMember, name: "reviewer", harness: "codex-native", model: null, lead: false },
+        ],
+      },
+    ];
+    renderSettings();
+
+    expect(screen.getByText("Claude SDK · opus · high")).toBeInTheDocument();
+    expect(screen.getByText("One member")).toBeInTheDocument();
+    expect(screen.getByText("3 members · Crew (Lead), architect, reviewer")).toBeInTheDocument();
+    expect(screen.getByText("Three members")).toBeInTheDocument();
   });
 });

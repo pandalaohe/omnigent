@@ -4,6 +4,7 @@ import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
+import type { CustomAgentMember } from "@/lib/customAgentsApi";
 import {
   nativeCodingAgentForAvailableAgent,
   nativeCodingAgentForAgentName,
@@ -32,6 +33,11 @@ export interface AvailableAgent {
   // same-named `omnigent run` upload, but lets a newer upload supersede a
   // user-registered template (builtin === false).
   builtin?: boolean;
+  // Roster projected from the catalog bundle: lead first, then each sub-agent.
+  // Only set on catalog rows from GET /v1/agents; omitted on session-derived
+  // agents and on older servers without the field. null means the bundle could
+  // not be loaded, so the roster is unknown rather than empty.
+  members?: CustomAgentMember[] | null;
   // True when the server declares this agent's harness generic-ACP (harness
   // catalog ``integration_mode === "acp-subprocess"``) — a builtin ACP CLI row
   // (devin / grok) or a user-configured ``acp:<slug>`` agent. Stamped on by
@@ -104,6 +110,7 @@ interface BuiltinAgentWire {
   // True only for server-seeded built-ins (deterministic id). Absent on
   // older servers, where every catalog row degrades to a protected entry.
   builtin?: boolean;
+  members?: CustomAgentMember[] | null;
   created_at?: number | null;
 }
 
@@ -145,6 +152,7 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     // sensitive to absent-vs-undefined. Logic that reads builtin treats
     // undefined as "protected" (same as true), so omission is safe.
     ...(a.builtin !== undefined ? { builtin: a.builtin } : {}),
+    ...(a.members !== undefined ? { members: a.members } : {}),
     ...(a.created_at !== undefined ? { created_at: a.created_at } : {}),
   }));
 }

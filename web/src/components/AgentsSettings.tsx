@@ -10,16 +10,22 @@ import {
   writeAgentBadgePreferences,
   type AgentBadgeValue,
 } from "@/lib/agentBadgePreferences";
-import { partitionAgentsByKind, selectableSessionAgents } from "@/lib/agentGrouping";
+import { isAcpHarnessAgent } from "@/lib/agentGrouping";
+import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { buildAgentBundle } from "@/lib/agentBundle";
 import {
   CUSTOM_AGENTS_QUERY_KEY,
   createCustomAgent,
   deleteCustomAgent,
+  duplicateBuiltinAgent,
+  getCustomAgent,
   importCustomAgent,
+  updateCustomAgent,
   useCustomAgents,
   type CustomAgent,
+  type CustomAgentMember,
 } from "@/lib/customAgentsApi";
+import { isNativeCodingAgent, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { AgentBadge } from "./AgentBadge";
 import { AgentBadgeEditor } from "./AgentBadgeEditor";
 import { Button } from "./ui/button";
@@ -48,19 +54,52 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "The Agent could not be saved.";
 }
 
+/** AgentEditor's label resolution: catalog label, then the native registry, then the id. */
+function harnessLabel(labels: Record<string, string>, harness: string): string {
+  return labels[harness] ?? nativeCodingAgentForHarness(harness)?.displayName ?? harness;
+}
+
+function memberSettings(member: CustomAgentMember, labels: Record<string, string>): string {
+  return [harnessLabel(labels, member.harness), member.model ?? "Default", member.reasoning_effort]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/** One-line roster summary for a saved Agent; `members` arrives lead-first. */
+function rosterSummary(members: CustomAgentMember[], labels: Record<string, string>): string {
+  const [lead, ...others] = members;
+  if (others.length === 0) return memberSettings(lead, labels);
+  return `${members.length} members · ${lead.name} (Lead), ${others
+    .map((member) => member.name)
+    .join(", ")}`;
+}
+
+function builtinSubtitle(agent: AvailableAgent): string {
+  const count = agent.members?.length ?? 0;
+  return [agent.description, count > 1 ? `${count} members` : null, "read-only"]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 export function AgentsSettings() {
   const queryClient = useQueryClient();
   const catalog = useCustomAgents();
   const available = useAvailableAgents();
   const preferences = useAgentBadgePreferences();
-  const { builtins } = partitionAgentsByKind(selectableSessionAgents(available.data ?? []));
+  const harnessLabels = useBrainHarnessLabels();
+  // Harness-backed built-ins are flat executor specs, not editable member
+  // Agents — the same Harnesses/Agents split NewChatDialog draws.
+  const builtinAgents = (available.data ?? []).filter(
+    (agent) => agent.builtin === true && !isNativeCodingAgent(agent) && !isAcpHarnessAgent(agent),
+  );
   const [createOpen, setCreateOpen] = useState(false);
   const [newBadge, setNewBadge] = useState<AgentBadgeValue | null>(null);
   const [newBadgeValid, setNewBadgeValid] = useState(true);
-  const [editing, setEditing] = useState<{ id: string; name: string; custom: boolean } | null>(
-    null,
-  );
+  const [editing, setEditing] = useState<CustomAgent | null>(null);
+  const [badgeEditing, setBadgeEditing] = useState<{ id: string; name: string } | null>(null);
+  const [viewing, setViewing] = useState<AvailableAgent | null>(null);
   const [deleting, setDeleting] = useState<CustomAgent | null>(null);
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -92,10 +131,21 @@ export function AgentsSettings() {
     }
   }
 
-  // A saved Agent's row opens the member editor; the catalog row carries the
-  // name/description the editor seeds from.
-  const editingSavedAgent =
-    editing?.custom === true ? catalog.data?.find((row) => row.id === editing.id) : undefined;
+  async function duplicateBuiltin(agent: AvailableAgent) {
+    if (duplicatingId !== null) return;
+    setDuplicatingId(agent.id);
+    setError(null);
+    try {
+      const copy = await duplicateBuiltinAgent(agent.id);
+      await refresh();
+      setViewing(null);
+      setEditing(copy);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setDuplicatingId(null);
+    }
+  }
 
   return (
     <section aria-label="Agents" className="mx-auto w-full max-w-3xl space-y-7">
@@ -115,7 +165,7 @@ export function AgentsSettings() {
         />
       </div>
       <div>
-        <h2 className="mb-2 text-sm text-muted-foreground">Built-in agents</h2>
+        <h2 className="mb-2 text-sm text-muted-foreground">Built-in</h2>
         {available.isLoading && (
           <p role="status" className="text-sm text-muted-foreground">
             Loading agents…
@@ -126,17 +176,41 @@ export function AgentsSettings() {
             {errorText(available.error)}
           </p>
         )}
-        {builtins.map((agent) => (
-          <div key={agent.id} className="flex min-h-12 items-center gap-2.5 border-b py-2">
+        {builtinAgents.map((agent) => (
+          <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
             <AgentBadge agentId={agent.id} />
-            <span className="min-w-0 flex-1 truncate text-sm">{agent.display_name}</span>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm">{agent.display_name}</div>
+              <div className="truncate text-xs text-muted-foreground">{builtinSubtitle(agent)}</div>
+            </div>
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => setEditing({ id: agent.id, name: agent.display_name, custom: false })}
+              onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
               aria-label={`Edit badge for ${agent.display_name}`}
             >
               Edit badge
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={`View ${agent.display_name}`}
+              disabled={duplicatingId !== null}
+              onClick={() => {
+                setError(null);
+                setViewing(agent);
+              }}
+            >
+              View
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={`Duplicate ${agent.display_name}`}
+              disabled={duplicatingId !== null}
+              onClick={() => void duplicateBuiltin(agent)}
+            >
+              Duplicate
             </Button>
           </div>
         ))}
@@ -173,37 +247,58 @@ export function AgentsSettings() {
         {catalog.data?.length === 0 && (
           <p className="py-4 text-sm text-muted-foreground">No custom agents yet.</p>
         )}
-        {catalog.data?.map((agent) => (
-          <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
-            <AgentBadge agentId={agent.id} />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm">{agent.name}</div>
-              {agent.description && (
-                <div className="truncate text-xs text-muted-foreground">{agent.description}</div>
-              )}
+        {catalog.data?.map((agent) => {
+          const members = agent.members;
+          return (
+            <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
+              <AgentBadge agentId={agent.id} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm">{agent.name}</div>
+                {members && members.length > 0 ? (
+                  <>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {rosterSummary(members, harnessLabels)}
+                    </div>
+                    {agent.description && (
+                      <div className="truncate text-xs text-muted-foreground">
+                        {agent.description}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  agent.description && (
+                    <div className="truncate text-xs text-muted-foreground">
+                      {agent.description}
+                    </div>
+                  )
+                )}
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`Edit ${agent.name}`}
+                onClick={() => {
+                  setError(null);
+                  setEditing(agent);
+                }}
+              >
+                Edit
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-destructive"
+                aria-label={`Delete ${agent.name}`}
+                onClick={() => {
+                  setError(null);
+                  setDeleting(agent);
+                }}
+              >
+                Delete
+              </Button>
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-label={`Edit ${agent.name}`}
-              onClick={() => setEditing({ id: agent.id, name: agent.name, custom: true })}
-            >
-              Edit
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-destructive"
-              aria-label={`Delete ${agent.name}`}
-              onClick={() => {
-                setError(null);
-                setDeleting(agent);
-              }}
-            >
-              Delete
-            </Button>
-          </div>
-        ))}
+          );
+        })}
       </div>
       {sessionAgents.length > 0 && !catalog.error && (
         <details className="text-sm">
@@ -226,7 +321,7 @@ export function AgentsSettings() {
           ))}
         </details>
       )}
-      {error && !deleting && (
+      {error && !deleting && !viewing && (
         <p role="alert" className="text-sm text-destructive">
           {error}
         </p>
@@ -248,22 +343,79 @@ export function AgentsSettings() {
           await refresh();
         }}
       />
-      {editing && !editing.custom && (
+      {badgeEditing && (
         <AgentSettingsEditor
+          key={badgeEditing.id}
+          agent={{ ...badgeEditing, custom: false }}
+          onClose={() => setBadgeEditing(null)}
+          onSaved={refresh}
+        />
+      )}
+      {editing && (
+        <SavedAgentEditor
           key={editing.id}
           agent={editing}
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />
       )}
-      {editingSavedAgent && (
-        <SavedAgentEditor
-          key={editingSavedAgent.id}
-          agent={editingSavedAgent}
-          onClose={() => setEditing(null)}
-          onSaved={refresh}
-        />
-      )}
+      <Dialog
+        open={viewing !== null}
+        onOpenChange={(open) => {
+          if (!open && duplicatingId === null) {
+            setViewing(null);
+            setError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{viewing?.display_name}</DialogTitle>
+            <DialogDescription>Built-in · read-only</DialogDescription>
+          </DialogHeader>
+          {viewing?.members == null ? (
+            <p className="py-2 text-sm text-muted-foreground">Members unavailable</p>
+          ) : (
+            <div className="space-y-2">
+              {viewing.members.map((member) => (
+                <div
+                  key={member.name}
+                  data-testid="builtin-member-row"
+                  className="flex items-center gap-2 rounded-md border border-border p-2"
+                >
+                  <span className="min-w-0 flex-1 truncate text-sm">{member.name}</span>
+                  {member.lead && (
+                    <span className="shrink-0 rounded-full border border-border px-1.5 text-xs text-muted-foreground">
+                      Lead
+                    </span>
+                  )}
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {memberSettings(member, harnessLabels)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
+          <DialogFooter className="sm:items-center">
+            <p className="text-xs text-muted-foreground sm:mr-auto">
+              Built-in agents can't be changed. Duplicate {viewing?.display_name} to get a copy you
+              can edit.
+            </p>
+            <Button
+              variant="outline"
+              disabled={duplicatingId !== null}
+              onClick={() => viewing && void duplicateBuiltin(viewing)}
+            >
+              Duplicate to edit
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog
         open={deleting !== null}
         onOpenChange={(open) => {

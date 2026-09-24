@@ -250,7 +250,11 @@ export function AgentEditor({
     return errors;
   }, [members, name, baseline]);
 
-  const leadModelMissing = members.length > 0 && members[0].model === null;
+  /* Only the omnigent executor requires a lead model (`omnigent/spec/omnigent.py`);
+     native-harness bundles load without one, so only a cleared saved model blocks. */
+  const savedLeadModel = baseline[0]?.model ?? null;
+  const leadModelMissing =
+    members.length > 0 && members[0].model === null && savedLeadModel !== null;
   const dirty = useMemo(() => {
     if (!detail.data || !initialized.current) return false;
     return (
