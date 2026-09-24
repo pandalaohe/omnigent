@@ -9898,7 +9898,7 @@ async def _create_session_from_existing_agent(
                     request=request,
                 )
             except Exception:
-                # F-B3: the host already created this worktree; a failure
+                # The host already created this worktree; a failure
                 # resolving its canonical path must not leak it. Same
                 # branch-preservation rule as the create_conversation
                 # rollback below: never -D a pre-existing branch.

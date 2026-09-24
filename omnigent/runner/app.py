@@ -1144,6 +1144,9 @@ class _SessionSnapshot:
     :param created_at: Server creation time (UNIX seconds), or the
         runner's wall clock when the fetch failed / omitted it.
     :param workspace: Server-stored workspace path, or ``None``.
+    :param worktree: Server-stored working tree (git readers), or
+        ``None``. ``None`` means "use the launch directory", so both a
+        legacy row and a failed fetch fall back the same way.
     :param agent_id: Bound agent id, or ``None`` when not yet bound /
         the fetch failed, e.g. ``"ag_abc123"``.
     :param sub_agent_name: For sub-agent sessions, the dispatched
@@ -1172,6 +1175,39 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    worktree: str | None = None
+
+
+async def _read_file_in_root(root: str, relative_path: str) -> str:
+    """Read *relative_path* under *root*, with the environment read's containment.
+
+    A session whose working tree differs from its launch directory records
+    both; its changed-files baseline comes from the working tree, so the
+    file's current content has to come from that same root. A fresh
+    caller-process environment pinned at *root* keeps the containment the
+    normal environment read enforces: ``..`` and absolute paths refused by
+    ``_validate_path``, symlink escapes refused by the helper's
+    ``_assert_within_cwd``.
+
+    :param root: The directory to read under, e.g. a session's worktree.
+    :param relative_path: Path relative to *root*.
+    :returns: Decoded file content.
+    :raises ValueError: If no filesystem can be built at *root*.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+    env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=root, sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    if env is None:
+        raise ValueError(f"cannot read {relative_path!r}: no filesystem at {root!r}")
+    try:
+        content = await CallerProcessFilesystem(env).read(relative_path, limit=None)
+    finally:
+        env.close()
+    return content.data.decode(content.encoding or "utf-8", errors="replace")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3058,9 +3094,9 @@ def create_runner_app(
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
-    # session_id → worktree path, from the session-init snapshot. Legacy
-    # (no-envelope) init leaves a session absent from this map, so git
-    # readers fall back to the workspace/runner_workspace they use today.
+    # session_id → worktree path, from the session-init envelope or the REST
+    # snapshot. Absence leaves git readers on the launch directory they use
+    # today, and a failed snapshot is never memoized here.
     _session_worktree_cache: dict[str, str | None] = {}
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
@@ -3754,6 +3790,7 @@ def create_runner_app(
             status_code: int | None = None
             created_at: float | None = None
             workspace: str | None = None
+            worktree: str | None = None
             agent_id: str | None = None
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
@@ -3769,6 +3806,9 @@ def create_runner_app(
                     if raw_created is not None:
                         created_at = float(raw_created)
                     workspace = body.get("workspace")
+                    raw_worktree = body.get("worktree")
+                    if isinstance(raw_worktree, str) and raw_worktree:
+                        worktree = raw_worktree
                     raw_agent_id = body.get("agent_id")
                     if isinstance(raw_agent_id, str) and raw_agent_id:
                         agent_id = raw_agent_id
@@ -3792,10 +3832,16 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                worktree=worktree,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
                     _session_snapshot_cache[session_id] = snapshot
+                    # A REST-learned row answers for sessions whose runner
+                    # never saw an init envelope (a replacement binds
+                    # without one). An envelope value, written at init,
+                    # stays authoritative when both are present.
+                    _session_worktree_cache.setdefault(session_id, snapshot.worktree)
             return snapshot
 
     async def _session_workspace_value(session_id: str) -> str | None:
@@ -3810,13 +3856,19 @@ def create_runner_app(
                 _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
-    def _session_worktree_value(session_id: str) -> str | None:
+    async def _session_worktree_value(session_id: str) -> str | None:
         """Return the session's recorded worktree, or ``None`` when unset.
 
-        Sourced only from the session-init envelope (the server decides
-        where a worktree lives); a legacy re-init leaves the session out
-        of the map, so callers must fall back to the launch directory.
+        Filled by the session-init envelope at launch, and by the REST
+        snapshot for a session the runner learns about without one — a
+        replacement (Claude ``/clear``, a Codex thread switch) binds a new
+        session and never replays the envelope. ``None`` sends git readers
+        back to the launch directory they use today.
         """
+        if session_id not in _session_worktree_cache:
+            # The snapshot loader records ``worktree`` when it caches a row;
+            # awaiting it here is what lets a REST-learned session answer.
+            await _session_snapshot(session_id)
         return _session_worktree_cache.get(session_id)
 
     async def _fetch_session_model_override(session_id: str) -> str | None:
@@ -3891,6 +3943,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            worktree=snapshot.worktree,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -3959,9 +4012,9 @@ def create_runner_app(
 
         # A git reader roots at the session's worktree when one is recorded,
         # never a project entry's own repository.
-        session_workspace = _session_worktree_value(session_id) or await _session_workspace_value(
+        session_workspace = await _session_worktree_value(
             session_id
-        )
+        ) or await _session_workspace_value(session_id)
         if session_workspace is None:
             return filesystem_registry
 
@@ -5324,6 +5377,7 @@ def create_runner_app(
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
+        _session_worktree_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
@@ -11929,10 +11983,19 @@ def create_runner_app(
 
         after: str | None = None
         if not is_deleted:
-            env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
-            fs = CallerProcessFilesystem(env)
-            content = await fs.read(relative_path, limit=None)
-            after = content.data.decode(content.encoding or "utf-8", errors="replace")
+            # The baseline above comes from the registry, which is rooted at
+            # the session's effective worktree when it has one; read the
+            # current content from that same root, or the two sides of the
+            # diff describe different files. Sessions without a worktree keep
+            # the launch-directory read exactly as before.
+            worktree = await _session_worktree_value(session_id)
+            if worktree is not None:
+                after = await _read_file_in_root(worktree, relative_path)
+            else:
+                env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+                fs = CallerProcessFilesystem(env)
+                content = await fs.read(relative_path, limit=None)
+                after = content.data.decode(content.encoding or "utf-8", errors="replace")
 
         return JSONResponse(
             status_code=200,
@@ -11955,7 +12018,7 @@ def create_runner_app(
         """Resolve the workspace root for GitHub routes, or 404 when headless."""
         agent_spec = await _require_os_env(session_id)
         root = resource_registry.compute_default_env_root(
-            session_id, agent_spec, worktree=_session_worktree_value(session_id)
+            session_id, agent_spec, worktree=await _session_worktree_value(session_id)
         )
         if root is None:
             raise HTTPException(

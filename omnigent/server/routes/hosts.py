@@ -1481,7 +1481,7 @@ def create_hosts_router(
                         raise HTTPException(status_code=409, detail=exc.message) from exc
                     except WorktreeProxyError as exc:
                         raise HTTPException(status_code=400, detail=exc.message) from exc
-                    # F-B3: a failure past this point leaves a worktree the
+                    # A failure past this point leaves a worktree the
                     # host created but no row/bind recorded it yet — roll it
                     # back rather than leaking it.
                     try:

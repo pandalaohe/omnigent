@@ -99,8 +99,8 @@ export interface ProjectHostRoot {
   workspace: string;
   source: "entry" | "binding" | "config";
   /**
-   * Repository a worktree is created from on that host (R-CHECKOUT), or
-   * `null` when none is registered. Absent on servers that predate the field.
+   * Repository a worktree is created from on that host, or `null` when none
+   * is registered. Absent on servers that predate the field.
    */
   checkout?: string | null;
 }

@@ -13,6 +13,7 @@ import {
   updateProjectConfig,
 } from "@/lib/projectsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ApiError } from "@/lib/sessionsApi";
 
 vi.mock("@/lib/projectsApi", () => ({
   createProject: vi.fn(),
@@ -434,7 +435,7 @@ describe("ProjectSettingsDialog", () => {
     hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
     listEntriesMock.mockResolvedValue([entry("h1", "/old"), entry("h2", "/stale")]);
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
-    deleteEntryMock.mockRejectedValue(new Error("Entry not found"));
+    deleteEntryMock.mockRejectedValue(new ApiError("host is unreachable", 502, null));
     renderDialog();
     await waitFor(() =>
       expect(screen.getByTestId("project-settings-entry-h2")).toBeInTheDocument(),
@@ -445,10 +446,56 @@ describe("ProjectSettingsDialog", () => {
 
     await waitFor(() =>
       expect(screen.getByTestId("project-settings-entries-error")).toHaveTextContent(
-        "Entry not found",
+        "host is unreachable",
       ),
     );
     expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("resumes a partial save without repeating a DELETE that already landed", async () => {
+    hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/old"), entry("h2", "/stale")]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    // The DELETE lands; the config PATCH fails. A retry must not repeat the
+    // DELETE (which would now 404) and must still send the PATCH.
+    updateMock.mockRejectedValueOnce(new Error("config unavailable"));
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h2")).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-entry-remove-h2"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    expect(deleteEntryMock).toHaveBeenCalledTimes(1);
+    expect(deleteEntryMock).toHaveBeenCalledWith("p_1", "h2");
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(2));
+    // The successful DELETE is now part of the saved baseline, so the retry
+    // sends only what is still pending.
+    expect(deleteEntryMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a 404 on an entry DELETE as already done", async () => {
+    hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/old"), entry("h2", "/stale")]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    const { onOpenChange } = renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h2")).toBeInTheDocument(),
+    );
+    deleteEntryMock.mockRejectedValue(new ApiError("Entry not found", 404, "NOT_FOUND"));
+
+    fireEvent.click(screen.getByTestId("project-settings-entry-remove-h2"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    // The row is already gone → the save continues to the config PATCH.
+    await waitFor(() => expect(updateMock).toHaveBeenCalled());
+    expect(screen.queryByTestId("project-settings-entries-error")).not.toBeInTheDocument();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("promotes a label-only folder first, then PUTs the entry with the new id (scenario 26)", async () => {

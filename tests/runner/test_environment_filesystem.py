@@ -1826,6 +1826,249 @@ async def test_envelope_worktree_session_uses_worktree_for_changes(
         )
 
 
+def _rest_session_app(
+    *,
+    session_id: str,
+    workspace: Path,
+    worktree: Path | None,
+    registry_workspace: Path,
+) -> tuple[FastAPI, SessionResourceRegistry]:
+    """Build a runner app for a session known only through a REST row.
+
+    A replacement session (Claude ``/clear``, a Codex thread switch) binds a
+    new session without a fresh session-init envelope, so the runner learns
+    its ``workspace`` / ``worktree`` from ``GET /v1/sessions/{id}``.
+
+    :param session_id: Session id the runner serves.
+    :param workspace: The row's launch directory (also the primary env root).
+    :param worktree: The row's recorded worktree, or ``None``.
+    :param registry_workspace: The registry's own runner workspace.
+    :returns: ``(app, registry)`` with the primary env pre-materialized.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry(runner_workspace=registry_workspace)
+    reg._primary_envs[session_id] = os_env
+
+    row: dict[str, object] = {
+        "id": session_id,
+        "agent_id": "agent_1",
+        "status": "idle",
+        "created_at": 1000,
+        "workspace": str(workspace),
+    }
+    if worktree is not None:
+        row["worktree"] = str(worktree)
+    session_response = httpx.Response(200, json=row)
+
+    async def _mock_transport(request: httpx.Request) -> httpx.Response:
+        """Answer the session row; 404 for anything else.
+
+        :param request: The outgoing request.
+        :returns: The mocked response.
+        """
+        if request.url.path == f"/v1/sessions/{session_id}":
+            return session_response
+        return httpx.Response(404)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_mock_transport),
+        base_url="http://fake-server",
+    )
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=registry_workspace,
+        server_client=server_client,
+    )
+    return app, reg
+
+
+def _init_git_repo(path: Path, env: dict[str, str]) -> None:
+    """Create a repository with one empty commit at *path*.
+
+    :param path: Directory to initialize.
+    :param env: Git environment (identity variables set).
+    """
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rest_snapshot_worktree_drives_the_changes_root(tmp_path: Path) -> None:
+    """A REST-learned session's /changes runs in its recorded worktree.
+
+    Sessions whose envelope the runner never saw (replacements) must still
+    read git state from the recorded worktree: the row is the only source
+    of the worktree there, and falling back to the launch directory would
+    show the project entry's clean repository instead of the worktree's
+    changes.
+    """
+    env = _git_env()
+
+    entry = tmp_path / "entry"
+    entry.mkdir()
+    _init_git_repo(entry, env)
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    _init_git_repo(worktree, env)
+    (worktree / "agent_change.py").write_text("# written in the worktree")
+
+    session_id = "conv_rest_worktree_changes"
+    app, _reg = _rest_session_app(
+        session_id=session_id,
+        workspace=entry,
+        worktree=worktree,
+        registry_workspace=entry,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+        )
+    assert resp.status_code == 200, resp.text
+    paths = [e["path"] for e in resp.json()["data"]]
+    assert "agent_change.py" in paths, (
+        f"Expected 'agent_change.py' (from the REST row's worktree) in changes but "
+        f"got {paths}. A session the runner learned over REST fell back to the "
+        "launch directory."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row_worktree, expected_root_name",
+    [(True, "worktree"), (False, "entry")],
+)
+async def test_rest_snapshot_worktree_drives_the_github_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    row_worktree: bool,
+    expected_root_name: str,
+) -> None:
+    """The GitHub reader roots at the worktree, or the launch directory.
+
+    With a worktree recorded on the REST row the GitHub root is the
+    worktree; a row without one keeps today's launch-directory root.
+    """
+    entry = tmp_path / "entry"
+    entry.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    session_id = f"conv_rest_github_{expected_root_name}"
+    app, _reg = _rest_session_app(
+        session_id=session_id,
+        workspace=entry,
+        worktree=worktree if row_worktree else None,
+        registry_workspace=entry,
+    )
+
+    captured: dict[str, str] = {}
+
+    def _fake_github_info(root: str, *, session_id: str, **kwargs: object) -> dict[str, object]:
+        """Capture the root the GitHub reader resolves.
+
+        :param root: The resolved workspace root.
+        :param session_id: Session id (unused).
+        :param kwargs: Remaining GitHub args (unused).
+        :returns: A minimal GitHub info payload.
+        """
+        del session_id, kwargs
+        captured["root"] = root
+        return {"object": "session.resource.github"}
+
+    from omnigent.runner import github_resource
+
+    monkeypatch.setattr(github_resource, "github_info", _fake_github_info)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(f"/v1/sessions/{session_id}/resources/github")
+    assert resp.status_code == 200, resp.text
+    expected = worktree if row_worktree else entry
+    assert captured["root"] == str(expected.resolve()), (
+        f"Expected the GitHub root to be {expected} but got {captured.get('root')!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_rest_snapshot_worktree_drives_the_file_diff(tmp_path: Path) -> None:
+    """A worktree session's diff reads both sides from the worktree.
+
+    The changed-files registry (and its baseline) is rooted at the session's
+    recorded worktree, so the diff's current content must come from that
+    same root. A same-named file in the launch directory must not be used.
+    """
+    env = _git_env()
+
+    entry = tmp_path / "entry"
+    entry.mkdir()
+    _init_git_repo(entry, env)
+    # Same-named, same-status file in the launch directory: if the endpoint
+    # pairs the worktree's baseline with the launch directory's content, the
+    # entry's version comes back instead.
+    (entry / "same_name.py").write_text("# entry baseline")
+    subprocess.run(
+        ["git", "add", "same_name.py"], cwd=entry, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add file"], cwd=entry, check=True, capture_output=True, env=env
+    )
+    (entry / "same_name.py").write_text("# entry current, not the worktree's")
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    _init_git_repo(worktree, env)
+    (worktree / "same_name.py").write_text("# worktree baseline")
+    subprocess.run(
+        ["git", "add", "same_name.py"], cwd=worktree, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add file"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    (worktree / "same_name.py").write_text("# worktree current")
+
+    session_id = "conv_rest_worktree_diff"
+    app, _reg = _rest_session_app(
+        session_id=session_id,
+        workspace=entry,
+        worktree=worktree,
+        registry_workspace=entry,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{DEFAULT_ENVIRONMENT_ID}/diff/same_name.py"
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["before"] == "# worktree baseline", (
+        f"Expected the worktree baseline, got {body['before']!r}."
+    )
+    assert body["after"] == "# worktree current", (
+        f"Expected the worktree's current content, got {body['after']!r}. The diff "
+        "endpoint read 'after' from the launch directory instead of the worktree."
+    )
+
+
 @pytest.mark.asyncio
 async def test_search_scopes_to_a_subdirectory(client: httpx.AsyncClient) -> None:
     """Search covers exactly what the tree is showing. Scoped to a directory it

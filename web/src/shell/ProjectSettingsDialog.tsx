@@ -60,6 +60,7 @@ import {
   type ProjectHostEntry,
 } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
+import { ApiError } from "@/lib/sessionsApi";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 
@@ -189,6 +190,13 @@ export function ProjectSettingsDialog({
   // the same alert as `updateConfig.error`.
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // The entry writes already persisted (host id → path), seeded from the
+  // fetched rows and advanced as each write succeeds. Save derives its PUT /
+  // DELETE plan from this baseline, not from the server rows, so a retry
+  // after a partial failure (a DELETE that landed, a config PATCH that did
+  // not) sends only what is still pending instead of repeating a DELETE that
+  // now 404s.
+  const [savedEntries, setSavedEntries] = useState<ReadonlyMap<string, string>>(() => new Map());
   // Worktree default for the project. The toggle seeds from the project's
   // stored value when set, else from the user-global "always use a worktree"
   // default (Settings › Git). On save it stays "inherit" (stores nothing) while
@@ -288,6 +296,7 @@ export function ProjectSettingsDialog({
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
     setDirectoryRows(seedDirectoryRows(entries, c));
+    setSavedEntries(new Map(entries.map((entry) => [entry.host_id, entry.workspace])));
     setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
@@ -297,20 +306,17 @@ export function ProjectSettingsDialog({
     setSaveError(null);
   }, [open, stored, loadFailed, entriesLoadFailed, entriesLoading, entries]);
 
-  // Entry sync derived from the seeded entries + draft rows: PUTs for rows
-  // whose path changed (or that are new), DELETEs for stored rows the user
-  // removed.
-  const storedByHost = useMemo(
-    () => new Map(entries.map((entry) => [entry.host_id, entry.workspace])),
-    [entries],
-  );
+  // Entry sync derived from the persisted baseline + draft rows: PUTs for
+  // rows whose path changed (or that are new), DELETEs for persisted rows the
+  // user removed. Comparing against `savedEntries` (not the query's rows) is
+  // what lets a retry converge after a partial failure.
   const changedRows = directoryRows.filter((row) => {
     const path = row.path.trim();
-    return path !== "" && storedByHost.get(row.hostId) !== path;
+    return path !== "" && savedEntries.get(row.hostId) !== path;
   });
-  const removedHostIds = entries
-    .filter((entry) => !directoryRows.some((row) => row.hostId === entry.host_id))
-    .map((entry) => entry.host_id);
+  const removedHostIds = [...savedEntries.keys()].filter(
+    (entryHostId) => !directoryRows.some((row) => row.hostId === entryHostId),
+  );
   // The default host's row supplies the config's `workspace` mirror. A missing
   // row, a blank path, or the sandbox default host leaves it unset.
   const defaultRow =
@@ -398,24 +404,36 @@ export function ProjectSettingsDialog({
       // PUT changed rows, DELETE removed rows, sequentially: the first failure
       // stops the sequence, its server message lands on that row, the dialog
       // stays open and no config is written. Sequential by design — the next
-      // write must not start after a failure.
+      // write must not start after a failure. Each success advances the
+      // baseline so a retry only sends what is still pending.
       for (const row of changedRows) {
+        const path = row.path.trim();
         try {
           // eslint-disable-next-line no-await-in-loop
-          await putProjectEntry(id, row.hostId, row.path.trim());
+          await putProjectEntry(id, row.hostId, path);
         } catch (error) {
           setEntriesError({ hostId: row.hostId, message: errorMessage(error) });
           return;
         }
+        setSavedEntries((current) => new Map(current).set(row.hostId, path));
       }
       for (const removedHostId of removedHostIds) {
         try {
           // eslint-disable-next-line no-await-in-loop
           await deleteProjectEntry(id, removedHostId);
         } catch (error) {
-          setEntriesError({ hostId: removedHostId, message: errorMessage(error) });
-          return;
+          // Already gone (a committed earlier attempt, or another tab):
+          // the goal state holds, so the save continues.
+          if (!(error instanceof ApiError && error.status === 404)) {
+            setEntriesError({ hostId: removedHostId, message: errorMessage(error) });
+            return;
+          }
         }
+        setSavedEntries((current) => {
+          const next = new Map(current);
+          next.delete(removedHostId);
+          return next;
+        });
       }
       try {
         await updateConfig.mutateAsync({ id, name: projectName, config });
