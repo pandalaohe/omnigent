@@ -755,12 +755,13 @@ def remove_devin_agent_rule_if_owned(workspace: Path, session_id: str) -> bool:
 def write_agent_instructions_preamble(bridge_dir: Path, instructions: str) -> None:
     """Stage instructions for the first injected message.
 
-    The fallback for workspaces where the rule channel is not session-scoped.
-    Unlike the rule this is not always-on, so it is a weaker delivery — used only
-    when the alternative is leaking instructions into other sessions.
+    Carries the session-scoped text: always the framework instructions, plus
+    the author's text where the rule channel is not session-scoped. Unlike the
+    rule this is not always-on, so it is a weaker delivery — used only when the
+    alternative is leaking instructions into other sessions or other Devin runs.
 
     :param bridge_dir: Per-session bridge directory.
-    :param instructions: Verbatim agent instructions; blank writes nothing.
+    :param instructions: Instructions for the session; blank writes nothing.
     """
     if not instructions.strip():
         return

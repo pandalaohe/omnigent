@@ -8,6 +8,8 @@ faked. No live Codex is needed.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -394,6 +396,98 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
     assert client.calls[0][1]["ephemeral"] is True
     assert client.calls[1][1]["threadId"] == "thread_side"  # first turn on the fork
     assert side_chat.peek_side_chat_requests(tmp_path) == []  # request consumed after forking
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "applied",
+    [None, "Be a concise assistant."],
+    ids=["no-applied-config", "applied-config"],
+)
+async def test_drive_side_chat_requests_keeps_the_sessions_applied_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, applied: str | None
+) -> None:
+    """The fork keeps the session's startup text after the reference boundary.
+
+    ``thread/fork`` replaces the child thread's ``developer_instructions``, so
+    without this a side chat would lose whatever the private config applied at
+    launch. An absent config leaves the boundary instruction alone.
+    """
+    if applied is not None:
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            f"developer_instructions = {json.dumps(applied)}\n", encoding="utf-8"
+        )
+    client = _FakeCodexClient(
+        {
+            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
+            "turn/start": {"result": {"turn": {"id": "turn_1"}}},
+        }
+    )
+    side_chat.request_side_chat(tmp_path, "what does this repo do?")
+
+    async def _stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_sleep", _stop)
+    with pytest.raises(asyncio.CancelledError):
+        await fwd._drive_side_chat_requests(
+            client,  # type: ignore[arg-type]
+            ap_client=AsyncMock(),
+            bridge_dir=tmp_path,
+            target=SimpleNamespace(  # type: ignore[arg-type]
+                thread_id="thread_parent", session_id="conv_parent"
+            ),
+        )
+
+    expected = side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS
+    if applied is not None:
+        expected = f"{expected}\n\n{applied}"
+    assert client.calls[0][1]["developerInstructions"] == expected
+
+
+@pytest.mark.asyncio
+async def test_drive_side_chat_requests_warns_when_the_private_config_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable config must not be silently treated as "no instructions".
+
+    The fork can still only carry the reference boundary, but the dropped
+    startup text has to leave a trace — nothing can recover it after the fork.
+    """
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text("developer_instructions = [\n", encoding="utf-8")
+    client = _FakeCodexClient(
+        {
+            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
+            "turn/start": {"result": {"turn": {"id": "turn_1"}}},
+        }
+    )
+    side_chat.request_side_chat(tmp_path, "what does this repo do?")
+
+    async def _stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_sleep", _stop)
+    with (
+        caplog.at_level(logging.WARNING, logger=fwd.__name__),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await fwd._drive_side_chat_requests(
+            client,  # type: ignore[arg-type]
+            ap_client=AsyncMock(),
+            bridge_dir=tmp_path,
+            target=SimpleNamespace(  # type: ignore[arg-type]
+                thread_id="thread_parent", session_id="conv_parent"
+            ),
+        )
+
+    assert (
+        client.calls[0][1]["developerInstructions"] == side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS
+    )
+    assert str(codex_home / "config.toml") in caplog.text
 
 
 @pytest.mark.asyncio

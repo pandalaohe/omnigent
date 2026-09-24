@@ -16,6 +16,7 @@ from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
     history_to_input_items,
+    native_startup_instructions,
     raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
@@ -391,3 +392,24 @@ def test_raw_author_instructions_verbatim_and_none() -> None:
 
     whitespace_only = cast(AgentSpec, SimpleNamespace(instructions="   \n  "))
     assert raw_author_instructions(whitespace_only) is None
+
+
+def test_native_startup_instructions_author_then_framework() -> None:
+    """A dispatching agent's startup text leads with the author, then the
+    wake-notice and embedded-browser framework instructions."""
+    spec = _spec("Agent prompt", spawn=True)
+
+    assert native_startup_instructions(spec) == (
+        f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+    )
+
+
+def test_native_startup_instructions_none_spec_is_none() -> None:
+    assert native_startup_instructions(None) is None
+
+
+def test_native_startup_instructions_unauthored_keeps_browser_only() -> None:
+    """No author text and no dispatch tools → the browser entry alone, and no
+    wake notice naming a tool this session does not have."""
+    assert native_startup_instructions(_spec(None)) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION

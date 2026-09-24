@@ -3589,35 +3589,36 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
     return yaml_path
 
 
-def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
-    """Resolve raw author instructions from the wrapper's agent spec.
+def _wrapper_spec_startup_instructions(spec_path: Path) -> str | None:
+    """Resolve startup instructions from the wrapper's agent spec.
 
     Reuses :func:`omnigent.spec.load` (the same loader
     :func:`~omnigent.cli._bundle` and the server use for both an agent-image
-    directory and a standalone single-file YAML) so the value matches exactly
-    what ``AgentSpec.instructions`` resolves to — including the
+    directory and a standalone single-file YAML) so the author text matches
+    exactly what ``AgentSpec.instructions`` resolves to — including the
     ``instructions:`` file precedence over ``prompt:`` — rather than
-    re-reading the raw YAML ad hoc.
+    re-reading the raw YAML ad hoc. The spec-level framework instructions are
+    appended after it, matching what the managed-host launch composes.
 
     :param spec_path: The generated/current wrapper agent spec (a
         standalone YAML file or an agent-image directory).
-    :returns: The verbatim instructions text, or ``None`` if unresolvable
-        or absent/whitespace-only. Best-effort: a malformed spec must not
-        block the terminal launch, so load failures degrade to ``None``.
+    :returns: The composed startup text, or ``None`` if unresolvable or
+        empty. Best-effort: a malformed spec must not block the terminal
+        launch, so load failures degrade to ``None``.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import native_startup_instructions
     from omnigent.spec import load as load_agent_spec
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
     except Exception:  # noqa: BLE001
         _logger.warning(
-            "Could not resolve raw instructions from wrapper spec %s",
+            "Could not resolve startup instructions from wrapper spec %s",
             spec_path,
             exc_info=True,
         )
         return None
-    return raw_author_instructions(spec)
+    return native_startup_instructions(spec)
 
 
 def _run_with_local_server(
@@ -3719,7 +3720,7 @@ def _run_with_local_server(
                     claude_config=claude_config,
                     startup_profiler=startup_profiler,
                     startup_progress=progress,
-                    append_system_prompt=_wrapper_spec_raw_instructions(spec_path),
+                    append_system_prompt=_wrapper_spec_startup_instructions(spec_path),
                 )
             )
             _mark_startup_step(
@@ -5041,10 +5042,11 @@ async def _prepare_claude_terminal(
         marks. ``None`` disables output.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
-    :param append_system_prompt: Raw author instructions for
-        ``--append-system-prompt``, applied on fresh launch and cold
-        resume only — the hot-reattach fast path below returns before
-        this is used, so it never relaunches or duplicates the flag.
+    :param append_system_prompt: Startup instructions (author text plus
+        spec-level framework text) for ``--append-system-prompt``, applied on
+        fresh launch and cold resume only — the hot-reattach fast path below
+        returns before this is used, so it never relaunches or duplicates the
+        flag.
     :returns: Prepared terminal details.
     :raises click.ClickException: If any server operation fails.
     """
@@ -6484,9 +6486,8 @@ async def _launch_claude_terminal(
     :param bridge_dir: Bridge directory shared with Claude's MCP
         MCP server and the web-chat harness.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) for this fresh native
-        session.
+    :param append_system_prompt: Optional startup instructions (author text
+        plus spec-level framework text) for this fresh native session.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: Terminal resource id.
@@ -6663,9 +6664,9 @@ def _claude_terminal_request(
     :param ap_auth_headers: Auth headers for the
         ``PermissionRequest`` command hook.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append to Claude
-        Code's system prompt.
+    :param append_system_prompt: Optional startup instructions (author text
+        plus spec-level framework text) to append to Claude Code's system
+        prompt.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: JSON body for ``POST /resources/terminals``.

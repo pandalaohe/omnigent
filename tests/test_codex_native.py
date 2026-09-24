@@ -8458,24 +8458,24 @@ def test_run_with_local_server_records_fresh_session_before_attach(
     assert order == ["prepare", "record:conv_fresh", "attach"]
 
 
-def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:
     """The ``omnigent codex`` wrapper's own materialized spec is resolvable.
 
-    Its ``prompt`` field is real ``AgentSpec.instructions`` content, not
-    framework-composed text, so it must reach ``developer_instructions``
-    like any other codex-native author instructions.
+    Its ``prompt`` field is real ``AgentSpec.instructions`` content, so it must
+    lead ``developer_instructions``, with the spec-level framework text
+    appended after it.
     """
     spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
-    result = codex_native._wrapper_spec_raw_instructions(spec_path)
+    result = codex_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
-    assert "Codex is running in the session terminal" in result
+    assert result.startswith("Codex is running in the session terminal")
 
 
-def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
     bad_spec.write_text("not: [valid, agent, spec")
-    assert codex_native._wrapper_spec_raw_instructions(bad_spec) is None
+    assert codex_native._wrapper_spec_startup_instructions(bad_spec) is None
 
 
 @pytest.mark.asyncio

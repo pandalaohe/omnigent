@@ -219,6 +219,29 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
     return None
 
 
+def native_startup_instructions(spec: AgentSpec | None) -> str | None:
+    """Compose the text a native harness's startup channel carries for ``spec``.
+
+    Author text first, then the spec-level framework instructions. A startup
+    channel is not tied to any one turn, so it may carry only text that holds
+    for the whole session — never per-turn late-bound framework text such as
+    ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION``, which is selected per
+    conversation when a turn's prompt is assembled.
+
+    :param spec: The resolved ``AgentSpec``, or ``None`` when none was
+        available.
+    :returns: The composed text, or ``None`` when there is nothing to send.
+    """
+    if spec is None:
+        return None
+    parts: list[str] = []
+    author_instructions = raw_author_instructions(spec)
+    if author_instructions:
+        parts.append(author_instructions)
+    parts.extend(_framework_instructions_for(spec))
+    return "\n\n".join(parts) if parts else None
+
+
 def _strip_output_annotations(
     content: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
