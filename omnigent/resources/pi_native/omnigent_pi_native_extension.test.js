@@ -426,6 +426,38 @@ async function testExistingTaskToolIsMirroredWithoutConflict() {
   );
 }
 
+// The executor wraps the session's first injected message with the launch-
+// staged instructions (wrap_agent_instructions); the mirrored "input" event
+// must strip that block so the mirrored bubble — and the server's pending-
+// input reconciliation, which matches mirrored text exactly against the
+// queued web message — see only the bare user text.
+async function testInputMirrorStripsAgentInstructionsBlock() {
+  const h = makeHarness({ captureEvents: true });
+  await h.handlers.session_start({}, {});
+
+  await h.handlers.input(
+    {
+      text:
+        "<omnigent_agent_instructions>\n" +
+        "These are your operating instructions for this session; follow them " +
+        "throughout, not just for this message:\n\n" +
+        "be terse\n" +
+        "</omnigent_agent_instructions>\n\n" +
+        "hello there",
+    },
+    {},
+  );
+
+  const event = h.postedEvents.find(
+    (item) => item.type === "external_conversation_item",
+  );
+  assert(
+    "mirrored input drops the wrapped instructions block",
+    !!event && event.data.item_data.content[0].text === "hello there",
+    JSON.stringify(event),
+  );
+}
+
 // The web store only clears its local "streaming" flag when a turn's `idle`
 // status edge carries the same response_id as the `running` edge that opened
 // it. A fresh id per edge left the composer stuck queueing until a tab switch
@@ -534,6 +566,7 @@ async function testToolCallRetryOutlastsTheShortBudget() {
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();
+    await testInputMirrorStripsAgentInstructionsBlock();
     await testToolCallRetryOutlastsTheShortBudget();
     await testIdleInterruptDoesNotPoisonNextTurn();
     await testIdleInterruptFallbackNoIsIdle();

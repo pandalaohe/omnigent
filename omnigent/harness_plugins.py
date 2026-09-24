@@ -399,7 +399,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -415,7 +415,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.PREAMBLE,
         # No shell-tool provocation: cursor-native was intentionally absent from
         # the bench's table (its tool probe is skipped), so leave shell_tool_* None.
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
@@ -433,7 +433,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -463,7 +463,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="developer__shell",
         shell_tool_prompt=_SHELL_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(

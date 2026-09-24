@@ -4719,6 +4719,8 @@ def create_runner_app(
                 "opencode-native",
                 "kimi-native",
                 "devin-native",
+                "kiro-native",
+                "goose-native",
             ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
@@ -11224,7 +11226,7 @@ def create_runner_app(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi", "devin"):
+            elif terminal_name in ("cursor", "kimi", "devin", "kiro", "goose"):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,

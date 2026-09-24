@@ -316,17 +316,23 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
                 "ensure_comment_relay",
                 "project_assignments_enabled",
                 "peer_messaging_enabled",
+                "global_instructions",
             },
         ),
         (
             "cursor-native",
             "_auto_create_cursor_terminal",
-            {"server_client", "ensure_comment_relay", "agent_spec"},
+            {"server_client", "ensure_comment_relay", "agent_spec", "global_instructions"},
         ),
         (
             "kiro-native",
             "_auto_create_kiro_terminal",
-            {"server_client", "ensure_comment_relay"},
+            {"server_client", "ensure_comment_relay", "agent_spec", "global_instructions"},
+        ),
+        (
+            "goose-native",
+            "_auto_create_goose_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec", "global_instructions"},
         ),
         (
             "kimi-native",
@@ -374,6 +380,68 @@ async def test_launch_adapters_forward_expected_kwarg_subset(
 
     assert captured["positional"] == (ctx.session_id, ctx.resource_registry, ctx.publish_event)
     assert captured["kwargs"] == expected_kwargs
+
+
+@pytest.mark.parametrize(
+    ("harness_name", "auto_create_target"),
+    [
+        ("kiro-native", "_auto_create_kiro_terminal"),
+        ("goose-native", "_auto_create_goose_terminal"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_create_session_resolves_agent_spec_for_kiro_and_goose(
+    monkeypatch: pytest.MonkeyPatch,
+    harness_name: str,
+    auto_create_target: str,
+) -> None:
+    """POST /v1/sessions threads the resolved spec to kiro/goose's terminal builder.
+
+    Regression guard: the runner's harness_name -> resolve_agent_spec table only
+    listed cursor/opencode/kimi/devin, so kiro and goose launched with
+    ``agent_spec=None`` even for a spec-bearing session — the author text (and,
+    for kiro, the framework text) never reached the staged startup preamble.
+    """
+    from omnigent.runner.native import orchestration as orch
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_auto_create(
+        session_id: str, registry: Any, publish: Any, **kwargs: Any
+    ) -> object:
+        del session_id, registry, publish
+        captured["agent_spec"] = kwargs.get("agent_spec")
+        return object()
+
+    monkeypatch.setattr(orch, auto_create_target, _fake_auto_create)
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        instructions="Author brief.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": uuid.uuid4().hex, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert resp.status_code == 201, resp.text
+
+    assert captured["agent_spec"] is not None
+    assert captured["agent_spec"].instructions == "Author brief."
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,6 @@ from omnigent.harnesses.devin_native.bridge import (
     build_devin_native_spawn_env,
     build_hook_config,
     canonical_devin_permission_mode,
-    clear_agent_instructions_preamble,
     clear_fork_preamble,
     devin_context_usage,
     devin_input_ready,
@@ -30,15 +29,12 @@ from omnigent.harnesses.devin_native.bridge import (
     inject_slash_command,
     iter_hook_events,
     prepare_bridge_dir,
-    read_agent_instructions_preamble,
     read_devin_workspace_hint,
     read_fork_preamble,
     record_hook_event,
     remove_devin_agent_rule_if_owned,
     session_config_path,
-    wrap_agent_instructions,
     wrap_fork_preamble,
-    write_agent_instructions_preamble,
     write_devin_agent_rule,
     write_devin_mcp_config,
     write_devin_session_config,
@@ -53,6 +49,12 @@ from omnigent.harnesses.devin_native.main import (
     family_effort_variants,
     list_devin_cli_model_options,
     resolve_devin_launch_model,
+)
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
+    write_agent_instructions_preamble,
 )
 
 # A real pane capture from devin 3000.10.21 (200x50), trimmed. The composer sits

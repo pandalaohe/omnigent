@@ -43,8 +43,6 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.devin_native.bridge import (
-    AGENT_INSTRUCTIONS_CLOSE_TAG,
-    AGENT_INSTRUCTIONS_OPEN_TAG,
     DEVIN_POLICY_BLOCKED_KEY,
     FORK_HISTORY_CLOSE_TAG,
     FORK_HISTORY_OPEN_TAG,
@@ -63,6 +61,10 @@ from omnigent.harnesses.devin_native.subagents import (
     transcript_items,
 )
 from omnigent.native._native_post_delivery import post_external_session_status
+from omnigent.native.native_bridge_common import (
+    AGENT_INSTRUCTIONS_CLOSE_TAG,
+    AGENT_INSTRUCTIONS_OPEN_TAG,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)

@@ -34,6 +34,11 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +107,11 @@ class CursorNativeExecutor(Executor):
         preamble = read_fork_preamble(self._bridge_dir)
         if preamble:
             text = wrap_fork_preamble(preamble, text)
+        # Launch-staged instructions frame the whole message, history included;
+        # like the fork preamble they survive a failed injection.
+        instructions = read_agent_instructions_preamble(self._bridge_dir)
+        if instructions:
+            text = wrap_agent_instructions(instructions, text)
         try:
             async with self._inject_lock:
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
@@ -112,6 +122,8 @@ class CursorNativeExecutor(Executor):
         # turns inject the plain user text.
         if preamble:
             clear_fork_preamble(self._bridge_dir)
+        if instructions:
+            clear_agent_instructions_preamble(self._bridge_dir)
         yield TurnComplete(response=None)
 
 

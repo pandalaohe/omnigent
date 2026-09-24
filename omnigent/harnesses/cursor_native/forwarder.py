@@ -53,6 +53,7 @@ from omnigent.harnesses.cursor_native import status as cursor_native_status
 from omnigent.harnesses.cursor_native.bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native._native_post_delivery import post_may_have_been_delivered
+from omnigent.native.native_bridge_common import strip_agent_instructions_block
 
 _logger = logging.getLogger(__name__)
 
@@ -487,6 +488,7 @@ def _unwrap_user_query(text: str) -> str | None:
     if match is None:
         return None
     inner = _FORK_HISTORY_RE.sub("", _strip_control_chars(match.group(1)))
+    inner = strip_agent_instructions_block(inner)
     inner = _ATTACHMENT_MARKER_RE.sub("", inner)
     return inner.strip() or None
 

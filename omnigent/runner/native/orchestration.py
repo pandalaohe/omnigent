@@ -56,6 +56,7 @@ from omnigent.entities.session_resources import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.models.model_override import validate_model_override
+from omnigent.native.native_bridge_common import write_agent_instructions_preamble
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
@@ -2408,6 +2409,7 @@ async def _auto_create_pi_terminal(
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     project_assignments_enabled: bool = False,
     peer_messaging_enabled: bool = False,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -2421,6 +2423,9 @@ async def _auto_create_pi_terminal(
         terminal inherits the agent's ``os_env.sandbox`` rather than falling
         back to the platform default. ``None`` only when the session has no
         spec; callers must not pass ``None`` to paper over a resolution error.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :param project_assignments_enabled: Gates the assignment tools on the
         relay surface, from the session's init snapshot.
     :param peer_messaging_enabled: Registers ``sys_session_send`` in
@@ -2448,6 +2453,13 @@ async def _auto_create_pi_terminal(
     )
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
+    # A relaunched pane is a new Pi process, so it must get a fresh copy of the
+    # instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Drop stale payloads so a relaunched Pi process can't replay them.
     clear_inbox(bridge_dir)
     pi_extension = pi_extension_path(bridge_dir)
@@ -2821,6 +2833,7 @@ async def _auto_create_cursor_terminal(
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Cursor TUI terminal for a cursor-native session.
@@ -2840,6 +2853,9 @@ async def _auto_create_cursor_terminal(
         declares a cursor-agent model (``executor.model``), that model is passed
         to the TUI via ``--model`` unless the user already pinned one through the
         passthrough launch args.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
     from omnigent.harnesses.cursor_native.main import resolve_cursor_executable
@@ -2871,6 +2887,13 @@ async def _auto_create_cursor_terminal(
     from omnigent.harnesses.cursor_native.usage import clear_cursor_usage_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # Staged for the first injected message; the executor clears it only once
+    # that injection lands, so a failed turn retries with it.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
 
     # Shared native-terminal snapshot reader (workspace + terminal_launch_args
     # + model_override), also used by the pi-native launch.
@@ -3115,6 +3138,8 @@ async def _auto_create_goose_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Goose TUI terminal for a goose-native session.
@@ -3130,6 +3155,11 @@ async def _auto_create_goose_terminal(
     :param resource_registry: Session resource registry for launching the terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
     from omnigent.harnesses.goose_native.main import resolve_goose_executable
@@ -3143,6 +3173,13 @@ async def _auto_create_goose_terminal(
     from omnigent.harnesses.goose_native.forwarder import clear_goose_bridge_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # Staged for the first injected message; the executor clears it only once
+    # that injection lands, so a failed turn retries with it.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     clear_goose_bridge_state(bridge_dir)
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
@@ -3538,8 +3575,17 @@ async def _auto_create_kiro_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
-    """Auto-create the Kiro TUI terminal for a kiro-native session."""
+    """Auto-create the Kiro TUI terminal for a kiro-native session.
+
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
+    """
     from omnigent.harnesses.kiro_native.bridge import (
         KIRO_NATIVE_ENV_UNSET,
         build_kiro_native_terminal_env,
@@ -3558,6 +3604,13 @@ async def _auto_create_kiro_terminal(
         raise RuntimeError(f"Kiro workspace does not exist for session {session_id!r}.")
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
+    # Staged for the first injected message; the executor clears it only once
+    # that injection lands, so a failed turn retries with it.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Declare the Omnigent MCP server in the workspace-scoped kiro config so
     # kiro-cli can call Omnigent tools. Only when the tool relay will actually
     # start (server_client + ensure_comment_relay present), else serve-mcp would
@@ -3693,7 +3746,6 @@ async def _auto_create_devin_terminal(
         export_path,
         prepare_bridge_dir,
         session_config_path,
-        write_agent_instructions_preamble,
         write_devin_agent_rule,
         write_devin_mcp_config,
         write_devin_workspace_hint,
@@ -8883,6 +8935,7 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         ensure_comment_relay=ctx.ensure_comment_relay,
         project_assignments_enabled=ctx.project_assignments_enabled,
         peer_messaging_enabled=ctx.peer_messaging_enabled,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8895,6 +8948,7 @@ async def _launch_cursor(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
         agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8906,6 +8960,8 @@ async def _launch_kiro(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8942,6 +8998,8 @@ async def _launch_goose(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 

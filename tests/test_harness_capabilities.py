@@ -365,8 +365,3 @@ def test_hermes_and_hermes_native_deliver_differently() -> None:
     caps = harness_capabilities()
     assert caps["hermes"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
     assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
-
-
-def test_kiro_native_is_not_delivered() -> None:
-    caps = harness_capabilities()
-    assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
