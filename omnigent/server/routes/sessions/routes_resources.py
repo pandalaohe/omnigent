@@ -1510,6 +1510,16 @@ def register_resources_routes(
                 conv.host_id,
                 conv.workspace,
                 conv.git_branch,
+                # R-INHERIT: the replacement keeps the old row's working tree.
+                worktree=conv.worktree,
+            )
+        elif conv.worktree is not None:
+            # A host-less child row (no bind to carry) still keeps the
+            # worktree, so a later bind launches in the same working tree.
+            await asyncio.to_thread(
+                conversation_store.set_worktree,
+                target_session_id,
+                conv.worktree,
             )
 
         _publish_and_persist_resource_event(

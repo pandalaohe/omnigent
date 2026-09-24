@@ -87,12 +87,21 @@ async def _register_fake_host(
 _WORKTREE_PATH = "/Users/alice/myrepo-worktrees/feature-login"
 
 
-def _make_worktree_conversation(db_uri: str, workspace: str = _WORKTREE_PATH) -> str:
+def _make_worktree_conversation(
+    db_uri: str,
+    workspace: str = _WORKTREE_PATH,
+    *,
+    worktree: str | None = None,
+    git_branch: str = "feature/login",
+) -> str:
     """Create a session row that looks like a server-created worktree.
 
     :param db_uri: DB URI for the conversation store.
-    :param workspace: Worktree path to record; defaults to the shared
+    :param workspace: Launch directory to record; defaults to the shared
         fixture path so two calls produce two sessions in one directory.
+    :param worktree: Recorded working tree, or ``None`` for a legacy row
+        whose launch directory is its working tree.
+    :param git_branch: Branch recorded on the row.
     :returns: The new conversation id.
     """
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -100,9 +109,21 @@ def _make_worktree_conversation(db_uri: str, workspace: str = _WORKTREE_PATH) ->
         agent_id=None,
         host_id=_HOST_ID,
         workspace=workspace,
-        git_branch="feature/login",
+        worktree=worktree,
+        git_branch=git_branch,
     )
     return conv.id
+
+
+class _Entries:
+    """Minimal entry guard for the delete route's ``entry_exists_at``."""
+
+    def __init__(self, entries: set[tuple[str, str]]) -> None:
+        self._entries = entries
+
+    def entry_exists_at(self, host_id: str, workspace: str) -> bool:
+        """Return whether any project has an entry at ``(host_id, workspace)``."""
+        return (host_id, workspace) in self._entries
 
 
 async def test_delete_with_flag_sends_remove_worktree(
@@ -403,6 +424,16 @@ def test_set_host_id_worktree_and_clear_host_binding(db_uri: str) -> None:
     ) == (None, None, None, None, None)
 
 
+def test_set_worktree_sets_and_clears_a_hostless_row(db_uri: str) -> None:
+    """``set_worktree`` is the host-less placement write: explicit ``None`` clears."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation(agent_id=None)
+    assert conv_store.set_worktree(conv.id, "/entry/nested/wt").worktree == "/entry/nested/wt"
+    assert conv_store.get_conversation(conv.id).worktree == "/entry/nested/wt"
+    assert conv_store.set_worktree(conv.id, None).worktree is None
+    assert conv_store.get_conversation(conv.id).worktree is None
+
+
 def test_has_other_live_session_matches_effective_worktree(db_uri: str) -> None:
     """The sharing check compares ``worktree ?? workspace``, never the entry."""
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -658,3 +689,97 @@ async def test_delete_with_flag_still_succeeds_on_host_git_failure(
     assert resp.status_code == 200, resp.text
     get_resp = await client.get(f"/v1/sessions/{conv_id}")
     assert get_resp.status_code == 404
+
+
+# ── R-CLEAN: the effective worktree, never an entry ─────────────────────
+
+
+async def test_delete_removes_the_recorded_worktree_not_the_entry(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Scenario 8: an entry-started session's delete removes its worktree only."""
+    captured = await _register_fake_host(app, db_uri)
+    worktree = "/Users/alice/entry/nested/wt"
+    conv_id = _make_worktree_conversation(
+        db_uri, workspace="/Users/alice/entry", worktree=worktree, git_branch="feature/login"
+    )
+
+    resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    assert resp.status_code == 200, resp.text
+
+    assert len(captured) == 1, "the session's worktree must be removed"
+    assert captured[0].worktree_path == worktree, (
+        "the cleanup must remove the effective worktree, never the entry"
+    )
+    assert captured[0].branch == "feature/login"
+    assert captured[0].delete_branch is True
+
+
+async def test_delete_removes_a_legacy_rows_launch_directory(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Scenario 9: with no recorded worktree a legacy row keeps cleaning up its workspace."""
+    captured = await _register_fake_host(app, db_uri)
+    conv_id = _make_worktree_conversation(db_uri, workspace=_WORKTREE_PATH, worktree=None)
+
+    resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    assert resp.status_code == 200, resp.text
+    assert len(captured) == 1
+    assert captured[0].worktree_path == _WORKTREE_PATH
+
+
+async def test_delete_of_an_entry_session_is_not_blocked_by_a_sibling_at_the_entry(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Scenario 18: sessions at the entry with distinct worktrees are not sharers."""
+    captured = await _register_fake_host(app, db_uri)
+    app.state.project_host_binding_store = _Entries({(_HOST_ID, "/Users/alice/entry")})
+    first = _make_worktree_conversation(
+        db_uri,
+        workspace="/Users/alice/entry",
+        worktree="/Users/alice/entry/wt-a",
+        git_branch="feature/a",
+    )
+    _make_worktree_conversation(
+        db_uri,
+        workspace="/Users/alice/entry",
+        worktree="/Users/alice/entry/wt-b",
+        git_branch="feature/b",
+    )
+
+    resp = await client.delete(f"/v1/sessions/{first}?delete_branch=true")
+    assert resp.status_code == 200, resp.text
+
+    assert len(captured) == 1, "a co-located entry session must not count as sharing this worktree"
+    assert captured[0].worktree_path == "/Users/alice/entry/wt-a"
+
+
+async def test_delete_never_removes_a_project_entry(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Scenario 19: a session bound to some project's entry is never cleaned up."""
+    captured = await _register_fake_host(app, db_uri)
+    entry = "/Users/alice/entry-repo"
+    # A No Project session bound (existing_worktree) to project A's entry: the
+    # row's launch directory is the entry and carries a branch, exactly the
+    # shape the cleanup gate used to remove.
+    app.state.project_host_binding_store = _Entries({(_HOST_ID, entry)})
+    conv_id = _make_worktree_conversation(db_uri, workspace=entry, worktree=None)
+
+    with caplog.at_level("WARNING", logger="omnigent.server.routes._sessions.helpers"):
+        resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+
+    assert resp.status_code == 200, resp.text
+    assert captured == [], "an entry on that host must never be removed"
+    assert any("project entry" in record.message for record in caplog.records), (
+        "the skipped removal must be logged"
+    )

@@ -17,7 +17,7 @@ import secrets
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -147,6 +147,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.project_placement import _same_canonical_path
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -236,6 +237,7 @@ from omnigent.server.routes._sessions.helpers import (
     _await_settled_managed_launch,
     _build_new_item,
     _build_policy_engine_from_spec,
+    _canonical_worktree_path,
     _child_session_summary_from_conversation,
     _codex_subagent_labels_from_body,
     _coerce_cumulative_field,
@@ -293,6 +295,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_native_policy_notice,
     _persist_session_status_error_labels,
     _persist_stored_session_bundle,
+    _place_project_session,
     _policy_notice_from_ensure_response,
     _poll_request_disconnect,
     _priced_cost_for_display,
@@ -1322,6 +1325,7 @@ def _build_session_list_item(
             else pending_count
         ),
         workspace=conv.workspace,
+        worktree=conv.worktree,
         git_branch=conv.git_branch,
         archived=conv.archived,
         comments_count=comments_fingerprint.count if comments_fingerprint else 0,
@@ -1628,6 +1632,7 @@ def _build_session_response(
         # (their message is already persisted into ``items``).
         pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
+        worktree=conv.worktree,
         git_branch=conv.git_branch,
         archived=conv.archived,
         # Replay the last native Plan after a Server restart.
@@ -9797,6 +9802,7 @@ async def _create_session_from_existing_agent(
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
     child_project_id: str | None = None
+    parent_conv: Conversation | None = None
     if body.parent_session_id is not None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
@@ -9865,15 +9871,70 @@ async def _create_session_from_existing_agent(
                 raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
             git_branch = body.git.branch_name
         else:
+            # R-PLACE step 1: a worktree made from the entry is sourced from
+            # the project's checkout, not the entry itself (R-CHECKOUT).
+            source_repo = canonical_workspace
+            if (
+                project_resolution.entry is not None
+                and project_resolution.checkout is not None
+                and canonical_workspace is not None
+                and _same_canonical_path(canonical_workspace, project_resolution.entry)
+            ):
+                source_repo = project_resolution.checkout
             created_worktree = await _create_session_worktree(
                 host_id=body.host_id,
-                source_repo=canonical_workspace,
+                source_repo=source_repo,
                 git=body.git,
                 request=request,
             )
-            canonical_workspace = created_worktree.worktree_path
-            git_branch = created_worktree.branch
+            # The host's path is canonicalised before any comparison or
+            # persistence; rollback keeps the raw path it returned.
             created_worktree_path = created_worktree.worktree_path
+            canonical_workspace = await _canonical_worktree_path(
+                host_id=body.host_id,
+                worktree_path=created_worktree_path,
+                request=request,
+            )
+            git_branch = created_worktree.branch
+
+    # R-PLACE / R-INHERIT: the launch directory and recorded worktree. A
+    # child created without an explicit workspace keeps its directory and
+    # takes the parent's worktree; everything else is placed by R-PLACE
+    # (the entry when the target sits strictly inside it and passes the
+    # agent's boundary, the target otherwise).
+    inherit_parent: Conversation | None = None
+    if (
+        body.parent_session_id is not None
+        and "workspace" not in request_fields_set
+        and parent_conv is not None
+    ):
+        inherit_parent = parent_conv
+    entry_boundary: Callable[[], Awaitable[object]] | None = None
+    if project_resolution.entry is not None:
+        _entry_path = project_resolution.entry
+
+        async def _check_entry_boundary() -> object:
+            assert body.host_id is not None
+            return await _validate_session_workspace(
+                user_id=user_id,
+                host_id=body.host_id,
+                workspace=_entry_path,
+                agent=agent,
+                agent_cache=agent_cache,
+                request=request,
+            )
+
+        entry_boundary = _check_entry_boundary
+
+    workspace, worktree = await _place_project_session(
+        host_id=body.host_id,
+        project_id=project_resolution.project_id,
+        entry=project_resolution.entry,
+        target=canonical_workspace,
+        git_used=body.git is not None,
+        entry_boundary=entry_boundary,
+        parent=inherit_parent,
+    )
 
     # Native-terminal pass-through args.
     #
@@ -9981,7 +10042,8 @@ async def _create_session_from_existing_agent(
             kind="sub_agent" if body.parent_session_id else "default",
             sub_agent_name=body.sub_agent_name,
             host_id=body.host_id,
-            workspace=canonical_workspace,
+            workspace=workspace,
+            worktree=worktree,
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
             project_id=project_resolution.project_id or child_project_id,
@@ -10316,6 +10378,7 @@ def _create_session_from_bundle(
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
     created_by: str | None = None,
+    worktree: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -10348,6 +10411,9 @@ def _create_session_from_bundle(
     :param created_by: Identity of the creating user, recorded on the
         new session-scoped agent so its code can only be mutated by the
         owner. ``None`` in single-user mode.
+    :param worktree: Optional working tree recorded by R-PLACE, e.g. a
+        worktree placed inside the project entry. ``None`` for sessions
+        whose launch directory is their working tree.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -10428,6 +10494,7 @@ def _create_session_from_bundle(
         inference_snapshot=inference_snapshot,
         inference_model=inference_model,
         created_by=created_by,
+        worktree=worktree,
     )
 
 

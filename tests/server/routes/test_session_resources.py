@@ -197,6 +197,7 @@ class _ConversationStore:
         host_id: str,
         workspace: str | None = None,
         git_branch: str | None = None,
+        worktree: str | None = None,
     ) -> Conversation:
         """Set a conversation's host placement fields."""
         conv = self._conversations[conversation_id]
@@ -205,6 +206,14 @@ class _ConversationStore:
             conv.workspace = workspace
         if git_branch is not None:
             conv.git_branch = git_branch
+        if worktree is not None:
+            conv.worktree = worktree
+        return conv
+
+    def set_worktree(self, conversation_id: str, worktree: str | None) -> Conversation:
+        """Set (or clear) a conversation's recorded working tree."""
+        conv = self._conversations[conversation_id]
+        conv.worktree = worktree
         return conv
 
     def append(
@@ -1758,6 +1767,7 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     assert source is not None
     source.host_id = "host_arca"
     source.workspace = "/home/alice/workspace"
+    source.worktree = "/home/alice/workspace/entry/wt"
     source.git_branch = "feature/clear"
     terminal_resource = {
         "id": "terminal_bash_s1",
@@ -1800,7 +1810,41 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     assert target is not None
     assert target.host_id == "host_arca"
     assert target.workspace == "/home/alice/workspace"
+    assert target.worktree == "/home/alice/workspace/entry/wt"
     assert target.git_branch == "feature/clear"
+
+
+@pytest.mark.asyncio
+async def test_transfer_terminal_copies_worktree_onto_a_hostless_row(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A replacement with no host bind still keeps the old row's worktree.
+
+    Claude ``/clear`` and Codex thread switches create the replacement
+    unbound and transfer the terminal afterwards; the worktree must ride
+    along even though ``host_id`` is ``None``, so the next bind launches
+    in the same tree.
+    """
+    conversation_store: _ConversationStore = app.state.test_conversation_store
+    source = conversation_store.get_conversation("79b22ebd2309e48fdeb450c65611d51b")
+    assert source is not None
+    source.worktree = "/entry/nested/wt"
+    fake_runner = _FakeRunnerClient(
+        payload={"id": "terminal_bash_s1", "object": "session.resource"}
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1/transfer",
+        json={"target_session_id": "5d29bee4350489d66feafecfebd94a97"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    target = conversation_store.get_conversation("5d29bee4350489d66feafecfebd94a97")
+    assert target is not None
+    assert target.host_id is None
+    assert target.worktree == "/entry/nested/wt"
 
 
 @pytest.mark.asyncio

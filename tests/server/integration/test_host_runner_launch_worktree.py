@@ -29,6 +29,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
@@ -50,12 +51,67 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "51dc949aba31e24ca8f047d6fba31a0d"
 _SOURCE_REPO = "/Users/alice/myrepo"
+_ENTRY = "/Users/alice/entry"
+_CHECKOUT = "/Users/alice/entry/fork/omnigent"
+_PROJECT_ID = "f0e1d2c3b4a5968778695a4b3c2d1e0f"
+
+
+class _ProjectDirs:
+    """In-memory project entries and bindings for ``launch_runner`` tests."""
+
+    def __init__(
+        self,
+        *,
+        entries: list[tuple[str, str]] = (),
+        bindings: list[tuple[str, str]] = (),
+    ) -> None:
+        self._entries = list(entries)
+        self._bindings = list(bindings)
+
+    def list_entries(self, project_id: str) -> list[ProjectHostEntry]:
+        """Return the project's ``(host_id, workspace)`` entries."""
+        return [
+            ProjectHostEntry(project_id, host_id, workspace, 1)
+            for host_id, workspace in self._entries
+        ]
+
+    def list_by_project(self, project_id: str) -> list[ProjectHostBinding]:
+        """Return the project's primary bindings."""
+        return [
+            ProjectHostBinding(
+                f"{project_id}-{host_id}",
+                project_id,
+                host_id,
+                "primary",
+                "repo",
+                workspace,
+                1,
+                1,
+                is_primary=True,
+            )
+            for host_id, workspace in self._bindings
+        ]
+
+
+async def _project_session(client: httpx.AsyncClient, db_uri: str) -> str:
+    """Create an unbound session filed under a project (no host, no workspace).
+
+    :param client: The test HTTP client.
+    :param db_uri: DB URI for the conversation store.
+    :returns: The new session id.
+    """
+    agent = await create_test_agent(client, name="entry-launch-agent")
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=agent["id"], project_id=_PROJECT_ID
+    )
+    return conv.id
 
 
 @pytest.fixture()
@@ -84,6 +140,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
     )
 
 
@@ -268,18 +325,21 @@ async def _launch(
     client: httpx.AsyncClient,
     session_id: str,
     *,
+    workspace: str = _SOURCE_REPO,
     git: dict[str, object] | None = None,
 ) -> httpx.Response:
     """POST the dedicated per-session bind+launch endpoint.
 
     :param client: The test HTTP client.
     :param session_id: Existing session to bind.
+    :param workspace: Directory to bind (the worktree for a Fork reuse),
+        e.g. ``"/Users/alice/myrepo"``.
     :param git: Optional ``git`` block. Create mode, e.g.
         ``{"branch_name": "feature/x"}``; bind mode, e.g.
         ``{"branch_name": "feature/x", "existing_worktree": True}``.
     :returns: The raw HTTP response.
     """
-    body: dict[str, object] = {"session_id": session_id, "workspace": _SOURCE_REPO}
+    body: dict[str, object] = {"session_id": session_id, "workspace": workspace}
     if git is not None:
         body["git"] = git
     return await client.post(f"/v1/hosts/{_HOST_ID}/runners", json=body)
@@ -586,3 +646,85 @@ async def test_launch_runner_rollback_preserves_existing_branch(
     assert conv is not None
     assert conv.runner_id is None
     assert conv.git_branch is None
+
+
+# ── R-PLACE at launch_runner ─────────────────────────────────────────────
+
+
+async def test_launch_runner_reuse_binds_at_entry_and_records_worktree(
+    app: FastAPI,
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Scenario 20: a no-git Fork reuse of a nested worktree launches at the entry.
+
+    The user picked the existing worktree ``T`` (the Fork dialog pre-fills
+    the source's effective worktree), so nothing is created; the session
+    nevertheless launches at the project entry and records ``T``.
+    """
+    cap = register_host()
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    session_id = await _project_session(client, db_uri)
+
+    response = await _launch(client, session_id, workspace=f"{_ENTRY}/nested", git=None)
+
+    assert response.status_code == 200, response.text
+    assert cap.create == [], "a Fork reuse must not create a worktree"
+    assert len(cap.launch) == 1
+    assert cap.launch[0].workspace == _ENTRY
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == _ENTRY
+    assert conv.worktree == f"{_ENTRY}/nested"
+    assert conv.host_id == _HOST_ID
+
+
+async def test_launch_runner_git_create_at_entry_sources_the_checkout(
+    app: FastAPI,
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A branch created with the entry picked sources the checkout, then places at the entry."""
+    cap = register_host()
+    app.state.project_host_binding_store = _ProjectDirs(
+        entries=[(_HOST_ID, _ENTRY)], bindings=[(_HOST_ID, _CHECKOUT)]
+    )
+    session_id = await _project_session(client, db_uri)
+
+    response = await _launch(
+        client, session_id, workspace=_ENTRY, git={"branch_name": "feature/x"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(cap.create) == 1
+    assert cap.create[0].repo_path == _CHECKOUT, "the worktree must come from the checkout"
+    created = f"{_CHECKOUT}-worktrees/feature-x"
+    assert cap.launch[0].workspace == _ENTRY
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == _ENTRY
+    assert conv.worktree == created
+    assert conv.git_branch == "feature/x"
+
+
+async def test_launch_runner_project_without_entry_on_host_is_unchanged(
+    app: FastAPI,
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A project with no entry on this host binds the picked directory, as today."""
+    cap = register_host()
+    app.state.project_host_binding_store = _ProjectDirs(entries=[("b" * 32, _ENTRY)])
+    session_id = await _project_session(client, db_uri)
+
+    response = await _launch(client, session_id, git=None)
+
+    assert response.status_code == 200, response.text
+    assert cap.launch[0].workspace == _SOURCE_REPO
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == _SOURCE_REPO
+    assert conv.worktree is None

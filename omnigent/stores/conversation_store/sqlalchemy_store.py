@@ -397,6 +397,7 @@ def _new_session_metadata_row(
     parent_conversation_id: str | None = None,
     runner_id: str | None = None,
     workspace: str | None = None,
+    worktree: str | None = None,
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
     host_id: str | None = None,
@@ -411,6 +412,8 @@ def _new_session_metadata_row(
     :param runner_id: Optional runner binding inherited from the
         parent session. ``None`` leaves the column NULL.
     :param workspace: Optional starting cwd. ``None`` leaves it NULL.
+    :param worktree: Optional working tree when it differs from
+        ``workspace``. ``None`` leaves it NULL.
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper. ``None`` leaves it NULL; a list
         (including ``[]``) is JSON-encoded.
@@ -429,6 +432,7 @@ def _new_session_metadata_row(
         host_id=host_id,
         inference_snapshot=inference_snapshot,
         workspace=workspace,
+        worktree=worktree,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         ),
@@ -5257,6 +5261,47 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
+    def set_worktree(
+        self,
+        conversation_id: str,
+        worktree: str | None,
+    ) -> Conversation:
+        """
+        Set (or clear) a session's recorded working tree.
+
+        See :meth:`ConversationStore.set_worktree`. Unlike
+        :meth:`set_host_id`, a caller here has no host bind to carry: a
+        terminal transfer copies the worktree onto an unbound
+        replacement row. ``None`` clears the column, so callers that
+        mean "leave it" must not call this method.
+
+        :param conversation_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param worktree: Working tree path, or ``None`` to clear it.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If no conversation row
+            exists for ``conversation_id``.
+        """
+
+        def write(session: Session) -> SqlConversationMetadata:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            meta.worktree = worktree
+            return meta
+
+        meta = run_write_transaction(self._session_immediate, "set_worktree", write)
+        with self._conv_session("set_worktree") as ap_sess:
+            ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
+
     def set_external_session_id(
         self,
         conversation_id: str,
@@ -5342,6 +5387,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         reasoning_effort: str | None = None,
         model_override: str | None = None,
         workspace: str | None = None,
+        worktree: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -5380,6 +5426,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` — but only when ``host_id`` is also unset (the
             ``ck_conversations_workspace_required_for_host``
             constraint requires the pair).
+        :param worktree: Optional working tree when it differs from
+            ``workspace``, e.g. a worktree placed inside the project
+            entry. ``None`` leaves the column NULL.
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -5417,6 +5466,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             reasoning_effort=reasoning_effort,
             model_override=model_override,
             workspace=workspace,
+            worktree=worktree,
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
@@ -5439,6 +5489,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         reasoning_effort: str | None = None,
         model_override: str | None = None,
         workspace: str | None = None,
+        worktree: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -5521,6 +5572,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 runner_id=runner_id,
                 project_id=project_id,
                 workspace=workspace,
+                worktree=worktree,
                 terminal_launch_args=terminal_launch_args,
                 host_id=host_id,
                 inference_snapshot=encoded_inference_snapshot,

@@ -212,6 +212,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
+    cleanup_worktree,
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
 )
@@ -3224,25 +3225,31 @@ def register_events_routes(
         # unreachable host fails the delete (409) with the session
         # retained, so nothing irrecoverable may be destroyed first.
         # Git errors on a reachable host stay best-effort.
-        if (
-            delete_branch
-            and conv.git_branch is not None
-            and conv.workspace is not None
-            and conv.host_id is not None
-        ):
-            await delete_lease.run(
-                _remove_session_worktree_best_effort(
-                    host_id=conv.host_id,
-                    worktree_path=conv.workspace,
-                    branch=conv.git_branch,
-                    delete_branch=True,
-                    request=request,
-                    reason="session-delete",
-                    conversation_store=conversation_store,
-                    exclude_conversation_id=conv.id,
-                    fail_if_unavailable=True,
+        if delete_branch:
+            binding_store = getattr(request.app.state, "project_host_binding_store", None)
+
+            def is_entry(host_id: str, path: str) -> bool:
+                """Whether ``(host_id, path)`` is any project's entry on that host."""
+                if binding_store is None:
+                    return False
+                return binding_store.entry_exists_at(host_id, path)
+
+            worktree_target = cleanup_worktree(conv, is_entry=is_entry)
+            if worktree_target is not None:
+                # cleanup_worktree returns a path only with a host and a branch.
+                await delete_lease.run(
+                    _remove_session_worktree_best_effort(
+                        host_id=cast(str, conv.host_id),
+                        worktree_path=worktree_target,
+                        branch=cast(str, conv.git_branch),
+                        delete_branch=True,
+                        request=request,
+                        reason="session-delete",
+                        conversation_store=conversation_store,
+                        exclude_conversation_id=conv.id,
+                        fail_if_unavailable=True,
+                    )
                 )
-            )
         # Session file cleanup. delete_all_for_session returns only the blob
         # keys that became orphaned — a blob still shared by a fork in another
         # session is not returned, so the fork's attachment survives.

@@ -7,7 +7,7 @@ import contextlib
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -141,6 +141,7 @@ from omnigent.server.routes._sessions.helpers import (
     _parse_session_create_metadata,
     _permission_level_from_grants,
     _pin_claude_permission_launch_args,
+    _place_project_session,
     _presentation_labels_for_agent,
     _prune_session_read_state,
     _publish_codex_approval_mode,
@@ -890,6 +891,7 @@ def register_core_routes(
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
+        parent_conv: Conversation | None = None
         if parsed_metadata.parent_session_id is not None:
             inherited_runner_id = await _authorize_bundled_parent_and_inherit_runner(
                 parsed_metadata.parent_session_id,
@@ -898,10 +900,10 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
+            parent_conv = await asyncio.to_thread(
+                conversation_store.get_conversation, parsed_metadata.parent_session_id
+            )
             if "project_id" not in request_fields_set and project_store is not None:
-                parent_conv = conversation_store.get_conversation(
-                    parsed_metadata.parent_session_id
-                )
                 parent_project_id = parent_conv.project_id if parent_conv is not None else None
                 if (
                     parent_project_id is not None
@@ -929,21 +931,68 @@ def register_core_routes(
         # the uploaded spec's os_env boundary BEFORE creating the row
         # (mirroring the JSON path — a bad workspace never produces a
         # session) and persist the canonical path the host returned.
+        os_env = getattr(spec, "os_env", None)
+        spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
         if parsed_metadata.host_id is not None:
             from omnigent.server.routes._session_create_validation import (
                 validate_uploaded_bundle_host_workspace,
             )
 
-            os_env = getattr(spec, "os_env", None)
             canonical_workspace = await validate_uploaded_bundle_host_workspace(
                 user_id=user_id,
                 host_id=parsed_metadata.host_id,
                 workspace=parsed_metadata.workspace,
-                spec_cwd=getattr(os_env, "cwd", None) if os_env is not None else None,
+                spec_cwd=spec_cwd,
                 host_store=getattr(request.app.state, "host_store", None),
                 host_registry=getattr(request.app.state, "host_registry", None),
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
+
+        # R-PLACE / R-INHERIT, shared with the JSON create: a child created
+        # without an explicit workspace keeps its directory and takes the
+        # parent's worktree; everything else launches at the project entry
+        # when the target sits strictly inside it and the entry passes the
+        # same spec boundary the target passed.
+        inherit_parent: Conversation | None = None
+        if (
+            parsed_metadata.parent_session_id is not None
+            and "workspace" not in request_fields_set
+            and parent_conv is not None
+        ):
+            inherit_parent = parent_conv
+        entry_boundary: Callable[[], Awaitable[object]] | None = None
+        if project_resolution.entry is not None:
+            _entry_path = project_resolution.entry
+            _entry_host_id = parsed_metadata.host_id
+
+            async def _check_entry_boundary() -> object:
+                from omnigent.server.routes._session_create_validation import (
+                    validate_uploaded_bundle_host_workspace,
+                )
+
+                assert _entry_host_id is not None
+                return await validate_uploaded_bundle_host_workspace(
+                    user_id=user_id,
+                    host_id=_entry_host_id,
+                    workspace=_entry_path,
+                    spec_cwd=spec_cwd,
+                    host_store=getattr(request.app.state, "host_store", None),
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                )
+
+            entry_boundary = _check_entry_boundary
+
+        placed_workspace, placed_worktree = await _place_project_session(
+            host_id=parsed_metadata.host_id,
+            project_id=project_resolution.project_id,
+            entry=project_resolution.entry,
+            target=parsed_metadata.workspace,
+            git_used=False,
+            entry_boundary=entry_boundary,
+            parent=inherit_parent,
+        )
+        if placed_workspace != parsed_metadata.workspace:
+            parsed_metadata = parsed_metadata.model_copy(update={"workspace": placed_workspace})
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
@@ -965,6 +1014,7 @@ def register_core_routes(
             inference_snapshot,
             inference_model,
             created_by=user_id,
+            worktree=placed_worktree,
         )
         session_created(result.session_id, inherited_runner_id)
         # Top-level creates (no inherited runner) skip the notify —

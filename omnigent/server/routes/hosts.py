@@ -21,6 +21,7 @@ import contextlib
 import logging
 import secrets
 import weakref
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -66,6 +67,12 @@ from omnigent.server.cli_retention import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.project_placement import (
+    _same_canonical_path,
+    checkout_on_host,
+    load_bindings,
+    load_entries,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
 from omnigent.server.routes._workspace_validation import (
@@ -1296,6 +1303,7 @@ def create_hosts_router(
         # when the router was wired without an agent cache (non-prod
         # test wiring); create_app always supplies one.
         workspace = body.workspace
+        spec_cwd: str | None = None
         if agent_store is not None and agent_cache is not None:
             from omnigent.server.routes._workspace_validation import (
                 WorkspaceValidationError,
@@ -1320,6 +1328,22 @@ def create_hosts_router(
                 body.session_id,
             )
 
+        # R-PLACE: a session filed in a project binds at that project's entry
+        # on this host and records the picked worktree. Without a project, an
+        # entry, or a binding store the placement below is a no-op.
+        entry: str | None = None
+        checkout: str | None = None
+        binding_store = getattr(request.app.state, "project_host_binding_store", None)
+        if target.conv.project_id is not None and binding_store is not None:
+            entries = await load_entries(binding_store, target.conv.project_id)
+            entry = next((row.workspace for row in entries if row.host_id == host_id), None)
+            if entry is not None:
+                checkout = checkout_on_host(
+                    await load_bindings(binding_store, target.conv.project_id),
+                    entries,
+                    host_id,
+                )
+
         if body.git is not None:
             from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 
@@ -1332,6 +1356,36 @@ def create_hosts_router(
         harness: str | None = None
         if agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
+
+        from omnigent.server.routes._sessions.helpers import (
+            _canonical_worktree_path,
+            _place_project_session,
+        )
+
+        # The entry-boundary check R-PLACE applies before launching at the
+        # entry: the same validation the picked directory already passed.
+        async def _entry_within_boundary() -> object:
+            from omnigent.server.routes._workspace_validation import (
+                WorkspaceValidationError,
+                validate_workspace,
+            )
+
+            assert entry is not None
+            try:
+                return await validate_workspace(
+                    host_registry=host_registry,
+                    host_id=host_id,
+                    workspace=entry,
+                    spec_cwd=spec_cwd,
+                    host_name_for_errors=target.host.name,
+                )
+            except WorkspaceValidationError as exc:
+                raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+
+        entry_boundary: Callable[[], Awaitable[object]] | None = (
+            _entry_within_boundary if entry is not None else None
+        )
+        placed_worktree: str | None = None
 
         git_branch: str | None = None
         worktree = None
@@ -1404,11 +1458,21 @@ def create_hosts_router(
                         create_worktree_on_host,
                     )
 
+                    # R-PLACE step 1: a worktree made from the entry is
+                    # sourced from the project's checkout, not the entry
+                    # itself (R-CHECKOUT).
+                    source_repo = workspace
+                    if (
+                        entry is not None
+                        and checkout is not None
+                        and _same_canonical_path(workspace, entry)
+                    ):
+                        source_repo = checkout
                     try:
                         worktree = await create_worktree_on_host(
                             host_registry=host_registry,
                             host_conn=conn,
-                            repo_path=workspace,
+                            repo_path=source_repo,
                             branch_name=body.git.branch_name,
                             base_branch=body.git.base_branch,
                             existing_branch=body.git.existing_branch,
@@ -1417,8 +1481,21 @@ def create_hosts_router(
                         raise HTTPException(status_code=409, detail=exc.message) from exc
                     except WorktreeProxyError as exc:
                         raise HTTPException(status_code=400, detail=exc.message) from exc
-                    workspace = worktree.worktree_path
+                    workspace = await _canonical_worktree_path(
+                        host_id=host_id,
+                        worktree_path=worktree.worktree_path,
+                        request=request,
+                    )
                     git_branch = worktree.branch
+
+            workspace, placed_worktree = await _place_project_session(
+                host_id=host_id,
+                project_id=target.conv.project_id,
+                entry=entry,
+                target=workspace,
+                git_used=body.git is not None,
+                entry_boundary=entry_boundary,
+            )
 
             try:
                 await host_registry.admit_launch(
@@ -1449,6 +1526,7 @@ def create_hosts_router(
                     host_id,
                     workspace,
                     git_branch,
+                    placed_worktree,
                 )
             )
             try:

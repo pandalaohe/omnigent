@@ -1841,6 +1841,30 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_worktree(
+        self,
+        conversation_id: str,
+        worktree: str | None,
+    ) -> Conversation:
+        """
+        Set (or clear) a session's recorded working tree.
+
+        Used by host-less paths that copy a placement field without a
+        host binding — a terminal transfer onto an unbound replacement
+        row. A ``host_id``-changing bind goes through
+        :meth:`set_host_id` instead.
+
+        :param conversation_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param worktree: Session working tree path, or ``None`` to
+            clear it.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If no conversation row
+            with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
     def set_external_session_id(
         self,
         conversation_id: str,
@@ -1889,6 +1913,7 @@ class ConversationStore(ABC):
         reasoning_effort: str | None = None,
         model_override: str | None = None,
         workspace: str | None = None,
+        worktree: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -1922,6 +1947,9 @@ class ConversationStore(ABC):
         :param workspace: Optional starting cwd to record on the
             session, e.g. ``"/Users/corey/projects/myapp"``.
             ``None`` leaves the column NULL.
+        :param worktree: Optional working tree when it differs from
+            ``workspace``, e.g. a worktree placed inside the project
+            entry. ``None`` leaves the column NULL.
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves

@@ -108,6 +108,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     RepoWorkspace,
 )
+from omnigent.server.project_placement import place_session
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
@@ -4198,6 +4199,8 @@ async def _create_and_publish_codex_child(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+            # R-INHERIT: a native child keeps its parent's working tree.
+            worktree=parent_conv.worktree,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)
@@ -5742,6 +5745,60 @@ async def _validate_session_workspace(
         agent_cache=agent_cache,
         host_store=getattr(request.app.state, "host_store", None),
         host_registry=getattr(request.app.state, "host_registry", None),
+    )
+
+
+async def _place_project_session(
+    *,
+    host_id: str | None,
+    project_id: str | None,
+    entry: str | None,
+    target: str | None,
+    git_used: bool,
+    entry_boundary: Callable[[], Awaitable[object]] | None,
+    parent: Conversation | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Decide a new session's launch directory and recorded worktree.
+
+    R-PLACE steps 4–5 plus the R-INHERIT child rule. ``parent`` is the
+    parent row when the request names a parent and omits an explicit
+    workspace: the child keeps its launch directory and takes the parent's
+    worktree. Otherwise, when the project has an entry on the target host
+    and the target sits strictly inside it, the session launches at the
+    entry and records the target as its worktree — a session editing
+    through its launch directory's grants may not reach a worktree outside
+    it — but only when the entry passes the same boundary validation the
+    target passed. Every other case launches at the target, recording it
+    as the worktree only when a git worktree was created or bound.
+
+    :param host_id: Host the session binds to, or ``None``.
+    :param project_id: Project the session is filed under, or ``None``.
+    :param entry: The project's entry on ``host_id``, or ``None``.
+    :param target: The validated directory the session would launch in.
+    :param git_used: Whether a git worktree was created or bound for this
+        session.
+    :param entry_boundary: Validates ``entry`` the way ``target`` was
+        validated (that site's own boundary check); ``None`` when there is
+        no entry. A failed check is a boundary failure, never propagated.
+    :param parent: Parent row when R-INHERIT applies, else ``None``.
+    :returns: ``(workspace, worktree)`` to persist.
+    """
+    if parent is not None:
+        return target, parent.worktree
+    if target is None or host_id is None or project_id is None:
+        return target, target if git_used else None
+    entry_within_agent_boundary = True
+    if entry is not None and entry_boundary is not None:
+        try:
+            await entry_boundary()
+        except OmnigentError:
+            entry_within_agent_boundary = False
+    return place_session(
+        entry,
+        target,
+        git_used=git_used,
+        entry_within_agent_boundary=entry_within_agent_boundary,
     )
 
 
@@ -9501,6 +9558,56 @@ async def _create_session_worktree(
         raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
 
 
+async def _canonical_worktree_path(
+    *,
+    host_id: str | None,
+    worktree_path: str,
+    request: Request,
+) -> str:
+    """
+    Canonicalise a just-created worktree path on its host (R-PLACE step 1).
+
+    The agent-boundary step is skipped (``spec_cwd=None``): the worktree
+    was created from a source that already passed the boundary, and a
+    server-made worktree may legitimately sit outside the agent's declared
+    cwd.
+
+    :param host_id: Host that created the worktree, e.g.
+        ``"host_a1b2c3d4..."``.
+    :param worktree_path: Raw path the host returned, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param request: FastAPI request carrying the host registry.
+    :returns: The canonical path the host reports.
+    :raises OmnigentError: ``INVALID_INPUT`` when the host rejects the
+        path; ``INTERNAL_ERROR`` without a host registry.
+    """
+    from omnigent.server.routes._workspace_validation import (
+        WorkspaceValidationError,
+        validate_workspace,
+    )
+
+    if host_id is None:  # pragma: no cover — worktree creation requires a host
+        raise OmnigentError(
+            "git worktree creation requires host_id",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if host_registry is None:
+        raise OmnigentError(
+            "host registry is not configured; cannot canonicalise a worktree",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+    try:
+        return await validate_workspace(
+            host_registry=host_registry,
+            host_id=host_id,
+            workspace=worktree_path,
+            spec_cwd=None,
+        )
+    except WorkspaceValidationError as exc:
+        raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+
+
 # Opt-in ``?delete_branch=true`` cannot reach git when the host tunnel
 # is down (users typically see this as ``runner_online: false``). Refuse
 # the delete instead of 404'ing or silently skipping cleanup.
@@ -9508,6 +9615,41 @@ _DELETE_WORKTREE_OFFLINE_MESSAGE = (
     "Cannot delete worktree — runner offline. "
     "Delete session only (delete_branch=false) or wait for the runner to reconnect."
 )
+
+
+def cleanup_worktree(
+    conv: Conversation,
+    *,
+    is_entry: Callable[[str, str], bool],
+) -> str | None:
+    """
+    Return the directory a delete with ``delete_branch`` should remove.
+
+    R-CLEAN: the session's effective worktree (``worktree ?? workspace``)
+    when it carries a branch and a host, and ``None`` when that directory
+    is some project's entry on the host — an entry is never disposable,
+    whatever the row says or which project the session belongs to. Legacy
+    rows have no worktree and keep cleaning up their launch directory.
+
+    :param conv: The session being deleted.
+    :param is_entry: Returns whether ``(host_id, path)`` is any project's
+        entry on that host.
+    :returns: The path to remove, or ``None`` when nothing should be
+        removed.
+    """
+    if conv.git_branch is None or conv.host_id is None:
+        return None
+    target = conv.worktree or conv.workspace
+    if target is None:
+        return None
+    if is_entry(conv.host_id, target):
+        _logger.warning(
+            "Keeping worktree %s: it is a project entry on host %s, not a disposable worktree",
+            target,
+            conv.host_id,
+        )
+        return None
+    return target
 
 
 async def _remove_session_worktree_best_effort(
@@ -10191,6 +10333,7 @@ def _persist_stored_session_bundle(
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
     created_by: str | None = None,
+    worktree: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -10210,6 +10353,9 @@ def _persist_stored_session_bundle(
     :param created_by: Identity of the creating user, recorded on the
         session-scoped agent so its code can only be mutated by the owner.
         ``None`` in single-user mode.
+    :param worktree: Optional working tree recorded by R-PLACE, e.g. a
+        worktree placed inside the project entry. ``None`` for sessions
+        whose launch directory is their working tree.
     :returns: Response with the new session id.
     :raises OmnigentError: If the agent insert violates integrity
         checks or the parent session no longer exists.
@@ -10231,6 +10377,7 @@ def _persist_stored_session_bundle(
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             workspace=metadata.workspace,
+            worktree=worktree,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
@@ -10279,6 +10426,7 @@ def _persist_stored_session_bundle(
         agent_id=agent_id,
         agent_name=agent_name,
         project_id=created.conversation.project_id,
+        worktree=created.conversation.worktree,
     )
 
 
@@ -11581,6 +11729,7 @@ __all__ = [
     "_build_policy_engine_from_spec",
     "_build_skill_slash_command_policy_body",
     "_canonical_tool_input",
+    "_canonical_worktree_path",
     "_child_session_current_task_status_from_cached_status",
     "_child_session_summary_from_conversation",
     "_claude_native_remember_host",
@@ -11679,6 +11828,7 @@ __all__ = [
     "_persist_session_status_error_labels",
     "_persist_stored_session_bundle",
     "_pin_claude_permission_launch_args",
+    "_place_project_session",
     "_policy_notice_from_ensure_response",
     "_poll_request_disconnect",
     "_presentation_labels_for_agent",
@@ -11782,5 +11932,6 @@ __all__ = [
     "_wait_for_runner_client",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
+    "cleanup_worktree",
     "prefetch_session_routing_catalogs",
 ]

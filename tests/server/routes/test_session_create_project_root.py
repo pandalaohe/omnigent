@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,10 +14,12 @@ from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import ProjectHostBinding, ProjectHostEntry
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
 from omnigent.server.schemas import ProjectSessionCreateRequest
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -534,3 +537,273 @@ async def test_entry_on_another_host_only_refuses_create(
         "Project 'entry-elsewhere' has no directory on host 'h2'. Pass workspace, or set "
         "this host's directory in the project settings."
     )
+
+
+# ── R-PLACE / R-INHERIT at JSON create ──────────────────────────────────
+#
+# The host-facing seams (workspace validation, worktree creation,
+# canonicalisation) are faked here: the real ones are exercised against a
+# fake host in tests/server/integration/test_host_runner_launch_worktree.py
+# and the launch tests. These tests pin the placement decision around them.
+
+_HOST = "1" * 32
+
+
+class _PlacementSeams:
+    """Fake host-side seams recording the create path's inputs."""
+
+    def __init__(self) -> None:
+        self.sources: list[str] = []
+        self.validated: list[str | None] = []
+        self.canonical_calls: list[str] = []
+        # Rewrites paths under this prefix to ``/elsewhere`` on
+        # canonicalisation (a symlinked worktrees directory).
+        self.canonical_prefix: str | None = None
+        # The agent's boundary root; a workspace outside it fails validation.
+        self.allowed: str | None = None
+
+    async def validate(self, *, workspace: str | None, **kwargs: object) -> str:
+        """Stand-in for ``_validate_session_workspace`` (the agent boundary)."""
+        self.validated.append(workspace)
+        assert workspace is not None
+        if self.allowed is not None and not (
+            workspace == self.allowed or workspace.startswith(self.allowed + "/")
+        ):
+            raise OmnigentError(
+                f"workspace {workspace!r} is outside the agent boundary",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return workspace
+
+    async def create_worktree(
+        self, *, source_repo: str, git: object, **kwargs: object
+    ) -> CreatedWorktree:
+        """Stand-in for ``_create_session_worktree`` (host git create)."""
+        self.sources.append(source_repo)
+        branch = str(getattr(git, "branch_name", "feature/x"))
+        return CreatedWorktree(f"{source_repo}-worktrees/{branch}", branch)
+
+    async def canonicalise(self, *, worktree_path: str, **kwargs: object) -> str:
+        """Stand-in for ``_canonical_worktree_path`` (host ``stat``)."""
+        self.canonical_calls.append(worktree_path)
+        prefix = self.canonical_prefix
+        if prefix is not None and worktree_path.startswith(prefix):
+            return "/elsewhere" + worktree_path[len(prefix) :]
+        return worktree_path
+
+
+@pytest.fixture()
+def placement(monkeypatch: pytest.MonkeyPatch) -> _PlacementSeams:
+    """Install the fake host seams the JSON create calls."""
+    from omnigent.server.routes._sessions import orchestration
+
+    seams = _PlacementSeams()
+    monkeypatch.setattr(orchestration, "_validate_session_workspace", seams.validate)
+    monkeypatch.setattr(orchestration, "_create_session_worktree", seams.create_worktree)
+    monkeypatch.setattr(orchestration, "_canonical_worktree_path", seams.canonicalise)
+    return seams
+
+
+async def _post_create(
+    client: httpx.AsyncClient, project_id: str, **payload: object
+) -> httpx.Response:
+    """POST a JSON create for a project, with the builtin agent bound."""
+    return await client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "agent_id": AGENT_ID, **payload},
+        headers=_headers(),
+    )
+
+
+async def test_entry_fills_create_and_records_no_worktree(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """Scenario 1: a no-git create at the entry launches there, worktree null."""
+    project_id = await _project(client, "place-entry", {"agent_id": AGENT_ID})
+    app.state.project_host_binding_store = Bindings([], [_entry(project_id, _HOST, "/entry")])
+    response = await _post_create(client, project_id, host_id=_HOST)
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["workspace"] == "/entry"
+    assert body["worktree"] is None
+    assert body["git_branch"] is None
+    # The entry was validated (as the target) and re-checked as the boundary.
+    assert placement.validated == ["/entry", "/entry"]
+
+
+async def test_git_create_sources_checkout_and_places_worktree_inside_entry(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """Scenario 3: the worktree comes from the checkout, the session from the entry."""
+    project_id = await _project(client, "place-git", {"agent_id": AGENT_ID})
+    app.state.project_host_binding_store = Bindings(
+        [_binding(project_id, _HOST, "/entry/fork/omnigent")],
+        [_entry(project_id, _HOST, "/entry")],
+    )
+    response = await _post_create(
+        client, project_id, host_id=_HOST, git={"branch_name": "feature/x"}
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert placement.sources == ["/entry/fork/omnigent"]
+    assert placement.canonical_calls == ["/entry/fork/omnigent-worktrees/feature/x"]
+    assert body["workspace"] == "/entry"
+    assert body["worktree"] == "/entry/fork/omnigent-worktrees/feature/x"
+    assert body["git_branch"] == "feature/x"
+
+
+async def test_checkout_still_sources_with_collaboration_off(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """Scenario 23: R-CHECKOUT is ungated — a primary binding sources the worktree."""
+    project_id = await _project(client, "place-off", {"agent_id": AGENT_ID})
+    # No FeatureFlags and no collaboration switch: bindings do not place, but
+    # a registered primary checkout still sources the worktree.
+    app.state.project_host_binding_store = Bindings(
+        [_binding(project_id, _HOST, "/entry/fork/omnigent")],
+        [_entry(project_id, _HOST, "/entry")],
+    )
+    response = await _post_create(
+        client, project_id, host_id=_HOST, git={"branch_name": "feature/x"}
+    )
+    assert response.status_code == 201, response.text
+    assert placement.sources == ["/entry/fork/omnigent"]
+    assert response.json()["workspace"] == "/entry"
+    assert response.json()["worktree"] == "/entry/fork/omnigent-worktrees/feature/x"
+
+
+async def test_single_repository_worktree_stays_sibling_of_the_entry(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """Scenario 4: with no binding the entry is the checkout; its sibling T is the session."""
+    project_id = await _project(client, "place-single", {"agent_id": AGENT_ID})
+    app.state.project_host_binding_store = Bindings([], [_entry(project_id, _HOST, "/repo")])
+    response = await _post_create(
+        client, project_id, host_id=_HOST, git={"branch_name": "feature/x"}
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert placement.sources == ["/repo"]
+    assert body["workspace"] == "/repo-worktrees/feature/x"
+    assert body["worktree"] == "/repo-worktrees/feature/x"
+
+
+async def test_symlinked_worktrees_directory_keeps_the_session_outside(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """Scenario 22: canonical T outside the entry launches there."""
+    project_id = await _project(client, "place-symlink", {"agent_id": AGENT_ID})
+    app.state.project_host_binding_store = Bindings(
+        [_binding(project_id, _HOST, "/entry/fork/omnigent")],
+        [_entry(project_id, _HOST, "/entry")],
+    )
+    placement.canonical_prefix = "/entry/fork/omnigent-worktrees"
+    response = await _post_create(
+        client, project_id, host_id=_HOST, git={"branch_name": "feature/x"}
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["workspace"] == "/elsewhere/feature/x"
+    assert body["worktree"] == "/elsewhere/feature/x"
+
+
+async def test_agent_boundary_keeps_the_session_in_the_bound_worktree(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """Scenario 21: the entry fails the agent boundary, so the session stays at T."""
+    project_id = await _project(client, "place-boundary", {"agent_id": AGENT_ID})
+    worktree = "/entry/fork/omnigent/worktrees/x"
+    app.state.project_host_binding_store = Bindings([], [_entry(project_id, _HOST, "/entry")])
+    placement.allowed = "/entry/fork/omnigent"
+    response = await _post_create(
+        client,
+        project_id,
+        host_id=_HOST,
+        workspace=worktree,
+        git={"branch_name": "feature/x", "existing_worktree": True},
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["workspace"] == worktree
+    assert body["worktree"] == worktree
+    # The bind path creates nothing; the worktree came from the caller.
+    assert placement.sources == []
+    assert placement.validated == [worktree, "/entry"]
+
+
+async def test_explicit_nested_workspace_without_git_launches_at_the_entry(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """An explicit directory inside the entry launches at the entry, recorded as worktree."""
+    project_id = await _project(client, "place-nested", {"agent_id": AGENT_ID})
+    app.state.project_host_binding_store = Bindings([], [_entry(project_id, _HOST, "/entry")])
+    response = await _post_create(client, project_id, host_id=_HOST, workspace="/entry/nested")
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["workspace"] == "/entry"
+    assert body["worktree"] == "/entry/nested"
+    assert body["git_branch"] is None
+
+
+async def test_child_without_explicit_workspace_inherits_the_parent_worktree(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """Scenario 7: a child takes the parent's worktree and keeps its own directory."""
+    project_id = await _project(client, "place-child", {"agent_id": AGENT_ID})
+    worktree = "/entry/nested/wt"
+    app.state.project_host_binding_store = Bindings([], [_entry(project_id, _HOST, "/entry")])
+    parent = await _post_create(
+        client,
+        project_id,
+        host_id=_HOST,
+        workspace=worktree,
+        git={"branch_name": "feature/x", "existing_worktree": True},
+    )
+    assert parent.status_code == 201, parent.text
+    assert parent.json()["worktree"] == worktree
+
+    child = await client.post(
+        "/v1/sessions",
+        json={"agent_id": AGENT_ID, "parent_session_id": parent.json()["id"]},
+        headers=_headers(),
+    )
+    assert child.status_code == 201, child.text
+    assert child.json()["project_id"] == project_id
+    assert child.json()["worktree"] == worktree
+    assert child.json()["workspace"] is None
+    # The list surface carries the inherited worktree too.
+    listed = await client.get("/v1/sessions", headers=_headers())
+    row = next(item for item in listed.json()["data"] if item["id"] == parent.json()["id"])
+    assert row["worktree"] == worktree
+
+
+async def test_multipart_create_places_a_nested_workspace_at_the_entry(
+    app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bundled create shares R-PLACE: a nested directory launches at the entry."""
+    from omnigent.server.routes import _session_create_validation as create_validation
+
+    async def _echo_workspace(**kwargs: object) -> str:
+        return str(kwargs["workspace"])
+
+    monkeypatch.setattr(
+        create_validation, "validate_uploaded_bundle_host_workspace", _echo_workspace
+    )
+    project_id = await _project(client, "multipart-place", {"agent_id": AGENT_ID})
+    app.state.project_host_binding_store = Bindings([], [_entry(project_id, _HOST, "/entry")])
+    response = await client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {"project_id": project_id, "host_id": _HOST, "workspace": "/entry/nested"}
+            )
+        },
+        files={"bundle": ("agent.tar.gz", build_agent_bundle(name="helper"), "application/gzip")},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["worktree"] == "/entry/nested"
+    session = await client.get(f"/v1/sessions/{response.json()['session_id']}", headers=_headers())
+    assert session.status_code == 200, session.text
+    assert session.json()["workspace"] == "/entry"
+    assert session.json()["worktree"] == "/entry/nested"

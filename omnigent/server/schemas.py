@@ -1853,12 +1853,17 @@ class CreatedSessionResponse(BaseModel):
     :param agent_name: Agent name loaded from the uploaded bundle's
         spec, e.g. ``"code-assistant"``.
     :param project_id: Owned project containing the new session, or ``None``.
+    :param worktree: The session's working tree when it differs from its
+        launch directory (``workspace``), e.g. a worktree placed inside
+        the project entry. ``None`` for sessions whose launch directory
+        is their working tree.
     """
 
     session_id: str
     agent_id: str
     agent_name: str
     project_id: str | None = None
+    worktree: str | None = None
 
 
 class SessionLabelsResponse(BaseModel):
@@ -2181,6 +2186,10 @@ class SessionResponse(BaseModel):
         Always ``None`` when not yet validated against a host. When a
         git worktree was created for the session, this is the
         worktree directory path.
+    :param worktree: The session's working tree when it differs from
+        its launch directory (``workspace``), e.g. a worktree placed
+        inside the project entry. ``None`` for sessions whose launch
+        directory is their working tree (the common case).
     :param git_branch: Git branch checked out in the session's
         worktree, e.g. ``"feature/login"``. Set only when the
         session was created with a server-created git worktree;
@@ -2292,6 +2301,7 @@ class SessionResponse(BaseModel):
     # Source: :mod:`omnigent.runtime.pending_inputs`.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
+    worktree: str | None = None
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
@@ -2844,6 +2854,10 @@ class SessionListItem(BaseModel):
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
+    :param worktree: The session's working tree when it differs from
+        its launch directory (``workspace``), e.g. a worktree placed
+        inside the project entry. ``None`` for sessions whose launch
+        directory is their working tree (the common case).
     :param git_branch: Git branch checked out in the session's
         worktree, e.g. ``"feature/login"``. Set only when the
         session was created with a server-created git worktree;
@@ -2914,6 +2928,7 @@ class SessionListItem(BaseModel):
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     workspace: str | None = None
+    worktree: str | None = None
     git_branch: str | None = None
     archived: bool = False
     comments_count: int = 0

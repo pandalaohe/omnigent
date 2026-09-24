@@ -7374,6 +7374,18 @@
             ],
             "description": "Absolute path on disk where the runner cd's, e.g. `\"/Users/corey/universe/src/foo\"`. `None` for sessions that haven't been bound to a host workspace.",
             "title": "Workspace"
+          },
+          "worktree": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's working tree when it differs from its launch directory (`workspace`), e.g. a worktree placed inside the project entry. `None` for sessions whose launch directory is their working tree (the common case).",
+            "title": "Worktree"
           }
         },
         "required": [
@@ -8454,6 +8466,18 @@
             ],
             "description": "Absolute path on disk where the runner cd's, e.g. `\"/Users/corey/universe/src/foo\"`. Set when the session was bound to a host workspace at create-time, or when the CLI captured `os.getcwd()` at session-create. Always `None` when not yet validated against a host. When a git worktree was created for the session, this is the worktree directory path.",
             "title": "Workspace"
+          },
+          "worktree": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's working tree when it differs from its launch directory (`workspace`), e.g. a worktree placed inside the project entry. `None` for sessions whose launch directory is their working tree (the common case).",
+            "title": "Worktree"
           }
         },
         "required": [

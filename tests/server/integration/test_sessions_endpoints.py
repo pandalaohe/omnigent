@@ -12930,6 +12930,46 @@ async def test_external_codex_subagent_start_mints_child_session(
     )
 
 
+async def test_external_codex_subagent_start_inherits_the_parent_worktree(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A Codex-native child row takes the parent's recorded working tree.
+
+    Scenario 25 (R-INHERIT): a native ``/side`` or AgentControl child is
+    minted by ``_create_and_publish_codex_child``; it must keep the
+    parent's ``worktree`` so a later bind launches it in the same tree.
+
+    :param client: The test HTTP client.
+    :param db_uri: DB URI for the conversation store.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "codex-native-ui"},
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_worktree(parent["id"], "/entry/nested/wt")
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {
+                "thread_id": "thread_child_worktree",
+                "parent_thread_id": "thread_parent",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    child_id = resp.json()["child_session_id"]
+    child = conv_store.get_conversation(child_id)
+    assert child is not None
+    assert child.worktree == "/entry/nested/wt"
+
+
 async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
     client: httpx.AsyncClient,
 ) -> None:
