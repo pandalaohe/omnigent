@@ -79,6 +79,8 @@ def _pick_default_agent(page: Page, agent_id: str) -> None:
     trigger = field.get_by_test_id("new-chat-landing-agent-select")
     expect(trigger).to_be_enabled()
     trigger.click()
+    # No host registered: no harness is host-usable, so native rows sit under "Other...".
+    page.get_by_test_id("new-chat-landing-harness-more").click()
     row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
     expect(row).to_be_visible()
     row.click()
