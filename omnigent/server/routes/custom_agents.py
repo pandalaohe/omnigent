@@ -28,6 +28,7 @@ from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.spec.validator import _AGENT_NAME_PATTERN
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
@@ -36,11 +37,32 @@ MAX_MULTIPART_REQUEST_BYTES = MAX_BUNDLE_BYTES + 1024 * 1024
 _INSTRUCTIONS_CACHE_SIZE = 256
 
 
+class AgentMember(BaseModel):
+    """One member of a joint Agent; the lead is the bundle's root spec."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=256)
+    description: str | None = Field(default=None, max_length=8192)
+    harness: str = Field(min_length=1, max_length=128)
+    model: str | None = Field(default=None, max_length=512)
+    reasoning_effort: str | None = None
+    lead: bool
+
+    @field_validator("name")
+    @classmethod
+    def valid_role_name(cls, value: str) -> str:
+        # The spec's own agent-name rule: a role is also an archive path segment.
+        if not _AGENT_NAME_PATTERN.match(value):
+            raise ValueError("name must match [a-zA-Z0-9_-]+ (no dots, slashes, or whitespace)")
+        return value
+
+
 class CustomAgentPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=8192)
     instructions: str | None = Field(default=None, max_length=262144)
+    members: list[AgentMember] | None = None
     version: int | None = Field(default=None, ge=1)
 
     @field_validator("name")
@@ -289,6 +311,37 @@ def create_custom_agents_router(
             raise OmnigentError(
                 "Custom Agent changed; reload before saving", code=ErrorCode.CONFLICT
             )
+        if "members" in body.model_fields_set:
+            members = body.members or []
+            if not members:
+                raise OmnigentError(
+                    "members must include at least one member", code=ErrorCode.INVALID_INPUT
+                )
+            if body.version is None:
+                raise OmnigentError(
+                    "version is required when patching members", code=ErrorCode.INVALID_INPUT
+                )
+            roles = [member.name for member in members]
+            if len(set(roles)) != len(roles):
+                raise OmnigentError("member names must be unique", code=ErrorCode.INVALID_INPUT)
+            leads = [member for member in members if member.lead]
+            if len(leads) != 1:
+                raise OmnigentError(
+                    "members must include exactly one lead", code=ErrorCode.INVALID_INPUT
+                )
+            resulting_name = body.name if body.name is not None else row["name"]
+            if leads[0].name != resulting_name:
+                raise OmnigentError(
+                    "lead member name must match the Agent name", code=ErrorCode.INVALID_INPUT
+                )
+            resulting_description = (
+                body.description if "description" in body.model_fields_set else row["description"]
+            )
+            if leads[0].description != resulting_description:
+                raise OmnigentError(
+                    "lead member description must match the Agent description",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         changes = body.model_dump(exclude_unset=True, exclude={"version"})
         if not changes:
             return await asyncio.to_thread(detail, owner_id, row)

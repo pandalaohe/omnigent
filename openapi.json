@@ -48,6 +48,70 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AgentMember": {
+        "additionalProperties": false,
+        "description": "One member of a joint Agent; the lead is the bundle's root spec.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 8192,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "harness": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Harness",
+            "type": "string"
+          },
+          "lead": {
+            "title": "Lead",
+            "type": "boolean"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          }
+        },
+        "required": [
+          "name",
+          "harness",
+          "lead"
+        ],
+        "title": "AgentMember",
+        "type": "object"
+      },
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
@@ -2427,6 +2491,20 @@
               }
             ],
             "title": "Instructions"
+          },
+          "members": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/AgentMember"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Members"
           },
           "name": {
             "anyOf": [

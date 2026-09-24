@@ -1,4 +1,4 @@
-"""Scalar edits retain every unrelated member of an uploaded Agent archive."""
+"""Scalar edits retain unrelated archive members; member edits re-dump touched configs."""
 
 from __future__ import annotations
 
@@ -16,12 +16,21 @@ import yaml
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.spec import AgentSpec, extract_safe
+from omnigent.spec.parser import _ConfigYamlLoader
 
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 _MANAGED_INSTRUCTIONS_PATH = re.compile(r"catalog-instructions-[0-9a-f]{32}\.md")
 
 
 def project_members(spec: AgentSpec) -> list[dict[str, Any]]:
+    remaining = list(spec.sub_agents)
+    ordered: list[AgentSpec] = []
+    for name in spec.tools.agents:
+        for index, member in enumerate(remaining):
+            if member.name == name:
+                ordered.append(remaining.pop(index))
+                break
+    ordered.extend(remaining)
     return [
         {
             "name": member.name,
@@ -31,7 +40,7 @@ def project_members(spec: AgentSpec) -> list[dict[str, Any]]:
             "reasoning_effort": member.executor.reasoning_effort,
             "lead": index == 0,
         }
-        for index, member in enumerate((spec, *spec.sub_agents))
+        for index, member in enumerate((spec, *ordered))
     ]
 
 
@@ -128,8 +137,160 @@ def _patch_yaml_fields(raw: str, fields: dict[str, Any]) -> str:
     return raw
 
 
+def _load_mapping(raw: str) -> dict[str, Any]:
+    data = yaml.load(raw, Loader=_ConfigYamlLoader)
+    if not isinstance(data, dict):
+        raise OmnigentError("Agent configuration must be a mapping", code=ErrorCode.INVALID_INPUT)
+    return data
+
+
+def _dump_mapping(data: dict[str, Any]) -> bytes:
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode("utf-8")
+
+
+def _mutable_mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
+    """Replace ``data[key]`` with a copy before editing: aliases load as shared objects."""
+    value = data.get(key)
+    value = dict(value) if isinstance(value, dict) else {}
+    data[key] = value
+    return value
+
+
+def _set_or_remove(data: dict[str, Any], key: str, value: Any) -> None:
+    if value is None:
+        data.pop(key, None)
+    else:
+        data[key] = value
+
+
+def _apply_member(data: dict[str, Any], member: dict[str, Any]) -> None:
+    """Fold one member's description and executor into a parsed config mapping."""
+    _set_or_remove(data, "description", member.get("description"))
+    executor = _mutable_mapping(data, "executor")
+    _mutable_mapping(executor, "config")["harness"] = member["harness"]
+    for key in ("model", "reasoning_effort"):
+        _set_or_remove(executor, key, member.get(key))
+    # The parser lifts llm.model / llm.reasoning_effort into a bare executor
+    # when the executor keys are absent, so a removed value must go from both.
+    llm = data.get("llm")
+    if isinstance(llm, dict):
+        llm = dict(llm)
+        llm.pop("reasoning_effort", None)
+        model = member.get("model")
+        if not llm.keys() - {"model"}:
+            llm.pop("model", None)
+            _set_or_remove(data, "llm", llm or None)
+        elif model is None:
+            # The parser rejects a legacy block without llm.model, and keeping
+            # the old model would re-lift it into the executor.
+            raise OmnigentError(
+                f"member '{member['name']}': legacy llm block requires a model",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        else:
+            llm["model"] = model
+            data["llm"] = llm
+
+
+def _new_sub_agent_config(member: dict[str, Any]) -> bytes:
+    """A minimal sub-agent config in the built-in Polly sub-agent shape."""
+    data: dict[str, Any] = {
+        "spec_version": 1,
+        "name": member["name"],
+        "executor": {"type": "omnigent"},
+    }
+    _apply_member(data, member)
+    return _dump_mapping(data)
+
+
+def _rewrite_sub_agents(
+    root: Path,
+    subs: list[dict[str, Any]],
+    replacements: dict[str, bytes],
+    dropped: list[str],
+) -> None:
+    """Update, create, or drop each role's directory by its config YAML name."""
+    by_role = {member["name"]: member for member in subs}
+    handled: set[str] = set()
+    used: set[str] = set()
+    agents = root / "agents"
+    for config in sorted(agents.glob("*/config.yaml")) if agents.is_dir() else []:
+        data = _load_mapping(config.read_text(encoding="utf-8"))
+        name = data.get("name")
+        directory = config.parent.relative_to(root).as_posix()
+        if not isinstance(name, str) or name not in by_role or name in handled:
+            # A directory whose YAML name is not on the roster loses all entries.
+            dropped.append(directory)
+            continue
+        handled.add(name)
+        used.add(directory)
+        _apply_member(data, by_role[name])
+        replacements[f"{directory}/config.yaml"] = _dump_mapping(data)
+    for name, member in by_role.items():
+        if name in handled:
+            continue
+        # A new role takes the first suffix no retained directory holds, so a
+        # directory named after the role never clobbers a retained member.
+        directory = f"agents/{name}"
+        suffix = 2
+        while directory in used:
+            directory = f"agents/{name}-{suffix}"
+            suffix += 1
+        used.add(directory)
+        replacements[f"{directory}/config.yaml"] = _new_sub_agent_config(member)
+
+
+def _rewrite_members(
+    root: Path,
+    config: Path,
+    raw: str,
+    members: list[dict[str, Any]],
+    fields: dict[str, Any],
+    replacements: dict[str, bytes],
+    dropped: list[str],
+) -> None:
+    """Fold the member roster into the root config and each role's config."""
+    leads = [member for member in members if member.get("lead")]
+    if len(leads) != 1:
+        raise OmnigentError("members must contain exactly one lead", code=ErrorCode.INVALID_INPUT)
+    lead = leads[0]
+    subs = [member for member in members if not member.get("lead")]
+
+    data = _load_mapping(raw)
+    _apply_member(data, lead)
+    for key in ("name", "description"):
+        if key in fields:
+            _set_or_remove(data, key, fields[key])
+    if subs:
+        _mutable_mapping(data, "tools")["agents"] = [member["name"] for member in subs]
+        data["spawn"] = True
+    else:
+        tools = data.get("tools")
+        if isinstance(tools, dict):
+            tools = dict(tools)
+            tools.pop("agents", None)
+            data["tools"] = tools
+    if "instructions" in fields:
+        # Use a generated file so inline text matching a bundle filename is
+        # never loaded as that file. Reuse our prior path to avoid growing
+        # the archive on every edit.
+        path = _managed_instructions_path(raw) or f"catalog-instructions-{uuid.uuid4().hex}.md"
+        replacements[path] = (fields["instructions"] or "").encode("utf-8")
+        data["instructions"] = path
+    replacements[config.name] = _dump_mapping(data)
+    _rewrite_sub_agents(root, subs, replacements, dropped)
+
+
 def patch_bundle(bundle: bytes, changes: dict[str, Any]) -> bytes:
-    """Patch top-level YAML scalars without reserializing unknown configuration."""
+    """Patch editable YAML fields of an Agent archive.
+
+    Without ``members`` the change is scalar-only: values are edited in place
+    and every unrelated byte is retained. A ``members`` change instead parses
+    the root config and each touched ``agents/<role>/config.yaml`` with the
+    spec parser's loader and re-dumps them, so comments in those files are
+    lost; roles dropped from the roster lose their archive entries. Every
+    other archive member is copied unchanged either way.
+    """
     with tempfile.TemporaryDirectory() as temp:
         root = extract_safe(bundle, Path(temp) / "bundle")
         config = root / "config.yaml"
@@ -143,15 +304,23 @@ def patch_bundle(bundle: bytes, changes: dict[str, Any]) -> bytes:
             config = candidates[0]
         raw = config.read_text(encoding="utf-8")
         replacements: dict[str, bytes] = {}
+        dropped: list[str] = []
         fields = dict(changes)
-        if "instructions" in fields:
-            # Use a generated file so inline text matching a bundle filename is
-            # never loaded as that file. Reuse our prior path to avoid growing
-            # the archive on every edit.
-            path = _managed_instructions_path(raw) or f"catalog-instructions-{uuid.uuid4().hex}.md"
-            replacements[path] = (fields["instructions"] or "").encode("utf-8")
-            fields["instructions"] = path
-        replacements[config.name] = _patch_yaml_fields(raw, fields).encode("utf-8")
+        members = fields.pop("members", None)
+        if members is None:
+            if "instructions" in fields:
+                # Use a generated file so inline text matching a bundle filename is
+                # never loaded as that file. Reuse our prior path to avoid growing
+                # the archive on every edit.
+                path = (
+                    _managed_instructions_path(raw)
+                    or f"catalog-instructions-{uuid.uuid4().hex}.md"
+                )
+                replacements[path] = (fields["instructions"] or "").encode("utf-8")
+                fields["instructions"] = path
+            replacements[config.name] = _patch_yaml_fields(raw, fields).encode("utf-8")
+        else:
+            _rewrite_members(root, config, raw, members, fields, replacements, dropped)
 
     output = io.BytesIO()
     seen: set[str] = set()
@@ -167,6 +336,8 @@ def patch_bundle(bundle: bytes, changes: dict[str, Any]) -> bytes:
                     code=ErrorCode.INVALID_INPUT,
                 )
             seen.add(normalized)
+            if any(normalized == path or normalized.startswith(f"{path}/") for path in dropped):
+                continue
             if normalized in replacements and member.isfile():
                 data = replacements.pop(normalized)
                 info = copy.copy(member)
