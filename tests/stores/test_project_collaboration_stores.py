@@ -753,7 +753,7 @@ def test_entry_delete_is_idempotent(
     assert binding_store.list_entries(project_id) == []
 
 
-def test_entry_exists_at_is_tenant_scoped_and_project_agnostic(
+def test_entry_at_or_under_is_tenant_scoped_and_project_agnostic(
     binding_store: SqlAlchemyProjectHostBindingStore,
     project_store: SqlAlchemyProjectStore,
 ) -> None:
@@ -762,10 +762,65 @@ def test_entry_exists_at_is_tenant_scoped_and_project_agnostic(
     other = _create_project(project_store, "other", name="Q")
     host_id = _uid("host-a")
     binding_store.put_entry(other, host_id, "/entry")
-    assert binding_store.entry_exists_at(host_id, "/entry") is True
-    assert binding_store.entry_exists_at(host_id, "/elsewhere") is False
-    assert binding_store.entry_exists_at(_uid("host-b"), "/entry") is False
+    assert binding_store.entry_at_or_under(host_id, "/entry") is True
+    assert binding_store.entry_at_or_under(host_id, "/elsewhere") is False
+    assert binding_store.entry_at_or_under(_uid("host-b"), "/entry") is False
     assert binding_store.list_entries(mine) == []
+
+
+def test_entry_at_or_under_matches_nested_entries(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """An entry inside the directory keeps the whole directory, trailing slash included."""
+    project_id = _create_project(project_store)
+    host_id = _uid("host-a")
+    binding_store.put_entry(project_id, host_id, "/repo-worktrees/topic/subproject")
+    assert binding_store.entry_at_or_under(host_id, "/repo-worktrees/topic") is True
+    assert binding_store.entry_at_or_under(host_id, "/repo-worktrees/topic/") is True
+    assert binding_store.entry_at_or_under(host_id, "/repo-worktrees") is True
+    assert binding_store.entry_at_or_under(host_id, "/repo") is False
+
+
+def test_entry_at_or_under_rejects_a_sibling_prefix(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """``/a/bc`` is not inside ``/a/b``; the separator decides, not the string."""
+    project_id = _create_project(project_store)
+    host_id = _uid("host-a")
+    binding_store.put_entry(project_id, host_id, "/a/bc")
+    assert binding_store.entry_at_or_under(host_id, "/a/b") is False
+    assert binding_store.entry_at_or_under(host_id, "/a") is True
+
+
+def test_entry_at_or_under_treats_wildcards_literally(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """``%`` and ``_`` in a path are characters, never LIKE wildcards."""
+    project_id = _create_project(project_store)
+    underscore_host = _uid("host-underscore")
+    binding_store.put_entry(project_id, underscore_host, "/a/bXc/d")
+    assert binding_store.entry_at_or_under(underscore_host, "/a/b_c") is False
+    assert binding_store.entry_at_or_under(underscore_host, "/a/bXc") is True
+    percent_host = _uid("host-percent")
+    binding_store.put_entry(project_id, percent_host, "/a/bX/c")
+    assert binding_store.entry_at_or_under(percent_host, "/a/%") is False
+    assert binding_store.entry_at_or_under(percent_host, "/a/bX") is True
+
+
+def test_entry_at_or_under_accepts_windows_separators(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """A backslash path matches at and under it, trailing separator included."""
+    project_id = _create_project(project_store)
+    host_id = _uid("host-a")
+    binding_store.put_entry(project_id, host_id, "D:\\repo\\wt\\sub")
+    assert binding_store.entry_at_or_under(host_id, "D:\\repo\\wt") is True
+    assert binding_store.entry_at_or_under(host_id, "D:\\repo\\wt\\") is True
+    assert binding_store.entry_at_or_under(host_id, "D:\\repo\\wo") is False
 
 
 def test_entry_put_missing_project_raises_not_found(

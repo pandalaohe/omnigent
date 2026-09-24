@@ -116,14 +116,19 @@ def _make_worktree_conversation(
 
 
 class _Entries:
-    """Minimal entry guard for the delete route's ``entry_exists_at``."""
+    """Minimal entry guard for the delete route's ``entry_at_or_under``."""
 
     def __init__(self, entries: set[tuple[str, str]]) -> None:
         self._entries = entries
 
-    def entry_exists_at(self, host_id: str, workspace: str) -> bool:
-        """Return whether any project has an entry at ``(host_id, workspace)``."""
-        return (host_id, workspace) in self._entries
+    def entry_at_or_under(self, host_id: str, workspace: str) -> bool:
+        """Return whether any project has an entry at or inside ``(host_id, workspace)``."""
+        base = workspace.rstrip("/\\")
+        return any(
+            entry_host == host_id
+            and (entry_workspace == base or entry_workspace.startswith((base + "/", base + "\\")))
+            for entry_host, entry_workspace in self._entries
+        )
 
 
 async def test_delete_with_flag_sends_remove_worktree(
@@ -780,6 +785,35 @@ async def test_delete_never_removes_a_project_entry(
 
     assert resp.status_code == 200, resp.text
     assert captured == [], "an entry on that host must never be removed"
+    assert any("project entry" in record.message for record in caplog.records), (
+        "the skipped removal must be logged"
+    )
+
+
+async def test_delete_keeps_a_worktree_holding_a_nested_project_entry(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Scenario 20: an entry nested inside a worktree keeps the whole tree.
+
+    A project may register a subdirectory of a worktree as its entry; removing
+    the parent would take that entry with it, so the guard must match an entry
+    anywhere under the directory, not only exactly at it.
+    """
+    captured = await _register_fake_host(app, db_uri)
+    worktree = "/Users/alice/repo-worktrees/topic"
+    app.state.project_host_binding_store = _Entries({(_HOST_ID, f"{worktree}/subproject")})
+    conv_id = _make_worktree_conversation(db_uri, workspace=worktree, worktree=worktree)
+
+    with caplog.at_level("WARNING", logger="omnigent.server.routes._sessions.helpers"):
+        resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+
+    assert resp.status_code == 200, resp.text
+    assert captured == [], (
+        "a session worktree holding a project entry must not be removed with its parent"
+    )
     assert any("project entry" in record.message for record in caplog.records), (
         "the skipped removal must be logged"
     )

@@ -2070,6 +2070,47 @@ async def test_rest_snapshot_worktree_drives_the_file_diff(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_read_file_in_root_confines_reads(tmp_path: Path) -> None:
+    """The worktree read serves files under the root and refuses escapes.
+
+    A ``..`` component, an absolute path, and a symlink pointing outside the
+    root must all be refused, not read: the direct read replaces the caller
+    process environment, so containment is this function's own duty.
+    """
+    from omnigent.entities.environment_filesystem import (
+        FilesystemPathNotFound,
+        InvalidPath,
+    )
+    from omnigent.runner.app import _read_file_in_root
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "inside.txt").write_text("inside")
+    nested = root / "nested"
+    nested.mkdir()
+    (nested / "deep.txt").write_text("deep")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside")
+    (root / "escape.txt").symlink_to(outside)
+
+    assert await _read_file_in_root(str(root), "inside.txt") == "inside"
+    assert await _read_file_in_root(str(root), "nested/deep.txt") == "deep"
+
+    for bad in (
+        "../outside.txt",
+        str(outside),
+        "nested/../../outside.txt",
+        "..\\outside.txt",
+        "escape.txt",
+    ):
+        with pytest.raises(InvalidPath):
+            await _read_file_in_root(str(root), bad)
+
+    with pytest.raises(FilesystemPathNotFound):
+        await _read_file_in_root(str(root), "missing.txt")
+
+
+@pytest.mark.asyncio
 async def test_search_scopes_to_a_subdirectory(client: httpx.AsyncClient) -> None:
     """Search covers exactly what the tree is showing. Scoped to a directory it
     reports the resolved base and returns paths relative to it, so a panel

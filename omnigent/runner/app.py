@@ -1179,35 +1179,52 @@ class _SessionSnapshot:
 
 
 async def _read_file_in_root(root: str, relative_path: str) -> str:
-    """Read *relative_path* under *root*, with the environment read's containment.
+    """Read *relative_path* under *root* without building an environment.
 
     A session whose working tree differs from its launch directory records
     both; its changed-files baseline comes from the working tree, so the
-    file's current content has to come from that same root. A fresh
-    caller-process environment pinned at *root* keeps the containment the
-    normal environment read enforces: ``..`` and absolute paths refused by
-    ``_validate_path``, symlink escapes refused by the helper's
-    ``_assert_within_cwd``.
+    file's current content has to come from that same root. Containment is
+    enforced here — an absolute path, a ``..`` component, or a symlink that
+    resolves outside *root* is refused — and the read is offloaded so a slow
+    file never blocks the loop. Building no environment per read keeps the
+    helper and its ``atexit`` callback out of the caller process.
 
     :param root: The directory to read under, e.g. a session's worktree.
     :param relative_path: Path relative to *root*.
     :returns: Decoded file content.
-    :raises ValueError: If no filesystem can be built at *root*.
+    :raises InvalidPath: If the path is absolute or resolves outside *root*.
+    :raises FilesystemPathNotFound: If the file cannot be read.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.os_env import create_os_environment
-    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
-
-    env = create_os_environment(
-        OSEnvSpec(type="caller_process", cwd=root, sandbox=OSEnvSandboxSpec(type="none"))
+    from omnigent.entities.environment_filesystem import (
+        FilesystemPathNotFound,
+        InvalidPath,
     )
-    if env is None:
-        raise ValueError(f"cannot read {relative_path!r}: no filesystem at {root!r}")
-    try:
-        content = await CallerProcessFilesystem(env).read(relative_path, limit=None)
-    finally:
-        env.close()
-    return content.data.decode(content.encoding or "utf-8", errors="replace")
+
+    def _read() -> bytes:
+        """Resolve the path inside *root* and read it.
+
+        :returns: The file's raw bytes.
+        :raises InvalidPath: If the path is absolute or resolves outside *root*.
+        :raises FilesystemPathNotFound: If the file cannot be read.
+        """
+        if os.path.isabs(relative_path) or ".." in relative_path.replace("\\", "/").split("/"):
+            raise InvalidPath(f"Path {relative_path!r} is not a safe relative path")
+        root_real = os.path.realpath(root)
+        target = os.path.realpath(os.path.join(root_real, relative_path))
+        try:
+            inside = os.path.commonpath([root_real, target]) == root_real
+        except ValueError:
+            inside = False
+        if not inside:
+            raise InvalidPath(f"Path {relative_path!r} escapes {root!r}")
+        try:
+            with open(target, "rb") as handle:
+                return handle.read()
+        except OSError as exc:
+            raise FilesystemPathNotFound(f"Path {relative_path!r} not found") from exc
+
+    data = await asyncio.to_thread(_read)
+    return data.decode("utf-8", errors="replace")
 
 
 @dataclasses.dataclass(frozen=True)

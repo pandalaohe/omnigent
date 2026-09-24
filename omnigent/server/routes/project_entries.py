@@ -43,12 +43,14 @@ def _is_managed_worktree_path(path: str) -> bool:
 
     Assignment release and session cleanup remove those directories, so an
     entry there could later be matched by a removal that never intended it.
+    Components compare case-insensitively: Windows paths are, and the
+    removal that owns those directories resolves case-insensitively too.
 
     :param path: Canonical path returned by the host.
     :returns: ``True`` for a ``.worktrees`` component or an
-        ``.omnigent/worktrees`` pair, on either path separator.
+        ``.omnigent/worktrees`` pair, on either path separator, in any case.
     """
-    components = path.replace("\\", "/").split("/")
+    components = [component.lower() for component in path.replace("\\", "/").split("/")]
     if ".worktrees" in components:
         return True
     return any(

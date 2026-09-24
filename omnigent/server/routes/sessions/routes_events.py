@@ -3229,12 +3229,12 @@ def register_events_routes(
             binding_store = getattr(request.app.state, "project_host_binding_store", None)
 
             def is_entry(host_id: str, path: str) -> bool:
-                """Whether ``(host_id, path)`` is any project's entry on that host."""
+                """Whether an entry sits at or under ``(host_id, path)``."""
                 if binding_store is None:
                     return False
-                return binding_store.entry_exists_at(host_id, path)
+                return binding_store.entry_at_or_under(host_id, path)
 
-            # ``is_entry`` hits the store synchronously (``entry_exists_at``);
+            # ``is_entry`` hits the store synchronously (``entry_at_or_under``);
             # run the whole call off-thread so it never blocks this async route.
             worktree_target = await asyncio.to_thread(cleanup_worktree, conv, is_entry=is_entry)
             if worktree_target is not None:

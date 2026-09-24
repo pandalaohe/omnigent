@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import asc, select
+from sqlalchemy import asc, or_, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
@@ -409,14 +409,27 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
 
         return run_write_transaction(self._session_immediate, "project_entries.delete", write)
 
-    def entry_exists_at(self, host_id: str, workspace: str) -> bool:
-        """Return whether any project has an entry at ``(host_id, workspace)``."""
-        with self._session("project_entries.exists_at") as session:
+    def entry_at_or_under(self, host_id: str, workspace: str) -> bool:
+        """Return whether any project has an entry at or inside ``workspace``.
+
+        A trailing separator on the caller's path is ignored — entry rows
+        store canonical paths — and the separator appended for the prefix
+        match is literal on either path separator. ``startswith`` escapes
+        ``%`` and ``_`` so they cannot widen the match.
+        """
+        base = workspace.rstrip("/\\")
+        with self._session("project_entries.at_or_under") as session:
             stmt = (
                 select(SqlProjectHostEntry.project_id)
                 .where(SqlProjectHostEntry.workspace_id == current_workspace_id())
                 .where(SqlProjectHostEntry.host_id == host_id)
-                .where(SqlProjectHostEntry.workspace == workspace)
+                .where(
+                    or_(
+                        SqlProjectHostEntry.workspace == base,
+                        SqlProjectHostEntry.workspace.startswith(f"{base}/", autoescape=True),
+                        SqlProjectHostEntry.workspace.startswith(f"{base}\\", autoescape=True),
+                    )
+                )
                 .limit(1)
             )
             return session.execute(stmt).first() is not None

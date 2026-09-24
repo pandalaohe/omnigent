@@ -229,15 +229,17 @@ class ProjectHostBindingStore(ABC):
         ...
 
     @abstractmethod
-    def entry_exists_at(self, host_id: str, workspace: str) -> bool:
+    def entry_at_or_under(self, host_id: str, workspace: str) -> bool:
         """
-        Return whether any project has an entry at ``(host_id, workspace)``.
+        Return whether any project has an entry at or inside ``workspace``.
 
         Tenant-scoped and project-agnostic: the guard that stops worktree
-        cleanup from removing a directory that is some project's entry.
+        cleanup from removing a directory that is, or holds, some project's
+        entry. A nested entry (``/repo-worktrees/topic/subproject``) keeps
+        the whole parent tree.
 
         :param host_id: The host holding the directory.
         :param workspace: The canonical directory path to match.
-        :returns: ``True`` when an entry row names the pair.
+        :returns: ``True`` when an entry row names the pair or lies under it.
         """
         ...

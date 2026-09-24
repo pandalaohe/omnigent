@@ -210,6 +210,7 @@ async def test_entry_put_bad_path_400(
         "/u/p/.worktrees/repo/topic",
         "/u/p/.omnigent/worktrees/repo",
         "D:\\p\\.omnigent\\worktrees\\asg\\root",
+        "D:\\p\\.OMNIGENT\\WORKTREES\\asg\\root",
     ],
 )
 async def test_entry_put_managed_worktree_path_400(
