@@ -204,6 +204,11 @@ export function isUserInputElicitation(elicitation: {
  * persisted tool call carry different elicitation ids — the live id is
  * minted per prompt and never persisted — so a merge that sees both
  * copies pairs them on the questions (or the plan) instead.
+ *
+ * Codex questions carry a protocol id per question, which names the exact
+ * instance asked rather than any question with the same text. When every
+ * question has one, the key is built from those ids; cards without ids
+ * (Claude) keep the text key.
  */
 export function userInputElicitationKey(elicitation: {
   askUserQuestion?: Record<string, unknown> | null;
@@ -214,6 +219,10 @@ export function userInputElicitationKey(elicitation: {
     castAskUserQuestionPayload(elicitation.askUserQuestion) ??
     parseAskUserQuestionPreview(elicitation.contentPreview);
   if (questions !== null) {
+    const ids = questions.questions.map((q) => q.id);
+    if (ids.length > 0 && ids.every((id) => typeof id === "string" && id !== "")) {
+      return `question-ids:${JSON.stringify(ids)}`;
+    }
     return `questions:${JSON.stringify(questions.questions.map((q) => q.question))}`;
   }
   const plan = exitPlanModePlan(elicitation.exitPlanMode);

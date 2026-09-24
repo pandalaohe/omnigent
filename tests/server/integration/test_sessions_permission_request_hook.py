@@ -3013,6 +3013,124 @@ async def test_codex_request_user_input_hook_returns_id_keyed_answers(
     assert resp.json() == {"answers": {"framework": {"answers": ["React"]}}}
 
 
+def _codex_async_question_payload() -> dict[str, Any]:
+    """
+    Build the synthetic async-question envelope the forwarder posts.
+
+    :returns: Codex elicitation request body for a parked question card.
+    """
+    return {
+        "id": "async_question:call_x:0:0",
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "call_x",
+            "omnigentAsyncQuestion": True,
+            "questions": [
+                {
+                    "id": "call_x:0",
+                    "question": "Pick one",
+                    "isOther": True,
+                    "isSecret": False,
+                    "options": [{"label": "A"}],
+                }
+            ],
+        },
+    }
+
+
+async def _decline_codex_request(
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[dict[str, Any]], httpx.Response]:
+    """
+    Drive one Codex hook request through a decline and capture runner forwards.
+
+    :param client: Test HTTP client.
+    :param payload: Codex elicitation request body.
+    :param monkeypatch: Fixture isolating the runner forward.
+    :returns: ``(forwarded_events, hook_response)``.
+    """
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> None:
+        forwarded.append(args[2])
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record,
+    )
+    agent = await create_test_agent(client, "test-codex-async-decline")
+    session_id = await _create_session(client, agent["id"])
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "decline")
+    assert verdict.status_code == 202, verdict.text
+    return forwarded, await hook_task
+
+
+async def test_codex_async_question_decline_skips_the_interrupt(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Closing a Codex async-question card declines without interrupting.
+
+    The card is answered outside the turn that asked the question, so the
+    interrupt a regular declined request sends would abort whatever Codex
+    is doing now. The response body stays the usual empty-answers decline.
+    """
+    forwarded, resp = await _decline_codex_request(
+        client, _codex_async_question_payload(), monkeypatch
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"answers": {}}
+    assert forwarded == []
+
+
+async def test_codex_request_user_input_decline_still_interrupts(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A regular native requestUserInput decline still forwards the interrupt."""
+    payload = {
+        "id": "req_9",
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "item_123",
+            "questions": [
+                {
+                    "id": "framework",
+                    "question": "Which framework?",
+                    "options": [{"label": "React"}],
+                    "isOther": False,
+                    "isSecret": False,
+                }
+            ],
+        },
+    }
+
+    forwarded, resp = await _decline_codex_request(client, payload, monkeypatch)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"answers": {}}
+    assert forwarded == [{"type": "interrupt"}]
+
+
 async def test_codex_plan_mode_final_prompt_round_trip(
     client: httpx.AsyncClient,
 ) -> None:

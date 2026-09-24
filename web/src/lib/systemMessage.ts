@@ -253,3 +253,81 @@ export function taskNotificationMarkerContent(
   }
   return null;
 }
+
+// Codex's async-question answer contract: one tag pair around a JSON
+// array, one entry per answered question, the answer verbatim. The TUI
+// writes it and the forwarder mirrors a web answer back in the same bytes.
+const QUESTION_REPLY_OPEN = "<send_user_message_question_reply>";
+const QUESTION_REPLY_CLOSE = "</send_user_message_question_reply>";
+const ASYNC_QUESTION_TOOL = "request_user_input_async";
+
+/**
+ * Re-label a Codex async-question reply as a ``[System: …]`` marker.
+ *
+ * The reply is protocol text, not prose — without this it renders as the
+ * raw tags. Classify strictly (exactly one tag pair, every entry carrying
+ * a string answer/question and a well-formed ``questionItemId``) so a
+ * user message that merely mentions the tags stays a normal bubble.
+ *
+ * :param text: One user message text block.
+ * :returns: Marker text (header plus ``"<question> → <answer>"`` lines),
+ *   or ``null`` when ``text`` is not a well-formed reply.
+ */
+export function codexQuestionReplyMarker(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith(QUESTION_REPLY_OPEN) || !trimmed.endsWith(QUESTION_REPLY_CLOSE)) {
+    return null;
+  }
+  const inner = trimmed.slice(QUESTION_REPLY_OPEN.length, -QUESTION_REPLY_CLOSE.length).trim();
+  let rawEntries: unknown;
+  try {
+    rawEntries = JSON.parse(inner);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(rawEntries) || rawEntries.length === 0) return null;
+  const lines: string[] = [];
+  for (const raw of rawEntries) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const { answer, question, questionItemId } = raw as Record<string, unknown>;
+    if (typeof answer !== "string" || typeof question !== "string") return null;
+    if (typeof questionItemId !== "string") return null;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(questionItemId);
+    } catch {
+      return null;
+    }
+    if (
+      !Array.isArray(decoded) ||
+      decoded.length !== 3 ||
+      decoded[0] !== ASYNC_QUESTION_TOOL ||
+      typeof decoded[1] !== "string" ||
+      decoded[1] === "" ||
+      typeof decoded[2] !== "number" ||
+      !Number.isInteger(decoded[2])
+    ) {
+      return null;
+    }
+    lines.push(`${question} → ${answer}`);
+  }
+  return `[System: Question answered]\n${lines.join("\n")}`;
+}
+
+/**
+ * System-marker content for a user message that is a Codex question reply.
+ *
+ * :param content: A user message block's content array.
+ * :returns: One ``input_text`` block carrying the marker, or ``null`` for an
+ *   ordinary user message.
+ */
+export function codexQuestionReplyMarkerContent(
+  content: MessageContentBlock[],
+): MessageContentBlock[] | null {
+  for (const block of content) {
+    if (!isTextBlock(block)) continue;
+    const marker = codexQuestionReplyMarker(block.text);
+    if (marker !== null) return [{ type: "input_text", text: marker }];
+  }
+  return null;
+}

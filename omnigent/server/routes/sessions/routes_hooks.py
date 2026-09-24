@@ -1176,15 +1176,20 @@ def register_hooks_routes(
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
         if result.action == "decline":
-            # Explicit user decline: interrupt Codex before returning the
-            # deny response, same as the Claude-native path. The await
-            # ensures the abort signal reaches Codex before it processes
-            # the decline result and lets the LLM continue.
-            await _forward_session_change_to_runner(
-                session_id,
-                get_server_runner_router(),
-                {"type": "interrupt"},
-            )
+            # Async questions are answered outside the turn that asked them:
+            # closing their card is not a verdict on whatever Codex is doing
+            # now, so the interrupt a regular declined request sends would
+            # abort an unrelated turn.
+            if not codex_request.codex_params.get("omnigentAsyncQuestion"):
+                # Explicit user decline: interrupt Codex before returning the
+                # deny response, same as the Claude-native path. The await
+                # ensures the abort signal reaches Codex before it processes
+                # the decline result and lets the LLM continue.
+                await _forward_session_change_to_runner(
+                    session_id,
+                    get_server_runner_router(),
+                    {"type": "interrupt"},
+                )
         body = codex_request.build_response(result)
         return Response(
             content=json.dumps(body),

@@ -150,7 +150,11 @@ import {
   onResponseStart,
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
-import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
+import {
+  codexQuestionReplyMarkerContent,
+  isSystemUserContent,
+  taskNotificationMarkerContent,
+} from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 
@@ -4339,7 +4343,9 @@ async function reconcileActiveSessionStatus(
  * the source of truth for what is still parked. Three reconciliations:
  *
  * - A prompt in the snapshot with no rendered card → append a fresh
- *   pending card (it fired during the gap).
+ *   pending card (it fired during the gap) — unless a rebuilt answered
+ *   copy of the same Codex question ids is already rendered, which makes
+ *   the snapshot copy the stale half of the rebuild.
  * - A rendered pending card absent from the snapshot → flip to
  *   "Resolved elsewhere" (it was answered during the gap), mirroring
  *   the missed `response.elicitation_resolved` event.
@@ -4395,11 +4401,22 @@ function reconcileElicitationBlocks(
     }
     return b;
   });
+  // A rebuilt answered card (an elicitation block carrying an itemId) proves
+  // its question ids answered for good — Codex confirmed the output. A live
+  // responded card does not: a failed reply re-parks those same ids.
+  const rebuiltQuestionKeys = new Set<string>();
+  for (const b of blocks) {
+    if (b.type !== "elicitation" || b.status !== "responded" || b.ctx.itemId === null) continue;
+    const key = userInputElicitationKey(b);
+    if (key !== null && key.startsWith("question-ids:")) rebuiltQuestionKeys.add(key);
+  }
   // Gap-fired prompts land at the bottom of the chat — the same
   // position the live stream would have given them.
-  const missing = snapshotPending.filter(
-    (b) => b.type === "elicitation" && !renderedIds.has(b.elicitationId),
-  );
+  const missing = snapshotPending.filter((b) => {
+    if (b.type !== "elicitation" || renderedIds.has(b.elicitationId)) return false;
+    const key = userInputElicitationKey(b);
+    return !(key !== null && key.startsWith("question-ids:") && rebuiltQuestionKeys.has(key));
+  });
   if (missing.length === 0 && !changed) return null;
   return [...patched, ...missing];
 }
@@ -4412,8 +4429,12 @@ function reconcileElicitationBlocks(
  * result lands — so a merge that pulls fresh items in alongside the
  * live tail would show the exchange twice. The two copies carry
  * different elicitation ids (the live one is minted per prompt and
- * never persisted), so they pair on what was asked instead. Only
- * answered cards are dropped: a still-parked prompt is the one the
+ * never persisted), so they pair on what was asked instead.
+ *
+ * A Codex card keys on the question's protocol ids, which name one exact
+ * instance — a rebuilt copy therefore proves that instance was answered,
+ * and the live copy is dropped whatever its status. Text-keyed cards
+ * (Claude) keep the answered-only rule: a pending prompt is the one the
  * user can act on, and no persisted item can rebuild it.
  *
  * @param liveBlocks - Blocks the live pump produced.
@@ -4459,15 +4480,25 @@ function withoutRebuiltUserInputCards(
   }
   if (rebuilt.size === 0) return liveBlocks;
   return liveBlocks.filter((b) => {
-    if (b.type !== "elicitation" || b.status !== "responded") return true;
+    if (b.type !== "elicitation") return true;
     const key = userInputElicitationKey(b);
-    return key === null || !rebuilt.has(key);
+    if (key === null || !rebuilt.has(key)) return true;
+    return key.startsWith("question-ids:") ? false : b.status !== "responded";
   });
 }
 
 // Prefix `itemsToBlocks` puts on a rebuilt card's elicitation id, naming the
 // persisted tool call that gated the question / plan (`answered:<call_id>`).
 const ANSWERED_ELICITATION_PREFIX = "answered:";
+
+// An id key names one exact question instance, so its rebuilt copy proves the
+// live copy was answered even while that copy still reads pending.
+function isClaimableLiveCopy(block: AnyBlock): block is ElicitationBlock {
+  if (block.type !== "elicitation") return false;
+  if (block.status === "responded") return true;
+  const key = userInputElicitationKey(block);
+  return key !== null && key.startsWith("question-ids:");
+}
 
 /**
  * Splice the reconnect backfill's committed `unseen` blocks into the live
@@ -4518,8 +4549,7 @@ function spliceReconnectBackfill(
     ) {
       const candidate = liveBlocks[i]!;
       if (
-        candidate.type === "elicitation" &&
-        candidate.status === "responded" &&
+        isClaimableLiveCopy(candidate) &&
         key !== null &&
         userInputElicitationKey(candidate) === key &&
         !claimedLive.has(i)
@@ -4535,7 +4565,7 @@ function spliceReconnectBackfill(
   const liveSlots = new Map<string, number[]>();
   for (let i = 0; i < liveBlocks.length; i += 1) {
     const b = liveBlocks[i]!;
-    if (b.type === "elicitation" && b.status === "responded" && !claimedLive.has(i)) {
+    if (isClaimableLiveCopy(b) && !claimedLive.has(i)) {
       const key = userInputElicitationKey(b);
       if (key !== null) {
         const slots = liveSlots.get(key);
@@ -5933,6 +5963,10 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   // other meta message (injected skill text) stays hidden.
   const marker = taskNotificationMarkerContent(content);
   if (marker !== null) return marker;
+  // A Codex question reply is protocol text, not prose: render the muted
+  // "[System: Question answered]" marker instead of the raw tags.
+  const replyMarker = codexQuestionReplyMarkerContent(content);
+  if (replyMarker !== null) return replyMarker;
   if (event.isMeta === true) return null;
   return content;
 }

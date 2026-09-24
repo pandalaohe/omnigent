@@ -120,6 +120,51 @@ describe("userInputElicitationKey", () => {
     const live = { askUserQuestion: questions, contentPreview: "" };
     const rebuilt = { askUserQuestion: { ...questions, extra: 1 }, contentPreview: "" };
     expect(userInputElicitationKey(live)).toBe(userInputElicitationKey(rebuilt));
+    // Claude's questions carry no ids, so the key stays the question text.
+    expect(userInputElicitationKey(live)).toBe('questions:["Which library?"]');
+  });
+
+  it("keys Codex questions by their protocol ids", () => {
+    const codex = {
+      askUserQuestion: {
+        questions: [
+          {
+            id: "call_abc:0",
+            question: "Which library?",
+            options: [{ label: "date-fns" }],
+            multiSelect: false,
+          },
+        ],
+      },
+      contentPreview: "",
+    };
+    expect(userInputElicitationKey(codex)).toBe('question-ids:["call_abc:0"]');
+    // Two questions of one call each carry their own id.
+    const two = {
+      askUserQuestion: {
+        questions: [
+          { id: "call_abc:0", question: "Q1", options: [{ label: "a" }], multiSelect: false },
+          { id: "call_abc:1", question: "Q2", options: [{ label: "b" }], multiSelect: false },
+        ],
+      },
+      contentPreview: "",
+    };
+    expect(userInputElicitationKey(two)).toBe('question-ids:["call_abc:0","call_abc:1"]');
+  });
+
+  it("falls back to the text key when any question lacks an id", () => {
+    // A half-id payload cannot name exact instances, so it must keep the
+    // old text key rather than pair two different calls.
+    const partial = {
+      askUserQuestion: {
+        questions: [
+          { id: "call_abc:0", question: "Q1", options: [{ label: "a" }], multiSelect: false },
+          { question: "Q2", options: [{ label: "b" }], multiSelect: false },
+        ],
+      },
+      contentPreview: "",
+    };
+    expect(userInputElicitationKey(partial)).toBe('questions:["Q1","Q2"]');
   });
 
   it("separates different questions, and plans from questions", () => {

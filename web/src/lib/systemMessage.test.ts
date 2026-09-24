@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import {
   claudeTaskNotificationMarker,
+  codexQuestionReplyMarker,
+  codexQuestionReplyMarkerContent,
   isSystemUserContent,
   parseSystemMessage,
   taskNotificationMarkerContent,
@@ -292,6 +294,86 @@ describe("Claude background-task notifications", () => {
           "[System: background task b3f9a2c1d completed]\n" +
           'Background command "air run" completed (exit code 0)',
       },
+    ]);
+  });
+});
+
+describe("Codex question replies", () => {
+  const itemId = (callId: string, index: number): string =>
+    JSON.stringify(["request_user_input_async", callId, index]);
+  const reply = (entries: unknown[]): string =>
+    `<send_user_message_question_reply>\n${JSON.stringify(entries)}\n</send_user_message_question_reply>`;
+
+  it("re-labels a reply as a marker whose header parses generically", () => {
+    const marker = codexQuestionReplyMarker(
+      reply([
+        { answer: "date-fns", question: "Which library?", questionItemId: itemId("call_abc", 0) },
+      ]),
+    );
+    expect(marker).toBe("[System: Question answered]\nWhich library? → date-fns");
+    // The generic branch already names it "Question answered" — no new kind.
+    expect(parseSystemMessage(marker!)).toEqual({
+      kind: "generic",
+      label: "Question answered",
+      body: "Which library? → date-fns",
+    });
+    // It is a system row, not a human turn: the consumed-event FIFO head
+    // must not be popped for it.
+    expect(isSystemUserContent([{ type: "input_text", text: marker! }])).toBe(true);
+  });
+
+  it("lists every answered question on its own line", () => {
+    const marker = codexQuestionReplyMarker(
+      reply([
+        { answer: "a", question: "Q1", questionItemId: itemId("call_abc", 0) },
+        { answer: "b", question: "Q2", questionItemId: itemId("call_abc", 1) },
+      ]),
+    );
+    expect(marker).toBe("[System: Question answered]\nQ1 → a\nQ2 → b");
+  });
+
+  it.each([
+    [
+      "malformed JSON",
+      "<send_user_message_question_reply>\nnot json\n</send_user_message_question_reply>",
+    ],
+    ["an empty entry list", reply([])],
+    [
+      "a questionItemId naming another tool",
+      reply([
+        {
+          answer: "B",
+          question: "Pick",
+          questionItemId: JSON.stringify(["request_user_input", "call_abc", 0]),
+        },
+      ]),
+    ],
+    [
+      "a non-integer question index",
+      reply([
+        {
+          answer: "B",
+          question: "Pick",
+          questionItemId: JSON.stringify(["request_user_input_async", "call_abc", "0"]),
+        },
+      ]),
+    ],
+    ["a missing questionItemId", reply([{ answer: "B", question: "Pick" }])],
+  ])("renders %s as raw text", (_name, text) => {
+    expect(codexQuestionReplyMarker(text)).toBeNull();
+  });
+
+  it("rejects a reply padded with prose", () => {
+    const valid = reply([{ answer: "B", question: "Pick", questionItemId: itemId("call_abc", 0) }]);
+    expect(codexQuestionReplyMarker(`please answer ${valid}`)).toBeNull();
+    expect(codexQuestionReplyMarker(`${valid} thanks`)).toBeNull();
+  });
+
+  it("finds the reply among a message's content blocks", () => {
+    const valid = reply([{ answer: "B", question: "Pick", questionItemId: itemId("call_abc", 0) }]);
+    expect(codexQuestionReplyMarkerContent([{ type: "input_text", text: "hi" }])).toBeNull();
+    expect(codexQuestionReplyMarkerContent([{ type: "input_text", text: valid }])).toEqual([
+      { type: "input_text", text: "[System: Question answered]\nPick → B" },
     ]);
   });
 });
