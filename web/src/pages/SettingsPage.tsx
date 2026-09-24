@@ -19,11 +19,12 @@
  * - **Account** — only when the accounts auth provider is active. Absorbs
  *   the old sidebar AccountMenu: signed-in identity, change password, and
  *   sign out.
- * - **Members** / **Policies** — admin-only, accounts deploys. Server-wide
- *   management surfaces rendered as settings sub-categories (previously
- *   standalone `/members` and `/policies` pages linked from Account) so
- *   entering them stays inside settings — the sidebar keeps the section nav
- *   instead of snapping back to the conversation list.
+ * - **Members** / **Policies** / **Global instructions** / **Sharing** —
+ *   admin-only, server-wide management surfaces rendered as settings
+ *   sub-categories (Members and Policies were previously standalone
+ *   `/members` and `/policies` pages linked from Account) so entering them
+ *   stays inside settings — the sidebar keeps the section nav instead of
+ *   snapping back to the conversation list.
  * - **Archived sessions** — archived sessions, moved out of the sidebar
  *   list. Not clickable; each row reveals Delete / Unarchive on hover, and
  *   Unarchive opens the restored session.
@@ -295,14 +296,20 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 
-// Admin-only management surfaces, rendered as the Members / Policies settings
-// sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
-// Lazy-loaded to keep the settings chunk small.
+// Admin-only management surfaces, rendered as the Members / Policies / Global
+// instructions / Sharing settings sub-categories. Visible to admins in all
+// modes (accounts, OIDC, single-user). Lazy-loaded to keep the settings chunk
+// small.
 const MembersPage = lazy(() =>
   import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
 );
 const PoliciesPage = lazy(() =>
   import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
+);
+const GlobalInstructionsPage = lazy(() =>
+  import("@/pages/GlobalInstructionsPage").then((m) => ({
+    default: m.GlobalInstructionsPage,
+  })),
 );
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
@@ -326,20 +333,28 @@ export function SettingsPage() {
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
 
-  // Members / Policies are admin-only management surfaces that own their full
-  // layout (their own PageScroll + admin gating), so they render directly —
-  // NOT inside the shared section PageScroll below, which would nest two
-  // scroll containers. Both self-gate to admins server-side and client-side.
+  // Members / Policies / Global instructions / Sharing are admin-only
+  // management surfaces that own their full layout (their own PageScroll +
+  // admin gating), so they render directly — NOT inside the shared section
+  // PageScroll below, which would nest two scroll containers. All self-gate to
+  // admins server-side and client-side.
   // Rendered in ANY multi-user mode (accounts AND OIDC), not gated on
   // `accountsEnabled` — the nav + pages handle admin gating, and Members runs
   // read-only under OIDC (no password actions).
-  if (section === "members" || section === "policies" || section === "sharing") {
+  if (
+    section === "members" ||
+    section === "policies" ||
+    section === "global-instructions" ||
+    section === "sharing"
+  ) {
     return (
       <Suspense fallback={null}>
         {section === "members" ? (
           <MembersPage />
         ) : section === "policies" ? (
           <PoliciesPage />
+        ) : section === "global-instructions" ? (
+          <GlobalInstructionsPage />
         ) : (
           <SharingPage />
         )}
