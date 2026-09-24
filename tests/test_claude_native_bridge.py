@@ -11587,14 +11587,17 @@ class _ScriptedPolicyClient:
     """Fake runner policy client with a scripted body or failure.
 
     :param body: JSON body for every response, or ``None`` to raise.
+    :param fail_first: Number of initial calls that raise before the body.
     """
 
-    def __init__(self, body: dict[str, object] | None) -> None:
+    def __init__(self, body: dict[str, object] | None, fail_first: int = 0) -> None:
         """Store the script.
 
         :param body: Response payload; ``None`` makes every call raise.
+        :param fail_first: Number of initial calls that raise.
         """
         self.body = body
+        self.fail_first = fail_first
         self.calls = 0
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
@@ -11608,7 +11611,7 @@ class _ScriptedPolicyClient:
 
         del url, json
         self.calls += 1
-        if self.body is None:
+        if self.body is None or self.calls <= self.fail_first:
             raise ConnectionError("scripted transport failure")
         raw = _json.dumps(self.body).encode("utf-8")
         return SimpleNamespace(
@@ -11711,6 +11714,14 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
+    # Zero the relay's re-attempt waits (same lengths): PreToolUse now sits
+    # on the long schedule, whose real waits sum to ~141s.
+    monkeypatch.setattr(claude_native_bridge, "_POLICY_EVAL_RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
+        (0.0,) * 11,
+    )
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -11730,6 +11741,85 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_pre_tool_use_rides_out_an_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PreToolUse retries past the short schedule; UserPromptSubmit does not.
+
+    Seven straight failures exhaust the two 0.4s re-attempts, so the
+    eighth PreToolUse call's ALLOW must still be the answer. The same
+    outage on UserPromptSubmit — whose 30s hook budget cannot fit the
+    long PreToolUse waits — falls back to the fail-closed block after
+    three calls.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_POLICY_EVAL_RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
+        (0.0,) * 11,
+    )
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_ALLOW"}, fail_first=7)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert body == "", f"a late ALLOW must come back empty, got {body!r}"
+        assert client.calls == 8, f"PreToolUse must spend all 8 attempts, saw {client.calls}"
+
+        # Replay the same outage for UserPromptSubmit, whose schedule is
+        # the short one: the third failed call is its last.
+        client.calls = 0
+        prompt_body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "UserPromptSubmit", "prompt": "hi"},
+        )
+        output = json.loads(prompt_body)
+        assert output["decision"] == "block", f"UserPromptSubmit must fail closed, got {output!r}"
+        assert client.calls == 3, f"UserPromptSubmit keeps the short schedule, saw {client.calls}"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_pre_tool_use_budget_stops_re_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spent wall-clock budget ends PreToolUse re-attempts at the fallback.
+
+    With no budget left, the pre-re-attempt check must fire before the
+    second call, so the single failure falls through to the fail-closed
+    "ask" hook output instead of spending the remaining schedule.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_POLICY_EVAL_RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
+        (0.0,) * 12,
+    )
+    monkeypatch.setattr(claude_native_bridge, "_PRE_TOOL_USE_POLICY_EVAL_RETRY_BUDGET_S", 0.0)
+    client = _ScriptedPolicyClient(None)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert client.calls == 1, f"budget must stop re-attempts, saw {client.calls}"
     finally:
         relay.close()
 

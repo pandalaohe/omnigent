@@ -225,6 +225,24 @@ _TOOL_CALL_TIMEOUT_S = 300.0
 # below the real round-trip latency under load, so slow-but-healthy calls
 # (session history reads, shell) tripped it and crashed the bridge.
 _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
+# Re-attempt delays for the policy-eval relay, indexed by re-attempt
+# (entry 0 spaces attempt 2). Claude Code gives a PreToolUse command hook
+# 600s by default, so PreToolUse's ~141s of waits plus the attempts fit
+# inside that budget — long enough to ride out a multi-minute DNS outage
+# instead of forcing an approval card. No other event may share it:
+# UserPromptSubmit's hook budget is 30s and a timed-out hook does not
+# block, so those waits there would turn its fail-closed into fail-open.
+# The budget below stops the re-attempts so the last one still gets ~300s
+# of the 600s hook timeout; a read that hangs without its own timeout is
+# pre-existing and not bounded here.
+_POLICY_EVAL_RETRY_DELAYS_S: tuple[float, ...] = (0.4, 0.4)
+_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S: tuple[float, ...] = (
+    0.4,
+    0.4,
+    *(8.0,) * 5,
+    *(20.0,) * 5,
+)
+_PRE_TOOL_USE_POLICY_EVAL_RETRY_BUDGET_S = 300.0
 # Backstop per-request threads above any expected client tool-call fan-out.
 _MAX_CONCURRENT_MCP_REQUESTS = 64
 # Web-UI → Claude input now flows through tmux send-keys, not
@@ -6370,6 +6388,7 @@ def _tool_relay_handler_factory(
             # subprocesses import it); the relay runs inside the runner
             # process where these modules are already loaded.
             from omnigent.native.native_policy_hook import (
+                _PRE_TOOL_USE,
                 evaluation_response_to_hook_output,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
@@ -6401,9 +6420,24 @@ def _tool_relay_handler_factory(
             url = f"/v1/sessions/{_up.quote(session_id, safe='')}/policies/evaluate"
             verdict: object = None
             last_error: str | None = None
-            for attempt in range(3):
+            delays = (
+                _PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S
+                if hook_event == _PRE_TOOL_USE
+                else _POLICY_EVAL_RETRY_DELAYS_S
+            )
+            started_at = time.monotonic()
+            attempts = 0
+            for attempt in range(len(delays) + 1):
                 if attempt:
-                    time.sleep(0.4)
+                    delay = delays[attempt - 1]
+                    if (
+                        hook_event == _PRE_TOOL_USE
+                        and time.monotonic() - started_at + delay
+                        > _PRE_TOOL_USE_POLICY_EVAL_RETRY_BUDGET_S
+                    ):
+                        break
+                    time.sleep(delay)
+                attempts += 1
                 future = asyncio.run_coroutine_threadsafe(
                     policy_client.post(url, json=request_body), loop
                 )
@@ -6423,9 +6457,10 @@ def _tool_relay_handler_factory(
             if not isinstance(verdict, dict) or not verdict.get("result"):
                 _logger.warning(
                     "policy_eval_relay_failure: session=%s hook_event=%s "
-                    "attempts=3 last_error=%r; falling back to fail-closed",
+                    "attempts=%d last_error=%r; falling back to fail-closed",
                     session_id,
                     hook_event,
+                    attempts,
                     last_error,
                     extra={"session_id": session_id},
                 )
