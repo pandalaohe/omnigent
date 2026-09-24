@@ -1401,6 +1401,124 @@ describe("chatStore — switchTo", () => {
     expect(reconciled[0]!.response).toEqual({ action: "auto_resolved" });
   });
 
+  it("does not resurrect the rebuilt Codex question card from a stale snapshot on tab focus", async () => {
+    // A reconnect reconcile drops the live pending copy once history has
+    // rebuilt the answered card, but the snapshot fetched beside it can still
+    // list the question as parked (its resolve landed after the fetch). If the
+    // snapshot copy is re-appended, the dropped card comes back clickable
+    // beside the answered one.
+    vi.useFakeTimers();
+    const sinks: StreamSink[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        // Honor the attempt abort like the real fetch does, so the wake
+        // recycle can actually sever the stream.
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const questionEvent = (elicitationId: string, questionId: string) => ({
+      type: "response.elicitation_request",
+      elicitation_id: elicitationId,
+      params: {
+        mode: "form",
+        message: "Codex needs input",
+        requestedSchema: null,
+        phase: "pre_tool_use",
+        policy_name: "codex_native_permission",
+        content_preview: "",
+        ask_user_question: {
+          questions: [
+            {
+              id: questionId,
+              question: "Pick a flavour",
+              options: [{ label: "Vanilla" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+    });
+    seedSession("conv_codex_rebuilt", [userMessage("resp_1", "ask me")]);
+    seedPendingElicitations("conv_codex_rebuilt", [
+      questionEvent("elicit_codex_q0", "call_async:0"),
+    ]);
+
+    await useChatStore.getState().switchTo("conv_codex_rebuilt");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sinks).toHaveLength(1);
+    const cards = () =>
+      useChatStore.getState().blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0]!.status).toBe("pending");
+
+    // The TUI answered question 0 while the tab slept: the call and its output
+    // land in history, and a second question fired during the gap. The
+    // reconnecting snapshot still lists question 0 as parked.
+    seedSessionItems("conv_codex_rebuilt", [
+      userMessage("resp_1", "ask me"),
+      {
+        id: "fc_async",
+        response_id: "resp_1",
+        type: "function_call",
+        status: "completed",
+        name: "request_user_input_async",
+        arguments: JSON.stringify({
+          questions: [
+            {
+              id: "call_async:0",
+              question: "Pick a flavour",
+              options: [{ label: "Vanilla" }],
+              multiSelect: false,
+            },
+          ],
+        }),
+        call_id: "call_async:0",
+        model: "codex-native-ui",
+      },
+      {
+        id: "fco_async",
+        response_id: "resp_1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_async:0",
+        output: "Vanilla",
+      },
+    ]);
+    seedPendingElicitations("conv_codex_rebuilt", [
+      questionEvent("elicit_codex_q0", "call_async:0"),
+      questionEvent("elicit_codex_q1", "call_async:1"),
+    ]);
+
+    // Tab focus after a sleep: the stale stream is recycled into a reconnect,
+    // whose reconcile rebuilds the answered card.
+    await vi.advanceTimersByTimeAsync(SSE_STALE_RECYCLE_MS + 1_000);
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Question 0 renders once — the rebuilt card — and not the snapshot's
+    // still-pending copy.
+    const rebuilt = cards().filter((c) => c.ctx.itemId === "fc_async:answer");
+    expect(rebuilt).toHaveLength(1);
+    expect(rebuilt[0]!.status).toBe("responded");
+    expect(cards().some((c) => c.elicitationId === "elicit_codex_q0")).toBe(false);
+    // The distinct parked question in the same snapshot survives.
+    const parked = cards().filter((c) => c.elicitationId === "elicit_codex_q1");
+    expect(parked).toHaveLength(1);
+    expect(parked[0]!.status).toBe("pending");
+
+    const last = sinks[sinks.length - 1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
   it("does not abort a conversation's stream when switching away", async () => {
     const sink = pushableStream();
     seedSession("conv_a", []);

@@ -4343,7 +4343,9 @@ async function reconcileActiveSessionStatus(
  * the source of truth for what is still parked. Three reconciliations:
  *
  * - A prompt in the snapshot with no rendered card → append a fresh
- *   pending card (it fired during the gap).
+ *   pending card (it fired during the gap) — unless a rebuilt answered
+ *   copy of the same Codex question ids is already rendered, which makes
+ *   the snapshot copy the stale half of the rebuild.
  * - A rendered pending card absent from the snapshot → flip to
  *   "Resolved elsewhere" (it was answered during the gap), mirroring
  *   the missed `response.elicitation_resolved` event.
@@ -4399,11 +4401,22 @@ function reconcileElicitationBlocks(
     }
     return b;
   });
+  // A rebuilt answered card (an elicitation block carrying an itemId) proves
+  // its question ids answered for good — Codex confirmed the output. A live
+  // responded card does not: a failed reply re-parks those same ids.
+  const rebuiltQuestionKeys = new Set<string>();
+  for (const b of blocks) {
+    if (b.type !== "elicitation" || b.status !== "responded" || b.ctx.itemId === null) continue;
+    const key = userInputElicitationKey(b);
+    if (key !== null && key.startsWith("question-ids:")) rebuiltQuestionKeys.add(key);
+  }
   // Gap-fired prompts land at the bottom of the chat — the same
   // position the live stream would have given them.
-  const missing = snapshotPending.filter(
-    (b) => b.type === "elicitation" && !renderedIds.has(b.elicitationId),
-  );
+  const missing = snapshotPending.filter((b) => {
+    if (b.type !== "elicitation" || renderedIds.has(b.elicitationId)) return false;
+    const key = userInputElicitationKey(b);
+    return !(key !== null && key.startsWith("question-ids:") && rebuiltQuestionKeys.has(key));
+  });
   if (missing.length === 0 && !changed) return null;
   return [...patched, ...missing];
 }
