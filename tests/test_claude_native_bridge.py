@@ -4407,6 +4407,54 @@ def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
     )
 
 
+def test_augment_claude_args_pins_policy_hook_timeouts(tmp_path: Path) -> None:
+    """
+    The policy hook pins the timeouts its retry budgets are sized against.
+
+    PreToolUse's 300s tool-call retry budget must land inside the 600s
+    hook, and UserPromptSubmit's 15s prompt budget inside the 30s hook:
+    Claude Code kills a hook at its timeout and a killed hook does not
+    block, so inheriting a changed CLI default would silently flip that
+    fail-closed into a fail-open. PostToolUse keeps the inherited default.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    settings = _load_invocation_settings(args)
+
+    pre_policy = [
+        hook
+        for entry in settings["hooks"]["PreToolUse"]
+        if "matcher" not in entry
+        for hook in entry["hooks"]
+        if "evaluate-policy" in hook["command"]
+    ]
+    assert len(pre_policy) == 1, f"expected one PreToolUse policy hook, got {pre_policy!r}"
+    assert pre_policy[0]["timeout"] == 600
+
+    prompt_policy = [
+        hook
+        for entry in settings["hooks"]["UserPromptSubmit"]
+        for hook in entry["hooks"]
+        if "evaluate-policy" in hook["command"]
+    ]
+    assert len(prompt_policy) == 1, f"expected one prompt policy hook, got {prompt_policy!r}"
+    assert prompt_policy[0]["timeout"] == 30
+
+    post_policy = [
+        hook
+        for entry in settings["hooks"]["PostToolUse"]
+        for hook in entry["hooks"]
+        if "evaluate-policy" in hook["command"]
+    ]
+    assert post_policy, "the PostToolUse policy hook must still be registered"
+    assert "timeout" not in post_policy[0], "PostToolUse must keep the inherited default"
+
+
 def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server(
     tmp_path: Path,
 ) -> None:
@@ -11716,7 +11764,11 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
     # Zero every wait so the test never sleeps; the tuple lengths mirror the
     # live schedules (PreToolUse's fills the shared TOOL_CALL retry budget).
-    monkeypatch.setattr(claude_native_bridge, "_POLICY_EVAL_RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_POLICY_EVAL_RETRY_DELAYS_S",
+        (0.0,) * len(claude_native_bridge._POLICY_EVAL_RETRY_DELAYS_S),
+    )
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
@@ -11757,7 +11809,11 @@ async def test_hook_evaluate_pre_tool_use_rides_out_an_outage(
     whose 30s hook budget cannot fit the long PreToolUse waits — falls back
     to the fail-closed block after three calls.
     """
-    monkeypatch.setattr(claude_native_bridge, "_POLICY_EVAL_RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_POLICY_EVAL_RETRY_DELAYS_S",
+        (0.0,) * len(claude_native_bridge._POLICY_EVAL_RETRY_DELAYS_S),
+    )
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
@@ -11801,7 +11857,11 @@ async def test_hook_evaluate_pre_tool_use_budget_stops_re_attempts(
     second call, so the single failure falls through to the fail-closed
     "ask" hook output instead of spending the remaining schedule.
     """
-    monkeypatch.setattr(claude_native_bridge, "_POLICY_EVAL_RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_POLICY_EVAL_RETRY_DELAYS_S",
+        (0.0,) * len(claude_native_bridge._POLICY_EVAL_RETRY_DELAYS_S),
+    )
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",

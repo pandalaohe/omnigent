@@ -646,6 +646,10 @@ async def _evaluate_policy_via_omnigent(
     the verdict back to the harness as a ``policy_verdict`` inbound
     event.
 
+    Transient transport errors and 5xx responses are retried within the
+    phase's policy budget before the default below applies, so a short
+    outage does not flip the gate for an in-flight tool call.
+
     On failure (AP unreachable, non-200, malformed response) the default
     verdict is phase-aware:
 
@@ -688,29 +692,41 @@ async def _evaluate_policy_via_omnigent(
     )
     verdict_data: _JsonObject | None = None
 
+    from omnigent.native.native_policy_hook import post_evaluate_with_retry_async
+
     try:
-        ap_resp = await server_client.post(
+        # A TOOL_CALL/LLM_REQUEST/REQUEST ASK parks server-side in
+        # ``_hold_native_ask_gate`` until a human resolves it (up to the
+        # deciding policy's ``ask_timeout``, default one day). A 30s read
+        # budget here severed that long-poll after 30s — the server saw an
+        # UPSTREAM DISCONNECT and failed the gate closed (DENY), so the
+        # main (claude-sdk) agent's approval card auto-resolved while
+        # native sub-agents (whose hooks already wait the full day) parked
+        # correctly. Hold the read budget at one day to match the native
+        # hooks' ``_EVALUATE_POLICY_TIMEOUT_S``; the server's ``ask_timeout``
+        # remains the single real cap. Fast connect so an unreachable
+        # server still fails out promptly into the fail-open path below.
+        ap_resp, ap_error = await post_evaluate_with_retry_async(
+            server_client,
             f"/v1/sessions/{conversation_id}/policies/evaluate",
-            json={
+            {
                 "event": {
                     "type": phase,
                     "data": data,
                 },
             },
-            # A TOOL_CALL/LLM_REQUEST/REQUEST ASK parks server-side in
-            # ``_hold_native_ask_gate`` until a human resolves it (up to the
-            # deciding policy's ``ask_timeout``, default one day). A 30s read
-            # budget here severed that long-poll after 30s — the server saw an
-            # UPSTREAM DISCONNECT and failed the gate closed (DENY), so the
-            # main (claude-sdk) agent's approval card auto-resolved while
-            # native sub-agents (whose hooks already wait the full day) parked
-            # correctly. Hold the read budget at one day to match the native
-            # hooks' ``_EVALUATE_POLICY_TIMEOUT_S``; the server's ``ask_timeout``
-            # remains the single real cap. Fast connect so an unreachable
-            # server still fails out promptly into the fail-open path below.
-            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+            _ASK_GATE_DELIVERY_TIMEOUT,
+            "runner policy evaluate",
         )
-        if ap_resp.status_code == 200:
+        if ap_resp is None:
+            _logger.warning(
+                "AP policy evaluate failed for %s; defaulting to %s: %s",
+                evaluation_id,
+                _default_action,
+                ap_error,
+                extra={"session_id": conversation_id},
+            )
+        elif ap_resp.status_code == 200:
             result = ap_resp.json()
             # A well-formed 200 carries "result"; a malformed body that
             # omits it falls back to _default_action — i.e. DENY on a

@@ -541,7 +541,7 @@ def test_post_evaluate_with_retry_reparks_a_held_ask_poll_the_gateway_severed(
     A held ASK poll the gateway severs re-POSTs the same id and spends no budget.
 
     The Databricks front door caps any request at 300s and answers 504 (or
-    tears the connection down). The transient budget is 30s from the first
+    tears the connection down). The transient budget is 15s from the first
     attempt, so counting that 504 as a fault exhausted it at once and an
     unattended ASK gate failed closed after five minutes.
     """

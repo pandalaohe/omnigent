@@ -21,6 +21,7 @@ model sees it).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import shlex
@@ -31,12 +32,22 @@ from typing import NotRequired, TypedDict
 
 import httpx
 
-# How long the request / result phases keep retrying transient 5xx /
-# connect errors on the policy evaluate POST before failing closed.
-# Keeps those gates from blocking long on a sick server while still
-# absorbing brief DB hiccups on a hosted deployment. A gateway-severed
-# held poll resets it — see :func:`post_evaluate_with_retry`.
-_EVALUATE_POLICY_RETRY_BUDGET_S = 30.0
+_logger = logging.getLogger(__name__)
+
+# How long every non-tool-call phase (request / result) keeps retrying
+# transient 5xx / connect errors on the policy evaluate POST before
+# failing closed. Keeps those gates from blocking long on a sick server
+# while still absorbing brief DB hiccups on a hosted deployment. The
+# budget must also land the fail-closed block inside the tightest
+# retrying caller's prompt hook timeout: Claude Code kills a
+# UserPromptSubmit hook at 30s and a killed hook does not block, so a
+# budget that outlasted it would turn the block into a fail-open. Sized
+# 30 - (5 TCP + 5 TLS) - 2 (hook start-up and the failed relay curl) -
+# 3 (margin) = 15: an attempt started just under it can still spend 5s
+# in TCP connect plus 5s in the TLS handshake (httpcore times connect_tcp
+# and start_tls separately) before it fails. A gateway-severed held poll
+# resets it — see :func:`post_evaluate_with_retry`.
+_EVALUATE_POLICY_RETRY_BUDGET_S = 15.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 # The tool-call phase gets its own, much longer budget: every harness
@@ -596,6 +607,26 @@ def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str
     return fail_closed_hook_output(hook_event, detail)
 
 
+def _retry_budget_for_request(
+    eval_request: Mapping[str, object],
+) -> tuple[float, float]:
+    """Return the ``(budget_s, max_backoff_s)`` a request's phase retries within.
+
+    A ``PHASE_TOOL_CALL`` gate takes :data:`TOOL_CALL_POLICY_RETRY_BUDGET_S`
+    with the tool-call backoff cap: its harness hook timeout sits far above
+    it, so the call can ride out a multi-minute outage. Every other phase
+    keeps :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`, which must land its
+    fail-closed block before a prompt hook's kill.
+
+    :param eval_request: ``EvaluationRequest`` JSON body about to be POSTed.
+    :returns: ``(retry_budget_s, max_backoff_s)`` for its event phase.
+    """
+    event = eval_request.get("event")
+    if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_CALL:
+        return TOOL_CALL_POLICY_RETRY_BUDGET_S, _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
+    return _EVALUATE_POLICY_RETRY_BUDGET_S, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
+
+
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],
@@ -666,13 +697,7 @@ def post_evaluate_with_retry(
     # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
     elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
-    event = eval_request.get("event")
-    if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_CALL:
-        retry_budget_s = TOOL_CALL_POLICY_RETRY_BUDGET_S
-        max_backoff_s = _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
-    else:
-        retry_budget_s = _EVALUATE_POLICY_RETRY_BUDGET_S
-        max_backoff_s = _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
+    retry_budget_s, max_backoff_s = _retry_budget_for_request(eval_request)
     deadline = time.monotonic() + retry_budget_s
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
@@ -797,4 +822,86 @@ def post_evaluate_with_retry(
             return None, f"retry budget exhausted (last error: {last_error})"
         # Two-step backoff; not worth a retry library in this dependency-light hook.
         time.sleep(backoff_s)
+        backoff_s = min(backoff_s * 2, max_backoff_s)
+
+
+async def post_evaluate_with_retry_async(
+    client: httpx.AsyncClient,
+    url: str,
+    eval_request: Mapping[str, object],
+    timeout: httpx.Timeout | float,
+    hook_label: str,
+) -> tuple[httpx.Response, None] | tuple[None, str]:
+    """
+    Async twin of :func:`post_evaluate_with_retry` for in-runner callers.
+
+    Retries :class:`httpx.TransportError` and 5xx responses within the same
+    phase-dependent budget (:func:`_retry_budget_for_request`), so an
+    in-flight tool call rides out a short server/DNS outage instead of
+    failing the caller's gate closed. A 4xx response and any non-transport
+    client error are final, as are empty / non-JSON bodies (the caller owns
+    the response parse). A stable ``_omnigent_elicitation_id`` is minted
+    once and stamped on every attempt, so a retry re-attaches to a parked
+    ASK instead of raising a second approval card. Unlike the sync helper
+    there is no held-poll budget reset: these callers already hold a
+    day-long read timeout, so a poll severed late enough to matter is past
+    the budget and falls back to the caller's fail-closed default.
+
+    :param client: Async HTTP client pointed at the Omnigent server.
+    :param url: Evaluate endpoint path/URL for the session.
+    :param eval_request: ``EvaluationRequest`` JSON body to POST.
+    :param timeout: Per-attempt timeout (``httpx.Timeout`` or seconds),
+        large enough to accommodate a parked ASK gate.
+    :param hook_label: Diagnostic label used in retry log records.
+    :returns: ``(response, error)`` — on success, ``(response, None)``; on
+        failure, ``(None, short_error_string)``.
+    """
+    # Lazy import: only the async callers pay for it; hook subprocesses use
+    # the sync helper.
+    import asyncio
+
+    # One stable id for the whole retry sequence; see the sync helper.
+    elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
+    request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
+    retry_budget_s, max_backoff_s = _retry_budget_for_request(eval_request)
+    deadline = time.monotonic() + retry_budget_s
+    backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
+    last_error = "unknown error"
+    while True:
+        try:
+            resp = await client.post(url, json=request_body, timeout=timeout)
+        except httpx.TransportError as exc:
+            last_error = f"connection error: {exc}"
+            _logger.warning("omnigent %s: Omnigent request failed; retrying: %s", hook_label, exc)
+        except httpx.HTTPError as exc:
+            last_error = f"request error: {exc}"
+            _logger.warning("omnigent %s: Omnigent request failed: %s", hook_label, exc)
+            return None, last_error
+        else:
+            if resp.status_code >= 500:
+                last_error = f"server returned {resp.status_code}"
+                _logger.warning(
+                    "omnigent %s: Omnigent returned %s; retrying",
+                    hook_label,
+                    resp.status_code,
+                )
+            elif resp.status_code >= 400:
+                body_preview = resp.text[:200] if resp.content else ""
+                last_error = f"server returned {resp.status_code}" + (
+                    f": {body_preview}" if body_preview else ""
+                )
+                _logger.warning("omnigent %s: %s", hook_label, last_error)
+                return None, last_error
+            else:
+                # 2xx (and any 3xx, which every caller treats as a non-200
+                # failure) — the caller owns the body parse.
+                return resp, None
+        # The next attempt starts after this backoff sleeps, so it is within
+        # budget iff its start is; an attempt that starts inside the budget
+        # runs to completion, landing the fallback at most one attempt past
+        # it (each attempt's read budget is bounded).
+        if time.monotonic() + backoff_s > deadline:
+            _logger.warning("omnigent %s: retry budget exhausted", hook_label)
+            return None, f"retry budget exhausted (last error: {last_error})"
+        await asyncio.sleep(backoff_s)
         backoff_s = min(backoff_s * 2, max_backoff_s)

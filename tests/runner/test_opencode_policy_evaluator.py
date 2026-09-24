@@ -10,15 +10,23 @@ mapping, and — critically — that every failure mode fails CLOSED.
 from __future__ import annotations
 
 import json as _json
+import re
 from typing import Any
 
 import httpx
+import pytest
 
+from omnigent.native import native_policy_hook
 from omnigent.runner.app import _build_opencode_policy_evaluator
 
 
 class _FakeServerClient:
-    """httpx-shaped stub recording the policy-evaluate POST."""
+    """httpx-shaped stub recording the policy-evaluate POST.
+
+    :param script: Optional per-call outcomes. Each entry is an exception to
+        raise or a ``(status, body)`` response tuple; the last entry repeats
+        once the script runs out.
+    """
 
     def __init__(
         self,
@@ -26,14 +34,23 @@ class _FakeServerClient:
         status: int = 200,
         body: dict[str, Any] | None = None,
         raise_exc: Exception | None = None,
+        script: list[Any] | None = None,
     ) -> None:
         self._status = status
         self._body = body
         self._raise_exc = raise_exc
+        self._script = list(script) if script is not None else None
         self.calls: list[tuple[str, dict[str, Any], Any]] = []
 
     async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> httpx.Response:
         self.calls.append((url, json, timeout))
+        if self._script is not None:
+            step = self._script.pop(0) if len(self._script) > 1 else self._script[0]
+            if isinstance(step, Exception):
+                raise step
+            status, body = step
+            content = b"" if body is None else _json.dumps(body).encode()
+            return httpx.Response(status, content=content, request=httpx.Request("POST", url))
         if self._raise_exc is not None:
             raise self._raise_exc
         content = b"" if self._body is None else _json.dumps(self._body).encode()
@@ -83,7 +100,12 @@ async def test_evaluator_maps_unknown_verdict_to_ask() -> None:
     assert (await evaluate({"action": "bash"})) == {"decision": "ask"}
 
 
-async def test_evaluator_fails_closed_on_transport_error() -> None:
+async def test_evaluator_fails_closed_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Zero the retry budget: this stub fails instantly, and the real budget
+    # would make the test wait its full backoff schedule out.
+    monkeypatch.setattr(native_policy_hook, "TOOL_CALL_POLICY_RETRY_BUDGET_S", 0.0)
     client = _FakeServerClient(raise_exc=httpx.ConnectError("boom"))
     evaluate = _build_opencode_policy_evaluator(
         server_client=client,  # type: ignore[arg-type]
@@ -92,7 +114,10 @@ async def test_evaluator_fails_closed_on_transport_error() -> None:
     assert (await evaluate({"action": "bash"})) == {"decision": "deny"}
 
 
-async def test_evaluator_fails_closed_on_non_200_or_empty_body() -> None:
+async def test_evaluator_fails_closed_on_non_200_or_empty_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(native_policy_hook, "TOOL_CALL_POLICY_RETRY_BUDGET_S", 0.0)
     for status, body in ((500, {"result": "POLICY_ACTION_ALLOW"}), (200, None)):
         client = _FakeServerClient(status=status, body=body)
         evaluate = _build_opencode_policy_evaluator(
@@ -100,3 +125,65 @@ async def test_evaluator_fails_closed_on_non_200_or_empty_body() -> None:
             conversation_id="c",
         )
         assert (await evaluate({"action": "bash"})) == {"decision": "deny"}
+
+
+async def test_evaluator_rides_out_transient_failures_with_one_elicitation_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5xx and a connect failure are retried; the late ALLOW is the verdict.
+
+    Every attempt must carry the SAME elicitation id, so a retry re-attaches
+    to a parked ASK instead of publishing a second approval card.
+    """
+
+    async def _no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeServerClient(
+        script=[
+            (500, {"result": "POLICY_ACTION_ALLOW"}),
+            httpx.ConnectError("dns outage"),
+            (200, {"result": "POLICY_ACTION_ALLOW"}),
+        ]
+    )
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    assert (await evaluate({"action": "bash"})) == {"decision": "allow"}
+    assert len(client.calls) == 3, "both transient failures must be retried"
+    ids = {body["_omnigent_elicitation_id"] for _, body, _ in client.calls}
+    assert len(ids) == 1, "every attempt must re-use one elicitation id"
+    assert re.fullmatch(r"elicit_evaluate_[0-9a-f]{32}", ids.pop())
+
+
+async def test_evaluator_denies_4xx_without_retry() -> None:
+    client = _FakeServerClient(script=[(400, {"error": "bad request"})])
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    assert (await evaluate({"action": "bash"})) == {"decision": "deny"}
+    assert len(client.calls) == 1, "a 4xx is final and must not be retried"
+
+
+async def test_evaluator_persistent_outage_stops_within_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent outage denies once the start-of-attempt budget rule fires."""
+    sleeps: list[float] = []
+
+    async def _record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("asyncio.sleep", _record_sleep)
+    monkeypatch.setattr(native_policy_hook, "TOOL_CALL_POLICY_RETRY_BUDGET_S", 3.5)
+    client = _FakeServerClient(raise_exc=httpx.ConnectError("server down"))
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    assert (await evaluate({"action": "bash"})) == {"decision": "deny"}
+    assert len(client.calls) == 3, "attempts must stop once the next start passes the budget"
+    assert sleeps == [1.0, 2.0], "backoff must double from 1s and stop at the budget"

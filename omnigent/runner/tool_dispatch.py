@@ -8600,9 +8600,13 @@ async def _evaluate_async_tool_call_policy(
     An ASK verdict parks the gate server-side (up to the policy's
     ``ask_timeout``) and blocks the background task until resolved or timed
     out — ``sys_cancel_async`` cannot interrupt a parked evaluation.
+    Transient transport errors and 5xx responses are retried within the
+    shared tool-call budget before failing closed.
 
     :returns: ``True`` when the tool may proceed; ``False`` to DENY.
     """
+    from omnigent.native.native_policy_hook import post_evaluate_with_retry_async
+
     evaluation_id = f"poleval_async_{uuid.uuid4().hex[:12]}"
     phase = "PHASE_TOOL_CALL"
     try:
@@ -8612,25 +8616,33 @@ async def _evaluate_async_tool_call_policy(
                 arguments_dict = {}
         except (json.JSONDecodeError, ValueError):
             arguments_dict = {}
-        resp = await server_client.post(
+        resp, api_error = await post_evaluate_with_retry_async(
+            server_client,
             f"/v1/sessions/{conversation_id}/policies/evaluate",
-            json={
-                "event": {"type": phase, "data": {"name": tool_name, "arguments": arguments_dict}}
-            },
-            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+            {"event": {"type": phase, "data": {"name": tool_name, "arguments": arguments_dict}}},
+            _ASK_GATE_DELIVERY_TIMEOUT,
+            "runner async PHASE_TOOL_CALL evaluate",
         )
-        if resp.status_code == 200:
+        if resp is None:
+            _logger.warning(
+                "async PHASE_TOOL_CALL policy evaluate failed for %s; denying: %s",
+                evaluation_id,
+                api_error,
+                extra={"session_id": conversation_id},
+            )
+        elif resp.status_code == 200:
             result = _string_object_dict(resp.json())
             if result is None:
                 return False
             action = result.get("result", "POLICY_ACTION_DENY")
             return bool(action == "POLICY_ACTION_ALLOW" or action == "POLICY_ACTION_UNSPECIFIED")
-        _logger.warning(
-            "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
-            resp.status_code,
-            evaluation_id,
-            extra={"session_id": conversation_id},
-        )
+        else:
+            _logger.warning(
+                "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
+                resp.status_code,
+                evaluation_id,
+                extra={"session_id": conversation_id},
+            )
     except Exception:  # noqa: BLE001
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",

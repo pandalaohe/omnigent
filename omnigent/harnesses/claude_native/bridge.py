@@ -230,7 +230,7 @@ _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
 # shared ``TOOL_CALL_POLICY_RETRY_BUDGET_S`` (imported from
 # ``omnigent.native.native_policy_hook`` where the relay reads it), and
 # that budget — not the tuple — ends the re-attempts, so the last one
-# still starts inside Claude Code's 600s default PreToolUse hook timeout.
+# still starts inside the pinned 600s PreToolUse hook timeout.
 # Long enough to ride out a multi-minute DNS outage instead of forcing an
 # approval card. No other event may share it: UserPromptSubmit's hook
 # budget is 30s and a timed-out hook does not block, so those waits there
@@ -2419,16 +2419,30 @@ def build_hook_settings(
             "&& { printf '%s' \"$out\"; exit 0; }; fi; "
             f"printf '%s' \"$p\" | {evaluate_policy_python}"
         )
+        # PostToolUse keeps the inherited default. PreToolUse pins 600s for
+        # the 300s tool-call budget; UserPromptSubmit pins 30s, which the
+        # Python fallback's prompt budget (``_EVALUATE_POLICY_RETRY_BUDGET_S``,
+        # 15s) is sized against.
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
             "command": evaluate_policy_command,
+        }
+        evaluate_policy_pre_tool_use_hook: _JsonObject = {
+            "type": "command",
+            "command": evaluate_policy_command,
+            "timeout": 600,
+        }
+        evaluate_policy_prompt_hook: _JsonObject = {
+            "type": "command",
+            "command": evaluate_policy_command,
+            "timeout": 30,
         }
 
         # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
         # permission prompt for the question in every mode, bypass included, so
         # the PermissionRequest hook above carries it. A second forwarder here
         # parked a duplicate elicitation and the web showed two identical cards.
-        hooks["PreToolUse"] = [{"hooks": [evaluate_policy_hook]}]
+        hooks["PreToolUse"] = [{"hooks": [evaluate_policy_pre_tool_use_hook]}]
         # PostToolUse already has TodoWrite and TaskUpdate matchers
         # for the transcript forwarder (the observer ``hook``). Append
         # a catch-all policy evaluation entry so TOOL_RESULT policies
@@ -2442,7 +2456,7 @@ def build_hook_settings(
         # dropping the prompt before the model sees it; ASK is resolved
         # server-side. Covers both web-UI-injected and direct-terminal
         # prompts, since both fire UserPromptSubmit.
-        hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
+        hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_prompt_hook]})
     if subagent_router_dir is not None:
         # Route natively spawned subagents (the Task/Agent tool) through
         # the runner's route-subagent endpoint. Settings-level hooks also

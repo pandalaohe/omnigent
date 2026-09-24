@@ -1876,7 +1876,10 @@ def _build_opencode_policy_evaluator(
     Fails CLOSED: an unreachable server, a non-200, a malformed body, or an
     unresolved ``ASK`` all yield a ``deny``/``ask`` verdict the forwarder
     rejects — never a silent approve. Only an explicit ``ALLOW`` permits the
-    operation.
+    operation. Transient transport errors and 5xx responses are first
+    retried within the shared tool-call budget, every attempt carrying one
+    elicitation id so a retry re-attaches to a parked ASK instead of raising
+    a second approval card.
 
     :param server_client: Runner's Omnigent server HTTP client.
     :param conversation_id: Owning Omnigent session id, e.g. ``"conv_abc"``.
@@ -1884,6 +1887,7 @@ def _build_opencode_policy_evaluator(
         verdict on failure.
     """
     from omnigent.harnesses.opencode_native.permissions import OPENCODE_NATIVE_HARNESS
+    from omnigent.native.native_policy_hook import post_evaluate_with_retry_async
 
     session_component = urllib.parse.quote(conversation_id, safe="")
     url = f"/v1/sessions/{session_component}/policies/evaluate"
@@ -1908,15 +1912,18 @@ def _build_opencode_policy_evaluator(
                 "context": {"harness": OPENCODE_NATIVE_HARNESS},
             },
         }
-        try:
-            resp = await server_client.post(
-                url, json=body, timeout=_OPENCODE_POLICY_EVALUATE_TIMEOUT_S
-            )
-        except httpx.HTTPError:
+        resp, api_error = await post_evaluate_with_retry_async(
+            server_client,
+            url,
+            body,
+            _OPENCODE_POLICY_EVALUATE_TIMEOUT_S,
+            "opencode-native permission evaluate",
+        )
+        if resp is None:
             _logger.warning(
-                "OpenCode policy evaluate POST failed for %s; failing closed",
+                "OpenCode policy evaluate POST failed for %s; failing closed: %s",
                 conversation_id,
-                exc_info=True,
+                api_error,
                 extra={"session_id": conversation_id},
             )
             return {"decision": "deny"}

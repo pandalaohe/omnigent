@@ -26,9 +26,22 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.native import native_policy_hook
 from omnigent.runner.app import _evaluate_policy_via_omnigent
 
 _RUNNER_LOGGER = "omnigent.runner.app"
+
+
+@pytest.fixture(autouse=True)
+def _zero_policy_eval_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop the server-POST retry loop before its first sleep in these tests.
+
+    ``_evaluate_policy_via_omnigent`` now retries transient failures within
+    the phase's policy budget; the stubs below fail instantly, so a real
+    budget would make every failure-path test wait it out.
+    """
+    monkeypatch.setattr(native_policy_hook, "TOOL_CALL_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
 
 
 class _RaisingServerClient:
