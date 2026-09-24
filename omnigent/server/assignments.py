@@ -41,6 +41,7 @@ from omnigent.host.frames import (
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runtime.agent_cache import AgentCache
 
 if TYPE_CHECKING:
     from omnigent.server.runner_session_init import RunnerSessionInitializer
@@ -51,7 +52,13 @@ from omnigent.server.assignment_host import (
 )
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.project_placement import load_entries, place_session
+from omnigent.server.routes._workspace_validation import (
+    WorkspaceValidationError,
+    validate_workspace,
+)
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores import AgentStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.assignment_store import AssignmentStore, InactiveAttemptError
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError, ConversationStore
@@ -165,6 +172,9 @@ def build_initial_event_text(
     assignment: Assignment,
     attempt_id: str,
     directories: dict[str, str],
+    *,
+    workspace: str | None = None,
+    worktree: str | None = None,
 ) -> str:
     """Build the one user message that starts an attempt.
 
@@ -175,6 +185,11 @@ def build_initial_event_text(
     :param assignment: The assignment being placed.
     :param attempt_id: The claimed attempt id.
     :param directories: Repository name to prepared directory.
+    :param workspace: The session's launch directory, when it differs
+        from its worktree (R-ASSIGN: a project entry). ``None`` when the
+        session launches directly at its execution root.
+    :param worktree: The session's recorded worktree (the execution
+        root), paired with ``workspace`` above.
     :returns: The user-message text dispatched to the runner.
     """
     roots = {entry.repository_name for entry in assignment.inputs if entry.is_execution_root}
@@ -190,6 +205,15 @@ def build_initial_event_text(
         directory = directories.get(entry.repository_name, "")
         marker = " (execution root)" if entry.repository_name in roots else ""
         lines.append(f"- {entry.repository_name}: {directory}{marker}")
+    if workspace is not None and worktree is not None and workspace != worktree:
+        # Multi-repository assignments still need the directory list and the
+        # "work only in the directories above" sentence below, so this adds
+        # the entry/worktree split rather than replacing that sentence.
+        lines += [
+            "",
+            f"Worktree: {worktree}. You start in the project directory {workspace}; "
+            "make the execution-root changes and commits in the worktree.",
+        ]
     lines += ["", "Read first:"]
     for entry in assignment.inputs:
         directory = directories.get(entry.repository_name, "")
@@ -228,6 +252,8 @@ class AssignmentCoordinator:
         scan_interval_seconds: float = 15.0,
         due_batch_limit: int = 50,
         runner_session_initializer: RunnerSessionInitializer | None = None,
+        agent_store: AgentStore | None = None,
+        agent_cache: AgentCache | None = None,
     ) -> None:
         self._assignment_store = assignment_store
         self._project_store = project_store
@@ -245,6 +271,12 @@ class AssignmentCoordinator:
         self._scan_interval_seconds = scan_interval_seconds
         self._due_batch_limit = due_batch_limit
         self._runner_session_initializer = runner_session_initializer
+        # R-ASSIGN entry-boundary check (§2, `_place`). ``None`` in test
+        # wirings without an agent store/cache — treated as a failed
+        # boundary there, never skipped: `_place` still launches at the
+        # execution root, as before this field existed.
+        self._agent_store = agent_store
+        self._agent_cache = agent_cache
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._host_tasks: dict[str, asyncio.Task[None]] = {}
         self._release_holds: dict[str, tuple[int, int | None]] = {}
@@ -1423,6 +1455,25 @@ class AssignmentCoordinator:
         if released is not None:
             self._release_holds.pop(assignment.id, None)
 
+    async def _resolve_target_agent_spec_cwd(self, agent_id: str | None) -> str | None:
+        """Read the target agent's ``os_env.cwd`` for the R-ASSIGN boundary check.
+
+        Mirrors ``routes/hosts.py`` ``_resolve_agent_spec_cwd``, resolved from
+        ``assignment.target_agent_id`` directly since no session row exists
+        yet at this point in ``_place``.
+
+        :param agent_id: The assignment's target agent, or ``None``.
+        :returns: The agent's ``os_env.cwd``, or ``None`` when unresolvable.
+        """
+        if agent_id is None or self._agent_store is None or self._agent_cache is None:
+            return None
+        agent = await asyncio.to_thread(self._agent_store.get, agent_id)
+        if agent is None or agent.bundle_location is None:
+            return None
+        loaded = await asyncio.to_thread(self._agent_cache.load, agent.id, agent.bundle_location)
+        os_env = getattr(loaded.spec, "os_env", None)
+        return getattr(os_env, "cwd", None) if os_env is not None else None
+
     async def _place(
         self,
         assignment: Assignment,
@@ -1432,10 +1483,37 @@ class AssignmentCoordinator:
     ) -> None:
         roots = [entry for entry in assignment.inputs if entry.is_execution_root]
         root_name = roots[0].repository_name if roots else assignment.inputs[0].repository_name
-        workspace = directories.get(root_name)
-        if not workspace:
+        execution_root = directories.get(root_name)
+        if not execution_root:
             await self._fail_before_launch(assignment, attempt, "prepare returned no directory")
             return
+
+        # R-ASSIGN: launch at the project's entry on this host when one is
+        # set and it passes the same agent-boundary check the execution
+        # root itself would; every other case launches at the execution
+        # root directly, as today. No agent store/cache wired (test
+        # wirings) is treated as a failed boundary, not skipped.
+        entries = await load_entries(self._binding_store, assignment.project_id)
+        entry = next((row.workspace for row in entries if row.host_id == host_id), None)
+        entry_within_agent_boundary = False
+        if entry is not None and self._agent_store is not None and self._agent_cache is not None:
+            spec_cwd = await self._resolve_target_agent_spec_cwd(assignment.target_agent_id)
+            try:
+                await validate_workspace(
+                    host_registry=self._host_registry,
+                    host_id=host_id,
+                    workspace=entry,
+                    spec_cwd=spec_cwd,
+                )
+                entry_within_agent_boundary = True
+            except WorkspaceValidationError:
+                entry_within_agent_boundary = False
+        workspace, worktree = place_session(
+            entry,
+            execution_root,
+            git_used=True,
+            entry_within_agent_boundary=entry_within_agent_boundary,
+        )
         conversation_id = _derived_session_id(attempt.id)
         owner = assignment.owner_user_id or RESERVED_USER_LOCAL
         if self._permission_store is not None:
@@ -1455,6 +1533,7 @@ class AssignmentCoordinator:
                 title=f"Assignment: {title}",
                 host_id=host_id,
                 workspace=workspace,
+                worktree=worktree,
                 conversation_id=conversation_id,
                 project_id=assignment.project_id,
             )
@@ -1606,7 +1685,13 @@ class AssignmentCoordinator:
                 "content": [
                     {
                         "type": "input_text",
-                        "text": build_initial_event_text(assignment, attempt.id, directories),
+                        "text": build_initial_event_text(
+                            assignment,
+                            attempt.id,
+                            directories,
+                            workspace=workspace,
+                            worktree=worktree,
+                        ),
                     }
                 ],
             },

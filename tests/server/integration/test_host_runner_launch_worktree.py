@@ -206,6 +206,7 @@ async def register_host(
         create_error: str | None = None,
         create_gate: asyncio.Event | None = None,
         launch_status: str = "launched",
+        stat_fails_for: Callable[[str], bool] | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
@@ -254,15 +255,26 @@ async def register_host(
                 if isinstance(frame, HostStatFrame):
                     fut = conn.pending_stats.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
-                        fut.set_result(
-                            {
-                                "status": "ok",
-                                "exists": True,
-                                "type": "directory",
-                                "canonical_path": frame.path,
-                                "error": None,
-                            }
-                        )
+                        if stat_fails_for is not None and stat_fails_for(frame.path):
+                            fut.set_result(
+                                {
+                                    "status": "failed",
+                                    "exists": False,
+                                    "type": None,
+                                    "canonical_path": None,
+                                    "error": "stat failed",
+                                }
+                            )
+                        else:
+                            fut.set_result(
+                                {
+                                    "status": "ok",
+                                    "exists": True,
+                                    "type": "directory",
+                                    "canonical_path": frame.path,
+                                    "error": None,
+                                }
+                            )
                 elif isinstance(frame, HostCreateWorktreeFrame):
                     cap.create.append(frame)
                     cap.create_started.set()
@@ -575,6 +587,39 @@ async def test_launch_runner_rolls_back_worktree_on_launch_failure(
     assert conv.git_branch is None, (
         f"git_branch should be cleared (branch was removed); got {conv.git_branch!r}"
     )
+
+
+async def test_launch_runner_rolls_back_worktree_on_canonicalize_failure(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """F-B3: a host.stat failure resolving the just-created worktree's
+    canonical path must not leak it.
+
+    The worktree is created (status ok), but the follow-up ``host.stat``
+    that canonicalises its path fails — before the session row is ever
+    bound. Without the fix, the worktree would be created on the host and
+    never rolled back (the failure propagated past ``_rollback_worktree``
+    unnoticed).
+    """
+    created_path = f"{_SOURCE_REPO}-worktrees/feature-x"
+    cap = register_host(stat_fails_for=lambda path: path == created_path)
+    session_id = await _bare_session(client, "wt-canonicalize-rollback-agent")
+
+    resp = await _launch(client, session_id, git={"branch_name": "feature/x"})
+
+    assert resp.status_code == 400, resp.text
+    assert len(cap.create) == 1
+    assert len(cap.remove) == 1, "expected a rollback remove_worktree frame after stat failure"
+    assert cap.remove[0].worktree_path == created_path
+    assert cap.remove[0].delete_branch is True
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is None
+    assert conv.host_id is None
+    assert conv.workspace is None
 
 
 async def test_launch_runner_retry_succeeds_after_failed_launch(

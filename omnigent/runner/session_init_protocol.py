@@ -42,6 +42,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     created_at: int
     updated_at: int
     workspace: str | None = None
+    worktree: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -115,6 +116,7 @@ def build_runner_session_init_payload(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
             workspace=conversation.workspace,
+            worktree=conversation.worktree,
             labels=conversation.labels,
             reasoning_effort=conversation.reasoning_effort,
             model_override=conversation.model_override,

@@ -986,6 +986,8 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         agent_spec: AgentSpec | None,
+        *,
+        worktree: str | None = None,
     ) -> str | None:
         """Compute the resolved filesystem root for the default environment.
 
@@ -996,6 +998,11 @@ class SessionResourceRegistry:
         Precedence (per
         designs/SESSION_WORKSPACE_SELECTION.md "How this maps onto runtime"):
 
+        0. ``worktree``, when the caller passes one — the session's
+           recorded worktree, for git readers that must never resolve
+           to a project entry's own repository (XHO04 R-CLEAN's
+           sibling for GITROOT sites). Callers with no such reader
+           (terminal cwd, os_env spec) omit it and keep today's order.
         1. ``self._runner_workspace`` (sourced from
            ``OMNIGENT_RUNNER_WORKSPACE``) — when set, ALWAYS
            wins. Both CLI- and host-launched sessions populate it
@@ -1013,6 +1020,8 @@ class SessionResourceRegistry:
             ``os_env`` field is ``None``, the session has no filesystem and
             ``None`` is returned.  When ``None`` (dev/standalone mode) the
             default workspace path is returned.
+        :param worktree: The session's effective worktree, when the caller
+            is a git reader. Takes precedence over everything below.
         :returns: Resolved absolute root path string, or ``None`` when the
             session has no filesystem.
         """
@@ -1023,6 +1032,9 @@ class SessionResourceRegistry:
             spec_os_env = getattr(agent_spec, "os_env", None)
             if spec_os_env is None:
                 return None
+
+        if worktree:
+            return str(Path(worktree).resolve())
 
         # Runner workspace wins when set. Per-session subdirectory
         # isolation is preserved so concurrent sessions

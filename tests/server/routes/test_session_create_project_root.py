@@ -777,6 +777,42 @@ async def test_child_without_explicit_workspace_inherits_the_parent_worktree(
     assert row["worktree"] == worktree
 
 
+async def test_child_with_git_options_records_its_own_created_worktree(
+    app: FastAPI, client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """F-B1: a child that creates its own worktree keeps it, never the parent's.
+
+    R-INHERIT applies only to a child with no ``git`` options; one that
+    creates or binds its own worktree goes through R-PLACE instead, even
+    when it names no explicit ``workspace`` (a project child defaults its
+    workspace to the project root, same as a top-level create).
+    """
+    project_id = await _project(client, "place-child-git", {"agent_id": AGENT_ID})
+    parent_worktree = "/entry/nested/parent-wt"
+    app.state.project_host_binding_store = Bindings([], [_entry(project_id, _HOST, "/entry")])
+    parent = await _post_create(
+        client,
+        project_id,
+        host_id=_HOST,
+        workspace=parent_worktree,
+        git={"branch_name": "feature/parent", "existing_worktree": True},
+    )
+    assert parent.status_code == 201, parent.text
+    assert parent.json()["worktree"] == parent_worktree
+
+    child = await _post_create(
+        client,
+        project_id,
+        host_id=_HOST,
+        parent_session_id=parent.json()["id"],
+        git={"branch_name": "feature/child"},
+    )
+    assert child.status_code == 201, child.text
+    assert child.json()["worktree"] != parent_worktree
+    assert child.json()["worktree"] == "/entry-worktrees/feature/child"
+    assert child.json()["git_branch"] == "feature/child"
+
+
 async def test_multipart_create_places_a_nested_workspace_at_the_entry(
     app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

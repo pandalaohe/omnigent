@@ -92,7 +92,12 @@ async def register_worktree_host(
     """
     conns: list[HostConnection] = []
 
-    def _register(*, create_status: str = "ok", create_error: str | None = None) -> _HostCapture:
+    def _register(
+        *,
+        create_status: str = "ok",
+        create_error: str | None = None,
+        stat_fails_for: Callable[[str], bool] | None = None,
+    ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
@@ -112,15 +117,26 @@ async def register_worktree_host(
                 if isinstance(frame, HostStatFrame):
                     fut = conn.pending_stats.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
-                        fut.set_result(
-                            {
-                                "status": "ok",
-                                "exists": True,
-                                "type": "directory",
-                                "canonical_path": frame.path,
-                                "error": None,
-                            }
-                        )
+                        if stat_fails_for is not None and stat_fails_for(frame.path):
+                            fut.set_result(
+                                {
+                                    "status": "failed",
+                                    "exists": False,
+                                    "type": None,
+                                    "canonical_path": None,
+                                    "error": "stat failed",
+                                }
+                            )
+                        else:
+                            fut.set_result(
+                                {
+                                    "status": "ok",
+                                    "exists": True,
+                                    "type": "directory",
+                                    "canonical_path": frame.path,
+                                    "error": None,
+                                }
+                            )
                 elif isinstance(frame, HostCreateWorktreeFrame):
                     cap.create.append(frame)
                     fut = conn.pending_create_worktrees.pop(frame.request_id, None)
@@ -471,3 +487,30 @@ async def test_create_failure_rollback_preserves_existing_branch(
         "rollback of an existing-branch recreate must preserve the user's "
         "pre-existing branch (unpushed commits would be lost)"
     )
+
+
+async def test_create_rolls_back_worktree_on_canonicalize_failure(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """F-B3: a host.stat failure resolving the just-created worktree's
+    canonical path must not leak it.
+
+    The worktree is created (status ok), but the follow-up ``host.stat``
+    that canonicalises its path fails — before the conversation row is
+    ever created. Without the fix, the created worktree would never be
+    rolled back (the failure propagated past ``create_conversation``'s
+    orphan-cleanup, which never runs).
+    """
+    created_path = f"{_SOURCE_REPO}-worktrees/feature-orphan"
+    cap = register_worktree_host(stat_fails_for=lambda path: path == created_path)
+    agent = await create_test_agent(client, name="wt-canonicalize-rollback-agent")
+
+    resp = await _create_git_session(client, agent["id"], {"branch_name": "feature/orphan"})
+
+    assert resp.status_code == 400, resp.text
+    assert len(cap.create) == 1, cap.create
+    assert len(cap.remove) == 1, f"expected a create-rollback remove frame, got {cap.remove}"
+    assert cap.remove[0].worktree_path == created_path
+    assert cap.remove[0].branch == "feature/orphan"
+    assert cap.remove[0].delete_branch is True

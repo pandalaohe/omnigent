@@ -6974,6 +6974,149 @@ async def test_github_set_preference_falls_back_to_host_when_runner_offline(
     assert captured["params"] == {"account": "octocat", "remote": None}
 
 
+# ── GITROOT host-fallback: worktree ?? workspace (XHO04 batch C) ─────
+
+_OFFLINE_WORKTREE = "/Users/dev/project/.worktrees/app/feature-x"
+
+
+@pytest.fixture
+def offline_env_app_with_worktree(
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> FastAPI:
+    """Like ``offline_env_app``, but the session carries a worktree distinct
+    from its (project-entry) workspace."""
+    del runner_globals_reset
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources as _routes
+
+    conv = Conversation(
+        id=_OFFLINE_SESSION,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=_OFFLINE_SESSION,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        host_id="host_offline",
+        workspace=_OFFLINE_WORKSPACE,
+        worktree=_OFFLINE_WORKTREE,
+    )
+    monkeypatch.setattr(
+        _routes,
+        "_load_agent_spec_for_session",
+        lambda _conv, _agent_store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+    )
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+
+    application = FastAPI()
+
+    @application.exception_handler(OmnigentError)
+    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    application.include_router(
+        create_sessions_router(
+            SimpleNamespace(get_conversation=lambda _sid: conv),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]  — stub agent store
+            host_registry=SimpleNamespace(get=lambda _host_id: object()),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    return application
+
+
+@pytest.fixture
+async def offline_env_client_with_worktree(
+    offline_env_app_with_worktree: FastAPI,
+) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=offline_env_app_with_worktree)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_changes_falls_back_to_the_worktree_when_set(
+    offline_env_client_with_worktree: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario 17: the offline changes list roots at the worktree, not the
+    (project-entry) workspace, when the session carries one."""
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, params
+        captured["op"] = op
+        captured["workspace"] = workspace
+        return {"object": "list", "data": [], "has_more": False}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
+
+    resp = await offline_env_client_with_worktree.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/changes"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert captured["op"] == "changes"
+    assert captured["workspace"] == _OFFLINE_WORKTREE
+
+
+@pytest.mark.asyncio
+async def test_filesystem_list_stays_on_the_workspace_even_with_a_worktree_set(
+    offline_env_client_with_worktree: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``list_or_read`` is a LAUNCH-class read (§9): it stays on ``workspace``
+    even when the session carries a recorded worktree, unlike GITROOT ops."""
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, params
+        captured["op"] = op
+        captured["workspace"] = workspace
+        return {"object": "list", "data": [], "has_more": False}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
+
+    resp = await offline_env_client_with_worktree.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert captured["op"] == "list_or_read"
+    assert captured["workspace"] == _OFFLINE_WORKSPACE
+
+
 # ── Workspace-file gzip (GZipFileContentRoute) ───────────────────
 #
 # These exercise the real routes through the real router, because the whole

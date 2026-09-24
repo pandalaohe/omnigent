@@ -7325,6 +7325,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "parent_session_id": None,
             "project_id": None,
             "workspace": None,
+            "worktree": None,
             "updated_at": None,
             "last_message_preview": None,
         },
@@ -7338,6 +7339,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "parent_session_id": None,
             "project_id": None,
             "workspace": None,
+            "worktree": None,
             "updated_at": None,
             "last_message_preview": None,
         },
@@ -8393,6 +8395,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "llm_model": "anthropic/claude-sonnet-4-6",
                     "model_override": "claude-opus-4-8",
                     "workspace": "/repo",
+                    "worktree": "/repo/.omnigent/worktrees/conv_target",
                     "git_branch": "feature/x",
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
                 },
@@ -8434,6 +8437,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         "cursor-native": False,
     }
     assert info["parent_session_id"] == "conv_parent"
+    assert info["worktree"] == "/repo/.omnigent/worktrees/conv_target"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the
     # override was ignored.

@@ -74,7 +74,9 @@ async def execute_assignment_tool(
     :param conversation_id: The calling session; every tool reads it as
         the session to act as.
     :param runner_workspace: The calling session's workspace; the
-        execution-root directory for ``sys_assignment_complete``.
+        execution-root directory for ``sys_assignment_complete`` when the
+        session has no recorded worktree (legacy rows; R-ASSIGN sets one
+        for every current assignment session).
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: Tool output JSON string.
     """
@@ -360,8 +362,8 @@ async def _get_assignment_row(
 
 async def _session_placement(
     tool_name: str, conversation_id: str, server_client: httpx.AsyncClient
-) -> tuple[str | None, str | None]:
-    """Return the calling session's ``(project_id, host_id)``."""
+) -> tuple[str | None, str | None, str | None]:
+    """Return the calling session's ``(project_id, host_id, worktree)``."""
     resp = await server_client.get(
         f"/v1/sessions/{conversation_id}",
         params={"include_items": "false", "include_liveness": "false"},
@@ -374,9 +376,11 @@ async def _session_placement(
     body = resp.json()
     project_id = body.get("project_id")
     host_id = body.get("host_id")
+    worktree = body.get("worktree")
     return (
         project_id if isinstance(project_id, str) else None,
         host_id if isinstance(host_id, str) else None,
+        worktree if isinstance(worktree, str) else None,
     )
 
 
@@ -537,7 +541,7 @@ async def _dispatch(
     except AssignmentToolError as exc:
         return json.dumps({"error": str(exc)})
 
-    project_id, host_id = await _session_placement(tool_name, conversation_id, server_client)
+    project_id, host_id, _ = await _session_placement(tool_name, conversation_id, server_client)
     if project_id is None:
         raise AssignmentToolError(f"{tool_name}: this session is not filed in a project")
     if host_id is None:
@@ -700,7 +704,9 @@ async def _complete(
 
     row = await _get_assignment_row(tool_name, str(assignment_id), server_client)
     inputs = _input_entries(row)
-    project_id, host_id = await _session_placement(tool_name, conversation_id, server_client)
+    project_id, host_id, worktree = await _session_placement(
+        tool_name, conversation_id, server_client
+    )
     collaboration: dict[str, object] | None = None
     registered: dict[str, tuple[str, str]] = {}
     prepared: list[_PreparedOutput] = []
@@ -712,12 +718,18 @@ async def _complete(
                 "name a repository from the assignment inputs"
             )
         if entry.get("is_execution_root"):
-            if runner_workspace is None:
+            # Commits in the session's recorded worktree (R-ASSIGN); a
+            # session launched at a project entry has its execution root
+            # there, not at the launch directory the entry itself is.
+            execution_root = worktree or (
+                str(runner_workspace) if runner_workspace is not None else None
+            )
+            if execution_root is None:
                 raise AssignmentToolError(
                     f"{tool_name}: no session workspace for the execution-root "
                     f"repository {req.repository_name!r}"
                 )
-            directory = str(runner_workspace)
+            directory = execution_root
         else:
             if host_id is None:
                 raise AssignmentToolError(

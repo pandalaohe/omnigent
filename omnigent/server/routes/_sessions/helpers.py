@@ -9617,6 +9617,23 @@ _DELETE_WORKTREE_OFFLINE_MESSAGE = (
 )
 
 
+def effective_worktree(conv: Conversation) -> str | None:
+    """
+    Return the directory a git reader should root itself at.
+
+    R-CLEAN's sibling for GITROOT sites: ``worktree ?? workspace``. A
+    session with no recorded worktree reads its launch directory as
+    today; one placed at a project entry (``workspace``) with a worktree
+    recorded reads the worktree instead, so the entry's own repository
+    is never mistaken for the session's.
+
+    :param conv: The session whose effective worktree is wanted.
+    :returns: The worktree path, the workspace, or ``None`` when neither
+        is set (a runner-only session).
+    """
+    return conv.worktree or conv.workspace
+
+
 def cleanup_worktree(
     conv: Conversation,
     *,
@@ -11933,5 +11950,6 @@ __all__ = [
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
     "cleanup_worktree",
+    "effective_worktree",
     "prefetch_session_routing_catalogs",
 ]

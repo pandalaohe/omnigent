@@ -3234,7 +3234,9 @@ def register_events_routes(
                     return False
                 return binding_store.entry_exists_at(host_id, path)
 
-            worktree_target = cleanup_worktree(conv, is_entry=is_entry)
+            # ``is_entry`` hits the store synchronously (``entry_exists_at``);
+            # run the whole call off-thread so it never blocks this async route.
+            worktree_target = await asyncio.to_thread(cleanup_worktree, conv, is_entry=is_entry)
             if worktree_target is not None:
                 # cleanup_worktree returns a path only with a host and a branch.
                 await delete_lease.run(

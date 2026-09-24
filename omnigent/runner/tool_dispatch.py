@@ -5459,6 +5459,7 @@ async def _session_get_info_via_rest(
             # agent spec's default; both may be None when unset.
             "model": snap.get("model_override") or snap.get("llm_model"),
             "workspace": snap.get("workspace"),
+            "worktree": snap.get("worktree"),
             "git_branch": snap.get("git_branch"),
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick
@@ -6490,6 +6491,7 @@ async def _collect_global_sessions(
                 "parent_session_id": r.get("parent_session_id"),
                 "project_id": r.get("project_id"),
                 "workspace": r.get("workspace"),
+                "worktree": r.get("worktree"),
                 "updated_at": r.get("updated_at"),
                 "last_message_preview": r.get("last_message_preview"),
             }

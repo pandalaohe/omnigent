@@ -1775,6 +1775,8 @@ def create_app(
                 file_store=file_store,
                 artifact_store=artifact_store,
                 runner_session_initializer=runner_session_initializer,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
             )
             await assignment_coordinator.start()
         app_inst.state.assignment_coordinator = assignment_coordinator

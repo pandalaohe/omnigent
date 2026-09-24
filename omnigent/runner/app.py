@@ -3058,6 +3058,10 @@ def create_runner_app(
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    # session_id → worktree path, from the session-init snapshot. Legacy
+    # (no-envelope) init leaves a session absent from this map, so git
+    # readers fall back to the workspace/runner_workspace they use today.
+    _session_worktree_cache: dict[str, str | None] = {}
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -3806,6 +3810,15 @@ def create_runner_app(
                 _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
+    def _session_worktree_value(session_id: str) -> str | None:
+        """Return the session's recorded worktree, or ``None`` when unset.
+
+        Sourced only from the session-init envelope (R-WTPATH is a server
+        placement concern); a legacy re-init leaves the session out of the
+        map, so callers must fall back to their pre-XHO04 root.
+        """
+        return _session_worktree_cache.get(session_id)
+
     async def _fetch_session_model_override(session_id: str) -> str | None:
         """One-shot uncached read of the persisted ``/model`` override.
 
@@ -3881,6 +3894,7 @@ def create_runner_app(
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
+        _session_worktree_cache[session_id] = snapshot.worktree
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
         if snapshot.reasoning_effort:
@@ -3943,7 +3957,11 @@ def create_runner_app(
         if session_id in _session_fs_registries:
             return _session_fs_registries[session_id]
 
-        session_workspace = await _session_workspace_value(session_id)
+        # A git reader roots at the session's worktree when one is recorded
+        # (R-CLEAN's GITROOT sibling), never a project entry's own repository.
+        session_workspace = _session_worktree_value(session_id) or await _session_workspace_value(
+            session_id
+        )
         if session_workspace is None:
             return filesystem_registry
 
@@ -11936,7 +11954,9 @@ def create_runner_app(
     async def _github_workspace_root(session_id: str) -> str:
         """Resolve the workspace root for GitHub routes, or 404 when headless."""
         agent_spec = await _require_os_env(session_id)
-        root = resource_registry.compute_default_env_root(session_id, agent_spec)
+        root = resource_registry.compute_default_env_root(
+            session_id, agent_spec, worktree=_session_worktree_value(session_id)
+        )
         if root is None:
             raise HTTPException(
                 status_code=404,

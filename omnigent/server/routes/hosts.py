@@ -68,10 +68,10 @@ from omnigent.server.cli_retention import (
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.project_placement import (
-    _same_canonical_path,
     checkout_on_host,
     load_bindings,
     load_entries,
+    same_canonical_path,
 )
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
@@ -1465,7 +1465,7 @@ def create_hosts_router(
                     if (
                         entry is not None
                         and checkout is not None
-                        and _same_canonical_path(workspace, entry)
+                        and same_canonical_path(workspace, entry)
                     ):
                         source_repo = checkout
                     try:
@@ -1481,21 +1481,32 @@ def create_hosts_router(
                         raise HTTPException(status_code=409, detail=exc.message) from exc
                     except WorktreeProxyError as exc:
                         raise HTTPException(status_code=400, detail=exc.message) from exc
-                    workspace = await _canonical_worktree_path(
-                        host_id=host_id,
-                        worktree_path=worktree.worktree_path,
-                        request=request,
-                    )
+                    # F-B3: a failure past this point leaves a worktree the
+                    # host created but no row/bind recorded it yet — roll it
+                    # back rather than leaking it.
+                    try:
+                        workspace = await _canonical_worktree_path(
+                            host_id=host_id,
+                            worktree_path=worktree.worktree_path,
+                            request=request,
+                        )
+                    except BaseException:
+                        await _rollback_worktree()
+                        raise
                     git_branch = worktree.branch
 
-            workspace, placed_worktree = await _place_project_session(
-                host_id=host_id,
-                project_id=target.conv.project_id,
-                entry=entry,
-                target=workspace,
-                git_used=body.git is not None,
-                entry_boundary=entry_boundary,
-            )
+            try:
+                workspace, placed_worktree = await _place_project_session(
+                    host_id=host_id,
+                    project_id=target.conv.project_id,
+                    entry=entry,
+                    target=workspace,
+                    git_used=body.git is not None,
+                    entry_boundary=entry_boundary,
+                )
+            except BaseException:
+                await _rollback_worktree()
+                raise
 
             try:
                 await host_registry.admit_launch(

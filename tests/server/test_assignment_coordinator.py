@@ -256,6 +256,8 @@ def _coordinator(
     runner_router: Any | None = None,
     runner_exit_reports: Any | None = None,
     runner_session_initializer: Any | None = None,
+    agent_store: Any | None = None,
+    agent_cache: Any | None = None,
 ) -> AssignmentCoordinator:
     return AssignmentCoordinator(
         assignment_store=stores["assignment"],
@@ -276,6 +278,8 @@ def _coordinator(
         scan_interval_seconds=scan_interval_seconds,
         due_batch_limit=due_batch_limit,
         runner_session_initializer=runner_session_initializer,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
     )
 
 
@@ -526,6 +530,10 @@ async def test_happy_path_places_session_and_dispatches_once(
     conv = stores["conversation"].get_conversation(expected_conv)
     assert conv is not None
     assert conv.workspace == prepared_dir
+    # No project entry on this host (R-ASSIGN): the execution root is both
+    # the launch directory and the recorded worktree, unchanged from
+    # pre-XHO04 behavior.
+    assert conv.worktree == prepared_dir
     assert conv.host_id == host_id
     assert conv.project_id == project_id
     assert conv.title == "Assignment: Fix the widget"
@@ -546,6 +554,142 @@ async def test_happy_path_places_session_and_dispatches_once(
     assert f'sys_assignment_complete with assignment_id "{assignment.id}"' in text
     assert "`outputs`" in text and "`summary`" in text
     assert 'attempt_id "' not in text
+
+
+@pytest.mark.asyncio
+async def test_entry_within_boundary_redirects_launch_to_entry(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-ASSIGN Scenario 12: an entry passing the boundary check becomes the
+    launch directory; the execution root is recorded as the worktree."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-entry")
+    project_id = _uid("entry-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/entry/checkout",
+    )
+    entry_path = "/entry"
+    stores["binding"].put_entry(project_id, host_id, entry_path)
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "entry-redirect",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    prepared_dir = "/entry/.omnigent/worktrees/entry-redirect/root"
+    fake_prepare = _prepare_ok({"root": prepared_dir})
+    monkeypatch.setattr(assignments_mod, "prepare_assignment_on_host", fake_prepare)
+
+    async def _fake_validate_ok(**kwargs: Any) -> str:
+        return kwargs["workspace"]
+
+    async def _fake_spec_cwd(_agent_id: str | None) -> str | None:
+        return None
+
+    monkeypatch.setattr(assignments_mod, "validate_workspace", _fake_validate_ok)
+    _install_placement_fakes(monkeypatch)
+    registry = FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)})
+    host_store = FakeHostStore([_FakeHost(host_id, ALICE)])
+    perms = FakePermissionStore()
+    coordinator = _coordinator(
+        stores,
+        registry=registry,
+        host_store=host_store,
+        permission_store=perms,
+        agent_store=SimpleNamespace(),
+        agent_cache=SimpleNamespace(),
+    )
+    coordinator._resolve_target_agent_spec_cwd = _fake_spec_cwd  # type: ignore[method-assign]
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "running", row
+    assert row.active_attempt_id is not None
+    attempt = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
+    assert attempt is not None and attempt.session_id is not None
+    conv = stores["conversation"].get_conversation(attempt.session_id)
+    assert conv is not None
+    assert conv.workspace == entry_path
+    assert conv.worktree == prepared_dir
+
+
+@pytest.mark.asyncio
+async def test_entry_outside_boundary_launches_at_execution_root(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-ASSIGN: an entry that fails the boundary check is not used — the
+    session launches at the execution root, as if there were no entry."""
+    from omnigent.server.routes._workspace_validation import WorkspaceValidationError
+
+    stores = _stores(db_uri)
+    host_id = _uid("host-entry-out")
+    project_id = _uid("entry-out-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/entry/checkout",
+    )
+    entry_path = "/entry"
+    stores["binding"].put_entry(project_id, host_id, entry_path)
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "entry-out",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    prepared_dir = "/entry/.omnigent/worktrees/entry-out/root"
+    fake_prepare = _prepare_ok({"root": prepared_dir})
+    monkeypatch.setattr(assignments_mod, "prepare_assignment_on_host", fake_prepare)
+
+    async def _fake_validate_fails(**_kwargs: Any) -> str:
+        raise WorkspaceValidationError("outside the agent's boundary")
+
+    async def _fake_spec_cwd(_agent_id: str | None) -> str | None:
+        return None
+
+    monkeypatch.setattr(assignments_mod, "validate_workspace", _fake_validate_fails)
+    _install_placement_fakes(monkeypatch)
+    registry = FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)})
+    host_store = FakeHostStore([_FakeHost(host_id, ALICE)])
+    perms = FakePermissionStore()
+    coordinator = _coordinator(
+        stores,
+        registry=registry,
+        host_store=host_store,
+        permission_store=perms,
+        agent_store=SimpleNamespace(),
+        agent_cache=SimpleNamespace(),
+    )
+    coordinator._resolve_target_agent_spec_cwd = _fake_spec_cwd  # type: ignore[method-assign]
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "running", row
+    assert row.active_attempt_id is not None
+    attempt = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
+    assert attempt is not None and attempt.session_id is not None
+    conv = stores["conversation"].get_conversation(attempt.session_id)
+    assert conv is not None
+    assert conv.workspace == prepared_dir
+    assert conv.worktree == prepared_dir
 
 
 @pytest.mark.asyncio
@@ -2503,6 +2647,37 @@ async def test_initial_assignment_event_says_complete_is_last_step() -> None:
     assert "sys_assignment_dispatch" in text
     assert "before" in text
     assert "session is closed after" in text
+
+
+async def test_initial_assignment_event_names_the_worktree_when_launched_at_entry() -> None:
+    """R-ASSIGN: launching at E != T adds a Worktree line naming T, and keeps
+    the "work only in the directories above" sentence (multi-repository
+    assignments still need it)."""
+    from omnigent.server.assignments import build_initial_event_text
+
+    assignment = Assignment(
+        id=_uid("wt-event"),
+        project_id=_uid("wt-event-project"),
+        source_session_id=_uid("wt-event-source"),
+        target_agent_id=AGENT_ID,
+        task="Do work",
+        inputs=[_input()],
+        idempotency_key="wt-event",
+        request_digest="e" * 64,
+    )
+    text = build_initial_event_text(
+        assignment, "attempt", {"root": "/w"}, workspace="/entry", worktree="/entry/wt/root"
+    )
+    assert "Worktree: /entry/wt/root" in text
+    assert "/entry" in text
+    assert "Work only in the directories above, commit the work there" in text
+
+    # Launched at the execution root itself (workspace == worktree, the
+    # no-entry case): no Worktree line.
+    same_text = build_initial_event_text(
+        assignment, "attempt", {"root": "/w"}, workspace="/w", worktree="/w"
+    )
+    assert "Worktree:" not in same_text
 
 
 # ── 14. active liveness ───────────────────────────────────────────────────

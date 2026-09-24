@@ -571,6 +571,61 @@ async def test_complete_happy_path(
     )
 
 
+async def test_complete_uses_session_worktree_over_runner_workspace_param(
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str, tmp_path: Path
+) -> None:
+    """XHO04 batch C: with a recorded worktree, complete commits there.
+
+    The session-init envelope's ``worktree`` outranks the legacy
+    ``runner_workspace`` fallback that ``sys_assignment_complete`` used
+    before R-ASSIGN gave every current assignment session a worktree.
+    """
+    seed = _seed(db_uri, tmp_path, "root")
+    row = await _dispatch(
+        seed["session_id"], client, _dispatch_args(seed["commit"], key="wt-complete")
+    )
+    assert row["state"] == "waiting", row
+    assignment_id = row["id"]
+    token, recv_session = _drive_to_running(db_uri, assignment_id, seed["session_id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_conversation_project(recv_session, seed["project_id"])
+    root_wt = seed["source"] / ".omnigent" / "worktrees" / assignment_id / "root"
+    root_wt.parent.mkdir(parents=True, exist_ok=True)
+    _git_ok(seed["source"], "worktree", "add", str(root_wt), "-b", f"wt-{assignment_id[:8]}")
+    conv_store.set_host_id(recv_session, _HOST_ID, workspace="/tmp/recv", worktree=str(root_wt))
+    (root_wt / "work.txt").write_text("finished root\n")
+    root_out = _commit_all(root_wt, "finish root work")
+
+    # A directory that is not the assignment's worktree — used only if the
+    # session's recorded worktree is (incorrectly) ignored.
+    bogus_workspace = tmp_path / "not-the-worktree"
+    bogus_workspace.mkdir()
+
+    async with _runner_client_for(app, token) as authed:
+        out = await execute_assignment_tool(
+            "sys_assignment_complete",
+            json.dumps(
+                {
+                    "assignment_id": assignment_id,
+                    "outputs": [{"repository_name": "root", "commit": root_out}],
+                    "summary": "done",
+                }
+            ),
+            conversation_id=recv_session,
+            runner_workspace=bogus_workspace,
+            server_client=authed,  # type: ignore[arg-type]
+        )
+    result = json.loads(out)
+    assert result["state"] == "succeeded", result
+    attempt_id = SqlAlchemyAssignmentStore(db_uri).get(assignment_id).active_attempt_id
+    assert (
+        _ls_remote(
+            seed["remote"], f"refs/omnigent/assignments/{assignment_id}/output/{attempt_id}/root"
+        )
+        == root_out
+    )
+
+
 async def test_complete_rejected_push_fails_row(
     app: FastAPI, client: httpx.AsyncClient, db_uri: str, tmp_path: Path
 ) -> None:

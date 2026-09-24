@@ -147,7 +147,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
-from omnigent.server.project_placement import _same_canonical_path
+from omnigent.server.project_placement import same_canonical_path
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -9878,7 +9878,7 @@ async def _create_session_from_existing_agent(
                 project_resolution.entry is not None
                 and project_resolution.checkout is not None
                 and canonical_workspace is not None
-                and _same_canonical_path(canonical_workspace, project_resolution.entry)
+                and same_canonical_path(canonical_workspace, project_resolution.entry)
             ):
                 source_repo = project_resolution.checkout
             created_worktree = await _create_session_worktree(
@@ -9890,11 +9890,27 @@ async def _create_session_from_existing_agent(
             # The host's path is canonicalised before any comparison or
             # persistence; rollback keeps the raw path it returned.
             created_worktree_path = created_worktree.worktree_path
-            canonical_workspace = await _canonical_worktree_path(
-                host_id=body.host_id,
-                worktree_path=created_worktree_path,
-                request=request,
-            )
+            try:
+                canonical_workspace = await _canonical_worktree_path(
+                    host_id=body.host_id,
+                    worktree_path=created_worktree_path,
+                    request=request,
+                )
+            except Exception:
+                # F-B3: the host already created this worktree; a failure
+                # resolving its canonical path must not leak it. Same
+                # branch-preservation rule as the create_conversation
+                # rollback below: never -D a pre-existing branch.
+                if body.host_id is not None:
+                    await _remove_session_worktree_best_effort(
+                        host_id=body.host_id,
+                        worktree_path=created_worktree_path,
+                        branch=created_worktree.branch,
+                        delete_branch=body.git is None or not body.git.existing_branch,
+                        request=request,
+                        reason="create-rollback",
+                    )
+                raise
             git_branch = created_worktree.branch
 
     # R-PLACE / R-INHERIT: the launch directory and recorded worktree. A
@@ -9906,6 +9922,7 @@ async def _create_session_from_existing_agent(
     if (
         body.parent_session_id is not None
         and "workspace" not in request_fields_set
+        and body.git is None
         and parent_conv is not None
     ):
         inherit_parent = parent_conv

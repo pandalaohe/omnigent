@@ -90,6 +90,7 @@ from omnigent.server.routes._sessions.helpers import (
     _read_upload_capped,
     _require_filesystem_attachment_harness,
     _stored_file_to_resource,
+    effective_worktree,
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -163,6 +164,22 @@ def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _attachment_upload_locks[session_id] = lock
     return lock
+
+
+# Host-fallback ops that read git state: rooted at the session's effective
+# worktree (``worktree ?? workspace``), never the entry it may be launched
+# at. ``list_or_read`` / ``search`` are plain file-panel reads and stay on
+# ``workspace`` (§9 GITROOT vs LAUNCH).
+_GITROOT_HOST_FALLBACK_OPS = frozenset(
+    {
+        "changes",
+        "diff",
+        "github_info",
+        "github_changes",
+        "github_diff",
+        "github_pr_diff",
+    }
+)
 
 
 def register_resources_routes(
@@ -848,12 +865,17 @@ def register_resources_routes(
         host_conn = host_registry.get(conversation.host_id)
         if host_conn is None:
             return None
+        default_workspace = (
+            effective_worktree(conversation)
+            if op in _GITROOT_HOST_FALLBACK_OPS
+            else conversation.workspace
+        )
         try:
             return await read_workspace_from_host(
                 host_registry=host_registry,
                 host_conn=host_conn,
                 op=op,
-                workspace=workspace_override or conversation.workspace,
+                workspace=workspace_override or default_workspace,
                 session_id=session_id,
                 params=host_params,
             )
@@ -906,7 +928,7 @@ def register_resources_routes(
                 host_registry=host_registry,
                 host_conn=host_conn,
                 op=op,
-                workspace=conversation.workspace,
+                workspace=effective_worktree(conversation),
                 session_id=session_id,
                 params=host_params,
             )

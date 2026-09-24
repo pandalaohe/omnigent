@@ -200,7 +200,7 @@ def host_roots(
     ]
 
 
-def _same_canonical_path(first: str, second: str) -> bool:
+def same_canonical_path(first: str, second: str) -> bool:
     """Return whether two host-canonical paths name the same directory.
 
     ``_is_subpath_of`` treats equal paths as contained; R-PLACE needs them
@@ -244,7 +244,7 @@ def place_session(
     if (
         entry is not None
         and entry_within_agent_boundary
-        and not _same_canonical_path(target, entry)
+        and not same_canonical_path(target, entry)
         and _is_subpath_of(target, entry)
     ):
         return entry, target

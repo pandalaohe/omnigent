@@ -1753,6 +1753,80 @@ async def test_worktree_session_uses_session_workspace_for_changes(
 
 
 @pytest.mark.asyncio
+async def test_envelope_worktree_session_uses_worktree_for_changes(
+    tmp_path: Path,
+) -> None:
+    """A session initialized via the envelope routes /changes to its worktree.
+
+    XHO04 batch C: the session-init envelope carries ``worktree`` alongside
+    ``workspace``; ``/changes`` must run ``git status`` in the worktree, not
+    the project entry workspace the session displays as its directory.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+
+    env = _git_env()
+
+    # Entry workspace: a clean repo the session displays as its directory.
+    entry_ws = tmp_path / "entry"
+    entry_ws.mkdir()
+    subprocess.run(["git", "init"], cwd=entry_ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=entry_ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    # Worktree: a separate repo with an uncommitted change, recorded as the
+    # session's ``worktree`` in the init envelope.
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    (worktree / "agent_change.py").write_text("# written by agent")
+
+    session_id = "conv_envelope_worktree_test"
+    conversation = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        agent_id="agent_1",
+        root_conversation_id=session_id,
+        workspace=str(entry_ws),
+        worktree=str(worktree),
+    )
+    payload = build_runner_session_init_payload(conversation, server_version="0.6.0")
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        init_resp = await client.post("/v1/sessions", json=payload)
+        assert init_resp.status_code == 201, init_resp.text
+
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+        )
+        assert resp.status_code == 200, resp.text
+        paths = [e["path"] for e in resp.json()["data"]]
+        assert "agent_change.py" in paths, (
+            f"Expected 'agent_change.py' (from the worktree) in changes but got "
+            f"{paths}. /changes is reading the entry workspace instead of the "
+            "session's worktree."
+        )
+
+
+@pytest.mark.asyncio
 async def test_search_scopes_to_a_subdirectory(client: httpx.AsyncClient) -> None:
     """Search covers exactly what the tree is showing. Scoped to a directory it
     reports the resolved base and returns paths relative to it, so a panel
