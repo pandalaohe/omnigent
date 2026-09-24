@@ -86,3 +86,27 @@ def test_guarded_upgrade_keeps_fd1_table_and_rows(tmp_path: Path) -> None:
 
     engine.dispose()
     clear_engine_cache()
+
+
+def test_members_column_upgrade_and_downgrade(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'custom-agent-members.db'}"
+    engine = sa.create_engine(uri)
+
+    _migrate(uri, engine, "c7a9e2f4b610")
+    assert "members" not in {
+        column["name"] for column in sa.inspect(engine).get_columns("custom_agents")
+    }
+
+    _migrate(uri, engine, "c1a6e2f4b610")
+    columns = {
+        column["name"]: column for column in sa.inspect(engine).get_columns("custom_agents")
+    }
+    assert columns["members"]["nullable"] is True
+
+    _downgrade(uri, engine, "c7a9e2f4b610")
+    assert "members" not in {
+        column["name"] for column in sa.inspect(engine).get_columns("custom_agents")
+    }
+
+    engine.dispose()
+    clear_engine_cache()

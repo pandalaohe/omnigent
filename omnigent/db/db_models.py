@@ -259,6 +259,8 @@ class SqlCustomAgent(OmnigentBase):
     description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     harness: Mapped[str] = mapped_column(String(128))
     model: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # JSON-encoded list of member dicts. NULL until projected from the bundle.
+    members: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     bundle_location: Mapped[str] = mapped_column(String(512))
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[int] = mapped_column(Integer)

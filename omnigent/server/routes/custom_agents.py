@@ -23,7 +23,7 @@ from omnigent.server.auth import (
     local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
-from omnigent.server.custom_agent_bundles import MAX_BUNDLE_BYTES, patch_bundle
+from omnigent.server.custom_agent_bundles import MAX_BUNDLE_BYTES, patch_bundle, project_members
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
@@ -119,7 +119,12 @@ def create_custom_agents_router(
         cache_instructions(location, spec.instructions)
         return spec.instructions
 
-    def detail(row: dict[str, Any]) -> dict[str, Any]:
+    def detail(owner_id: str, row: dict[str, Any]) -> dict[str, Any]:
+        if row["members"] is None:
+            location = row["bundle_location"]
+            spec = validate(artifact_bytes(location))
+            cache_instructions(location, spec.instructions)
+            row = store.backfill_members(owner_id, row["id"], location, project_members(spec))
         return {
             **public(row),
             "instructions": instructions_for(row["bundle_location"]),
@@ -138,6 +143,7 @@ def create_custom_agents_router(
                 "description": spec.description,
                 "harness": spec.executor.harness_kind,
                 "model": spec.executor.model,
+                "members": project_members(spec),
                 "bundle_location": location,
             },
         )
@@ -260,7 +266,7 @@ def create_custom_agents_router(
     @router.get("/custom-agents/{agent_id}")
     async def get_custom_agent(request: Request, agent_id: str) -> dict[str, Any]:
         row = await asyncio.to_thread(store.get, owner(request), agent_id)
-        return await asyncio.to_thread(detail, row)
+        return await asyncio.to_thread(detail, owner(request), row)
 
     @router.get(
         "/custom-agents/{agent_id}/contents",
@@ -285,7 +291,7 @@ def create_custom_agents_router(
             )
         changes = body.model_dump(exclude_unset=True, exclude={"version"})
         if not changes:
-            return await asyncio.to_thread(detail, row)
+            return await asyncio.to_thread(detail, owner_id, row)
 
         def update() -> dict[str, Any]:
             data = patch_bundle(artifact_bytes(row["bundle_location"]), changes)
@@ -299,6 +305,9 @@ def create_custom_agents_router(
                 {
                     "name": spec.name,
                     "description": spec.description,
+                    "harness": spec.executor.harness_kind,
+                    "model": spec.executor.model,
+                    "members": project_members(spec),
                     "bundle_location": location,
                 },
             )

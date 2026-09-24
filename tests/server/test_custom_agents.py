@@ -33,7 +33,7 @@ class HeaderAuth(AuthProvider):
         return request.headers.get("x-test-user")
 
 
-def bundle(config: str | None = None) -> bytes:
+def bundle(config: str | None = None, subagent: str | None = None) -> bytes:
     entries = {
         "config.yaml": (
             config
@@ -58,6 +58,8 @@ tools:
         "tools/helper.py": b"# Preserve this bundled executable verbatim\n",
         "assets/data.bin": bytes(range(256)),
     }
+    if subagent is not None:
+        entries["agents/researcher/config.yaml"] = subagent.encode()
     out = io.BytesIO()
     with tarfile.open(fileobj=out, mode="w:gz") as archive:
         for name, data in entries.items():
@@ -66,6 +68,22 @@ tools:
             info.mode = 0o755 if name.endswith(".py") else 0o644
             archive.addfile(info, io.BytesIO(data))
     return out.getvalue()
+
+
+def joint_bundle() -> bytes:
+    return bundle(
+        """spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, model: lead-model, reasoning_effort: high, config: {harness: codex}}
+""",
+        """spec_version: 1
+name: researcher
+description: Research support
+executor: {type: omnigent, model: research-model, reasoning_effort: medium,
+  config: {harness: claude-sdk}}
+""",
+    )
 
 
 def members(data: bytes) -> dict[str, tuple[bytes, int]]:
@@ -88,6 +106,183 @@ def make_app(db_uri: str, tmp_path: Path):
         permission_store=permissions,
     )
     return app, artifacts, agents, conversations, permissions
+
+
+@pytest.mark.asyncio
+async def test_create_single_member_projection(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    data = bundle("""spec_version: 1
+name: solo
+executor: {type: omnigent, model: solo-model, reasoning_effort: high, config: {harness: codex}}
+""")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", data)},
+        )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["members"] == [
+        {
+            "name": "solo",
+            "description": None,
+            "harness": "codex",
+            "model": "solo-model",
+            "reasoning_effort": "high",
+            "lead": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_multi_member_projection(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", joint_bundle())},
+        )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["members"] == [
+        {
+            "name": "custom-reviewer",
+            "description": "Lead reviewer",
+            "harness": "codex",
+            "model": "lead-model",
+            "reasoning_effort": "high",
+            "lead": True,
+        },
+        {
+            "name": "researcher",
+            "description": "Research support",
+            "harness": "claude-sdk",
+            "model": "research-model",
+            "reasoning_effort": "medium",
+            "lead": False,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_returns_stored_members_without_artifact_read(
+    db_uri: str, tmp_path: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", joint_bundle())},
+        )
+        assert created.status_code == 201, created.text
+        CustomAgentsStore(db_uri).create(
+            "alice",
+            {
+                "id": "ca_legacy_list",
+                "name": "legacy",
+                "harness": "codex",
+                "bundle_location": "unused",
+            },
+        )
+
+        def unexpected_get(_location: str) -> bytes:
+            raise AssertionError("list read an artifact")
+
+        monkeypatch.setattr(artifacts, "get", unexpected_get)
+        listed = await client.get("/v1/custom-agents", headers={"x-test-user": "alice"})
+
+    assert listed.status_code == 200, listed.text
+    rows = {row["id"]: row for row in listed.json()["data"]}
+    assert rows[created.json()["id"]]["members"] == created.json()["members"]
+    assert rows["ca_legacy_list"]["members"] is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_detail_backfills_members_without_version_change(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    data = joint_bundle()
+    agent_id = "ca_legacy_detail"
+    location = bundle_location(agent_id, data)
+    artifacts.put(location, data)
+    before = CustomAgentsStore(db_uri).create(
+        "alice",
+        {
+            "id": agent_id,
+            "name": "custom-reviewer",
+            "description": "Lead reviewer",
+            "harness": "codex",
+            "model": "lead-model",
+            "bundle_location": location,
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        detail = await client.get(
+            f"/v1/custom-agents/{agent_id}", headers={"x-test-user": "alice"}
+        )
+        listed = await client.get("/v1/custom-agents", headers={"x-test-user": "alice"})
+
+    assert detail.status_code == 200, detail.text
+    assert [member["reasoning_effort"] for member in detail.json()["members"]] == [
+        "high",
+        "medium",
+    ]
+    assert detail.json()["members"][1]["model"] == "research-model"
+    assert listed.json()["data"][0]["members"] == detail.json()["members"]
+    assert detail.json()["version"] == before["version"]
+    assert detail.json()["updated_at"] == before["updated_at"]
+
+
+@pytest.mark.asyncio
+async def test_patch_rederives_lead_model_from_bundle(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    data = bundle("""spec_version: 1
+name: custom-reviewer
+executor: {type: omnigent, model: newer-model, config: {harness: codex}}
+""")
+    agent_id = "ca_stale_model"
+    location = bundle_location(agent_id, data)
+    artifacts.put(location, data)
+    CustomAgentsStore(db_uri).create(
+        "alice",
+        {
+            "id": agent_id,
+            "name": "custom-reviewer",
+            "harness": "codex",
+            "model": "older-model",
+            "bundle_location": location,
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers={"x-test-user": "alice"},
+            json={"name": "renamed"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == "newer-model"
+    assert response.json()["members"][0]["model"] == "newer-model"
 
 
 @pytest.mark.asyncio
@@ -171,7 +366,7 @@ async def test_import_requires_owner_and_retains_archive(
     db_uri: str, tmp_path: Path, runtime_init: None
 ) -> None:
     app, artifacts, agents, conversations, permissions = make_app(db_uri, tmp_path)
-    original = bundle()
+    original = joint_bundle()
     runtime_id = generate_agent_id()
     location = bundle_location(runtime_id, original)
     artifacts.put(location, original)
@@ -195,6 +390,7 @@ async def test_import_requires_owner_and_retains_archive(
             "/v1/custom-agents", headers={"x-test-user": "alice"}, json=payload
         )
         assert created.status_code == 201, created.text
+        assert created.json()["members"][1]["reasoning_effort"] == "medium"
         contents = await client.get(
             f"/v1/custom-agents/{created.json()['id']}/contents", headers={"x-test-user": "alice"}
         )

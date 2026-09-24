@@ -15,10 +15,24 @@ from typing import Any
 import yaml
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.spec import extract_safe
+from omnigent.spec import AgentSpec, extract_safe
 
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 _MANAGED_INSTRUCTIONS_PATH = re.compile(r"catalog-instructions-[0-9a-f]{32}\.md")
+
+
+def project_members(spec: AgentSpec) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": member.name,
+            "description": member.description,
+            "harness": member.executor.harness_kind,
+            "model": member.executor.model,
+            "reasoning_effort": member.executor.reasoning_effort,
+            "lead": index == 0,
+        }
+        for index, member in enumerate((spec, *spec.sub_agents))
+    ]
 
 
 def _managed_instructions_path(raw: str) -> str | None:
