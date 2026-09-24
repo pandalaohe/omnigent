@@ -13891,7 +13891,7 @@
         ]
       },
       "put": {
-        "description": "Validate and store a host's entry directory.\n\nThe typed path is validated live on the host; the canonical path the\nhost returns is what gets stored, never the typed one.\n\n**Parameters**\n\n- `body` \u2014 Workspace path on the host.\n\n**Returns:** The inserted or updated entry.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 for the sandbox host or a bad path, 409 when the host is offline.",
+        "description": "Validate and store a host's entry directory.\n\nThe typed path is validated live on the host; the canonical path the\nhost returns is what gets stored, never the typed one.\n\n**Parameters**\n\n- `body` \u2014 Workspace path on the host.\n\n**Returns:** The inserted or updated entry.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 for the sandbox host, a bad path or a path inside a worktree folder, 409 when the host is offline.",
         "operationId": "put_project_entry_v1_projects__project_id__entries__host_id__put",
         "parameters": [
           {

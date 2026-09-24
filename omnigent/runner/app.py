@@ -190,6 +190,7 @@ from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
     raw_author_instructions,
+    session_startup_extras,
 )
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
@@ -3113,9 +3114,10 @@ def create_runner_app(
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
-    # session_id → server-held global instructions from the init snapshot.
-    # Read by the launch and composition points, never from the TTL'd envelope
-    # cache, so the text outlives the cache. Blank is "off".
+    # session_id → the session's startup extras from the init snapshot: the
+    # worktree line (when the session records one) followed by the server-held
+    # global text. Read by the launch and composition points, never from the
+    # TTL'd envelope cache, so the text outlives the cache. Blank is "off".
     _session_global_instructions: dict[str, str | None] = {}
 
     def _global_framework_instructions(value: str | None) -> list[str]:
@@ -3987,7 +3989,11 @@ def create_runner_app(
             _session_reasoning_effort[session_id] = snapshot.reasoning_effort
         _session_project_assignments_enabled[session_id] = snapshot.project_assignments_enabled
         _session_peer_messaging_enabled[session_id] = snapshot.peer_messaging_enabled
-        _session_global_instructions[session_id] = snapshot.global_instructions
+        _session_global_instructions[session_id] = session_startup_extras(
+            snapshot.global_instructions,
+            workspace=snapshot.workspace,
+            worktree=snapshot.worktree,
+        )
         # A relay started before this init (resource access precedes the
         # handshake) read the previous flag; rebuild it in place on a flip.
         _stale_relay = _session_comment_relays.get(session_id)

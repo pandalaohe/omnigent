@@ -12,12 +12,15 @@ from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
+    WORKTREE_INSTRUCTION,
     append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
     history_to_input_items,
     native_startup_instructions,
     raw_author_instructions,
+    session_startup_extras,
+    worktree_instruction,
 )
 from omnigent.spec import AgentSpec
 
@@ -432,3 +435,83 @@ def test_native_startup_instructions_global_text_needs_no_spec() -> None:
         "Global notice"
     )
     assert native_startup_instructions(None, global_instructions="  \n ") is None
+
+
+def test_worktree_instruction_gate_and_text() -> None:
+    """The worktree line applies only to a tree that is not the launch directory."""
+    assert worktree_instruction("/entry", None) is None
+    assert worktree_instruction("/entry", "   ") is None
+    assert worktree_instruction("/entry", "/entry") is None
+    assert worktree_instruction("/entry/", "/entry") is None
+    assert worktree_instruction("/entry", "/entry/") is None
+    assert worktree_instruction(None, "/entry/.worktrees/repo/topic") is None
+    assert worktree_instruction("   ", "/entry/.worktrees/repo/topic") is None
+
+    text = worktree_instruction("/entry", "/entry/.worktrees/repo/topic")
+    assert text == WORKTREE_INSTRUCTION.format(
+        workspace="/entry", worktree="/entry/.worktrees/repo/topic"
+    )
+    assert "`/entry`" in text
+    assert "`/entry/.worktrees/repo/topic`" in text
+
+
+def test_worktree_instruction_strips_trailing_separators_when_comparing() -> None:
+    """A trailing separator is not a difference, on either side."""
+    assert worktree_instruction("/entry/", "/entry/.worktrees/repo/topic") == (
+        WORKTREE_INSTRUCTION.format(workspace="/entry/", worktree="/entry/.worktrees/repo/topic")
+    )
+
+
+def test_session_startup_extras_orders_worktree_before_global() -> None:
+    """The worktree line precedes the global text, joined by a blank line."""
+    line = worktree_instruction("/entry", "/entry/.worktrees/repo/topic")
+
+    assert (
+        session_startup_extras(
+            "Global notice", workspace="/entry", worktree="/entry/.worktrees/repo/topic"
+        )
+        == f"{line}\n\nGlobal notice"
+    )
+
+
+def test_session_startup_extras_blank_global_is_off() -> None:
+    """A blank global contributes nothing: extras are either the worktree line
+    alone or ``None``, never an empty global entry."""
+    line = worktree_instruction("/entry", "/entry/.worktrees/repo/topic")
+
+    assert (
+        session_startup_extras(
+            "  \n ", workspace="/entry", worktree="/entry/.worktrees/repo/topic"
+        )
+        == line
+    )
+    assert session_startup_extras(None, workspace="/entry", worktree="/entry") is None
+    assert session_startup_extras("  ", workspace="/entry", worktree="/entry") is None
+    assert session_startup_extras(None, workspace="/entry", worktree=None) is None
+
+
+def test_session_startup_extras_empty_worktree_keeps_global_unchanged() -> None:
+    """Without a worktree the extras are the global text exactly, so the
+    unchanged session path composes byte-for-byte as before."""
+    assert (
+        session_startup_extras("Global notice", workspace="/entry", worktree=None)
+        == "Global notice"
+    )
+    assert (
+        session_startup_extras("Global notice", workspace="/entry", worktree="/entry")
+        == "Global notice"
+    )
+
+
+def test_native_startup_instructions_worktree_then_global_last() -> None:
+    """The composed startup text reads author → framework → worktree → global."""
+    spec = _spec("Agent prompt", spawn=True)
+    extras = session_startup_extras(
+        "Global notice", workspace="/entry", worktree="/entry/.worktrees/repo/topic"
+    )
+    worktree_line = worktree_instruction("/entry", "/entry/.worktrees/repo/topic")
+
+    assert native_startup_instructions(spec, global_instructions=extras) == (
+        f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{worktree_line}\n\nGlobal notice"
+    )

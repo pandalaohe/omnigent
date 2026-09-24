@@ -6944,7 +6944,8 @@ def _handle_mcp_request(
                 "tools are available outside an active turn for "
                 "workspace file and shell access. Sessions created for a project "
                 "are filed under it and start in that project's directory on the "
-                "target host; a child session joins its parent's project."
+                "target host; a child session joins its parent's project and keeps its "
+                "parent's working tree."
             ),
         }
     if method == "tools/list":

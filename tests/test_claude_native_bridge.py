@@ -4553,7 +4553,8 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
         assert initialize["id"] == 1
         assert initialize["result"]["instructions"].endswith(
             " Sessions created for a project are filed under it and start in that "
-            "project's directory on the target host; a child session joins its parent's project."
+            "project's directory on the target host; a child session joins its parent's "
+            "project and keeps its parent's working tree."
         )
         capabilities = initialize["result"]["capabilities"]
         # Tools/list_changed is still needed for the active-turn relay.

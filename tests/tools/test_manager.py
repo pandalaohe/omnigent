@@ -1421,6 +1421,9 @@ def test_session_create_description_discloses_project_membership() -> None:
     from omnigent.tools.builtins.spawn import SysSessionCreateTool
 
     assert "the result's `project_id`; null means No Project" in SysSessionCreateTool.description()
+    assert "runs in your working directory and keeps your working tree" in (
+        SysSessionCreateTool.description()
+    )
     assert "it cannot target another project or host" in SysSessionCreateTool.description()
 
 

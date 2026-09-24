@@ -38,6 +38,16 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
     "approval) are routine runtime status messages in the same way."
 )
 
+# A session can launch at a project directory while its git working tree sits
+# elsewhere (a linked worktree inside the project entry). Naming both keeps the
+# model editing and running git in the worktree instead of the shared project
+# directory.
+WORKTREE_INSTRUCTION = (
+    "You started in the project directory `{workspace}`. Your working tree is "
+    "`{worktree}`: make code changes, run git and tests there; the project "
+    "directory holds shared project files."
+)
+
 # Steers models toward the embedded browser they are handed: the browser_*
 # tools are auto-registered for every agent (ToolManager._register_browser_tools),
 # but a tool description alone loses to a model's native web tooling, so the
@@ -217,6 +227,67 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
     if spec.instructions and spec.instructions.strip():
         return spec.instructions
     return None
+
+
+def _without_trailing_separator(path: str) -> str:
+    """Strip one trailing ``/`` or ``\\`` from *path*, keeping the root form."""
+    if len(path) > 1 and path[-1] in ("/", "\\"):
+        return path[:-1]
+    return path
+
+
+def worktree_instruction(workspace: str | None, worktree: str | None) -> str | None:
+    """The line naming a session's working tree to the agent, or ``None``.
+
+    The line applies only when the session records a working tree that differs
+    from the directory it launched in; the two compare as plain strings after a
+    trailing separator is stripped, so a launch directory recorded with a
+    trailing slash is not treated as a different tree. A session without a
+    launch directory (or without a recorded tree) gets nothing: the line names
+    both paths, so neither may be blank.
+
+    :param workspace: The session's launch directory (its project entry), or
+        ``None`` when it has none.
+    :param worktree: The session's recorded git working tree, or ``None``.
+    :returns: The composed instruction, or ``None`` when no line applies.
+    """
+    if workspace is None or not workspace.strip():
+        return None
+    if worktree is None or not worktree.strip():
+        return None
+    workspace_path = workspace.strip()
+    worktree_path = worktree.strip()
+    if _without_trailing_separator(workspace_path) == _without_trailing_separator(worktree_path):
+        return None
+    return WORKTREE_INSTRUCTION.format(workspace=workspace_path, worktree=worktree_path)
+
+
+def session_startup_extras(
+    global_instructions: str | None,
+    *,
+    workspace: str | None,
+    worktree: str | None,
+) -> str | None:
+    """Compose a session's startup extras: the worktree line, then global text.
+
+    The worktree line lands after the framework instructions and before the
+    server-held global text (author → framework → worktree → global), so the
+    global text stays last wherever the composed text is delivered. Blank
+    global text means "off" and contributes no empty entry.
+
+    :param global_instructions: The server-held global instructions text, or
+        ``None``/blank when the admin has none set.
+    :param workspace: The session's launch directory, from its init snapshot.
+    :param worktree: The session's recorded git working tree, or ``None``.
+    :returns: The composed text, or ``None`` when neither part applies.
+    """
+    parts: list[str] = []
+    worktree_line = worktree_instruction(workspace, worktree)
+    if worktree_line:
+        parts.append(worktree_line)
+    if global_instructions and global_instructions.strip():
+        parts.append(global_instructions)
+    return "\n\n".join(parts) if parts else None
 
 
 def native_startup_instructions(

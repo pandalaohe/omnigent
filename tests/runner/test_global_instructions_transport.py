@@ -3,8 +3,10 @@
 A session initialized with ``global_instructions`` records the text in a
 per-session map seeded from the init snapshot — never the TTL'd envelope
 cache — so an envelope re-init refreshes it and every turn still composes
-it after the cache's 60 s TTL. SDK harnesses receive it as the last
-framework instruction of the composed per-turn prompt.
+it after the cache's 60 s TTL. A session that records a working tree other
+than its launch directory has the worktree line prepended to that text; SDK
+harnesses receive the extras as the last framework instruction of the
+composed per-turn prompt.
 """
 
 from __future__ import annotations
@@ -18,7 +20,11 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    WORKTREE_INSTRUCTION,
+    session_startup_extras,
+)
 from omnigent.spec.types import AgentSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -50,7 +56,14 @@ def _build_turn_app() -> tuple[FastAPI, _ScriptedHarnessClient]:
     return app, harness_client
 
 
-def _init_body(session_id: str, agent_id: str, global_instructions: str) -> dict[str, Any]:
+def _init_body(
+    session_id: str,
+    agent_id: str,
+    global_instructions: str,
+    *,
+    workspace: str | None = None,
+    worktree: str | None = None,
+) -> dict[str, Any]:
     """Session-init POST body carrying *global_instructions* in the snapshot."""
     return {
         "session_id": session_id,
@@ -64,7 +77,8 @@ def _init_body(session_id: str, agent_id: str, global_instructions: str) -> dict
             "snapshot": {
                 "created_at": 1234,
                 "updated_at": 1234,
-                "workspace": None,
+                "workspace": workspace,
+                "worktree": worktree,
                 "labels": {},
                 "global_instructions": global_instructions,
             },
@@ -77,9 +91,19 @@ async def _init_session(
     session_id: str,
     agent_id: str,
     global_instructions: str,
+    *,
+    workspace: str | None = None,
+    worktree: str | None = None,
 ) -> None:
     init = await client.post(
-        "/v1/sessions", json=_init_body(session_id, agent_id, global_instructions)
+        "/v1/sessions",
+        json=_init_body(
+            session_id,
+            agent_id,
+            global_instructions,
+            workspace=workspace,
+            worktree=worktree,
+        ),
     )
     assert init.status_code == 201, init.text
 
@@ -169,3 +193,75 @@ async def test_turn_composes_the_text_after_the_envelope_cache_expires(
         composed = await _turn_instructions(client, harness_client, session_id)
 
     assert composed.endswith("SURVIVOR-TEXT")
+
+
+def _spy_on_startup_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str | None]:
+    """Record every extras value the runner writes into its per-session map."""
+    recorded: list[str | None] = []
+    real_extras = session_startup_extras
+
+    def _spy(
+        global_instructions: str | None,
+        *,
+        workspace: str | None,
+        worktree: str | None,
+    ) -> str | None:
+        value = real_extras(global_instructions, workspace=workspace, worktree=worktree)
+        recorded.append(value)
+        return value
+
+    monkeypatch.setattr("omnigent.runner.app.session_startup_extras", _spy)
+    return recorded
+
+
+@pytest.mark.asyncio
+async def test_worktree_line_recorded_before_the_global_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session-init envelope with distinct workspace and worktree records the
+    worktree line ahead of the global text, and the next turn composes them
+    after the framework instructions."""
+    recorded = _spy_on_startup_extras(monkeypatch)
+    app, harness_client = _build_turn_app()
+    session_id, agent_id = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(
+            client,
+            session_id,
+            agent_id,
+            "GLOBAL-MARKER",
+            workspace="/entry",
+            worktree="/entry/.worktrees/repo/topic",
+        )
+        composed = await _turn_instructions(client, harness_client, session_id)
+
+    line = WORKTREE_INSTRUCTION.format(workspace="/entry", worktree="/entry/.worktrees/repo/topic")
+    assert recorded == [f"{line}\n\nGLOBAL-MARKER"]
+    assert composed.endswith(f"{line}\n\nGLOBAL-MARKER")
+    assert composed.index(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION) < composed.index(line)
+
+
+@pytest.mark.asyncio
+async def test_without_a_worktree_the_recorded_value_is_the_global_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session without a worktree records the global text exactly — the
+    unchanged path — and composes no worktree line."""
+    recorded = _spy_on_startup_extras(monkeypatch)
+    app, harness_client = _build_turn_app()
+    session_id, agent_id = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(
+            client,
+            session_id,
+            agent_id,
+            "GLOBAL-MARKER",
+            workspace="/entry",
+        )
+        composed = await _turn_instructions(client, harness_client, session_id)
+
+    assert recorded == ["GLOBAL-MARKER"]
+    assert composed.endswith("GLOBAL-MARKER")
+    assert "You started in the project directory" not in composed
