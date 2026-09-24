@@ -1552,7 +1552,10 @@ export function AgentHarnessPicker({
   );
   const selectedReadiness = harnessReadinessOnHost(selectedEntry?.harness, host);
   const selectedUnavailable =
-    selectedEntry != null && !selectedReadiness.selectable && selectedReadiness.fallbackRelevant;
+    selectedEntry != null &&
+    !(selectedEntry.id.startsWith("ca_") && !selectedEntry.harness) &&
+    !selectedReadiness.selectable &&
+    selectedReadiness.fallbackRelevant;
   const selectedWarningMessage = selectedUnavailable
     ? harnessWarningMessage(
         selectedEntry.display_name,
@@ -1677,7 +1680,12 @@ export function AgentHarnessPicker({
     const summary = details || entrySummaries?.[agent.id] || "Default";
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
     const readiness = harnessReadinessOnHost(agent.harness, host);
-    const unavailable = !readiness.selectable && readiness.fallbackRelevant;
+    // A saved Agent without a harness id launches from its bundle, so the
+    // null-harness readiness verdict does not apply to it.
+    const unavailable =
+      !(agent.id.startsWith("ca_") && !agent.harness) &&
+      !readiness.selectable &&
+      readiness.fallbackRelevant;
     const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
     const warningMessage = harnessWarningMessage(
       agent.display_name,
