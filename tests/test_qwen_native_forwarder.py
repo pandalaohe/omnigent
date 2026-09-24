@@ -136,6 +136,24 @@ def test_could_not_load_marker_stripped() -> None:
     assert item.item_data["content"][0]["text"] == "look"
 
 
+def test_strips_agent_instructions_preamble_block_for_user_only() -> None:
+    # The executor wraps the session's first injected message with the
+    # launch-staged instructions (wrap_agent_instructions); the mirrored
+    # bubble must show only the user's real text, and only for the user role
+    # (an assistant reply is never wrapped, so it must pass through as-is).
+    from omnigent.native.native_bridge_common import wrap_agent_instructions
+
+    wrapped = wrap_agent_instructions("be terse", "the real question")
+    item = _event_to_item(_user_ev("u5", wrapped), _AGENT)
+    assert item is not None
+    assert item.item_data["content"][0]["text"] == "the real question"
+
+    # An assistant event carrying the same literal text is not stripped.
+    item = _event_to_item(_asst_ev("a3", [{"type": "text", "text": wrapped}]), _AGENT)
+    assert item is not None
+    assert item.item_data["content"][0]["text"] == wrapped
+
+
 def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(_ev_bytes(_user_ev("u1", "q")))

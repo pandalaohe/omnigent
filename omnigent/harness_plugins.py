@@ -448,7 +448,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="run_command",
         shell_tool_prompt=_SHELL_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "goose-native": _C(
         _IM.NATIVE_TUI,
@@ -479,7 +479,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="run_shell_command",
         shell_tool_prompt=_SHELL_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
@@ -494,7 +494,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
@@ -571,7 +571,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="terminal",
         shell_tool_prompt=_SHELL_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
@@ -696,7 +696,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "hermes": _C(
         _IM.CLI_SUBPROCESS,

@@ -73,6 +73,7 @@ from omnigent.native._native_forwarder_health import (
 from omnigent.native._native_forwarder_health import (
     record_post_failure as record_native_post_failure,
 )
+from omnigent.native.native_bridge_common import strip_agent_instructions_block
 
 _logger = logging.getLogger(__name__)
 
@@ -733,7 +734,7 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
         origin = row.get("origin")
         if isinstance(origin, dict) and origin.get("kind") != "user":
             return None
-        text = _input_text(row.get("input"))
+        text = strip_agent_instructions_block(_input_text(row.get("input"))).strip()
         if not text:
             return None
         return KimiWireItem(

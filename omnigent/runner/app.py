@@ -1333,7 +1333,7 @@ class InstructionComposition:
     Computed once inside ``_stream_message_to_harness`` (the point where the
     background and direct-stream dispatch paths converge) and consumed
     in-process by the single delivery-gap warn check and by delivery
-    channels (opencode-native, hermes) that must not leak the fabricated
+    channels (opencode-native, hermes, kimi) that must not leak the fabricated
     ``"You are a helpful assistant."`` fallback. Never attached to
     ``TurnDispatch``, ``MessageEvent``, ``CreateResponseRequest``, or
     ``ExecutorConfig`` — the wire shape is unchanged from today.
@@ -1352,9 +1352,10 @@ class InstructionComposition:
 # needs the gated ``InstructionComposition.composed`` value there instead of
 # the default fallback-including composed-per-turn string — opencode-native
 # via its NativePrompt.system_prompt; hermes via HermesExecutor.run_turn's
-# system_prompt param. See the harness-conditional swap in
+# system_prompt param; kimi via KimiExecutor.run_turn's system_prompt param
+# (prefixes it onto the first turn). See the harness-conditional swap in
 # _stream_message_to_harness.
-_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
+_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes", "kimi"})
 
 
 def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
@@ -4709,6 +4710,9 @@ def create_runner_app(
                     return PreLaunchResult(needs_terminal=needs)
 
                 _launch_pre = _antigravity_pre_launch
+                _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
+                    session_id
+                )
 
             elif harness_name == "pi-native":
                 # pi resolves its spec unwrapped — a resolution error surfaces as
@@ -4721,6 +4725,8 @@ def create_runner_app(
                 "devin-native",
                 "kiro-native",
                 "goose-native",
+                "qwen-native",
+                "hermes-native",
             ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
@@ -11101,11 +11107,12 @@ def create_runner_app(
             and not (terminal_name == "antigravity" and body.get("spec"))
         ):
             # Each native harness contributes only the ensure hooks that differ
-            # from the uniform base; a single _ensure_native_terminal call runs
-            # them. The 4 uniform harnesses (goose/kiro/hermes/qwen) need only the
-            # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
-            # via build_context; codex/antigravity add an ownership check (and
-            # codex a one-shot policy-notice response wrap).
+            # from the base; a single _ensure_native_terminal call runs them.
+            # claude/pi/opencode resolve an agent spec via build_context that
+            # surfaces a resolution error as a terminal-start error;
+            # cursor/kimi/devin/kiro/goose/qwen/hermes/antigravity resolve one
+            # tolerating failure instead; codex/antigravity also add an
+            # ownership check (and codex a one-shot policy-notice response wrap).
             _ensure_locks = _require_full_native_lock_coverage(
                 {
                     "claude": _claude_terminal_ensure_locks,
@@ -11207,6 +11214,15 @@ def create_runner_app(
                 )
 
             elif terminal_name == "antigravity":
+
+                async def _antigravity_ensure_build(
+                    ctx: NativeLaunchContext,
+                ) -> NativeLaunchContext:
+                    return dataclasses.replace(
+                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
+                    )
+
+                _ensure_build = _antigravity_ensure_build
                 _ensure_is_owned = _is_runner_owned_antigravity_terminal
                 _ensure_conflict = (
                     "Existing antigravity terminal is not a runner-owned agy TUI "
@@ -11226,7 +11242,7 @@ def create_runner_app(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi", "devin", "kiro", "goose"):
+            elif terminal_name in ("cursor", "kimi", "devin", "kiro", "goose", "qwen", "hermes"):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
@@ -11638,6 +11654,8 @@ def create_runner_app(
                         _publish_event,
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
+                        agent_spec=await _resolve_session_agent_spec_or_none(session_id),
+                        global_instructions=_session_global_instructions.get(session_id),
                     )
                 except Exception:
                     _logger.exception(

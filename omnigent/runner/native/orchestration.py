@@ -3319,6 +3319,8 @@ async def _auto_create_hermes_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Hermes TUI terminal for a hermes-native session.
@@ -3335,6 +3337,11 @@ async def _auto_create_hermes_terminal(
     :param resource_registry: Session resource registry for launching the terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
     from omnigent.harnesses.hermes_native.main import resolve_hermes_executable
@@ -3354,6 +3361,13 @@ async def _auto_create_hermes_terminal(
     from omnigent.harnesses.hermes_native.status import clear_hermes_status_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # A relaunched pane is a new Hermes process, so it must get a fresh copy of
+    # the instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     clear_hermes_bridge_state(bridge_dir)
     # Likewise drop the idle poster state so a stale posted-count from a prior
     # terminal can't make the new forwarder skip (or re-fire) the
@@ -4055,6 +4069,8 @@ async def _auto_create_qwen_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the qwen TUI terminal for a qwen-native session.
@@ -4071,6 +4087,11 @@ async def _auto_create_qwen_terminal(
     :param resource_registry: Session resource registry for launching the terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
     from omnigent.harnesses.qwen_native.main import resolve_qwen_executable
@@ -4093,6 +4114,13 @@ async def _auto_create_qwen_terminal(
     from omnigent.harnesses.qwen_native.forwarder import clear_qwen_bridge_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # A relaunched pane is a new qwen process, so it must get a fresh copy of
+    # the instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     clear_qwen_bridge_state(bridge_dir)
     # Create fresh, empty input + event files before launch: qwen ``watchFile``\\s
     # the ``--input-file`` (it must exist) and a relaunched terminal must not
@@ -4328,6 +4356,7 @@ async def _auto_create_kimi_terminal(
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Kimi TUI terminal for a kimi-native session.
@@ -4359,11 +4388,15 @@ async def _auto_create_kimi_terminal(
         workspace snapshot read).
     :param ensure_comment_relay: Unused; kept for call-site parity with the
         other native auto-create helpers.
-    :param agent_spec: Unused for now (model pinning via the kimi TUI is a
-        follow-up); kept for call-site parity.
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions (model pinning via the kimi
+        TUI is a separate follow-up).
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
-    del ensure_comment_relay, agent_spec
+    del ensure_comment_relay
     from omnigent.harnesses.kimi_native.bridge import (
         bridge_dir_for_session_id,
         write_hook_config,
@@ -4379,6 +4412,13 @@ async def _auto_create_kimi_terminal(
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # A relaunched pane is a new Kimi process, so it must get a fresh copy of
+    # the instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Stamp launch time before the TUI starts so the forwarder only adopts a kimi
     # session created for THIS launch. Tear down any prior forwarder + its line
     # offset so a re-created terminal tails the fresh wire log (mirrors cursor).
@@ -5851,6 +5891,8 @@ async def _auto_create_antigravity_terminal(
     *,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the native Antigravity (agy) terminal for a session.
@@ -5905,6 +5947,11 @@ async def _auto_create_antigravity_terminal(
         relay is started against this session's bridge dir before launch so the
         wrapped agy sees the ``sys_*`` tools (#1194). ``None`` skips relay wiring
         (the ``_run_turn_bg`` first-turn fallback re-ensures it).
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: The created terminal resource view.
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
@@ -5982,6 +6029,13 @@ async def _auto_create_antigravity_terminal(
     # claude/codex auto-create teardown ordering).
     await _cancel_auto_forwarder_task(session_id)
     bridge_dir = prepare_bridge_dir(bridge_id)
+    # A relaunched pane is a new agy process, so it must get a fresh copy of the
+    # instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Clear stale turn/conversation state so the reader binds this run's real agy
     # conversation id (the cold-start mints it below) instead of a prior run's.
     clear_bridge_state(bridge_dir)
@@ -9011,6 +9065,8 @@ async def _launch_hermes(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -9022,6 +9078,8 @@ async def _launch_qwen(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -9034,6 +9092,7 @@ async def _launch_kimi(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
         agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -9060,6 +9119,8 @@ async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 

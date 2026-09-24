@@ -337,7 +337,22 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "kimi-native",
             "_auto_create_kimi_terminal",
-            {"server_client", "ensure_comment_relay", "agent_spec"},
+            {"server_client", "ensure_comment_relay", "agent_spec", "global_instructions"},
+        ),
+        (
+            "hermes-native",
+            "_auto_create_hermes_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec", "global_instructions"},
+        ),
+        (
+            "qwen-native",
+            "_auto_create_qwen_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec", "global_instructions"},
+        ),
+        (
+            "antigravity-native",
+            "_auto_create_antigravity_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec", "global_instructions"},
         ),
         (
             "codex-native",
@@ -387,6 +402,9 @@ async def test_launch_adapters_forward_expected_kwarg_subset(
     [
         ("kiro-native", "_auto_create_kiro_terminal"),
         ("goose-native", "_auto_create_goose_terminal"),
+        ("qwen-native", "_auto_create_qwen_terminal"),
+        ("hermes-native", "_auto_create_hermes_terminal"),
+        ("antigravity-native", "_auto_create_antigravity_terminal"),
     ],
 )
 @pytest.mark.asyncio
@@ -395,12 +413,13 @@ async def test_create_session_resolves_agent_spec_for_kiro_and_goose(
     harness_name: str,
     auto_create_target: str,
 ) -> None:
-    """POST /v1/sessions threads the resolved spec to kiro/goose's terminal builder.
+    """POST /v1/sessions threads the resolved spec to the terminal builder.
 
     Regression guard: the runner's harness_name -> resolve_agent_spec table only
-    listed cursor/opencode/kimi/devin, so kiro and goose launched with
-    ``agent_spec=None`` even for a spec-bearing session — the author text (and,
-    for kiro, the framework text) never reached the staged startup preamble.
+    listed cursor/opencode/kimi/devin, so kiro, goose, qwen, hermes and
+    antigravity launched with ``agent_spec=None`` even for a spec-bearing
+    session — the author text (and, for kiro, the framework text) never
+    reached the staged startup preamble.
     """
     from omnigent.runner.native import orchestration as orch
 
