@@ -16,6 +16,7 @@ from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
     runner_archive_state,
 )
+from omnigent.runtime import current_global_instructions_text
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -140,22 +141,27 @@ class RunnerSessionInitializer:
         )
         task = self._tasks.get(key)
         if task is None:
-            payload = build_runner_session_init_payload(
-                conversation,
-                server_version=self._server_version,
-                suppress_recovery_turn=suppress_recovery_turn,
-                archive_states=effective_archive_states,
-                project_assignments_enabled=self._project_assignments_enabled,
-                peer_messaging_enabled=self._peer_messaging_enabled,
-                resume_interrupted_turn=resume_interrupted_turn,
-                recovery_id=(
-                    self._recovery_ids.setdefault(key, uuid4().hex)
-                    if resume_interrupted_turn
-                    else None
-                ),
+            recovery_id = (
+                self._recovery_ids.setdefault(key, uuid4().hex)
+                if resume_interrupted_turn
+                else None
             )
 
             async def post_session_init() -> httpx.Response:
+                # Built here, not before create_task: the store read blocks,
+                # and awaiting between the single-flight lookup and the task
+                # registration would let a second caller start its own init.
+                payload = build_runner_session_init_payload(
+                    conversation,
+                    server_version=self._server_version,
+                    suppress_recovery_turn=suppress_recovery_turn,
+                    archive_states=effective_archive_states,
+                    project_assignments_enabled=self._project_assignments_enabled,
+                    peer_messaging_enabled=self._peer_messaging_enabled,
+                    global_instructions=await asyncio.to_thread(current_global_instructions_text),
+                    resume_interrupted_turn=resume_interrupted_turn,
+                    recovery_id=recovery_id,
+                )
                 if self._conversation_store is not None and self._file_store is not None:
                     from omnigent.server.routes._sessions.helpers import (
                         _filesystem_attachment_in_history,
