@@ -81,6 +81,7 @@ vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useNewChatHostId: vi.fn(() => null),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
