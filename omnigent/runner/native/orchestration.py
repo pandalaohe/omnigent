@@ -3669,6 +3669,7 @@ async def _auto_create_devin_terminal(
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """Auto-create the Devin TUI terminal for a devin-native session.
 
@@ -3682,6 +3683,9 @@ async def _auto_create_devin_terminal(
         the workspace (Devin's only per-turn system-prompt channel); framework
         instructions ride the session-scoped first-message preamble so the rule
         never carries them.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Rides the first-message
+        preamble with the framework text; the workspace rule stays author-only.
     """
     from omnigent.harnesses.devin_native.bridge import (
         DEVIN_NATIVE_ENV_UNSET,
@@ -3731,6 +3735,8 @@ async def _auto_create_devin_terminal(
         preamble_parts.append(raw_instructions)
     if spec is not None:
         preamble_parts.extend(_framework_instructions_for(spec))
+    if global_instructions and global_instructions.strip():
+        preamble_parts.append(global_instructions)
     if preamble_parts:
         write_agent_instructions_preamble(bridge_dir, "\n\n".join(preamble_parts))
     if rule_is_live:
@@ -4447,6 +4453,7 @@ async def _auto_create_codex_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -4485,6 +4492,9 @@ async def _auto_create_codex_terminal(
     :param agent_spec: Optional resolved agent spec for the session.
         When provided, its executor model is used as the Codex app-server
         default, e.g. ``"gpt-5.4-mini"``.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Composed last on
+        ``developer_instructions``, after the author and framework text.
     :param server_client: Runner's Omnigent server HTTP client. Used to read
         persisted launch args and the native thread id.
     :returns: The created terminal resource view.
@@ -4932,7 +4942,9 @@ async def _auto_create_codex_terminal(
         "\n\n".join(
             x
             for x in [
-                _native_startup_instructions_from_spec(agent_spec),
+                _native_startup_instructions_from_spec(
+                    agent_spec, global_instructions=global_instructions
+                ),
                 _codex_routing_note,
             ]
             if x
@@ -6597,25 +6609,29 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
 
 def _native_startup_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
+    *,
+    global_instructions: str | None = None,
 ) -> str | None:
     """Compose the text for a native harness's startup-additive channel.
 
     Shared by claude-native's ``--append-system-prompt`` and codex-native's
     ``developer_instructions``. Composes the author's text with the session's
-    framework instructions (``native_startup_instructions``); a startup channel
-    is not tied to any one turn, so it never carries the fully framework-composed
-    per-turn string (late-bound framework text like
-    ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is selected per conversation for
-    the turn about to run).
+    framework instructions and the server-held global instructions
+    (``native_startup_instructions``); a startup channel is not tied to any one
+    turn, so it never carries the fully framework-composed per-turn string
+    (late-bound framework text like ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is
+    selected per conversation for the turn about to run).
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
+    :param global_instructions: The session's server-held global instructions
+        text, or ``None``/blank when none is set.
     :returns: The composed startup text, or ``None`` when there is none.
     """
     from omnigent.runtime.prompt import native_startup_instructions
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    return native_startup_instructions(spec)
+    return native_startup_instructions(spec, global_instructions=global_instructions)
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -7490,6 +7506,7 @@ async def _auto_create_claude_terminal(
     auth_token_factory: Callable[[], str | None] | None = None,
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None,
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -7534,6 +7551,9 @@ async def _auto_create_claude_terminal(
         the model-options endpoint so launch and UI use one catalog query.
     :param record_launch_config: Optional callback that stores the exact
         provider/model snapshot used for this session's launch.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Composed last on
+        ``--append-system-prompt``, before the routed-spawn note.
     :returns: The launched terminal's :class:`SessionResourceView`, so
         callers that create it on demand (the resume "ensure" path in
         :func:`create_session_terminal`) can return the resource.
@@ -8196,7 +8216,14 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
-            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
+            x
+            for x in [
+                _native_startup_instructions_from_spec(
+                    agent_spec, global_instructions=global_instructions
+                ),
+                routed_spawn_note,
+            ]
+            if x
         )
         or None,
         allowed_tools=routed_spawn_tools,
@@ -8820,6 +8847,7 @@ class NativeLaunchContext:
     session_init: RunnerSessionInitEnvelope | None = None
     project_assignments_enabled: bool = False
     peer_messaging_enabled: bool = False
+    global_instructions: str | None = None
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
@@ -8890,6 +8918,7 @@ async def _launch_devin(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
         agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8961,6 +8990,7 @@ async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8997,6 +9027,7 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         auth_token_factory=ctx.auth_token_factory,
         resolve_launch_config=ctx.resolve_launch_config,
         record_launch_config=ctx.record_launch_config,
+        global_instructions=ctx.global_instructions,
     )
 
 

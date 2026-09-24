@@ -3056,6 +3056,19 @@ def create_runner_app(
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
+    # session_id → server-held global instructions from the init snapshot.
+    # Read by the launch and composition points, never from the TTL'd envelope
+    # cache, so the text outlives the cache. Blank is "off".
+    _session_global_instructions: dict[str, str | None] = {}
+
+    def _global_framework_instructions(value: str | None) -> list[str]:
+        """The session's global text as a one-entry framework instruction list.
+
+        Blank means the admin turned it off, so it must compose as absent
+        rather than as an empty entry.
+        """
+        return [value] if value and value.strip() else []
+
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -3848,10 +3861,9 @@ def create_runner_app(
 
     async def _load_legacy_session_init_context(session_id: str) -> _SessionInitContext:
         await _get_server_version(server_client)
-        # An envelope-free re-init (WS reconnect, resume) carries no flag
-        # snapshot; keep this session's last known project_assignments /
-        # peer_messaging values instead of popping them back to the off
-        # default — a legacy load must not silently revert a real grant.
+        # An envelope-free re-init (WS reconnect, resume) carries no snapshot:
+        # keep this session's last known project_assignments / peer_messaging /
+        # global-instructions values rather than silently reverting to defaults.
         _session_tool_schemas.pop(session_id, None)
         return _SessionInitContext(envelope=None)
 
@@ -3887,6 +3899,7 @@ def create_runner_app(
             _session_reasoning_effort[session_id] = snapshot.reasoning_effort
         _session_project_assignments_enabled[session_id] = snapshot.project_assignments_enabled
         _session_peer_messaging_enabled[session_id] = snapshot.peer_messaging_enabled
+        _session_global_instructions[session_id] = snapshot.global_instructions
         # A relay started before this init (resource access precedes the
         # handshake) read the previous flag; rebuild it in place on a flip.
         _stale_relay = _session_comment_relays.get(session_id)
@@ -4512,6 +4525,7 @@ def create_runner_app(
                     session_id, False
                 ),
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
+                global_instructions=_session_global_instructions.get(session_id),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -5312,6 +5326,7 @@ def create_runner_app(
         _session_reasoning_effort.pop(session_id, None)
         _session_project_assignments_enabled.pop(session_id, None)
         _session_peer_messaging_enabled.pop(session_id, None)
+        _session_global_instructions.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -8939,13 +8954,21 @@ def create_runner_app(
             _authored_bg = raw_author_instructions(cached_spec) is not None
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
-                    cached_spec, _raw_per_request_instructions, []
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                    framework_instructions=_global_framework_instructions(
+                        _session_global_instructions.get(conv)
+                    ),
                 )
             else:
                 instructions = build_instructions(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    framework_instructions=_global_framework_instructions(
+                        _session_global_instructions.get(conv)
+                    ),
                 )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
@@ -9378,6 +9401,7 @@ def create_runner_app(
                             conv_id, False
                         ),
                         peer_messaging_enabled=_session_peer_messaging_enabled.get(conv_id, False),
+                        global_instructions=_session_global_instructions.get(conv_id),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
                     resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
@@ -9552,7 +9576,12 @@ def create_runner_app(
                         _ic_ds = InstructionComposition(
                             authored_present=_authored_ds,
                             composed=build_instructions_nullable(
-                                _instr_spec_ds, _per_req_instr, []
+                                _instr_spec_ds,
+                                _per_req_instr,
+                                [],
+                                framework_instructions=_global_framework_instructions(
+                                    _session_global_instructions.get(conv_id)
+                                ),
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
@@ -9564,7 +9593,12 @@ def create_runner_app(
                             _instr_body = {
                                 **body,
                                 "instructions": build_instructions(
-                                    _instr_spec_ds, _per_req_instr, []
+                                    _instr_spec_ds,
+                                    _per_req_instr,
+                                    [],
+                                    framework_instructions=_global_framework_instructions(
+                                        _session_global_instructions.get(conv_id)
+                                    ),
                                 ),
                             }
                         if _authored_ds and harness_name:
@@ -11108,6 +11142,7 @@ def create_runner_app(
                     session_id, False
                 ),
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
+                global_instructions=_session_global_instructions.get(session_id),
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None

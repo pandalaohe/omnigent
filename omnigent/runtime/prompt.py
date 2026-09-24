@@ -219,26 +219,35 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
     return None
 
 
-def native_startup_instructions(spec: AgentSpec | None) -> str | None:
+def native_startup_instructions(
+    spec: AgentSpec | None,
+    *,
+    global_instructions: str | None = None,
+) -> str | None:
     """Compose the text a native harness's startup channel carries for ``spec``.
 
-    Author text first, then the spec-level framework instructions. A startup
-    channel is not tied to any one turn, so it may carry only text that holds
-    for the whole session — never per-turn late-bound framework text such as
+    Author text first, then the spec-level framework instructions, then the
+    server-held global instructions. A startup channel is not tied to any one
+    turn, so it may carry only text that holds for the whole session — never
+    per-turn late-bound framework text such as
     ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION``, which is selected per
     conversation when a turn's prompt is assembled.
 
     :param spec: The resolved ``AgentSpec``, or ``None`` when none was
-        available.
+        available. A missing spec still carries the global text: the session
+        is Omnigent's even when its own spec could not be resolved.
+    :param global_instructions: The server-held global instructions text, or
+        ``None``/blank when the admin has none set.
     :returns: The composed text, or ``None`` when there is nothing to send.
     """
-    if spec is None:
-        return None
     parts: list[str] = []
-    author_instructions = raw_author_instructions(spec)
-    if author_instructions:
-        parts.append(author_instructions)
-    parts.extend(_framework_instructions_for(spec))
+    if spec is not None:
+        author_instructions = raw_author_instructions(spec)
+        if author_instructions:
+            parts.append(author_instructions)
+        parts.extend(_framework_instructions_for(spec))
+    if global_instructions and global_instructions.strip():
+        parts.append(global_instructions)
     return "\n\n".join(parts) if parts else None
 
 

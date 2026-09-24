@@ -1365,6 +1365,7 @@ class TestStartupInstructionRouting:
                 lambda _sid, _evt: None,
                 server_client=None,
                 agent_spec=agent_spec,
+                global_instructions="G",
             )
 
         framework_text = (
@@ -1376,9 +1377,10 @@ class TestStartupInstructionRouting:
             rule_text = rule.read_text(encoding="utf-8")
             assert "Author brief." in rule_text
             assert framework_text not in rule_text
-            assert preamble == framework_text
+            assert "G" not in rule_text
+            assert preamble == f"{framework_text}\n\nG"
             # Recorded so SessionEnd removes the live rule.
             assert read_devin_workspace_hint(bridge_dir) == workspace
         else:
             assert not rule.exists()
-            assert preamble == f"Author brief.\n\n{framework_text}"
+            assert preamble == f"Author brief.\n\n{framework_text}\n\nG"

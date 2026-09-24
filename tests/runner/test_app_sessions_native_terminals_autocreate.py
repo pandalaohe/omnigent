@@ -1301,12 +1301,14 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
 ) -> None:
     """
     Host-spawned launch emits ``--append-system-prompt`` with the agent's
-    startup text: raw author instructions, then the spec-level framework text.
+    startup text: raw author instructions, then the spec-level framework text,
+    then the session's global instructions last (a routed-spawn note, when the
+    session has one, keeps its place after the whole composed text).
 
     The managed-host wiring in ``runner/native/orchestration.py``
     (``augment_claude_args(..., append_system_prompt=
-    _native_startup_instructions_from_spec(agent_spec))``), where
-    ``AgentSpec.instructions`` can become unreachable by claude-native.
+    _native_startup_instructions_from_spec(agent_spec, global_instructions=...))``),
+    where ``AgentSpec.instructions`` can become unreachable by claude-native.
     Drives the real ``_auto_create_claude_terminal`` →
     ``augment_claude_args`` integration rather than the helpers in isolation.
     """
@@ -1369,13 +1371,16 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
         lambda _sid, _evt: None,
         server_client=fake_client,
         agent_spec=agent_spec,
+        global_instructions="G",
     )
 
     args = captured["spec"].args
     assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
     idx = args.index("--append-system-prompt")
     assert args[idx + 1] == (
-        "Be a concise, careful coding assistant.\n\n" + EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+        "Be a concise, careful coding assistant.\n\n"
+        + EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+        + "\n\nG"
     )
 
 

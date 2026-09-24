@@ -336,7 +336,14 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "codex-native",
             "_auto_create_codex_terminal",
-            {"bundle_dir", "skills_filter", "agent_spec", "server_client", "ensure_comment_relay"},
+            {
+                "bundle_dir",
+                "skills_filter",
+                "agent_spec",
+                "server_client",
+                "ensure_comment_relay",
+                "global_instructions",
+            },
         ),
     ],
 )
