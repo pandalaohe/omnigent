@@ -106,6 +106,41 @@ def test_docker_entrypoint_wires_the_user_preferences_store() -> None:
     assert "user_preferences_store" in wired_keywords
 
 
+def test_docker_entrypoint_wires_the_global_instructions_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The container path must expose server-held global instructions.
+
+    ``create_app`` only mounts ``/v1/global-instructions`` when it gets a
+    store, and the session-init envelope reads the runtime global: both
+    kwargs have to be wired or a published text silently reaches no
+    session.
+    """
+    from fastapi.testclient import TestClient
+
+    from deploy.docker.entrypoint import build_app, run_migrations
+    from omnigent.runtime import get_global_instructions_store
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}\n")
+    database_url = f"sqlite:///{tmp_path / 'entrypoint.db'}"
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
+
+    run_migrations(database_url)
+    app = build_app().app
+
+    assert get_global_instructions_store() is not None
+    # Unauthenticated here means single-user local mode, not missing: a 404
+    # is what a build without the store returns, while 401/403 still proves
+    # the route is mounted.
+    response = TestClient(app).get("/v1/global-instructions")
+    assert response.status_code != 404
+
+
 def test_docker_entrypoint_runs_the_schema_initializer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

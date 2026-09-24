@@ -191,6 +191,9 @@ try:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.global_instructions_store.sqlalchemy_store import (
+        SqlAlchemyGlobalInstructionsStore,
+    )
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
@@ -244,6 +247,7 @@ try:
     file_comment_store = SqlAlchemyCommentStore(DB_URI)
     permission_store = SqlAlchemyPermissionStore(DB_URI)
     policy_store = SqlAlchemyPolicyStore(DB_URI)
+    global_instructions_store = SqlAlchemyGlobalInstructionsStore(DB_URI)
     project_store = SqlAlchemyProjectStore(DB_URI)
     project_repository_store = SqlAlchemyProjectRepositoryStore(DB_URI)
     project_host_binding_store = SqlAlchemyProjectHostBindingStore(DB_URI)
@@ -263,6 +267,7 @@ try:
         artifact_store=artifact_store,
         comment_store=file_comment_store,
         policy_store=policy_store,
+        global_instructions_store=global_instructions_store,
     )
 
     # The Databricks Apps proxy injects ``X-Forwarded-Email`` on
@@ -288,6 +293,7 @@ try:
         comment_store=file_comment_store,
         permission_store=permission_store,
         policy_store=policy_store,
+        global_instructions_store=global_instructions_store,
         project_store=project_store,
         project_repository_store=project_repository_store,
         project_host_binding_store=project_host_binding_store,
