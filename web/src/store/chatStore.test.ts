@@ -2025,6 +2025,235 @@ describe("chatStore — switchTo", () => {
     }
   });
 
+  it("drops a pending Codex card once hydration rebuilds the answered one", async () => {
+    // The TUI answered while this web card was still pending: history
+    // rebuilds the answered card from the call + output, and the id key
+    // proves the live pending copy is the same instance — one card, the
+    // rebuilt one.
+    const questions = {
+      questions: [
+        {
+          id: "call_async:0",
+          question: "Pick a flavour",
+          options: [{ label: "Vanilla" }, { label: "Mint" }],
+          multiSelect: false,
+        },
+      ],
+    };
+    seedSession("conv_codex_answered", [userMessage("resp_1", "ask me")]);
+    await useChatStore.getState().switchTo("conv_codex_answered");
+    useChatStore.setState((s) => ({
+      blocks: [
+        ...s.blocks,
+        {
+          type: "elicitation",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "resp_1",
+            itemId: null,
+          },
+          elicitationId: "elicit_codex_pending",
+          message: "",
+          phase: "pre_tool_use",
+          policyName: "codex_native_permission",
+          contentPreview: "",
+          requestedSchema: {},
+          status: "pending",
+          response: null,
+          askUserQuestion: questions,
+        } satisfies ElicitationBlock,
+      ],
+    }));
+    seedSession("conv_codex_answered", [
+      userMessage("resp_1", "ask me"),
+      {
+        id: "fc_async",
+        response_id: "resp_1",
+        type: "function_call",
+        status: "completed",
+        name: "request_user_input_async",
+        arguments: JSON.stringify(questions),
+        call_id: "call_async:0",
+        model: "codex-native-ui",
+      },
+      {
+        id: "fco_async",
+        response_id: "resp_1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_async:0",
+        output: "Vanilla",
+      },
+    ]);
+
+    useChatStore.setState({ abortController: null });
+    await useChatStore.getState().send("thanks", "agent_xyz");
+
+    const cards = useChatStore
+      .getState()
+      .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("responded");
+    expect(cards[0]!.ctx.itemId).toBe("fc_async:answer");
+  });
+
+  it("keeps a pending Codex card whose text matches another answered call", async () => {
+    // Two calls asked the identical question text; only one was answered.
+    // Ids — not text — pair the rebuilt copy, so the still-pending
+    // instance survives the merge.
+    const questionText = "Deploy to prod?";
+    const answeredArgs = {
+      questions: [
+        {
+          id: "call_one:0",
+          question: questionText,
+          options: [{ label: "Yes" }],
+          multiSelect: false,
+        },
+      ],
+    };
+    const pendingArgs = {
+      questions: [
+        {
+          id: "call_two:0",
+          question: questionText,
+          options: [{ label: "Yes" }],
+          multiSelect: false,
+        },
+      ],
+    };
+    seedSession("conv_codex_twins", [userMessage("resp_1", "ask me")]);
+    await useChatStore.getState().switchTo("conv_codex_twins");
+    useChatStore.setState((s) => ({
+      blocks: [
+        ...s.blocks,
+        {
+          type: "elicitation",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "resp_1",
+            itemId: null,
+          },
+          elicitationId: "elicit_codex_two",
+          message: "",
+          phase: "pre_tool_use",
+          policyName: "codex_native_permission",
+          contentPreview: "",
+          requestedSchema: {},
+          status: "pending",
+          response: null,
+          askUserQuestion: pendingArgs,
+        } satisfies ElicitationBlock,
+      ],
+    }));
+    seedSession("conv_codex_twins", [
+      userMessage("resp_1", "ask me"),
+      {
+        id: "fc_one",
+        response_id: "resp_1",
+        type: "function_call",
+        status: "completed",
+        name: "request_user_input_async",
+        arguments: JSON.stringify(answeredArgs),
+        call_id: "call_one:0",
+        model: "codex-native-ui",
+      },
+      {
+        id: "fco_one",
+        response_id: "resp_1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_one:0",
+        output: "Yes",
+      },
+    ]);
+
+    useChatStore.setState({ abortController: null });
+    await useChatStore.getState().send("thanks", "agent_xyz");
+
+    const cards = useChatStore
+      .getState()
+      .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards).toHaveLength(2);
+    expect(cards.map((c) => c.status).sort()).toEqual(["pending", "responded"]);
+    expect(cards.find((c) => c.status === "pending")?.elicitationId).toBe("elicit_codex_two");
+    expect(cards.find((c) => c.status === "responded")?.ctx.itemId).toBe("fc_one:answer");
+  });
+
+  it("keeps Claude's pending text-keyed card even when history rebuilt a matching one", async () => {
+    // Claude cards carry no ids, so two prompts can share a question
+    // verbatim; a rebuilt copy cannot prove the pending one was answered,
+    // and the answered-only rule stands.
+    const questions = {
+      questions: [
+        { question: "Which library?", options: [{ label: "date-fns" }], multiSelect: false },
+      ],
+    };
+    seedSession("conv_claude_pair", [userMessage("resp_1", "pick one")]);
+    await useChatStore.getState().switchTo("conv_claude_pair");
+    useChatStore.setState((s) => ({
+      blocks: [
+        ...s.blocks,
+        {
+          type: "elicitation",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "resp_1",
+            itemId: null,
+          },
+          elicitationId: "elicit_claude_pending",
+          message: "",
+          phase: "pre_tool_use",
+          policyName: "claude_native_permission",
+          contentPreview: "",
+          requestedSchema: {},
+          status: "pending",
+          response: null,
+          askUserQuestion: questions,
+        } satisfies ElicitationBlock,
+      ],
+    }));
+    seedSession("conv_claude_pair", [
+      userMessage("resp_1", "pick one"),
+      {
+        id: "fc_ask_claude",
+        response_id: "resp_1",
+        type: "function_call",
+        status: "completed",
+        name: "AskUserQuestion",
+        arguments: JSON.stringify(questions),
+        call_id: "call_ask_claude",
+      },
+      {
+        id: "fco_ask_claude",
+        response_id: "resp_1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_ask_claude",
+        output: 'Your questions have been answered: "Which library?"="date-fns".',
+      },
+    ]);
+
+    useChatStore.setState({ abortController: null });
+    await useChatStore.getState().send("thanks", "agent_xyz");
+
+    const cards = useChatStore
+      .getState()
+      .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards).toHaveLength(2);
+    expect(cards.find((c) => c.status === "pending")?.elicitationId).toBe("elicit_claude_pending");
+    expect(cards.find((c) => c.status === "responded")?.ctx.itemId).toBe("fc_ask_claude:answer");
+  });
+
   it("hydrates only the initial window and flags that older history remains", async () => {
     // Longer than the initial window so the loaded window is a strict subset.
     const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
@@ -7100,6 +7329,57 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           text:
             "[System: background task b3f9a2c1d completed]\n" +
             "Background command completed (exit code 0)",
+        },
+      ]);
+      expect(after.pendingUserMessages).toEqual([
+        { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
+      ]);
+    });
+
+    it("renders a Codex question reply as a system marker without consuming pending", () => {
+      // The reply is protocol text, not a human message: it must land as
+      // a `[System: Question answered]` boundary and must not pop a queued
+      // web message.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_codex_reply",
+        itemType: "message",
+        data: {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                "<send_user_message_question_reply>\n" +
+                JSON.stringify([
+                  {
+                    answer: "看到了，可以点击选项",
+                    question: "选择卡显示测试：你能看到这张可点击的单选卡吗？",
+                    questionItemId: JSON.stringify(["request_user_input_async", "call_5q2o", 0]),
+                  },
+                ]) +
+                "\n</send_user_message_question_reply>",
+            },
+          ],
+        },
+      });
+
+      const after = useChatStore.getState();
+      expect(after.blocks).toHaveLength(1);
+      expect(after.blocks[0]!.type).toBe("user_message");
+      expect((after.blocks[0] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text:
+            "[System: Question answered]\n" +
+            "选择卡显示测试：你能看到这张可点击的单选卡吗？ → 看到了，可以点击选项",
         },
       ]);
       expect(after.pendingUserMessages).toEqual([

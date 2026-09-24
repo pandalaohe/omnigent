@@ -139,6 +139,40 @@ describe("itemsToBlocks — flat shape", () => {
     expect(userBlocks[1]!.ctx.itemId).toBe("msg_legacy_task_notification");
   });
 
+  it("re-labels a Codex question reply as a system marker between real messages", () => {
+    const reply = [
+      "<send_user_message_question_reply>",
+      JSON.stringify([
+        {
+          answer: "看到了，可以点击选项",
+          question: "选择卡显示测试：你能看到这张可点击的单选卡吗？",
+          questionItemId: JSON.stringify(["request_user_input_async", "call_5q2o", 0]),
+        },
+      ]),
+      "</send_user_message_question_reply>",
+    ].join("\n");
+    const items: ConversationItem[] = [
+      userMessage("resp_before", "visible before", "msg_before"),
+      userMessage("resp_reply", reply, "msg_reply"),
+      userMessage("resp_after", "visible after", "msg_after"),
+    ];
+
+    const blocks = itemsToBlocks(items);
+
+    const userBlocks = blocks.filter((b): b is UserMessageBlock => b.type === "user_message");
+    expect(userBlocks).toHaveLength(3);
+    // Protocol text, not prose: the raw tags would read as a user bubble.
+    expect(userBlocks[1]!.content).toEqual([
+      {
+        type: "input_text",
+        text:
+          "[System: Question answered]\n" +
+          "选择卡显示测试：你能看到这张可点击的单选卡吗？ → 看到了，可以点击选项",
+      },
+    ]);
+    expect(userBlocks[1]!.ctx.itemId).toBe("msg_reply");
+  });
+
   it("re-labels an is_meta task notification (bridge-marked) as a system marker", () => {
     const items: ConversationItem[] = [
       {
@@ -599,6 +633,50 @@ describe("itemsToBlocks — answered question and plan cards", () => {
       functionCallOutput("resp_1", "c1", "The user doesn't want to proceed with this tool use."),
     ]);
     expect(blocks.map((b) => b.type)).toEqual(["tool_group", "tool_result"]);
+  });
+
+  const CODEX_QUESTION = {
+    questions: [
+      {
+        id: "call_async:0",
+        question: "选择卡显示测试：你能看到这张可点击的单选卡吗？",
+        options: [{ label: "看到了，可以点击选项" }, { label: "看到了，但无法点击" }],
+        multiSelect: false,
+      },
+    ],
+  };
+  const codexQuestionCall = (): ConversationItem =>
+    functionCall(
+      "resp_1",
+      "call_async:0",
+      "request_user_input_async",
+      CODEX_QUESTION,
+      "fc_async_q0",
+      "codex-native-ui",
+    );
+
+  it("rebuilds a responded Codex async question card from the call and its output", () => {
+    const items: ConversationItem[] = [
+      codexQuestionCall(),
+      functionCallOutput("resp_1", "call_async:0", "看到了，可以点击选项", "fco_async_q0"),
+    ];
+    const blocks = itemsToBlocks(items);
+    expect(blocks.map((b) => b.type)).toEqual(["elicitation", "tool_group", "tool_result"]);
+    const card = blocks[0] as ElicitationBlock;
+    expect(card.status).toBe("responded");
+    expect(card.response).toEqual({
+      action: "accept",
+      content: { "选择卡显示测试：你能看到这张可点击的单选卡吗？": "看到了，可以点击选项" },
+    });
+    // The card reads "Codex" like the live one did: item.model resolves
+    // through the same vendor table the live elicitation's policy id does.
+    expect(card.policyName).toBe("codex_native_permission");
+    expect(card.ctx.itemId).toBe("fc_async_q0:answer");
+  });
+
+  it("leaves an unanswered Codex async question as a plain tool row", () => {
+    const blocks = itemsToBlocks([codexQuestionCall()]);
+    expect(blocks.map((b) => b.type)).toEqual(["tool_group"]);
   });
 
   it("rebuilds an approved plan card from the ExitPlanMode result", () => {

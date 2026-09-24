@@ -61,13 +61,16 @@ import {
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
-import { taskNotificationMarkerContent } from "./systemMessage";
+import { taskNotificationMarkerContent, codexQuestionReplyMarkerContent } from "./systemMessage";
 
-// Claude built-ins whose call is a question TO the user rather than work
-// the agent did on its own. The elicitation that carried the card is
-// never persisted, so history rebuilds it from the call and its result.
+// Calls whose card asks the user a question rather than report work the
+// agent did on its own. The elicitation that carried the card is never
+// persisted, so history rebuilds it from the call and its result.
 const ASK_USER_QUESTION_TOOL = "AskUserQuestion";
 const EXIT_PLAN_MODE_TOOL = "ExitPlanMode";
+// Codex's async question: the forwarder posts one call per question plus
+// an output carrying the answer, so the same rebuild applies.
+const ASYNC_QUESTION_TOOL = "request_user_input_async";
 
 // Claude Code's ExitPlanMode result opens with this when the user
 // approved; a rejection returns the feedback they typed instead.
@@ -140,7 +143,7 @@ function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
 }
 
 /**
- * Rebuild the answered question / plan card for a gated Claude built-in.
+ * Rebuild the answered question / plan card for a gated question call.
  *
  * The card the user answered rode an elicitation, which is never
  * persisted — so on reload the only trace of the exchange is the tool
@@ -148,7 +151,8 @@ function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
  * responded card from that pair puts the question and the answer back
  * in the transcript, alongside the tool row the live stream also shows.
  *
- * @param item - The persisted ``AskUserQuestion`` / ``ExitPlanMode`` call.
+ * @param item - The persisted ``AskUserQuestion`` / ``ExitPlanMode`` /
+ *   ``request_user_input_async`` call.
  * @param output - The paired tool result, or undefined when this batch of
  *   items doesn't hold it (still outstanding, or split across history
  *   pages). Without it the answer is unknown, so no card is rebuilt.
@@ -160,7 +164,13 @@ function answeredElicitationBlock(
   output: string | undefined,
 ): ElicitationBlock | null {
   if (output === undefined) return null;
-  if (item.name !== ASK_USER_QUESTION_TOOL && item.name !== EXIT_PLAN_MODE_TOOL) return null;
+  if (
+    item.name !== ASK_USER_QUESTION_TOOL &&
+    item.name !== EXIT_PLAN_MODE_TOOL &&
+    item.name !== ASYNC_QUESTION_TOOL
+  ) {
+    return null;
+  }
   let args: Record<string, unknown>;
   try {
     args = JSON.parse(item.arguments) as Record<string, unknown>;
@@ -175,6 +185,18 @@ function answeredElicitationBlock(
       response: output.startsWith(PLAN_APPROVED_PREFIX)
         ? { action: "accept" }
         : { action: "decline", content: { feedback: output } },
+    };
+  }
+  if (item.name === ASYNC_QUESTION_TOOL) {
+    // Codex answers are read straight off the output: the question id in
+    // the call names one instance, and the output is that instance's answer.
+    const payload = castAskUserQuestionPayload(args);
+    const question = payload?.questions[0]?.question;
+    if (typeof question !== "string" || question === "") return null;
+    return {
+      ...elicitationShell(item),
+      askUserQuestion: args,
+      response: { action: "accept", content: { [question]: output } },
     };
   }
   const payload = castAskUserQuestionPayload(args);
@@ -248,6 +270,12 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
     const marker = taskNotificationMarkerContent(item.content);
     if (marker !== null) {
       return { ...userMessageToBlock(item), content: marker };
+    }
+    // A Codex question reply is protocol text, not prose — the raw tagged
+    // JSON would otherwise render as a user bubble.
+    const replyMarker = codexQuestionReplyMarkerContent(item.content);
+    if (replyMarker !== null) {
+      return { ...userMessageToBlock(item), content: replyMarker };
     }
   }
   if (isMessageItem(item) && item.is_meta === true) {

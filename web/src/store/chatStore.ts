@@ -150,7 +150,11 @@ import {
   onResponseStart,
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
-import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
+import {
+  codexQuestionReplyMarkerContent,
+  isSystemUserContent,
+  taskNotificationMarkerContent,
+} from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 
@@ -4412,8 +4416,12 @@ function reconcileElicitationBlocks(
  * result lands — so a merge that pulls fresh items in alongside the
  * live tail would show the exchange twice. The two copies carry
  * different elicitation ids (the live one is minted per prompt and
- * never persisted), so they pair on what was asked instead. Only
- * answered cards are dropped: a still-parked prompt is the one the
+ * never persisted), so they pair on what was asked instead.
+ *
+ * A Codex card keys on the question's protocol ids, which name one exact
+ * instance — a rebuilt copy therefore proves that instance was answered,
+ * and the live copy is dropped whatever its status. Text-keyed cards
+ * (Claude) keep the answered-only rule: a pending prompt is the one the
  * user can act on, and no persisted item can rebuild it.
  *
  * @param liveBlocks - Blocks the live pump produced.
@@ -4459,9 +4467,10 @@ function withoutRebuiltUserInputCards(
   }
   if (rebuilt.size === 0) return liveBlocks;
   return liveBlocks.filter((b) => {
-    if (b.type !== "elicitation" || b.status !== "responded") return true;
+    if (b.type !== "elicitation") return true;
     const key = userInputElicitationKey(b);
-    return key === null || !rebuilt.has(key);
+    if (key === null || !rebuilt.has(key)) return true;
+    return key.startsWith("question-ids:") ? false : b.status !== "responded";
   });
 }
 
@@ -5933,6 +5942,10 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   // other meta message (injected skill text) stays hidden.
   const marker = taskNotificationMarkerContent(content);
   if (marker !== null) return marker;
+  // A Codex question reply is protocol text, not prose: render the muted
+  // "[System: Question answered]" marker instead of the raw tags.
+  const replyMarker = codexQuestionReplyMarkerContent(content);
+  if (replyMarker !== null) return replyMarker;
   if (event.isMeta === true) return null;
   return content;
 }
