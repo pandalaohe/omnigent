@@ -641,6 +641,7 @@ export function AppShell() {
       runner_id: activeSession.runnerId ?? null,
       host_id: activeSession.hostId ?? null,
       workspace: activeSession.workspace ?? null,
+      worktree: activeSession.worktree ?? null,
       agent_id: activeSession.agentId,
       agent_name: activeSession.agentName,
       git_branch: activeSession.gitBranch ?? null,

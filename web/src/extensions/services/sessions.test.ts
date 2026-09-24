@@ -103,6 +103,7 @@ describe("projectSessionPage", () => {
             ...wireRow,
             title: "t".repeat(400),
             workspace: "w".repeat(900),
+            worktree: "k".repeat(900),
           },
         ],
         has_more: false,
@@ -122,10 +123,12 @@ describe("projectSessionPage", () => {
       "unread",
       "updatedAt",
       "workspace",
+      "worktree",
     ]);
     expect(result.sessions[0].title).toHaveLength(256);
     expect(result.sessions[0].projectId).toBe("project-secret");
     expect(result.sessions[0].workspace).toHaveLength(512);
+    expect(result.sessions[0].worktree).toHaveLength(512);
     expect(result.nextCursor).toBeNull();
   });
 

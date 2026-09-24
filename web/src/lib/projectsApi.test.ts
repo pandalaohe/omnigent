@@ -6,11 +6,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createProject,
   deleteProject,
+  deleteProjectEntry,
   deleteProjectHostBinding,
   deleteProjectRepository,
   getProject,
   getProjectCollaboration,
+  listProjectEntries,
   listProjects,
+  putProjectEntry,
   putProjectHostBinding,
   putProjectRepository,
   renameProject,
@@ -249,5 +252,71 @@ describe("verifyProjectHostBinding", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/projects/p_1/hosts/h1/bindings/primary/verify");
     expect(init.method).toBe("POST");
+  });
+});
+
+describe("listProjectEntries", () => {
+  it("GETs /v1/projects/{id}/entries and unwraps the entries array", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        entries: [{ host_id: "h1", workspace: "/repo", updated_at: null }],
+      }),
+    );
+    const result = await listProjectEntries("p_1");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p_1/entries");
+    expect(init.method).toBeUndefined();
+    expect(result).toEqual([{ host_id: "h1", workspace: "/repo", updated_at: null }]);
+  });
+
+  it("throws on non-2xx", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
+    await expect(listProjectEntries("missing")).rejects.toThrow();
+  });
+});
+
+describe("putProjectEntry", () => {
+  it("PUTs the workspace (url-encoded segments) and returns the entry", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ host_id: "h 1", workspace: "/repo", updated_at: 5 }),
+    );
+    const result = await putProjectEntry("p a", "h 1", "/repo");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p%20a/entries/h%201");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ workspace: "/repo" });
+    expect(result.workspace).toBe("/repo");
+  });
+
+  it("surfaces the server message on an offline host (409)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "conflict", message: "host is offline" } },
+        { ok: false, status: 409 },
+      ),
+    );
+    const err = await putProjectEntry("p_1", "h1", "/repo").catch((e) => e);
+    expect(err.status).toBe(409);
+    expect(err.message).toBe("host is offline");
+  });
+});
+
+describe("deleteProjectEntry", () => {
+  it("DELETEs /v1/projects/{id}/entries/{host_id}", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(null, { status: 204 }));
+    await deleteProjectEntry("p_1", "h1");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p_1/entries/h1");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("surfaces the server message when the entry is absent (404)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "not_found", message: "Entry not found" } },
+        { ok: false, status: 404 },
+      ),
+    );
+    await expect(deleteProjectEntry("p_1", "h1")).rejects.toThrow("Entry not found");
   });
 });

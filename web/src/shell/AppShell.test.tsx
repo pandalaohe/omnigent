@@ -26,10 +26,10 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import {
   readLastExplicitRightRailTab,
+  readSessionWorkspaceState,
   writeSessionWorkspaceState,
 } from "@/lib/sessionWorkspaceState";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import {
   readSessionNavigationPreferences,

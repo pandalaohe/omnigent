@@ -181,6 +181,7 @@ describe("createSession", () => {
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,
+      worktree: null,
       gitBranch: null,
     });
   });
@@ -370,6 +371,42 @@ describe("createSession", () => {
 
     const session = await createSession("agent_xyz");
     expect(session.activeResponseId).toBeNull();
+  });
+
+  it("maps worktree (snake) to worktree for a project-entry session", async () => {
+    // The recorded working tree rides beside workspace / git_branch; git
+    // readers use `worktree ?? workspace`.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_entry",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        workspace: "/Users/me/project",
+        worktree: "/Users/me/project/.worktrees/repo/feature-x",
+        git_branch: "feature/x",
+      }),
+    );
+
+    const session = await createSession("agent_xyz");
+    expect(session.worktree).toBe("/Users/me/project/.worktrees/repo/feature-x");
+    expect(session.workspace).toBe("/Users/me/project");
+  });
+
+  it("defaults worktree to null when the snapshot omits it", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_legacy",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+      }),
+    );
+
+    const session = await createSession("agent_xyz");
+    expect(session.worktree).toBeNull();
   });
 });
 

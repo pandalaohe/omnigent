@@ -333,6 +333,12 @@ export interface Session {
    */
   workspace?: string | null;
   /**
+   * Working tree recorded on the session when it differs from the launch
+   * directory (a project-entry session's git worktree). Git-reading surfaces
+   * use ``worktree ?? workspace``. ``null`` when the session records none.
+   */
+  worktree?: string | null;
+  /**
    * Native-terminal CLI args the session was launched with, e.g.
    * ``["--permission-mode", "plan"]``. Reflects the LAUNCH command only:
    * a later permission-mode switch lands in `labels`, so read the mode

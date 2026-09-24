@@ -836,6 +836,13 @@ export interface ConversationState {
    */
   gitBranch: string | null;
   /**
+   * Working tree recorded on the active session when it differs from the
+   * launch directory (a project-entry session's git worktree). Seeded from
+   * the session snapshot on bind (stable per session). ``null`` before bind
+   * or when the session records none.
+   */
+  worktree: string | null;
+  /**
    * Current Claude Code todo list for `omnigent claude` sessions.
    * Populated from the session snapshot on bind and updated by
    * `session.todos` SSE events. Empty array for non-claude-native
@@ -1708,6 +1715,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionCostUsd: null,
   sessionUsageByModel: null,
   gitBranch: null,
+  worktree: null,
   todos: [],
   codexModelOptions: [],
   terminalPending: false,
@@ -3630,6 +3638,7 @@ function sessionBindingPatch(
   | "autoCompactTokenLimit"
   | "providerUsageLimits"
   | "gitBranch"
+  | "worktree"
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
@@ -3667,6 +3676,7 @@ function sessionBindingPatch(
     autoCompactTokenLimit: session.autoCompactTokenLimit ?? null,
     providerUsageLimits: session.providerUsageLimits ?? null,
     gitBranch: session.gitBranch ?? null,
+    worktree: session.worktree ?? null,
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,

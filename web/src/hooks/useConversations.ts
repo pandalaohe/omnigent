@@ -203,6 +203,13 @@ export interface Conversation {
    * for sessions not bound to a host workspace.
    */
   workspace?: string | null;
+  /**
+   * Working tree recorded on the session when it differs from the launch
+   * directory (a project-entry session's git worktree), e.g.
+   * ``"/Users/me/project/.worktrees/repo/feature-x"``. Git-reading surfaces
+   * use ``worktree ?? workspace``. ``null``/absent when none is recorded.
+   */
+  worktree?: string | null;
   /** Durable identifier of the bound agent, e.g. ``"ag_abc123"``. */
   agent_id?: string;
   /** Stable source template identity, retained across runtime clones. */
@@ -546,6 +553,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
     workspace: wire.workspace ?? null,
+    worktree: wire.worktree ?? null,
     agent_id: wire.agent_id,
     agent_template_id: wire.agent_template_id ?? undefined,
     agent_name: wire.agent_name ?? null,

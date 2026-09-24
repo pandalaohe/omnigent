@@ -135,6 +135,7 @@ function projectSession(value: unknown): ExtensionSessionSummary {
     status: status as ExtensionSessionSummary["status"],
     unread: isConversationUnseen(id, updatedAt, status),
     workspace: optionalBoundedString(row.workspace, "workspace", SESSION_WORKSPACE_MAX_LENGTH),
+    worktree: optionalBoundedString(row.worktree, "worktree", SESSION_WORKSPACE_MAX_LENGTH),
     gitBranch: optionalBoundedString(row.git_branch, "git_branch", SESSION_TITLE_MAX_LENGTH),
     projectId: optionalBoundedString(row.project_id, "project_id", SESSION_ID_MAX_LENGTH),
     createdAt,

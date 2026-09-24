@@ -3560,6 +3560,28 @@ it("keeps authoritative template identity when backfilling a pinned clone", asyn
   });
 });
 
+it("carries the recorded worktree when backfilling a session row", async () => {
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({
+      id: "conv_entry",
+      created_at: 1,
+      workspace: "/Users/me/project",
+      worktree: "/Users/me/project/.worktrees/repo/feature-x",
+      git_branch: "feature/x",
+    }),
+  );
+  expect(await fetchConversationById("conv_entry")).toMatchObject({
+    workspace: "/Users/me/project",
+    worktree: "/Users/me/project/.worktrees/repo/feature-x",
+    git_branch: "feature/x",
+  });
+});
+
+it("defaults worktree to null when backfilling a legacy row", async () => {
+  fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_legacy", created_at: 1 }));
+  expect(await fetchConversationById("conv_legacy")).toMatchObject({ worktree: null });
+});
+
 describe("undoArchiveConversations optimistic restore", () => {
   it("re-injects evicted rows into cached lists before the unarchive PATCH settles", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

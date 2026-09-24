@@ -97,7 +97,12 @@ export async function getProject(id: string): Promise<Project> {
 export interface ProjectHostRoot {
   host_id: string;
   workspace: string;
-  source: "binding" | "config";
+  source: "entry" | "binding" | "config";
+  /**
+   * Repository a worktree is created from on that host (R-CHECKOUT), or
+   * `null` when none is registered. Absent on servers that predate the field.
+   */
+  checkout?: string | null;
 }
 
 export interface ProjectHostRoots {
@@ -110,6 +115,54 @@ export async function getProjectHostRoots(id: string): Promise<ProjectHostRoots>
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/host-roots`);
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as ProjectHostRoots;
+}
+
+/** A project's entry directory on one host — where its sessions open. */
+export interface ProjectHostEntry {
+  host_id: string;
+  /** Canonical directory path on that host, as the host returned it. */
+  workspace: string;
+  updated_at: number | null;
+}
+
+interface ProjectEntryListResponse {
+  entries: ProjectHostEntry[];
+}
+
+/** List a project's per-host entry directories. Empty when none are set. */
+export async function listProjectEntries(id: string): Promise<ProjectHostEntry[]> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/entries`);
+  const body = await readCollaborationJsonOrThrow<ProjectEntryListResponse>(res);
+  return body.entries;
+}
+
+/**
+ * Validate and store one host's entry directory. The host canonicalises the
+ * typed path; the returned entry carries what was actually stored.
+ */
+export async function putProjectEntry(
+  id: string,
+  hostId: string,
+  workspace: string,
+): Promise<ProjectHostEntry> {
+  const res = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(id)}/entries/${encodeURIComponent(hostId)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace }),
+    },
+  );
+  return readCollaborationJsonOrThrow<ProjectHostEntry>(res);
+}
+
+/** Delete one host's entry directory. 404s when the host has none. */
+export async function deleteProjectEntry(id: string, hostId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(id)}/entries/${encodeURIComponent(hostId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
 }
 
 /**

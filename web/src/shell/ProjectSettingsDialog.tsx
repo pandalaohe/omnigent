@@ -15,7 +15,7 @@
 // all-default dialog stores an empty config.
 
 import { ChevronDownIcon } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -50,7 +50,15 @@ import {
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
-import { getProjectCollaboration, type ProjectConfig } from "@/lib/projectsApi";
+import {
+  createProject,
+  deleteProjectEntry,
+  getProjectCollaboration,
+  listProjectEntries,
+  putProjectEntry,
+  type ProjectConfig,
+  type ProjectHostEntry,
+} from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
@@ -96,6 +104,33 @@ function trimOrUndef(value: string): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
+/** A draft entry row: one project directory per host. */
+interface DirectoryRow {
+  hostId: string;
+  path: string;
+}
+
+/**
+ * Seed the directory rows from the project's stored entries. A project with
+ * no entry yet falls back to the config's `workspace` when it names a
+ * concrete default host — Save then promotes that row into a real entry.
+ */
+function seedDirectoryRows(entries: ProjectHostEntry[], config: ProjectConfig): DirectoryRow[] {
+  if (entries.length > 0) {
+    return entries.map((entry) => ({ hostId: entry.host_id, path: entry.workspace }));
+  }
+  const hostId = config.host_id;
+  const workspace = trimOrUndef(config.workspace ?? "");
+  if (hostId !== undefined && hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && workspace) {
+    return [{ hostId, path: workspace }];
+  }
+  return [];
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Something went wrong. Try again.";
+}
+
 export function ProjectSettingsDialog({
   open,
   onOpenChange,
@@ -109,6 +144,7 @@ export function ProjectSettingsDialog({
   projectId: string | null;
   projectName: string;
 }) {
+  const queryClient = useQueryClient();
   // A label-only folder has no row to read; its config starts empty and the
   // save promotes it. Fetch only runs for a first-class project.
   const { data: stored, isLoading, isError } = useProjectConfig(open ? projectId : null);
@@ -136,10 +172,23 @@ export function ProjectSettingsDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const sandboxProvider = info !== "loading" ? info.sandbox_provider : null;
 
-  // Draft fields. Seeded from the stored config each time the dialog opens (or
-  // the fetched config arrives); local until saved.
+  // Draft fields. Seeded from the stored config + entries each time the dialog
+  // opens (or the fetches arrive); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
-  const [workspace, setWorkspace] = useState("");
+  // One directory per host — the project's entry rows. The Host field above is
+  // the default host; the rows are independent of it.
+  const [directoryRows, setDirectoryRows] = useState<DirectoryRow[]>([]);
+  // Which row's filesystem browser is expanded (host id), if any.
+  const [openRow, setOpenRow] = useState<string | null>(null);
+  // The first entry write to fail on Save: its server message renders on that
+  // row, the sequence stops, and no config is written.
+  const [entriesError, setEntriesError] = useState<{ hostId: string; message: string } | null>(
+    null,
+  );
+  // Non-entry save failures (project promotion / config PATCH) — rendered with
+  // the same alert as `updateConfig.error`.
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   // Worktree default for the project. The toggle seeds from the project's
   // stored value when set, else from the user-global "always use a worktree"
   // default (Settings › Git). On save it stays "inherit" (stores nothing) while
@@ -154,7 +203,6 @@ export function ProjectSettingsDialog({
   // Default model for new sessions, only meaningful when the default agent is
   // a native harness with a model choice; NONE stores no default (unset key).
   const [model, setModel] = useState<string>(NONE);
-  const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("defaults");
   const tabsId = useId();
   const { data: collaborationStatus } = useQuery({
@@ -163,6 +211,35 @@ export function ProjectSettingsDialog({
     enabled: open && showCollaboration,
     retry: false,
   });
+  // The single "Project directory" row set. A label-only folder has no stored
+  // project yet, so there is nothing to fetch until Save promotes it.
+  const {
+    data: storedEntries,
+    isPending: entriesPending,
+    isError: entriesErrorState,
+  } = useQuery({
+    queryKey: ["project-entries", projectId],
+    queryFn: () => listProjectEntries(projectId as string),
+    enabled: open && projectId !== null,
+    retry: false,
+    staleTime: 30_000,
+  });
+  // Same rationale as `loadFailed`: a failed entries GET must not be read as
+  // "no entries" — Save would reuse a blank row set and could delete/overwrite
+  // rows it never saw.
+  const entriesLoadFailed = projectId !== null && entriesErrorState;
+  const entriesLoading = projectId !== null && entriesPending;
+  const entries = useMemo(() => storedEntries ?? [], [storedEntries]);
+  const hostsById = useMemo(
+    () => new Map((hosts.data ?? []).map((host) => [host.host_id, host])),
+    [hosts.data],
+  );
+  // Hosts the user owns that no row covers yet — the "Add host" choices.
+  // Sandbox hosts are server-provisioned launch targets, never entry hosts
+  // (the entries API refuses them).
+  const addableHosts = (hosts.data ?? []).filter(
+    (host) => !host.sandbox_provider && !directoryRows.some((row) => row.hostId === host.host_id),
+  );
 
   useEffect(() => {
     if (open) setActiveTab("defaults");
@@ -204,33 +281,81 @@ export function ProjectSettingsDialog({
     if (!open) return;
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
-    if (loadFailed) return;
+    if (loadFailed || entriesLoadFailed) return;
+    // Wait for the entry rows, or the config-fallback row would be seeded and
+    // then immediately replaced by the fetched rows.
+    if (entriesLoading) return;
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
-    setWorkspace(c.workspace ?? "");
+    setDirectoryRows(seedDirectoryRows(entries, c));
     setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setModel(c.model ?? NONE);
-    setWorkspaceOpen(false);
-  }, [open, stored, loadFailed]);
+    setOpenRow(null);
+    setEntriesError(null);
+    setSaveError(null);
+  }, [open, stored, loadFailed, entriesLoadFailed, entriesLoading, entries]);
 
-  const onSubmit = (e: FormEvent) => {
+  // Entry sync derived from the seeded entries + draft rows: PUTs for rows
+  // whose path changed (or that are new), DELETEs for stored rows the user
+  // removed.
+  const storedByHost = useMemo(
+    () => new Map(entries.map((entry) => [entry.host_id, entry.workspace])),
+    [entries],
+  );
+  const changedRows = directoryRows.filter((row) => {
+    const path = row.path.trim();
+    return path !== "" && storedByHost.get(row.hostId) !== path;
+  });
+  const removedHostIds = entries
+    .filter((entry) => !directoryRows.some((row) => row.hostId === entry.host_id))
+    .map((entry) => entry.host_id);
+  // The default host's row supplies the config's `workspace` mirror. A missing
+  // row, a blank path, or the sandbox default host leaves it unset.
+  const defaultRow =
+    hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE
+      ? directoryRows.find((row) => row.hostId === hostId)
+      : undefined;
+  const defaultHostRowPath = defaultRow ? trimOrUndef(defaultRow.path) : undefined;
+
+  const addDirectoryRow = (rowHostId: string) => {
+    setEntriesError(null);
+    setDirectoryRows((rows) =>
+      rows.some((row) => row.hostId === rowHostId)
+        ? rows
+        : [...rows, { hostId: rowHostId, path: "" }],
+    );
+  };
+
+  const removeDirectoryRow = (rowHostId: string) => {
+    setEntriesError(null);
+    setOpenRow((current) => (current === rowHostId ? null : current));
+    setDirectoryRows((rows) => rows.filter((row) => row.hostId !== rowHostId));
+  };
+
+  const setDirectoryPath = (rowHostId: string, path: string) => {
+    setEntriesError(null);
+    setDirectoryRows((rows) =>
+      rows.map((row) => (row.hostId === rowHostId ? { ...row, path } : row)),
+    );
+  };
+
+  const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    if (loadFailed || entriesLoadFailed || saving) return;
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
-    // A workspace is host-relative and only meaningful with a concrete host —
-    // don't persist a stale path from a since-cleared host, and drop it for the
-    // sandbox (a sandbox create provisions its own workspace and ignores this).
-    const ws =
-      hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
-    if (ws) config.workspace = ws;
+    // The stored workspace is only a single-host mirror for upstream readers:
+    // the default host's row when it has one, else nothing. Placement reads the
+    // entries once the project has any, so this can never route a session to a
+    // directory the dialog didn't save.
+    if (defaultHostRowPath) config.workspace = defaultHostRowPath;
     else delete config.workspace;
     if (agentId) config.agent_id = agentId;
     else delete config.agent_id;
@@ -255,10 +380,54 @@ export function ProjectSettingsDialog({
     if (supportsModelDefault && model !== NONE) config.model = model;
     else if (!agentUnresolved) delete config.model;
 
-    updateConfig.mutate(
-      { id: projectId, name: projectName, config },
-      { onSuccess: () => onOpenChange(false) },
-    );
+    setEntriesError(null);
+    setSaveError(null);
+    setSaving(true);
+    try {
+      let id = projectId;
+      if (id === null) {
+        // A label-only folder is promoted first; the entry writes below use the
+        // returned id.
+        try {
+          id = (await createProject(projectName)).id;
+        } catch (error) {
+          setSaveError(errorMessage(error));
+          return;
+        }
+      }
+      // PUT changed rows, DELETE removed rows, sequentially: the first failure
+      // stops the sequence, its server message lands on that row, the dialog
+      // stays open and no config is written. Sequential by design — the next
+      // write must not start after a failure.
+      for (const row of changedRows) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await putProjectEntry(id, row.hostId, row.path.trim());
+        } catch (error) {
+          setEntriesError({ hostId: row.hostId, message: errorMessage(error) });
+          return;
+        }
+      }
+      for (const removedHostId of removedHostIds) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await deleteProjectEntry(id, removedHostId);
+        } catch (error) {
+          setEntriesError({ hostId: removedHostId, message: errorMessage(error) });
+          return;
+        }
+      }
+      try {
+        await updateConfig.mutateAsync({ id, name: projectName, config });
+      } catch {
+        // updateConfig.isError renders the server message below.
+        return;
+      }
+      void queryClient.invalidateQueries({ queryKey: ["project-entries", id] });
+      onOpenChange(false);
+    } finally {
+      setSaving(false);
+    }
   };
 
   // Offer only online hosts (an offline host can only fail on create), plus the
@@ -276,14 +445,11 @@ export function ProjectSettingsDialog({
   const browsableHostId =
     hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
 
-  // A working directory belongs to one Host. When the Host changes, discard
-  // the prior Host's path; opening the browser will then start at the newly
-  // selected Host's pinned folder (or home when it has no pin).
+  // The default host is a config field of its own — changing it leaves the
+  // per-host directory rows untouched. Close any open browser so the newly
+  // selected default host's row starts collapsed.
   const onHostChange = (nextHostId: string) => {
-    if (nextHostId !== hostId) {
-      setWorkspace("");
-      setWorkspaceOpen(false);
-    }
+    if (nextHostId !== hostId) setOpenRow(null);
     setHostId(nextHostId);
   };
 
@@ -428,96 +594,171 @@ export function ProjectSettingsDialog({
             </Select>
           </Field>
 
-          <Field
-            label="Working directory"
-            hint={
-              hostId === NONE
-                ? "Pick a host first"
-                : browsableHostId
-                  ? "Browse the host or type a path"
-                  : "Absolute path on the host"
-            }
-            htmlFor="project-settings-workspace"
-          >
-            {hostId === NONE ? (
-              // Mirror the new-session composer: the working directory can only
-              // be chosen once a host is selected (the file browser lists
-              // against a concrete host, and a path is host-relative anyway).
-              <p
-                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
-                data-testid="project-settings-workspace"
-              >
-                Pick a host first
-              </p>
-            ) : browsableHostId ? (
-              // A compact trigger showing the current path; clicking expands
-              // the filesystem browser as an overlay anchored to the trigger.
-              // The browser is rendered inside DialogContent (not a portaled
-              // popover) so it scrolls — a modal Dialog's scroll-lock blocks
-              // wheel events on portaled content — but positioned `absolute`
-              // so it floats over the fields below instead of stretching the
-              // modal. onNavigate updates the field live as you browse.
-              <div
-                className="relative flex flex-col gap-1.5"
-                data-testid="project-settings-workspace"
-              >
-                <button
-                  type="button"
-                  onClick={() => setWorkspaceOpen((v) => !v)}
-                  aria-expanded={workspaceOpen}
-                  disabled={isLoading}
-                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+          {/* One project directory per host — the project's entry rows. The
+              Host field above stays the default host; these rows are what
+              sessions open in. */}
+          <div className="grid min-w-0 grid-cols-1 gap-1.5">
+            <div className="flex min-w-0 flex-col">
+              <span className="font-medium text-ui">Project directory</span>
+              <span className="text-muted-foreground text-sm">
+                Where new sessions open — one directory per host
+              </span>
+            </div>
+            <div className="flex min-w-0 flex-col gap-2" data-testid="project-settings-directories">
+              {directoryRows.length === 0 && (
+                <p
+                  className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
+                  data-testid="project-settings-directories-empty"
                 >
-                  <span
-                    className={
-                      workspace ? "min-w-0 truncate font-mono" : "truncate text-muted-foreground"
-                    }
-                    title={workspace || undefined}
+                  No project directory yet
+                </p>
+              )}
+              {directoryRows.map((row) => {
+                const rowHost = hostsById.get(row.hostId);
+                const rowError = entriesError?.hostId === row.hostId ? entriesError : null;
+                // The filesystem browser needs a live host; an offline or
+                // unregistered host falls back to typing a path.
+                const browsable = rowHost?.status === "online";
+                const rowOpen = openRow === row.hostId;
+                return (
+                  <div
+                    key={row.hostId}
+                    className="flex min-w-0 flex-col gap-1.5 rounded-md border p-2"
+                    data-testid={`project-settings-entry-${row.hostId}`}
                   >
-                    {workspace || "Browse…"}
-                  </span>
-                  <ChevronDownIcon
-                    className={`size-4 shrink-0 opacity-50 transition-transform ${
-                      workspaceOpen ? "rotate-180" : ""
-                    }`}
-                  />
-                </button>
-                {workspaceOpen && (
-                  <>
-                    {/* Click-away: a transparent full-modal backdrop that
-                    closes the browser (keeping the current path) on any
-                    click outside it. */}
-                    <button
-                      type="button"
-                      aria-label="Close directory browser"
-                      className="fixed inset-0 z-10 cursor-default"
-                      onClick={() => setWorkspaceOpen(false)}
-                    />
-                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:border-white/10 dark:backdrop-blur-xl dark:backdrop-saturate-150 [&>[data-testid=workspace-picker]]:border-0">
-                      <HostWorkspacePicker
-                        hostId={browsableHostId}
-                        initialPath={isNavigablePath(workspace) ? workspace : undefined}
-                        onNavigate={setWorkspace}
-                      />
+                    <div className="flex min-w-0 items-center justify-between gap-2">
+                      <span className="min-w-0 truncate text-ui" title={rowHost?.name ?? row.hostId}>
+                        {rowHost?.name ?? row.hostId}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-auto shrink-0 p-0 text-muted-foreground text-sm hover:bg-transparent"
+                        data-testid={`project-settings-entry-remove-${row.hostId}`}
+                        onClick={() => removeDirectoryRow(row.hostId)}
+                        disabled={isLoading || saving}
+                      >
+                        Remove
+                      </Button>
                     </div>
-                  </>
+                    {browsable ? (
+                      // A compact trigger showing the current path; clicking
+                      // expands the filesystem browser as an overlay anchored
+                      // to the trigger. The browser is rendered inside
+                      // DialogContent (not a portaled popover) so it scrolls —
+                      // a modal Dialog's scroll-lock blocks wheel events on
+                      // portaled content — but positioned `absolute` so it
+                      // floats over the fields below. onNavigate updates the
+                      // row's path live as you browse.
+                      <div className="relative flex flex-col gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setOpenRow(rowOpen ? null : row.hostId)}
+                          aria-expanded={rowOpen}
+                          disabled={isLoading || saving}
+                          data-testid={`project-settings-entry-browse-${row.hostId}`}
+                          aria-label={`Project directory on ${rowHost?.name ?? row.hostId}`}
+                          className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <span
+                            className={
+                              row.path
+                                ? "min-w-0 truncate font-mono"
+                                : "truncate text-muted-foreground"
+                            }
+                            title={row.path || undefined}
+                          >
+                            {row.path || "Browse…"}
+                          </span>
+                          <ChevronDownIcon
+                            className={`size-4 shrink-0 opacity-50 transition-transform ${
+                              rowOpen ? "rotate-180" : ""
+                            }`}
+                          />
+                        </button>
+                        {rowOpen && (
+                          <>
+                            {/* Click-away: a transparent full-modal backdrop
+                            that closes the browser (keeping the current path)
+                            on any click outside it. */}
+                            <button
+                              type="button"
+                              aria-label="Close directory browser"
+                              className="fixed inset-0 z-10 cursor-default"
+                              onClick={() => setOpenRow(null)}
+                            />
+                            <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:border-white/10 dark:backdrop-blur-xl dark:backdrop-saturate-150 [&>[data-testid=workspace-picker]]:border-0">
+                              <HostWorkspacePicker
+                                hostId={row.hostId}
+                                initialPath={isNavigablePath(row.path) ? row.path : undefined}
+                                onNavigate={(path) => setDirectoryPath(row.hostId, path)}
+                              />
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <input
+                        data-testid={`project-settings-entry-path-${row.hostId}`}
+                        aria-label={`Project directory on ${rowHost?.name ?? row.hostId}`}
+                        className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                        placeholder="/path/to/repo"
+                        value={row.path}
+                        title={row.path || undefined}
+                        onChange={(e) => setDirectoryPath(row.hostId, e.target.value)}
+                        disabled={isLoading || saving}
+                      />
+                    )}
+                    {rowError && (
+                      <p
+                        className="text-destructive text-ui"
+                        role="alert"
+                        data-testid={`project-settings-entry-error-${row.hostId}`}
+                      >
+                        {rowError.message}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+              {entriesError &&
+                !directoryRows.some((row) => row.hostId === entriesError.hostId) && (
+                  // A DELETE that failed has no row left to carry the message.
+                  <p
+                    className="text-destructive text-ui"
+                    role="alert"
+                    data-testid="project-settings-entries-error"
+                  >
+                    {entriesError.message}
+                  </p>
                 )}
-              </div>
-            ) : (
-              // A host is picked but not browsable (sandbox / offline stored
-              // host) — fall back to typing an absolute path.
-              <input
-                id="project-settings-workspace"
-                data-testid="project-settings-workspace"
-                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                placeholder="/path/to/repo"
-                value={workspace}
-                title={workspace || undefined}
-                onChange={(e) => setWorkspace(e.target.value)}
-                disabled={isLoading}
-              />
-            )}
-          </Field>
+              {addableHosts.length > 0 && (
+                // A menu-shaped Select: its value never changes, so picking a
+                // host adds a row and the trigger keeps reading "Add host".
+                <Select
+                  value={NONE}
+                  onValueChange={(value) => {
+                    if (value !== NONE) addDirectoryRow(value);
+                  }}
+                  onOpenChange={onDropdownOpenChange}
+                  disabled={isLoading || saving}
+                >
+                  <SelectTrigger className="w-full" data-testid="project-settings-add-host">
+                    <SelectValue placeholder="Add host" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={NONE}>Add host</SelectItem>
+                    {addableHosts.map((host) => (
+                      <SelectItem key={host.host_id} value={host.host_id}>
+                        {host.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+            </div>
+          </div>
 
           <Field
             switchRow
@@ -650,9 +891,19 @@ export function ProjectSettingsDialog({
               disabled so your existing defaults aren't overwritten.
             </p>
           )}
-          {updateConfig.isError && (
+          {entriesLoadFailed && (
+            <p
+              className="text-destructive text-ui"
+              role="alert"
+              data-testid="project-settings-entries-load-error"
+            >
+              Couldn't load this project's directories. Close and reopen to try again — saving is
+              disabled so they aren't overwritten.
+            </p>
+          )}
+          {(saveError ?? (updateConfig.isError ? (updateConfig.error as Error).message : null)) && (
             <p className="text-destructive text-ui" role="alert">
-              {(updateConfig.error as Error).message}
+              {saveError ?? (updateConfig.error as Error).message}
             </p>
           )}
         </form>
@@ -675,7 +926,7 @@ export function ProjectSettingsDialog({
                 type="button"
                 variant="ghost"
                 onClick={() => onOpenChange(false)}
-                disabled={updateConfig.isPending}
+                disabled={updateConfig.isPending || saving}
               >
                 Cancel
               </Button>
@@ -683,8 +934,8 @@ export function ProjectSettingsDialog({
                 type="submit"
                 form="project-settings-defaults-form"
                 data-testid="project-settings-save"
-                loading={updateConfig.isPending}
-                disabled={isLoading || loadFailed}
+                loading={updateConfig.isPending || saving}
+                disabled={isLoading || entriesLoading || loadFailed || entriesLoadFailed}
               >
                 Save
               </Button>

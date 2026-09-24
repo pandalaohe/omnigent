@@ -23,6 +23,7 @@ export interface ExtensionSessionSummary {
   /** True when `title` is the shell's provisional first-message title (no server title yet). */
   titleProvisional: boolean;
   workspace: string | null;
+  worktree: string | null;
   gitBranch: string | null;
   projectId: string | null;
   createdAt: number;

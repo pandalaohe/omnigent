@@ -1571,6 +1571,48 @@ describe("Sidebar session list", () => {
     });
   });
 
+  it("shows the worktree under the project directory in the session tooltip when they differ", async () => {
+    const workspace = "/Users/me/project";
+    const worktree = "/Users/me/project/.worktrees/repo/feature-x";
+    mockConversations([
+      conv("conv_entry_tooltip", "Codex", {
+        title: "Entry session",
+        workspace,
+        worktree,
+      }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByText("Entry session").closest("a")!;
+    expect(within(row).queryByText(worktree)).toBeNull();
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    await waitFor(() => {
+      expect(screen.getAllByTestId("session-tooltip-workspace")[0]).toHaveTextContent(workspace);
+      expect(screen.getAllByTestId("session-tooltip-worktree")[0]).toHaveTextContent(worktree);
+    });
+  });
+
+  it("omits the tooltip worktree line when it matches the directory", async () => {
+    const workspace = "/Users/me/project";
+    mockConversations([
+      conv("conv_same_tooltip", "Codex", {
+        title: "Plain session",
+        workspace,
+        worktree: workspace,
+      }),
+    ]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByText("Plain session").closest("a")!, {
+      pointerType: "mouse",
+    });
+    await waitFor(() => {
+      expect(screen.getAllByTestId("session-tooltip-workspace")[0]).toHaveTextContent(workspace);
+    });
+    expect(screen.queryByTestId("session-tooltip-worktree")).not.toBeInTheDocument();
+  });
+
   it("shares one hosts observer across multiple ordinary session rows", () => {
     const observerMounted = vi.fn();
     useHostsMock.mockImplementation(() => {

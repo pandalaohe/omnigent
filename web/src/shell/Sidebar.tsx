@@ -35,6 +35,7 @@ import {
   ClockIcon,
   CircleAlertIcon,
   CircleStopIcon,
+  FolderGit2Icon,
   FolderIcon,
   FolderInputIcon,
   FolderMinusIcon,
@@ -2293,10 +2294,10 @@ function ConversationList({
     let hasMore = hasNextConversationPage;
     while (hasMore) {
       // Cursor pagination is sequential: each request needs the cursor returned by the prior page.
-      // eslint-disable-next-line no-await-in-loop
       // SidebarListQuery erases fetchNextPage's return to `unknown` so the
       // several sources behind it stay interchangeable; this loop is the one
       // caller that reads it, so it names the two fields it consumes.
+      // eslint-disable-next-line no-await-in-loop
       const result = (await fetchNextConversationPage()) as {
         data?: { pages?: typeof pages };
         hasNextPage?: boolean;
@@ -4070,6 +4071,24 @@ function SessionTooltipContent({
         <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
         <span className="truncate">{locationLabel}</span>
       </p>
+      {conversation.workspace && (
+        <p
+          data-testid="session-tooltip-workspace"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          <FolderIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{conversation.workspace}</span>
+        </p>
+      )}
+      {conversation.worktree && conversation.worktree !== conversation.workspace && (
+        <p
+          data-testid="session-tooltip-worktree"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          <FolderGit2Icon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{conversation.worktree}</span>
+        </p>
+      )}
       {conversation.git_branch && (
         <p
           data-testid="session-tooltip-branch"
@@ -5160,6 +5179,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "git_branch",
   "host_id",
   "workspace",
+  "worktree",
   "runner_id",
   "project_id",
   "owner",

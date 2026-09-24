@@ -157,6 +157,11 @@ interface SessionResponseWire {
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   /**
+   * Recorded working tree when it differs from the launch directory (a
+   * project-entry session's git worktree); ``null``/absent when none.
+   */
+  worktree?: string | null;
+  /**
    * Native-terminal CLI args the session launched with, e.g.
    * ``["--permission-mode", "plan"]``. Records only the LAUNCH flags —
    * a later mode switch is reflected in `labels`, not here.
@@ -336,6 +341,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     title: wire.title ?? null,
     labels: wire.labels,
     workspace: wire.workspace ?? null,
+    worktree: wire.worktree ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
     items: wire.items ?? [],
