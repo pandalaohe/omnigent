@@ -112,7 +112,7 @@ describe("settingsNavGroups", () => {
     expect(ids(true)).toContain("updates");
   });
 
-  it("includes the Admin group (Members / Policies / Sharing) for any admin, in accounts OR OIDC mode", () => {
+  it("includes the Admin group (Members / Policies / Global instructions / Sharing) for any admin, in accounts OR OIDC mode", () => {
     const ids = (accountsEnabled: boolean, isAdmin: boolean) =>
       settingsNavGroups(accountsEnabled, false, isAdmin)
         .flatMap((g) => g.items)
@@ -122,21 +122,32 @@ describe("settingsNavGroups", () => {
     expect(ids(false, false)).not.toContain("members");
     // Admin on an accounts deploy → all appear, grouped under "Admin".
     const accountsAdmin = settingsNavGroups(true, false, true).find((g) => g.title === "Admin");
-    expect(accountsAdmin?.items.map((i) => i.id)).toEqual(["members", "policies", "sharing"]);
+    expect(accountsAdmin?.items.map((i) => i.id)).toEqual([
+      "members",
+      "policies",
+      "global-instructions",
+      "sharing",
+    ]);
     // Admin under OIDC (accountsEnabled false) → still appears. This is the
     // #1489 fix: OIDC previously had no admin chrome at all.
     const oidcAdmin = settingsNavGroups(false, false, true).find((g) => g.title === "Admin");
-    expect(oidcAdmin?.items.map((i) => i.id)).toEqual(["members", "policies", "sharing"]);
+    expect(oidcAdmin?.items.map((i) => i.id)).toEqual([
+      "members",
+      "policies",
+      "global-instructions",
+      "sharing",
+    ]);
   });
 
-  it("drops Members and Sharing from the Admin group in single-user mode, keeping Policies", () => {
+  it("drops Members and Sharing from the Admin group in single-user mode, keeping Policies and Global instructions", () => {
     // 4th arg is isSingleUser. Members (manage accounts) and Sharing (grant to
     // other users) are meaningless with no other users, so both are hidden;
-    // Policies stays — global policies apply to the solo user's own sessions.
+    // Policies and Global instructions stay — both apply to the solo user's
+    // own sessions.
     const singleUserAdmin = settingsNavGroups(false, false, true, true).find(
       (g) => g.title === "Admin",
     );
-    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies"]);
+    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies", "global-instructions"]);
   });
 
   it("includes the Sandbox Integrations item only when a connection is enabled", () => {
@@ -267,14 +278,16 @@ describe("SettingsSidebarBody", () => {
     expect(onNavClick).toHaveBeenCalledTimes(1);
   });
 
-  it("renders Members / Policies sub-categories for an admin, linking under /settings", () => {
+  it("renders Members / Policies / Global instructions sub-categories for an admin, linking under /settings", () => {
     mocks.accountsEnabled = true;
     mocks.isAdmin = true;
     renderBody();
     const members = screen.getByTestId("settings-nav-members");
     const policies = screen.getByTestId("settings-nav-policies");
+    const globalInstructions = screen.getByTestId("settings-nav-global-instructions");
     expect(members).toHaveAttribute("href", "/settings/members");
     expect(policies).toHaveAttribute("href", "/settings/policies");
+    expect(globalInstructions).toHaveAttribute("href", "/settings/global-instructions");
   });
 
   it("renders the admin sub-categories for an admin under OIDC (accounts off)", () => {
@@ -291,10 +304,11 @@ describe("SettingsSidebarBody", () => {
     );
   });
 
-  it("hides Members and Sharing but keeps Policies for an admin in single-user mode", () => {
+  it("hides Members and Sharing but keeps Policies and Global instructions for an admin in single-user mode", () => {
     // Explicit single-user local runtime (single_user marker set): there are
     // no other users to manage or share with, so Members and Sharing drop from
-    // the nav. Policies stays — it's meaningful for a solo user's own sessions.
+    // the nav. Policies and Global instructions stay — both are meaningful for
+    // a solo user's own sessions.
     mocks.accountsEnabled = false;
     mocks.loginUrl = null;
     mocks.singleUser = true;
@@ -306,6 +320,10 @@ describe("SettingsSidebarBody", () => {
       "href",
       "/settings/policies",
     );
+    expect(screen.getByTestId("settings-nav-global-instructions")).toHaveAttribute(
+      "href",
+      "/settings/global-instructions",
+    );
   });
 
   it("hides the admin sub-categories for a non-admin", () => {
@@ -314,6 +332,7 @@ describe("SettingsSidebarBody", () => {
     renderBody();
     expect(screen.queryByTestId("settings-nav-members")).toBeNull();
     expect(screen.queryByTestId("settings-nav-policies")).toBeNull();
+    expect(screen.queryByTestId("settings-nav-global-instructions")).toBeNull();
   });
 });
 
@@ -369,6 +388,10 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "general" });
     expect(routeHook("/settings/sharing")).toEqual({ inSettings: true, section: "general" });
     expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
+    expect(routeHook("/settings/global-instructions")).toEqual({
+      inSettings: true,
+      section: "global-instructions",
+    });
   });
 
   it("reports NOT in settings for the legacy standalone /members and /policies paths", () => {
@@ -398,6 +421,10 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/context-usage")).toEqual({
       inSettings: true,
       section: "context-usage",
+    });
+    expect(routeHook("/settings/global-instructions")).toEqual({
+      inSettings: true,
+      section: "global-instructions",
     });
     expect(routeHook("/settings")).toEqual({ inSettings: true, section: "general" });
     expect(routeHook("/settings/not-a-section")).toEqual({

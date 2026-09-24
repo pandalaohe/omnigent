@@ -40,6 +40,7 @@ from omnigent.harness_availability import (
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.claude_native.main import (
     _attach_with_reconnect,
+    _fetch_global_instructions,
     attach_local_terminal,
 )
 from omnigent.harnesses.codex_native.app_server import (
@@ -632,35 +633,43 @@ def _materialize_codex_agent_spec(
     return yaml_path
 
 
-def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
-    """Resolve raw author instructions from the wrapper's agent spec.
+def _wrapper_spec_startup_instructions(
+    spec_path: Path,
+    *,
+    global_instructions: str | None = None,
+) -> str | None:
+    """Resolve startup instructions from the wrapper's agent spec.
 
     Reuses :func:`omnigent.spec.load` (the same loader
     :func:`~omnigent.cli._bundle` and the server use for both an agent-image
-    directory and a standalone single-file YAML) so the value matches exactly
-    what ``AgentSpec.instructions`` resolves to — including the
+    directory and a standalone single-file YAML) so the author text matches
+    exactly what ``AgentSpec.instructions`` resolves to — including the
     ``instructions:`` file precedence over ``prompt:`` — rather than
-    re-reading the raw YAML ad hoc.
+    re-reading the raw YAML ad hoc. The spec-level framework instructions are
+    appended after it, matching what the managed-host launch composes.
 
     :param spec_path: The generated/current wrapper agent spec (a
         standalone YAML file or an agent-image directory).
-    :returns: The verbatim instructions text, or ``None`` if unresolvable
-        or absent/whitespace-only. Best-effort: a malformed spec must not
-        block the terminal launch, so load failures degrade to ``None``.
+    :param global_instructions: The server-held global instructions text, or
+        ``None``/blank when unavailable.
+    :returns: The composed startup text, or ``None`` if unresolvable or
+        empty. Best-effort: a malformed spec must not block the terminal
+        launch, so load failures degrade to spec-less composition — which
+        still carries the global text.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import native_startup_instructions
     from omnigent.spec import load as load_agent_spec
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
     except Exception:  # noqa: BLE001 — best-effort; never block the launch
         _logger.warning(
-            "Could not resolve raw instructions from wrapper spec %s",
+            "Could not resolve startup instructions from wrapper spec %s",
             spec_path,
             exc_info=True,
         )
-        return None
-    return raw_author_instructions(spec)
+        spec = None
+    return native_startup_instructions(spec, global_instructions=global_instructions)
 
 
 def _run_with_local_server(
@@ -701,6 +710,7 @@ def _run_with_local_server(
     base_url = f"http://127.0.0.1:{port}"
     try:
         _wait_for_server(port, server_handle)
+        global_instructions = _fetch_global_instructions(base_url=base_url, headers={})
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
             headers={},
@@ -730,7 +740,10 @@ def _run_with_local_server(
                     command=command,
                     model=model,
                     startup_progress=progress,
-                    developer_instructions=_wrapper_spec_raw_instructions(spec_path),
+                    developer_instructions=_wrapper_spec_startup_instructions(
+                        spec_path,
+                        global_instructions=global_instructions,
+                    ),
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
@@ -1164,10 +1177,11 @@ async def _prepare_codex_terminal(
     :param model: Optional model id.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
-    :param developer_instructions: Raw author instructions persisted into
-        Codex's private per-session config, applied on fresh launch and
-        cold resume only — the reattach branch below returns before this
-        is used, so it never relaunches or duplicates the value.
+    :param developer_instructions: Startup instructions (author text plus
+        spec-level framework text) persisted into Codex's private per-session
+        config, applied on fresh launch and cold resume only — the reattach
+        branch below returns before this is used, so it never relaunches or
+        duplicates the value.
     :returns: Prepared terminal details.
     """
     timeout = httpx.Timeout(30.0, read=120.0)

@@ -128,6 +128,18 @@ class TestUnwrapUserQuery:
         raw = f"<user_query>\n{FORK_HISTORY_OPEN_TAG}\nYou: earlier turn, cut off\n</user_query>"
         assert fwd._unwrap_user_query(raw) is None
 
+    def test_strips_agent_instructions_preamble_block(self) -> None:
+        # The executor wraps the session's first injected message with the
+        # launch-staged instructions (wrap_agent_instructions); the mirrored
+        # bubble must show only the user's real text, or pending-input
+        # reconciliation (which matches mirrored text exactly) never consumes
+        # the queued web message.
+        from omnigent.native.native_bridge_common import wrap_agent_instructions
+
+        wrapped = wrap_agent_instructions("be terse", "the real question")
+        raw = f"<user_query>\n{wrapped}\n</user_query>"
+        assert fwd._unwrap_user_query(raw) == "the real question"
+
 
 class TestContentText:
     def test_string_content(self) -> None:

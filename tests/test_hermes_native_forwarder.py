@@ -216,6 +216,27 @@ def test_read_new_items_maps_roles_and_strips_attachments(tmp_path: Path) -> Non
     assert posted[1].item_data["content"] == [{"type": "output_text", "text": "hello"}]
 
 
+def test_message_to_items_strips_agent_instructions_block_for_user_only() -> None:
+    # The executor wraps the session's first injected message with the
+    # launch-staged instructions (wrap_agent_instructions); the mirrored
+    # bubble must show only the user's real text, and only for the user role.
+    from omnigent.native.native_bridge_common import wrap_agent_instructions
+
+    wrapped = wrap_agent_instructions("be terse", "the real question")
+    items = f._message_to_items(
+        1, "user", wrapped, None, None, None, None, None, "hermes-native-ui"
+    )
+    assert len(items) == 1
+    assert items[0].item_data["content"][0]["text"] == "the real question"
+
+    # An assistant row carrying the same literal text is not stripped.
+    items = f._message_to_items(
+        2, "assistant", wrapped, None, None, None, None, None, "hermes-native-ui"
+    )
+    assert len(items) == 1
+    assert items[0].item_data["content"] == [{"type": "output_text", "text": wrapped}]
+
+
 def test_read_new_items_mirrors_reasoning_before_message(tmp_path: Path) -> None:
     """An assistant row with reasoning posts a one-shot reasoning delta before the message."""
     db = tmp_path / "state.db"

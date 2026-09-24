@@ -14,6 +14,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -32,6 +33,7 @@ from omnigent.runner.resource_registry import (
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -412,6 +414,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         *,
         server_client: object,
         ensure_comment_relay: object = None,
+        agent_spec: object = None,
+        global_instructions: object = None,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_qwen_terminal`` that registers a
@@ -423,8 +427,13 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         :param server_client: Omnigent server client (unused).
         :param ensure_comment_relay: Comment relay hook threaded by the
             recreate path (unused by the stub).
+        :param agent_spec: Resolved agent spec threaded by the recreate
+            path (unused by the stub; see the dedicated wiring test below).
+        :param global_instructions: Server-held global instructions text
+            threaded by the recreate path (unused by the stub).
         :returns: Terminal resource view for the fresh pane.
         """
+        del agent_spec, global_instructions
         auto_create_sessions.append(session_id)
         _seed_registry(registry, session_id, fresh)
         return SessionResourceView(
@@ -461,6 +470,105 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
 
     assert auto_create_sessions == ["conv_abc"]
     assert attach_sockets[1] == str(fresh_dir / "qwen-main.sock")
+
+
+def test_runner_resource_attach_recreates_dead_qwen_terminal_forwards_agent_spec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Qwen's attach-time recreate threads the session's spec, not ``None``.
+
+    Regression guard: ``_recreate_qwen_terminal`` used to call
+    ``_auto_create_qwen_terminal`` without ``agent_spec``/``global_instructions``
+    at all — a recreated pane silently dropped the session's author instructions
+    and the server-held global text even though they were resolvable. This
+    drives the recreate path against a spec-bearing session and asserts the
+    resolved spec (not a default ``None``) reaches the terminal builder.
+    """
+    registry = TerminalRegistry()
+    stale = _make_running_instance("qwen", "main", tmp_path)
+
+    async def dead_tmux() -> bool:
+        stale.running = False
+        return False
+
+    stale.is_alive = dead_tmux  # type: ignore[method-assign]
+    _seed_registry(registry, "conv_abc", stale)
+
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    resource_registry._terminal_roles[("conv_abc", "terminal_qwen_main")] = (
+        QWEN_NATIVE_TERMINAL_ROLE
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_abc":
+            return httpx.Response(200, json={"agent_id": "agent-x"})
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://ap"
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        instructions="Author brief.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=server_client,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+    )
+
+    fresh_dir = tmp_path / "fresh"
+    fresh_dir.mkdir()
+    fresh = _make_running_instance("qwen", "main", fresh_dir)
+    captured: dict[str, object] = {}
+
+    async def fake_auto_create(
+        session_id: str,
+        rr: SessionResourceRegistry,
+        publish_event: object,
+        *,
+        server_client: object,
+        ensure_comment_relay: object = None,
+        agent_spec: object = None,
+        global_instructions: object = None,
+    ) -> SessionResourceView:
+        del rr, publish_event, server_client, ensure_comment_relay
+        captured["agent_spec"] = agent_spec
+        captured["global_instructions"] = global_instructions
+        _seed_registry(registry, session_id, fresh)
+        return SessionResourceView(
+            id="terminal_qwen_main",
+            type="terminal",
+            session_id=session_id,
+            name="qwen",
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_qwen_terminal", fake_auto_create)
+    _patch_control_attach(monkeypatch, lambda *_a: None)
+
+    with pytest.raises(RuntimeError, match="bridge stopped"):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
+        ):
+            pass
+
+    assert captured["agent_spec"] is not None
+    assert captured["agent_spec"].instructions == "Author brief."
+    # global_instructions is only set by the session-init envelope, not
+    # exercised by this registry-only harness; asserting the kwarg key
+    # arrives (rather than being silently dropped) is what this test pins.
+    assert "global_instructions" in captured
 
 
 def test_runner_resource_attach_dead_non_repl_terminal_keeps_4404(

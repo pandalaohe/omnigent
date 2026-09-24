@@ -223,6 +223,20 @@ def test_message_to_items_strips_attachment_markers() -> None:
     assert items[0].item_data["content"][0]["text"] == "hi"
 
 
+def test_message_to_items_strips_agent_instructions_block() -> None:
+    # The executor wraps the session's first injected message with the
+    # launch-staged instructions (wrap_agent_instructions); the mirrored
+    # bubble must show only the user's real text.
+    from omnigent.native.native_bridge_common import wrap_agent_instructions
+
+    wrapped = wrap_agent_instructions("be terse", "the real question")
+    items = f._message_to_items(
+        1, "user", json.dumps([{"type": "text", "text": wrapped}]), "goose", None
+    )
+    assert len(items) == 1
+    assert items[0].item_data["content"][0]["text"] == "the real question"
+
+
 def test_message_to_items_empty_assistant_skipped() -> None:
     """A tool-only assistant row with no prose produces only function_call items."""
     content = json.dumps([{"type": "toolreq", "id": "req_x", "name": "bash", "parameters": {}}])

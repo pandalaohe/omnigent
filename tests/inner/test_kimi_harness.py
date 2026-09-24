@@ -612,6 +612,58 @@ def test_run_turn_uses_session_resume_on_second_turn(monkeypatch: pytest.MonkeyP
     assert second_argv[idx + 1] == "session_aaaaa"
 
 
+def test_run_turn_prefixes_system_prompt_on_first_turn_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """system_prompt prefixes -p text pre-session-id, not once a session resumes."""
+    fake_first = _FakeProcess(
+        [
+            json.dumps({"role": "assistant", "content": "first"}),
+            json.dumps(
+                {"role": "meta", "type": "session.resume_hint", "session_id": "session_bbbbb"}
+            ),
+        ],
+        b"",
+        returncode=0,
+    )
+    fake_second = _FakeProcess(
+        [json.dumps({"role": "assistant", "content": "second"})],
+        b"",
+        returncode=0,
+    )
+    first_argv: list[str] = []
+    second_argv: list[str] = []
+    calls = {"count": 0}
+
+    async def _fake_spawn(*args: Any, **_kwargs: Any) -> _FakeProcess:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            first_argv.extend(args)
+            return fake_first
+        second_argv.extend(args)
+        return fake_second
+
+    monkeypatch.setattr(kimi_executor, "_create_subprocess_exec", _fake_spawn)
+    monkeypatch.setattr(kimi_executor.shutil, "which", lambda _binary: "/usr/local/bin/kimi")
+
+    ex = KimiExecutor(binary_path="kimi")
+    system_prompt = "Author brief."
+
+    async def _run(text: str) -> None:
+        async for _ in ex.run_turn(
+            messages=[{"role": "user", "content": text}],
+            tools=[],
+            system_prompt=system_prompt,
+        ):
+            pass
+
+    asyncio.run(_run("first"))
+    asyncio.run(_run("next"))
+
+    assert first_argv[-1] == f"{system_prompt}\n\nfirst"
+    assert second_argv[-1] == "next"
+
+
 def test_run_turn_falls_back_to_stderr_regex_for_session_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

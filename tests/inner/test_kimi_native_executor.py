@@ -231,6 +231,70 @@ async def test_run_turn_bounds_persistent_approval_pending(
         ]
 
 
+@pytest.mark.asyncio
+async def test_run_turn_wraps_staged_preamble_and_clears_after_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The first injected message is wrapped, and the file is cleared after."""
+    from omnigent.native.native_bridge_common import (
+        read_agent_instructions_preamble,
+        write_agent_instructions_preamble,
+    )
+
+    injected: list[str] = []
+
+    def _inject(_bridge_dir: Path, *, content: str, **_kwargs: object) -> None:
+        injected.append(content)
+
+    monkeypatch.setattr(kimi_native_executor, "inject_user_message", _inject)
+    write_agent_instructions_preamble(tmp_path, "be terse")
+
+    events = [
+        event
+        async for event in KimiNativeExecutor(tmp_path).run_turn(
+            messages=[{"role": "user", "content": "first"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert len(events) == 1
+    assert injected[0].startswith("<omnigent_agent_instructions>")
+    assert "be terse" in injected[0]
+    assert injected[0].endswith("first")
+    assert read_agent_instructions_preamble(tmp_path) is None
+
+
+@pytest.mark.asyncio
+async def test_run_turn_keeps_staged_preamble_when_injection_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed first injection leaves the staged instructions on disk."""
+    from omnigent.native.native_bridge_common import (
+        read_agent_instructions_preamble,
+        write_agent_instructions_preamble,
+    )
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("Kimi TUI input box did not become ready")
+
+    monkeypatch.setattr(kimi_native_executor, "inject_user_message", _fail)
+    write_agent_instructions_preamble(tmp_path, "be terse")
+
+    events = [
+        event
+        async for event in KimiNativeExecutor(tmp_path).run_turn(
+            messages=[{"role": "user", "content": "first"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert read_agent_instructions_preamble(tmp_path) == "be terse"
+
+
 class TestPastePayload:
     def test_newlines_become_cr(self) -> None:
         assert _paste_payload_bytes("a\nb") == b"a\rb"

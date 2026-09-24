@@ -1,4 +1,4 @@
-"""Shared owner-pid marker + orphan prune for native-harness bridge dirs.
+"""Shared owner-pid marker, orphan prune and instruction preamble for bridge dirs.
 
 Each native coding-agent harness (claude / codex / antigravity / opencode /
 pi) keeps a per-session bridge directory under its own bridge root holding the
@@ -18,6 +18,10 @@ own bridge root), plus a dynamic cross-harness reaper for host maintenance or
 standalone runner startup. It mirrors the terminal orphan sweep
 (``inner/terminal.py:reap_orphaned_terminals``) and reuses that module's
 canonical process-liveness predicate.
+
+It also owns the session-scoped instruction preamble: the composed startup
+text a launch stages in the bridge dir, which the harness's executor prepends
+to the first injected user message and clears only once that injection lands.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import contextlib
 import importlib
 import logging
 import os
+import re
 import shutil
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -215,3 +220,89 @@ def reap_orphaned_native_bridge_dirs() -> int:
                 agent.key,
             )
     return pruned
+
+
+#: Session-scoped startup instructions staged for the first injected message.
+_INSTRUCTIONS_PREAMBLE_FILE = "instructions_preamble.txt"
+AGENT_INSTRUCTIONS_OPEN_TAG = "<omnigent_agent_instructions>"
+AGENT_INSTRUCTIONS_CLOSE_TAG = "</omnigent_agent_instructions>"
+_AGENT_INSTRUCTIONS_HEADER = (
+    "These are your operating instructions for this session; follow them "
+    "throughout, not just for this message:"
+)
+# Second alternative: an unterminated block (truncated, no close tag) strips
+# to end-of-text rather than mirroring the raw block.
+_AGENT_INSTRUCTIONS_BLOCK_RE = re.compile(
+    rf"{re.escape(AGENT_INSTRUCTIONS_OPEN_TAG)}.*?{re.escape(AGENT_INSTRUCTIONS_CLOSE_TAG)}"
+    rf"|{re.escape(AGENT_INSTRUCTIONS_OPEN_TAG)}.*",
+    re.DOTALL,
+)
+
+
+def write_agent_instructions_preamble(bridge_dir: Path, instructions: str) -> None:
+    """Stage the session's startup instructions for the first injected message.
+
+    The harness reads them once, so unlike a vendor startup flag this is a
+    weaker channel — used where no session-scoped startup channel exists.
+
+    :param bridge_dir: Per-session bridge directory.
+    :param instructions: Instructions for the session; blank writes nothing.
+    """
+    if not instructions.strip():
+        return
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).write_text(instructions, encoding="utf-8")
+
+
+def read_agent_instructions_preamble(bridge_dir: Path) -> str | None:
+    """Return staged instructions, or ``None`` when there are none.
+
+    Left in place until :func:`clear_agent_instructions_preamble`, so a failed
+    first injection retries with the instructions rather than losing them.
+    """
+    try:
+        text = (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text or None
+
+
+def clear_agent_instructions_preamble(bridge_dir: Path) -> None:
+    """Drop the staged instructions once they have been delivered."""
+    with contextlib.suppress(OSError):
+        (bridge_dir / _INSTRUCTIONS_PREAMBLE_FILE).unlink()
+
+
+def wrap_agent_instructions(instructions: str, user_text: str) -> str:
+    """Frame staged instructions ahead of the session's first user message.
+
+    :param instructions: Verbatim session instructions.
+    :param user_text: The message text this call prefixes.
+    :returns: The framed instructions followed by the user text.
+    """
+    body = instructions.strip()
+    body = body.replace(AGENT_INSTRUCTIONS_OPEN_TAG, "[omnigent_agent_instructions]").replace(
+        AGENT_INSTRUCTIONS_CLOSE_TAG, "[/omnigent_agent_instructions]"
+    )
+    return (
+        f"{AGENT_INSTRUCTIONS_OPEN_TAG}\n"
+        f"{_AGENT_INSTRUCTIONS_HEADER}\n\n"
+        f"{body}\n"
+        f"{AGENT_INSTRUCTIONS_CLOSE_TAG}\n\n"
+        f"{user_text}"
+    )
+
+
+def strip_agent_instructions_block(text: str) -> str:
+    """Drop a ``wrap_agent_instructions`` block from a mirrored user turn.
+
+    The executor's injected instructions are context for the harness, not
+    something the user typed; a forwarder mirroring the TUI's stored turn back
+    to the server must strip them so the mirrored text matches what the server
+    queued (pending-input reconciliation matches normalized text exactly).
+
+    :param text: The stored/mirrored text, which may carry the block anywhere
+        in it (harnesses that also fence fork-history strip that separately).
+    :returns: *text* with the block removed, not yet whitespace-trimmed.
+    """
+    return _AGENT_INSTRUCTIONS_BLOCK_RE.sub("", text)

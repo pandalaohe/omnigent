@@ -125,6 +125,26 @@ class TestUserInputCommitted:
         events = map_step_to_events(step, conversation_id=_CID)
         assert events == []
 
+    def test_user_input_strips_agent_instructions_block(self) -> None:
+        """The launch-staged instructions block is stripped from the mirrored turn.
+
+        The executor wraps the session's first injected message with the
+        staged instructions (wrap_agent_instructions); the mirrored bubble
+        must show only the user's real text.
+        """
+        from omnigent.native.native_bridge_common import wrap_agent_instructions
+
+        wrapped = wrap_agent_instructions("be terse", "the real question")
+        step = {
+            "type": "CORTEX_STEP_TYPE_USER_INPUT",
+            "userInput": {"userResponse": wrapped},
+        }
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert len(events) == 1
+        assert events[0].data["item_data"]["content"] == [
+            {"type": "input_text", "text": "the real question"}
+        ]
+
 
 # ---------------------------------------------------------------------------
 # PLANNER_RESPONSE (text only) → one message, NO delta

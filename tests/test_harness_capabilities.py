@@ -359,14 +359,3 @@ def test_every_canonical_harness_declares_instruction_delivery() -> None:
     caps = harness_capabilities()
     for harness in valid_harnesses():
         assert caps[harness].instruction_delivery is not InstructionDelivery.UNKNOWN, harness
-
-
-def test_hermes_and_hermes_native_deliver_differently() -> None:
-    caps = harness_capabilities()
-    assert caps["hermes"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
-    assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
-
-
-def test_kiro_native_is_not_delivered() -> None:
-    caps = harness_capabilities()
-    assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED

@@ -9,13 +9,10 @@ from pathlib import Path
 
 from omnigent.harnesses.devin_native.bridge import (
     DEVIN_NATIVE_BRIDGE_DIR_ENV_VAR,
-    clear_agent_instructions_preamble,
     clear_fork_preamble,
     inject_model_command,
     inject_user_message,
-    read_agent_instructions_preamble,
     read_fork_preamble,
-    wrap_agent_instructions,
     wrap_fork_preamble,
 )
 from omnigent.inner.executor import (
@@ -28,6 +25,11 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
     describe_exception,
+)
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
 )
 
 

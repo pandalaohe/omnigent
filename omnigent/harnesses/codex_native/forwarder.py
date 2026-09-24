@@ -2548,6 +2548,35 @@ async def supervise_forwarder(
             await client.close()
 
 
+def _side_chat_developer_instructions(bridge_dir: Path) -> str:
+    """
+    Compose the side fork's developer instructions: reference boundary plus the
+    session's applied startup text.
+
+    ``thread/fork`` replaces the child thread's ``developer_instructions``
+    outright, so without this a side chat would lose the startup text (author +
+    framework) the session was launched with. Best-effort: an absent private
+    config leaves the boundary instruction alone; an unreadable one warns and
+    does the same.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The boundary instruction, with the session's applied
+        ``developer_instructions`` appended when the config carries one.
+    """
+    read = read_codex_config_developer_instructions_state(bridge_dir)
+    if read.state is DeveloperInstructionsReadState.UNREADABLE:
+        _logger.warning(
+            "Codex private config %s could not be read; the /side fork carries "
+            "only the reference boundary",
+            codex_home_for_bridge_dir(bridge_dir) / "config.toml",
+        )
+        return side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS
+    applied = read.value if read.state is DeveloperInstructionsReadState.PRESENT else None
+    if not applied:
+        return side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS
+    return f"{side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS}\n\n{applied}"
+
+
 async def _drive_side_chat_requests(
     codex_client: CodexAppServerClient,
     *,
@@ -2592,6 +2621,7 @@ async def _drive_side_chat_requests(
                             codex_client,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
+                            developer_instructions=_side_chat_developer_instructions(bridge_dir),
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")

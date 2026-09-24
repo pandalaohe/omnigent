@@ -19,7 +19,6 @@ from omnigent.harnesses.devin_native.bridge import (
     build_devin_native_spawn_env,
     build_hook_config,
     canonical_devin_permission_mode,
-    clear_agent_instructions_preamble,
     clear_fork_preamble,
     devin_context_usage,
     devin_input_ready,
@@ -30,15 +29,12 @@ from omnigent.harnesses.devin_native.bridge import (
     inject_slash_command,
     iter_hook_events,
     prepare_bridge_dir,
-    read_agent_instructions_preamble,
     read_devin_workspace_hint,
     read_fork_preamble,
     record_hook_event,
     remove_devin_agent_rule_if_owned,
     session_config_path,
-    wrap_agent_instructions,
     wrap_fork_preamble,
-    write_agent_instructions_preamble,
     write_devin_agent_rule,
     write_devin_mcp_config,
     write_devin_session_config,
@@ -53,6 +49,12 @@ from omnigent.harnesses.devin_native.main import (
     family_effort_variants,
     list_devin_cli_model_options,
     resolve_devin_launch_model,
+)
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
+    write_agent_instructions_preamble,
 )
 
 # A real pane capture from devin 3000.10.21 (200x50), trimmed. The composer sits
@@ -1296,3 +1298,91 @@ class TestSessionEndRuleTeardown:
         # This session (conv_abc) ending must not delete conv_other's live rule.
         self._run_session_end(bridge, monkeypatch, "conv_abc")
         assert "other brief" in rule.read_text(encoding="utf-8")
+
+
+class TestStartupInstructionRouting:
+    """The workspace rule stays author-only; framework text rides the preamble."""
+
+    @pytest.mark.parametrize(
+        "rule_is_writable",
+        [True, False],
+        ids=["rule-live", "rule-unavailable"],
+    )
+    @pytest.mark.asyncio
+    async def test_auto_create_devin_terminal_routes_framework_text_to_the_preamble(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        rule_is_writable: bool,
+    ) -> None:
+        """A Devin launched in this workspace outside Omnigent must never see
+        the framework text, so only the session-scoped first-message preamble
+        may carry it."""
+        from types import SimpleNamespace
+
+        from omnigent.runner.native import orchestration as native_orchestration
+        from omnigent.runtime.prompt import (
+            EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+            SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+        )
+        from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        bridge_dir = tmp_path / "bridge"
+
+        class _StopAfterPreamble(Exception):
+            pass
+
+        def _stop(workspace_path: Path, bridge: Path) -> None:
+            del workspace_path, bridge
+            raise _StopAfterPreamble
+
+        async def _launch_config(**_kwargs: object) -> object:
+            return SimpleNamespace(workspace=workspace)
+
+        monkeypatch.setattr(bridge_module, "prepare_bridge_dir", lambda session_id: bridge_dir)
+        monkeypatch.setattr(bridge_module, "write_devin_mcp_config", _stop)
+        monkeypatch.setattr(
+            bridge_module,
+            "_rule_dir_is_machine_global",
+            lambda workspace: not rule_is_writable,
+        )
+        monkeypatch.setattr(native_orchestration, "_pi_native_launch_config", _launch_config)
+
+        agent_spec = AgentSpec(
+            spec_version=1,
+            name="devin-agent",
+            instructions="Author brief.",
+            spawn=True,
+            executor=ExecutorSpec(type="omnigent", config={"harness": "devin-native"}),
+        )
+
+        # Let the launch run up to the first step after the rule/preamble
+        # decision; everything past it needs a terminal and a live server.
+        with pytest.raises(_StopAfterPreamble):
+            await native_orchestration._auto_create_devin_terminal(
+                "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+                SimpleNamespace(),  # type: ignore[arg-type]
+                lambda _sid, _evt: None,
+                server_client=None,
+                agent_spec=agent_spec,
+                global_instructions="G",
+            )
+
+        framework_text = (
+            f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        )
+        rule = workspace / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+        preamble = read_agent_instructions_preamble(bridge_dir)
+        if rule_is_writable:
+            rule_text = rule.read_text(encoding="utf-8")
+            assert "Author brief." in rule_text
+            assert framework_text not in rule_text
+            assert "G" not in rule_text
+            assert preamble == f"{framework_text}\n\nG"
+            # Recorded so SessionEnd removes the live rule.
+            assert read_devin_workspace_hint(bridge_dir) == workspace
+        else:
+            assert not rule.exists()
+            assert preamble == f"Author brief.\n\n{framework_text}\n\nG"

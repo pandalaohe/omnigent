@@ -39,6 +39,11 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.llms.errors import PermanentLLMError, RetryableLLMError
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    read_agent_instructions_preamble,
+    wrap_agent_instructions,
+)
 
 logger = logging.getLogger(__name__)
 _STEERING_READY_TIMEOUT_S = 30.0
@@ -100,6 +105,11 @@ class KimiNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="kimi native turn had no user text to send")
             return
+        # The instructions staged at launch frame the first message; they are
+        # cleared only after the injection lands, so a failure retries with them.
+        instructions = read_agent_instructions_preamble(self._bridge_dir)
+        if instructions:
+            text = wrap_agent_instructions(instructions, text)
         try:
             await self._inject_message(text)
         except KimiApprovalPendingError as exc:
@@ -112,6 +122,8 @@ class KimiNativeExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc))
             return
         self._approval_pending_retries = 0
+        if instructions:
+            clear_agent_instructions_preamble(self._bridge_dir)
         yield TurnComplete(response=None)
 
     async def _inject_message(

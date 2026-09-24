@@ -1333,7 +1333,7 @@ class InstructionComposition:
     Computed once inside ``_stream_message_to_harness`` (the point where the
     background and direct-stream dispatch paths converge) and consumed
     in-process by the single delivery-gap warn check and by delivery
-    channels (opencode-native, hermes) that must not leak the fabricated
+    channels (opencode-native, hermes, kimi) that must not leak the fabricated
     ``"You are a helpful assistant."`` fallback. Never attached to
     ``TurnDispatch``, ``MessageEvent``, ``CreateResponseRequest``, or
     ``ExecutorConfig`` — the wire shape is unchanged from today.
@@ -1352,9 +1352,10 @@ class InstructionComposition:
 # needs the gated ``InstructionComposition.composed`` value there instead of
 # the default fallback-including composed-per-turn string — opencode-native
 # via its NativePrompt.system_prompt; hermes via HermesExecutor.run_turn's
-# system_prompt param. See the harness-conditional swap in
+# system_prompt param; kimi via KimiExecutor.run_turn's system_prompt param
+# (prefixes it onto the first turn). See the harness-conditional swap in
 # _stream_message_to_harness.
-_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
+_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes", "kimi"})
 
 
 def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
@@ -3056,6 +3057,19 @@ def create_runner_app(
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
+    # session_id → server-held global instructions from the init snapshot.
+    # Read by the launch and composition points, never from the TTL'd envelope
+    # cache, so the text outlives the cache. Blank is "off".
+    _session_global_instructions: dict[str, str | None] = {}
+
+    def _global_framework_instructions(value: str | None) -> list[str]:
+        """The session's global text as a one-entry framework instruction list.
+
+        Blank means the admin turned it off, so it must compose as absent
+        rather than as an empty entry.
+        """
+        return [value] if value and value.strip() else []
+
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -3848,10 +3862,9 @@ def create_runner_app(
 
     async def _load_legacy_session_init_context(session_id: str) -> _SessionInitContext:
         await _get_server_version(server_client)
-        # An envelope-free re-init (WS reconnect, resume) carries no flag
-        # snapshot; keep this session's last known project_assignments /
-        # peer_messaging values instead of popping them back to the off
-        # default — a legacy load must not silently revert a real grant.
+        # An envelope-free re-init (WS reconnect, resume) carries no snapshot:
+        # keep this session's last known project_assignments / peer_messaging /
+        # global-instructions values rather than silently reverting to defaults.
         _session_tool_schemas.pop(session_id, None)
         return _SessionInitContext(envelope=None)
 
@@ -3887,6 +3900,7 @@ def create_runner_app(
             _session_reasoning_effort[session_id] = snapshot.reasoning_effort
         _session_project_assignments_enabled[session_id] = snapshot.project_assignments_enabled
         _session_peer_messaging_enabled[session_id] = snapshot.peer_messaging_enabled
+        _session_global_instructions[session_id] = snapshot.global_instructions
         # A relay started before this init (resource access precedes the
         # handshake) read the previous flag; rebuild it in place on a flip.
         _stale_relay = _session_comment_relays.get(session_id)
@@ -4512,6 +4526,7 @@ def create_runner_app(
                     session_id, False
                 ),
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
+                global_instructions=_session_global_instructions.get(session_id),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -4695,6 +4710,9 @@ def create_runner_app(
                     return PreLaunchResult(needs_terminal=needs)
 
                 _launch_pre = _antigravity_pre_launch
+                _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
+                    session_id
+                )
 
             elif harness_name == "pi-native":
                 # pi resolves its spec unwrapped — a resolution error surfaces as
@@ -4705,6 +4723,10 @@ def create_runner_app(
                 "opencode-native",
                 "kimi-native",
                 "devin-native",
+                "kiro-native",
+                "goose-native",
+                "qwen-native",
+                "hermes-native",
             ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
@@ -5312,6 +5334,7 @@ def create_runner_app(
         _session_reasoning_effort.pop(session_id, None)
         _session_project_assignments_enabled.pop(session_id, None)
         _session_peer_messaging_enabled.pop(session_id, None)
+        _session_global_instructions.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -8939,13 +8962,21 @@ def create_runner_app(
             _authored_bg = raw_author_instructions(cached_spec) is not None
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
-                    cached_spec, _raw_per_request_instructions, []
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                    framework_instructions=_global_framework_instructions(
+                        _session_global_instructions.get(conv)
+                    ),
                 )
             else:
                 instructions = build_instructions(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    framework_instructions=_global_framework_instructions(
+                        _session_global_instructions.get(conv)
+                    ),
                 )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
@@ -9378,6 +9409,7 @@ def create_runner_app(
                             conv_id, False
                         ),
                         peer_messaging_enabled=_session_peer_messaging_enabled.get(conv_id, False),
+                        global_instructions=_session_global_instructions.get(conv_id),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
                     resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
@@ -9552,7 +9584,12 @@ def create_runner_app(
                         _ic_ds = InstructionComposition(
                             authored_present=_authored_ds,
                             composed=build_instructions_nullable(
-                                _instr_spec_ds, _per_req_instr, []
+                                _instr_spec_ds,
+                                _per_req_instr,
+                                [],
+                                framework_instructions=_global_framework_instructions(
+                                    _session_global_instructions.get(conv_id)
+                                ),
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
@@ -9564,7 +9601,12 @@ def create_runner_app(
                             _instr_body = {
                                 **body,
                                 "instructions": build_instructions(
-                                    _instr_spec_ds, _per_req_instr, []
+                                    _instr_spec_ds,
+                                    _per_req_instr,
+                                    [],
+                                    framework_instructions=_global_framework_instructions(
+                                        _session_global_instructions.get(conv_id)
+                                    ),
                                 ),
                             }
                         if _authored_ds and harness_name:
@@ -11065,11 +11107,12 @@ def create_runner_app(
             and not (terminal_name == "antigravity" and body.get("spec"))
         ):
             # Each native harness contributes only the ensure hooks that differ
-            # from the uniform base; a single _ensure_native_terminal call runs
-            # them. The 4 uniform harnesses (goose/kiro/hermes/qwen) need only the
-            # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
-            # via build_context; codex/antigravity add an ownership check (and
-            # codex a one-shot policy-notice response wrap).
+            # from the base; a single _ensure_native_terminal call runs them.
+            # claude/pi/opencode resolve an agent spec via build_context that
+            # surfaces a resolution error as a terminal-start error;
+            # cursor/kimi/devin/kiro/goose/qwen/hermes/antigravity resolve one
+            # tolerating failure instead; codex/antigravity also add an
+            # ownership check (and codex a one-shot policy-notice response wrap).
             _ensure_locks = _require_full_native_lock_coverage(
                 {
                     "claude": _claude_terminal_ensure_locks,
@@ -11108,6 +11151,7 @@ def create_runner_app(
                     session_id, False
                 ),
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
+                global_instructions=_session_global_instructions.get(session_id),
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
@@ -11170,6 +11214,15 @@ def create_runner_app(
                 )
 
             elif terminal_name == "antigravity":
+
+                async def _antigravity_ensure_build(
+                    ctx: NativeLaunchContext,
+                ) -> NativeLaunchContext:
+                    return dataclasses.replace(
+                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
+                    )
+
+                _ensure_build = _antigravity_ensure_build
                 _ensure_is_owned = _is_runner_owned_antigravity_terminal
                 _ensure_conflict = (
                     "Existing antigravity terminal is not a runner-owned agy TUI "
@@ -11189,7 +11242,7 @@ def create_runner_app(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi", "devin"):
+            elif terminal_name in ("cursor", "kimi", "devin", "kiro", "goose", "qwen", "hermes"):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
@@ -11601,6 +11654,8 @@ def create_runner_app(
                         _publish_event,
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
+                        agent_spec=await _resolve_session_agent_spec_or_none(session_id),
+                        global_instructions=_session_global_instructions.get(session_id),
                     )
                 except Exception:
                     _logger.exception(

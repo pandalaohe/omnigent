@@ -383,6 +383,49 @@ def test_run_turn_tui_inject_error_surfaces(tmp_path: Path, injected: dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# run_turn — launch-staged instructions preamble
+# ---------------------------------------------------------------------------
+
+
+def test_run_turn_wraps_staged_preamble_and_clears_after_success(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
+    """The first injected message is wrapped, and the file is cleared after."""
+    from omnigent.native.native_bridge_common import (
+        read_agent_instructions_preamble,
+        write_agent_instructions_preamble,
+    )
+
+    _seed_state(tmp_path)
+    write_agent_instructions_preamble(tmp_path, "be terse")
+    events = asyncio.run(_run(_executor(tmp_path), "first"))
+    calls = _injected(injected)
+    assert len(events) == 1 and isinstance(events[0], TurnComplete)
+    assert calls[0]["content"].startswith("<omnigent_agent_instructions>")
+    assert "be terse" in calls[0]["content"]
+    assert calls[0]["content"].endswith("first")
+    assert read_agent_instructions_preamble(tmp_path) is None
+
+
+def test_run_turn_keeps_staged_preamble_when_injection_raises(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
+    """A failed first injection leaves the staged instructions on disk."""
+    from omnigent.native.native_bridge_common import (
+        read_agent_instructions_preamble,
+        write_agent_instructions_preamble,
+    )
+
+    _seed_state(tmp_path)
+    write_agent_instructions_preamble(tmp_path, "be terse")
+    injected["raise"] = RuntimeError("the agy terminal is no longer running (the TUI exited)")
+    events = asyncio.run(_run(_executor(tmp_path), "first"))
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert read_agent_instructions_preamble(tmp_path) == "be terse"
+
+
+# ---------------------------------------------------------------------------
 # enqueue_session_message (mid-turn steering)
 # ---------------------------------------------------------------------------
 

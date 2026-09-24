@@ -50,6 +50,7 @@ import httpx
 
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native._native_post_delivery import post_external_session_status
+from omnigent.native.native_bridge_common import strip_agent_instructions_block
 
 _logger = logging.getLogger(__name__)
 
@@ -348,7 +349,8 @@ def _message_to_items(
     per_msg_id = f"goose:{msg_id}"
 
     if role == "user":
-        text = _ATTACHMENT_MARKER_RE.sub("", _content_text(content_json)).strip()
+        text = strip_agent_instructions_block(_content_text(content_json))
+        text = _ATTACHMENT_MARKER_RE.sub("", text).strip()
         if not text:
             return []
         return [

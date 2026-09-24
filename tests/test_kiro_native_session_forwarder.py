@@ -216,6 +216,33 @@ def test_read_new_kiro_messages_returns_user_and_assistant_text(tmp_path: Path) 
     assert byte_offset == jsonl_path.stat().st_size
 
 
+def test_parse_kiro_jsonl_line_strips_agent_instructions_block_for_user() -> None:
+    """A mirrored Prompt carrying the wrapped preamble mirrors only user text.
+
+    The executor wraps the session's first injected message with the
+    launch-staged instructions (wrap_agent_instructions); the mirrored
+    conversation item must show only the user's real text, or pending-input
+    reconciliation (which matches mirrored text exactly) never consumes the
+    queued web message.
+    """
+    from omnigent.native.native_bridge_common import wrap_agent_instructions
+
+    wrapped = wrap_agent_instructions("be terse", "the real question")
+    line = json.dumps(
+        {
+            "version": "v1",
+            "kind": "Prompt",
+            "data": {"message_id": "user-1", "content": [{"kind": "text", "data": wrapped}]},
+        }
+    )
+
+    message = forwarder.parse_kiro_jsonl_line(line)
+
+    assert message == forwarder._KiroConversationMessage(
+        message_id="user-1", role="user", text="the real question"
+    )
+
+
 def test_read_new_kiro_messages_holds_offset_at_partial_trailing_line(tmp_path: Path) -> None:
     """A record still mid-write (no trailing newline) is not skipped.
 

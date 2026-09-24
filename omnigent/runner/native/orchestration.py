@@ -56,6 +56,7 @@ from omnigent.entities.session_resources import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.models.model_override import validate_model_override
+from omnigent.native.native_bridge_common import write_agent_instructions_preamble
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
@@ -2408,6 +2409,7 @@ async def _auto_create_pi_terminal(
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     project_assignments_enabled: bool = False,
     peer_messaging_enabled: bool = False,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -2421,6 +2423,9 @@ async def _auto_create_pi_terminal(
         terminal inherits the agent's ``os_env.sandbox`` rather than falling
         back to the platform default. ``None`` only when the session has no
         spec; callers must not pass ``None`` to paper over a resolution error.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :param project_assignments_enabled: Gates the assignment tools on the
         relay surface, from the session's init snapshot.
     :param peer_messaging_enabled: Registers ``sys_session_send`` in
@@ -2448,6 +2453,13 @@ async def _auto_create_pi_terminal(
     )
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
+    # A relaunched pane is a new Pi process, so it must get a fresh copy of the
+    # instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Drop stale payloads so a relaunched Pi process can't replay them.
     clear_inbox(bridge_dir)
     pi_extension = pi_extension_path(bridge_dir)
@@ -2821,6 +2833,7 @@ async def _auto_create_cursor_terminal(
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Cursor TUI terminal for a cursor-native session.
@@ -2840,6 +2853,9 @@ async def _auto_create_cursor_terminal(
         declares a cursor-agent model (``executor.model``), that model is passed
         to the TUI via ``--model`` unless the user already pinned one through the
         passthrough launch args.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
     from omnigent.harnesses.cursor_native.main import resolve_cursor_executable
@@ -2871,6 +2887,13 @@ async def _auto_create_cursor_terminal(
     from omnigent.harnesses.cursor_native.usage import clear_cursor_usage_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # Staged for the first injected message; the executor clears it only once
+    # that injection lands, so a failed turn retries with it.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
 
     # Shared native-terminal snapshot reader (workspace + terminal_launch_args
     # + model_override), also used by the pi-native launch.
@@ -3115,6 +3138,8 @@ async def _auto_create_goose_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Goose TUI terminal for a goose-native session.
@@ -3130,6 +3155,11 @@ async def _auto_create_goose_terminal(
     :param resource_registry: Session resource registry for launching the terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
     from omnigent.harnesses.goose_native.main import resolve_goose_executable
@@ -3143,6 +3173,13 @@ async def _auto_create_goose_terminal(
     from omnigent.harnesses.goose_native.forwarder import clear_goose_bridge_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # Staged for the first injected message; the executor clears it only once
+    # that injection lands, so a failed turn retries with it.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     clear_goose_bridge_state(bridge_dir)
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
@@ -3282,6 +3319,8 @@ async def _auto_create_hermes_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Hermes TUI terminal for a hermes-native session.
@@ -3298,6 +3337,11 @@ async def _auto_create_hermes_terminal(
     :param resource_registry: Session resource registry for launching the terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
     from omnigent.harnesses.hermes_native.main import resolve_hermes_executable
@@ -3317,6 +3361,13 @@ async def _auto_create_hermes_terminal(
     from omnigent.harnesses.hermes_native.status import clear_hermes_status_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # A relaunched pane is a new Hermes process, so it must get a fresh copy of
+    # the instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     clear_hermes_bridge_state(bridge_dir)
     # Likewise drop the idle poster state so a stale posted-count from a prior
     # terminal can't make the new forwarder skip (or re-fire) the
@@ -3538,8 +3589,17 @@ async def _auto_create_kiro_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
-    """Auto-create the Kiro TUI terminal for a kiro-native session."""
+    """Auto-create the Kiro TUI terminal for a kiro-native session.
+
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
+    """
     from omnigent.harnesses.kiro_native.bridge import (
         KIRO_NATIVE_ENV_UNSET,
         build_kiro_native_terminal_env,
@@ -3558,6 +3618,13 @@ async def _auto_create_kiro_terminal(
         raise RuntimeError(f"Kiro workspace does not exist for session {session_id!r}.")
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
+    # Staged for the first injected message; the executor clears it only once
+    # that injection lands, so a failed turn retries with it.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Declare the Omnigent MCP server in the workspace-scoped kiro config so
     # kiro-cli can call Omnigent tools. Only when the tool relay will actually
     # start (server_client + ensure_comment_relay present), else serve-mcp would
@@ -3669,6 +3736,7 @@ async def _auto_create_devin_terminal(
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """Auto-create the Devin TUI terminal for a devin-native session.
 
@@ -3679,7 +3747,12 @@ async def _auto_create_devin_terminal(
 
     :param agent_spec: The session's resolved agent spec. A custom agent's
         ``instructions`` are delivered to Devin as an always-on Windsurf rule in
-        the workspace (Devin's only per-turn system-prompt channel).
+        the workspace (Devin's only per-turn system-prompt channel); framework
+        instructions ride the session-scoped first-message preamble so the rule
+        never carries them.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Rides the first-message
+        preamble with the framework text; the workspace rule stays author-only.
     """
     from omnigent.harnesses.devin_native.bridge import (
         DEVIN_NATIVE_ENV_UNSET,
@@ -3687,7 +3760,6 @@ async def _auto_create_devin_terminal(
         export_path,
         prepare_bridge_dir,
         session_config_path,
-        write_agent_instructions_preamble,
         write_devin_agent_rule,
         write_devin_mcp_config,
         write_devin_workspace_hint,
@@ -3717,11 +3789,23 @@ async def _auto_create_devin_terminal(
     # would not be session-scoped — a home-directory workspace Devin reads from
     # every cwd, or one another agent's live rule already owns — the instructions
     # ride the first message instead, which is weaker but stays in this session.
-    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
+    # Framework text is always session-scoped, so it rides that preamble; the
+    # rule must stay free of it for a Devin launched here outside Omnigent.
+    from omnigent.runtime.prompt import _framework_instructions_for, raw_author_instructions
+
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    raw_instructions = raw_author_instructions(spec) if spec is not None else None
     rule_is_live = write_devin_agent_rule(workspace_path, raw_instructions, session_id=session_id)
+    preamble_parts: list[str] = []
     if raw_instructions and not rule_is_live:
-        write_agent_instructions_preamble(bridge_dir, raw_instructions)
-    elif rule_is_live:
+        preamble_parts.append(raw_instructions)
+    if spec is not None:
+        preamble_parts.extend(_framework_instructions_for(spec))
+    if global_instructions and global_instructions.strip():
+        preamble_parts.append(global_instructions)
+    if preamble_parts:
+        write_agent_instructions_preamble(bridge_dir, "\n\n".join(preamble_parts))
+    if rule_is_live:
         # Record the workspace so the SessionEnd hook can remove this rule when
         # the session ends, rather than leaving it to load into a later Devin run.
         write_devin_workspace_hint(bridge_dir, workspace_path)
@@ -3985,6 +4069,8 @@ async def _auto_create_qwen_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the qwen TUI terminal for a qwen-native session.
@@ -4001,6 +4087,11 @@ async def _auto_create_qwen_terminal(
     :param resource_registry: Session resource registry for launching the terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
     from omnigent.harnesses.qwen_native.main import resolve_qwen_executable
@@ -4023,6 +4114,13 @@ async def _auto_create_qwen_terminal(
     from omnigent.harnesses.qwen_native.forwarder import clear_qwen_bridge_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # A relaunched pane is a new qwen process, so it must get a fresh copy of
+    # the instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     clear_qwen_bridge_state(bridge_dir)
     # Create fresh, empty input + event files before launch: qwen ``watchFile``\\s
     # the ``--input-file`` (it must exist) and a relaunched terminal must not
@@ -4258,6 +4356,7 @@ async def _auto_create_kimi_terminal(
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Kimi TUI terminal for a kimi-native session.
@@ -4289,11 +4388,15 @@ async def _auto_create_kimi_terminal(
         workspace snapshot read).
     :param ensure_comment_relay: Unused; kept for call-site parity with the
         other native auto-create helpers.
-    :param agent_spec: Unused for now (model pinning via the kimi TUI is a
-        follow-up); kept for call-site parity.
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions (model pinning via the kimi
+        TUI is a separate follow-up).
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: Created terminal resource view.
     """
-    del ensure_comment_relay, agent_spec
+    del ensure_comment_relay
     from omnigent.harnesses.kimi_native.bridge import (
         bridge_dir_for_session_id,
         write_hook_config,
@@ -4309,6 +4412,13 @@ async def _auto_create_kimi_terminal(
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     bridge_dir = bridge_dir_for_session_id(session_id)
+    # A relaunched pane is a new Kimi process, so it must get a fresh copy of
+    # the instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Stamp launch time before the TUI starts so the forwarder only adopts a kimi
     # session created for THIS launch. Tear down any prior forwarder + its line
     # offset so a re-created terminal tails the fresh wire log (mirrors cursor).
@@ -4435,6 +4545,7 @@ async def _auto_create_codex_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -4473,6 +4584,9 @@ async def _auto_create_codex_terminal(
     :param agent_spec: Optional resolved agent spec for the session.
         When provided, its executor model is used as the Codex app-server
         default, e.g. ``"gpt-5.4-mini"``.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Composed last on
+        ``developer_instructions``, after the author and framework text.
     :param server_client: Runner's Omnigent server HTTP client. Used to read
         persisted launch args and the native thread id.
     :returns: The created terminal resource view.
@@ -4920,7 +5034,9 @@ async def _auto_create_codex_terminal(
         "\n\n".join(
             x
             for x in [
-                _native_startup_raw_instructions_from_spec(agent_spec),
+                _native_startup_instructions_from_spec(
+                    agent_spec, global_instructions=global_instructions
+                ),
                 _codex_routing_note,
             ]
             if x
@@ -5775,6 +5891,8 @@ async def _auto_create_antigravity_terminal(
     *,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the native Antigravity (agy) terminal for a session.
@@ -5829,6 +5947,11 @@ async def _auto_create_antigravity_terminal(
         relay is started against this session's bridge dir before launch so the
         wrapped agy sees the ``sys_*`` tools (#1194). ``None`` skips relay wiring
         (the ``_run_turn_bg`` first-turn fallback re-ensures it).
+    :param agent_spec: The session's resolved agent spec; supplies the author
+        text of the staged startup instructions.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Staged with the rest of the
+        startup text for the first injected message.
     :returns: The created terminal resource view.
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
@@ -5906,6 +6029,13 @@ async def _auto_create_antigravity_terminal(
     # claude/codex auto-create teardown ordering).
     await _cancel_auto_forwarder_task(session_id)
     bridge_dir = prepare_bridge_dir(bridge_id)
+    # A relaunched pane is a new agy process, so it must get a fresh copy of the
+    # instructions; the executor clears them only once the first injection lands.
+    startup_instructions = _native_startup_instructions_from_spec(
+        agent_spec, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Clear stale turn/conversation state so the reader binds this run's real agy
     # conversation id (the cold-start mints it below) instead of a prior run's.
     clear_bridge_state(bridge_dir)
@@ -6583,31 +6713,31 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     return model
 
 
-def _native_startup_raw_instructions_from_spec(
+def _native_startup_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
+    *,
+    global_instructions: str | None = None,
 ) -> str | None:
-    """Read raw author instructions for a native harness's startup-additive channel.
+    """Compose the text for a native harness's startup-additive channel.
 
     Shared by claude-native's ``--append-system-prompt`` and codex-native's
-    ``developer_instructions``. Returns the verbatim ``AgentSpec.instructions``
-    text only — never the fully framework-composed per-turn string. Terminal
-    launch is not tied to any one turn, while the composed string is
-    assembled per conversation for the turn about to run (late-bound
-    framework text like ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is
-    selected per conversation), so a startup channel carrying one turn's
-    composition would address every later turn with it.
+    ``developer_instructions``. Composes the author's text with the session's
+    framework instructions and the server-held global instructions
+    (``native_startup_instructions``); a startup channel is not tied to any one
+    turn, so it never carries the fully framework-composed per-turn string
+    (late-bound framework text like ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is
+    selected per conversation for the turn about to run).
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
-    :returns: The original resolved instructions text, or ``None`` when
-        absent/whitespace-only.
+    :param global_instructions: The session's server-held global instructions
+        text, or ``None``/blank when none is set.
+    :returns: The composed startup text, or ``None`` when there is none.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import native_startup_instructions
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    if spec is None:
-        return None
-    return raw_author_instructions(spec)
+    return native_startup_instructions(spec, global_instructions=global_instructions)
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -7482,6 +7612,7 @@ async def _auto_create_claude_terminal(
     auth_token_factory: Callable[[], str | None] | None = None,
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None,
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -7526,6 +7657,9 @@ async def _auto_create_claude_terminal(
         the model-options endpoint so launch and UI use one catalog query.
     :param record_launch_config: Optional callback that stores the exact
         provider/model snapshot used for this session's launch.
+    :param global_instructions: The server-held global instructions text for
+        this session, or ``None`` when none is set. Composed last on
+        ``--append-system-prompt``, before the routed-spawn note.
     :returns: The launched terminal's :class:`SessionResourceView`, so
         callers that create it on demand (the resume "ensure" path in
         :func:`create_session_terminal`) can return the resource.
@@ -8189,7 +8323,12 @@ async def _auto_create_claude_terminal(
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
             x
-            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
+            for x in [
+                _native_startup_instructions_from_spec(
+                    agent_spec, global_instructions=global_instructions
+                ),
+                routed_spawn_note,
+            ]
             if x
         )
         or None,
@@ -8814,6 +8953,7 @@ class NativeLaunchContext:
     session_init: RunnerSessionInitEnvelope | None = None
     project_assignments_enabled: bool = False
     peer_messaging_enabled: bool = False
+    global_instructions: str | None = None
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
@@ -8849,6 +8989,7 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         ensure_comment_relay=ctx.ensure_comment_relay,
         project_assignments_enabled=ctx.project_assignments_enabled,
         peer_messaging_enabled=ctx.peer_messaging_enabled,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8861,6 +9002,7 @@ async def _launch_cursor(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
         agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8872,6 +9014,8 @@ async def _launch_kiro(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8884,6 +9028,7 @@ async def _launch_devin(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
         agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8907,6 +9052,8 @@ async def _launch_goose(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8918,6 +9065,8 @@ async def _launch_hermes(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8929,6 +9078,8 @@ async def _launch_qwen(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8941,6 +9092,7 @@ async def _launch_kimi(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
         agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8955,6 +9107,7 @@ async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8966,6 +9119,8 @@ async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+        global_instructions=ctx.global_instructions,
     )
 
 
@@ -8991,6 +9146,7 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         auth_token_factory=ctx.auth_token_factory,
         resolve_launch_config=ctx.resolve_launch_config,
         record_launch_config=ctx.record_launch_config,
+        global_instructions=ctx.global_instructions,
     )
 
 
