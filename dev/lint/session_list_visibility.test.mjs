@@ -130,7 +130,7 @@ test("accepts TSX and ignores endpoint text inside JSX", () => {
 });
 
 for (const [filename, missing] of [
-  ["web/src/hooks/useConversations.ts", 6],
+  ["web/src/hooks/useConversations.ts", 9],
   ["web/src/canvas/canvasSessions.ts", 1],
   ["web/src/extensions/services/sessions.ts", 1],
 ]) {
