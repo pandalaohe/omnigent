@@ -974,3 +974,178 @@ def test_prepare_serialized_per_assignment_id(
     worktree = Path(outcomes["a"].directories["root"])  # type: ignore[union-attr]
     assert worktree.is_dir()
     assert _git_ok(worktree, "rev-parse", "HEAD") == commit_x
+
+
+# ── entry layout: <entry>/.worktrees/<repo>/<topic> ──────────────────────
+
+
+def _entry_repo(tmp_path: Path) -> Path:
+    """Create a git-repo directory to act as the project entry."""
+    entry = (tmp_path / "entry").resolve()
+    entry.mkdir()
+    _git_ok(entry, "init", "-q", "-b", "main")
+    return entry
+
+
+def test_prepare_under_entry_places_worktree_and_excludes(tmp_path: Path) -> None:
+    """Prepare with an entry lands at ``<entry>/.worktrees/<repo>/<id>``."""
+    remote, source, commit, digest = _setup_basic(tmp_path)
+    entry = _entry_repo(tmp_path)
+
+    result = prepare([_entry(source, remote, commit, digest)], _ASSIGNMENT_ID, entry=str(entry))
+
+    assert result.status == "ok", result.error
+    expected = entry / ".worktrees" / "myrepo" / _ASSIGNMENT_ID
+    assert result.directories["root"] == str(expected)
+    assert _git_ok(expected, "rev-parse", "HEAD") == commit
+    # Detached, as every assignment execution root is.
+    assert _git_ok(expected, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    # The entry's own repository gains the ignore line for .worktrees/.
+    assert _exclude_lines(entry).count("/.worktrees/") == 1
+
+    # A second prepare reuses the same worktree and writes no second line.
+    again = prepare([_entry(source, remote, commit, digest)], _ASSIGNMENT_ID, entry=str(entry))
+    assert again.status == "ok", again.error
+    assert again.directories == result.directories
+    assert _exclude_lines(entry).count("/.worktrees/") == 1
+
+    released = release([_release_entry(source)], _ASSIGNMENT_ID)
+    assert released.status == "ok", released.failures
+    assert not expected.exists()
+
+
+def test_prepare_under_entry_symlinked_worktrees_refused(tmp_path: Path) -> None:
+    """A ``.worktrees`` symlinked out of the entry is refused; nothing is created."""
+    remote, source, commit, digest = _setup_basic(tmp_path)
+    entry = (tmp_path / "entry").resolve()
+    entry.mkdir()
+    elsewhere = (tmp_path / "elsewhere").resolve()
+    elsewhere.mkdir()
+    (entry / ".worktrees").symlink_to(elsewhere)
+
+    result = prepare([_entry(source, remote, commit, digest)], _ASSIGNMENT_ID, entry=str(entry))
+
+    assert result.status == "failed"
+    assert result.error_code == "worktree_failed"
+    assert "escapes the project entry" in (result.error or "")
+    assert str(entry / ".worktrees") in (result.error or "")
+    assert list(elsewhere.iterdir()) == []
+    assert _worktree_count(source) == 1
+
+
+def test_prepare_under_entry_qualifies_colliding_topics(tmp_path: Path) -> None:
+    """Two sources with the same main-worktree name get repository-qualified topics."""
+    remote_a, source_a, commit_a, digest_a = _setup_basic(tmp_path)
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    remote_b, source_b, commit_b, digest_b = _setup_basic(second_root)
+    # Each repository's input ref is published under its own name.
+    _push_input(source_a, commit_a, name="a")
+    _push_input(source_b, commit_b, name="b")
+    entry = _entry_repo(tmp_path)
+
+    result = prepare(
+        [
+            _entry(source_a, remote_a, commit_a, digest_a, name="a"),
+            _entry(source_b, remote_b, commit_b, digest_b, name="b"),
+        ],
+        _ASSIGNMENT_ID,
+        entry=str(entry),
+    )
+
+    assert result.status == "ok", result.error
+    assert result.directories["a"] == str(entry / ".worktrees" / "myrepo" / f"{_ASSIGNMENT_ID}-a")
+    assert result.directories["b"] == str(entry / ".worktrees" / "myrepo" / f"{_ASSIGNMENT_ID}-b")
+    assert _git_ok(Path(result.directories["a"]), "rev-parse", "HEAD") == commit_a
+    assert _git_ok(Path(result.directories["b"]), "rev-parse", "HEAD") == commit_b
+
+    released = release(
+        [_release_entry(source_a, "a"), _release_entry(source_b, "b")], _ASSIGNMENT_ID
+    )
+    assert released.status == "ok", released.failures
+    assert sorted(released.removed) == ["a", "b"]
+
+
+def test_prepare_entry_failure_keeps_legacy_per_assignment_dir(tmp_path: Path) -> None:
+    """A failed prepare rolls back only what it created under the entry."""
+    import dataclasses
+
+    remote, source, commit, digest = _setup_basic(tmp_path)
+    entry = _entry_repo(tmp_path)
+    # An empty legacy directory from another assignment run: the entry
+    # layout's rollback must not remove it.
+    legacy_dir = source / ".omnigent" / "worktrees" / _ASSIGNMENT_ID
+    legacy_dir.mkdir(parents=True)
+    bad = dataclasses.replace(
+        _entry(source, remote, commit, digest, name="b"), input_commit="b" * 40
+    )
+
+    result = prepare(
+        [_entry(source, remote, commit, digest, name="a"), bad],
+        _ASSIGNMENT_ID,
+        entry=str(entry),
+    )
+
+    assert result.status == "failed"
+    assert not (entry / ".worktrees" / "myrepo" / f"{_ASSIGNMENT_ID}-a").exists()
+    assert legacy_dir.is_dir()
+
+
+def test_release_finds_entry_layout_root_in_the_registry(tmp_path: Path) -> None:
+    """Release locates a root created under the entry from the source registry."""
+    remote, source, commit, digest = _setup_basic(tmp_path)
+    entry = _entry_repo(tmp_path)
+    prepared = prepare([_entry(source, remote, commit, digest)], _ASSIGNMENT_ID, entry=str(entry))
+    root = Path(prepared.directories["root"])
+    assert root.is_dir()
+
+    released = release([_release_entry(source)], _ASSIGNMENT_ID)
+
+    assert released.status == "ok", released.failures
+    assert released.removed == ["root"]
+    assert not root.exists()
+
+
+def test_release_leaves_branch_worktree_at_assignment_topic(tmp_path: Path) -> None:
+    """A branch worktree at the topic path is never selected, even at the legacy root."""
+    remote, source, commit, digest = _setup_basic(tmp_path)
+    entry = _entry_repo(tmp_path)
+    legacy = prepare([_entry(source, remote, commit, digest)], _ASSIGNMENT_ID)
+    assert legacy.status == "ok", legacy.error
+    legacy_root = Path(legacy.directories["root"])
+    topic_path = entry / ".worktrees" / "myrepo" / _ASSIGNMENT_ID
+    topic_path.parent.mkdir(parents=True)
+    _git_ok(source, "worktree", "add", "-q", "-b", _ASSIGNMENT_ID, str(topic_path))
+
+    released = release([_release_entry(source)], _ASSIGNMENT_ID)
+
+    assert released.status == "ok", released.failures
+    assert not legacy_root.exists()
+    assert topic_path.is_dir()
+    assert _git_ok(topic_path, "rev-parse", "--abbrev-ref", "HEAD") == _ASSIGNMENT_ID
+
+
+def test_release_without_registration_counts_removed(tmp_path: Path) -> None:
+    """Nothing registered for the assignment counts as already removed."""
+    _remote, source, _commit, _digest = _setup_basic(tmp_path)
+
+    released = release([_release_entry(source)], _ASSIGNMENT_ID)
+
+    assert released.status == "ok"
+    assert released.removed == ["root"]
+
+
+def test_release_registered_path_missing_on_disk_counts_removed(tmp_path: Path) -> None:
+    """A registered but deleted worktree counts as removed without pruning."""
+    remote, source, commit, digest = _setup_basic(tmp_path)
+    prepared = prepare([_entry(source, remote, commit, digest)], _ASSIGNMENT_ID)
+    root = Path(prepared.directories["root"])
+    shutil.rmtree(root)
+
+    released = release([_release_entry(source)], _ASSIGNMENT_ID)
+
+    assert released.status == "ok"
+    assert released.removed == ["root"]
+    assert released.failures == {}
+    # The stale registration is still listed: release never prunes.
+    assert "worktree " in _git_ok(source, "worktree", "list", "--porcelain")

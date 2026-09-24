@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +22,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
@@ -28,15 +30,82 @@ from omnigent.host.frames import (
     HostStatFrame,
     decode_host_frame,
 )
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "2b8753b34a61b09af35a01136d40fadf"
 _SOURCE_REPO = "/Users/alice/myrepo"
+_ENTRY = "/Users/alice/project"
+_PROJECT_ID = "aa11bb22cc33dd44ee55ff6600112233"
+
+
+class _ProjectDirs:
+    """In-memory project entries and bindings for the create route."""
+
+    def __init__(
+        self,
+        *,
+        entries: list[tuple[str, str]] = (),
+        bindings: list[tuple[str, str]] = (),
+    ) -> None:
+        self._entries = list(entries)
+        self._bindings = list(bindings)
+
+    def list_entries(self, project_id: str) -> list[ProjectHostEntry]:
+        """Return the project's per-host entries."""
+        return [
+            ProjectHostEntry(project_id, host_id, workspace, 1)
+            for host_id, workspace in self._entries
+        ]
+
+    def list_by_project(self, project_id: str) -> list[ProjectHostBinding]:
+        """Return the project's primary bindings."""
+        return [
+            ProjectHostBinding(
+                f"{project_id}-{host_id}",
+                project_id,
+                host_id,
+                "primary",
+                "repo",
+                workspace,
+                1,
+                1,
+                is_primary=True,
+            )
+            for host_id, workspace in self._bindings
+        ]
+
+
+@pytest.fixture()
+def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """The shared app plus a project store, so a create can resolve a project entry.
+
+    The shared ``client`` fixture depends on this ``app``.
+    """
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+    )
 
 
 class _FakeWebSocket:
@@ -233,6 +302,8 @@ async def test_create_passes_branch_and_base_branch_to_host(
     assert frame.repo_path == _SOURCE_REPO
     assert frame.branch_name == "feature/login"
     assert frame.base_branch == "main"
+    # No project on this create: no entry, so the legacy location is used.
+    assert frame.entry is None
 
     # The returned worktree path becomes the session workspace, and the
     # branch is persisted (drives sidebar display + delete cleanup).
@@ -260,6 +331,42 @@ async def test_create_without_base_branch_sends_none(
     assert len(cap.create) == 1
     assert cap.create[0].branch_name == "wip"
     assert cap.create[0].base_branch is None
+
+
+async def test_create_with_project_entry_sends_it_to_host(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A create filed in a project with an entry sends the entry to the host.
+
+    The host uses it to nest the worktree under ``<entry>/.worktrees/``;
+    without it the worktree would land at the legacy sibling location.
+    """
+    cap = register_worktree_host()
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-entry-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/login", "base_branch": "main"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    frame = cap.create[0]
+    assert frame.entry == _ENTRY
+    # No primary binding is registered, so the entry itself is the source.
+    assert frame.repo_path == _ENTRY
+    assert frame.branch_name == "feature/login"
 
 
 async def test_create_with_invalid_base_branch_fails_400(

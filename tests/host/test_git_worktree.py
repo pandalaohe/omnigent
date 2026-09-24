@@ -334,6 +334,130 @@ def test_create_worktree_non_repo_fails(tmp_path: Path) -> None:
     assert "not a git repository" in exc.value.message
 
 
+def test_create_worktree_entry_places_under_the_entry(git_repo: Path, tmp_path: Path) -> None:
+    """With an entry the worktree lands at ``<entry>/.worktrees/<repo>/<branch>``."""
+    entry = (tmp_path / "project").resolve()
+    created = create_worktree(
+        repo_path=str(git_repo), branch_name="feature/login", entry=str(entry)
+    )
+    assert created.worktree_path == str(entry / ".worktrees" / "myrepo" / "feature-login")
+    assert Path(created.worktree_path).is_dir()
+    assert _current_branch(Path(created.worktree_path)) == "feature/login"
+
+
+def test_create_worktree_entry_from_linked_worktree_names_main_repo(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A linked-worktree source still names the MAIN worktree under the entry."""
+    first = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
+    entry = (tmp_path / "project").resolve()
+    second = create_worktree(
+        repo_path=first.worktree_path, branch_name="feature/b", entry=str(entry)
+    )
+    # ``myrepo`` is the main checkout's directory name, not ``feature-a``.
+    assert second.worktree_path == str(entry / ".worktrees" / "myrepo" / "feature-b")
+
+
+def test_create_worktree_entry_collision_gets_numeric_suffix(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A taken topic under the entry takes today's ``-2`` suffix."""
+    entry = (tmp_path / "project").resolve()
+    base = entry / ".worktrees" / "myrepo"
+    base.mkdir(parents=True)
+    (base / "feat-x").mkdir()
+    created = create_worktree(repo_path=str(git_repo), branch_name="feat/x", entry=str(entry))
+    assert created.worktree_path == str(base / "feat-x-2")
+    assert _current_branch(Path(created.worktree_path)) == "feat/x"
+
+
+def test_create_worktree_without_entry_keeps_sibling_layout(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """``entry=None`` keeps the sibling path byte-identical to today's."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="wip", entry=None)
+    assert created.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+
+
+def test_create_worktree_entry_refuses_symlinked_worktrees_dir(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A ``.worktrees`` symlinked out of the entry is refused; nothing is created."""
+    entry = (tmp_path / "project").resolve()
+    entry.mkdir()
+    elsewhere = (tmp_path / "elsewhere").resolve()
+    elsewhere.mkdir()
+    (entry / ".worktrees").symlink_to(elsewhere)
+
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(repo_path=str(git_repo), branch_name="escape", entry=str(entry))
+
+    assert "escapes the project entry" in exc.value.message
+    assert str(entry / ".worktrees") in exc.value.message
+    assert list(elsewhere.iterdir()) == []
+    assert _worktree_count(git_repo) == 1
+
+
+def test_create_worktree_existing_branch_entry_places_under_the_entry(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """The existing-branch recreate path uses the entry layout too."""
+    import shutil
+
+    entry = (tmp_path / "project").resolve()
+    created = create_worktree(repo_path=str(git_repo), branch_name="fix-1", entry=str(entry))
+    shutil.rmtree(created.worktree_path)
+    recreated = create_worktree(
+        repo_path=str(git_repo), branch_name="fix-1", existing_branch=True, entry=str(entry)
+    )
+    assert recreated.worktree_path == str(entry / ".worktrees" / "myrepo" / "fix-1")
+    assert _current_branch(Path(recreated.worktree_path)) == "fix-1"
+
+
+def test_create_worktree_bare_main_repository_refused(tmp_path: Path) -> None:
+    """A bare main repository has no work tree to link and is refused."""
+    bare = (tmp_path / "bare.git").resolve()
+    bare.mkdir()
+    _git(bare, "init", "-q", "--bare", "-b", "main")
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(repo_path=str(bare), branch_name="x")
+    assert "bare" in exc.value.message
+
+
+def test_create_worktree_entry_writes_exclude_at_repo_root(git_repo: Path, tmp_path: Path) -> None:
+    """An entry at a repo root gains ``/.worktrees/`` in its exclude, once."""
+    entry = (tmp_path / "project").resolve()
+    entry.mkdir()
+    _git(entry, "init", "-q", "-b", "main")
+    create_worktree(repo_path=str(git_repo), branch_name="one", entry=str(entry))
+    create_worktree(repo_path=str(git_repo), branch_name="two", entry=str(entry))
+    lines = (entry / ".git" / "info" / "exclude").read_text().splitlines()
+    assert lines.count("/.worktrees/") == 1
+
+
+def test_create_worktree_entry_writes_exclude_from_subdirectory(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """An entry below a repo top level gains its relative path in the exclude."""
+    repo = (tmp_path / "outer").resolve()
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    entry = repo / "sub" / "project"
+    create_worktree(repo_path=str(git_repo), branch_name="one", entry=str(entry))
+    lines = (repo / ".git" / "info" / "exclude").read_text().splitlines()
+    assert lines.count("/sub/project/.worktrees/") == 1
+
+
+def test_create_worktree_entry_outside_git_writes_no_exclude(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """An entry outside any git working tree writes no exclude file."""
+    entry = (tmp_path / "plain-project").resolve()
+    created = create_worktree(repo_path=str(git_repo), branch_name="one", entry=str(entry))
+    assert Path(created.worktree_path).is_dir()
+    assert not (entry / ".git").exists()
+
+
 def test_remove_worktree_deletes_dir_and_branch(git_repo: Path) -> None:
     """``delete_branch=True`` removes the directory AND the branch."""
     created = create_worktree(repo_path=str(git_repo), branch_name="feature/login")

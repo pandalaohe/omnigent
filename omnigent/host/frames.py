@@ -603,6 +603,11 @@ class HostCreateWorktreeFrame:
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree (the deleted-worktree
         recreate path) instead of creating a new branch.
+    :param entry: The project's entry directory on the host, e.g.
+        ``"/Users/alice/project"``. When set, the worktree is created at
+        ``<entry>/.worktrees/<main repo name>/<topic>``; ``None`` keeps
+        today's sibling layout
+        ``<repo parent>/<repo name>-worktrees/<topic>``.
     """
 
     request_id: str
@@ -610,6 +615,7 @@ class HostCreateWorktreeFrame:
     branch_name: str
     base_branch: str | None = None
     existing_branch: bool = False
+    entry: str | None = None
 
 
 @dataclass
@@ -750,17 +756,25 @@ class HostAssignmentPrepareFrame:
 
     The host fetches each input ref by explicit refspec, verifies the
     pinned commit, checks the manifest, and adds one detached worktree
-    per repository under
-    ``<source>/.omnigent/worktrees/<assignment_id>/<repository_name>``.
+    per repository. The worktree lands under
+    ``<source>/.omnigent/worktrees/<assignment_id>/<repository_name>``,
+    or — when ``entry`` is set — under
+    ``<entry>/.worktrees/<main repo name>/<topic>`` with ``<topic>``
+    the assignment id (qualified with the repository name when two
+    repositories in the frame share a main-worktree name).
 
     :param request_id: Correlates the result, e.g. ``"req_ap_1"``.
     :param assignment_id: Assignment being prepared, e.g. ``"asg_abc"``.
     :param repositories: One entry per repository, in dispatch order.
+    :param entry: The assignment project's entry directory on the host,
+        e.g. ``"/Users/alice/project"``. ``None`` keeps today's location
+        under the source checkout.
     """
 
     request_id: str
     assignment_id: str
     repositories: list[HostAssignmentPrepareRepository] = field(default_factory=list)
+    entry: str | None = None
 
 
 @dataclass
@@ -771,7 +785,9 @@ class HostAssignmentPrepareResultFrame:
         :class:`HostAssignmentPrepareFrame`, e.g. ``"req_ap_1"``.
     :param status: ``"ok"`` or ``"failed"``.
     :param directories: Repository name → absolute worktree path, e.g.
-        ``{"root": "/Users/alice/myrepo/.omnigent/worktrees/asg_abc/root"}``.
+        ``{"root": "/Users/alice/myrepo/.omnigent/worktrees/asg_abc/root"}``
+        or, when the prepare frame carried an ``entry``,
+        ``{"root": "/Users/alice/project/.worktrees/myrepo/asg_abc"}``.
         Populated on ``"ok"`` only.
     :param error_code: Machine-readable failure category on ``"failed"``,
         ``None`` on success. Stable values:
@@ -1601,6 +1617,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
                 "existing_branch": frame.existing_branch,
+                **({"entry": frame.entry} if frame.entry is not None else {}),
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -1669,6 +1686,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                     }
                     for entry in frame.repositories
                 ],
+                **({"entry": frame.entry} if frame.entry is not None else {}),
             }
         )
     if isinstance(frame, HostAssignmentPrepareResultFrame):
@@ -2403,6 +2421,7 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
         existing_branch=existing_branch is True,
+        entry=_optional_nullable_str(msg, "entry"),
     )
 
 
@@ -2503,6 +2522,7 @@ def _decode_assignment_prepare(msg: _JsonObject) -> HostAssignmentPrepareFrame:
         request_id=_required_str(msg, "request_id"),
         assignment_id=_required_str(msg, "assignment_id"),
         repositories=[_decode_assignment_prepare_repository(item) for item in raw],
+        entry=_optional_nullable_str(msg, "entry"),
     )
 
 

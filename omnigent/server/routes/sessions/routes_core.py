@@ -948,11 +948,11 @@ def register_core_routes(
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
 
-        # R-PLACE / R-INHERIT, shared with the JSON create: a child created
-        # without an explicit workspace keeps its directory and takes the
-        # parent's worktree; everything else launches at the project entry
-        # when the target sits strictly inside it and the entry passes the
-        # same spec boundary the target passed.
+        # Shared with the JSON create: a child created without an explicit
+        # workspace keeps its directory and takes the parent's worktree;
+        # everything else launches at the project entry when the target sits
+        # strictly inside it and the entry passes the same spec boundary the
+        # target passed.
         inherit_parent: Conversation | None = None
         if (
             parsed_metadata.parent_session_id is not None

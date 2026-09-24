@@ -507,6 +507,8 @@ async def test_happy_path_places_session_and_dispatches_once(
 
     frame = fake_prepare.captured  # type: ignore[attr-defined]
     assert frame.assignment_id == assignment.id
+    # No project entry on this host: the frame carries none.
+    assert frame.entry is None
     assert [r.repository_name for r in frame.repositories] == ["root"]
     assert frame.repositories[0].source_directory == r"C:\work\p"
     assert frame.repositories[0].remote_url == "https://example.com/org/repo.git"
@@ -621,6 +623,8 @@ async def test_entry_within_boundary_redirects_launch_to_entry(
     assert conv is not None
     assert conv.workspace == entry_path
     assert conv.worktree == prepared_dir
+    # The prepare frame carries the entry so the host nests the root under it.
+    assert fake_prepare.captured.entry == entry_path  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -677,6 +681,78 @@ async def test_entry_outside_boundary_launches_at_execution_root(
         agent_cache=SimpleNamespace(),
     )
     coordinator._resolve_target_agent_spec_cwd = _fake_spec_cwd  # type: ignore[method-assign]
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "running", row
+    assert row.active_attempt_id is not None
+    attempt = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
+    assert attempt is not None and attempt.session_id is not None
+    conv = stores["conversation"].get_conversation(attempt.session_id)
+    assert conv is not None
+    assert conv.workspace == prepared_dir
+    assert conv.worktree == prepared_dir
+
+
+@pytest.mark.asyncio
+async def test_place_spec_load_failure_launches_at_execution_root(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec store/cache error is a failed boundary, never a failed placement.
+
+    The entry exists, but loading the target agent's spec raises: the
+    session must still be placed, at the execution root, exactly as when
+    the entry fails the boundary check.
+    """
+    stores = _stores(db_uri)
+    host_id = _uid("host-spec-fail")
+    project_id = _uid("spec-fail-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/entry/checkout",
+    )
+    entry_path = "/entry"
+    stores["binding"].put_entry(project_id, host_id, entry_path)
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "spec-fail",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+    )
+    prepared_dir = "/entry/.worktrees/myrepo/spec-fail"
+    fake_prepare = _prepare_ok({"root": prepared_dir})
+    monkeypatch.setattr(assignments_mod, "prepare_assignment_on_host", fake_prepare)
+
+    async def _must_not_validate(**_kwargs: Any) -> str:
+        raise AssertionError("validate_workspace must not run after a spec-load failure")
+
+    monkeypatch.setattr(assignments_mod, "validate_workspace", _must_not_validate)
+    _install_placement_fakes(monkeypatch)
+    registry = FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)})
+    host_store = FakeHostStore([_FakeHost(host_id, ALICE)])
+    perms = FakePermissionStore()
+    coordinator = _coordinator(
+        stores,
+        registry=registry,
+        host_store=host_store,
+        permission_store=perms,
+        agent_store=SimpleNamespace(),
+        agent_cache=SimpleNamespace(),
+    )
+
+    async def _boom(_agent_id: str | None) -> str | None:
+        raise RuntimeError("agent store down")
+
+    coordinator._resolve_target_agent_spec_cwd = _boom  # type: ignore[method-assign]
     coordinator.trigger(assignment.id)
     await coordinator.wait_for_idle()
     await coordinator.shutdown()

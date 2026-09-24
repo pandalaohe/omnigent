@@ -1422,6 +1422,83 @@ def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
     assert decoded.existing_branch is False
 
 
+def test_create_worktree_frame_entry_round_trip() -> None:
+    """A set entry survives encode → decode (drives the worktree location)."""
+    original = HostCreateWorktreeFrame(
+        request_id="req_wt_entry",
+        repo_path="/Users/alice/myrepo",
+        branch_name="feature/login",
+        entry="/Users/alice/project",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded == original
+    assert decoded.entry == "/Users/alice/project"
+
+
+def test_create_worktree_frame_entry_absent_decodes_none() -> None:
+    """An unset entry is omitted from the wire form and decodes to None.
+
+    An older host that ignores the key must keep placing worktrees at the
+    legacy sibling location.
+    """
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_5", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    assert "entry" not in msg
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.entry is None
+
+
+def test_assignment_prepare_frame_entry_round_trip() -> None:
+    """A set entry survives encode → decode on the prepare frame."""
+    original = HostAssignmentPrepareFrame(
+        request_id="req_ap_entry",
+        assignment_id="asg_abc",
+        repositories=[_prepare_entry()],
+        entry="/Users/alice/project",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostAssignmentPrepareFrame)
+    assert decoded == original
+    assert decoded.entry == "/Users/alice/project"
+
+
+def test_assignment_prepare_frame_entry_absent_decodes_none() -> None:
+    """An unset prepare entry is omitted and decodes to None."""
+    encoded = encode_host_frame(
+        HostAssignmentPrepareFrame(
+            request_id="req_ap_3", assignment_id="asg_abc", repositories=[_prepare_entry()]
+        )
+    )
+    msg = json.loads(encoded)
+    assert "entry" not in msg
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostAssignmentPrepareFrame)
+    assert decoded.entry is None
+
+
+def test_assignment_release_frame_has_no_entry_field() -> None:
+    """The release frame carries no entry: release finds the root by registry."""
+    import dataclasses
+
+    assert "entry" not in {field.name for field in dataclasses.fields(HostAssignmentReleaseFrame)}
+    encoded = encode_host_frame(
+        HostAssignmentReleaseFrame(
+            request_id="req_ar_entry",
+            assignment_id="asg_abc",
+            repositories=[
+                HostAssignmentReleaseRepository(
+                    repository_name="root", source_directory="/Users/alice/myrepo"
+                )
+            ],
+        )
+    )
+    assert "entry" not in json.loads(encoded)
+
+
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 

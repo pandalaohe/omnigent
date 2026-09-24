@@ -47,7 +47,7 @@ class ProjectCreateResolution:
     :param entry: The project's entry on the resolved host, or ``None``
         (no entry, no host, or the sandbox host).
     :param checkout: The repository a worktree would source from on the
-        resolved host (R-CHECKOUT), or ``None``.
+        resolved host, or ``None``.
     """
 
     body: Any

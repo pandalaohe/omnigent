@@ -186,7 +186,7 @@ def build_initial_event_text(
     :param attempt_id: The claimed attempt id.
     :param directories: Repository name to prepared directory.
     :param workspace: The session's launch directory, when it differs
-        from its worktree (R-ASSIGN: a project entry). ``None`` when the
+        from its worktree (a project entry). ``None`` when the
         session launches directly at its execution root.
     :param worktree: The session's recorded worktree (the execution
         root), paired with ``workspace`` above.
@@ -271,7 +271,7 @@ class AssignmentCoordinator:
         self._scan_interval_seconds = scan_interval_seconds
         self._due_batch_limit = due_batch_limit
         self._runner_session_initializer = runner_session_initializer
-        # R-ASSIGN entry-boundary check (§2, `_place`). ``None`` in test
+        # Entry-boundary check in `_place`. ``None`` in test
         # wirings without an agent store/cache — treated as a failed
         # boundary there, never skipped: `_place` still launches at the
         # execution root, as before this field existed.
@@ -765,10 +765,13 @@ class AssignmentCoordinator:
             )
             for entry in assignment.inputs
         ]
+        entries = await asyncio.to_thread(self._binding_store.list_entries, assignment.project_id)
+        entry = next((row.workspace for row in entries if row.host_id == host_id), None)
         frame = HostAssignmentPrepareFrame(
             request_id=uuid.uuid4().hex,
             assignment_id=assignment.id,
             repositories=repositories,
+            entry=entry,
         )
         try:
             result = await prepare_assignment_on_host(
@@ -1456,7 +1459,7 @@ class AssignmentCoordinator:
             self._release_holds.pop(assignment.id, None)
 
     async def _resolve_target_agent_spec_cwd(self, agent_id: str | None) -> str | None:
-        """Read the target agent's ``os_env.cwd`` for the R-ASSIGN boundary check.
+        """Read the target agent's ``os_env.cwd`` for the entry-boundary check.
 
         Mirrors ``routes/hosts.py`` ``_resolve_agent_spec_cwd``, resolved from
         ``assignment.target_agent_id`` directly since no session row exists
@@ -1488,7 +1491,7 @@ class AssignmentCoordinator:
             await self._fail_before_launch(assignment, attempt, "prepare returned no directory")
             return
 
-        # R-ASSIGN: launch at the project's entry on this host when one is
+        # Launch at the project's entry on this host when one is
         # set and it passes the same agent-boundary check the execution
         # root itself would; every other case launches at the execution
         # root directly, as today. No agent store/cache wired (test
@@ -1497,17 +1500,32 @@ class AssignmentCoordinator:
         entry = next((row.workspace for row in entries if row.host_id == host_id), None)
         entry_within_agent_boundary = False
         if entry is not None and self._agent_store is not None and self._agent_cache is not None:
-            spec_cwd = await self._resolve_target_agent_spec_cwd(assignment.target_agent_id)
+            spec_cwd: str | None = None
+            spec_loaded = True
             try:
-                await validate_workspace(
-                    host_registry=self._host_registry,
-                    host_id=host_id,
-                    workspace=entry,
-                    spec_cwd=spec_cwd,
+                spec_cwd = await self._resolve_target_agent_spec_cwd(assignment.target_agent_id)
+            except Exception:  # noqa: BLE001
+                # A store/cache failure loading the spec is a failed
+                # boundary, never a failed placement: the session still
+                # launches, at the execution root.
+                spec_loaded = False
+                _logger.warning(
+                    "Assignment %s: target agent spec load failed; "
+                    "launching at the execution root",
+                    assignment.id,
+                    exc_info=True,
                 )
-                entry_within_agent_boundary = True
-            except WorkspaceValidationError:
-                entry_within_agent_boundary = False
+            if spec_loaded:
+                try:
+                    await validate_workspace(
+                        host_registry=self._host_registry,
+                        host_id=host_id,
+                        workspace=entry,
+                        spec_cwd=spec_cwd,
+                    )
+                    entry_within_agent_boundary = True
+                except WorkspaceValidationError:
+                    entry_within_agent_boundary = False
         workspace, worktree = place_session(
             entry,
             execution_root,

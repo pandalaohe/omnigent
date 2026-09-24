@@ -1000,9 +1000,9 @@ class SessionResourceRegistry:
 
         0. ``worktree``, when the caller passes one — the session's
            recorded worktree, for git readers that must never resolve
-           to a project entry's own repository (XHO04 R-CLEAN's
-           sibling for GITROOT sites). Callers with no such reader
-           (terminal cwd, os_env spec) omit it and keep today's order.
+           to a project entry's own repository. Callers with no such
+           reader (terminal cwd, os_env spec) omit it and keep today's
+           order.
         1. ``self._runner_workspace`` (sourced from
            ``OMNIGENT_RUNNER_WORKSPACE``) — when set, ALWAYS
            wins. Both CLI- and host-launched sessions populate it

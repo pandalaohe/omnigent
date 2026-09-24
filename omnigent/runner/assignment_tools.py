@@ -75,8 +75,8 @@ async def execute_assignment_tool(
         the session to act as.
     :param runner_workspace: The calling session's workspace; the
         execution-root directory for ``sys_assignment_complete`` when the
-        session has no recorded worktree (legacy rows; R-ASSIGN sets one
-        for every current assignment session).
+        session has no recorded worktree (legacy rows; every current
+        assignment session records one).
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: Tool output JSON string.
     """
@@ -718,7 +718,7 @@ async def _complete(
                 "name a repository from the assignment inputs"
             )
         if entry.get("is_execution_root"):
-            # Commits in the session's recorded worktree (R-ASSIGN); a
+            # Commits in the session's recorded worktree; a
             # session launched at a project entry has its execution root
             # there, not at the launch directory the entry itself is.
             execution_root = worktree or (

@@ -3513,6 +3513,7 @@ class HostProcess:
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
                     existing_branch=frame.existing_branch,
+                    entry=frame.entry,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
@@ -3637,6 +3638,7 @@ class HostProcess:
                     assignment_workspace.prepare,
                     frame.repositories,
                     frame.assignment_id,
+                    entry=frame.entry,
                 )
         except Exception as exc:
             _logger.exception("Assignment prepare crashed for %s", frame.assignment_id)

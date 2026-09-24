@@ -157,6 +157,62 @@ def _git_error(label: str, result: subprocess.CompletedProcess[str]) -> Worktree
     return WorktreeError(f"{label} (exit {result.returncode}){suffix}")
 
 
+def _contained_inside(candidate: str, root: str) -> bool:
+    """Whether realpath ``candidate`` is at or inside realpath ``root``.
+
+    :param candidate: Path to check, e.g. a worktree parent directory.
+    :param root: Path the candidate must be inside, e.g. the entry.
+    :returns: ``True`` when ``candidate`` resolves inside ``root``.
+    """
+    try:
+        return os.path.commonpath([candidate, root]) == root
+    except ValueError:
+        # Different drives (Windows) can't share a common path.
+        return False
+
+
+def ensure_entry_excluded(entry: str) -> None:
+    """Add the entry's ``.worktrees/`` directory to the enclosing repo's exclude file.
+
+    Worktree directories Omnigent creates under the entry would
+    otherwise show as untracked noise in the enclosing repository's
+    status. The line is ``/<entry relative to the tree's top level>/.worktrees/``,
+    matching the ``/.omnigent/`` mechanism assignments already use, and is
+    written at most once. Tracked ignore files (``.gitignore``) are never
+    touched, and an entry outside any git working tree writes nothing.
+
+    :param entry: Absolute entry directory on the host, e.g.
+        ``"/Users/alice/project"``.
+    :raises WorktreeError: If the exclude file cannot be written.
+    """
+    if not os.path.isdir(entry):
+        return
+    top = _run_git(["rev-parse", "--show-toplevel"], cwd=entry)
+    if top.returncode != 0:
+        return
+    toplevel = top.stdout.strip()
+    common = _run_git(["rev-parse", "--git-common-dir"], cwd=entry)
+    if common.returncode != 0:
+        return
+    common_dir = common.stdout.strip()
+    if not os.path.isabs(common_dir):
+        common_dir = os.path.join(entry, common_dir)
+    relative = os.path.relpath(os.path.join(entry, ".worktrees"), toplevel)
+    line = "/" + relative.replace(os.sep, "/") + "/"
+    exclude = Path(common_dir) / "info" / "exclude"
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        raw = exclude.read_bytes() if exclude.exists() else b""
+        if line.encode("utf-8") in raw.splitlines():
+            return
+        with exclude.open("ab") as handle:
+            if raw and not raw.endswith(b"\n"):
+                handle.write(b"\n")
+            handle.write(line.encode("utf-8") + b"\n")
+    except OSError as exc:
+        raise WorktreeError(f"could not write git exclude for {entry}: {exc}") from exc
+
+
 def _main_work_tree(repo_path: str) -> str:
     """Resolve the MAIN work tree for any path inside a git repo.
 
@@ -175,8 +231,10 @@ def _main_work_tree(repo_path: str) -> str:
         ``"/Users/alice/myrepo-worktrees/feature"``.
     :returns: Absolute path of the main work tree, e.g.
         ``"/Users/alice/myrepo"``.
-    :raises WorktreeError: If ``repo_path`` is not a directory or not
-        inside a git work tree, or the git command fails.
+    :raises WorktreeError: If ``repo_path`` is not a directory, not
+        inside a git work tree, the git command fails, or the main
+        repository is bare (a bare repository has no work tree to link
+        a worktree to).
     """
     if not Path(repo_path).is_dir():
         raise WorktreeError(f"path is not a directory: {repo_path}")
@@ -187,10 +245,18 @@ def _main_work_tree(repo_path: str) -> str:
         ):
             raise WorktreeError(f"not a git repository: {repo_path}")
         raise _git_error("git worktree list failed", result)
-    for line in result.stdout.splitlines():
+    lines = result.stdout.splitlines()
+    for index, line in enumerate(lines):
         # Porcelain format: the first record's ``worktree <path>`` line is
         # the main work tree; linked worktrees follow.
         if line.startswith("worktree "):
+            # A bare repository's only record carries a ``bare`` line right
+            # after its path — there is no working tree to branch off.
+            for record_line in lines[index + 1 :]:
+                if record_line == "" or record_line.startswith("worktree "):
+                    break
+                if record_line == "bare":
+                    raise WorktreeError(f"bare main repository is not supported: {repo_path}")
             return line[len("worktree ") :].strip()
     raise WorktreeError(f"could not resolve main work tree for {repo_path}")
 
@@ -316,24 +382,33 @@ def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     )
 
 
-def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
-    """Compute a collision-free sibling worktree directory path.
+def _resolve_worktree_path(repo_root: str, branch_name: str, *, entry: str | None = None) -> Path:
+    """Compute a collision-free worktree directory path.
 
-    Places the worktree at
-    ``<parent-of-repo-root>/<repo-name>-worktrees/<sanitized-branch>``,
-    appending a numeric suffix if that path already exists on disk.
+    With ``entry`` the worktree goes to
+    ``<entry>/.worktrees/<repo-name>/<sanitized-branch>``; without it, to
+    today's sibling location
+    ``<parent-of-repo-root>/<repo-name>-worktrees/<sanitized-branch>``.
+    Either way a numeric suffix is appended if the path already exists on
+    disk.
 
     :param repo_root: Absolute repo work-tree root, e.g.
         ``"/Users/alice/myrepo"``.
     :param branch_name: Validated branch name, e.g.
         ``"feature/login"``.
+    :param entry: Project entry directory on the host, or ``None`` for
+        the sibling layout, e.g. ``"/Users/alice/project"``.
     :returns: A path that does not yet exist, e.g.
-        ``Path("/Users/alice/myrepo-worktrees/feature-login")``.
+        ``Path("/Users/alice/project/.worktrees/myrepo/feature-login")``.
     :raises WorktreeError: If no free path is found within
         :data:`_MAX_DIR_COLLISION_SUFFIX` attempts.
     """
     root = Path(repo_root)
-    base_dir = root.parent / f"{root.name}-worktrees"
+    base_dir = (
+        Path(entry) / ".worktrees" / root.name
+        if entry is not None
+        else root.parent / f"{root.name}-worktrees"
+    )
     dirname = _sanitize_dirname(branch_name)
     candidate = base_dir / dirname
     if not candidate.exists():
@@ -406,16 +481,17 @@ def create_worktree(
     branch_name: str,
     base_branch: str | None = None,
     existing_branch: bool = False,
+    entry: str | None = None,
 ) -> CreatedWorktree:
     """Create a git worktree with a new — or existing — branch checked out.
 
-    Resolves the repo root, picks a collision-free sibling directory,
-    and runs ``git worktree add -b`` (fetching once if ``base_branch``
-    isn't locally resolvable). With ``existing_branch`` the branch must
-    already exist and not be checked out in any live worktree; stale
-    registrations (a worktree whose directory was deleted from disk)
-    are pruned first, and the branch is checked out without ``-b`` —
-    the recreate path for a deleted worktree.
+    Resolves the repo root, picks a collision-free directory, and runs
+    ``git worktree add -b`` (fetching once if ``base_branch`` isn't
+    locally resolvable). With ``existing_branch`` the branch must already
+    exist and not be checked out in any live worktree; stale registrations
+    (a worktree whose directory was deleted from disk) are pruned first,
+    and the branch is checked out without ``-b`` — the recreate path for a
+    deleted worktree.
 
     :param repo_path: Absolute path inside the source repo — the
         directory the user picked, e.g. ``"/Users/alice/myrepo"``.
@@ -428,12 +504,18 @@ def create_worktree(
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree instead of creating a new
         branch.
+    :param entry: The session project's entry directory on the host.
+        When set, the worktree is created at
+        ``<entry>/.worktrees/<main repo name>/<topic>`` and the entry's
+        repository gains an ``info/exclude`` line for it; when ``None``,
+        today's sibling location under the repo's parent is used.
     :returns: The created worktree's path and branch.
     :raises WorktreeError: If the branch name is invalid, the path is
-        not a git repo, the base ref can't be resolved, or
+        not a git repo, the base ref can't be resolved,
         ``git worktree add`` fails (e.g. the branch already exists in
         create mode, is missing or still checked out in
-        existing-branch mode).
+        existing-branch mode), or the worktree directory would resolve
+        outside the entry.
     """
     validate_branch_name(branch_name)
     if existing_branch and base_branch is not None:
@@ -473,8 +555,24 @@ def create_worktree(
         )
     if base_branch is not None:
         _ensure_base_resolvable(repo_root, base_branch)
-    worktree_path = _resolve_worktree_path(repo_root, branch_name)
+    worktree_path = _resolve_worktree_path(repo_root, branch_name, entry=entry)
+    if entry is not None and not _contained_inside(
+        os.path.realpath(worktree_path.parent), os.path.realpath(entry)
+    ):
+        # Checked before creating anything too, so a ``.worktrees`` symlink
+        # out of the entry leaves no directory behind.
+        raise WorktreeError(
+            f"worktree directory escapes the project entry: {worktree_path.parent}"
+        )
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    if entry is not None:
+        # Re-checked after ``makedirs``: a component that resolved inside
+        # the entry may be replaced by a link before the directory exists.
+        if not _contained_inside(os.path.realpath(worktree_path.parent), os.path.realpath(entry)):
+            raise WorktreeError(
+                f"worktree directory escapes the project entry: {worktree_path.parent}"
+            )
+        ensure_entry_excluded(entry)
 
     if existing_branch:
         # --end-of-options: treat the branch as a rev, never a git flag

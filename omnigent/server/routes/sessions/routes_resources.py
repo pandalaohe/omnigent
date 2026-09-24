@@ -169,7 +169,7 @@ def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
 # Host-fallback ops that read git state: rooted at the session's effective
 # worktree (``worktree ?? workspace``), never the entry it may be launched
 # at. ``list_or_read`` / ``search`` are plain file-panel reads and stay on
-# ``workspace`` (§9 GITROOT vs LAUNCH).
+# ``workspace``.
 _GITROOT_HOST_FALLBACK_OPS = frozenset(
     {
         "changes",
@@ -1532,7 +1532,7 @@ def register_resources_routes(
                 conv.host_id,
                 conv.workspace,
                 conv.git_branch,
-                # R-INHERIT: the replacement keeps the old row's working tree.
+                # The replacement keeps the old row's working tree.
                 worktree=conv.worktree,
             )
         elif conv.worktree is not None:

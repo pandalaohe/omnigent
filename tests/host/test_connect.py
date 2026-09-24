@@ -43,6 +43,8 @@ from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
+    HostCreateWorktreeFrame,
+    HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
     HostHarnessReadinessFrame,
@@ -7599,7 +7601,45 @@ async def test_github_pr_update_reports_lock_contention_on_host(
 # ── host.assignment_prepare / host.assignment_release dispatch ──
 
 
-def _prepare_frame() -> HostAssignmentPrepareFrame:
+async def test_dispatch_create_worktree_passes_entry_to_creator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create-worktree dispatch forwards the frame's entry to the host op."""
+    from omnigent.host import connect as connect_module
+
+    host = _make_host_process()
+    seen: dict[str, object] = {}
+
+    def _fake_create_worktree(**kwargs: object) -> object:
+        seen.update(kwargs)
+        return SimpleNamespace(
+            worktree_path="/Users/alice/project/.worktrees/myrepo/x",
+            branch="x",
+        )
+
+    monkeypatch.setattr(connect_module, "create_worktree", _fake_create_worktree)
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(  # type: ignore[arg-type]
+        ws,
+        HostCreateWorktreeFrame(
+            request_id="req_wt_9",
+            repo_path="/Users/alice/myrepo",
+            branch_name="x",
+            entry="/Users/alice/project",
+        ),
+    )
+
+    assert seen["entry"] == "/Users/alice/project"
+    assert seen["repo_path"] == "/Users/alice/myrepo"
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostCreateWorktreeResultFrame)
+    assert result.request_id == "req_wt_9"
+    assert result.status == "ok"
+    _cleanup_host(host)
+
+
+def _prepare_frame(entry: str | None = None) -> HostAssignmentPrepareFrame:
     """Build a prepare request with one repository entry."""
     return HostAssignmentPrepareFrame(
         request_id="req_ap_9",
@@ -7615,6 +7655,7 @@ def _prepare_frame() -> HostAssignmentPrepareFrame:
                 manifest_digest="sha256:" + "0" * 64,
             )
         ],
+        entry=entry,
     )
 
 
@@ -7641,10 +7682,11 @@ async def test_dispatch_assignment_prepare_replies_with_result(
     seen: dict[str, object] = {}
 
     def _fake_prepare(
-        repositories: object, assignment_id: str
+        repositories: object, assignment_id: str, *, entry: str | None = None
     ) -> HostAssignmentPrepareResultFrame:
         seen["repositories"] = repositories
         seen["assignment_id"] = assignment_id
+        seen["entry"] = entry
         return HostAssignmentPrepareResultFrame(
             request_id="",
             status="ok",
@@ -7654,9 +7696,10 @@ async def test_dispatch_assignment_prepare_replies_with_result(
     monkeypatch.setattr(assignment_workspace, "prepare", _fake_prepare)
     ws = _FakeTunnel()
 
-    await host._dispatch_host_frame(ws, _prepare_frame())  # type: ignore[arg-type]
+    await host._dispatch_host_frame(ws, _prepare_frame(entry="/Users/alice/project"))  # type: ignore[arg-type]
 
     assert seen["assignment_id"] == "asg_x"
+    assert seen["entry"] == "/Users/alice/project"
     assert len(ws.sent) == 1
     result = decode_host_frame(ws.sent[0])
     assert isinstance(result, HostAssignmentPrepareResultFrame)
@@ -7675,7 +7718,9 @@ async def test_dispatch_assignment_prepare_crash_still_answers_failed(
 
     host = _make_host_process()
 
-    def _boom(repositories: object, assignment_id: str) -> HostAssignmentPrepareResultFrame:
+    def _boom(
+        repositories: object, assignment_id: str, *, entry: str | None = None
+    ) -> HostAssignmentPrepareResultFrame:
         raise RuntimeError("disk on fire")
 
     monkeypatch.setattr(assignment_workspace, "prepare", _boom)

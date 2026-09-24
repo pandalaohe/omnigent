@@ -386,6 +386,8 @@ async def test_launch_runner_with_git_creates_worktree_and_persists_branch(
     assert cap.create[0].repo_path == _SOURCE_REPO
     assert cap.create[0].branch_name == "feature/login"
     assert cap.create[0].base_branch == "main"
+    # No project on this session: no entry, so the legacy location is used.
+    assert cap.create[0].entry is None
     # Success path: no rollback.
     assert cap.remove == [], "worktree was rolled back on a successful launch"
 
@@ -745,6 +747,9 @@ async def test_launch_runner_git_create_at_entry_sources_the_checkout(
     assert response.status_code == 200, response.text
     assert len(cap.create) == 1
     assert cap.create[0].repo_path == _CHECKOUT, "the worktree must come from the checkout"
+    # The project's entry travels with the frame so the host nests the
+    # worktree under ``<entry>/.worktrees/``.
+    assert cap.create[0].entry == _ENTRY
     created = f"{_CHECKOUT}-worktrees/feature-x"
     assert cap.launch[0].workspace == _ENTRY
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
@@ -752,6 +757,30 @@ async def test_launch_runner_git_create_at_entry_sources_the_checkout(
     assert conv.workspace == _ENTRY
     assert conv.worktree == created
     assert conv.git_branch == "feature/x"
+
+
+async def test_launch_runner_sends_the_entry_even_outside_it(
+    app: FastAPI,
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The project's entry is sent whenever it exists on the host.
+
+    The picked directory here is not the entry, so the worktree keeps
+    sourcing from it — but the host still learns the entry, which is what
+    decides where a worktree created from the entry would go.
+    """
+    cap = register_host()
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    session_id = await _project_session(client, db_uri)
+
+    response = await _launch(client, session_id, git={"branch_name": "feature/y"})
+
+    assert response.status_code == 200, response.text
+    assert len(cap.create) == 1
+    assert cap.create[0].repo_path == _SOURCE_REPO
+    assert cap.create[0].entry == _ENTRY
 
 
 async def test_launch_runner_project_without_entry_on_host_is_unchanged(

@@ -1328,9 +1328,9 @@ def create_hosts_router(
                 body.session_id,
             )
 
-        # R-PLACE: a session filed in a project binds at that project's entry
-        # on this host and records the picked worktree. Without a project, an
-        # entry, or a binding store the placement below is a no-op.
+        # A session filed in a project binds at that project's entry on this
+        # host and records the picked worktree. Without a project, an entry,
+        # or a binding store the placement below is a no-op.
         entry: str | None = None
         checkout: str | None = None
         binding_store = getattr(request.app.state, "project_host_binding_store", None)
@@ -1362,8 +1362,8 @@ def create_hosts_router(
             _place_project_session,
         )
 
-        # The entry-boundary check R-PLACE applies before launching at the
-        # entry: the same validation the picked directory already passed.
+        # The entry-boundary check applied before launching at the entry:
+        # the same validation the picked directory already passed.
         async def _entry_within_boundary() -> object:
             from omnigent.server.routes._workspace_validation import (
                 WorkspaceValidationError,
@@ -1458,9 +1458,8 @@ def create_hosts_router(
                         create_worktree_on_host,
                     )
 
-                    # R-PLACE step 1: a worktree made from the entry is
-                    # sourced from the project's checkout, not the entry
-                    # itself (R-CHECKOUT).
+                    # A worktree made from the entry is sourced from the
+                    # project's checkout, not the entry itself.
                     source_repo = workspace
                     if (
                         entry is not None
@@ -1476,6 +1475,7 @@ def create_hosts_router(
                             branch_name=body.git.branch_name,
                             base_branch=body.git.base_branch,
                             existing_branch=body.git.existing_branch,
+                            entry=entry,
                         )
                     except WorktreeHostUnavailableError as exc:
                         raise HTTPException(status_code=409, detail=exc.message) from exc

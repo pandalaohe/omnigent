@@ -25,8 +25,8 @@ class HostRoot:
     :param host_id: Host carrying this root.
     :param workspace: Directory path on that host.
     :param source: Entry, binding or project config that supplied the path.
-    :param checkout: Repository a worktree is created from on that host
-        (R-CHECKOUT), or ``None`` when none is registered.
+    :param checkout: Repository a worktree is created from on that host,
+        or ``None`` when none is registered.
     """
 
     host_id: str
@@ -81,10 +81,10 @@ def checkout_on_host(
 ) -> str | None:
     """Return the repository a worktree is created from on one host.
 
-    R-CHECKOUT, ungated by the flag and the collaboration switch: a registered
-    primary enabled binding is the repository source whatever those say; with
-    no such binding the entry itself is the repository (single-repository
-    projects); otherwise none.
+    Ungated by the flag and the collaboration switch: a registered primary
+    enabled binding is the repository source whatever those say; with no such
+    binding the entry itself is the repository (single-repository projects);
+    otherwise none.
 
     :param bindings: The project's per-host bindings.
     :param entries: The project's per-host entries.
@@ -108,11 +108,11 @@ def root_on_host(
 ) -> HostRoot | None:
     """Return the project's root on one host, if configured.
 
-    R-ROOT: once a project has an entry on any host, entries are its only
-    roots — that host's entry when it exists, otherwise no root on that host
-    (deleting an entry means "no directory on that host", never a silent
-    fallback to a binding or the config). A project without entries keeps the
-    legacy binding → config resolution.
+    Once a project has an entry on any host, entries are its only roots —
+    that host's entry when it exists, otherwise no root on that host (deleting
+    an entry means "no directory on that host", never a silent fallback to a
+    binding or the config). A project without entries keeps the legacy
+    binding → config resolution.
 
     :param project: Project whose root is resolved.
     :param bindings: Its per-host directory bindings.
@@ -203,7 +203,7 @@ def host_roots(
 def same_canonical_path(first: str, second: str) -> bool:
     """Return whether two host-canonical paths name the same directory.
 
-    ``_is_subpath_of`` treats equal paths as contained; R-PLACE needs them
+    ``_is_subpath_of`` treats equal paths as contained; placement needs them
     distinguished ("strictly inside"). Windows paths compare case-insensitively
     with separators normalised, so ``D:\\P`` and ``d:\\p\\`` are the same
     directory.
@@ -224,7 +224,7 @@ def place_session(
     git_used: bool,
     entry_within_agent_boundary: bool,
 ) -> tuple[str, str | None]:
-    """Decide a session's launch directory and recorded worktree (R-PLACE 4–5).
+    """Decide a session's launch directory and recorded worktree.
 
     When the project has an entry on the target host, the target is strictly
     inside it, and the entry passes the same agent-boundary check the target

@@ -4199,7 +4199,7 @@ async def _create_and_publish_codex_child(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
-            # R-INHERIT: a native child keeps its parent's working tree.
+            # A native child keeps its parent's working tree.
             worktree=parent_conv.worktree,
         )
     except NameAlreadyExistsError:
@@ -5761,7 +5761,7 @@ async def _place_project_session(
     """
     Decide a new session's launch directory and recorded worktree.
 
-    R-PLACE steps 4–5 plus the R-INHERIT child rule. ``parent`` is the
+    The child-inheritance rule plus the placement rule: ``parent`` is the
     parent row when the request names a parent and omits an explicit
     workspace: the child keeps its launch directory and takes the parent's
     worktree. Otherwise, when the project has an entry on the target host
@@ -5781,7 +5781,8 @@ async def _place_project_session(
     :param entry_boundary: Validates ``entry`` the way ``target`` was
         validated (that site's own boundary check); ``None`` when there is
         no entry. A failed check is a boundary failure, never propagated.
-    :param parent: Parent row when R-INHERIT applies, else ``None``.
+    :param parent: Parent row when the child-inheritance rule applies,
+        else ``None``.
     :returns: ``(workspace, worktree)`` to persist.
     """
     if parent is not None:
@@ -9496,6 +9497,7 @@ async def _create_session_worktree(
     source_repo: str | None,
     git: SessionGitOptions,
     request: Request,
+    entry: str | None = None,
 ) -> CreatedWorktree:
     """
     Create a git worktree on the host for a new session branch.
@@ -9513,6 +9515,10 @@ async def _create_session_worktree(
     :param git: Validated git options (``branch_name``, optional
         ``base_branch``).
     :param request: FastAPI request carrying the host registry.
+    :param entry: The session project's entry directory on the host, or
+        ``None``. When set, the host creates the worktree under
+        ``<entry>/.worktrees/`` and records it as the session's working
+        tree.
     :returns: The created worktree's ``worktree_path`` (to store as
         ``workspace``) and ``branch`` (to store as ``git_branch``).
     :raises OmnigentError: ``invalid_input`` for a bad branch name,
@@ -9548,6 +9554,7 @@ async def _create_session_worktree(
             branch_name=git.branch_name,
             base_branch=git.base_branch,
             existing_branch=git.existing_branch,
+            entry=entry,
         )
     except WorktreeHostUnavailableError as exc:
         # Host offline / unresponsive — infra, not user input.
@@ -9565,7 +9572,7 @@ async def _canonical_worktree_path(
     request: Request,
 ) -> str:
     """
-    Canonicalise a just-created worktree path on its host (R-PLACE step 1).
+    Canonicalise a just-created worktree path on its host.
 
     The agent-boundary step is skipped (``spec_cwd=None``): the worktree
     was created from a source that already passed the boundary, and a
@@ -9621,11 +9628,10 @@ def effective_worktree(conv: Conversation) -> str | None:
     """
     Return the directory a git reader should root itself at.
 
-    R-CLEAN's sibling for GITROOT sites: ``worktree ?? workspace``. A
-    session with no recorded worktree reads its launch directory as
-    today; one placed at a project entry (``workspace``) with a worktree
-    recorded reads the worktree instead, so the entry's own repository
-    is never mistaken for the session's.
+    ``worktree ?? workspace``: a session with no recorded worktree reads
+    its launch directory as today; one placed at a project entry
+    (``workspace``) with a worktree recorded reads the worktree instead,
+    so the entry's own repository is never mistaken for the session's.
 
     :param conv: The session whose effective worktree is wanted.
     :returns: The worktree path, the workspace, or ``None`` when neither
@@ -9642,11 +9648,11 @@ def cleanup_worktree(
     """
     Return the directory a delete with ``delete_branch`` should remove.
 
-    R-CLEAN: the session's effective worktree (``worktree ?? workspace``)
-    when it carries a branch and a host, and ``None`` when that directory
-    is some project's entry on the host — an entry is never disposable,
-    whatever the row says or which project the session belongs to. Legacy
-    rows have no worktree and keep cleaning up their launch directory.
+    The session's effective worktree (``worktree ?? workspace``) when it
+    carries a branch and a host, and ``None`` when that directory is some
+    project's entry on the host — an entry is never disposable, whatever
+    the row says or which project the session belongs to. Legacy rows
+    have no worktree and keep cleaning up their launch directory.
 
     :param conv: The session being deleted.
     :param is_entry: Returns whether ``(host_id, path)`` is any project's
@@ -10370,8 +10376,8 @@ def _persist_stored_session_bundle(
     :param created_by: Identity of the creating user, recorded on the
         session-scoped agent so its code can only be mutated by the owner.
         ``None`` in single-user mode.
-    :param worktree: Optional working tree recorded by R-PLACE, e.g. a
-        worktree placed inside the project entry. ``None`` for sessions
+    :param worktree: Optional working tree recorded at placement, e.g.
+        a worktree placed inside the project entry. ``None`` for sessions
         whose launch directory is their working tree.
     :returns: Response with the new session id.
     :raises OmnigentError: If the agent insert violates integrity

@@ -3813,9 +3813,9 @@ def create_runner_app(
     def _session_worktree_value(session_id: str) -> str | None:
         """Return the session's recorded worktree, or ``None`` when unset.
 
-        Sourced only from the session-init envelope (R-WTPATH is a server
-        placement concern); a legacy re-init leaves the session out of the
-        map, so callers must fall back to their pre-XHO04 root.
+        Sourced only from the session-init envelope (the server decides
+        where a worktree lives); a legacy re-init leaves the session out
+        of the map, so callers must fall back to the launch directory.
         """
         return _session_worktree_cache.get(session_id)
 
@@ -3957,8 +3957,8 @@ def create_runner_app(
         if session_id in _session_fs_registries:
             return _session_fs_registries[session_id]
 
-        # A git reader roots at the session's worktree when one is recorded
-        # (R-CLEAN's GITROOT sibling), never a project entry's own repository.
+        # A git reader roots at the session's worktree when one is recorded,
+        # never a project entry's own repository.
         session_workspace = _session_worktree_value(session_id) or await _session_workspace_value(
             session_id
         )

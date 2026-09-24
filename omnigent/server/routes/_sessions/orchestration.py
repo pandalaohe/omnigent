@@ -9871,8 +9871,8 @@ async def _create_session_from_existing_agent(
                 raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
             git_branch = body.git.branch_name
         else:
-            # R-PLACE step 1: a worktree made from the entry is sourced from
-            # the project's checkout, not the entry itself (R-CHECKOUT).
+            # A worktree made from the entry is sourced from the project's
+            # checkout, not the entry itself.
             source_repo = canonical_workspace
             if (
                 project_resolution.entry is not None
@@ -9886,6 +9886,7 @@ async def _create_session_from_existing_agent(
                 source_repo=source_repo,
                 git=body.git,
                 request=request,
+                entry=project_resolution.entry,
             )
             # The host's path is canonicalised before any comparison or
             # persistence; rollback keeps the raw path it returned.
@@ -9913,11 +9914,11 @@ async def _create_session_from_existing_agent(
                 raise
             git_branch = created_worktree.branch
 
-    # R-PLACE / R-INHERIT: the launch directory and recorded worktree. A
-    # child created without an explicit workspace keeps its directory and
-    # takes the parent's worktree; everything else is placed by R-PLACE
-    # (the entry when the target sits strictly inside it and passes the
-    # agent's boundary, the target otherwise).
+    # The launch directory and recorded worktree. A child created without
+    # an explicit workspace keeps its directory and takes the parent's
+    # worktree; everything else is placed at the project entry when the
+    # target sits strictly inside it and passes the agent's boundary, and
+    # at the target otherwise.
     inherit_parent: Conversation | None = None
     if (
         body.parent_session_id is not None
@@ -10428,8 +10429,8 @@ def _create_session_from_bundle(
     :param created_by: Identity of the creating user, recorded on the
         new session-scoped agent so its code can only be mutated by the
         owner. ``None`` in single-user mode.
-    :param worktree: Optional working tree recorded by R-PLACE, e.g. a
-        worktree placed inside the project entry. ``None`` for sessions
+    :param worktree: Optional working tree recorded at placement, e.g.
+        a worktree placed inside the project entry. ``None`` for sessions
         whose launch directory is their working tree.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert

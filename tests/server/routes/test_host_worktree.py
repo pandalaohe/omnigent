@@ -148,6 +148,34 @@ async def test_create_worktree_success_returns_path_and_branch(
     assert sent.repo_path == "/Users/alice/myrepo"
     assert sent.branch_name == "feature/login"
     assert sent.base_branch == "main"
+    # No entry passed: the frame carries none (legacy location).
+    assert sent.entry is None
+
+
+async def test_create_worktree_forwards_entry(host_setup: HostRegistry) -> None:
+    """A passed entry reaches the host frame, where it decides the location."""
+    registry = host_setup
+    registry._create_reply_for_test.update(  # type: ignore[attr-defined]
+        {
+            "status": "ok",
+            "worktree_path": "/Users/alice/project/.worktrees/myrepo/feature-login",
+            "branch": "feature/login",
+            "error": None,
+        }
+    )
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    await create_worktree_on_host(
+        host_registry=registry,
+        host_conn=conn,
+        repo_path="/Users/alice/myrepo",
+        branch_name="feature/login",
+        base_branch=None,
+        entry="/Users/alice/project",
+    )
+    sent = registry._sent_frames_for_test[-1]  # type: ignore[attr-defined]
+    assert isinstance(sent, HostCreateWorktreeFrame)
+    assert sent.entry == "/Users/alice/project"
 
 
 async def test_create_worktree_failure_surfaced(host_setup: HostRegistry) -> None:

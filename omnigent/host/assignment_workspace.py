@@ -3,7 +3,11 @@
 Serves ``host.assignment_prepare`` / ``host.assignment_release``: fetch
 pinned input refs by explicit refspec, verify commits and manifests, and
 add (or remove) one detached worktree per repository under
-``<source>/.omnigent/worktrees/<assignment_id>/<repository_name>``.
+``<source>/.omnigent/worktrees/<assignment_id>/<repository_name>`` — or,
+when the prepare frame carries the project's entry,
+``<entry>/.worktrees/<main repo name>/<topic>``. Release locates the
+execution root in the source repository's own worktree registry, so it
+finds it in either layout.
 
 All git runs through :func:`omnigent.host.git_worktree._run_git` as argv
 lists, never a shell. The attempt never checks out into the bound working
@@ -28,7 +32,12 @@ from omnigent.host.frames import (
     HostAssignmentReleaseRepository,
     HostAssignmentReleaseResultFrame,
 )
-from omnigent.host.git_worktree import WorktreeError, _run_git
+from omnigent.host.git_worktree import (
+    WorktreeError,
+    _main_work_tree,
+    _run_git,
+    ensure_entry_excluded,
+)
 from omnigent.project_context import (
     THIS_REPOSITORY_KEY,
     ManifestError,
@@ -136,6 +145,71 @@ def _worktree_path(source_toplevel: str, assignment_id: str, repository_name: st
     return os.path.join(source_toplevel, ".omnigent", "worktrees", assignment_id, repository_name)
 
 
+def _main_worktree_name(source_directory: str) -> str:
+    """Directory name of the source repository's main work tree."""
+    return Path(_main_work_tree(source_directory)).name
+
+
+def _main_worktree_names(
+    repositories: Sequence[HostAssignmentPrepareRepository],
+) -> dict[str, str]:
+    """Main-worktree directory name per repository, for repositories that resolve.
+
+    A source that is not (yet) a git working copy is simply absent; its
+    prepare fails later with the ordinary ``source_invalid`` error.
+    """
+    names: dict[str, str] = {}
+    for repository in repositories:
+        if not os.path.isdir(repository.source_directory):
+            continue
+        try:
+            names[repository.repository_name] = _main_worktree_name(repository.source_directory)
+        except WorktreeError:
+            continue
+    return names
+
+
+def _assignment_topics(
+    repositories: Sequence[HostAssignmentPrepareRepository],
+    assignment_id: str,
+    main_names: dict[str, str],
+) -> dict[str, str]:
+    """Topic directory per repository for the entry layout.
+
+    The assignment id is the topic unless two repositories in this frame
+    share a main-worktree name; then every one of them is qualified with
+    its repository name so their paths differ.
+    """
+    counts: dict[str, int] = {}
+    for repository in repositories:
+        name = main_names.get(repository.repository_name)
+        if name is not None:
+            counts[name] = counts.get(name, 0) + 1
+    topics: dict[str, str] = {}
+    for repository in repositories:
+        name = main_names.get(repository.repository_name)
+        if name is not None and counts[name] > 1:
+            topics[repository.repository_name] = f"{assignment_id}-{repository.repository_name}"
+        else:
+            topics[repository.repository_name] = assignment_id
+    return topics
+
+
+def _makedirs_tracking(path: str) -> list[str]:
+    """Create ``path`` with its parents; return the directories it created, outermost first."""
+    missing: list[str] = []
+    probe = path
+    while probe and not os.path.isdir(probe):
+        missing.append(probe)
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    os.makedirs(path, exist_ok=True)
+    missing.reverse()
+    return missing
+
+
 def _git_common_dir(cwd: str) -> str:
     """Resolve the shared git dir for the repository containing ``cwd``."""
     result = _run_git(["rev-parse", "--git-common-dir"], cwd=cwd)
@@ -186,6 +260,62 @@ def _listed_as_detached(worktree_list: str, path: str) -> bool:
     return _same_path(current, path)
 
 
+@dataclass
+class _ListedWorktree:
+    """One record of ``git worktree list --porcelain``.
+
+    :param path: Absolute worktree directory reported by git.
+    :param detached: Whether the record is in detached-HEAD state.
+    """
+
+    path: str
+    detached: bool
+
+
+def _parse_worktree_list(porcelain: str) -> list[_ListedWorktree]:
+    """Parse ``git worktree list --porcelain`` output into records, main first."""
+    records: list[_ListedWorktree] = []
+    current: str | None = None
+    detached = False
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            if current is not None:
+                records.append(_ListedWorktree(current, detached))
+            current = line[len("worktree ") :].strip()
+            detached = False
+        elif line == "detached":
+            detached = True
+        elif line == "" and current is not None:
+            records.append(_ListedWorktree(current, detached))
+            current = None
+            detached = False
+    if current is not None:
+        records.append(_ListedWorktree(current, detached))
+    return records
+
+
+def _is_assignment_worktree_path(
+    path: str,
+    *,
+    legacy_path: str,
+    main_name: str,
+    assignment_id: str,
+    repository_name: str,
+) -> bool:
+    """Whether a registered worktree path is this repository's assignment root.
+
+    Matches the legacy derived path, or the entry layout's last three
+    components ``.worktrees/<main repo name>/<topic>`` with ``<topic>``
+    the assignment id or its repository-qualified form.
+    """
+    if _same_path(path, legacy_path):
+        return True
+    components = Path(path).parts
+    if len(components) < 3 or components[-3] != ".worktrees" or components[-2] != main_name:
+        return False
+    return components[-1] in (assignment_id, f"{assignment_id}-{repository_name}")
+
+
 def _is_reusable_worktree(path: str, toplevel: str, common_dir: str, commit: str) -> bool:
     """Return whether ``path`` is already the worktree this call would add."""
     try:
@@ -213,14 +343,16 @@ def _remove_dir_if_empty(path: str) -> None:
         os.rmdir(path)
 
 
-def _rollback(created: list[tuple[str, str]], assignment_id: str) -> None:
+def _rollback(created: list[tuple[str, str, tuple[str, ...]]]) -> None:
     """Remove every worktree this call added; never mask the original error.
 
     Every path in ``created`` did not exist before this call, so whatever is
     left there (including a partial directory from a failed ``worktree add``)
-    is ours to remove.
+    is ours to remove. ``cleanup_dirs`` names the directories to remove
+    again when empty — the legacy per-assignment directory, or the
+    directories this call created under an entry.
     """
-    for toplevel, path in reversed(created):
+    for toplevel, path, _cleanup_dirs in reversed(created):
         try:
             result = _run_git(["worktree", "remove", "--force", "--", path], cwd=toplevel)
         except (WorktreeError, OSError) as exc:
@@ -240,8 +372,9 @@ def _rollback(created: list[tuple[str, str]], assignment_id: str) -> None:
                     shutil.rmtree(path)
             except OSError as exc:
                 _logger.warning("Assignment rollback failed for %s: %s", path, exc)
-    for toplevel, _ in reversed(created):
-        _remove_dir_if_empty(os.path.join(toplevel, ".omnigent", "worktrees", assignment_id))
+    for _toplevel, _path, cleanup_dirs in reversed(created):
+        for directory in reversed(cleanup_dirs):
+            _remove_dir_if_empty(directory)
 
 
 def _fail_prepare(
@@ -261,7 +394,10 @@ def _prepare_one(
     entry: HostAssignmentPrepareRepository,
     assignment_id: str,
     prepared: dict[str, _PreparedRepository],
-    created: list[tuple[str, str]],
+    created: list[tuple[str, str, tuple[str, ...]]],
+    entry_path: str | None,
+    main_names: dict[str, str],
+    topics: dict[str, str],
 ) -> HostAssignmentPrepareResultFrame | None:
     """Prepare one repository; ``None`` means success (registered in ``prepared``)."""
     name = entry.repository_name
@@ -370,20 +506,35 @@ def _prepare_one(
     except (WorktreeError, OSError) as exc:
         message = exc.message if isinstance(exc, WorktreeError) else str(exc)
         return _fail_prepare(name, "worktree_failed", f"could not exclude .omnigent: {message}")
+    if entry_path is not None:
+        try:
+            ensure_entry_excluded(entry_path)
+        except (WorktreeError, OSError) as exc:
+            message = exc.message if isinstance(exc, WorktreeError) else str(exc)
+            return _fail_prepare(
+                name, "worktree_failed", f"could not exclude .worktrees: {message}"
+            )
 
-    path = _worktree_path(toplevel, assignment_id, name)
+    if entry_path is not None:
+        try:
+            main_name = main_names.get(name) or _main_worktree_name(toplevel)
+        except WorktreeError as exc:
+            return _fail_prepare(name, "worktree_failed", exc.message)
+        path = os.path.join(entry_path, ".worktrees", main_name, topics[name])
+        containment_root = os.path.realpath(entry_path)
+        escape_message = f"worktree parent escapes the project entry: {os.path.dirname(path)}"
+    else:
+        path = _worktree_path(toplevel, assignment_id, name)
+        containment_root = toplevel
+        escape_message = f"worktree parent escapes the source checkout: {os.path.dirname(path)}"
     parent = os.path.dirname(path)
-    if not _contained_inside(os.path.realpath(parent), toplevel):
-        return _fail_prepare(
-            name, "worktree_failed", f"worktree parent escapes the source checkout: {parent}"
-        )
+    if not _contained_inside(os.path.realpath(parent), containment_root):
+        return _fail_prepare(name, "worktree_failed", escape_message)
     # makedirs stays bare: an OSError here propagates to prepare(), which
     # rolls back this call's worktrees before re-raising.
-    os.makedirs(parent, exist_ok=True)
-    if not _contained_inside(os.path.realpath(parent), toplevel):
-        return _fail_prepare(
-            name, "worktree_failed", f"worktree parent escapes the source checkout: {parent}"
-        )
+    created_dirs = _makedirs_tracking(parent)
+    if not _contained_inside(os.path.realpath(parent), containment_root):
+        return _fail_prepare(name, "worktree_failed", escape_message)
     # Never prune here: it scans the whole repository and drops other
     # worktrees' registrations while their volumes are unmounted. A stale
     # registration at this path surfaces as an add failure naming the path.
@@ -400,7 +551,15 @@ def _prepare_one(
             return None
         return _fail_prepare(name, "worktree_failed", f"worktree path already exists: {path}")
     # mkdir takes ownership: a retried prepare can race on the same path.
-    created.append((toplevel, path))
+    created.append(
+        (
+            toplevel,
+            path,
+            tuple(created_dirs)
+            if entry_path is not None
+            else (os.path.join(toplevel, ".omnigent", "worktrees", assignment_id),),
+        )
+    )
     try:
         added = _run_git(
             ["worktree", "add", "--detach", "--", path, entry.input_commit], cwd=toplevel
@@ -466,6 +625,7 @@ def _check_required(
 def prepare(
     repositories: Sequence[HostAssignmentPrepareRepository],
     assignment_id: str,
+    entry: str | None = None,
 ) -> HostAssignmentPrepareResultFrame:
     """Prepare one detached worktree per repository for an assignment.
 
@@ -476,6 +636,13 @@ def prepare(
 
     :param repositories: One entry per repository, in dispatch order.
     :param assignment_id: Assignment being prepared, e.g. ``"asg_abc"``.
+    :param entry: The assignment project's entry directory on the host.
+        When set, each worktree goes to
+        ``<entry>/.worktrees/<main repo name>/<topic>`` with the
+        assignment id as the topic (qualified with the repository name
+        when two repositories share a main-worktree name), and the
+        entry's repository gains an ``info/exclude`` line for it. ``None``
+        keeps today's location under the source checkout.
     :returns: ``status "ok"`` with the repository → directory map, or
         ``status "failed"`` with a stable ``error_code``. The returned
         frame carries an empty ``request_id``; the dispatcher stamps the
@@ -483,19 +650,23 @@ def prepare(
     """
     with _lock_for_assignment(assignment_id):
         prepared: dict[str, _PreparedRepository] = {}
-        created: list[tuple[str, str]] = []
+        created: list[tuple[str, str, tuple[str, ...]]] = []
+        main_names = _main_worktree_names(repositories) if entry is not None else {}
+        topics = _assignment_topics(repositories, assignment_id, main_names)
         try:
-            for entry in repositories:
-                failure = _prepare_one(entry, assignment_id, prepared, created)
+            for repo_entry in repositories:
+                failure = _prepare_one(
+                    repo_entry, assignment_id, prepared, created, entry, main_names, topics
+                )
                 if failure is not None:
-                    _rollback(created, assignment_id)
+                    _rollback(created)
                     return failure
             missing = _check_required(repositories, prepared)
             if missing is not None:
-                _rollback(created, assignment_id)
+                _rollback(created)
                 return missing
         except Exception:
-            _rollback(created, assignment_id)
+            _rollback(created)
             raise
         return HostAssignmentPrepareResultFrame(
             request_id="",
@@ -513,9 +684,18 @@ def release(
 ) -> HostAssignmentReleaseResultFrame:
     """Remove an assignment's worktrees without discarding user content.
 
+    The execution root of each repository is located in that repository's
+    own worktree registry: a detached worktree at the path this module
+    would have derived under the source checkout, or one whose path ends
+    ``…/.worktrees/<main repo name>/<topic>`` with ``<topic>`` the
+    assignment id (or its repository-qualified form). Only that
+    registered, detached worktree is removed — a branch worktree is never
+    selected, and an entry edited after prepare does not hide the root.
+
     Removal never uses ``--force``: a worktree with leftover uncommitted
     changes is reported in ``failures`` and left in place. A missing
-    worktree counts as removed.
+    worktree — including one with no registration at all — counts as
+    removed.
     Ignored files are project-declared disposables; only tracked/untracked changes block removal.
 
     :param repositories: One entry per repository, in dispatch order.
@@ -548,16 +728,45 @@ def release(
                 failures[name] = f"not a git working copy: {entry.source_directory}"
                 continue
             toplevel = os.path.realpath(top.stdout.strip())
-            path = _worktree_path(toplevel, assignment_id, name)
-            if not _contained_inside(os.path.realpath(os.path.dirname(path)), toplevel):
-                failures[name] = f"worktree path escapes the source checkout: {path}"
+            legacy_dir = os.path.join(toplevel, ".omnigent", "worktrees", assignment_id)
+            try:
+                listed = _run_git(["worktree", "list", "--porcelain"], cwd=toplevel)
+            except WorktreeError as exc:
+                failures[name] = exc.message
                 continue
-            if not os.path.lexists(path):
-                removed.append(name)
-                _remove_dir_if_empty(
-                    os.path.join(toplevel, ".omnigent", "worktrees", assignment_id)
+            if listed.returncode != 0:
+                failures[name] = _detail(
+                    listed.stderr,
+                    listed.returncode,
+                    f"git worktree list failed for {toplevel}",
                 )
                 continue
+            records = _parse_worktree_list(listed.stdout)
+            legacy_path = _worktree_path(toplevel, assignment_id, name)
+            main_name = Path(records[0].path).name if records else ""
+            target = next(
+                (
+                    record
+                    for record in records[1:]
+                    if record.detached
+                    and _is_assignment_worktree_path(
+                        record.path,
+                        legacy_path=legacy_path,
+                        main_name=main_name,
+                        assignment_id=assignment_id,
+                        repository_name=name,
+                    )
+                ),
+                None,
+            )
+            if target is None or not os.path.lexists(target.path):
+                # Nothing registered for this assignment (or its directory
+                # is already gone): a missing worktree counts as removed,
+                # and a stale registration is left for the user to prune.
+                removed.append(name)
+                _remove_dir_if_empty(legacy_dir)
+                continue
+            path = target.path
             try:
                 # Explicit --untracked-files=all: the user's
                 # status.showUntrackedFiles=no must not hide work we'd delete.
@@ -585,7 +794,7 @@ def release(
                 )
                 continue
             removed.append(name)
-            _remove_dir_if_empty(os.path.join(toplevel, ".omnigent", "worktrees", assignment_id))
+            _remove_dir_if_empty(legacy_dir)
         return HostAssignmentReleaseResultFrame(
             request_id="",
             status="ok" if not failures else "partial",
