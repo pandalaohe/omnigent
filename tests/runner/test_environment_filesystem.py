@@ -2111,6 +2111,28 @@ async def test_read_file_in_root_confines_reads(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_file_in_root_caps_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worktree read caps at ``_MAX_READ_BYTES`` like the environment read.
+
+    A file larger than the cap must come back as its capped prefix, not its
+    whole content: the direct read runs in the caller process, which must not
+    hold an unbounded file in memory just because a diff view asked for the
+    worktree's current content.
+    """
+    from omnigent.runner.app import _read_file_in_root
+
+    monkeypatch.setattr("omnigent.runner.app._MAX_READ_BYTES", 8)
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "large.txt").write_text("0123456789abcdef")
+
+    assert await _read_file_in_root(str(root), "large.txt") == "01234567"
+
+
+@pytest.mark.asyncio
 async def test_search_scopes_to_a_subdirectory(client: httpx.AsyncClient) -> None:
     """Search covers exactly what the tree is showing. Scoped to a directory it
     reports the resolved base and returns paths relative to it, so a panel

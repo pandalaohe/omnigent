@@ -102,6 +102,7 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
+from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionConflict,
@@ -1186,7 +1187,9 @@ async def _read_file_in_root(root: str, relative_path: str) -> str:
     file's current content has to come from that same root. Containment is
     enforced here — an absolute path, a ``..`` component, or a symlink that
     resolves outside *root* is refused — and the read is offloaded so a slow
-    file never blocks the loop. Building no environment per read keeps the
+    file never blocks the loop. The read is capped at ``_MAX_READ_BYTES``
+    (10 MiB), like the environment read, so only the file's prefix can be
+    pulled into memory. Building no environment per read keeps the
     helper and its ``atexit`` callback out of the caller process.
 
     :param root: The directory to read under, e.g. a session's worktree.
@@ -1219,7 +1222,7 @@ async def _read_file_in_root(root: str, relative_path: str) -> str:
             raise InvalidPath(f"Path {relative_path!r} escapes {root!r}")
         try:
             with open(target, "rb") as handle:
-                return handle.read()
+                return handle.read(_MAX_READ_BYTES)
         except OSError as exc:
             raise FilesystemPathNotFound(f"Path {relative_path!r} not found") from exc
 
