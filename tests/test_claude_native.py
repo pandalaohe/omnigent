@@ -6611,6 +6611,88 @@ def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: 
     assert claude_native._wrapper_spec_startup_instructions(bad_spec) is None
 
 
+def test_wrapper_spec_startup_instructions_keeps_global_text_on_unresolvable_spec(
+    tmp_path: Path,
+) -> None:
+    """An unresolvable wrapper spec degrades to the global text, not to nothing."""
+    bad_spec = tmp_path / "bad.yaml"
+    bad_spec.write_text("not: [valid, agent, spec")
+    assert (
+        claude_native._wrapper_spec_startup_instructions(
+            bad_spec, global_instructions="Global notice"
+        )
+        == "Global notice"
+    )
+
+
+def _mock_sync_httpx_client(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Any,
+) -> None:
+    """Route the wrapper's own sync httpx clients through a MockTransport."""
+    real_client = httpx.Client
+
+    def _client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(claude_native.httpx, "Client", _client)
+
+
+def test_fetch_global_instructions_returns_text_on_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The helper returns the server-held text that later rides the launch."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/global-instructions"
+        return httpx.Response(200, json={"text": "Prefer minimal diffs."})
+
+    _mock_sync_httpx_client(monkeypatch, handler)
+
+    result = claude_native._fetch_global_instructions(base_url="http://127.0.0.1:1", headers={})
+
+    assert result == "Prefer minimal diffs."
+
+
+def test_fetch_global_instructions_warns_once_and_returns_none_on_404(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An older server must not block the launch, and must not be silent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404)
+
+    _mock_sync_httpx_client(monkeypatch, handler)
+
+    result = claude_native._fetch_global_instructions(base_url="http://127.0.0.1:1", headers={})
+
+    assert result is None
+    warnings = [line for line in capsys.readouterr().err.splitlines() if "Warning" in line]
+    assert len(warnings) == 1
+    assert "HTTP 404" in warnings[0]
+
+
+def test_fetch_global_instructions_warns_once_and_returns_none_on_connection_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A refused connection must not block the launch, and must not be silent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _mock_sync_httpx_client(monkeypatch, handler)
+
+    result = claude_native._fetch_global_instructions(base_url="http://127.0.0.1:1", headers={})
+
+    assert result is None
+    warnings = [line for line in capsys.readouterr().err.splitlines() if "Warning" in line]
+    assert len(warnings) == 1
+    assert "ConnectError" in warnings[0]
+
+
 @pytest.mark.asyncio
 async def test_attach_passes_start_at_end_true_on_cold_resume(
     monkeypatch: pytest.MonkeyPatch,

@@ -8478,6 +8478,20 @@ def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: 
     assert codex_native._wrapper_spec_startup_instructions(bad_spec) is None
 
 
+def test_wrapper_spec_startup_instructions_keeps_global_text_on_unresolvable_spec(
+    tmp_path: Path,
+) -> None:
+    """An unresolvable wrapper spec degrades to the global text, not to nothing."""
+    bad_spec = tmp_path / "bad.yaml"
+    bad_spec.write_text("not: [valid, agent, spec")
+    assert (
+        codex_native._wrapper_spec_startup_instructions(
+            bad_spec, global_instructions="Global notice"
+        )
+        == "Global notice"
+    )
+
+
 @pytest.mark.asyncio
 async def test_prepare_codex_terminal_fresh_session_passes_developer_instructions(
     monkeypatch: pytest.MonkeyPatch,

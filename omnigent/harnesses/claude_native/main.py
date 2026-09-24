@@ -212,6 +212,9 @@ _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
+#: Short: the local server either answers immediately or is down/upgrading,
+#: and a launch must not stall on the optional global-instructions fetch.
+_GLOBAL_INSTRUCTIONS_FETCH_TIMEOUT_S = 3.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
 #: revalidation retries them later). Startup dominates each run and
@@ -3589,7 +3592,11 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
     return yaml_path
 
 
-def _wrapper_spec_startup_instructions(spec_path: Path) -> str | None:
+def _wrapper_spec_startup_instructions(
+    spec_path: Path,
+    *,
+    global_instructions: str | None = None,
+) -> str | None:
     """Resolve startup instructions from the wrapper's agent spec.
 
     Reuses :func:`omnigent.spec.load` (the same loader
@@ -3602,9 +3609,12 @@ def _wrapper_spec_startup_instructions(spec_path: Path) -> str | None:
 
     :param spec_path: The generated/current wrapper agent spec (a
         standalone YAML file or an agent-image directory).
+    :param global_instructions: The server-held global instructions text, or
+        ``None``/blank when unavailable.
     :returns: The composed startup text, or ``None`` if unresolvable or
         empty. Best-effort: a malformed spec must not block the terminal
-        launch, so load failures degrade to ``None``.
+        launch, so load failures degrade to spec-less composition — which
+        still carries the global text.
     """
     from omnigent.runtime.prompt import native_startup_instructions
     from omnigent.spec import load as load_agent_spec
@@ -3617,8 +3627,59 @@ def _wrapper_spec_startup_instructions(spec_path: Path) -> str | None:
             spec_path,
             exc_info=True,
         )
-        return None
-    return native_startup_instructions(spec)
+        spec = None
+    return native_startup_instructions(spec, global_instructions=global_instructions)
+
+
+def _fetch_global_instructions(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+) -> str | None:
+    """Fetch the server-held global instructions for a local CLI launch.
+
+    Best-effort by design: an older server (404), any non-2xx, a transport
+    failure or a malformed body must never block the launch, but never
+    silently drop the text either — one warning line names the reason. A
+    200 with blank ``text`` is a valid state (the admin has it off) and
+    stays silent.
+
+    :param base_url: Omnigent server base URL.
+    :param headers: HTTP auth headers for *base_url*.
+    :returns: The global instructions text, or ``None`` when unset or
+        unavailable.
+    """
+    failure: str | None = None
+    text: str | None = None
+    try:
+        with httpx.Client(
+            base_url=base_url,
+            headers=headers,
+            timeout=_GLOBAL_INSTRUCTIONS_FETCH_TIMEOUT_S,
+            trust_env=not is_loopback_url(base_url),
+        ) as client:
+            response = client.get("/v1/global-instructions")
+        if response.status_code != 200:
+            failure = f"HTTP {response.status_code}"
+        else:
+            try:
+                payload = response.json()
+            except ValueError:
+                failure = "malformed response body"
+            else:
+                value = payload.get("text") if isinstance(payload, dict) else None
+                if not isinstance(value, str):
+                    failure = "malformed response body"
+                elif value.strip():
+                    text = value
+    except Exception as exc:  # noqa: BLE001
+        failure = f"{type(exc).__name__}: {exc}"
+    if failure is not None:
+        click.echo(
+            f"Warning: global instructions not loaded ({failure}); launching without them.",
+            err=True,
+        )
+    return text
 
 
 def _run_with_local_server(
@@ -3665,6 +3726,7 @@ def _run_with_local_server(
     try:
         _wait_for_server(port, server_handle)
         startup_profiler.mark("local server healthy")
+        global_instructions = _fetch_global_instructions(base_url=base_url, headers={})
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
             headers={},
@@ -3720,7 +3782,10 @@ def _run_with_local_server(
                     claude_config=claude_config,
                     startup_profiler=startup_profiler,
                     startup_progress=progress,
-                    append_system_prompt=_wrapper_spec_startup_instructions(spec_path),
+                    append_system_prompt=_wrapper_spec_startup_instructions(
+                        spec_path,
+                        global_instructions=global_instructions,
+                    ),
                 )
             )
             _mark_startup_step(

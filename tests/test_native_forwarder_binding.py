@@ -42,7 +42,7 @@ def test_local_cli_threads_only_its_minted_binding_to_forwarder(
     monkeypatch.setattr(
         module, "_align_working_directory_with_session", lambda *args, **kwargs: None
     )
-    monkeypatch.setattr(module, "_wrapper_spec_startup_instructions", lambda *args: None)
+    monkeypatch.setattr(module, "_wrapper_spec_startup_instructions", lambda *args, **kwargs: None)
     monkeypatch.setattr(module, "open_conversation_link_if_enabled", lambda **kwargs: None)
     captured: dict[str, Any] = {}
 
