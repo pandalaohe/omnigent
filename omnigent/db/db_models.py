@@ -1721,9 +1721,15 @@ class SqlScheduledTask(OmnigentBase):
         written for — who the run belongs to, e.g. ``"alice@example.com"``.
         ``None`` in single-user / OSS mode; the fire path resolves it to the
         reserved ``"local"`` user.
-    :param agent_id: The agent bound to this task (relates to
-        ``agents.id``). Cascade cleanup on agent deletion is application-owned
-        — there is no DB-level foreign key (schema Rule R032).
+    :param agent_id: The stored agent bound to this task (relates to
+        ``agents.id``); ``None`` when the task binds a saved library Agent
+        instead. Cascade cleanup on agent deletion is application-owned — there
+        is no DB-level foreign key (schema Rule R032).
+    :param custom_agent_id: The saved library Agent bound to this task
+        (``custom_agents.id``, ``ca_<hex>``); ``None`` when the task binds an
+        ``agents`` row. Exactly one of ``agent_id`` / ``custom_agent_id`` is
+        set, so the store surfaces their single set value as the entity's
+        ``agent_id``. No DB foreign key (schema Rule R032).
     :param model_override: Per-task LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
@@ -1793,7 +1799,11 @@ class SqlScheduledTask(OmnigentBase):
     # written into) and every other user-identity column in this schema.
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Relates to agents.id. No DB foreign key (Rule R032); cascade is app-owned.
-    agent_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    agent_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # Saved library Agent binding (custom_agents.id, ``ca_<hex>``; width matches
+    # that column). Exactly one of agent_id / custom_agent_id is set (see
+    # ck_scheduled_tasks_agent_binding); no DB foreign key (Rule R032).
+    custom_agent_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
     # Per-task overrides — None means fall back to the agent default. Widths
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -1837,6 +1847,12 @@ class SqlScheduledTask(OmnigentBase):
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
+        # A task binds exactly one agent: a stored ``agents`` row or a saved
+        # library Agent, never both and never neither.
+        CheckConstraint(
+            "(agent_id IS NULL) <> (custom_agent_id IS NULL)",
+            name="ck_scheduled_tasks_agent_binding",
+        ),
         # One user-scoped listing index. Covers "a user's tasks ordered by
         # created_at" (GET /scheduled-tasks) as a covered seek; the scheduler's
         # state scan reads whole rows regardless of any index.

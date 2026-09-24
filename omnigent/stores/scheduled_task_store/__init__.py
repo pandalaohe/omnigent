@@ -67,7 +67,10 @@ class ScheduledTaskStore(ABC):
             trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``.
         :param user_id: User the spawned session's ``LEVEL_OWNER`` grant
             is written for; ``None`` in single-user mode.
-        :param agent_id: The agent bound to this task.
+        :param agent_id: The agent bound to this task — a stored agent's uuid
+            hex, or a saved library Agent's ``ca_<hex>`` id. The store binds one
+            to ``agent_id`` and the other to ``custom_agent_id``; exactly one
+            column is set per row.
         :param timezone: IANA timezone the trigger is evaluated in.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
@@ -165,9 +168,12 @@ class ScheduledTaskStore(ABC):
         leaves it unchanged.
 
         Passing ``agent_id`` rebinds the task to a different agent, which
-        switches the harness its future firings run. The fire path reads
-        ``agent_id`` fresh on every firing and each firing owns its own
-        conversation, so past runs keep the agent they actually ran.
+        switches the harness its future firings run. A ``ca_`` id is written to
+        ``custom_agent_id`` (clearing ``agent_id``), any other id to
+        ``agent_id`` (clearing ``custom_agent_id``), so exactly one binding
+        column stays set. The fire path reads ``agent_id`` fresh on every firing
+        and each firing owns its own conversation, so past runs keep the agent
+        they actually ran.
 
         Returns ``None`` if the task does not exist.
 
