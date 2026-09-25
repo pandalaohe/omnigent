@@ -49,6 +49,7 @@ _HOOK_ENV_VARS = (
     "OMNIGENT_BINDING_WORKSPACE",
     "OMNIGENT_REPOSITORY_NAME",
     "OMNIGENT_PROJECT_IDENTITY_ID",
+    "OMNIGENT_HOOK_TRIGGER",
 )
 
 _IDENTITY_ID_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
@@ -253,6 +254,7 @@ def _build_env(frame: HostPostBindHookFrame) -> dict[str, str]:
     env["OMNIGENT_BINDING_PRIMARY"] = "true" if frame.is_primary else "false"
     env["OMNIGENT_BINDING_WORKSPACE"] = frame.workspace
     env["OMNIGENT_REPOSITORY_NAME"] = frame.repository_name
+    env["OMNIGENT_HOOK_TRIGGER"] = frame.trigger
     identity_id = _read_identity_id(frame)
     if identity_id is not None:
         env["OMNIGENT_PROJECT_IDENTITY_ID"] = identity_id

@@ -56,6 +56,7 @@ import {
   getProjectCollaboration,
   listProjectEntries,
   putProjectEntry,
+  type PostBindResult,
   type ProjectConfig,
   type ProjectHostEntry,
 } from "@/lib/projectsApi";
@@ -132,6 +133,20 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Something went wrong. Try again.";
 }
 
+/** Hook statuses surfaced as a warning and that keep the dialog open on Save. */
+const WARNING_HOOK_STATUSES = new Set(["failed", "timed_out", "unreachable"]);
+
+function hookStatusLabel(status: string): string {
+  return status === "timed_out" ? "timed out" : status;
+}
+
+/** The last post-bind outcome for one row, and where it came from. */
+interface EntryHookOutcome {
+  result: PostBindResult;
+  /** Save surfaces only warnings; a per-row run shows any status. */
+  source: "save" | "run";
+}
+
 export function ProjectSettingsDialog({
   open,
   onOpenChange,
@@ -190,6 +205,13 @@ export function ProjectSettingsDialog({
   // the same alert as `updateConfig.error`.
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Post-bind outcome per host from the last Save (warnings only) or the
+  // per-row run (any status), so the row can show it under its path.
+  const [entryHookOutcomes, setEntryHookOutcomes] = useState<ReadonlyMap<string, EntryHookOutcome>>(
+    () => new Map(),
+  );
+  // The row whose "Run post-bind command" is in flight, if any.
+  const [runningPostBindHostId, setRunningPostBindHostId] = useState<string | null>(null);
   // The entry writes already persisted (host id → path), seeded from the
   // fetched rows and advanced as each write succeeds. Save derives its PUT /
   // DELETE plan from this baseline, not from the server rows, so a retry
@@ -250,7 +272,13 @@ export function ProjectSettingsDialog({
   );
 
   useEffect(() => {
-    if (open) setActiveTab("defaults");
+    if (open) {
+      setActiveTab("defaults");
+      // Outcomes are dialog-session state; a refetch must not wipe a warning
+      // the user still needs to see.
+      setEntryHookOutcomes(new Map());
+      setRunningPostBindHostId(null);
+    }
   }, [open]);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
@@ -347,6 +375,32 @@ export function ProjectSettingsDialog({
     );
   };
 
+  // Re-run the host's post-bind command for a persisted row by re-PUTting the
+  // SAVED path (never the draft), and show whatever status comes back.
+  const runPostBindCommand = async (rowHostId: string) => {
+    const id = projectId;
+    const savedPath = savedEntries.get(rowHostId);
+    if (id === null || savedPath === undefined) return;
+    setEntriesError(null);
+    setRunningPostBindHostId(rowHostId);
+    try {
+      const written = await putProjectEntry(id, rowHostId, savedPath);
+      const postBind = written.post_bind;
+      setEntryHookOutcomes((current) => {
+        const next = new Map(current);
+        if (postBind) next.set(rowHostId, { result: postBind, source: "run" });
+        else next.delete(rowHostId);
+        return next;
+      });
+      void queryClient.invalidateQueries({ queryKey: ["project-host-roots", id] });
+      void queryClient.invalidateQueries({ queryKey: ["project-collaboration", id] });
+    } catch (error) {
+      setEntriesError({ hostId: rowHostId, message: errorMessage(error) });
+    } finally {
+      setRunningPostBindHostId(null);
+    }
+  };
+
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
@@ -389,8 +443,13 @@ export function ProjectSettingsDialog({
     setEntriesError(null);
     setSaveError(null);
     setSaving(true);
+    let id = projectId;
+    // Whether any entry PUT / DELETE committed this run: the finally block
+    // refreshes host-roots + collaboration even when a later write fails.
+    let entryWriteCommitted = false;
+    // A hook warning keeps the dialog open after the save instead of closing.
+    let hookWarningSeen = false;
     try {
-      let id = projectId;
       if (id === null) {
         // A label-only folder is promoted first; the entry writes below use the
         // returned id.
@@ -408,14 +467,24 @@ export function ProjectSettingsDialog({
       // baseline so a retry only sends what is still pending.
       for (const row of changedRows) {
         const path = row.path.trim();
+        let written: ProjectHostEntry & { post_bind?: PostBindResult };
         try {
           // eslint-disable-next-line no-await-in-loop
-          await putProjectEntry(id, row.hostId, path);
+          written = await putProjectEntry(id, row.hostId, path);
         } catch (error) {
           setEntriesError({ hostId: row.hostId, message: errorMessage(error) });
           return;
         }
+        entryWriteCommitted = true;
         setSavedEntries((current) => new Map(current).set(row.hostId, path));
+        const postBind = written.post_bind;
+        if (postBind && WARNING_HOOK_STATUSES.has(postBind.status)) hookWarningSeen = true;
+        setEntryHookOutcomes((current) => {
+          const next = new Map(current);
+          if (postBind) next.set(row.hostId, { result: postBind, source: "save" });
+          else next.delete(row.hostId);
+          return next;
+        });
       }
       for (const removedHostId of removedHostIds) {
         try {
@@ -429,6 +498,7 @@ export function ProjectSettingsDialog({
             return;
           }
         }
+        entryWriteCommitted = true;
         setSavedEntries((current) => {
           const next = new Map(current);
           next.delete(removedHostId);
@@ -442,8 +512,14 @@ export function ProjectSettingsDialog({
         return;
       }
       void queryClient.invalidateQueries({ queryKey: ["project-entries", id] });
-      onOpenChange(false);
+      if (!hookWarningSeen) onOpenChange(false);
     } finally {
+      if (entryWriteCommitted && id !== null) {
+        // Partial progress included: the Collaboration tab reads host-roots
+        // for the entry default, and the entries refetch would reseed drafts.
+        void queryClient.invalidateQueries({ queryKey: ["project-host-roots", id] });
+        void queryClient.invalidateQueries({ queryKey: ["project-collaboration", id] });
+      }
       setSaving(false);
     }
   };
@@ -638,6 +714,13 @@ export function ProjectSettingsDialog({
                 // unregistered host falls back to typing a path.
                 const browsable = rowHost?.status === "online";
                 const rowOpen = openRow === row.hostId;
+                const rowSaved = savedEntries.has(row.hostId);
+                const rowOutcome = entryHookOutcomes.get(row.hostId);
+                const rowOutcomeWarning = rowOutcome
+                  ? WARNING_HOOK_STATUSES.has(rowOutcome.result.status)
+                  : false;
+                const showOutcome =
+                  rowOutcome !== undefined && (rowOutcome.source === "run" || rowOutcomeWarning);
                 return (
                   <div
                     key={row.hostId}
@@ -645,7 +728,10 @@ export function ProjectSettingsDialog({
                     data-testid={`project-settings-entry-${row.hostId}`}
                   >
                     <div className="flex min-w-0 items-center justify-between gap-2">
-                      <span className="min-w-0 truncate text-ui" title={rowHost?.name ?? row.hostId}>
+                      <span
+                        className="min-w-0 truncate text-ui"
+                        title={rowHost?.name ?? row.hostId}
+                      >
                         {rowHost?.name ?? row.hostId}
                       </span>
                       <Button
@@ -728,6 +814,40 @@ export function ProjectSettingsDialog({
                         disabled={isLoading || saving}
                       />
                     )}
+                    {rowSaved && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-auto self-start p-0 text-muted-foreground text-sm hover:bg-transparent"
+                        data-testid={`project-settings-entry-run-post-bind-${row.hostId}`}
+                        onClick={() => void runPostBindCommand(row.hostId)}
+                        disabled={isLoading || saving || runningPostBindHostId !== null}
+                      >
+                        Run post-bind command
+                      </Button>
+                    )}
+                    {showOutcome && rowOutcome && (
+                      <div
+                        className={
+                          rowOutcomeWarning
+                            ? "text-destructive text-ui"
+                            : "text-ui text-muted-foreground"
+                        }
+                        role="status"
+                        data-testid={`project-settings-entry-post-bind-${row.hostId}`}
+                      >
+                        {rowOutcomeWarning ? "Directory saved; " : ""}post-bind command{" "}
+                        {hookStatusLabel(rowOutcome.result.status)}
+                        {rowOutcome.result.error ? `: ${rowOutcome.result.error}` : ""}
+                        {typeof rowOutcome.result.exit_code === "number"
+                          ? ` (exit code ${rowOutcome.result.exit_code})`
+                          : ""}
+                        {rowOutcome.result.output ? (
+                          <pre className="mt-1 whitespace-pre-wrap">{rowOutcome.result.output}</pre>
+                        ) : null}
+                      </div>
+                    )}
                     {rowError && (
                       <p
                         className="text-destructive text-ui"
@@ -740,17 +860,16 @@ export function ProjectSettingsDialog({
                   </div>
                 );
               })}
-              {entriesError &&
-                !directoryRows.some((row) => row.hostId === entriesError.hostId) && (
-                  // A DELETE that failed has no row left to carry the message.
-                  <p
-                    className="text-destructive text-ui"
-                    role="alert"
-                    data-testid="project-settings-entries-error"
-                  >
-                    {entriesError.message}
-                  </p>
-                )}
+              {entriesError && !directoryRows.some((row) => row.hostId === entriesError.hostId) && (
+                // A DELETE that failed has no row left to carry the message.
+                <p
+                  className="text-destructive text-ui"
+                  role="alert"
+                  data-testid="project-settings-entries-error"
+                >
+                  {entriesError.message}
+                </p>
+              )}
               {addableHosts.length > 0 && (
                 // A menu-shaped Select: its value never changes, so picking a
                 // host adds a row and the trigger keeps reading "Add host".

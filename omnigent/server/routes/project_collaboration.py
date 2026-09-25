@@ -401,24 +401,40 @@ def _post_bind_result(status: str, *, error: str | None = None) -> dict[str, Any
     return {"status": status, "exit_code": None, "output": None, "error": error}
 
 
-async def _run_post_bind_hook(
+async def run_post_bind_request(
     *,
     host_registry: HostRegistry,
     host_id: str,
-    binding: ProjectHostBinding,
-    repository: ProjectRepository,
+    project_id: str,
+    binding_name: str,
+    binding_id: str,
+    revision: int,
+    repository_name: str,
+    workspace: str,
+    is_primary: bool,
+    context_manifest_path: str,
+    trigger: str,
 ) -> dict[str, Any]:
-    """Ask the host to run its own post-bind command for a stored binding.
+    """Ask the host to run its own post-bind command for one stored row.
 
     Never raises for hook outcomes: a missing tunnel, a host without the
     capability, a dropped connection and an expired wait all map to a
-    status object the caller returns beside the binding.
+    status object the caller returns beside the row.
 
     :param host_registry: Live host tunnels on this replica.
-    :param host_id: The bound host.
-    :param binding: The stored binding the hook runs for; its ``revision``
-        rides the frame so the host can drop a superseded request.
-    :param repository: The registered repository the binding points at.
+    :param host_id: The host the command runs on.
+    :param project_id: The project the row belongs to.
+    :param binding_name: Binding name, or ``""`` for a project entry.
+    :param binding_id: Stored binding row id, or ``"entry:<project_id>"``
+        for a project entry.
+    :param revision: Stored binding revision; entries carry 0.
+    :param repository_name: Registered repository name, or ``""`` for an
+        entry.
+    :param workspace: Canonical directory the command runs in.
+    :param is_primary: Whether the row is the host's primary.
+    :param context_manifest_path: Repo-relative manifest path.
+    :param trigger: ``"binding"`` or ``"entry"``; the host exports it as
+        ``OMNIGENT_HOOK_TRIGGER``.
     :returns: The D9 object (``status``, ``exit_code``, ``output``,
         ``error``).
     """
@@ -433,14 +449,15 @@ async def _run_post_bind_hook(
     frame = encode_host_frame(
         HostPostBindHookFrame(
             request_id=request_id,
-            project_id=binding.project_id,
-            binding_name=binding.name,
-            binding_id=binding.id,
-            revision=binding.revision,
-            repository_name=repository.name,
-            workspace=binding.workspace,
-            is_primary=binding.is_primary,
-            context_manifest_path=repository.context_manifest_path,
+            project_id=project_id,
+            binding_name=binding_name,
+            binding_id=binding_id,
+            revision=revision,
+            repository_name=repository_name,
+            workspace=workspace,
+            is_primary=is_primary,
+            context_manifest_path=context_manifest_path,
+            trigger=trigger,
         )
     )
     try:
@@ -462,6 +479,38 @@ async def _run_post_bind_hook(
         "output": result.get("output"),
         "error": result.get("error"),
     }
+
+
+async def _run_post_bind_hook(
+    *,
+    host_registry: HostRegistry,
+    host_id: str,
+    binding: ProjectHostBinding,
+    repository: ProjectRepository,
+) -> dict[str, Any]:
+    """Ask the host to run its post-bind command for a stored binding.
+
+    :param host_registry: Live host tunnels on this replica.
+    :param host_id: The bound host.
+    :param binding: The stored binding the hook runs for; its ``revision``
+        rides the frame so the host can drop a superseded request.
+    :param repository: The registered repository the binding points at.
+    :returns: The D9 object (``status``, ``exit_code``, ``output``,
+        ``error``).
+    """
+    return await run_post_bind_request(
+        host_registry=host_registry,
+        host_id=host_id,
+        project_id=binding.project_id,
+        binding_name=binding.name,
+        binding_id=binding.id,
+        revision=binding.revision,
+        repository_name=repository.name,
+        workspace=binding.workspace,
+        is_primary=binding.is_primary,
+        context_manifest_path=repository.context_manifest_path,
+        trigger="binding",
+    )
 
 
 async def _require_owned_project(

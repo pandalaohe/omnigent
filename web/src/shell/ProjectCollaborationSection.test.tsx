@@ -8,6 +8,7 @@ import {
   deleteProjectHostBinding,
   deleteProjectRepository,
   getProjectCollaboration,
+  getProjectHostRoots,
   putProjectHostBinding,
   putProjectRepository,
   setProjectCollaborationEnabled,
@@ -20,6 +21,7 @@ vi.mock("@/lib/projectsApi", () => ({
   deleteProjectHostBinding: vi.fn(),
   deleteProjectRepository: vi.fn(),
   getProjectCollaboration: vi.fn(),
+  getProjectHostRoots: vi.fn(),
   putProjectHostBinding: vi.fn(),
   putProjectRepository: vi.fn(),
   setProjectCollaborationEnabled: vi.fn(),
@@ -56,6 +58,7 @@ vi.mock("@/hooks/useHosts", () => ({
 }));
 
 const getMock = vi.mocked(getProjectCollaboration);
+const getHostRootsMock = vi.mocked(getProjectHostRoots);
 const setEnabledMock = vi.mocked(setProjectCollaborationEnabled);
 const putRepoMock = vi.mocked(putProjectRepository);
 const putBindingMock = vi.mocked(putProjectHostBinding);
@@ -129,12 +132,18 @@ function renderSection() {
 
 beforeEach(() => {
   getMock.mockReset();
+  getHostRootsMock.mockReset();
   setEnabledMock.mockReset();
   putRepoMock.mockReset();
   putBindingMock.mockReset();
   vi.mocked(deleteProjectRepository).mockReset();
   vi.mocked(deleteProjectHostBinding).mockReset();
   vi.mocked(verifyProjectHostBinding).mockReset();
+  getHostRootsMock.mockResolvedValue({
+    roots: [],
+    default_host_id: null,
+    default_host_reason: "none",
+  });
 });
 
 afterEach(cleanup);
@@ -648,6 +657,67 @@ describe("ProjectCollaborationSection", () => {
       expect(screen.getByTestId("project-collaboration-binding-open")).toBeDisabled(),
     );
     expect(screen.getByText("Add a repository first.")).toBeVisible();
+  });
+
+  it("shows the entry as the host's default until a primary enabled binding exists", async () => {
+    // A primary binding that is disabled does not replace the entry default.
+    getMock.mockResolvedValue(
+      collaboration({ repositories: [repo()], bindings: [binding({ enabled: false })] }),
+    );
+    getHostRootsMock.mockResolvedValue({
+      roots: [{ host_id: "h1", workspace: "/entry/one", source: "entry", checkout: "/entry/one" }],
+      default_host_id: "h1",
+      default_host_reason: "single_root",
+    });
+    renderSection();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-entry-default-h1")).toHaveTextContent(
+        "Default: project directory /entry/one — sessions branch from here until a primary binding is set.",
+      ),
+    );
+    cleanup();
+
+    // An enabled primary binding replaces the entry, so the line disappears.
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    renderSection();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-binding-verify-h1-web")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("project-collaboration-entry-default-h1")).not.toBeInTheDocument();
+  });
+
+  it("prefills the binding folder from the host's entry and follows a host switch while untouched", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()] }));
+    getHostRootsMock.mockResolvedValue({
+      roots: [
+        { host_id: "h1", workspace: "/entry/one", source: "entry", checkout: "/entry/one" },
+        { host_id: "h2", workspace: "/entry/two", source: "entry", checkout: "/entry/two" },
+      ],
+      default_host_id: "h1",
+      default_host_reason: "single_root",
+    });
+    renderSection();
+    // Wait for the host-roots read (its default lines prove it landed).
+    await waitFor(() =>
+      expect(screen.getByTestId("project-collaboration-entry-default-h1")).toBeInTheDocument(),
+    );
+    await openBindingForm();
+
+    const input = screen.getByTestId("project-collaboration-binding-workspace");
+    expect(input).toHaveValue("/entry/one");
+
+    // Untouched: switching host follows the new host's entry.
+    fireEvent.change(screen.getByTestId("project-collaboration-binding-host"), {
+      target: { value: "h2" },
+    });
+    expect(input).toHaveValue("/entry/two");
+
+    // A hand-set folder survives a host switch.
+    fireEvent.change(input, { target: { value: "/typed" } });
+    fireEvent.change(screen.getByTestId("project-collaboration-binding-host"), {
+      target: { value: "h1" },
+    });
+    expect(input).toHaveValue("/typed");
   });
 
   it("fills the folder by browsing and allows editing it afterward", async () => {

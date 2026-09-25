@@ -2330,6 +2330,68 @@ def test_post_bind_hook_frame_missing_revision_raises() -> None:
         decode_host_frame(json.dumps(msg))
 
 
+def test_post_bind_hook_frame_trigger_entry_round_trip() -> None:
+    """An entry-triggered request survives encode → decode."""
+    original = HostPostBindHookFrame(
+        request_id="req_pb_entry",
+        project_id="proj_abc",
+        binding_name="",
+        binding_id="entry:proj_abc",
+        revision=0,
+        repository_name="",
+        workspace="/Users/alice/myrepo",
+        is_primary=True,
+        context_manifest_path=".agents/project/manifest.json",
+        trigger="entry",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostPostBindHookFrame)
+    assert decoded == original
+
+
+def test_post_bind_hook_frame_trigger_absent_decodes_binding() -> None:
+    """A frame from an older server without ``trigger`` runs as a binding."""
+    encoded = encode_host_frame(
+        HostPostBindHookFrame(
+            request_id="req_pb_3",
+            project_id="proj_abc",
+            binding_name="primary",
+            binding_id="bind_abc",
+            revision=2,
+            repository_name="root",
+            workspace="/Users/alice/myrepo",
+            is_primary=True,
+            context_manifest_path=".agents/project/manifest.json",
+        )
+    )
+    msg = json.loads(encoded)
+    del msg["trigger"]
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostPostBindHookFrame)
+    assert decoded.trigger == "binding"
+
+
+def test_post_bind_hook_frame_trigger_unknown_raises() -> None:
+    """An unrecognised trigger value refuses the frame."""
+    encoded = encode_host_frame(
+        HostPostBindHookFrame(
+            request_id="req_pb_4",
+            project_id="proj_abc",
+            binding_name="primary",
+            binding_id="bind_abc",
+            revision=1,
+            repository_name="root",
+            workspace="/Users/alice/myrepo",
+            is_primary=True,
+            context_manifest_path=".agents/project/manifest.json",
+        )
+    )
+    msg = json.loads(encoded)
+    msg["trigger"] = "x"
+    with pytest.raises(ValueError, match="trigger"):
+        decode_host_frame(json.dumps(msg))
+
+
 def test_post_bind_hook_result_frame_round_trip() -> None:
     """A completed hook result carries the exit code and output tail."""
     original = HostPostBindHookResultFrame(

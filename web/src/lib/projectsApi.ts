@@ -138,13 +138,14 @@ export async function listProjectEntries(id: string): Promise<ProjectHostEntry[]
 
 /**
  * Validate and store one host's entry directory. The host canonicalises the
- * typed path; the returned entry carries what was actually stored.
+ * typed path; the returned entry carries what was actually stored, plus the
+ * post-bind hook outcome (absent on servers that predate the hook).
  */
 export async function putProjectEntry(
   id: string,
   hostId: string,
   workspace: string,
-): Promise<ProjectHostEntry> {
+): Promise<ProjectHostEntry & { post_bind?: PostBindResult }> {
   const res = await authenticatedFetch(
     `/v1/projects/${encodeURIComponent(id)}/entries/${encodeURIComponent(hostId)}`,
     {
@@ -153,7 +154,7 @@ export async function putProjectEntry(
       body: JSON.stringify({ workspace }),
     },
   );
-  return readCollaborationJsonOrThrow<ProjectHostEntry>(res);
+  return readCollaborationJsonOrThrow<ProjectHostEntry & { post_bind?: PostBindResult }>(res);
 }
 
 /** Delete one host's entry directory. 404s when the host has none. */

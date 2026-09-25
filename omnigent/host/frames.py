@@ -1316,6 +1316,9 @@ class HostPostBindHookFrame:
     :param is_primary: Whether this binding is the host's primary.
     :param context_manifest_path: Repo-relative manifest path, e.g.
         ``".agents/project/manifest.json"``.
+    :param trigger: ``"binding"`` for a binding upsert/verify, ``"entry"``
+        for a project entry save. Old peers ignore the key; a missing key
+        decodes as ``"binding"``.
     """
 
     request_id: str
@@ -1327,6 +1330,7 @@ class HostPostBindHookFrame:
     workspace: str
     is_primary: bool
     context_manifest_path: str
+    trigger: str = "binding"
 
 
 @dataclass
@@ -1941,6 +1945,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "is_primary": frame.is_primary,
                 "context_manifest_path": frame.context_manifest_path,
+                "trigger": frame.trigger,
             }
         )
     if isinstance(frame, HostPostBindHookResultFrame):
@@ -2911,6 +2916,9 @@ def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
 
 def _decode_post_bind_hook(msg: _JsonObject) -> HostPostBindHookFrame:
     """Decode a host.post_bind_hook request frame."""
+    trigger = msg.get("trigger", "binding")
+    if trigger not in ("binding", "entry"):
+        raise ValueError("frame field must be 'binding' or 'entry': 'trigger'")
     return HostPostBindHookFrame(
         request_id=_required_str(msg, "request_id"),
         project_id=_required_str(msg, "project_id"),
@@ -2921,6 +2929,7 @@ def _decode_post_bind_hook(msg: _JsonObject) -> HostPostBindHookFrame:
         workspace=_required_str(msg, "workspace"),
         is_primary=_required_bool(msg, "is_primary"),
         context_manifest_path=_required_str(msg, "context_manifest_path"),
+        trigger=trigger,
     )
 
 

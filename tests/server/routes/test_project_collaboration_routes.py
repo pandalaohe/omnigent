@@ -1167,6 +1167,7 @@ async def test_binding_put_post_bind_runs_for_disabled_binding(
     assert frame.workspace == "/data/work"
     assert frame.is_primary is True
     assert frame.context_manifest_path == ".agents/project/manifest.json"
+    assert frame.trigger == "binding"
 
 
 async def test_binding_put_post_bind_failure_is_carried_back(

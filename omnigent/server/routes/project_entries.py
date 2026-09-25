@@ -19,7 +19,11 @@ from omnigent.entities import ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes.project_collaboration import _canonical_binding_workspace
+from omnigent.server.routes.project_collaboration import (
+    _DEFAULT_MANIFEST_PATH,
+    _canonical_binding_workspace,
+    run_post_bind_request,
+)
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_store import ProjectStore
 
@@ -137,7 +141,8 @@ def create_project_entries_router(
         :param project_id: The project the entry belongs to.
         :param host_id: The host the directory lives on.
         :param body: Workspace path on the host.
-        :returns: The inserted or updated entry.
+        :returns: The inserted or updated entry plus the ``post_bind``
+            outcome object.
         :raises OmnigentError: 401 if unauthenticated, 404 if the project is
             not found / not owned, 400 for the sandbox host, a bad path or a
             path inside a worktree folder, 409 when the host is offline.
@@ -168,7 +173,23 @@ def create_project_entries_router(
             host_id,
             canonical,
         )
-        return _entry_to_response(entry)
+        # The entry is stored before the hook runs and is never refused by
+        # it; revision 0 keeps repeated entry runs from being superseded.
+        assert host_registry is not None  # guaranteed by _canonical_binding_workspace
+        post_bind = await run_post_bind_request(
+            host_registry=host_registry,
+            host_id=host_id,
+            project_id=project_id,
+            binding_name="",
+            binding_id=f"entry:{project_id}",
+            revision=0,
+            repository_name="",
+            workspace=entry.workspace,
+            is_primary=True,
+            context_manifest_path=_DEFAULT_MANIFEST_PATH,
+            trigger="entry",
+        )
+        return {**_entry_to_response(entry), "post_bind": post_bind}
 
     @router.delete(
         "/projects/{project_id}/entries/{host_id}", status_code=status.HTTP_204_NO_CONTENT
