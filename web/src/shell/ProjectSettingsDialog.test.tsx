@@ -591,6 +591,31 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).not.toHaveBeenCalled();
   });
 
+  it("shows only a success line when a re-run of the post-bind command exits 0", async () => {
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    putEntryMock.mockResolvedValue({
+      ...entry("h1", "/repo"),
+      post_bind: { status: "ok", exit_code: 0, output: "joined\n", error: null },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h1")).toHaveTextContent("/repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-entry-run-post-bind-h1"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-post-bind-h1")).toHaveTextContent(
+        "Post-bind command succeeded",
+      ),
+    );
+    const outcome = screen.getByTestId("project-settings-entry-post-bind-h1");
+    expect(outcome.textContent).toBe("Post-bind command succeeded");
+    expect(outcome).not.toHaveTextContent("joined");
+    expect(outcome).not.toHaveTextContent("exit code");
+  });
+
   it("invalidates host-roots and collaboration after a partial entry save, keeping drafts", async () => {
     hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
     listEntriesMock.mockResolvedValue([entry("h1", "/one"), entry("h2", "/two")]);
