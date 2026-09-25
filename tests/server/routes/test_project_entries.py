@@ -10,6 +10,7 @@ host that answers ``host.stat`` frames, reusing the fakes from
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ from fastapi import FastAPI
 from omnigent.stores.host_store import HostStore
 from tests.server.routes.test_project_collaboration_routes import (
     _HOST_A,
+    _HOST_B,
+    _HOST_HOOKED,
     _HOST_OFFLINE,
     _as_user,
     _build_app,
@@ -89,6 +92,29 @@ async def live_host(entries_app: FastAPI) -> AsyncIterator[dict[str, Any]]:
         await _stop_fake_host(comm, drain_task)
 
 
+@pytest_asyncio.fixture()
+async def hooked_host(entries_app: FastAPI) -> AsyncIterator[dict[str, Any]]:
+    """Connect a fake host that advertises and answers ``host.post_bind_hook``.
+
+    Tests register per-binding-name hook results as
+    ``hooks["replies"][name]`` (the entry trigger uses the empty name);
+    every received frame is appended to ``hooks["seen"]``.
+    """
+    comm = await _connect_fake_host(entries_app, _HOST_HOOKED, "fake-hooked", post_bind_hook=True)
+    replies: dict[str, dict[str, Any]] = {}
+    hooks: dict[str, Any] = {"replies": {}, "seen": [], "drop": False}
+    drain_task = _start_stat_drain(comm, replies, hooks=hooks)
+    try:
+        yield {
+            "host_id": _HOST_HOOKED,
+            "replies": replies,
+            "hooks": hooks,
+            "app": entries_app,
+        }
+    finally:
+        await _stop_fake_host(comm, drain_task)
+
+
 async def test_entries_crud_round_trip(
     entries_client: httpx.AsyncClient,
     live_host: dict[str, Any],
@@ -106,15 +132,24 @@ async def test_entries_crud_round_trip(
         json={"workspace": "/data/link"},
     )
     assert created.status_code == 200, created.text
-    assert created.json() == {
-        "host_id": live_host["host_id"],
-        "workspace": "/private/data/entry",
-        "updated_at": None,
-    }
+    created_body = created.json()
+    assert created_body["host_id"] == live_host["host_id"]
+    assert created_body["workspace"] == "/private/data/entry"
+    assert created_body["updated_at"] is None
+    # The host without the capability answers at once; the entry still stores.
+    assert created_body["post_bind"]["status"] == "unsupported"
 
     listed = await entries_client.get(f"/v1/projects/{project_id}/entries")
     assert listed.status_code == 200, listed.text
-    assert listed.json() == {"entries": [created.json()]}
+    assert listed.json() == {
+        "entries": [
+            {
+                "host_id": live_host["host_id"],
+                "workspace": "/private/data/entry",
+                "updated_at": None,
+            }
+        ]
+    }
 
     same = await entries_client.put(
         f"/v1/projects/{project_id}/entries/{live_host['host_id']}",
@@ -306,3 +341,201 @@ async def test_entries_surface_is_not_flag_gated(
     absent = await disabled_client.delete(f"/v1/projects/{project_id}/entries/{_HOST_A}")
     assert absent.status_code == 404
     assert absent.json()["error"]["message"] == "Entry not found"
+
+
+async def test_entry_put_runs_post_bind_with_entry_facts(
+    entries_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """A saved entry runs the hook with empty names, revision 0 and trigger entry."""
+    project_id = await _make_project(entries_client)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/private/data/work",
+    }
+    hooked_host["hooks"]["replies"][""] = {"status": "ok", "exit_code": 0, "output": "joined"}
+
+    resp = await entries_client.put(
+        f"/v1/projects/{project_id}/entries/{hooked_host['host_id']}",
+        json={"workspace": "/data/work"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["workspace"] == "/private/data/work"
+    assert body["post_bind"] == {
+        "status": "ok",
+        "exit_code": 0,
+        "output": "joined",
+        "error": None,
+    }
+    frames = hooked_host["hooks"]["seen"]
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame.project_id == project_id
+    assert frame.binding_name == ""
+    assert frame.binding_id == f"entry:{project_id}"
+    assert frame.revision == 0
+    assert frame.repository_name == ""
+    assert frame.workspace == "/private/data/work"
+    assert frame.is_primary is True
+    assert frame.context_manifest_path == ".agents/project/manifest.json"
+    assert frame.trigger == "entry"
+
+
+async def test_entry_reput_reruns_and_is_never_superseded(
+    entries_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """An identical re-PUT stores nothing new and still sends revision 0 again."""
+    project_id = await _make_project(entries_client)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/private/data/work",
+    }
+    path = f"/v1/projects/{project_id}/entries/{hooked_host['host_id']}"
+
+    first = await entries_client.put(path, json={"workspace": "/data/work"})
+    second = await entries_client.put(path, json={"workspace": "/data/work"})
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["updated_at"] is None
+    assert second.json()["updated_at"] is None
+    assert second.json()["post_bind"]["status"] == "ok"
+    frames = hooked_host["hooks"]["seen"]
+    assert len(frames) == 2
+    assert [frame.revision for frame in frames] == [0, 0]
+    assert [frame.binding_id for frame in frames] == [f"entry:{project_id}"] * 2
+
+
+async def test_entry_put_legacy_host_unsupported_sends_no_frame(
+    entries_client: httpx.AsyncClient,
+    entries_app: FastAPI,
+) -> None:
+    """A hello without post_bind_hook stores the entry and sends no frame."""
+    project_id = await _make_project(entries_client)
+    comm = await _connect_fake_host(entries_app, _HOST_B, "fake-b", post_bind_hook=False)
+    replies: dict[str, dict[str, Any]] = {
+        "/data/work": {
+            "status": "ok",
+            "exists": True,
+            "type": "directory",
+            "canonical_path": "/data/work",
+        }
+    }
+    hooks: dict[str, Any] = {"replies": {}, "seen": [], "drop": False}
+    drain_task = _start_stat_drain(comm, replies, hooks=hooks)
+    try:
+        resp = await entries_client.put(
+            f"/v1/projects/{project_id}/entries/{_HOST_B}",
+            json={"workspace": "/data/work"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["post_bind"]["status"] == "unsupported"
+        assert hooks["seen"] == []
+    finally:
+        await _stop_fake_host(comm, drain_task)
+    listed = await entries_client.get(f"/v1/projects/{project_id}/entries")
+    assert [entry["workspace"] for entry in listed.json()["entries"]] == ["/data/work"]
+
+
+async def test_entry_put_post_bind_failure_is_carried_back(
+    entries_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """A failing command reports its exit code without refusing or rolling back."""
+    project_id = await _make_project(entries_client)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    hooked_host["hooks"]["replies"][""] = {
+        "status": "failed",
+        "exit_code": 3,
+        "output": "hook exploded",
+        "error": "command exited 3",
+    }
+
+    resp = await entries_client.put(
+        f"/v1/projects/{project_id}/entries/{hooked_host['host_id']}",
+        json={"workspace": "/data/work"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["post_bind"] == {
+        "status": "failed",
+        "exit_code": 3,
+        "output": "hook exploded",
+        "error": "command exited 3",
+    }
+    listed = await entries_client.get(f"/v1/projects/{project_id}/entries")
+    assert [entry["workspace"] for entry in listed.json()["entries"]] == ["/data/work"]
+
+
+async def test_entry_put_post_bind_unreachable_without_an_answer(
+    entries_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that never answers costs the bounded wait; the entry is stored."""
+    monkeypatch.setattr(
+        "omnigent.server.routes.project_collaboration._POST_BIND_HOOK_TIMEOUT_S", 0.1
+    )
+    project_id = await _make_project(entries_client)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    hooked_host["hooks"]["drop"] = True
+
+    resp = await entries_client.put(
+        f"/v1/projects/{project_id}/entries/{hooked_host['host_id']}",
+        json={"workspace": "/data/work"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["post_bind"] == {
+        "status": "unreachable",
+        "exit_code": None,
+        "output": None,
+        "error": None,
+    }
+    listed = await entries_client.get(f"/v1/projects/{project_id}/entries")
+    assert [entry["workspace"] for entry in listed.json()["entries"]] == ["/data/work"]
+
+
+async def test_entry_delete_sends_no_post_bind_frame(
+    entries_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """DELETE runs no hook; only the PUT's frame was ever sent."""
+    project_id = await _make_project(entries_client)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    created = await entries_client.put(
+        f"/v1/projects/{project_id}/entries/{hooked_host['host_id']}",
+        json={"workspace": "/data/work"},
+    )
+    assert created.status_code == 200, created.text
+    assert len(hooked_host["hooks"]["seen"]) == 1
+
+    deleted = await entries_client.delete(
+        f"/v1/projects/{project_id}/entries/{hooked_host['host_id']}"
+    )
+
+    assert deleted.status_code == 204, deleted.text
+    await asyncio.sleep(0.05)
+    assert len(hooked_host["hooks"]["seen"]) == 1

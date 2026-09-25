@@ -12,6 +12,7 @@ import {
   deleteProjectHostBinding,
   deleteProjectRepository,
   getProjectCollaboration,
+  getProjectHostRoots,
   putProjectHostBinding,
   putProjectRepository,
   setProjectCollaborationEnabled,
@@ -55,6 +56,13 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
   const collaboration = useQuery({
     queryKey,
     queryFn: () => getProjectCollaboration(projectId),
+    retry: false,
+  });
+  // The project's root per host; an entry-sourced root is the host's default
+  // checkout until a primary enabled binding replaces it (R-CHECKOUT).
+  const hostRoots = useQuery({
+    queryKey: ["project-host-roots", projectId],
+    queryFn: () => getProjectHostRoots(projectId),
     retry: false,
   });
   const hosts = useHosts();
@@ -237,8 +245,17 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
     ? bindingRepo
     : (repositories[0]?.name ?? "");
   const canAddBinding = repositories.length > 0;
+  const entryRootByHost = new Map(
+    (hostRoots.data?.roots ?? [])
+      .filter((root) => root.source === "entry")
+      .map((root) => [root.host_id, root.workspace] as const),
+  );
+  const hasPrimaryEnabledBinding = (hostId: string) =>
+    bindings.some((b) => b.host_id === hostId && b.is_primary && b.enabled);
 
-  const groupedHosts = [...new Set(bindings.map((b) => b.host_id))];
+  // Host groups: every host with a binding, plus every host whose entry is its
+  // default checkout — a host with an entry but no bindings still gets a group.
+  const groupedHosts = [...new Set([...bindings.map((b) => b.host_id), ...entryRootByHost.keys()])];
   const selectedHost = eligibleHosts.find((h) => h.host_id === effectiveBindingHost);
   const effectiveBindingName = bindingName.trim() || effectiveBindingRepo;
   const replacedBinding = bindings.find(
@@ -261,7 +278,9 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
     setBindingFormLocation(location);
     setBindingHost(hostId);
     setBindingPrimary(null);
-    setBindingWorkspace("");
+    // Prefill the host's entry (its default checkout); a hand-set binding path
+    // still wins on submit.
+    setBindingWorkspace(entryRootByHost.get(hostId) ?? "");
     setBindingName("");
     setWorkspaceOpen(false);
   };
@@ -297,7 +316,16 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
           className={inputClassName}
           value={effectiveBindingHost}
           onChange={(e) => {
-            setBindingHost(e.target.value);
+            const nextHostId = e.target.value;
+            // Follow the new host's entry only while the field is untouched
+            // (still empty or still the previous host's entry).
+            setBindingWorkspace((current) => {
+              const previousEntry = entryRootByHost.get(effectiveBindingHost) ?? "";
+              return current === "" || current === previousEntry
+                ? (entryRootByHost.get(nextHostId) ?? "")
+                : current;
+            });
+            setBindingHost(nextHostId);
             setBindingPrimary(null);
             setWorkspaceOpen(false);
           }}
@@ -704,6 +732,15 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
                   <span className="text-sm font-normal text-muted-foreground">{host.platform}</span>
                 )}
               </div>
+              {!hasPrimaryEnabledBinding(hostId) && entryRootByHost.has(hostId) && (
+                <p
+                  className="font-mono text-sm text-muted-foreground"
+                  data-testid={`project-collaboration-entry-default-${hostId}`}
+                >
+                  Default: project directory {entryRootByHost.get(hostId)} — sessions branch from
+                  here until a primary binding is set.
+                </p>
+              )}
               {hostBindings.map((binding) => (
                 <div
                   key={binding.id}

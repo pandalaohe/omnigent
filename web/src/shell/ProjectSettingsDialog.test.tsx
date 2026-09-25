@@ -8,6 +8,7 @@ import {
   deleteProjectEntry,
   getProject,
   getProjectCollaboration,
+  getProjectHostRoots,
   listProjectEntries,
   putProjectEntry,
   updateProjectConfig,
@@ -20,6 +21,7 @@ vi.mock("@/lib/projectsApi", () => ({
   deleteProjectEntry: vi.fn(),
   getProject: vi.fn(),
   getProjectCollaboration: vi.fn(),
+  getProjectHostRoots: vi.fn(),
   listProjectEntries: vi.fn(),
   putProjectEntry: vi.fn(),
   setProjectCollaborationEnabled: vi.fn(),
@@ -110,6 +112,7 @@ vi.mock("./WorkspacePicker", () => ({
 
 const getProjectMock = vi.mocked(getProject);
 const getCollaborationMock = vi.mocked(getProjectCollaboration);
+const getHostRootsMock = vi.mocked(getProjectHostRoots);
 const updateMock = vi.mocked(updateProjectConfig);
 const createMock = vi.mocked(createProject);
 const listEntriesMock = vi.mocked(listProjectEntries);
@@ -136,12 +139,18 @@ function renderDialog(projectId: string | null = "p_1", onOpenChangeSpy?: (open:
     </QueryClientProvider>
   );
   const result = render(view(true));
-  return { ...result, onOpenChange, rerenderOpen: (open: boolean) => result.rerender(view(open)) };
+  return {
+    ...result,
+    client,
+    onOpenChange,
+    rerenderOpen: (open: boolean) => result.rerender(view(open)),
+  };
 }
 
 beforeEach(() => {
   getProjectMock.mockReset();
   getCollaborationMock.mockReset();
+  getHostRootsMock.mockReset();
   updateMock.mockReset();
   createMock.mockReset();
   listEntriesMock.mockReset();
@@ -164,6 +173,11 @@ beforeEach(() => {
   putEntryMock.mockImplementation(async (_id, hostId, workspace) => entry(hostId, workspace));
   deleteEntryMock.mockResolvedValue(undefined);
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+  getHostRootsMock.mockResolvedValue({
+    roots: [],
+    default_host_id: null,
+    default_host_reason: "none",
+  });
 });
 
 afterEach(cleanup);
@@ -498,6 +512,123 @@ describe("ProjectSettingsDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("keeps the dialog open with a row warning when the post-bind command fails", async () => {
+    listEntriesMock.mockResolvedValue([entry("h1", "/old")]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    const onOpenChange = vi.fn();
+    putEntryMock.mockResolvedValue({
+      ...entry("h1", "/new"),
+      post_bind: { status: "failed", exit_code: 3, output: "boom", error: "command exited 3" },
+    });
+    renderDialog("p_1", onOpenChange);
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h1")).toHaveTextContent("/old"),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-entry-browse-h1"));
+    fireEvent.click(screen.getByText("pick dir"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-post-bind-h1")).toHaveTextContent(
+        /Directory saved; post-bind command failed/,
+      ),
+    );
+    const warning = screen.getByTestId("project-settings-entry-post-bind-h1");
+    expect(warning).toHaveTextContent("exit code 3");
+    expect(warning).toHaveTextContent("boom");
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+    // The row and the config mirror still saved; only the hook failed.
+    expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1", workspace: "/picked/dir" });
+  });
+
+  it("closes the dialog when the post-bind command succeeds", async () => {
+    listEntriesMock.mockResolvedValue([entry("h1", "/old")]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    const onOpenChange = vi.fn();
+    putEntryMock.mockResolvedValue({
+      ...entry("h1", "/new"),
+      post_bind: { status: "ok", exit_code: 0, output: "skip: no .collab-root", error: null },
+    });
+    renderDialog("p_1", onOpenChange);
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h1")).toHaveTextContent("/old"),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-entry-browse-h1"));
+    fireEvent.click(screen.getByText("pick dir"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    // A successful hook shows nothing on Save.
+    expect(screen.queryByTestId("project-settings-entry-post-bind-h1")).not.toBeInTheDocument();
+  });
+
+  it("re-runs the post-bind command on the saved path and shows any status", async () => {
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    putEntryMock.mockResolvedValue({
+      ...entry("h1", "/repo"),
+      post_bind: { status: "not_configured", exit_code: null, output: null, error: null },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h1")).toHaveTextContent("/repo"),
+    );
+
+    // Touch the draft only — Run must re-PUT the saved path, not the draft.
+    fireEvent.click(screen.getByTestId("project-settings-entry-browse-h1"));
+    fireEvent.click(screen.getByText("pick dir"));
+    fireEvent.click(screen.getByTestId("project-settings-entry-run-post-bind-h1"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-post-bind-h1")).toHaveTextContent(
+        "post-bind command not_configured",
+      ),
+    );
+    expect(putEntryMock).toHaveBeenCalledWith("p_1", "h1", "/repo");
+    // A re-run writes no config.
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("invalidates host-roots and collaboration after a partial entry save, keeping drafts", async () => {
+    hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/one"), entry("h2", "/two")]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    const { client } = renderDialog();
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h1")).toHaveTextContent("/one"),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-entry-browse-h1"));
+    fireEvent.click(screen.getByText("pick dir"));
+    fireEvent.click(screen.getByTestId("project-settings-entry-browse-h2"));
+    fireEvent.click(screen.getByText("pick dir"));
+    // Row h1 commits; row h2's PUT fails — partial progress still refreshes.
+    putEntryMock
+      .mockResolvedValueOnce(entry("h1", "/picked/dir"))
+      .mockRejectedValueOnce(new Error("host is offline"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-error-h2")).toHaveTextContent(
+        "host is offline",
+      ),
+    );
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["project-host-roots", "p_1"],
+      }),
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-collaboration", "p_1"] });
+    // Entries are not refetched (that would reseed the drafts) and no config lands.
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["project-entries", "p_1"] });
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("project-settings-entry-browse-h1")).toHaveTextContent("/picked/dir");
+    expect(screen.getByTestId("project-settings-entry-browse-h2")).toHaveTextContent("/picked/dir");
+  });
+
   it("promotes a label-only folder first, then PUTs the entry with the new id (scenario 26)", async () => {
     hostsMock.mockReturnValue({ data: [LAPTOP, SERVER] });
     createMock.mockResolvedValue({ id: "p_new", name: "Work" });
@@ -539,9 +670,7 @@ describe("ProjectSettingsDialog", () => {
       expect.objectContaining({ hostId: "h1", initialPath: "/repo" }),
     );
     fireEvent.click(screen.getByText("pick dir"));
-    expect(screen.getByTestId("project-settings-entry-browse-h1")).toHaveTextContent(
-      "/picked/dir",
-    );
+    expect(screen.getByTestId("project-settings-entry-browse-h1")).toHaveTextContent("/picked/dir");
 
     // The click-away backdrop closes the browser, keeping the picked path.
     fireEvent.click(screen.getByRole("button", { name: /close directory browser/i }));

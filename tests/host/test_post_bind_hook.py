@@ -93,6 +93,8 @@ def _frame(
     revision: int = 1,
     is_primary: bool = True,
     context_manifest_path: str = ".agents/project/manifest.json",
+    repository_name: str = "root",
+    trigger: str = "binding",
 ) -> HostPostBindHookFrame:
     """Build a hook request for a workspace path."""
     return HostPostBindHookFrame(
@@ -101,10 +103,11 @@ def _frame(
         binding_name=binding_name,
         binding_id=binding_id,
         revision=revision,
-        repository_name="root",
+        repository_name=repository_name,
         workspace=str(workspace),
         is_primary=is_primary,
         context_manifest_path=context_manifest_path,
+        trigger=trigger,
     )
 
 
@@ -168,8 +171,67 @@ def test_happy_path_runs_with_binding_facts(
     assert env["OMNIGENT_BINDING_PRIMARY"] == "true"
     assert env["OMNIGENT_BINDING_WORKSPACE"] == str(workspace)
     assert env["OMNIGENT_REPOSITORY_NAME"] == "root"
+    assert env["OMNIGENT_HOOK_TRIGGER"] == "binding"
     assert env["OMNIGENT_PROJECT_IDENTITY_ID"] == "identity-abc"
     assert "OMNIGENT_HOST_TOKEN" not in env
+
+
+def test_entry_frame_runs_with_entry_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entry-triggered request runs in the entry path with empty names."""
+    record = tmp_path / "record.txt"
+    monkeypatch.setenv(_RECORD_ENV, str(record))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _write_manifest(workspace)
+    stub = _write_stub(tmp_path / "hook.sh", _STUB)
+    config = _write_config(tmp_path / "config.yaml", [str(stub)])
+
+    result = PostBindHookRunner(config).run(
+        _frame(
+            workspace,
+            binding_name="",
+            binding_id="entry:proj_1",
+            revision=0,
+            repository_name="",
+            trigger="entry",
+        )
+    )
+
+    assert result.status == "ok"
+    cwd, _, env = _stub_record(record)
+    assert cwd == str(workspace)
+    assert env["OMNIGENT_BINDING_NAME"] == ""
+    assert env["OMNIGENT_BINDING_REVISION"] == "0"
+    assert env["OMNIGENT_REPOSITORY_NAME"] == ""
+    assert env["OMNIGENT_HOOK_TRIGGER"] == "entry"
+
+
+def test_repeated_revision_zero_entries_never_supersede(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated entry runs share revision 0 and every one still runs."""
+    ran = tmp_path / "ran.txt"
+    monkeypatch.setenv(_RAN_ENV, str(ran))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    stub = _write_stub(tmp_path / "hook.sh", _SLEEPING_STUB)
+    config = _write_config(tmp_path / "config.yaml", [str(stub)])
+    runner = PostBindHookRunner(config)
+    entry = _frame(
+        workspace,
+        binding_name="",
+        binding_id="entry:proj_1",
+        revision=0,
+        repository_name="",
+        trigger="entry",
+    )
+
+    statuses = [runner.run(entry).status for _ in range(2)]
+
+    assert statuses == ["ok", "ok"]
+    assert ran.read_text() == "run\nrun\n"
 
 
 def test_legacy_env_aliases_never_reach_the_child(
@@ -181,6 +243,8 @@ def test_legacy_env_aliases_never_reach_the_child(
     monkeypatch.setenv("OMNIGENTS_HOST_TOKEN", "legacy-token")
     monkeypatch.setenv("OMNIAGENTS_HOST_TOKEN", "older-legacy-token")
     monkeypatch.setenv("OMNIGENTS_PROJECT_IDENTITY_ID", "legacy-identity")
+    monkeypatch.setenv("OMNIGENTS_HOOK_TRIGGER", "legacy-trigger")
+    monkeypatch.setenv("OMNIAGENTS_HOOK_TRIGGER", "older-legacy-trigger")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     _write_manifest(workspace)
@@ -197,6 +261,8 @@ def test_legacy_env_aliases_never_reach_the_child(
         "OMNIAGENTS_HOST_TOKEN",
         "OMNIGENT_PROJECT_IDENTITY_ID",
         "OMNIGENTS_PROJECT_IDENTITY_ID",
+        "OMNIGENTS_HOOK_TRIGGER",
+        "OMNIAGENTS_HOOK_TRIGGER",
     ):
         assert name not in env, name
 
