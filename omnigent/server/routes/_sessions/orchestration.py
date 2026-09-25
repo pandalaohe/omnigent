@@ -7174,11 +7174,22 @@ async def _dispatch_session_event_to_runner_impl(
         )
         # A codex /side command never reaches the main thread — the executor
         # forks it into a side chat — so the transcript forwarder never mirrors
-        # it back and this bubble would sit in the parent chat forever.
+        # it back and this bubble would sit in the parent chat forever. The
+        # executor forks text-only content only: any multimodal block
+        # normalizes to several input items, which is not a side chat.
+        # Lazy: importing the executor adapter at server startup would pull the
+        # inner runtime into the server import path.
         from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
+        from omnigent.runtime.harnesses._executor_adapter import _MULTIMODAL_BLOCK_TYPES
 
-        opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
-            _extract_user_text_for_routing(body)
+        _has_multimodal_block = isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") in _MULTIMODAL_BLOCK_TYPES
+            for block in content
+        )
+        opens_side_chat = (
+            not _has_multimodal_block
+            and is_side_chat_command(_extract_user_text_for_routing(body))
+            and await _native_pane_harness(conv) == "codex-native"
         )
         # An older host forwards `/side` to Codex as a plain prompt (no fork), so
         # the web side chat opens and hangs and the question lands on the main
