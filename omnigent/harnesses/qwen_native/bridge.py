@@ -615,8 +615,9 @@ def wait_for_ready(
     :param bridge_dir: The qwen-native bridge dir holding the events file.
     :param timeout_s: Max seconds to wait for the boot signal.
     :param poll_interval_s: Seconds between polls of the events file.
-    :returns: ``True`` once the boot signal is seen; ``False`` on timeout (the
-        caller submits anyway — best effort beats hanging the turn).
+    :returns: ``True`` once the boot signal is seen; ``False`` on timeout. The
+        caller must not submit on ``False`` — appending then races the watcher's
+        read offset and silently drops the message.
     """
     events_file = events_file_path(bridge_dir)
     deadline = time.monotonic() + timeout_s

@@ -8,12 +8,19 @@ starts, so the executor must wait for qwen to be ready before the first append.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.qwen_native import bridge as qwen_bridge
+from omnigent.harnesses.qwen_native.bridge import events_file_path
 from omnigent.inner import qwen_native_executor as qne
 from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.native.native_bridge_common import (
+    read_agent_instructions_preamble,
+    write_agent_instructions_preamble,
+)
 
 
 def test_supports_flags(tmp_path: Path) -> None:
@@ -132,10 +139,10 @@ async def test_enqueue_session_message_injects(
 async def test_ensure_ready_does_not_latch_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ready_calls = {"n": 0}
+    ready_timeouts: list[float] = []
 
-    def _timeout(*_a: object, **_k: object) -> bool:
-        ready_calls["n"] += 1
+    def _timeout(*_a: object, timeout_s: float, **_k: object) -> bool:
+        ready_timeouts.append(timeout_s)
         return False  # readiness gate times out every time
 
     submitted: list[str] = []
@@ -143,16 +150,79 @@ async def test_ensure_ready_does_not_latch_on_timeout(
     monkeypatch.setattr(
         qne, "submit_user_message", lambda _b, *, content: submitted.append(content)
     )
+    write_agent_instructions_preamble(tmp_path, "be terse")
     ex = qne.QwenNativeExecutor(bridge_dir=tmp_path)
-    async for _ in ex.run_turn([{"role": "user", "content": "a"}], [], ""):
-        pass
-    async for _ in ex.run_turn([{"role": "user", "content": "b"}], [], ""):
-        pass
-    # On timeout the gate is NOT latched — it re-checks each turn (qwen is almost
-    # certainly up by the next one) — yet still submits best-effort both times.
-    assert ready_calls["n"] == 2
-    assert submitted == ["a", "b"]
+    events = [e async for e in ex.run_turn([{"role": "user", "content": "a"}], [], "")]
+    # A timeout fails the turn instead of appending a message qwen's watcher
+    # would skip: nothing written, the preamble stays staged, and ``_ready``
+    # stays unlatched so the next turn re-checks.
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert "not sent" in events[0].message
+    assert submitted == []
+    assert read_agent_instructions_preamble(tmp_path) == "be terse"
     assert ex._ready is False
+    assert await ex.enqueue_session_message("main", "steer") is False
+    assert submitted == []
+    # The executor waits under its own widened bound, not the bridge default.
+    assert ready_timeouts == [qne._READY_TIMEOUT_S, qne._READY_TIMEOUT_S]
+    assert qne._READY_TIMEOUT_S > 30.0
+
+
+class _FakeClock:
+    """Stand-in for the bridge's ``time`` module: polling advances fake time.
+
+    Installed in place of ``omnigent.harnesses.qwen_native.bridge.time`` so
+    ``wait_for_ready``'s poll sleeps cost no real time, and appends the boot
+    signal to the events file only once fake time reaches *ready_at*.
+    """
+
+    def __init__(self, events_file: Path, ready_at: float) -> None:
+        self.now = 0.0
+        self._events_file = events_file
+        self._ready_at = ready_at
+        #: Fake time the boot signal was appended at, or ``None`` if never.
+        self.boot_signal_at: float | None = None
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        if self.boot_signal_at is None and self.now >= self._ready_at:
+            self.boot_signal_at = self.now
+            self._events_file.write_text(
+                json.dumps({"type": "system", "subtype": "session_start"}) + "\n",
+                encoding="utf-8",
+            )
+
+
+async def test_run_turn_waits_for_a_late_boot_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The boot signal lands at fake time 45 s — beyond the bridge's 30 s default,
+    # inside the executor's widened bound. With the original 30 s bound the poll
+    # gives up (and the turn now fails) before the signal ever appears.
+    clock = _FakeClock(events_file_path(tmp_path), ready_at=45.0)
+    monkeypatch.setattr(qwen_bridge, "time", clock)
+
+    submitted: list[tuple[float, str]] = []
+    monkeypatch.setattr(
+        qne,
+        "submit_user_message",
+        lambda _b, *, content: submitted.append((clock.now, content)),
+    )
+
+    ex = qne.QwenNativeExecutor(bridge_dir=tmp_path)
+    events = [e async for e in ex.run_turn([{"role": "user", "content": "first"}], [], "")]
+    # No append before the boot signal (and thus none before ~45 s); exactly one
+    # after it, then the turn completes and readiness latches.
+    assert clock.boot_signal_at is not None and clock.boot_signal_at >= 45.0
+    assert len(submitted) == 1
+    append_at, content = submitted[0]
+    assert content == "first"
+    assert append_at >= clock.boot_signal_at
+    assert len(events) == 1 and isinstance(events[0], TurnComplete)
+    assert ex._ready is True
 
 
 async def test_ensure_ready_is_latched_across_turns(

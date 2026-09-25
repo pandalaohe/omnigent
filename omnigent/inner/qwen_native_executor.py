@@ -46,6 +46,12 @@ from omnigent.native.native_bridge_common import (
 
 logger = logging.getLogger(__name__)
 
+#: Max seconds the first append waits for qwen's input watcher. Wider than the
+#: bridge's 30 s default because a timeout now fails the turn; the harness
+#: watchdog defaults (``HARNESS_TURN_TIMEOUT_S`` 3600 s,
+#: ``HARNESS_TURN_ABSOLUTE_TIMEOUT_S`` 10800 s) sit far above this bound.
+_READY_TIMEOUT_S = 90.0
+
 
 class QwenNativeExecutor(Executor):
     """Harness-side executor for ``omnigent qwen`` web-UI turns.
@@ -79,23 +85,28 @@ class QwenNativeExecutor(Executor):
         watcher is up — so the offset is taken on the still-empty input file.
 
         Only latches ``_ready`` on a confirmed-ready result, so a warm session
-        never re-blocks but a *timeout* re-checks on the next turn (qwen is
-        almost certainly up by then). On timeout we log and let the caller submit
-        anyway — best-effort beats hanging the turn — but the warning makes the
-        rare dropped-first-message failure diagnosable rather than silent.
+        never re-blocks but a timeout re-checks on the next turn.
+
+        :raises RuntimeError: If the watcher is still not ready after
+            :data:`_READY_TIMEOUT_S` seconds; nothing was appended.
         """
         if self._ready:
             return
-        ready = await asyncio.to_thread(wait_for_ready, self._bridge_dir)
+        ready = await asyncio.to_thread(
+            wait_for_ready, self._bridge_dir, timeout_s=_READY_TIMEOUT_S
+        )
         if ready:
             self._ready = True
-        else:
-            logger.warning(
-                "qwen-native readiness gate timed out for %s; submitting anyway — "
-                "the first message may be dropped if qwen's input watcher is not up "
-                "yet (will re-check next turn)",
-                self._bridge_dir,
-            )
+            return
+        logger.warning(
+            "qwen-native readiness gate timed out for %s after %.0fs; failing the "
+            "turn instead of appending a message qwen would skip",
+            self._bridge_dir,
+            _READY_TIMEOUT_S,
+        )
+        raise RuntimeError(
+            f"qwen did not become ready within {_READY_TIMEOUT_S:.0f}s; the message was not sent"
+        )
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` — output is shown by the embedded terminal, not this executor."""
