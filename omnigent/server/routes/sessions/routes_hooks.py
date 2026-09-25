@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any, NamedTuple
 
 from fastapi import (
@@ -47,7 +48,11 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -88,6 +93,7 @@ from omnigent.server.routes._sessions.helpers import (
     _structured_ask_user_question,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    HarnessTimeoutPolicy,
     _hold_native_ask_gate,
     _publish_and_wait_for_harness_elicitation,
     _spawn_gateway_backed,
@@ -95,6 +101,11 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.server.schemas import (
     ElicitationRequestParams,
+    ElicitationResult,
+)
+from omnigent.server.user_preferences_store import (
+    ApprovalTimeout,
+    SqlAlchemyUserPreferencesStore,
 )
 from omnigent.spec.types import (
     Phase,
@@ -107,6 +118,79 @@ from omnigent.stores.permission_store import PermissionStore
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+def _approval_timeout_owner(
+    session_id: str,
+    *,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+) -> str | None:
+    """
+    Resolve whose approval-timeout setting governs a session.
+
+    Mirrors the ``/v1/me`` preferences rule: with no auth provider the
+    reserved local user owns everything; otherwise the session's owner
+    grant decides. ``None`` (no owner grant) makes the reader fall back
+    to defaults — never the hook caller's identity, which may belong to
+    a different user or the host itself.
+
+    :param session_id: Session whose owner is wanted, e.g.
+        ``"conv_abc123"``.
+    :param auth_provider: Active auth provider, or ``None`` in local
+        single-user mode.
+    :param permission_store: Permission store for the owner lookup, or
+        ``None`` when permission checks are disabled.
+    :returns: The owner's user id, or ``None`` when unresolvable.
+    """
+    if auth_provider is None:
+        return RESERVED_USER_LOCAL
+    return _get_session_owner_id(session_id, permission_store)
+
+
+async def _claude_timeout_stop() -> ElicitationResult:
+    """
+    The Claude route's stop verdict at the deadline.
+
+    Claude reads ``decision.interrupt`` from the PermissionRequest
+    response, so a cancel carrying the interrupt marker closes its TUI
+    dialog and ends the turn — the same output the manual
+    ``Cancel & interrupt`` control produces.
+    """
+    return ElicitationResult(
+        action="cancel",
+        _meta={"interrupt": True, "omnigent_timeout": True},
+    )
+
+
+def _codex_timeout_stop(
+    session_id: str,
+) -> Callable[[], Awaitable[ElicitationResult | None]]:
+    """
+    Build the Codex route's stop callback for one session.
+
+    Codex has no deny-with-interrupt response, so the stop is delivered
+    as a runner interrupt and only then reported as a decline. A forward
+    that does not land (no runner, transport error, non-2xx — the runner
+    answers 503 when ``turn/interrupt`` fails) returns ``None`` so the
+    wait falls back to the native timeout path rather than claiming a
+    stop that never happened.
+
+    :param session_id: Session whose runner receives the interrupt.
+    :returns: The async stop callback.
+    """
+
+    async def _stop() -> ElicitationResult | None:
+        forward = await _forward_session_change_to_runner(
+            session_id,
+            get_server_runner_router(),
+            {"type": "interrupt"},
+        )
+        if forward is None or not 200 <= forward.status_code < 300:
+            return None
+        return ElicitationResult(action="decline", _meta={"omnigent_timeout": True})
+
+    return _stop
 
 
 def _create_route_decision_id(
@@ -150,8 +234,31 @@ def register_hooks_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     agent_cache: AgentCache | None = None,
+    user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
 ) -> None:
     """Register the hooks routes on router."""
+
+    async def _approval_timeout_for_session(session_id: str) -> ApprovalTimeout:
+        """
+        Read the session owner's approval-timeout setting off the loop.
+
+        :param session_id: Session whose owner's setting applies.
+        :returns: The owner's resolved setting, or the defaults when the
+            owner or the preferences store is unavailable.
+        """
+        from omnigent.server.routes import sessions as _sf
+
+        owner = await asyncio.to_thread(
+            _approval_timeout_owner,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
+        return await asyncio.to_thread(
+            _sf.read_approval_timeout,
+            user_preferences_store,
+            owner,
+        )
 
     @router.post(
         "/sessions/{session_id}/hooks/permission-request",
@@ -261,12 +368,17 @@ def register_hooks_routes(
         native_agent = native_coding_agent_for_harness(harness) or (
             native_coding_agent_for_wrapper_label(conv.labels.get("omnigent.wrapper"))
         )
-        # Check ownership after the metadata awaits, without yielding before registration.
-        elicitation_id = _client_supplied_hook_elicitation_id(payload, session_id)
+        # The vendor decides whether the timeout-setting read below applies,
+        # and it is legible from the raw client id without claiming ownership.
+        # The claim itself must yield nothing before the wait registers it,
+        # or two concurrent hooks can both pass the ownership check (see the
+        # concurrency test): read the raw id here, claim it just before the
+        # wait, and let the checked helper reject malformed/foreign ids there.
+        raw_elicitation_id = payload.get("_omnigent_elicitation_id")
         hook_vendor = "claude"
-        if elicitation_id:
+        if isinstance(raw_elicitation_id, str):
             for vendor in ("kimi", "devin"):
-                if elicitation_id.startswith(f"elicit_{vendor}_"):
+                if raw_elicitation_id.startswith(f"elicit_{vendor}_"):
                     hook_vendor = vendor
                     break
         elif native_agent is not None and native_agent.key == "devin":
@@ -282,6 +394,11 @@ def register_hooks_routes(
                 f"{native_agent.display_name} harness.",
                 code=ErrorCode.CONFLICT,
             )
+        approval_timeout: ApprovalTimeout | None = (
+            await _approval_timeout_for_session(session_id) if is_claude else None
+        )
+        # Check ownership after the metadata awaits, without yielding before registration.
+        elicitation_id = _client_supplied_hook_elicitation_id(payload, session_id)
 
         try:
             preview_str = json.dumps(tool_input or {}, ensure_ascii=False)
@@ -374,17 +491,29 @@ def register_hooks_routes(
             content_preview=f"{tool_name}({preview_str})",
             **extras,
         )
+        # Claude waits on the owner's configured timeout. The two hardcoded
+        # budgets stay for Kimi / Devin below: their AskUserQuestion-named tool
+        # keeps its shorter fallback, and neither reads the setting.
+        timeout_policy: HarnessTimeoutPolicy | None = (
+            HarnessTimeoutPolicy(
+                timeout_s=approval_timeout.timeout_s,
+                stop=_claude_timeout_stop if approval_timeout.stop_turn else None,
+            )
+            if approval_timeout is not None
+            else None
+        )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
             params=params,
-            # AskUserQuestion parks on its own budget: it is a question, not a
-            # permission gate, so it expires into Claude's TUI prompt in under
-            # an hour instead of holding the turn for a day.
             timeout_s=(
-                _sf._CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S
-                if tool_name == "AskUserQuestion"
-                else _sf._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S
+                timeout_policy.timeout_s
+                if timeout_policy is not None
+                else (
+                    _sf._CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S
+                    if tool_name == "AskUserQuestion"
+                    else _sf._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S
+                )
             ),
             conversation_store=conversation_store,
             # Client-minted stable id so a retry re-parks the same elicitation.
@@ -396,6 +525,7 @@ def register_hooks_routes(
             # (or None when absent).
             tool_name=tool_name,
             tool_input=tool_input if isinstance(tool_input, dict) else None,
+            timeout_policy=timeout_policy,
         )
         if result is None:
             # Disconnect or timeout. Either way Claude is no
@@ -1161,17 +1291,31 @@ def register_hooks_routes(
         codex_request = parse_codex_elicitation_request(payload)
         from omnigent.server.routes import sessions as _sf
 
+        # Async questions are answered outside the turn that asked them
+        # (BUG12 contract), so they keep the day-long budget and never stop.
+        is_async_question = bool(codex_request.codex_params.get("omnigentAsyncQuestion"))
+        if is_async_question:
+            timeout_policy: HarnessTimeoutPolicy | None = None
+            timeout_s = _sf._CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S
+        else:
+            timeout_setting = await _approval_timeout_for_session(session_id)
+            timeout_policy = HarnessTimeoutPolicy(
+                timeout_s=timeout_setting.timeout_s,
+                stop=_codex_timeout_stop(session_id) if timeout_setting.stop_turn else None,
+            )
+            timeout_s = timeout_policy.timeout_s
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
             params=codex_request.params,
-            timeout_s=_sf._CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
+            timeout_s=timeout_s,
             conversation_store=conversation_store,
             elicitation_id=codex_elicitation_id(
                 session_id,
                 codex_request.method,
                 codex_request.request_id,
             ),
+            timeout_policy=timeout_policy,
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
@@ -1179,8 +1323,9 @@ def register_hooks_routes(
             # Async questions are answered outside the turn that asked them:
             # closing their card is not a verdict on whatever Codex is doing
             # now, so the interrupt a regular declined request sends would
-            # abort an unrelated turn.
-            if not codex_request.codex_params.get("omnigentAsyncQuestion"):
+            # abort an unrelated turn. A timeout stop already interrupted on
+            # its way here, so its replay must not interrupt a second time.
+            if not is_async_question and not (result.meta or {}).get("omnigent_timeout"):
                 # Explicit user decline: interrupt Codex before returning the
                 # deny response, same as the Claude-native path. The await
                 # ensures the abort signal reaches Codex before it processes

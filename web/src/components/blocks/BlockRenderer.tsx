@@ -40,7 +40,12 @@ import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
-import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
+import {
+  ApprovalTimeoutNotice,
+  ErrorBanner,
+  PolicyDeniedBanner,
+  RetryIndicator,
+} from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
 
 // Re-exported for the existing import sites; it lives in ./ChatMarkdown so
@@ -856,6 +861,11 @@ function renderItem(
         />
       );
     case "error":
+      // The timeout stop persists its record as an info error item, but
+      // it reads as a transcript marker, not a notice banner.
+      if (item.code === "approval_timed_out" && item.level === "info") {
+        return <ApprovalTimeoutNotice key={key} message={item.message} />;
+      }
       return (
         <ErrorBanner
           key={key}

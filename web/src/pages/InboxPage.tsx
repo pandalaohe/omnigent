@@ -52,7 +52,7 @@ import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { approve, getSession } from "@/lib/sessionsApi";
+import { ApiError, approve, getSession } from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
@@ -61,7 +61,9 @@ import { conversationDisplayLabel, getConversationAgentType } from "@/shell/side
 type RespondedMap = Record<
   string,
   {
-    action: "accept" | "decline";
+    action: "accept" | "decline" | "auto_resolved";
+    /** Set when the server reported the prompt already timed out. */
+    reason?: "timed_out";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   }
@@ -166,7 +168,18 @@ export function InboxPage() {
         () => {
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
         },
-        () => {
+        (error: unknown) => {
+          // The prompt timed out before this verdict arrived. Keep the
+          // responded entry with reason "timed_out" so ApprovalCard
+          // renders nothing — restoring the buttons would offer a retry
+          // the server can never accept.
+          if (error instanceof ApiError && error.code === "elicitation_timed_out") {
+            setResponded((prev) => ({
+              ...prev,
+              [elicitationId]: { action: "auto_resolved", reason: "timed_out" },
+            }));
+            return;
+          }
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {

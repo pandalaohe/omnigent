@@ -453,8 +453,17 @@ _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 # gate: nothing is blocked by answering late, and an unanswered card should hand
 # the turn back to Claude's own TUI prompt rather than park for a day. 50
 # minutes is long enough to step away from the desk and short enough that a
-# forgotten card does not pin a session overnight.
+# forgotten card does not pin a session overnight. Retained for Kimi / Devin,
+# whose AskUserQuestion-named tool does not read the approval-timeout setting.
 _CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S = 3000.0
+
+
+# Approval / question wait retentions, beside the other hook budgets. A
+# timed-out approval keeps its replay record for a day, and the first-park
+# timeout snapshot ages out on the same clock.
+_APPROVAL_TIMEOUT_RECORD_TTL_S = 86400.0
+
+_APPROVAL_TIMEOUT_SNAPSHOT_TTL_S = 86400.0
 
 
 # custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
@@ -1027,6 +1036,8 @@ __all__ = [
     "_ANTIGRAVITY_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY",
     "_ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY",
     "_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
+    "_APPROVAL_TIMEOUT_RECORD_TTL_S",
+    "_APPROVAL_TIMEOUT_SNAPSHOT_TTL_S",
     "_APPROVAL_TYPE",
     "_BROWSER_ACTION_AWAIT_S",
     "_BROWSER_ACTION_CLAIM_GRACE_S",

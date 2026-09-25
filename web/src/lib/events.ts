@@ -305,9 +305,11 @@ export interface ElicitationResolved {
    * Why the prompt resolved without a verdict, when the server knows:
    * `"unanswered"` means the hook stopped waiting (a severed poll never
    * re-parked, the ask timed out) before anyone answered, so the prompt
-   * is gone rather than decided. Never present alongside `action`.
+   * is gone rather than decided; `"timed_out"` means the deadline stopped
+   * the turn, so the card itself is replaced by a persisted notice. Never
+   * present alongside `action`.
    */
-  reason?: "unanswered";
+  reason?: "unanswered" | "timed_out";
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,11 +12,20 @@ from starlette.requests import HTTPConnection
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    UnifiedAuthProvider,
+)
+from omnigent.server.routes.sessions.routes_hooks import _approval_timeout_owner
 from omnigent.server.user_preferences_store import (
+    ApprovalTimeout,
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
+    read_approval_timeout,
     validate_preferences_envelope,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -342,3 +352,141 @@ async def test_preferences_api_rate_limits_writes_per_user(
         )
         assert limited.status_code == 429
         assert limited.headers["retry-after"] == "60"
+
+
+def test_read_approval_timeout_defaults_on_missing_store_or_owner(db_uri: str) -> None:
+    """S15: every gap resolves to 50 minutes and stop enabled."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    default = ApprovalTimeout(timeout_s=3000.0, stop_turn=True)
+    assert read_approval_timeout(None, "alice@example.com") == default
+    assert read_approval_timeout(store, None) == default
+    assert read_approval_timeout(store, "alice@example.com") == default
+
+
+def test_read_approval_timeout_clamps_and_defaults_invalid_fields(db_uri: str) -> None:
+    """S15: timeoutMinutes clamps to 1..1380; invalid fields take defaults."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    default = ApprovalTimeout(timeout_s=3000.0, stop_turn=True)
+
+    store.patch_namespace(
+        "ten@example.com", "approval_timeout", {"timeoutMinutes": 10, "stopTurn": False}
+    )
+    assert read_approval_timeout(store, "ten@example.com") == ApprovalTimeout(
+        timeout_s=600.0, stop_turn=False
+    )
+
+    store.patch_namespace(
+        "low@example.com", "approval_timeout", {"timeoutMinutes": 0, "stopTurn": "yes"}
+    )
+    assert read_approval_timeout(store, "low@example.com") == ApprovalTimeout(
+        timeout_s=60.0, stop_turn=True
+    )
+
+    store.patch_namespace("high@example.com", "approval_timeout", {"timeoutMinutes": 5000})
+    assert read_approval_timeout(store, "high@example.com") == ApprovalTimeout(
+        timeout_s=1380.0 * 60.0, stop_turn=True
+    )
+
+    store.patch_namespace(
+        "text@example.com", "approval_timeout", {"timeoutMinutes": "x", "stopTurn": True}
+    )
+    assert read_approval_timeout(store, "text@example.com") == default
+
+    store.patch_namespace("null@example.com", "approval_timeout", None)
+    assert read_approval_timeout(store, "null@example.com") == default
+
+
+def test_read_approval_timeout_tolerates_bad_rows_and_shapes() -> None:
+    """S15: a corrupt row or malformed value never fails a hook."""
+    default = ApprovalTimeout(timeout_s=3000.0, stop_turn=True)
+
+    class _RaisingStore:
+        def get(self, user_id: str) -> None:
+            raise UserPreferencesValidationError("stored preferences are invalid JSON")
+
+    class _ShapeStore:
+        def __init__(self, value: object) -> None:
+            self._value = value
+
+        def get(self, user_id: str) -> object:
+            return self._value
+
+    assert read_approval_timeout(_RaisingStore(), "alice@example.com") == default
+    assert read_approval_timeout(_ShapeStore([]), "alice@example.com") == default
+    assert (
+        read_approval_timeout(
+            _ShapeStore({"settings": {"approval_timeout": "compact"}}),
+            "alice@example.com",
+        )
+        == default
+    )
+
+
+class _OwnerGrantStore:
+    """Minimal permission store returning fixed grants for owner resolution."""
+
+    def __init__(self, grants: list[object]) -> None:
+        self._grants = grants
+
+    def list_for_session(
+        self, conversation_id: str, limit: int = 1000
+    ) -> tuple[list[object], None]:
+        return self._grants, None
+
+
+def test_approval_timeout_owner_resolution() -> None:
+    """S16: local mode resolves to the reserved user; accounts need an owner grant."""
+    assert (
+        _approval_timeout_owner("conv_1", auth_provider=None, permission_store=None)
+        == RESERVED_USER_LOCAL
+    )
+
+    provider = _HeaderAuthProvider()
+    assert _approval_timeout_owner("conv_1", auth_provider=provider, permission_store=None) is None
+
+    owner = SimpleNamespace(level=LEVEL_OWNER, user_id="owner@example.com")
+    assert (
+        _approval_timeout_owner(
+            "conv_1",
+            auth_provider=provider,
+            permission_store=_OwnerGrantStore([owner]),
+        )
+        == "owner@example.com"
+    )
+
+    member = SimpleNamespace(level=LEVEL_EDIT, user_id="member@example.com")
+    assert (
+        _approval_timeout_owner(
+            "conv_1",
+            auth_provider=provider,
+            permission_store=_OwnerGrantStore([member]),
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_accepts_the_approval_timeout_namespace(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """The new namespace is in the allowlist and survives the API round trip."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "timeout@example.com"}
+        patched = await client.patch(
+            "/v1/me/preferences/approval_timeout",
+            headers=headers,
+            json={"value": {"timeoutMinutes": 10, "stopTurn": False}},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["approval_timeout"] == {
+            "timeoutMinutes": 10,
+            "stopTurn": False,
+        }
+
+        assert read_approval_timeout(
+            SqlAlchemyUserPreferencesStore(db_uri), "timeout@example.com"
+        ) == ApprovalTimeout(timeout_s=600.0, stop_turn=False)

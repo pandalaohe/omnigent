@@ -8851,6 +8851,30 @@ describe("chatStore — submitApproval", () => {
     }
   });
 
+  it("keeps a refused late verdict responded as timed out instead of reopening the card", async () => {
+    // The prompt hit its deadline before this verdict arrived, so the
+    // server answers 409 elicitation_timed_out. Rolling back would put
+    // buttons on a card the server can never accept; the card must stay
+    // responded with the timeout reason so it hides.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_timed_out")],
+    });
+    fetchMock.mockImplementationOnce(() =>
+      mockResponse(
+        { error: { code: "elicitation_timed_out", message: "The prompt already timed out." } },
+        { ok: false, status: 409 },
+      ),
+    );
+
+    await useChatStore.getState().submitApproval("elic_timed_out", "accept");
+
+    const block = useChatStore.getState().blocks[0];
+    if (block?.type !== "elicitation") throw new Error("expected an elicitation block");
+    expect(block.status).toBe("responded");
+    expect(block.response).toEqual({ action: "auto_resolved", reason: "timed_out" });
+  });
+
   it("rolls back on the answering conversation when the failure outlives a switch", async () => {
     // The approve POST can outlive a switch away. Resolving the rollback target
     // late reopened the card on whatever conversation was then visible while

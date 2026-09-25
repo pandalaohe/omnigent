@@ -2,6 +2,7 @@ export type UserPreferenceNamespace =
   | "keyboard_shortcuts"
   | "mobile_assistant"
   | "session_navigation"
+  | "approval_timeout"
   | "context_indicator"
   | "usage_context"
   | "agent_badges";
@@ -26,6 +27,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     session_navigation: {
       storageKey: "omnigent:session-navigation",
       eventName: "omnigent:session-navigation-changed",
+    },
+    approval_timeout: {
+      storageKey: "omnigent:approval-timeout",
+      eventName: "omnigent:approval-timeout-changed",
     },
     context_indicator: {
       storageKey: "omnigent:context-indicator-mode",

@@ -224,6 +224,11 @@ class ErrorCode:
         indistinguishable from a completed enumeration, so the caller
         silently loses the remaining rows. The caller's remedy is to
         restart the enumeration without the cursor.
+    :cvar ELICITATION_TIMED_OUT: A verdict references an elicitation
+        whose wait already hit its configured deadline and stopped the
+        turn (HTTP 409). The distinct code lets chat / Inbox render the
+        timed-out state instead of rolling the card back to pending for
+        an answer the server will never accept.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -244,6 +249,7 @@ class ErrorCode:
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
     STALE_CURSOR = "stale_cursor"
+    ELICITATION_TIMED_OUT = "elicitation_timed_out"
 
 
 # Single source of truth for error code → HTTP status.
@@ -284,6 +290,9 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
     ErrorCode.STALE_CURSOR: 400,
+    # 409 like CONFLICT: the request is well-formed but the prompt's state
+    # (already timed out and stopped) makes accepting it invalid.
+    ErrorCode.ELICITATION_TIMED_OUT: 409,
 }
 
 
@@ -321,6 +330,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
+    # A human answered a prompt their own configured timeout already ended.
+    ErrorCode.ELICITATION_TIMED_OUT: ErrorCategory.USER,
 }
 
 
@@ -363,6 +374,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
+    ErrorCode.ELICITATION_TIMED_OUT: ErrorImpact.BENIGN,
 }
 
 
@@ -400,6 +412,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     # Context-driven: a backing call can be cancelled while serving any stage.
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
+    ErrorCode.ELICITATION_TIMED_OUT: ErrorPhase.REQUEST,
 }
 
 

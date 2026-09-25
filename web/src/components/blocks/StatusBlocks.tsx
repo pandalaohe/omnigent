@@ -7,11 +7,14 @@
 // - CompactionMarker: permanent marker shown after compaction completes.
 //   The in-progress state renders as a Shimmer in ChatPage, mirroring
 //   the "Working…" indicator.
+// - ApprovalTimeoutNotice: muted one-liner standing in for a card whose
+//   approval prompt timed out with the turn stop on.
 
 import {
   BrainCircuitIcon,
   CheckIcon,
   ChevronRightIcon,
+  ClockIcon,
   CopyIcon,
   Loader2Icon,
   RotateCcwIcon,
@@ -605,6 +608,24 @@ export function CompactionMarker() {
     <div className="flex items-center gap-2 text-muted-foreground text-sm italic">
       <ShrinkIcon className="size-3" />
       <span>Conversation compacted</span>
+    </div>
+  );
+}
+
+/**
+ * One-line notice standing in for an approval card whose prompt hit the
+ * timeout deadline with the turn stop on. The card hides itself
+ * (`reason: "timed_out"`); this persisted info item is the only record
+ * the user sees, live and after reload.
+ */
+export function ApprovalTimeoutNotice({ message }: { message: string }) {
+  return (
+    <div
+      className="flex items-center gap-2 text-muted-foreground text-sm italic"
+      data-testid="approval-timeout-notice"
+    >
+      <ClockIcon className="size-3" />
+      <span>{message}</span>
     </div>
   );
 }

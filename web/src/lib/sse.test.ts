@@ -504,4 +504,19 @@ describe("parseEvent — response.elicitation_resolved", () => {
       action: "decline",
     } satisfies ElicitationResolved);
   });
+
+  it("keeps the timed_out reason on a verdict-less clear", () => {
+    // The deadline stop clears the prompt without a verdict and says
+    // why. Losing the reason here would strand the card on the generic
+    // "Resolved elsewhere" pill instead of hiding it for the notice.
+    const ev = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_7",
+      reason: "timed_out",
+    });
+    expect(ev).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_7",
+      reason: "timed_out",
+    } satisfies ElicitationResolved);
+  });
 });

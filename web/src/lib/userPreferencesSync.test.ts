@@ -7,6 +7,10 @@ import {
   refreshUserPreferencesFromServer,
   resetUserPreferencesSyncForTests,
 } from "./userPreferencesSync";
+import {
+  readApprovalTimeoutPreferences,
+  writeApprovalTimeoutPreferences,
+} from "./approvalTimeoutPreferences";
 
 beforeEach(() => {
   localStorage.clear();
@@ -74,6 +78,40 @@ describe("user preference synchronization", () => {
       ...badgePreferences,
       enabled: true,
     });
+  });
+
+  it("collects, patches, and hydrates the Approval timeout namespace", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    const preferences = { timeoutMinutes: 10, stopTurn: false };
+    writeApprovalTimeoutPreferences(preferences);
+    await vi.advanceTimersByTimeAsync(251);
+    expect(collectLocalUserPreferences().settings.approval_timeout).toEqual(preferences);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/v1/me/preferences/approval_timeout",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ value: preferences }),
+      }),
+    );
+
+    writeApprovalTimeoutPreferences({ timeoutMinutes: 50, stopTurn: true });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(localStorage.getItem("omnigent:approval-timeout")).toBeNull();
+    expect(fetcher).toHaveBeenLastCalledWith(
+      "/v1/me/preferences/approval_timeout",
+      expect.objectContaining({ body: JSON.stringify({ value: null }) }),
+    );
+
+    resetUserPreferencesSyncForTests();
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { approval_timeout: { timeoutMinutes: 5, stopTurn: false } } },
+      vi.fn(),
+      "alice",
+    );
+    expect(readApprovalTimeoutPreferences()).toEqual({ timeoutMinutes: 5, stopTurn: false });
   });
 
   it("cancels queued sync when switching to an older Server", async () => {

@@ -12,6 +12,7 @@ resolving another's parked Future.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -98,12 +99,46 @@ class _PreResolvedHarnessElicitation:
         verdict-carrying tombstone without a fingerprint fails closed at
         consume time (dropped, prompt re-published) rather than falling
         back to adopt-by-id.
+    :param timed_out: Set when the server's own deadline ended the wait.
+        The record then carries the stop verdict for replay and is
+        retained far longer than an ordinary tombstone, so a late human
+        answer is refused instead of re-asking.
     """
 
     session_id: str
     created_at: float
     result: ElicitationResult | None = None
     request_fingerprint: str | None = None
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class _HarnessElicitationTimeoutSnapshot:
+    """
+    First-park timeout decision for one harness elicitation.
+
+    A hook retry re-POSTs the same logical prompt; the deadline and the
+    stop-on-timeout choice are fixed when that prompt first parks, so a
+    later settings change cannot alter a wait already in progress.
+
+    :param request_fingerprint: Digest of the request params the snapshot
+        was taken for. A same-id re-POST with a different digest is a
+        DIFFERENT question and starts a fresh snapshot.
+    :param deadline: Wall-clock deadline from ``time.time()``, e.g.
+        ``1710000000.0``; the remaining wait is ``deadline - now``.
+    :param stop_enabled: Whether the first park had a stop callback.
+    :param stop: The first park's stop callback, kept for the same
+        reason as the deadline: a re-POST after a settings change must
+        still be able to enact the stop the snapshot promised.
+    :param created_at: Wall-clock timestamp from ``time.time()`` used to
+        age the snapshot out.
+    """
+
+    request_fingerprint: str
+    deadline: float
+    stop_enabled: bool
+    stop: Callable[[], Awaitable[ElicitationResult | None]] | None
+    created_at: float
 
 
 # Maps ``elicitation_id`` to its parked-elicitation state. Populated
@@ -121,14 +156,21 @@ _harness_pre_resolved_elicitations: WorkspaceScopedCache[str, _PreResolvedHarnes
     WorkspaceScopedCache()
 )
 
+# Maps ``elicitation_id`` to the first park's timeout decision. Entries
+# outlive the parked record for the re-park grace (a retry keeps its
+# deadline) and are pruned by age.
+_harness_elicitation_timeouts: WorkspaceScopedCache[str, _HarnessElicitationTimeoutSnapshot] = (
+    WorkspaceScopedCache()
+)
+
 
 def reset_for_tests() -> None:
     """
     Clear every elicitation registry. For test isolation only.
 
-    The four registries are module-global and keyed by
-    ``elicitation_id``, so entries left behind by one test (a severed
-    long-poll, an unresolved prompt, a pre-resolved tombstone) are
+    The registries are module-global and keyed by ``elicitation_id``, so
+    entries left behind by one test (a severed long-poll, an unresolved
+    prompt, a pre-resolved tombstone, a stale timeout snapshot) are
     visible to every later test in the same worker process. Mirrors
     :func:`omnigent.runtime.pending_elicitations.reset_for_tests`.
     Not for production callers.
@@ -137,13 +179,16 @@ def reset_for_tests() -> None:
     _harness_elicitation_owners.clear()
     _harness_parked_elicitations.clear()
     _harness_pre_resolved_elicitations.clear()
+    _harness_elicitation_timeouts.clear()
 
 
 __all__ = [
+    "_HarnessElicitationTimeoutSnapshot",
     "_ParkedHarnessElicitation",
     "_PreResolvedHarnessElicitation",
     "_harness_elicitation_owners",
     "_harness_elicitation_registry",
+    "_harness_elicitation_timeouts",
     "_harness_parked_elicitations",
     "_harness_pre_resolved_elicitations",
 ]

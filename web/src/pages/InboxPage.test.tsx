@@ -28,35 +28,39 @@ import type { CommentInbox } from "@/hooks/useCommentInbox";
 // Minimal ApprovalCard stub: renders the message and an Accept button that
 // forwards to the page's submit handler. The real card's form/preview UX is
 // out of scope here — we only need to exercise `makeSubmit` → `approve`.
+// A timed-out response hides the card, as the real card does.
 vi.mock("@/components/blocks/ApprovalCard", () => ({
   ApprovalCard: ({
     elicitationId,
     message,
     status,
+    response,
     allowAutoMode,
     onSubmit,
   }: {
     elicitationId: string;
     message: string;
     status: string;
+    response: { reason?: string } | null;
     allowAutoMode?: boolean;
     onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
-  }) => (
-    <div data-testid="approval-card" data-status={status}>
-      <span>{message}</span>
-      <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
-        Stub Accept
-      </button>
-      {allowAutoMode && (
-        <button
-          type="button"
-          onClick={() => onSubmit(elicitationId, "accept", { allow_auto_mode: true })}
-        >
-          Stub Auto Mode
+  }) =>
+    status === "responded" && response?.reason === "timed_out" ? null : (
+      <div data-testid="approval-card" data-status={status}>
+        <span>{message}</span>
+        <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
+          Stub Accept
         </button>
-      )}
-    </div>
-  ),
+        {allowAutoMode && (
+          <button
+            type="button"
+            onClick={() => onSubmit(elicitationId, "accept", { allow_auto_mode: true })}
+          >
+            Stub Auto Mode
+          </button>
+        )}
+      </div>
+    ),
 }));
 
 vi.mock("@/hooks/useConversations", async (importActual) => ({
@@ -64,7 +68,11 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
-vi.mock("@/lib/sessionsApi", () => ({ getSession: vi.fn(), approve: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importActual) => ({
+  ...(await importActual<typeof sessionsApi>()),
+  getSession: vi.fn(),
+  approve: vi.fn(),
+}));
 
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
   return {
@@ -295,6 +303,25 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "pending"),
     );
+  });
+
+  it("drops the card when the server reports the prompt already timed out", async () => {
+    // WHY: a 409 elicitation_timed_out means the deadline beat the user,
+    // so the verdict can never be accepted. The card must disappear
+    // instead of returning to pending with buttons that cannot work.
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(sessionsApi.approve).mockRejectedValue(
+      new sessionsApi.ApiError("The prompt already timed out.", 409, "elicitation_timed_out"),
+    );
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+
+    await waitFor(() => expect(screen.queryByTestId("approval-card")).not.toBeInTheDocument());
   });
 
   it("clears a stale verdict when a snapshot refresh still shows the elicitation as pending", async () => {

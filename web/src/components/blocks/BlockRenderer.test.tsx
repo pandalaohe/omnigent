@@ -188,6 +188,29 @@ describe("BlockRenderer dispatch", () => {
     );
   });
 
+  it("renders the approval timeout item as one muted line, not the notice banner", () => {
+    // The timeout stop persists a level "info" error item. Without this
+    // dispatch it fell through to ErrorBanner and rendered a "Notice"
+    // pill for what is a one-line transcript marker.
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: "err_timeout",
+        source: "harness",
+        code: "approval_timed_out",
+        message: "Timed out · turn stopped",
+        level: "info",
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    expect(screen.getByTestId("approval-timeout-notice")).toHaveTextContent(
+      "Timed out · turn stopped",
+    );
+    expect(screen.queryByText("Notice")).toBeNull();
+  });
+
   it("renders a friendly failure card when the error is classified", () => {
     const items: RenderItem[] = [
       {

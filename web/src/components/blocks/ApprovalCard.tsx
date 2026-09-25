@@ -30,7 +30,9 @@
 //   1. optimistically flips the block to "responded" (instant UI),
 //   2. calls `approve(targetSessionId, elicitationId, {action, content?})`
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
-//   3. rolls back to "pending" on network error.
+//   3. rolls back to "pending" on network error, except a 409
+//      `elicitation_timed_out`, which keeps it responded with
+//      `reason: "timed_out"` so this card hides.
 
 import { useContext } from "react";
 import {
@@ -118,7 +120,7 @@ interface ApprovalCardProps {
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
     /** Why an `auto_resolved` card has no verdict; see `ElicitationBlock`. */
-    reason?: "unanswered";
+    reason?: "unanswered" | "timed_out";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   } | null;
@@ -488,6 +490,10 @@ export function ApprovalCard({
   );
 
   if (status === "responded" && response) {
+    // A timed-out prompt leaves no card: the turn was stopped, the
+    // block stays in the store, and the persisted notice line stands
+    // in for what the card would have said.
+    if (response.reason === "timed_out") return null;
     const autoResolved = response.action === "auto_resolved";
     const promptExpired = autoResolved && response.reason === "unanswered";
     const accepted = response.action === "accept";

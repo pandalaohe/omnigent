@@ -3471,6 +3471,9 @@ def create_app(
             feature_flags=resolved_feature_flags,
             peer_message_store=peer_message_store,
             app_state=app.state,
+            # Lets the native hook routes read the session owner's
+            # approval-timeout setting; absent → defaults.
+            user_preferences_store=user_preferences_store,
         ),
         prefix="/v1",
         tags=["sessions"],

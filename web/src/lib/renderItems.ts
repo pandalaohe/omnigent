@@ -135,6 +135,7 @@ export type RenderItem =
       status: "pending" | "responded";
       response: {
         action: "accept" | "decline" | "cancel" | "auto_resolved";
+        reason?: "unanswered" | "timed_out";
         content?: Record<string, unknown>;
         _meta?: Record<string, unknown>;
       } | null;

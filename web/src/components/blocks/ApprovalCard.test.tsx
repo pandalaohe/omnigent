@@ -1696,4 +1696,24 @@ describe("ApprovalCard — prompt expired", () => {
     expect(screen.getByText(/Resolved elsewhere/)).toBeDefined();
     expect(screen.queryByTestId("prompt-expired-hint")).toBeNull();
   });
+
+  it("renders nothing for a timed-out prompt so the notice line stands alone", () => {
+    // The deadline stop both hides the card and persists its own
+    // "Timed out · turn stopped" notice; a lingering pill or a
+    // "Resolved elsewhere" label would double up on that story.
+    render(
+      <ApprovalCard
+        elicitationId="elic_timed_out"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "auto_resolved", reason: "timed_out" }}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-card")).toBeNull();
+  });
 });

@@ -82,6 +82,7 @@ UserPreferenceNamespace = Literal[
     "context_indicator",
     "usage_context",
     "agent_badges",
+    "approval_timeout",
 ]
 
 
@@ -4352,13 +4353,16 @@ class ElicitationResolvedEvent(_SSEEventBase):
         poll never re-parked, the ask timed out) before anyone
         answered, so the prompt is gone rather than decided and the
         UI can say so instead of implying it was resolved elsewhere.
+        ``"timed_out"``: the wait hit its configured deadline with
+        stop-turn enabled and the server ended the turn, so the card
+        disappears in favour of the persisted timeout notice.
         ``None`` when a verdict is present or the reason is unknown.
     """
 
     type: Literal["response.elicitation_resolved"]
     elicitation_id: str
     action: Literal["accept", "decline", "cancel"] | None = None
-    reason: Literal["unanswered"] | None = None
+    reason: Literal["unanswered", "timed_out"] | None = None
 
 
 class PolicyDeniedEvent(_SSEEventBase):

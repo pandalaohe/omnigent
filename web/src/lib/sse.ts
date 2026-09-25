@@ -1155,8 +1155,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       // of the ambiguous "Resolved elsewhere" pill.
       ...(hasVerdict ? { action } : {}),
       // Only a verdict-less clear may say why: "unanswered" means the
-      // prompt expired, so the card can tell the user what to do next.
-      ...(!hasVerdict && data.reason === "unanswered" ? { reason: data.reason } : {}),
+      // prompt expired and "timed_out" means the deadline stopped the
+      // turn, so the card can tell the user what happened.
+      ...(!hasVerdict && (data.reason === "unanswered" || data.reason === "timed_out")
+        ? { reason: data.reason }
+        : {}),
     } satisfies ElicitationResolved;
   }
 

@@ -2622,7 +2622,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
-    } catch {
+    } catch (error) {
+      // The prompt timed out before this verdict arrived and the server
+      // refused it. Keep the block responded as timed out so the card
+      // hides instead of re-offering a retry that can never succeed.
+      if (error instanceof ApiError && error.code === "elicitation_timed_out") {
+        write((s) => ({
+          blocks: s.blocks.map((b) =>
+            b.type === "elicitation" && b.elicitationId === elicitationId
+              ? {
+                  ...b,
+                  status: "responded",
+                  response: { action: "auto_resolved", reason: "timed_out" },
+                }
+              : b,
+          ),
+        }));
+        return;
+      }
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
       // reappear and the user can try again.

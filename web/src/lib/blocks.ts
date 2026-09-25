@@ -634,9 +634,11 @@ export interface ElicitationBlock {
     /**
      * Refines `auto_resolved`: `"unanswered"` means the server cleared
      * the prompt because the hook stopped waiting before anyone
-     * answered, so the card says the prompt expired and how to resume.
+     * answered, so the card says the prompt expired and how to resume;
+     * `"timed_out"` means the deadline stopped the turn, so the card
+     * renders nothing and the persisted notice speaks instead.
      */
-    reason?: "unanswered";
+    reason?: "unanswered" | "timed_out";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   } | null;

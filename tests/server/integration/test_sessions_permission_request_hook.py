@@ -42,12 +42,15 @@ from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.runtime import session_stream
 from omnigent.server._elicitation_registry import (
+    _harness_elicitation_timeouts,
     _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _HarnessElicitationTimeoutSnapshot,
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
+from omnigent.server.user_preferences_store import ApprovalTimeout
 from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
@@ -152,6 +155,83 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
         "tool_name": tool_name,
         "tool_input": {"command": "ls -la"},
     }
+
+
+def _patch_approval_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    timeout_s: float,
+    stop_turn: bool,
+) -> None:
+    """
+    Pin the approval-timeout setting the hook routes read.
+
+    The routes resolve the reader through the ``sessions`` facade at call
+    time, so patching it there covers both the Claude and Codex hooks.
+
+    :param monkeypatch: Fixture isolating the patch.
+    :param timeout_s: Budget the reader should return.
+    :param stop_turn: Switch value the reader should return.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        sessions_route,
+        "read_approval_timeout",
+        lambda store, owner: ApprovalTimeout(timeout_s=timeout_s, stop_turn=stop_turn),
+    )
+
+
+async def _drain_one_resolved(session_id: str, *, timeout_s: float = 3.0) -> dict[str, Any]:
+    """
+    Wait for the next ``response.elicitation_resolved`` event.
+
+    :param session_id: Session stream to subscribe to.
+    :param timeout_s: Maximum seconds to wait.
+    :returns: The captured resolved event.
+    """
+    async with asyncio.timeout(timeout_s):
+        async for event in session_stream.subscribe(session_id):
+            if event.get("type") == "response.elicitation_resolved":
+                return event
+    raise AssertionError("no elicitation_resolved event arrived")
+
+
+async def _approval_timeout_notices(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """
+    Return the session's persisted ``approval_timed_out`` notice items.
+
+    :param client: Test HTTP client.
+    :param session_id: Session whose items to read.
+    :returns: Matching persisted items, oldest first.
+    """
+    resp = await client.get(f"/v1/sessions/{session_id}/items")
+    assert resp.status_code == 200, resp.text
+    return [
+        item
+        for item in resp.json()["data"]
+        if item.get("type") == "error" and item.get("code") == "approval_timed_out"
+    ]
+
+
+def _shorten_timeout_deadline(elicitation_id: str, *, in_s: float) -> None:
+    """
+    Move a parked wait's deadline close enough to observe in a test.
+
+    :param elicitation_id: Id whose snapshot to rewrite.
+    :param in_s: Seconds from now the deadline should land.
+    :returns: None.
+    """
+    snapshot = _harness_elicitation_timeouts[elicitation_id]
+    _harness_elicitation_timeouts[elicitation_id] = _HarnessElicitationTimeoutSnapshot(
+        request_fingerprint=snapshot.request_fingerprint,
+        deadline=time.time() + in_s,
+        stop_enabled=snapshot.stop_enabled,
+        stop=snapshot.stop,
+        created_at=snapshot.created_at,
+    )
 
 
 @pytest.mark.parametrize("harness", [None, "claude-native"])
@@ -1845,69 +1925,80 @@ async def test_permission_request_hook_omits_structured_extras_for_other_tools(
     await hook_task
 
 
-async def test_permission_request_hook_timeout_returns_empty_body(
+@pytest.mark.parametrize("tool_name", ["Bash", "AskUserQuestion", "ExitPlanMode"])
+async def test_claude_timeout_with_stop_stops_the_turn(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
 ) -> None:
     """
-    When no verdict arrives within the wait budget, the endpoint
-    returns ``200`` with an empty body — Claude Code's HTTP hook
-    contract treats that as "defer to the TUI prompt" (fail-ask).
+    S1/S2: at the deadline with the switch ON the turn stops.
 
-    Without this contract: an unattended UI would block Claude's
-    tool call for the full hook timeout (Claude's own default is
-    ~10 minutes), then default to allow on its end. Returning empty
-    early lets Claude fall back to its terminal prompt promptly.
-
-    Asserts the response body is literally empty, not just empty
-    JSON ``{}`` (the docs explicitly distinguish the two; only the
-    empty-body form triggers TUI fallback cleanly).
+    The hook returns Claude's deny+interrupt decision for every gated
+    tool — question, permission and plan cards alike — the resolved
+    event says ``timed_out`` with no action, and one persisted
+    ``approval_timed_out`` info line replaces the card.
     """
-    monkeypatch.setattr(
-        sessions_route,
-        "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
-        0.1,
-    )
-    agent = await create_test_agent(client, "test-permission-timeout")
+    _patch_approval_timeout(monkeypatch, timeout_s=0.05, stop_turn=True)
+    agent = await create_test_agent(client, f"test-claude-timeout-stop-{tool_name}")
     session_id = await _create_session(client, agent["id"])
-    payload = await _claude_permission_payload()
+    payload = await _claude_permission_payload(tool_name)
+    if tool_name == "AskUserQuestion":
+        payload["tool_input"] = {
+            "questions": [{"question": "Continue?", "header": "Next", "options": []}]
+        }
+    elif tool_name == "ExitPlanMode":
+        payload["tool_input"] = {"plan": "Run the tests."}
 
+    resolved_task = asyncio.create_task(_drain_one_resolved(session_id, timeout_s=5.0))
+    await asyncio.sleep(0.05)
     resp = await client.post(
         f"/v1/sessions/{session_id}/hooks/permission-request",
         json=payload,
     )
     assert resp.status_code == 200, resp.text
-    assert resp.content == b"", f"expected empty body on timeout, got {resp.content!r}"
+    assert resp.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "deny",
+        "interrupt": True,
+    }
+
+    event = await resolved_task
+    assert event["reason"] == "timed_out"
+    assert "action" not in event
+    elicitation_id = event["elicitation_id"]
+    record = _harness_pre_resolved_elicitations.get(elicitation_id)
+    assert record is not None and record.timed_out
+    assert record.result is not None and record.result.action == "cancel"
+    notices = await _approval_timeout_notices(client, session_id)
+    assert len(notices) == 1, notices
+    assert notices[0]["message"] == "Timed out · turn stopped"
+    assert notices[0]["level"] == "info"
+    _harness_pre_resolved_elicitations.pop(elicitation_id, None)
 
 
-async def test_ask_user_question_waits_on_its_own_shorter_budget(
+async def test_question_timeout_with_stop_off_returns_empty_body(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AskUserQuestion expires on its own budget, not the permission one.
-
-    A question is not a permission gate: an unanswered card must hand the turn
-    back to Claude's TUI prompt rather than park for the permission timeout
-    (a day in production). The two budgets are set far apart here so a card
-    that returned on the permission clock would blow the assertion below.
     """
-    monkeypatch.setattr(
-        sessions_route,
-        "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
-        30.0,
-    )
-    monkeypatch.setattr(
-        sessions_route,
-        "_CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S",
-        0.1,
-    )
-    agent = await create_test_agent(client, "test-ask-user-question-timeout")
+    S3: with the switch OFF the configured deadline keeps the native flow.
+
+    AskUserQuestion parks for the owner's budget (not a fixed 3000 s),
+    then returns ``200`` with an empty body so Claude falls back to its
+    TUI prompt; the deferred clear says ``unanswered`` and no stop notice
+    is written.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.1, stop_turn=False)
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
+    agent = await create_test_agent(client, "test-question-timeout-stop-off")
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload("AskUserQuestion")
     payload["tool_input"] = {
         "questions": [{"question": "Continue?", "header": "Next", "options": []}]
     }
 
+    resolved_task = asyncio.create_task(_drain_one_resolved(session_id, timeout_s=5.0))
+    await asyncio.sleep(0.05)
     started = time.monotonic()
     resp = await client.post(
         f"/v1/sessions/{session_id}/hooks/permission-request",
@@ -1917,7 +2008,44 @@ async def test_ask_user_question_waits_on_its_own_shorter_budget(
 
     assert resp.status_code == 200, resp.text
     assert resp.content == b"", f"expected empty body on timeout, got {resp.content!r}"
-    assert elapsed < 10.0, f"waited {elapsed:.1f}s — the permission budget, not the question one"
+    assert elapsed < 10.0, f"waited {elapsed:.1f}s — the configured budget was ignored"
+    event = await resolved_task
+    assert event["reason"] == "unanswered"
+    assert "action" not in event
+    assert await _approval_timeout_notices(client, session_id) == []
+
+
+async def test_claude_timeout_ignored_when_an_answer_lands_first(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S4: an accepted answer wins before the timeout decision.
+
+    With a budget far longer than the test, the web verdict resolves the
+    wait normally and leaves no timed-out record or notice behind.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=30.0, stop_turn=True)
+    agent = await create_test_agent(client, "test-claude-timeout-answer-wins")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload()
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+    event = await drain_task
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    record = _harness_pre_resolved_elicitations.get(event["elicitation_id"])
+    assert record is None or record.timed_out is False
+    assert await _approval_timeout_notices(client, session_id) == []
 
 
 async def test_permission_request_hook_timeout_clears_pending_index(
@@ -1942,11 +2070,7 @@ async def test_permission_request_hook_timeout_clears_pending_index(
     """
     from omnigent.runtime import pending_elicitations, session_stream
 
-    monkeypatch.setattr(
-        sessions_route,
-        "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
-        0.1,
-    )
+    _patch_approval_timeout(monkeypatch, timeout_s=0.1, stop_turn=False)
     # Timeout defers the index clear by the re-park grace; shrink it
     # so the test observes the clear quickly.
     monkeypatch.setattr(
@@ -2609,6 +2733,344 @@ async def test_permission_hook_verdict_during_gap_honored_on_repark(
     pending_elicitations.reset_for_tests()
 
 
+async def test_repark_keeps_first_park_deadline_and_stop(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S6/S7: a re-POST reuses the first park's deadline and stop choice.
+
+    The first long-poll is severed, then the settings flip to OFF and a
+    much longer budget; the retry must still stop the turn on the
+    ORIGINAL deadline with the snapshot's stop callback, so neither
+    change alters a prompt already waiting.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    _patch_approval_timeout(monkeypatch, timeout_s=30.0, stop_turn=True)
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 1.0)
+    disconnect_calls = 0
+
+    async def _disconnect_first_call_only(_request: Any) -> None:
+        nonlocal disconnect_calls
+        disconnect_calls += 1
+        if disconnect_calls == 1:
+            await asyncio.sleep(0.01)
+            return
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        sessions_route,
+        "_poll_request_disconnect",
+        _disconnect_first_call_only,
+    )
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-repark-timeout-snapshot")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        **(await _claude_permission_payload()),
+        "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
+    }
+
+    first = await client.post(
+        f"/v1/sessions/{session_id}/hooks/permission-request",
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+    assert first.content == b"", f"severed poll should fail-ask, got {first.content!r}"
+    assert _harness_elicitation_timeouts.get(_REATTACH_ELICITATION_ID) is not None
+
+    # The setting changes only AFTER the first park, and the deadline is
+    # pulled close enough to observe; the retry must ignore both.
+    _patch_approval_timeout(monkeypatch, timeout_s=30.0, stop_turn=False)
+    _shorten_timeout_deadline(_REATTACH_ELICITATION_ID, in_s=0.05)
+
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+    resp = await asyncio.wait_for(hook_task, timeout=5.0)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "deny",
+        "interrupt": True,
+    }
+    assert _harness_elicitation_timeouts.get(_REATTACH_ELICITATION_ID) is None
+    notices = await _approval_timeout_notices(client, session_id)
+    assert len(notices) == 1, notices
+    for task in set(sessions_route._deferred_elicitation_clear_tasks):
+        await asyncio.wait_for(task, timeout=5.0)
+    pending_elicitations.reset_for_tests()
+
+
+async def test_timeout_snapshot_resets_for_a_different_request_fingerprint() -> None:
+    """
+    S8: a same-id request with different params starts a fresh snapshot.
+
+    Harness ids recur across distinct questions, so a stale deadline and
+    stop choice must never govern a new one.
+    """
+    elicitation_id = f"elicit_claude_{'cd' * 16}"
+    first = sessions_route._harness_timeout_snapshot(
+        elicitation_id,
+        "fingerprint-a",
+        sessions_route.HarnessTimeoutPolicy(timeout_s=10.0, stop=None),
+    )
+    second = sessions_route._harness_timeout_snapshot(
+        elicitation_id,
+        "fingerprint-b",
+        sessions_route.HarnessTimeoutPolicy(timeout_s=20.0, stop=None),
+    )
+
+    assert second is not first
+    assert second.request_fingerprint == "fingerprint-b"
+    assert second.stop_enabled is False
+    assert second.deadline > first.deadline
+
+
+async def test_timed_out_replay_stays_refused_and_never_republishes(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S9/S10: the replay record outlives any one re-POST.
+
+    A retry after the stop replays the stop verdict, a web answer that
+    races it is refused, and a further retry replays again without
+    publishing a new ``elicitation_request`` — the record must not be
+    consumed away by the first replay, or the next answer would be
+    accepted and the next retry would re-park a stopped question.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.05, stop_turn=True)
+    agent = await create_test_agent(client, "test-timeout-replay")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        **(await _claude_permission_payload()),
+        "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
+    }
+    collector = await start_session_stream_collector(session_id)
+
+    try:
+        first = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+        assert first.json()["hookSpecificOutput"]["decision"] == {
+            "behavior": "deny",
+            "interrupt": True,
+        }
+        replay = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["hookSpecificOutput"]["decision"] == {
+            "behavior": "deny",
+            "interrupt": True,
+        }
+
+        late = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
+        assert late.status_code == 409, late.text
+        assert late.json()["error"]["code"] == "elicitation_timed_out"
+
+        again = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+        assert again.status_code == 200, again.text
+        assert again.json()["hookSpecificOutput"]["decision"] == {
+            "behavior": "deny",
+            "interrupt": True,
+        }
+        assert len(await _approval_timeout_notices(client, session_id)) == 1
+
+        # Every replay returned from the record before registration, so only
+        # the first POST ever published a request; a second one would mean a
+        # stopped question re-parked.
+        await asyncio.sleep(0.1)
+        requests = []
+        while not collector.queue.empty():
+            event = collector.queue.get_nowait()
+            if event.get("type") == "response.elicitation_request":
+                requests.append(event)
+        assert len(requests) == 1, requests
+    finally:
+        await collector.stop()
+        assert _harness_elicitation_timeouts.get(_REATTACH_ELICITATION_ID) is None
+
+
+async def test_external_resolve_after_timeout_keeps_the_refusal(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S10: the external-resolved signal must not erase a timed-out id's refusal.
+
+    That signal's nothing-parked branch writes an ordinary tombstone; over a
+    timed-out record it would turn the next web answer from a 409 into an
+    accepted verdict. The record must survive unchanged.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.05, stop_turn=True)
+    agent = await create_test_agent(client, "test-timeout-external-resolve")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        **(await _claude_permission_payload()),
+        "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
+    }
+
+    first = await client.post(
+        f"/v1/sessions/{session_id}/hooks/permission-request",
+        json=payload,
+    )
+    assert first.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "deny",
+        "interrupt": True,
+    }
+
+    resolved = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_elicitation_resolved",
+            "data": {"elicitation_id": _REATTACH_ELICITATION_ID},
+        },
+    )
+    assert resolved.status_code == 202, resolved.text
+    record = _harness_pre_resolved_elicitations.get(_REATTACH_ELICITATION_ID)
+    assert record is not None and record.timed_out is True
+
+    late = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
+    assert late.status_code == 409, late.text
+    assert late.json()["error"]["code"] == "elicitation_timed_out"
+
+
+async def test_external_resolve_from_foreign_session_cannot_erase_the_refusal(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S10: a foreign session's external-resolved signal cannot clear the refusal.
+
+    The timed-out wait drops both its owners entry and its parked record, so
+    session B naming A's id reaches the nothing-parked branch. Without the
+    record's own session check, B's ordinary tombstone would overwrite A's
+    timed-out record and A's late answer would be accepted instead of 409.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.05, stop_turn=True)
+    agent = await create_test_agent(client, "test-timeout-foreign-external-resolve")
+    session_a = await _create_session(client, agent["id"])
+    session_b = await _create_session(client, agent["id"])
+    payload = {
+        **(await _claude_permission_payload()),
+        "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
+    }
+
+    first = await client.post(
+        f"/v1/sessions/{session_a}/hooks/permission-request",
+        json=payload,
+    )
+    assert first.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "deny",
+        "interrupt": True,
+    }
+
+    resolved = await client.post(
+        f"/v1/sessions/{session_b}/events",
+        json={
+            "type": "external_elicitation_resolved",
+            "data": {"elicitation_id": _REATTACH_ELICITATION_ID},
+        },
+    )
+    assert resolved.status_code == 400, resolved.text
+    record = _harness_pre_resolved_elicitations.get(_REATTACH_ELICITATION_ID)
+    assert record is not None and record.timed_out is True
+    assert record.session_id == session_a
+
+    late = await _post_approval(client, session_a, _REATTACH_ELICITATION_ID, "accept")
+    assert late.status_code == 409, late.text
+    assert late.json()["error"]["code"] == "elicitation_timed_out"
+
+
+async def test_late_verdict_after_timeout_is_refused_and_retained(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S10: an answer after the stop is refused, and stays refused.
+
+    The ``elicitation_timed_out`` 409 comes before any tombstone or
+    runner forward, and the replay record outlives the ordinary 300 s
+    tombstone window by a day.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.05, stop_turn=True)
+    agent = await create_test_agent(client, "test-late-verdict")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload()
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/permission-request",
+        json=payload,
+    )
+    assert resp.status_code == 200, resp.text
+    event = await drain_task
+    elicitation_id = event["elicitation_id"]
+
+    late = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert late.status_code == 409, late.text
+    assert late.json()["error"]["code"] == "elicitation_timed_out"
+    record = _harness_pre_resolved_elicitations[elicitation_id]
+    assert record.timed_out is True
+    assert record.result is not None
+
+    # Well past the ordinary tombstone TTL, the timed-out record (and its
+    # refusal) must survive.
+    sessions_route._prune_pre_resolved_harness_elicitations(now=time.time() + 301.0)
+    assert _harness_pre_resolved_elicitations.get(elicitation_id) is not None
+    again = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert again.status_code == 409, again.text
+
+
+async def test_kimi_question_ignores_the_timeout_setting(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S14: Kimi / Devin keep their hardcoded native budgets.
+
+    Their AskUserQuestion-named tool still expires on the short fallback
+    constant and never stops the turn, even with the setting ON.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=30.0, stop_turn=True)
+    monkeypatch.setattr(
+        sessions_route,
+        "_CLAUDE_NATIVE_ASK_USER_QUESTION_HOOK_TIMEOUT_S",
+        0.05,
+    )
+    agent = await create_test_agent(
+        client,
+        "test-kimi-timeout-unchanged",
+        executor={"type": "omnigent", "config": {"harness": "kimi-native"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_kimi_{'0' * 32}"
+    payload = await _claude_permission_payload("AskUserQuestion")
+    payload["_omnigent_elicitation_id"] = elicitation_id
+    payload["tool_input"] = {
+        "questions": [{"question": "Continue?", "header": "Next", "options": []}]
+    }
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/permission-request",
+        json=payload,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"", f"Kimi must fail-ask natively, got {resp.content!r}"
+    assert _harness_elicitation_timeouts.get(elicitation_id) is None
+
+
 async def test_permission_hook_rejects_malformed_reattach_id(
     client: httpx.AsyncClient,
 ) -> None:
@@ -3131,6 +3593,321 @@ async def test_codex_request_user_input_decline_still_interrupts(
     assert forwarded == [{"type": "interrupt"}]
 
 
+async def test_codex_timeout_with_stop_interrupts_once_and_declines(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S11/S9: Codex stop ON forwards one interrupt and declines.
+
+    The runner receives exactly one ``{"type": "interrupt"}``; the hook
+    answers Codex's request with the usual decline body; and a re-POST of
+    the same request replays that stop without interrupting again.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.05, stop_turn=True)
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> Any:
+        forwarded.append(args[2])
+        return sessions_route._RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record,
+    )
+    agent = await create_test_agent(client, "test-codex-timeout-stop")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": "req_timeout",
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "item_timeout",
+            "questions": [
+                {
+                    "id": "framework",
+                    "question": "Which framework?",
+                    "options": [{"label": "React"}],
+                    "isOther": False,
+                    "isSecret": False,
+                }
+            ],
+        },
+    }
+
+    resolved_task = asyncio.create_task(_drain_one_resolved(session_id, timeout_s=5.0))
+    await asyncio.sleep(0.05)
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+        json=payload,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"answers": {}}
+    assert forwarded == [{"type": "interrupt"}]
+    event = await resolved_task
+    assert event["reason"] == "timed_out"
+    assert len(await _approval_timeout_notices(client, session_id)) == 1
+
+    replay = await client.post(
+        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+        json=payload,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {"answers": {}}
+    assert forwarded == [{"type": "interrupt"}]
+    assert len(await _approval_timeout_notices(client, session_id)) == 1
+
+
+async def test_stranded_wait_does_not_stop_after_the_retry_is_answered(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Only the wait still holding the id may take the timeout decision.
+
+    A proxy-stranded first wait (A) is re-parked by a hook retry (B) and
+    the web accepts B. A's later deadline must not stop the turn the
+    accept already ended — the registry no longer holds A's future.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.3, stop_turn=True)
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> Any:
+        forwarded.append(args[2])
+        return sessions_route._RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record,
+    )
+    agent = await create_test_agent(client, "test-stranded-timeout-wait")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": "req_stranded",
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "item_stranded",
+            "questions": [
+                {
+                    "id": "framework",
+                    "question": "Which framework?",
+                    "options": [{"label": "React"}],
+                    "isOther": False,
+                    "isSecret": False,
+                }
+            ],
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    stranded = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+    event = await drain_task
+    # The retry publishes its own request event before it waits, so waiting
+    # for that event proves it re-parked over the stranded wait's registry
+    # entry — no sleep guesswork about which wait the verdict reaches.
+    retry_drain = asyncio.create_task(_drain_until_elicitation(session_id))
+    retry = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+    await retry_drain
+
+    verdict = await _post_approval(
+        client, session_id, event["elicitation_id"], "accept", content={"framework": "React"}
+    )
+    assert verdict.status_code == 202, verdict.text
+    retry_resp = await asyncio.wait_for(retry, timeout=5.0)
+    assert retry_resp.json() == {"answers": {"framework": {"answers": ["React"]}}}
+
+    stranded_resp = await asyncio.wait_for(stranded, timeout=5.0)
+    assert stranded_resp.status_code == 200, stranded_resp.text
+    assert stranded_resp.content == b""
+
+    assert forwarded == []
+    record = _harness_pre_resolved_elicitations.get(event["elicitation_id"])
+    assert record is None or record.timed_out is False
+    assert await _approval_timeout_notices(client, session_id) == []
+    for task in set(sessions_route._deferred_elicitation_clear_tasks):
+        await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_two_waits_for_one_id_stop_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Park A, re-POST B, nobody answers: exactly one interrupt and one notice.
+
+    Both invocations reach the same first-park deadline, so without the
+    ownership check each would separately stop the turn (and Codex would
+    receive two interrupts).
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.3, stop_turn=True)
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> Any:
+        forwarded.append(args[2])
+        return sessions_route._RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record,
+    )
+    agent = await create_test_agent(client, "test-double-timeout-wait")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": "req_double_stop",
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "item_double_stop",
+            "questions": [
+                {
+                    "id": "framework",
+                    "question": "Which framework?",
+                    "options": [{"label": "React"}],
+                    "isOther": False,
+                    "isSecret": False,
+                }
+            ],
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    stranded = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+    event = await drain_task
+    # Wait for the retry's own request event so it is certainly the wait
+    # holding the registry when the shared deadline arrives.
+    retry_drain = asyncio.create_task(_drain_until_elicitation(session_id))
+    retry = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+    await retry_drain
+
+    stranded_resp = await asyncio.wait_for(stranded, timeout=5.0)
+    assert stranded_resp.status_code == 200, stranded_resp.text
+    assert stranded_resp.content == b""
+    retry_resp = await asyncio.wait_for(retry, timeout=5.0)
+    assert retry_resp.status_code == 200, retry_resp.text
+    assert retry_resp.json() == {"answers": {}}
+
+    assert forwarded == [{"type": "interrupt"}]
+    notices = await _approval_timeout_notices(client, session_id)
+    assert len(notices) == 1, notices
+    record = _harness_pre_resolved_elicitations.get(event["elicitation_id"])
+    assert record is not None and record.timed_out is True
+    for task in set(sessions_route._deferred_elicitation_clear_tasks):
+        await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_codex_failed_stop_falls_back_to_native(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S12: a stop the runner never accepted is not reported as a stop.
+
+    A 503 interrupt returns the empty 200 native path, publishes
+    ``unanswered``, writes no notice, and leaves a later web answer free
+    to resolve as today.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.1, stop_turn=True)
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
+
+    async def _fail(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions_route._RunnerForwardResult(status_code=503, body="interrupt failed")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _fail,
+    )
+    agent = await create_test_agent(client, "test-codex-stop-failed")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": 41,
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "mode": "form",
+            "message": "Pick a value",
+            "requestedSchema": {"type": "object", "properties": {}},
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    resolved_task = asyncio.create_task(_drain_one_resolved(session_id, timeout_s=5.0))
+    await asyncio.sleep(0.05)
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+        json=payload,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"", f"failed stop must fail-ask, got {resp.content!r}"
+    event = await drain_task
+    assert await _approval_timeout_notices(client, session_id) == []
+    resolved = await resolved_task
+    assert resolved["reason"] == "unanswered"
+
+    late = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert late.status_code == 202, late.text
+
+
+async def test_codex_async_question_ignores_the_timeout_setting(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S13: async questions keep the 86400 s budget and never stop.
+
+    The setting's tiny deadline must not fire while an async question is
+    parked, preserving the BUG12 contract for out-of-turn questions.
+    """
+    _patch_approval_timeout(monkeypatch, timeout_s=0.05, stop_turn=True)
+    agent = await create_test_agent(client, "test-codex-async-unchanged")
+    session_id = await _create_session(client, agent["id"])
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_codex_async_question_payload(),
+        )
+    )
+    event = await drain_task
+    await asyncio.sleep(0.1)
+    assert not hook_task.done(), "an async question must not stop at the setting's deadline"
+    assert _harness_elicitation_timeouts.get(event["elicitation_id"]) is None
+
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "decline")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"answers": {}}
+
+
 async def test_codex_plan_mode_final_prompt_round_trip(
     client: httpx.AsyncClient,
 ) -> None:
@@ -3515,16 +4292,13 @@ async def test_codex_elicitation_hook_timeout_clears_pending_index(
 ) -> None:
     """
     Codex-native elicitation timeout uses the same cleanup path as the
-    Claude hook: return an empty body and decrement the pending
-    elicitation index once the re-park grace elapses with no retry.
+    Claude hook: with stop-turn OFF, return an empty body and decrement
+    the pending elicitation index once the re-park grace elapses with no
+    retry.
     """
     from omnigent.runtime import pending_elicitations, session_stream
 
-    monkeypatch.setattr(
-        sessions_route,
-        "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
-        0.1,
-    )
+    _patch_approval_timeout(monkeypatch, timeout_s=0.1, stop_turn=False)
     monkeypatch.setattr(
         sessions_route,
         "_HARNESS_ELICITATION_REPARK_GRACE_S",
@@ -3615,11 +4389,7 @@ async def test_permission_hook_finally_emits_elicitation_resolved_on_timeout(
     """
     from omnigent.runtime import pending_elicitations, session_stream
 
-    monkeypatch.setattr(
-        sessions_route,
-        "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
-        0.1,
-    )
+    _patch_approval_timeout(monkeypatch, timeout_s=0.1, stop_turn=False)
     # The resolved event is deferred by the re-park grace; shrink it
     # so the 3s capture window sees the publish.
     monkeypatch.setattr(

@@ -1100,10 +1100,11 @@ def _consume_pre_resolved_harness_elicitation(
         reused this id. Terminal-side tombstones (``result is None``)
         skip the check: adopting one only fail-asks, and their producer
         has no params to fingerprint.
-    :returns: The consumed tombstone when one matched this session
+    :returns: The matched tombstone when one belonged to this session
         (its ``result`` carries the web verdict to honor, or ``None``
-        for a terminal-side resolution), or ``None`` when nothing was
-        pre-resolved.
+        for a terminal-side resolution); a ``timed_out`` record is left
+        in place so its refusal outlives the consume. ``None`` when
+        nothing matched.
     """
     _prune_pre_resolved_harness_elicitations()
     tombstone = _harness_pre_resolved_elicitations.pop(elicitation_id, None)
@@ -1125,6 +1126,12 @@ def _consume_pre_resolved_harness_elicitation(
         # tombstone and let the new prompt be published — the safe cost
         # is one re-ask, never a stale approval gating a new question.
         return None
+    if tombstone.timed_out:
+        # A timeout refusal outlives any one consume: it is kept for its
+        # whole long retention so a later web answer is still refused and
+        # a further retry still replays the stop verdict. A verdict for a
+        # DIFFERENT question still dropped above.
+        _harness_pre_resolved_elicitations[elicitation_id] = tombstone
     return tombstone
 
 
@@ -1146,7 +1153,12 @@ def _prune_pre_resolved_harness_elicitations(now: float | None = None) -> None:
     expired = [
         elicitation_id
         for elicitation_id, tombstone in _harness_pre_resolved_elicitations.items()
-        if now - tombstone.created_at > _facade._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S
+        if now - tombstone.created_at
+        > (
+            _facade._APPROVAL_TIMEOUT_RECORD_TTL_S
+            if tombstone.timed_out
+            else _facade._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S
+        )
     ]
     for elicitation_id in expired:
         _harness_pre_resolved_elicitations.pop(elicitation_id, None)
@@ -1205,6 +1217,18 @@ def _signal_harness_elicitation_resolved_by_id(
             code=ErrorCode.INVALID_INPUT,
         )
     if parked is None:
+        # A timed-out record is a refusal, not a tombstone: replacing it
+        # with an ordinary one would let a late answer through. Only its
+        # own session may leave it alone; a foreign signal is vetoed as
+        # with a parked record.
+        existing = _harness_pre_resolved_elicitations.get(elicitation_id)
+        if existing is not None and existing.timed_out:
+            if existing.session_id != session_id:
+                raise OmnigentError(
+                    "Elicitation does not belong to this session.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            return
         _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
             session_id=session_id,
             created_at=time.time(),
@@ -3146,8 +3170,9 @@ def _publish_external_output_reasoning_delta(session_id: str, body: SessionEvent
 _VALID_ELICITATION_ACTIONS: tuple[str, ...] = ("accept", "decline", "cancel")
 # Why a resolved event carries no verdict. ``"unanswered"``: the hook stopped
 # waiting (a severed poll never re-parked, or the ask timed out) before anyone
-# answered, so the prompt is gone rather than decided.
-_VALID_ELICITATION_RESOLVED_REASONS: tuple[str, ...] = ("unanswered",)
+# answered, so the prompt is gone rather than decided. ``"timed_out"``: the
+# deadline stopped the turn, so the prompt is gone by the user's own setting.
+_VALID_ELICITATION_RESOLVED_REASONS: tuple[str, ...] = ("unanswered", "timed_out")
 
 
 def _publish_elicitation_resolved(

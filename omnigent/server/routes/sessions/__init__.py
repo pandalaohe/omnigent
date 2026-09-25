@@ -108,8 +108,10 @@ from omnigent.server import presence
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
+    _harness_elicitation_timeouts,
     _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _HarnessElicitationTimeoutSnapshot,
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
@@ -177,6 +179,8 @@ from omnigent.server.routes._sessions.common import (
     COST_CONTROL_OVERRIDE_VALUES as COST_CONTROL_OVERRIDE_VALUES,
     _ALLOWED_EVENT_TYPES as _ALLOWED_EVENT_TYPES,
     _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S as _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
+    _APPROVAL_TIMEOUT_RECORD_TTL_S as _APPROVAL_TIMEOUT_RECORD_TTL_S,
+    _APPROVAL_TIMEOUT_SNAPSHOT_TTL_S as _APPROVAL_TIMEOUT_SNAPSHOT_TTL_S,
     _APPROVAL_TYPE as _APPROVAL_TYPE,
     _BROWSER_ACTION_AWAIT_S as _BROWSER_ACTION_AWAIT_S,
     _BROWSER_ACTION_CLAIM_GRACE_S as _BROWSER_ACTION_CLAIM_GRACE_S,
@@ -605,6 +609,7 @@ from omnigent.server.routes._sessions.helpers import (
 # Higher-layer orchestration flows (runner relay, session-event dispatch,
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
+    HarnessTimeoutPolicy as HarnessTimeoutPolicy,
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
@@ -630,6 +635,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot as _get_session_snapshot,
     _handle_mcp_tools_call as _handle_mcp_tools_call,
     _harness_elicitation_request_fingerprint as _harness_elicitation_request_fingerprint,
+    _harness_timeout_snapshot as _harness_timeout_snapshot,
     _heal_subagent_runner_binding_via_parent as _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session as _is_native_terminal_session,
     _kick_managed_relaunch as _kick_managed_relaunch,
@@ -722,6 +728,12 @@ from omnigent.server.schemas import (
     SkillSummary,
     UpdateSessionRequest,
 )
+from omnigent.server.user_preferences_store import (
+    SqlAlchemyUserPreferencesStore as SqlAlchemyUserPreferencesStore,
+)
+from omnigent.server.user_preferences_store import (
+    read_approval_timeout as read_approval_timeout,
+)
 from omnigent.spec.types import (
     FunctionPolicySpec,
     Phase,
@@ -811,6 +823,7 @@ def create_sessions_router(
     feature_flags: FeatureFlags | None = None,
     peer_message_store: PeerMessageStore | None = None,
     app_state: Any | None = None,
+    user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -882,6 +895,10 @@ def create_sessions_router(
         ``register_peer_routes`` so it can stash the constructed peer
         sweeper for the lifespan to start/stop. ``None`` in routers built
         without a host app (focused tests).
+    :param user_preferences_store: Store for the session owner's synced
+        preferences, used by the native hook routes to read the
+        approval-timeout setting. ``None`` (focused tests, servers
+        without preferences) makes every hook take the defaults.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -924,6 +941,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         agent_cache=agent_cache,
+        user_preferences_store=user_preferences_store,
     )
 
     register_items_routes(

@@ -18,6 +18,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
@@ -120,8 +121,10 @@ from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
+    _harness_elicitation_timeouts,
     _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _HarnessElicitationTimeoutSnapshot,
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
@@ -169,6 +172,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _APPROVAL_TIMEOUT_SNAPSHOT_TTL_S,
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
@@ -429,6 +433,186 @@ def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class HarnessTimeoutPolicy:
+    """
+    Opt-in timeout behaviour for one harness elicitation wait.
+
+    :param timeout_s: Wait budget in seconds for the first park, e.g.
+        ``3000.0``.
+    :param stop: Async callback enacted at the deadline. It returns the
+        verdict to hand back, or ``None`` when the stop could not be
+        delivered (the native timeout path then applies). ``None`` keeps
+        the harness's native action at the deadline.
+    """
+
+    timeout_s: float
+    stop: Callable[[], Awaitable[ElicitationResult | None]] | None = None
+
+
+def _prune_harness_elicitation_timeouts(now: float | None = None) -> None:
+    """
+    Drop timeout snapshots older than their retention window.
+
+    :param now: Optional wall-clock timestamp from ``time.time()``,
+        e.g. ``1710000000.0``. ``None`` reads the current time.
+    :returns: None.
+    """
+    if not _harness_elicitation_timeouts:
+        return
+    now = time.time() if now is None else now
+    stale = [
+        elicitation_id
+        for elicitation_id, snapshot in _harness_elicitation_timeouts.items()
+        if now - snapshot.created_at > _APPROVAL_TIMEOUT_SNAPSHOT_TTL_S
+    ]
+    for elicitation_id in stale:
+        _harness_elicitation_timeouts.pop(elicitation_id, None)
+
+
+def _harness_timeout_snapshot(
+    elicitation_id: str,
+    request_fingerprint: str,
+    policy: HarnessTimeoutPolicy,
+) -> _HarnessElicitationTimeoutSnapshot:
+    """
+    Return the first-park timeout snapshot, taking one if needed.
+
+    A re-POST of the same id with the same request fingerprint keeps the
+    original deadline and stop callback, so neither a later settings
+    change nor a retry's fresh policy can alter a prompt already
+    waiting. A different fingerprint is a different question and starts
+    fresh.
+
+    :param elicitation_id: Harness elicitation id, e.g.
+        ``"elicit_claude_abc123"``.
+    :param request_fingerprint: Digest of the request params, e.g. a
+        sha256 hex string.
+    :param policy: The caller's current timeout policy.
+    :returns: The snapshot governing this wait.
+    """
+    _prune_harness_elicitation_timeouts()
+    existing = _harness_elicitation_timeouts.get(elicitation_id)
+    if existing is not None and existing.request_fingerprint == request_fingerprint:
+        return existing
+    now = time.time()
+    snapshot = _HarnessElicitationTimeoutSnapshot(
+        request_fingerprint=request_fingerprint,
+        deadline=now + max(0.0, policy.timeout_s),
+        stop_enabled=policy.stop is not None,
+        stop=policy.stop,
+        created_at=now,
+    )
+    _harness_elicitation_timeouts[elicitation_id] = snapshot
+    return snapshot
+
+
+def _drop_harness_elicitation_timeout(elicitation_id: str) -> None:
+    """Drop one settled wait's timeout snapshot, keeping a re-park's own."""
+    _harness_elicitation_timeouts.pop(elicitation_id, None)
+
+
+def _mark_harness_elicitation_timed_out(
+    session_id: str,
+    elicitation_id: str,
+    request_fingerprint: str,
+) -> None:
+    """
+    Write the placeholder that refuses answers from now on.
+
+    Written synchronously before the stop callback awaits, so a web
+    verdict racing the stop cannot resolve a prompt the server already
+    decided to end. The verdict replaces this record once the stop
+    lands; a failed stop clears it again.
+    """
+    _prune_pre_resolved_harness_elicitations()
+    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+        session_id=session_id,
+        created_at=time.time(),
+        request_fingerprint=request_fingerprint,
+        timed_out=True,
+    )
+
+
+def _write_timed_out_harness_elicitation(
+    session_id: str,
+    elicitation_id: str,
+    request_fingerprint: str,
+    result: ElicitationResult,
+) -> None:
+    """Keep the stop verdict for replay by a hook / forwarder retry."""
+    _prune_pre_resolved_harness_elicitations()
+    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+        session_id=session_id,
+        created_at=time.time(),
+        result=result,
+        request_fingerprint=request_fingerprint,
+        timed_out=True,
+    )
+
+
+def _clear_timed_out_harness_elicitation(session_id: str, elicitation_id: str) -> None:
+    """Remove our own placeholder after a stop that could not be delivered."""
+    existing = _harness_pre_resolved_elicitations.get(elicitation_id)
+    if existing is not None and existing.timed_out and existing.session_id == session_id:
+        _harness_pre_resolved_elicitations.pop(elicitation_id, None)
+
+
+#: Error code + line for the persisted "the deadline stopped the turn" notice.
+_APPROVAL_TIMED_OUT_CODE = "approval_timed_out"
+_APPROVAL_TIMED_OUT_MESSAGE = "Timed out · turn stopped"
+
+
+async def _persist_approval_timeout_notice(
+    session_id: str,
+    elicitation_id: str,
+    conversation_store: ConversationStore | None,
+) -> None:
+    """
+    Persist + publish the one-line notice replacing a timed-out card.
+
+    The id derives from the elicitation so a replay of the same stop
+    cannot append a second notice. A deduplicated append is not
+    re-published — the live item is already on the stream.
+
+    :param session_id: Session/conversation identifier.
+    :param elicitation_id: Elicitation whose card the notice replaces.
+    :param conversation_store: Store for the durable append, or ``None``
+        to skip (the resolved event still tells clients to drop the card).
+    """
+    if conversation_store is None:
+        return
+    notice_key = f"{_APPROVAL_TIMED_OUT_CODE}:{elicitation_id}"
+    stable_id = hashlib.sha256(notice_key.encode()).hexdigest()[:32]
+    item = NewConversationItem(
+        type="error",
+        response_id=generate_task_id(),
+        data=ErrorData(
+            source="harness",
+            code=_APPROVAL_TIMED_OUT_CODE,
+            message=_APPROVAL_TIMED_OUT_MESSAGE,
+            level="info",
+        ),
+        stable_id=stable_id,
+    )
+    try:
+        persisted = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [item],
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to persist approval-timeout notice for session %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if persisted and not persisted[0].deduplicated:
+        _publish_external_conversation_item(session_id, persisted[0])
+
+
 async def _publish_and_wait_for_harness_elicitation(
     request: Request,
     *,
@@ -439,6 +623,7 @@ async def _publish_and_wait_for_harness_elicitation(
     elicitation_id: str | None = None,
     tool_name: str | None = None,
     tool_input: dict[str, Any] | None = None,
+    timeout_policy: HarnessTimeoutPolicy | None = None,
 ) -> ElicitationResult | None:
     """
     Publish one harness-originated elicitation and wait for web verdict.
@@ -464,14 +649,23 @@ async def _publish_and_wait_for_harness_elicitation(
     to a verdict that landed during a gap via the pre-resolved
     tombstone, returned at registration time without re-publishing.
 
+    ``timeout_policy`` opts this wait into the owner's configured
+    timeout: the first park snapshots the deadline and stop callback
+    (so a re-POST keeps both), and at the deadline with a stop enabled
+    the server ends the turn instead of falling back to the native
+    prompt. Callers that pass no policy keep the historical
+    timeout/disconnect behaviour byte for byte.
+
     :param request: FastAPI request object so upstream disconnect can
         be detected.
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
     :param params: Elicitation params to publish.
-    :param timeout_s: Maximum wait in seconds, e.g. ``300.0``.
+    :param timeout_s: Maximum wait in seconds, e.g. ``300.0``. Ignored
+        once ``timeout_policy`` has a first-park snapshot.
     :param conversation_store: Optional store used to mirror
-        child-session prompts into ancestor streams. ``None`` keeps
-        the prompt scoped to ``session_id`` only.
+        child-session prompts into ancestor streams and to persist the
+        timeout notice. ``None`` keeps the prompt scoped to
+        ``session_id`` only.
     :param elicitation_id: Optional precomputed correlation id, e.g.
         ``"elicit_codex_abc123"``. ``None`` mints a random id.
     :param tool_name: Gated tool name, e.g. ``"Bash"``, used to
@@ -482,7 +676,10 @@ async def _publish_and_wait_for_harness_elicitation(
     :param tool_input: Gated tool input, e.g. ``{"command": "ls"}``,
         used with ``tool_name`` to disambiguate the result when several
         same-named prompts are parked at once.
-    :returns: Web verdict, or ``None`` on terminal-side resolution,
+    :param timeout_policy: Optional configured-timeout behaviour; see
+        :class:`HarnessTimeoutPolicy`. ``None`` = historical behaviour.
+    :returns: Web verdict, or the stop verdict on a timed-out wait that
+        stopped the turn; ``None`` on terminal-side resolution, native
         timeout, or disconnect.
     """
     if elicitation_id is None:
@@ -495,6 +692,8 @@ async def _publish_and_wait_for_harness_elicitation(
     # ends promptly without relying on the web verdict or on disconnect
     # detection (unreliable behind the Databricks Apps proxy).
     request_fingerprint = _harness_elicitation_request_fingerprint(params)
+    timeout_snapshot: _HarnessElicitationTimeoutSnapshot | None = None
+    wait_timeout_s = timeout_s
     parked = _ParkedHarnessElicitation(
         session_id=session_id,
         tool_name=tool_name,
@@ -512,6 +711,8 @@ async def _publish_and_wait_for_harness_elicitation(
     # MCP verdict when a real web verdict settles the wait, so the
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
+    # No-verdict reason when the wait ends without one (timed-out stop).
+    settled_reason: str | None = None
     try:
         tombstone = _consume_pre_resolved_harness_elicitation(
             session_id, elicitation_id, request_fingerprint
@@ -519,6 +720,12 @@ async def _publish_and_wait_for_harness_elicitation(
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
             return tombstone.result
+        if timeout_policy is not None:
+            # First park for this (id, fingerprint): take the snapshot the
+            # whole wait — including a later retry — is governed by.
+            timeout_snapshot = _harness_timeout_snapshot(
+                elicitation_id, request_fingerprint, timeout_policy
+            )
         event = ElicitationRequestEvent(
             type="response.elicitation_request",
             elicitation_id=elicitation_id,
@@ -539,21 +746,57 @@ async def _publish_and_wait_for_harness_elicitation(
         )
         resolved_elsewhere_task = asyncio.create_task(parked.resolved_elsewhere.wait())
         race_tasks = (disconnect_task, resolved_elsewhere_task)
+        stop_callback: Callable[[], Awaitable[ElicitationResult | None]] | None = None
         try:
+            if timeout_snapshot is not None:
+                # The snapshot's deadline is fixed at the first park; the
+                # ancestor publish above awaited, so the remaining budget is
+                # measured here — a slow publish must not extend the wait.
+                wait_timeout_s = max(0.0, timeout_snapshot.deadline - time.time())
             waiters: set[asyncio.Future[Any]] = {future, *race_tasks}
             done, _pending = await asyncio.wait(
                 waiters,
-                timeout=timeout_s,
+                timeout=wait_timeout_s,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if (
+                not done
+                and timeout_snapshot is not None
+                and timeout_snapshot.stop_enabled
+                and timeout_snapshot.stop is not None
+            ):
+                # Deadline, not disconnect and not terminal. Decide
+                # synchronously, before the cleanup awaits below, so an
+                # approval that lands from here on is refused by the
+                # timed-out record rather than resolving a wait the
+                # server already ended.
+                if future.done() and future.exception() is None:
+                    # An answer accepted before the decision wins.
+                    settled = True
+                    verdict = future.result()
+                    settled_action = getattr(verdict, "action", None)
+                    _drop_harness_elicitation_timeout(elicitation_id)
+                    return verdict
+                # Only the wait still holding the registry entry may take
+                # the decision: a retry re-parks over it, and a
+                # proxy-stranded older wait must neither stop the turn the
+                # retry is carrying nor double the stop when nobody answers.
+                existing_timed_out = _harness_pre_resolved_elicitations.get(elicitation_id)
+                if _harness_elicitation_registry.get(elicitation_id) is future and not (
+                    existing_timed_out is not None and existing_timed_out.timed_out
+                ):
+                    _mark_harness_elicitation_timed_out(
+                        session_id, elicitation_id, request_fingerprint
+                    )
+                    stop_callback = timeout_snapshot.stop
         finally:
             for race_task in race_tasks:
                 if not race_task.done():
                     race_task.cancel()
                     # Bounded: a cancellation swallowed inside the race
                     # task (e.g. coalesced into an anyio cancel-scope
-                    # unwind) must not convert this cleanup into
-                    # an unbounded wait — that wedged the whole request
+                    # unwind) must not convert this cleanup into an
+                    # unbounded wait — that wedged the whole request
                     # for the gate's timeout. ``asyncio.wait`` absorbs
                     # the CancelledError outcome; an unreaped task is
                     # logged and abandoned to die with the request.
@@ -572,6 +815,32 @@ async def _publish_and_wait_for_harness_elicitation(
                             race_task.get_coro(),
                             elicitation_id,
                         )
+        if stop_callback is not None:
+            try:
+                stop_verdict = await stop_callback()
+            except Exception:  # noqa: BLE001
+                _logger.exception(
+                    "Approval-timeout stop failed for elicitation %s",
+                    elicitation_id,
+                    extra={"session_id": session_id},
+                )
+                stop_verdict = None
+            if stop_verdict is not None:
+                _write_timed_out_harness_elicitation(
+                    session_id, elicitation_id, request_fingerprint, stop_verdict
+                )
+                _drop_harness_elicitation_timeout(elicitation_id)
+                await _persist_approval_timeout_notice(
+                    session_id, elicitation_id, conversation_store
+                )
+                settled = True
+                # The verdict rides in the replay record, not the resolved
+                # event: a verdict and a reason stay mutually exclusive.
+                settled_reason = "timed_out"
+                return stop_verdict
+            # The stop could not be delivered — clear the placeholder and
+            # fall through to the native timeout path.
+            _clear_timed_out_harness_elicitation(session_id, elicitation_id)
         # Only an actual web verdict yields a result; a terminal-side
         # resolution, disconnect, or timeout returns None (fail-ask).
         # Checking ``future in done`` (not ``future.done()``) avoids
@@ -580,8 +849,11 @@ async def _publish_and_wait_for_harness_elicitation(
             settled = True
             verdict = future.result()
             settled_action = getattr(verdict, "action", None)
+            _drop_harness_elicitation_timeout(elicitation_id)
             return verdict
         settled = parked.resolved_elsewhere.is_set()
+        if settled:
+            _drop_harness_elicitation_timeout(elicitation_id)
         return None
     finally:
         # Pop only our own entries — a hook retry may have re-parked
@@ -611,7 +883,12 @@ async def _publish_and_wait_for_harness_elicitation(
                 parked=parked,
             )
         elif published_request:
-            _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
+            _publish_elicitation_resolved(
+                session_id,
+                elicitation_id,
+                action=settled_action,
+                reason=settled_reason,
+            )
             if conversation_store is not None:
                 await asyncio.to_thread(
                     _publish_elicitation_resolved_to_ancestors,
@@ -619,6 +896,7 @@ async def _publish_and_wait_for_harness_elicitation(
                     session_id,
                     elicitation_id,
                     settled_action,
+                    settled_reason,
                 )
 
 
@@ -2420,6 +2698,10 @@ async def _resolve_elicitation(
     badge clear, and runner forward — stay identical regardless of
     how the verdict arrived.
 
+    A verdict for an id the server already timed out is refused with
+    ``elicitation_timed_out`` before any effect below: the wait is
+    over, and accepting a late answer would resurrect a stopped turn.
+
     Three effects, in order:
 
     1. **Server-side harness Future.** Claude-native permission
@@ -2459,6 +2741,24 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    # A timed-out id belongs to a wait the server already ended. Refuse
+    # the answer before the live-future and unknown-id branches can
+    # tombstone or forward it, so the stop is authoritative: no runner
+    # forward, no resolved publish, no overwrite of the replay record.
+    timed_out_record = (
+        _harness_pre_resolved_elicitations.get(elicitation_id)
+        if isinstance(elicitation_id, str) and elicitation_id
+        else None
+    )
+    if (
+        timed_out_record is not None
+        and timed_out_record.timed_out
+        and timed_out_record.session_id == session_id
+    ):
+        raise OmnigentError(
+            "This approval timed out and the turn was stopped.",
+            code=ErrorCode.ELICITATION_TIMED_OUT,
+        )
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation

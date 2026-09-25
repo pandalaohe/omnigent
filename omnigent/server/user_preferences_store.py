@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, TypeAlias, cast
 
 from sqlalchemy.exc import IntegrityError
@@ -28,10 +29,78 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "context_indicator",
         "usage_context",
         "agent_badges",
+        "approval_timeout",
     }
 )
 
 PreferencesEnvelope: TypeAlias = dict[str, Any]
+
+APPROVAL_TIMEOUT_NAMESPACE = "approval_timeout"
+APPROVAL_TIMEOUT_DEFAULT_MINUTES = 50
+APPROVAL_TIMEOUT_MAX_MINUTES = 1380
+
+
+@dataclass(frozen=True)
+class ApprovalTimeout:
+    """
+    Resolved approval / question wait setting for one session owner.
+
+    :param timeout_s: Wait budget in seconds, e.g. ``3000.0``.
+    :param stop_turn: Whether the deadline stops the turn instead of
+        falling back to the harness's native timeout behaviour.
+    """
+
+    timeout_s: float
+    stop_turn: bool
+
+
+def read_approval_timeout(
+    store: SqlAlchemyUserPreferencesStore | None,
+    owner: str | None,
+) -> ApprovalTimeout:
+    """
+    Read one owner's approval-timeout preference, defaulting on any gap.
+
+    The hook path must never fail on a malformed preference row: a
+    missing store / owner / namespace, a non-object value, an invalid
+    field, or a row that fails envelope validation all resolve to the
+    50-minute, stop-enabled default. ``timeoutMinutes`` is clamped to
+    1..1380 so the server always answers before the host-side client
+    budgets give up.
+
+    :param store: Preferences store, or ``None`` when the server has no
+        synced preferences.
+    :param owner: Session owner whose setting applies, or ``None`` when
+        the session has no resolvable owner.
+    :returns: The owner's :class:`ApprovalTimeout`, or the default.
+    """
+    default = ApprovalTimeout(
+        timeout_s=float(APPROVAL_TIMEOUT_DEFAULT_MINUTES) * 60.0,
+        stop_turn=True,
+    )
+    if store is None or owner is None:
+        return default
+    try:
+        envelope = store.get(owner)
+    except UserPreferencesValidationError:
+        return default
+    if not isinstance(envelope, dict):
+        return default
+    settings = envelope.get("settings")
+    if not isinstance(settings, dict):
+        return default
+    value = settings.get(APPROVAL_TIMEOUT_NAMESPACE)
+    if not isinstance(value, dict):
+        return default
+    raw_minutes = value.get("timeoutMinutes")
+    if isinstance(raw_minutes, int) and not isinstance(raw_minutes, bool):
+        minutes = min(max(raw_minutes, 1), APPROVAL_TIMEOUT_MAX_MINUTES)
+        timeout_s = float(minutes) * 60.0
+    else:
+        timeout_s = default.timeout_s
+    raw_stop = value.get("stopTurn")
+    stop_turn = raw_stop if isinstance(raw_stop, bool) else True
+    return ApprovalTimeout(timeout_s=timeout_s, stop_turn=stop_turn)
 
 
 class UserPreferencesValidationError(ValueError):
