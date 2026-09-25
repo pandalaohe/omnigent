@@ -8,11 +8,11 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { useHosts } from "@/hooks/useHosts";
+import { useProjectHostRoots } from "@/hooks/useConversations";
 import {
   deleteProjectHostBinding,
   deleteProjectRepository,
   getProjectCollaboration,
-  getProjectHostRoots,
   putProjectHostBinding,
   putProjectRepository,
   setProjectCollaborationEnabled,
@@ -60,11 +60,7 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
   });
   // The project's root per host; an entry-sourced root is the host's default
   // checkout until a primary enabled binding replaces it (R-CHECKOUT).
-  const hostRoots = useQuery({
-    queryKey: ["project-host-roots", projectId],
-    queryFn: () => getProjectHostRoots(projectId),
-    retry: false,
-  });
+  const hostRoots = useProjectHostRoots(projectId);
   const hosts = useHosts();
   const [actionError, setActionError] = useState<{
     message: string;
