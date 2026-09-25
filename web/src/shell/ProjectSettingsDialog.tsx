@@ -837,15 +837,23 @@ export function ProjectSettingsDialog({
                         role="status"
                         data-testid={`project-settings-entry-post-bind-${row.hostId}`}
                       >
-                        {rowOutcomeWarning ? "Directory saved; " : ""}post-bind command{" "}
-                        {hookStatusLabel(rowOutcome.result.status)}
-                        {rowOutcome.result.error ? `: ${rowOutcome.result.error}` : ""}
-                        {typeof rowOutcome.result.exit_code === "number"
-                          ? ` (exit code ${rowOutcome.result.exit_code})`
-                          : ""}
-                        {rowOutcome.result.output ? (
-                          <pre className="mt-1 whitespace-pre-wrap">{rowOutcome.result.output}</pre>
-                        ) : null}
+                        {rowOutcome.result.status === "ok" ? (
+                          "Post-bind command succeeded"
+                        ) : (
+                          <>
+                            {rowOutcomeWarning ? "Directory saved; " : ""}post-bind command{" "}
+                            {hookStatusLabel(rowOutcome.result.status)}
+                            {rowOutcome.result.error ? `: ${rowOutcome.result.error}` : ""}
+                            {typeof rowOutcome.result.exit_code === "number"
+                              ? ` (exit code ${rowOutcome.result.exit_code})`
+                              : ""}
+                            {rowOutcome.result.output ? (
+                              <pre className="mt-1 whitespace-pre-wrap">
+                                {rowOutcome.result.output}
+                              </pre>
+                            ) : null}
+                          </>
+                        )}
                       </div>
                     )}
                     {rowError && (
