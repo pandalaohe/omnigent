@@ -22,6 +22,8 @@ from typing import Any
 
 import pytest
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
+from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -95,6 +97,7 @@ class _SnapshotServerClient(NullServerClient):
         """Configure the bodies returned for the child and parent session GETs."""
         self._child_body = child_body
         self._parent_body = parent_body
+        self.posts: list[tuple[str, dict[str, Any]]] = []
 
     class _Resp:
         def __init__(self, payload: dict[str, Any]) -> None:
@@ -115,6 +118,11 @@ class _SnapshotServerClient(NullServerClient):
             return self._Resp(self._parent_body)
         if url.rstrip("/").endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
+        return self._Response()
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        """Record the request, then answer like the empty-200 base client."""
+        self.posts.append((url, kwargs))
         return self._Response()
 
 
@@ -208,6 +216,7 @@ def _child_snapshot(
     sub_agent_name: str | None,
     parent_session_id: str | None,
     agent_name: str | None = "cursor-native-ui",
+    labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a child ``SessionResponse``-shaped body."""
     return {
@@ -218,6 +227,7 @@ def _child_snapshot(
         "parent_session_id": parent_session_id,
         "created_at": 0,
         "workspace": None,
+        "labels": labels or {},
     }
 
 
@@ -234,22 +244,25 @@ def _parent_snapshot(*, parent_session_id: str | None) -> dict[str, Any]:
     }
 
 
-async def _post_native_idle(
+async def _post_native_status(
     *,
     child_body: dict[str, Any],
     seed_parent_inbox: bool,
     register_work: bool,
+    status: str = "idle",
     output: str = "review complete: LGTM",
     parent_body: dict[str, Any] | None = None,
-) -> tuple[int, list[dict[str, Any]]]:
-    """POST a native ``external_session_status: idle`` and return (http, inbox items).
+) -> tuple[int, list[dict[str, Any]], _SnapshotServerClient]:
+    """POST an ``external_session_status`` edge and return (http, inbox items, client).
 
     Models the forwarder reporting a finished native sub-agent turn.
     ``register_work`` seeds the in-memory work entry (the healthy case); leaving
     it ``False`` models a reconnect-wiped map or a ``sys_session_create`` child
     the dispatch never registered. ``seed_parent_inbox`` controls whether the
     parent's inbox queue is present on this runner. ``parent_body`` is the
-    parent's session snapshot; when omitted the parent reads as top-level.
+    parent's session snapshot; when omitted the parent reads as top-level. The
+    returned client records every POST it served, so a test can assert that no
+    wake notice was posted.
     """
     if seed_parent_inbox:
         runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
@@ -271,10 +284,11 @@ async def _post_native_idle(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
         )
 
+    server_client = _SnapshotServerClient(child_body, parent_body)
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=_SnapshotServerClient(child_body, parent_body),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
     )
 
     async with _runner_client(app) as client:
@@ -282,7 +296,7 @@ async def _post_native_idle(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
             json={
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": output},
+                "data": {"status": status, "output": output},
             },
         )
 
@@ -291,7 +305,26 @@ async def _post_native_idle(
     if inbox is not None:
         while not inbox.empty():
             items.append(inbox.get_nowait())
-    return resp.status_code, items
+    return resp.status_code, items, server_client
+
+
+async def _post_native_idle(
+    *,
+    child_body: dict[str, Any],
+    seed_parent_inbox: bool,
+    register_work: bool,
+    output: str = "review complete: LGTM",
+    parent_body: dict[str, Any] | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """POST a native ``external_session_status: idle`` and return (http, inbox items)."""
+    http, items, _client = await _post_native_status(
+        child_body=child_body,
+        seed_parent_inbox=seed_parent_inbox,
+        register_work=register_work,
+        output=output,
+        parent_body=parent_body,
+    )
+    return http, items
 
 
 @pytest.mark.asyncio
@@ -348,6 +381,42 @@ async def test_sys_session_create_child_without_sub_agent_name_delivers(
     )
     assert items[0]["status"] == "completed"
     assert items[0]["agent"] == "cursor-native-ui"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "failed"])
+async def test_claude_agent_tool_mirror_terminal_status_is_not_redelivered(
+    _clean_subagent_registry: None,
+    status: str,
+) -> None:
+    """A mirrored Claude Agent-tool sub-agent must not be delivered twice.
+
+    The forwarder mirrors each Claude Code Agent-tool sub-agent and derives the
+    parent edge from Claude's own hand-back of the result, so the parent already
+    has it natively. The terminal status still arrives here for display
+    bookkeeping; enqueueing an inbox entry and posting a wake notice on top
+    would deliver the result a second time.
+    """
+    http, items, server_client = await _post_native_status(
+        status=status,
+        child_body=_child_snapshot(
+            sub_agent_name=None,
+            parent_session_id=PARENT_SESSION_ID,
+            labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_CODING_AGENT.subagent_wrapper_label},
+        ),
+        seed_parent_inbox=True,
+        register_work=False,
+    )
+    # Let a wake task, if one was scheduled, reach its POST before asserting.
+    await asyncio.sleep(0.05)
+
+    assert http == 204
+    assert items == [], f"a mirrored Agent-tool sub-agent was delivered twice (status={status})"
+    assert runner_app.get_subagent_work(CHILD_SESSION_ID) is None
+    assert server_client.posts == [], (
+        f"a mirrored Claude Agent-tool sub-agent posted a wake notice (status={status}); "
+        "Claude Code already handed the result back to the parent"
+    )
 
 
 @pytest.mark.asyncio
