@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import shlex
 import shutil
 import threading
 import uuid
@@ -752,6 +753,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launched.args == [
         "codex",
         "--",
+        "-c",
+        "check_for_update_on_startup=false",
         "--dangerously-bypass-hook-trust",
         *permission_args,
         "resume",
@@ -766,6 +769,24 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
+    # A kept pane is what lets the exit event carry Codex's exit status and
+    # final screen; without it an early exit is just "no server running".
+    assert launched.keep_alive_after_exit is True
+    launch_events = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "codex_terminal_launch"
+    ]
+    assert len(launch_events) == 1
+    assert launch_events[0].session_id == session_id
+    assert launch_events[0].attributes["command"] == "codex-wrapper"
+    assert launch_events[0].attributes["resume"] is True
+    from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
+
+    assert launch_events[0].attributes["args"] == shlex.join(
+        redact_codex_launch_args(launched.args)
+    )
+    from omnigent.harnesses.codex_native.app_server import _format_codex_version
+
+    assert launch_events[0].attributes["codex_cli_version"] == _format_codex_version(version)
     assert preload_calls == [
         (
             app_server.listen_url,
@@ -1681,7 +1702,11 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     # session behind Codex's terminal-only hook review screen. Omnigent's
     # supported Codex floor is newer than the release that added this flag.
     assert app_server.codex_cli_version is None
-    assert launch_captured["spec"].args[0] == "--dangerously-bypass-hook-trust"
+    assert launch_captured["spec"].args[:3] == [
+        "-c",
+        "check_for_update_on_startup=false",
+        "--dangerously-bypass-hook-trust",
+    ]
 
 
 @pytest.mark.asyncio

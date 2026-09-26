@@ -23,6 +23,7 @@ class Feature(StrEnum):
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
+    CUSTOMIZE = "customize"
     PROJECT_ASSIGNMENTS = "project_assignments"
     SESSION_PEER_MESSAGING = "session_peer_messaging"
 
@@ -54,6 +55,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.CANVAS,
         description="Web Canvas page: sessions as draggable cards grouped by project",
+        owner="web",
+        review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CUSTOMIZE,
+        description="Web Customize settings section (Harnesses & Skills)",
         owner="web",
         review_by_release="0.15.0",
     ),

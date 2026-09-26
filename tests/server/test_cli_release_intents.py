@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -23,6 +24,15 @@ from omnigent.server.cli_retention import (
 from omnigent.stores.conversation_store import ConversationArchiveClosingError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
+
+
+@pytest.fixture(autouse=True)
+def _no_archive_undo_grace() -> Iterator[None]:
+    """Expand archive roots at once; the Undo grace has its own tests."""
+    from omnigent.server.routes import sessions as _sessions_facade
+
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0):
+        yield
 
 
 class _Registry:

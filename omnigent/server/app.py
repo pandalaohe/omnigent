@@ -1421,6 +1421,7 @@ def create_app(
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
+    default_public_sessions: str | Callable[[], str] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1561,6 +1562,12 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param default_public_sessions: Which new sessions start with a public
+        read grant: ``"off"`` (all private), ``"sandbox"`` (managed cloud
+        sandbox sessions only) or ``"all"``. Same shape as ``public_sharing``:
+        ``None`` reads ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (default ``off``)
+        with an admin-editable file override; a static value or callable is
+        authoritative. Never grants past ``sharing_mode``/``public_sharing``.
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
@@ -1900,6 +1907,7 @@ def create_app(
                 # (before this lifespan runs), so it is already on state here.
                 sandbox_config=sandbox_config,
                 managed_launches=app_inst.state.managed_launches,
+                app_state=app_inst.state,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -1993,7 +2001,7 @@ def create_app(
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
 
-    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
 
     runner_account_store = (
         account_store
@@ -2063,7 +2071,7 @@ def create_app(
     # promoted (``promote_if_listed`` runs at login) would be authorized by the
     # routes yet see no admin chrome. The file portion lazily reloads on mtime
     # change (no restart).
-    from omnigent.server.admin_list import load_admin_list
+    from omnigent.server.admin_list import load_admin_list, promote_if_listed
 
     admin_list = load_admin_list(extra=frozenset(admins or ()))
     # Session-sharing policy, normalized to a per-request callable, plus a
@@ -2123,6 +2131,33 @@ def create_app(
         _public_static = bool(public_sharing)
         app.state.public_sharing = lambda: _public_static
         app.state.public_sharing_writable = False
+    # Default-public policy for NEW sessions, same shape as public_sharing.
+    from omnigent.server.sharing_settings import DefaultPublicSessions
+
+    if default_public_sessions is None:
+        from omnigent.server.sharing_settings import (
+            default_public_sessions_env_default,
+            read_default_public_sessions_override,
+        )
+
+        _default_public_env = default_public_sessions_env_default()
+
+        def _resolve_default_public_sessions() -> DefaultPublicSessions:
+            override = read_default_public_sessions_override()
+            return override if override is not None else _default_public_env
+
+        app.state.default_public_sessions = _resolve_default_public_sessions
+        app.state.default_public_sessions_writable = True
+    elif callable(default_public_sessions):
+        _default_public_callable = default_public_sessions
+        app.state.default_public_sessions = lambda: DefaultPublicSessions.coerce(
+            _default_public_callable()
+        )
+        app.state.default_public_sessions_writable = False
+    else:
+        _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
+        app.state.default_public_sessions = lambda: _default_public_static
+        app.state.default_public_sessions_writable = False
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -2294,6 +2329,9 @@ def create_app(
                         operation="create",
                         creation_kind=_bag.get("creation_kind", "unknown"),
                         host_type=_bag.get("host_type", "unknown"),
+                        create_persistence_ms=_bag.get("create_persistence_ms"),
+                        create_identity_ms=_bag.get("create_identity_ms"),
+                        create_acl_ms=_bag.get("create_acl_ms"),
                         stage="create_request",
                         status_code=status_code,
                         error_code=(
@@ -3194,6 +3232,11 @@ def create_app(
         EVERY mode, including OIDC/SSO where the accounts-only
         ``/auth/me`` endpoint does not exist.
 
+        An identity the admin list names but the database doesn't yet
+        flag is promoted here, as login does for OIDC and accounts.
+        Header auth has no login step, so without this a listed admin
+        would see admin chrome that every admin-gated route refuses.
+
         When OIDC is active and the user is unauthenticated,
         returns 401 with a ``login_url`` so the frontend knows
         where to redirect.
@@ -3214,16 +3257,22 @@ def create_app(
                 headers={"Cache-Control": "private, no-store"},
             )
         http_response.headers["Cache-Control"] = "private, no-store"
-        # Mirror the admin check the auth routes use
-        # (``permission_store.is_admin(caller) or admin_list.is_admin(caller)``)
-        # so the SPA's admin chrome never under-reports relative to what the
-        # endpoints actually authorize — e.g. for an identity added to the
-        # admin-list file who hasn't re-logged-in yet (so ``promote_if_listed``
-        # hasn't flipped the DB flag).
-        is_admin = user_id is not None and (
-            (permission_store is not None and permission_store.is_admin(user_id))
-            or admin_list.is_admin(user_id)
-        )
+        is_admin = False
+        if user_id is not None:
+            listed = admin_list.is_admin(user_id)
+            flagged = permission_store is not None and permission_store.is_admin(user_id)
+            if listed and not flagged and permission_store is not None:
+                # Same promotion OIDC runs at login (see routes/auth.py). Best-effort:
+                # a failed write must not break identity resolution.
+                try:
+                    await asyncio.to_thread(permission_store.ensure_user, user_id)
+                    await asyncio.to_thread(
+                        promote_if_listed, admin_list, permission_store, user_id
+                    )
+                except Exception:  # noqa: BLE001
+                    _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
+            # Still report the list, so admin chrome shows even if promotion failed.
+            is_admin = flagged or listed
         preferences = None
         preferences_owner: str | None = None
         if auth_provider is None:
@@ -4510,6 +4559,7 @@ def create_app(
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
+    app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before
         # routing and every other middleware sees canonical `/v1/...` paths.

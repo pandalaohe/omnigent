@@ -177,6 +177,7 @@ async def post_external_session_status(
     background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
     replayed: bool = False,
+    failure_detail: str | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -209,11 +210,17 @@ async def post_external_session_status(
     :param replayed: Whether this terminal edge was restored from historical
         cold-resume metadata. Only ``True`` is serialized; live/default edges
         omit the field for backward compatibility.
+    :param failure_detail: Optional harness-reported reason for a ``"failed"``
+        edge, e.g. ``"API Error: 500 Internal server error"``. Unlike
+        ``output`` it keeps the harness-neutral failure code, and servers
+        that predate it ignore it. Ignored when falsy.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
     if output:
         data["output"] = output
+    if failure_detail:
+        data["failure_detail"] = failure_detail
     if background_task_count is not None:
         data["background_task_count"] = background_task_count
     if background_tasks is not None:

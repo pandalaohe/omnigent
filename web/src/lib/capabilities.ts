@@ -61,6 +61,7 @@ export type FeatureKey =
   | "usage_page"
   | "harness_install"
   | "canvas"
+  | "customize"
   | "project_assignments"
   | "session_peer_messaging";
 

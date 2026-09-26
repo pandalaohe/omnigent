@@ -29,13 +29,13 @@ vi.mock("@/lib/projectsApi", () => ({
 }));
 vi.mock("./WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
-  HostWorkspacePicker: ({ onNavigate }: { onNavigate: (path: string) => void }) => (
+  HostWorkspacePicker: ({ onSelect }: { onSelect: (path: string) => void }) => (
     <div>
       <input data-testid="mock-checkout-picker-input" />
-      <button type="button" onClick={() => onNavigate("/picked/path")}>
+      <button type="button" onClick={() => onSelect("/picked/path")}>
         Choose folder
       </button>
-      <button type="button" onClick={() => onNavigate("/entered/path")}>
+      <button type="button" onClick={() => onSelect("/entered/path")}>
         Open folder with Enter
       </button>
     </div>

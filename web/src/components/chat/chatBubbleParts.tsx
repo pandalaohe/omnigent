@@ -18,10 +18,10 @@ import {
   CopyIcon,
   FileTextIcon,
   FolderIcon,
-  GitForkIcon,
   ImageIcon,
   Link2Icon,
   Loader2Icon,
+  SplitIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -92,6 +92,13 @@ import {
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 
+const COLLAPSE_THRESHOLD = 12000;
+
+// Slice a string by threshold and remove corrupted symbols
+function sliceByCodePoint(str: string, limit: number): string {
+  return str.slice(0, limit).replace(/[\uD800-\uDBFF]$/, "");
+}
+
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
 export const SessionSharedContext = createContext(false);
@@ -158,6 +165,7 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
+const MERMAID_FENCE_RE = /^ {0,3}(?:`{3,}|~{3,})mermaid(?:\s|$)/im;
 
 function isMarkdownTableRow(line: string): boolean {
   return line.trim().includes("|");
@@ -180,6 +188,10 @@ export function containsMarkdownTable(items: RenderItem[]): boolean {
 
 export function containsDisplayMath(items: RenderItem[]): boolean {
   return items.some((item) => item.kind === "text" && DISPLAY_MATH_RE.test(item.text));
+}
+
+export function containsMermaidDiagram(items: RenderItem[]): boolean {
+  return items.some((item) => item.kind === "text" && MERMAID_FENCE_RE.test(item.text));
 }
 
 /**
@@ -717,6 +729,10 @@ function UserBubble({
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
+  // Collapse long prompts by default to avoid expensive Markdown parsing and
+  // a large DOM for text the user hasn't asked to read yet.
+  const isLong = text.length > COLLAPSE_THRESHOLD;
+  const [isCollapsed, setIsCollapsed] = useState(isLong);
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
@@ -739,7 +755,7 @@ function UserBubble({
       data-role="user"
       data-user-message-id={bubble.itemId}
       data-message-id={bubble.itemId}
-      className={cn("max-w-[640px]", flashing && "animate-message-highlight")}
+      className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
@@ -766,6 +782,7 @@ function UserBubble({
             </Tooltip>
           )}
           <MessageContent
+            className={flashing ? "animate-message-highlight" : undefined}
             // Another contributor's bubble takes their avatar color at low
             // alpha instead of the default bg-muted.
             style={
@@ -798,58 +815,90 @@ function UserBubble({
                 ))}
               </div>
             )}
-            {/* Preserve the authored text/attachment order after send. Adjacent
-                text is already coalesced by the composer, so each block can be
-                rendered directly without lifting uploads ahead of prose. */}
-            {keyedContent.map(({ block, key }) => {
-              if (isTextBlock(block)) {
-                const visible = block.text.replace(ATTACHED_RE, "").trim();
-                return visible ? (
-                  <FilePathAwareMessageResponse
-                    key={key}
-                    breaks
-                    mode="static"
-                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                  >
-                    {visible}
-                  </FilePathAwareMessageResponse>
-                ) : null;
-              }
-              if (block.type === "input_image") {
-                const preview = imagePreview(block);
-                return (
-                  <div key={key} className="my-1.5 flex overflow-x-auto">
-                    {preview.kind === "uploaded" ? (
-                      <SessionImage
-                        path={
-                          sessionId
-                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(preview.fileId)}/content`
-                            : undefined
-                        }
-                        alt={preview.alt}
-                        className="rounded-md object-contain"
-                      />
-                    ) : preview.kind === "inline" ? (
-                      <InlineImage
-                        src={preview.src}
-                        alt={preview.alt}
-                        className="rounded-md object-contain"
-                      />
-                    ) : (
-                      <AttachmentChip icon={ImageIcon} label={preview.label} />
+            {/* Preserve the authored text/attachment order after send (MOD-s10).
+                Adjacent text is already coalesced by the composer, so each block
+                can be rendered directly without lifting uploads ahead of prose.
+                A long prompt collapses (upstream #7731): while collapsed only the
+                first COLLAPSE_THRESHOLD characters of text reach the Markdown
+                renderer and the box clips at max-h-64. */}
+            {(() => {
+              let budget = isCollapsed ? COLLAPSE_THRESHOLD : Number.POSITIVE_INFINITY;
+              const blocks = keyedContent.map(({ block, key }) => {
+                if (isTextBlock(block)) {
+                  const full = block.text.replace(ATTACHED_RE, "").trim();
+                  if (!full || budget <= 0) return null;
+                  const visible = budget < full.length ? sliceByCodePoint(full, budget) : full;
+                  budget -= visible.length;
+                  return (
+                    <FilePathAwareMessageResponse
+                      key={key}
+                      breaks
+                      mode="static"
+                      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                    >
+                      {visible}
+                    </FilePathAwareMessageResponse>
+                  );
+                }
+                if (block.type === "input_image") {
+                  const preview = imagePreview(block);
+                  return (
+                    <div key={key} className="my-1.5 flex overflow-x-auto">
+                      {preview.kind === "uploaded" ? (
+                        <SessionImage
+                          path={
+                            sessionId
+                              ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(preview.fileId)}/content`
+                              : undefined
+                          }
+                          alt={preview.alt}
+                          className="rounded-md object-contain"
+                        />
+                      ) : preview.kind === "inline" ? (
+                        <InlineImage
+                          src={preview.src}
+                          alt={preview.alt}
+                          className="rounded-md object-contain"
+                        />
+                      ) : (
+                        <AttachmentChip icon={ImageIcon} label={preview.label} />
+                      )}
+                    </div>
+                  );
+                }
+                if (block.type === "input_file") {
+                  return (
+                    <div key={key} className="my-1.5 flex flex-wrap gap-1.5">
+                      <AttachmentChip icon={FileTextIcon} label={attachmentLabel(block)} />
+                    </div>
+                  );
+                }
+                return null;
+              });
+              return (
+                <>
+                  <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
+                    {blocks}
+                    {/* Gradient fade at the bottom of collapsed prompts to signal
+                        there is more content below. */}
+                    {isCollapsed && isLong && (
+                      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
                     )}
                   </div>
-                );
-              }
-              if (block.type === "input_file") {
-                return (
-                  <div key={key} className="my-1.5 flex flex-wrap gap-1.5">
-                    <AttachmentChip icon={FileTextIcon} label={attachmentLabel(block)} />
-                  </div>
-                );
-              }
-              return null;
-            })}
+                  {isLong && (
+                    <button
+                      type="button"
+                      onClick={() => setIsCollapsed((c) => !c)}
+                      className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      {isCollapsed
+                        ? `Show full prompt (${text.length.toLocaleString()} chars)`
+                        : "Collapse prompt"}
+                    </button>
+                  )}
+                </>
+              );
+            })()}
           </MessageContent>
         </div>
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
@@ -998,7 +1047,10 @@ function AssistantBubble({
   // Elicitation cards want full chat-column width to match the composer.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide =
-    hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
+    hasElicitation ||
+    containsMarkdownTable(bubble.items) ||
+    containsDisplayMath(bubble.items) ||
+    containsMermaidDiagram(bubble.items);
   // An error banner's dashed rule spans the full chat column.
   const hasError = bubble.items.some((it) => it.kind === "error");
   // A bubble carrying an error but no prose stands alone as a thread-level
@@ -1014,14 +1066,18 @@ function AssistantBubble({
         data-role="assistant"
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={cn(
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]",
-          flashing && "animate-message-highlight",
-        )}
+        className={
+          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
+        }
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap rather
             than shrink-wrapping to the summary row's ~110px. */}
-        <MessageContent className={spansFullColumn || foldOnly ? "w-full" : undefined}>
+        <MessageContent
+          className={cn(
+            (spansFullColumn || foldOnly) && "w-full",
+            flashing && "animate-message-highlight rounded-lg",
+          )}
+        >
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -1049,8 +1105,10 @@ function AssistantBubble({
         {!foldOnly && !errorOnly && (
           <div
             className={cn(
-              "flex items-center gap-3 py-1 opacity-40 transition-opacity md:group-hover:opacity-100 md:group-focus-within:opacity-100",
-              !actionsPersistent && "md:opacity-0",
+              "flex items-center gap-3 py-1",
+              actionsPersistent
+                ? "opacity-100"
+                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
             )}
           >
             <MessageActions>
@@ -1075,7 +1133,7 @@ function AssistantBubble({
                   onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
                   componentId="chat.message.fork"
                 >
-                  <GitForkIcon size={14} />
+                  <SplitIcon size={14} />
                 </MessageAction>
               )}
               <MessageAction

@@ -78,6 +78,7 @@ vi.mock("@/store/chatStore", () => ({
   hydrateLocalConversation: (...args: unknown[]) => hydrateLocalConversationMock(...args),
   removeLocalConversation: vi.fn(),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
+  hasPendingLocalMessage: () => true,
 }));
 
 vi.mock("@/lib/sessionUpdatesSocket", () => ({

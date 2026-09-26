@@ -74,12 +74,8 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
-import {
-  HostWorkspacePicker,
-  isNavigablePath,
-  resolveWorkspacePath,
-  useResolvedHostHome,
-} from "./WorkspacePicker";
+import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -713,7 +709,6 @@ export function ForkSessionForm({
   const [workspace, setWorkspace] = useState("");
   const [branchName, setBranchName] = useState("");
   const [browsing, setBrowsing] = useState(false);
-  const [browseNonce, setBrowseNonce] = useState(0);
   // Whether the "connect another host" CLI hint is expanded (only shown when
   // at least one host is online; otherwise the instructions render directly).
   const [showConnect, setShowConnect] = useState(false);
@@ -988,7 +983,6 @@ export function ForkSessionForm({
   function commitWorkspacePath(path: string): void {
     setWorkspace(path);
     setBrowsing(true);
-    setBrowseNonce((n) => n + 1);
   }
 
   async function handleFork(): Promise<void> {
@@ -1380,20 +1374,13 @@ export function ForkSessionForm({
                           recent={recent}
                           dropdownDisabled={browsing}
                         />
-                        {browsing && (
-                          <HostWorkspacePicker
-                            key={browseNonce}
-                            hostId={selectedHostId}
-                            initialPath={
-                              isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
-                            }
-                            onSelect={(path) => {
-                              setWorkspace(path);
-                              setBrowsing(false);
-                            }}
-                            onClose={() => setBrowsing(false)}
-                          />
-                        )}
+                        <WorkspacePickerDialog
+                          open={browsing}
+                          onOpenChange={setBrowsing}
+                          hostId={selectedHostId}
+                          initialPath={workspaceTrimmed}
+                          onConfirm={setWorkspace}
+                        />
                         {showMismatchWarning && (
                           <p
                             className="flex items-start gap-1.5 text-sm text-warning"

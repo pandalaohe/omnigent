@@ -6,7 +6,7 @@ import { useId, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useProjectHostRoots } from "@/hooks/useConversations";
 import {
@@ -372,37 +372,19 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
             type="button"
             variant="outline"
             data-testid="project-collaboration-binding-browse"
-            onClick={() => setWorkspaceOpen((value) => !value)}
+            onClick={() => setWorkspaceOpen(true)}
             disabled={selectedHost?.status !== "online" || bindingAddMutation.isPending}
           >
             Browse…
           </Button>
-          {workspaceOpen && selectedHost && (
-            <>
-              <button
-                type="button"
-                aria-label="Close checkout browser"
-                className="fixed inset-0 z-10 cursor-default"
-                onClick={() => setWorkspaceOpen(false)}
-              />
-              <div
-                className="absolute top-full right-0 left-0 z-20 mt-1 rounded-xl border bg-popover p-2 shadow-menu"
-                onKeyDown={(e) => {
-                  if (
-                    e.key === "Enter" &&
-                    e.target instanceof HTMLInputElement &&
-                    (e.target.type === "text" || e.target.type === "search")
-                  )
-                    e.preventDefault();
-                }}
-              >
-                <HostWorkspacePicker
-                  hostId={selectedHost.host_id}
-                  initialPath={isNavigablePath(bindingWorkspace) ? bindingWorkspace : undefined}
-                  onNavigate={setBindingWorkspace}
-                />
-              </div>
-            </>
+          {selectedHost && (
+            <WorkspacePickerDialog
+              open={workspaceOpen}
+              onOpenChange={setWorkspaceOpen}
+              hostId={selectedHost.host_id}
+              initialPath={bindingWorkspace}
+              onConfirm={setBindingWorkspace}
+            />
           )}
         </div>
         <p className="text-sm text-muted-foreground">Type the absolute path, or Browse… the host</p>

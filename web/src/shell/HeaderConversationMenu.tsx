@@ -265,7 +265,7 @@ export function HeaderConversationMenu({
 
     // The Undo toast is driven by module state + the app-level Toaster, so it
     // survives this menu unmounting.
-    showArchiveUndoToast(queryClient, [conversation]);
+    showArchiveUndoToast(queryClient, [conversation], navigate);
     navigate("/", { replace: true });
   };
 

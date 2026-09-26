@@ -108,6 +108,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
@@ -138,7 +139,7 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
@@ -345,6 +346,11 @@ export function beginLocalConversation(
   const bubble: PendingUserMessage = {
     tempId: pendingMsgTempId,
     content: pendingComposerContent(text, files ?? [], composerParts),
+    initialDraft: {
+      text,
+      files: files ?? [],
+      ...(composerParts ? { composerParts: [...composerParts] } : {}),
+    },
     createdAtS: Math.floor(Date.now() / 1000),
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
@@ -388,6 +394,27 @@ export function beginLocalConversation(
   return { tempConvId, pendingMsgTempId, createToken };
 }
 
+/** Whether a temporary conversation still owns its unsent first message. */
+export function hasPendingLocalMessage(tempConvId: string): boolean {
+  return (
+    conversationRegistry
+      .peek(tempConvId)
+      ?.getState()
+      .pendingUserMessages.some((message) => message.initialDraft !== undefined) ?? false
+  );
+}
+
+/**
+ * Hydrate a client-only conversation onto its real server id once
+ * `createSession` returns: rekey the registry entry (carrying the optimistic
+ * bubble), the send chain, and the sidebar row from `tempConvId` to `realId`;
+ * flip the store + URL when still viewing it; then POST the first message via
+ * `send` (reusing the already-shown bubble), which binds the real stream.
+ *
+ * Navigate-away safe: the registry/chain/sidebar rekey is id-addressed and
+ * always runs. The store flip + `navigate` run ONLY when still on `tempConvId`,
+ * so a background create can't yank a user who has moved to another chat.
+ */
 export function hydrateLocalConversation(
   tempConvId: string,
   realId: string,
@@ -401,8 +428,18 @@ export function hydrateLocalConversation(
   project?: LocalConversationProject,
   composerParts?: ComposerDraftPart[],
 ): void {
+  const shouldSend = hasPendingLocalMessage(tempConvId);
+  const restoredDraft = conversationRegistry.peek(tempConvId)?.getState().failedSendDraft;
+  // Registry entry (carrying the optimistic bubble) + the sidebar row, both
+  // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
+  // can't drop it. No send-chain migration: the composer is read-only for a temp
+  // id, so no send is ever keyed under it — the hydrating `send` below enters
+  // the chain under the real id directly.
   conversationRegistry.rekey(tempConvId, realId);
   rekeyConvRow(tempConvId, realId, text, project);
+  if (restoredDraft) {
+    setterFor(realId)({ failedSendDraft: { ...restoredDraft, conversationId: realId } });
+  }
 
   const stillViewing = useChatStore.getState().conversationId === tempConvId && isStillViewing();
   if (stillViewing) {
@@ -410,6 +447,14 @@ export function hydrateLocalConversation(
     conversationRegistry.setActive(realId);
     mirrorActiveEntry();
     navigate(`/c/${realId}`, { replace: true });
+  }
+
+  if (!shouldSend) {
+    // Creation can finish after Interrupt; bind the empty session without sending.
+    void ensureBoundSession(agentId, useChatStore.getState, undefined, realId).catch(() => {
+      // bindStream records load failures on the conversation.
+    });
+    return;
   }
 
   const store = useChatStore.getState();
@@ -459,6 +504,8 @@ export function removeLocalConversation(tempConvId: string): boolean {
 export interface PendingUserMessage {
   tempId: string;
   content: MessageContentBlock[];
+  /** Unsent draft awaiting session/model readiness, including unuploaded files. */
+  initialDraft?: { text: string; files: File[]; composerParts?: ComposerDraftPart[] };
   /** Client epoch seconds stamped ONCE at send time — the optimistic
    *  bubble's display timestamp. Stamping here (not at render or
    *  promotion) keeps the shown time pinned to when the user hit send.
@@ -1266,6 +1313,57 @@ let queueSeq = 0;
 // never reordering a slow one.
 const SEND_CHAIN_MAX_WAIT_MS = 180_000;
 
+function modelSelectionPending(state: ConversationState): boolean {
+  // Claude reports its model before a prompt; other native CLIs may need a turn.
+  return (
+    state.pendingModelChange !== null ||
+    (state.sessionModelSeeded && state.sessionHarness === "claude-native")
+  );
+}
+
+/** Keep the draft local while native model startup or a model switch is pending. */
+function waitForModelSelection(conversationId: string, tempId: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const finish = (ready: boolean, error?: Error) => {
+      clearTimeout(timer);
+      unsubscribe();
+      unsubscribeDisposed();
+      if (error) reject(error);
+      else resolve(ready);
+    };
+    const check = () => {
+      const entry = conversationRegistry.peek(conversationId);
+      const state = entry?.getState();
+      if (
+        !state ||
+        entry?.disposed ||
+        !state.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft)
+      ) {
+        finish(false);
+      } else if (state.conversationLoadError || state.sessionStatus === "failed") {
+        finish(
+          false,
+          state.conversationLoadError ?? new Error("Session failed before the message was sent."),
+        );
+      } else if (!modelSelectionPending(state)) {
+        finish(true);
+      }
+    };
+    const unsubscribe = conversationRegistry.subscribe((id) => {
+      if (id === conversationId) check();
+    });
+    const unsubscribeDisposed = conversationRegistry.subscribeDisposed((id) => {
+      if (id === conversationId) finish(false);
+    });
+    const timer = setTimeout(
+      () =>
+        finish(false, new Error("The model did not finish starting. Please retry the message.")),
+      SEND_CHAIN_MAX_WAIT_MS,
+    );
+    check();
+  });
+}
+
 /**
  * Read one conversation's server-side status from the sidebar cache.
  *
@@ -2037,6 +2135,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (opensSideChat) {
       useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
     }
+    const targetState = pinnedId === null ? get() : setterForState(pinnedId);
+    const initialDraft =
+      opts?.reusePendingTempId != null
+        ? targetState?.pendingUserMessages.find((p) => p.tempId === opts.reusePendingTempId)
+            ?.initialDraft
+        : !opensSideChat &&
+            targetState &&
+            (modelSelectionPending(targetState) ||
+              (targetState.sessionModelSeeded && targetState.sessionHarness === null))
+          ? {
+              text,
+              files: files ?? [],
+              ...(opts?.composerParts ? { composerParts: opts.composerParts } : {}),
+            }
+          : undefined;
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
@@ -2085,6 +2198,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               {
                 tempId,
                 content,
+                ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
               },
@@ -2116,14 +2230,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    let initialDispatched = false;
+    const initialSendPending = () => {
+      const id = postedSessionId ?? submitConversationId;
+      const state = id === null ? get() : setterForState(id);
+      return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
+    };
 
     try {
       await waitForPrior();
+      if (initialDraft && !initialSendPending()) return;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
+      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -2137,6 +2259,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         (block): block is Extract<ContentBlock, { type: "input_image" | "input_file" }> =>
           block.type === "input_image" || block.type === "input_file",
       );
+      if (initialDraft && !initialSendPending()) return;
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -2155,6 +2278,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
       }
 
+      if (initialDraft) {
+        // From this point Interrupt belongs to the runner, not the local draft.
+        setterFor(sessionId)((s) => ({
+          pendingUserMessages: s.pendingUserMessages.map((p) =>
+            p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
+          ),
+          status: "streaming",
+          sendLatchedAt: Date.now(),
+        }));
+        initialDispatched = true;
+      }
       const postResult = await postEvent(sessionId, {
         type: "message",
         data: {
@@ -2209,6 +2343,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // status transitions that happen during the turn.
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
+      if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
@@ -2425,8 +2560,32 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   stop: async () => {
-    const sessionId = get().conversationId;
-    if (!sessionId || interruptRequestsInFlight.has(sessionId)) return;
+    const state = get();
+    const sessionId = state.conversationId;
+    if (!sessionId) return;
+    // Upstream #8039: a first message still held locally (model selection or
+    // native startup pending) is cancelled here and handed back to the
+    // composer; it never reached the runner, so nothing is interrupted for it.
+    const initialDraft = state.pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
+    if (initialDraft) {
+      const draft = getSessionDraft(sessionId) ?? initialDraft;
+      setSessionDraft(sessionId, draft);
+      setActive({
+        pendingUserMessages: [],
+        status: "idle",
+        sendLatchedAt: null,
+        failedSendDraft: { ...draft, conversationId: sessionId },
+      });
+      // A local follow-up must not prevent Interrupt from stopping earlier work.
+      if (
+        state.activeResponse?.state !== "streaming" &&
+        state.sessionStatus !== "running" &&
+        state.sessionStatus !== "waiting" &&
+        state.backgroundTaskCount === 0
+      )
+        return;
+    }
+    if (isTempConvId(sessionId) || interruptRequestsInFlight.has(sessionId)) return;
     interruptRequestsInFlight.add(sessionId);
     // Keep the stream and lifecycle state live until the server confirms that
     // the runner accepted the interrupt. Optimistically forcing idle here hid
@@ -3791,7 +3950,10 @@ async function bindStream(
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
   if (getOmnigentHostConfig().fetcher && getSessionHost(id) === null) {
     try {
-      await getSessionSlim(id);
+      // Prefer the registered resolver: it walks a hostless sub-agent child up
+      // to its host-bound ancestor. Without one, the bare snapshot still seeds
+      // a top-level session's own host.
+      await (resolveSessionHost(id) ?? getSessionSlim(id));
     } catch {
       // Best-effort: a failed resolve (bad id, transient) falls through to the
       // unkeyed open; the snapshot fetch surfaces the real error.
@@ -6837,7 +6999,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          if (s.pendingUserMessages.length === 0) return {};
+          if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
+            return {};
           if (!pendingMatchesConsumedEvent(event, s.pendingUserMessages[0]!)) return {};
           return { pendingUserMessages: s.pendingUserMessages.slice(1) };
         }
@@ -6872,7 +7035,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
 
         // 2. FIFO head fallback (id not adopted yet / cross-client).
-        //    Skipped for a mirrored system marker (the vendor CLI's own
+        //    Skipped for an unsent draft or a mirrored system marker (the vendor CLI's own
         //    interrupt record): it is synthesized by the CLI, never queued
         //    here, so popping the head would hand the queued message's
         //    uploads to the marker and leave the real message empty. A
@@ -6881,7 +7044,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    branch 1 and never reaches this fallback.
         const eventContent = userContentFromEvent(event);
         const head =
-          eventContent !== null && isSystemUserContent(eventContent)
+          (eventContent !== null && isSystemUserContent(eventContent)) ||
+          s.pendingUserMessages[0]?.initialDraft
             ? undefined
             : s.pendingUserMessages[0];
         const matchedHead = head && pendingMatchesConsumedEvent(event, head) ? head : undefined;
@@ -6925,10 +7089,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // so the optimistic bubble in `pendingUserMessages` would
       // otherwise linger next to the rendered SlashCommandBlock
       // until refresh. Pop the FIFO head here to ack the local
-      // send; non-empty guard so observing clients (with no pending
-      // bubble) just render the block.
+      // send; observing clients and drafts still held locally cannot
+      // acknowledge a send, so they just render the block.
       applyToConversation((s) => {
-        if (s.pendingUserMessages.length === 0) return {};
+        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
       });
@@ -7397,20 +7561,23 @@ function failUnavailableStream(set: Setter, error: string): void {
 // within the connect-grace + relaunch window.
 const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
 
+// Replace only the server's no-context fallback; preserve phase-specific detail.
+const RUNNER_UNAVAILABLE_TERSE_MESSAGE = "No runner bound for session";
+
 /**
  * Turn a thrown send failure into user-facing banner text + a code.
  *
- * The runner-unavailable 503 gets self-explanatory copy (and no raw code in
- * the banner title) so a slow/never-online runner reads as a clear, retryable
- * message rather than the server's terse "No runner bound for session". Other
- * failures fall back to the error's own message, carrying the machine code
- * when present for debuggability.
+ * Keep the runner-unavailable code and any phase-specific detail. Replace
+ * only the server's no-context message with friendly copy.
  */
 function describeSendFailure(err: unknown): { message: string; code: string } {
   if (err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE) {
+    const informative = err.message && err.message !== RUNNER_UNAVAILABLE_TERSE_MESSAGE;
     return {
-      message: "The runner didn't come online in time. Please try again.",
-      code: "",
+      message: informative
+        ? err.message
+        : "The runner didn't come online in time. Please try again.",
+      code: RUNNER_UNAVAILABLE_CODE,
     };
   }
   if (err instanceof ApiError) {

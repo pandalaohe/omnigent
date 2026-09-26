@@ -588,7 +588,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("Goal session frame", () => {
   it("frames the complete active chat column and leaves the workspace outside", () => {
@@ -2794,7 +2797,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
   });
 
-  it("reserves the visible pane width plus its two desktop margins from the header", () => {
+  it("keeps the pane mounted and transitions its width target to zero", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -2810,6 +2813,11 @@ describe("Right workspace card visibility", () => {
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(`${panelWidth}px`);
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    const exiting = document.querySelector('aside[aria-label="Workspace"]');
+    expect(exiting).not.toBeNull();
+    expect(exiting).toHaveAttribute("data-state", "closed");
+    expect(exiting).toHaveClass("workspace-panel-motion", "md:overflow-hidden");
+    expect(exiting).toHaveStyle({ width: "0px" });
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
   });
 

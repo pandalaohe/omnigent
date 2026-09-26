@@ -63,7 +63,7 @@ import {
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { ApiError } from "@/lib/sessionsApi";
 import { AgentHarnessPicker } from "./NewChatDialog";
-import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
 const NONE = "__none__";
@@ -303,6 +303,10 @@ export function ProjectSettingsDialog({
     target: EventTarget | null;
     preventDefault: () => void;
   }) => {
+    if (openRow !== null) {
+      event.preventDefault();
+      return;
+    }
     if (
       shouldGuardDialogDismiss(event.target, {
         selectOpen: dropdownOpenCountRef.current > 0,
@@ -747,18 +751,14 @@ export function ProjectSettingsDialog({
                       </Button>
                     </div>
                     {browsable ? (
-                      // A compact trigger showing the current path; clicking
-                      // expands the filesystem browser as an overlay anchored
-                      // to the trigger. The browser is rendered inside
-                      // DialogContent (not a portaled popover) so it scrolls —
-                      // a modal Dialog's scroll-lock blocks wheel events on
-                      // portaled content — but positioned `absolute` so it
-                      // floats over the fields below. onNavigate updates the
-                      // row's path live as you browse.
+                      // A compact trigger showing the row's current path;
+                      // clicking opens the shared workspace browser dialog.
+                      // Navigation there is provisional until the user
+                      // confirms a folder, which becomes this row's path.
                       <div className="relative flex flex-col gap-1.5">
                         <button
                           type="button"
-                          onClick={() => setOpenRow(rowOpen ? null : row.hostId)}
+                          onClick={() => setOpenRow(row.hostId)}
                           aria-expanded={rowOpen}
                           disabled={isLoading || saving}
                           data-testid={`project-settings-entry-browse-${row.hostId}`}
@@ -781,26 +781,13 @@ export function ProjectSettingsDialog({
                             }`}
                           />
                         </button>
-                        {rowOpen && (
-                          <>
-                            {/* Click-away: a transparent full-modal backdrop
-                            that closes the browser (keeping the current path)
-                            on any click outside it. */}
-                            <button
-                              type="button"
-                              aria-label="Close directory browser"
-                              className="fixed inset-0 z-10 cursor-default"
-                              onClick={() => setOpenRow(null)}
-                            />
-                            <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:border-white/10 dark:backdrop-blur-xl dark:backdrop-saturate-150 [&>[data-testid=workspace-picker]]:border-0">
-                              <HostWorkspacePicker
-                                hostId={row.hostId}
-                                initialPath={isNavigablePath(row.path) ? row.path : undefined}
-                                onNavigate={(path) => setDirectoryPath(row.hostId, path)}
-                              />
-                            </div>
-                          </>
-                        )}
+                        <WorkspacePickerDialog
+                          open={rowOpen}
+                          onOpenChange={(next) => setOpenRow(next ? row.hostId : null)}
+                          hostId={row.hostId}
+                          initialPath={row.path}
+                          onConfirm={(path) => setDirectoryPath(row.hostId, path)}
+                        />
                       </div>
                     ) : (
                       <input

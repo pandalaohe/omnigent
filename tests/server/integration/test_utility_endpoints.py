@@ -89,6 +89,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # flag in `omnigent/server/feature_flags.py` has to appear here.
     assert data["features"] == {
         "usage_page": False,
+        "customize": False,
         "harness_install": False,
         "canvas": False,
         "project_assignments": False,

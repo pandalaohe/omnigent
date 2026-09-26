@@ -1,7 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "storybook/test";
+import type { Host } from "@/hooks/useHosts";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
-import { WorkspacePicker } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import {
   seedFilesystem,
   storyDirectory,
@@ -19,18 +20,25 @@ const projectEntries = [
   storyFile(`${workspaceStoryProjects}/README.md`, 2048),
 ];
 
+function storyBody(canvasElement: HTMLElement) {
+  return within(canvasElement.ownerDocument.body);
+}
+
 const meta = {
-  title: "Components/Workspace/WorkspacePicker",
-  component: WorkspacePicker,
+  title: "Components/Workspace/WorkspacePickerDialog",
+  component: WorkspacePickerDialog,
   tags: ["visual-snapshot"],
   args: {
+    open: true,
+    onOpenChange: () => undefined,
     hostId: workspaceStoryHost,
     initialPath: workspaceStoryProjects,
-    defaultPath: workspaceStoryProjects,
-    defaultPathHostName: "MacBook Pro",
-    onDefaultPathChange: () => undefined,
-    onSelect: () => undefined,
-    onClose: () => undefined,
+    onConfirm: () => undefined,
+  },
+  play: async ({ canvasElement }) => {
+    await userEvent.click(
+      await storyBody(canvasElement).findByTestId("workspace-picker-search-input"),
+    );
   },
   decorators: [
     (Story, context) => (
@@ -40,6 +48,15 @@ const meta = {
           seedFilesystem(queryClient, "", [
             storyDirectory(`${workspaceStoryHome}/projects`),
             storyDirectory(`${workspaceStoryHome}/Downloads`),
+          ]);
+          queryClient.setQueryData<Host[]>(["hosts", { includeSandbox: false }], [
+            {
+              host_id: workspaceStoryHost,
+              name: "MacBook Pro",
+              owner: "story",
+              status: "online",
+              default_workspace: workspaceStoryProjects,
+            },
           ]);
           queryClient.setQueryData(
             ["host-worktrees", workspaceStoryHost, workspaceStoryProjects],
@@ -81,20 +98,17 @@ const meta = {
           );
         }}
       >
-        <div className="flex h-[min(520px,calc(100dvh-2rem))] w-[min(800px,calc(100vw-2rem))] justify-center">
-          <Story />
-        </div>
+        <Story />
       </StoryQueryRouter>
     ),
   ],
-} satisfies Meta<typeof WorkspacePicker>;
+} satisfies Meta<typeof WorkspacePickerDialog>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const PopulatedWithConflict: Story = {
   args: {
-    onClose: () => undefined,
     workspacePath: `${workspaceStoryProjects}/app`,
     occupancyForPath: (path) => (path === workspaceStoryProjects ? 2 : 0),
   },
@@ -108,25 +122,10 @@ export const MainCheckoutOnly: Story = {};
 
 export const LinkedWorktreeSelected: Story = {
   play: async ({ canvasElement }) => {
-    await userEvent.click(
-      within(canvasElement).getByRole("radio", { name: "Use worktree command-palette" }),
-    );
+    const body = storyBody(canvasElement);
+    await userEvent.click(await body.findByRole("radio", { name: "Use worktree command-palette" }));
+    await userEvent.click(await body.findByTestId("workspace-picker-search-input"));
   },
-};
-
-export const CompactEmbedded: Story = {
-  args: {
-    onSelect: undefined,
-    onClose: undefined,
-    onNavigate: () => undefined,
-  },
-  decorators: [
-    (Story) => (
-      <div className="w-[min(28rem,calc(100vw-2rem))]">
-        <Story />
-      </div>
-    ),
-  ],
 };
 
 export const TypedFilter: Story = {
@@ -134,7 +133,7 @@ export const TypedFilter: Story = {
   // stable; the user-facing story name reflects the now-separate search UI.
   name: "Folder search",
   play: async ({ canvasElement }) => {
-    const input = within(canvasElement).getByTestId("workspace-picker-search-input");
+    const input = await storyBody(canvasElement).findByTestId("workspace-picker-search-input");
     await userEvent.clear(input);
     await userEvent.type(input, "ap");
   },

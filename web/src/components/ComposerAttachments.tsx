@@ -17,8 +17,9 @@ import {
 } from "lucide-react";
 
 import { attachmentFilename, attachmentKey } from "@/lib/attachments";
-import { ZoomableImage } from "@/components/ImageLightbox";
 import { cn } from "@/lib/utils";
+import { ZoomableImage } from "@/components/ImageLightbox";
+import { ComposerChipRow } from "@/components/composer/ChatComposer";
 
 /**
  * Pending (pre-send) attachments shown under the composer textarea. A supported
@@ -50,7 +51,7 @@ export function ComposerAttachments({
 }) {
   if (files.length === 0) return null;
   return (
-    <div className={cn("flex flex-wrap items-start gap-2 px-4 pb-2", className)}>
+    <ComposerChipRow className={className}>
       {files.map((file, i) => (
         <AttachmentTile
           key={attachmentKey(file)}
@@ -62,7 +63,7 @@ export function ComposerAttachments({
           onBadgeClick={onBadgeClick ? () => onBadgeClick(i) : undefined}
         />
       ))}
-    </div>
+    </ComposerChipRow>
   );
 }
 

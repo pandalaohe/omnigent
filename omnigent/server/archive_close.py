@@ -78,17 +78,18 @@ class ArchiveCloseCoordinator:
             with workspace_scope(workspace_id):
                 self.trigger_pending()
 
-    def trigger(self, session_id: str) -> None:
-        """Expand one newly committed archive request without awaiting teardown."""
+    def trigger(self, session_id: str) -> asyncio.Task[None]:
+        """Expand one newly committed archive request; return its (possibly running) task."""
         key = (current_workspace_id(), session_id)
         existing = self._root_tasks.get(key)
         if existing is not None and not existing.done():
-            return
+            return existing
         task = asyncio.create_task(
             self._expand_archive_root(key), name=f"archive-cli-expand:{session_id}"
         )
         self._root_tasks[key] = task
         self._retain_task(task, key=key, roots=True)
+        return task
 
     def trigger_pending(
         self,
@@ -173,17 +174,29 @@ class ArchiveCloseCoordinator:
 
     async def _expand_archive_root(self, key: tuple[int, str]) -> None:
         root_id = key[1]
-        root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
-        if root is None:
-            return
-        revision = root.archive_close_requested_revision
-        if (
-            not root.archived
-            or revision is None
-            or revision != root.archive_revision
-            or root.archive_close_completed_revision == revision
-        ):
-            return
+        from omnigent.server.routes import sessions as _sessions_facade
+
+        while True:
+            root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
+            if root is None:
+                return
+            revision = root.archive_close_requested_revision
+            if (
+                not root.archived
+                or revision is None
+                or revision != root.archive_revision
+                or root.archive_close_completed_revision == revision
+            ):
+                return
+            # Keep the archive Undo window durable: a recovery scan, a runner
+            # reconnect or another replica can reach a fresh archive before its
+            # grace ends. Once it has passed, the re-read above is the guard.
+            remaining = (
+                (root.archived_at or 0) + _sessions_facade._ARCHIVE_STOP_UNDO_GRACE_S - time.time()
+            )
+            if remaining <= 0:
+                break
+            await asyncio.sleep(remaining)
         now = int(time.time())
         token = secrets.token_hex(16)
         claim = await asyncio.to_thread(
@@ -203,7 +216,6 @@ class ArchiveCloseCoordinator:
             self._root_lease_heartbeat(root_id, token, owner_task),
             name=f"archive-expand-lease:{root_id}",
         )
-        from omnigent.server.routes import sessions as _sessions_facade
         from omnigent.server.routes._sessions.orchestration import _archive_close_intents
 
         _archive_close_intents.add(root_id)

@@ -728,6 +728,29 @@ def _get_current_db_revision(engine: Engine) -> str | None:
             return ctx.get_current_revision()
 
 
+def _get_current_db_heads(engine: Engine) -> tuple[str, ...]:
+    """
+    Return every Alembic revision stamped in the database's version table.
+
+    An empty tuple means the database has no ``alembic_version`` table
+    (or the table is empty) — i.e. nothing has ever been migrated
+    against this database. A downgrade through a join migration writes
+    one row per branch, so the table can hold several revisions even
+    though the migration graph has a single head.
+
+    :param engine: SQLAlchemy engine bound to the target database.
+    :returns: The stamped revision hashes, one per branch.
+    """
+    from alembic.runtime.migration import MigrationContext
+
+    with query_name_scope("omnigent.database.select_current_revision"):
+        inspector = inspect(engine)
+        if "alembic_version" not in inspector.get_table_names():
+            return ()
+        with engine.connect() as connection:
+            return tuple(MigrationContext.configure(connection).get_current_heads())
+
+
 def _get_head_db_revision(db_uri: str) -> str:
     """
     Return the head Alembic revision for our migrations directory.
@@ -846,9 +869,11 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     - **At head** — no-op.
     - **Behind head** — log a warning, attempt an automatic Alembic
       upgrade to head, then verify that the database reached head.
-      If the migration fails, re-raise with context so the server
-      still terminates with an actionable error instead of continuing
-      against an incompatible schema.
+      A version table left holding several branch heads (a downgrade
+      through a join migration stamps one row per branch) is treated
+      as behind head. If the migration fails, re-raise with context so
+      the server still terminates with an actionable error instead of
+      continuing against an incompatible schema.
     - **Newer than this build** — stop without attempting a migration
       and tell the operator to upgrade Omnigent.
 
@@ -872,14 +897,18 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
                 f"schema head (now {migrated!r}, expected {head!r})."
             )
         return
-    current = _get_current_db_revision(engine)
-    _verify_db_revision_is_supported(db_uri, current, head)
+    current_heads = _get_current_db_heads(engine)
+    for revision in current_heads:
+        _verify_db_revision_is_supported(db_uri, revision, head)
 
-    if current is None:
+    if not current_heads:
         _run_migrations(engine, db_uri)
         return
 
-    if current != head:
+    if current_heads != (head,):
+        # A downgrade through a join migration leaves one row per branch in
+        # alembic_version, so several heads simply mean the database is stale.
+        current = current_heads[0] if len(current_heads) == 1 else current_heads
         _logger.warning(
             "Omnigent database schema is out of date "
             "(found revision %r, expected %r); attempting automatic migration.",
@@ -899,11 +928,12 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
                 f"to inspect or retry the migration manually."
             ) from exc
 
-        migrated = _get_current_db_revision(engine)
-        if migrated != head:
+        migrated_heads = _get_current_db_heads(engine)
+        if migrated_heads != (head,):
+            migrated_now = migrated_heads[0] if len(migrated_heads) == 1 else migrated_heads
             raise RuntimeError(
                 f"Omnigent automatic database migration did not reach head "
-                f"(started at {current!r}, now at {migrated!r}, expected {head!r}). "
+                f"(started at {current!r}, now at {migrated_now!r}, expected {head!r}). "
                 f"Take a backup of your database, then run\n"
                 f"\n"
                 f"    omnigent debug db-upgrade {_quote_db_upgrade_uri(db_uri)}\n"

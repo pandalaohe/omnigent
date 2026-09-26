@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +40,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_latest_transcript_goal_state,
     read_message_deltas_from_offset,
     read_pane_signals,
+    read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
@@ -4867,24 +4868,44 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-def _is_subagent_hook_record(record: ClaudeHookRecord) -> bool:
+def _stop_failure_detail(record: ClaudeHookRecord) -> str | None:
+    """
+    Return the reason a ``StopFailure`` hook gives for its failed turn.
+
+    The hook carries the error text Claude Code rendered, which the transcript
+    mirror can deliver after the failed edge or not at all; without it the
+    server borrows the turn's last prose or reports no detail.
+
+    :param record: ``StopFailure`` hook record.
+    :returns: The error text, a category-only fallback, or ``None``.
+    """
+    if record.failure_message is not None:
+        return record.failure_message
+    if record.failure_category is not None:
+        return f"Claude Code ended the turn with an API error ({record.failure_category})."
+    return None
+
+
+def _is_subagent_hook_record(
+    record: ClaudeHookRecord,
+    *,
+    parent_claude_session_ids: Collection[str] | None = None,
+) -> bool:
     """
     Return whether a hook record originated from a Claude subagent.
 
-    Claude Code subagent transcripts live under a ``subagents/``
-    subdirectory (e.g.
-    ``~/.claude/projects/<encoded>/<session>/subagents/agent-<id>.jsonl``).
-    When a subagent fires a lifecycle hook (``Stop``,
-    ``UserPromptSubmit``), its ``transcript_path`` contains that
-    ``subagents`` component. The parent process's transcript lives
-    one level up (``<session>.jsonl``) and never contains it.
-
-    :param record: Claude hook record read from ``hooks.jsonl``.
-    :returns: ``True`` when the record's transcript path indicates a
-        subagent, ``False`` otherwise (including when no transcript
-        path is available — conservative default so parent events
-        are never accidentally dropped).
+    Primary: a session id absent from the set of ids ever pinned to
+    this bridge belongs to a background subagent process. Fallback:
+    the ``subagents/`` path component for synchronous subagents.
     """
+    # Primary: id not in any id the parent has ever held → subagent.
+    if (
+        parent_claude_session_ids
+        and record.claude_session_id
+        and record.claude_session_id not in parent_claude_session_ids
+    ):
+        return True
+    # Fallback: subagent directory structure.
     if record.transcript_path is None:
         return False
     return "subagents" in record.transcript_path.parts
@@ -5203,6 +5224,10 @@ async def _forward_available_status_events(
         retried and the failing event is retried later.
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
+    # Read all session ids ever pinned to this bridge so a rotation race
+    # (batch spans the old id's StopFailure and the new SessionStart)
+    # does not drop the parent's own failure as a subagent event.
+    parent_claude_session_ids = read_seen_claude_session_ids(bridge_dir)
     if not result.records:
         if result.event_cursor == state.event_cursor and result.byte_offset == (
             state.byte_offset or 0
@@ -5234,7 +5259,12 @@ async def _forward_available_status_events(
         # owns only running transitions. A child ``Stop``/``StopFailure`` must
         # not flip the parent: child completion is correlated separately by
         # the subagent watcher via the parent's structured task notification.
-        if status is not None and _is_subagent_hook_record(record):
+        # A record is a child's when its Claude session id was never pinned to
+        # this bridge (background sub-agent) or its transcript sits under
+        # ``subagents/`` (synchronous sub-agent).
+        if status is not None and _is_subagent_hook_record(
+            record, parent_claude_session_ids=parent_claude_session_ids
+        ):
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
                 session_id,
@@ -5389,6 +5419,7 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
+                failure_detail=_stop_failure_detail(record) if status == "failed" else None,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)

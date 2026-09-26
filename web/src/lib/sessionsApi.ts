@@ -15,7 +15,7 @@ import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
-import { setSessionHost } from "./sessionHost";
+import { setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
@@ -119,6 +119,8 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  runner_online?: boolean | null;
+  host_online?: boolean | null;
   /**
    * Whether this session is bound to a dormant managed host the server can
    * wake in place (its sandbox provider supports resume). Read only when the
@@ -322,15 +324,19 @@ function usageByModelFromWire(
 
 function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
-  // attach) can pin to the replica holding that host's runner tunnel.
+  // attach) can pin to the replica holding that host's runner tunnel; a
+  // sub-agent child inherits its parent's through the recorded parent link.
   setSessionHost(wire.id, wire.host_id);
+  setSessionParent(wire.id, wire.parent_session_id);
   return {
     id: wire.id,
     agentId: wire.agent_id,
     ...(wire.agent_template_id !== undefined ? { agentTemplateId: wire.agent_template_id } : {}),
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
+    runnerOnline: wire.runner_online ?? undefined,
     hostId: wire.host_id ?? null,
+    hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
     status: wire.status,
@@ -794,7 +800,7 @@ export async function createBundledSession(
  *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
  * @param options.title - Optional title for the new fork.
- * @param options.agentId - Optional built-in agent to switch the fork to
+ * @param options.agentId - Optional agent to switch the fork to
  *   (e.g. fork a Claude-SDK session into Claude Code). Omitted → keep the
  *   source's agent. The server carries model settings (and native
  *   history) across only within the same provider family.
@@ -898,40 +904,41 @@ export async function forkSession(
 }
 
 /**
- * Open a generic side chat by forking the conversation and launching a runner
- * for the fork on the SOURCE's own host — exactly what the per-message Fork
- * button does. This is host-agnostic: it drives on a local host or a managed
- * one, with no managed-sandbox requirement. Codex sessions do NOT use this —
- * they fork in-process via their native `/side` path (prompt-cache-warm) — so
- * this is the generic (non-Codex) create.
+ * Fork a generic side chat in the parent's current working directory.
+ * Hosted sessions launch a separate runner; CLI sessions use their existing
+ * runner, and in-process sessions use normal server dispatch. Codex uses its
+ * native `/side` fork instead.
  *
- * When the source is on a git branch the fork launches in its OWN worktree
- * (`side-chat/<id>`, based on the source branch) so the side chat stays off the
- * parent's working tree; otherwise it launches in the source's effective
- * worktree (its recorded worktree, else its launch directory) so the branch
- * forks off the repository the source actually works in.
+ * Like native Codex side chats, these share the parent's working tree: the
+ * fork launches in the source's effective worktree (its recorded worktree,
+ * else its launch directory — MOD-xho04), so a project-entry session's side
+ * chat reads git state from the parent's worktree. A saved branch may belong
+ * to a previous host and must not be required to send.
  *
  * @param sourceId - The parent conversation to fork, e.g. "conv_abc123".
  * @returns The new side-chat session id.
- * @throws Error when the source has no host/worktree to launch on, or when the
- *   fork / runner launch fails, so the caller can surface it (a toast).
+ * @throws Error when the source is disconnected or the fork / runner launch fails.
  */
 export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
-  const source = await getSession(sourceId);
-  const { hostId, gitBranch } = source;
+  let source = await getSession(sourceId);
+  if (source.hostResumable && source.hostOnline === false && source.runnerOnline !== true) {
+    await retrySession(sourceId);
+    source = await getSession(sourceId);
+  }
+  const { hostId, runnerId } = source;
   const repoPath = effectiveWorktree(source);
-  if (!hostId || !repoPath) {
-    // No host/worktree to run on — fail before creating an orphan fork so the
-    // caller shows an error instead of opening a dead tab.
-    throw new Error("This session has no host to run a side chat on.");
+  const canLaunchOnHost = hostId && repoPath && source.hostOnline !== false;
+  const canUseRunner =
+    source.runnerOnline !== false && (runnerId != null || source.runnerOnline === true);
+  if (!canLaunchOnHost && !canUseRunner) {
+    throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
   const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
-  await launchRunner(
-    hostId,
-    fork.id,
-    repoPath,
-    gitBranch ? { branchName: `side-chat/${fork.id.slice(-8)}`, baseBranch: gitBranch } : undefined,
-  );
+  if (canLaunchOnHost) {
+    await launchRunner(hostId, fork.id, repoPath);
+  } else if (runnerId) {
+    await updateSession(fork.id, { runnerId });
+  }
   return { childSessionId: fork.id };
 }
 
