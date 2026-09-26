@@ -48,6 +48,8 @@ _CONFIG_WORKSPACE = "/work/configured-repo"
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 # One project config endpoint: /v1/projects/<id> (not the bare list).
 _PROJECT_CFG_RE = re.compile(r"/v1/projects/[^/?]+")
+# One project host-roots endpoint: /v1/projects/<id>/host-roots.
+_PROJECT_HOST_ROOTS_RE = re.compile(r"/v1/projects/[^/]+/host-roots")
 
 
 def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
@@ -198,6 +200,7 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/projects", handle_projects_list)
             await page.route(_PROJECT_CFG_RE, handle_project_config)
+            await _stub_project_host_roots(page, _project_config_body())
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
             await page.route(
@@ -360,6 +363,7 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/projects", handle_projects_list)
             await page.route(_PROJECT_CFG_RE, handle_project_config)
+            await _stub_project_host_roots(page, _sandbox_config_body())
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
             await page.route(
@@ -462,6 +466,7 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/projects", handle_projects_list)
             await page.route(_PROJECT_CFG_RE, handle_project_config)
+            await _stub_project_host_roots(page, _project_config_body())
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
             await page.route(
@@ -698,6 +703,47 @@ def _worktree_off_config_body() -> str:
     )
 
 
+def _host_roots_body(config_body: str) -> str:
+    """``GET /v1/projects/{id}/host-roots`` derived from the test's own config.
+
+    Mirrors the server: a root needs a real (non-sandbox) config host with a
+    workspace; the default host follows the config host alone, so a host
+    without a workspace still seeds the host but no directory.
+    """
+    config = json.loads(config_body).get("config") or {}
+    host_id = config.get("host_id")
+    if host_id == _SANDBOX_CHOICE:
+        host_id = None
+    workspace = config.get("workspace")
+    return json.dumps(
+        {
+            "roots": (
+                [{"host_id": host_id, "workspace": workspace, "source": "config"}]
+                if host_id and workspace
+                else []
+            ),
+            "default_host_id": host_id,
+            "default_host_reason": "config" if host_id else "none",
+        }
+    )
+
+
+async def _stub_project_host_roots(page, config_body: str) -> None:
+    """Serve host-roots derived from *config_body*.
+
+    Must be registered after the config route: ``_PROJECT_CFG_RE`` swallows the
+    host-roots URL too, and Playwright tries the most recently registered match
+    first.
+    """
+
+    async def handle_host_roots(route: Route) -> None:
+        await route.fulfill(
+            status=200, content_type="application/json", body=_host_roots_body(config_body)
+        )
+
+    await page.route(_PROJECT_HOST_ROOTS_RE, handle_host_roots)
+
+
 async def _route_composer_stubs(
     page,
     *,
@@ -705,8 +751,9 @@ async def _route_composer_stubs(
     create_bodies: list[dict[str, Any]],
     session_id: str,
 ) -> None:
-    """Wire the standard composer stubs (hosts/agents/projects/config/worktrees/
-    create). ``create_bodies`` captures the create POST — the thing under test."""
+    """Wire the standard composer stubs (hosts/agents/projects/config/host-roots/
+    worktrees/create). ``create_bodies`` captures the create POST — the thing
+    under test."""
 
     async def handle_hosts(route: Route) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_hosts_body())
@@ -754,25 +801,11 @@ async def _route_composer_stubs(
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/projects", handle_projects_list)
     await page.route(_PROJECT_CFG_RE, handle_project_config)
+    await _stub_project_host_roots(page, config_body)
     await page.route(_WORKTREES_RE, handle_worktrees)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
     await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
-
-
-def _host_roots_body() -> str:
-    """``GET /v1/projects/{id}/host-roots`` — real-host placement for prefill.
-
-    Must match ``_plain_config_body``: prefill only writes a workspace alongside
-    a host it takes from ``roots``.
-    """
-    return json.dumps(
-        {
-            "roots": [{"host_id": _HOST_ID, "workspace": _GIT_REPO, "source": "config"}],
-            "default_host_id": _HOST_ID,
-            "default_host_reason": "config",
-        }
-    )
 
 
 def test_typed_picker_preserves_posix_trailing_space_in_create(
@@ -796,16 +829,6 @@ async def _drive_typed_picker_trailing_space(base_url: str, session_id: str) -> 
                 create_bodies=create_bodies,
                 session_id=session_id,
             )
-
-            # _PROJECT_CFG_RE matches /v1/projects/<id> as a search, so it also
-            # swallows /v1/projects/<id>/host-roots; this later route wins
-            # (Playwright tries the most recently registered match first).
-            async def handle_host_roots(route: Route) -> None:
-                await route.fulfill(
-                    status=200, content_type="application/json", body=_host_roots_body()
-                )
-
-            await page.route(f"**/v1/projects/{_PROJECT_ID}/host-roots", handle_host_roots)
 
             async def handle_filesystem(route: Route) -> None:
                 await route.fulfill(
