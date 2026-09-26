@@ -5,9 +5,10 @@ pinned input refs by explicit refspec, verify commits and manifests, and
 add (or remove) one detached worktree per repository under
 ``<source>/.omnigent/worktrees/<assignment_id>/<repository_name>`` — or,
 when the prepare frame carries the project's entry,
-``<entry>/.worktrees/<main repo name>/<topic>``. Release locates the
-execution root in the source repository's own worktree registry, so it
-finds it in either layout.
+``<entry>/.worktrees/<main repo name>/<topic>``. When
+``host.worktree_add_command`` is set, the configured command places each
+worktree instead. Release locates the execution root in the source
+repository's own worktree registry, so it finds it in either layout.
 
 All git runs through :func:`omnigent.host.git_worktree._run_git` as argv
 lists, never a shell. The attempt never checks out into the bound working
@@ -38,6 +39,7 @@ from omnigent.host.git_worktree import (
     _run_git,
     ensure_entry_excluded,
 )
+from omnigent.host.worktree_command import WorktreeCommandError, run_worktree_command
 from omnigent.project_context import (
     THIS_REPOSITORY_KEY,
     ManifestError,
@@ -398,6 +400,7 @@ def _prepare_one(
     entry_path: str | None,
     main_names: dict[str, str],
     topics: dict[str, str],
+    command: list[str] | None,
 ) -> HostAssignmentPrepareResultFrame | None:
     """Prepare one repository; ``None`` means success (registered in ``prepared``)."""
     name = entry.repository_name
@@ -515,6 +518,84 @@ def _prepare_one(
                 name, "worktree_failed", f"could not exclude .worktrees: {message}"
             )
 
+    if command is not None:
+        # The registered paths before the call: a command-reported path is
+        # only ours when it was not already registered.
+        try:
+            listed_before = _run_git(["worktree", "list", "--porcelain"], cwd=toplevel)
+        except WorktreeError as exc:
+            return _fail_prepare(name, "worktree_failed", exc.message)
+        if listed_before.returncode != 0:
+            return _fail_prepare(
+                name,
+                "worktree_failed",
+                _detail(
+                    listed_before.stderr,
+                    listed_before.returncode,
+                    f"git worktree list failed for {toplevel}",
+                ),
+            )
+        registered_before = _parse_worktree_list(listed_before.stdout)
+        main_worktree = registered_before[0].path if registered_before else toplevel
+        try:
+            path = run_worktree_command(
+                command,
+                source=toplevel,
+                topic=topics[name],
+                entry=entry_path,
+                mode=[f"--detach={entry.input_commit}"],
+            )
+        except WorktreeCommandError as exc:
+            if exc.code == "EXISTS":
+                detail = exc.detail or {}
+                candidate = detail.get("path")
+                if (
+                    isinstance(candidate, str)
+                    and not _same_path(candidate, toplevel)
+                    and not _same_path(candidate, main_worktree)
+                    and (
+                        entry_path is None
+                        or _contained_inside(
+                            os.path.realpath(candidate), os.path.realpath(entry_path)
+                        )
+                    )
+                    and _is_reusable_worktree(candidate, toplevel, common_dir, entry.input_commit)
+                ):
+                    # A retried prepare found the worktree this call would add.
+                    prepared[name] = _PreparedRepository(
+                        toplevel=toplevel,
+                        worktree_path=candidate,
+                        commit=entry.input_commit,
+                        manifest=manifest,
+                    )
+                    return None
+            error_code = (
+                "source_invalid"
+                if exc.code in ("NOT_A_REPO", "BARE_SOURCE", "AMBIGUOUS_SOURCE")
+                else "worktree_failed"
+            )
+            return _fail_prepare(name, error_code, exc.message)
+        if (
+            any(_same_path(record.path, path) for record in registered_before)
+            or _same_path(path, toplevel)
+            or _same_path(path, main_worktree)
+            or not _is_reusable_worktree(path, toplevel, common_dir, entry.input_commit)
+        ):
+            return _fail_prepare(
+                name,
+                "worktree_failed",
+                "worktree command returned a path that is not a new detached "
+                f"worktree of {toplevel}: {path}",
+            )
+        created.append((toplevel, path, ()))
+        prepared[name] = _PreparedRepository(
+            toplevel=toplevel,
+            worktree_path=path,
+            commit=entry.input_commit,
+            manifest=manifest,
+        )
+        return None
+
     if entry_path is not None:
         try:
             main_name = main_names.get(name) or _main_worktree_name(toplevel)
@@ -626,6 +707,7 @@ def prepare(
     repositories: Sequence[HostAssignmentPrepareRepository],
     assignment_id: str,
     entry: str | None = None,
+    command: list[str] | None = None,
 ) -> HostAssignmentPrepareResultFrame:
     """Prepare one detached worktree per repository for an assignment.
 
@@ -643,6 +725,11 @@ def prepare(
         when two repositories share a main-worktree name), and the
         entry's repository gains an ``info/exclude`` line for it. ``None``
         keeps today's location under the source checkout.
+    :param command: Configured external worktree command
+        (``host.worktree_add_command``). ``None`` keeps the built-in
+        location; when set, that command creates each detached worktree
+        and its failure refuses the prepare — the built-in layout is
+        never used as a fallback.
     :returns: ``status "ok"`` with the repository → directory map, or
         ``status "failed"`` with a stable ``error_code``. The returned
         frame carries an empty ``request_id``; the dispatcher stamps the
@@ -651,12 +738,21 @@ def prepare(
     with _lock_for_assignment(assignment_id):
         prepared: dict[str, _PreparedRepository] = {}
         created: list[tuple[str, str, tuple[str, ...]]] = []
-        main_names = _main_worktree_names(repositories) if entry is not None else {}
+        main_names = (
+            _main_worktree_names(repositories) if entry is not None or command is not None else {}
+        )
         topics = _assignment_topics(repositories, assignment_id, main_names)
         try:
             for repo_entry in repositories:
                 failure = _prepare_one(
-                    repo_entry, assignment_id, prepared, created, entry, main_names, topics
+                    repo_entry,
+                    assignment_id,
+                    prepared,
+                    created,
+                    entry,
+                    main_names,
+                    topics,
+                    command,
                 )
                 if failure is not None:
                     _rollback(created)

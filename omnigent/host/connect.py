@@ -126,6 +126,7 @@ from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_hos
 from omnigent.host.maintenance import HostMaintenanceJanitor, RunnerLogRunawayTracker
 from omnigent.host.post_bind_hook import PostBindHookRunner
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.worktree_command import load_worktree_command
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
@@ -1082,10 +1083,11 @@ class HostProcess:
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
-        # The hook reads the command from the config file this process was
-        # started with; a host launched with an explicit --config must not
-        # fall back to the default file.
-        self._post_bind_hook_runner = PostBindHookRunner(config_path or CONFIG_PATH)
+        # The hook and the worktree command read from the config file this
+        # process was started with; a host launched with an explicit --config
+        # must not fall back to the default file.
+        self._config_path = config_path or CONFIG_PATH
+        self._post_bind_hook_runner = PostBindHookRunner(self._config_path)
         self._interactive_shells = normalize_interactive_shells(
             interactive_shells
             if interactive_shells is not None
@@ -3502,6 +3504,7 @@ class HostProcess:
             success, or ``status: "failed"`` with an error message.
         """
         try:
+            command = load_worktree_command(self._config_path)
             # Pause the orphan reaper: create_worktree runs git via
             # subprocess.run, whose children are direct children of this host
             # but not tracked runners — the reaper must not wait() them out
@@ -3514,6 +3517,7 @@ class HostProcess:
                     base_branch=frame.base_branch,
                     existing_branch=frame.existing_branch,
                     entry=frame.entry,
+                    command=command,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
@@ -3631,6 +3635,17 @@ class HostProcess:
             message, never silence.
         """
         try:
+            command = load_worktree_command(self._config_path)
+        except WorktreeError as exc:
+            # A malformed host.worktree_add_command refuses the prepare: the
+            # configured command is the only producer that may run.
+            return HostAssignmentPrepareResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error_code="worktree_failed",
+                error=exc.message,
+            )
+        try:
             # Pause the orphan reaper while git runs — see
             # _handle_create_worktree above and _reap_orphans_once.
             with self._host_subprocess_op():
@@ -3639,6 +3654,7 @@ class HostProcess:
                     frame.repositories,
                     frame.assignment_id,
                     entry=frame.entry,
+                    command=command,
                 )
         except Exception as exc:
             _logger.exception("Assignment prepare crashed for %s", frame.assignment_id)

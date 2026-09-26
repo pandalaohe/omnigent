@@ -8,7 +8,9 @@ root resolution, or removal ordering fails loud here.
 
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +26,9 @@ from omnigent.host.git_worktree import (
     remove_worktree,
     validate_branch_name,
 )
+from omnigent.host.worktree_command import WorktreeCommandError
+
+_FAKE_WORKTREE_COMMAND = Path(__file__).resolve().parent / "_fake_worktree_command.py"
 
 # Deterministic identity + config so the tests don't depend on the
 # developer's global git config (user.name / init.defaultBranch).
@@ -657,3 +662,156 @@ def test_validate_branch_name_rejects_bad(bad: str) -> None:
 def test_validate_branch_name_accepts_good(good: str) -> None:
     """Well-formed branch names pass validation."""
     validate_branch_name(good)  # must not raise
+
+
+# ── configured worktree command ───────────────────────────
+
+
+def _fake_command(record: Path, behave: str = "ok") -> list[str]:
+    """Build the fake command's argv for one record file and behave mode."""
+    return [
+        sys.executable,
+        str(_FAKE_WORKTREE_COMMAND),
+        f"--fake-record={record}",
+        f"--fake-behave={behave}",
+    ]
+
+
+def _recorded_argv(record: Path) -> list[str]:
+    """Return the argv recorded by the last fake-command invocation."""
+    return json.loads(record.read_text().splitlines()[-1])["argv"]
+
+
+def test_create_worktree_command_creates_at_reported_path(git_repo: Path, tmp_path: Path) -> None:
+    """A configured command's reported path and branch are what gets returned."""
+    record = tmp_path / "record.jsonl"
+
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="feature/login",
+        base_branch="main",
+        command=_fake_command(record),
+    )
+
+    expected = git_repo / ".worktrees" / "myrepo" / "feature-login"
+    assert isinstance(created, CreatedWorktree)
+    assert created.worktree_path == str(expected)
+    assert _current_branch(Path(created.worktree_path)) == "feature/login"
+    # Exact argv: source is the CALLER's repo_path, and every value uses the
+    # --flag=value form the command contract defines.
+    assert _recorded_argv(record) == [
+        f"--source={git_repo}",
+        "--topic=feature/login",
+        "--new-branch=feature/login",
+        "--base=main",
+    ]
+
+
+def test_create_worktree_command_entry_shape_and_exclude(git_repo: Path, tmp_path: Path) -> None:
+    """A set entry adds --entry and keeps the entry's exclude written."""
+    entry = (tmp_path / "project").resolve()
+    entry.mkdir()
+    _git(entry, "init", "-q", "-b", "main")
+    record = tmp_path / "record.jsonl"
+
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="wip",
+        entry=str(entry),
+        command=_fake_command(record),
+    )
+
+    assert created.worktree_path == str(entry / ".worktrees" / "myrepo" / "wip")
+    assert _recorded_argv(record) == [
+        f"--source={git_repo}",
+        "--topic=wip",
+        f"--entry={entry}",
+        "--new-branch=wip",
+    ]
+    assert (entry / ".git" / "info" / "exclude").read_text().splitlines().count(
+        "/.worktrees/"
+    ) == 1
+
+
+def test_create_worktree_command_existing_branch_sends_branch_flag(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """The existing-branch recreate path sends --branch, never --new-branch."""
+    _git(git_repo, "branch", "fix-1")
+    record = tmp_path / "record.jsonl"
+
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="fix-1",
+        existing_branch=True,
+        command=_fake_command(record),
+    )
+
+    assert created.worktree_path == str(git_repo / ".worktrees" / "myrepo" / "fix-1")
+    assert _current_branch(Path(created.worktree_path)) == "fix-1"
+    assert _recorded_argv(record) == [f"--source={git_repo}", "--topic=fix-1", "--branch=fix-1"]
+
+
+def test_create_worktree_command_refusal_never_falls_back(git_repo: Path, tmp_path: Path) -> None:
+    """A failing command refuses the worktree; the built-in layout is not used."""
+    record = tmp_path / "record.jsonl"
+
+    with pytest.raises(WorktreeCommandError) as exc:
+        create_worktree(
+            repo_path=str(git_repo),
+            branch_name="feature/x",
+            command=_fake_command(record, "refuse:EXISTS"),
+        )
+
+    assert exc.value.code == "EXISTS"
+    assert _worktree_count(git_repo) == 1
+    # No sibling directory and no .worktrees layout either.
+    assert not (git_repo.parent / "myrepo-worktrees").exists()
+    assert not (git_repo / ".worktrees").exists()
+
+
+def test_create_worktree_command_unregistered_path_refused(git_repo: Path, tmp_path: Path) -> None:
+    """A path that is not a worktree on the branch is refused."""
+    record = tmp_path / "record.jsonl"
+
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(
+            repo_path=str(git_repo),
+            branch_name="feature/x",
+            command=_fake_command(record, "outside"),
+        )
+
+    assert "not a worktree on branch feature/x" in exc.value.message
+    assert str(git_repo) in exc.value.message
+    assert _worktree_count(git_repo) == 1
+
+
+def test_create_worktree_command_rejects_adopted_preexisting_worktree(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A command that switches an ALREADY-registered worktree's branch is refused.
+
+    The branch pre-checks cannot see a buggy command running
+    ``git checkout -b`` inside an existing linked worktree and reporting
+    it as its result. Accepting that would let a later session delete run
+    ``git worktree remove --force`` on a worktree Omnigent never created.
+    """
+    linked = git_repo.parent / "myrepo-worktrees" / "linked"
+    linked.parent.mkdir(parents=True, exist_ok=True)
+    _git(git_repo, "worktree", "add", "-q", "-b", "feature/existing", str(linked))
+    record = tmp_path / "record.jsonl"
+
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(
+            repo_path=str(linked),
+            branch_name="feature/adopted",
+            command=_fake_command(record, "adopt-source"),
+        )
+
+    assert "not a worktree on branch feature/adopted" in exc.value.message
+    # The command did run and did switch the branch inside L...
+    assert _current_branch(linked) == "feature/adopted"
+    # ...but L stays registered exactly once and no worktree was added.
+    listed = list_worktrees(repo_path=str(git_repo))
+    assert sum(1 for w in listed if Path(w.path) == linked) == 1
+    assert _worktree_count(git_repo) == 2
