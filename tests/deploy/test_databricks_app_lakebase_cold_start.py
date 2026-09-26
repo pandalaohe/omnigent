@@ -16,10 +16,12 @@ succeed.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import sys
 import time
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import NoReturn
 from unittest.mock import MagicMock
 
@@ -52,13 +54,17 @@ _BOOT_ENV = {
 _BOOT_STORE_CLASSES = (
     "omnigent.stores.agent_store.sqlalchemy_store.SqlAlchemyAgentStore",
     "omnigent.stores.artifact_store.databricks_volumes.DatabricksVolumesArtifactStore",
+    "omnigent.stores.assignment_store.sqlalchemy_store.SqlAlchemyAssignmentStore",
     "omnigent.stores.comment_store.sqlalchemy_store.SqlAlchemyCommentStore",
     "omnigent.stores.conversation_store.sqlalchemy_store.SqlAlchemyConversationStore",
     "omnigent.stores.file_store.sqlalchemy_store.SqlAlchemyFileStore",
     "omnigent.stores.global_instructions_store.sqlalchemy_store.SqlAlchemyGlobalInstructionsStore",
     "omnigent.stores.host_store.HostStore",
+    "omnigent.stores.peer_message_store.sqlalchemy_store.SqlAlchemyPeerMessageStore",
     "omnigent.stores.permission_store.sqlalchemy_store.SqlAlchemyPermissionStore",
     "omnigent.stores.policy_store.sqlalchemy_store.SqlAlchemyPolicyStore",
+    "omnigent.stores.project_host_binding_store.sqlalchemy_store.SqlAlchemyProjectHostBindingStore",
+    "omnigent.stores.project_repository_store.sqlalchemy_store.SqlAlchemyProjectRepositoryStore",
     "omnigent.stores.project_store.sqlalchemy_store.SqlAlchemyProjectStore",
     "omnigent.stores.scheduled_task_store.sqlalchemy_store.SqlAlchemyScheduledTaskStore",
     "omnigent.server.user_preferences_store.SqlAlchemyUserPreferencesStore",
@@ -284,3 +290,24 @@ def test_boot_without_migration_failure_does_not_exit(
 
     assert attempts["n"] == 1
     assert boot_exit_codes == []
+
+
+def test_boot_wires_the_peer_message_store_into_create_app() -> None:
+    """The boot's ``create_app`` call must carry the peer-message store.
+
+    Without it every peer route answers 500 "Peer messaging is not
+    configured on this server" while ``/v1/info`` still advertises the
+    feature as on.
+    """
+    source = (Path(__file__).resolve().parents[2] / "deploy/databricks/src/app.py").read_text()
+    create_app_calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_app"
+    ]
+
+    assert len(create_app_calls) == 1
+    wired_keywords = {keyword.arg for keyword in create_app_calls[0].keywords}
+    assert "peer_message_store" in wired_keywords

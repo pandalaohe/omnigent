@@ -195,6 +195,9 @@ try:
         SqlAlchemyGlobalInstructionsStore,
     )
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.peer_message_store.sqlalchemy_store import (
+        SqlAlchemyPeerMessageStore,
+    )
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
     )
@@ -252,6 +255,7 @@ try:
     project_repository_store = SqlAlchemyProjectRepositoryStore(DB_URI)
     project_host_binding_store = SqlAlchemyProjectHostBindingStore(DB_URI)
     assignment_store = SqlAlchemyAssignmentStore(DB_URI)
+    peer_message_store = SqlAlchemyPeerMessageStore(DB_URI)
     host_store = HostStore(DB_URI)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
     user_preferences_store = SqlAlchemyUserPreferencesStore(DB_URI)
@@ -298,6 +302,7 @@ try:
         project_repository_store=project_repository_store,
         project_host_binding_store=project_host_binding_store,
         assignment_store=assignment_store,
+        peer_message_store=peer_message_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         user_preferences_store=user_preferences_store,

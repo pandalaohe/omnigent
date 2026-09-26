@@ -89,7 +89,12 @@ def test_entrypoint_imports_without_side_effects(
 
 
 def test_docker_entrypoint_wires_the_user_preferences_store() -> None:
-    """Keep cross-device settings available on the actual container path."""
+    """The container path must pass its stores to ``create_app``.
+
+    User preferences keep cross-device settings available on the actual
+    container path; the peer-message store is what keeps the peer routes from
+    answering 500 "Peer messaging is not configured on this server".
+    """
     from deploy.docker.entrypoint import build_app
 
     tree = ast.parse(inspect.getsource(build_app))
@@ -104,6 +109,7 @@ def test_docker_entrypoint_wires_the_user_preferences_store() -> None:
     assert len(create_app_calls) == 1
     wired_keywords = {keyword.arg for keyword in create_app_calls[0].keywords}
     assert "user_preferences_store" in wired_keywords
+    assert "peer_message_store" in wired_keywords
 
 
 def test_docker_entrypoint_wires_the_global_instructions_store(
@@ -139,6 +145,38 @@ def test_docker_entrypoint_wires_the_global_instructions_store(
     # the route is mounted.
     response = TestClient(app).get("/v1/global-instructions")
     assert response.status_code != 404
+
+
+def test_docker_entrypoint_wires_the_peer_message_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The container path must accept peer messages, not 500 as unconfigured.
+
+    ``create_app`` only hands the store to the peer routes when it gets one;
+    without it every peer route answers 500 "Peer messaging is not configured
+    on this server". An unknown session must 404 — that proves the request
+    reached the conversation lookup instead of the missing-store guard.
+    """
+    from fastapi.testclient import TestClient
+
+    from deploy.docker.entrypoint import build_app, run_migrations
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}\n")
+    database_url = f"sqlite:///{tmp_path / 'entrypoint.db'}"
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_FEATURES", "session_peer_messaging")
+    monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
+
+    run_migrations(database_url)
+    app = build_app().app
+
+    response = TestClient(app).get("/v1/sessions/0f0f0f0f0f0f0f0f0f0f0f0f0f0f/peer-messages")
+    assert response.status_code == 404, response.text
+    assert app.state.peer_message_store is not None
 
 
 def test_docker_entrypoint_runs_the_schema_initializer(
