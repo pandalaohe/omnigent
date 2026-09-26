@@ -1,7 +1,8 @@
 """E2E: the home composer prefills from a project's stored ``config``.
 
-Visiting ``/?project=<name>`` seeds the new-session composer from that project's
-stored defaults (``web/src/shell/projectPrefill.ts`` +
+Choosing ``New session in <name>`` from the command palette navigates to
+``/?project=<name>`` and seeds the composer from that project's stored defaults
+(``web/src/shell/projectPrefill.ts`` +
 ``web/src/shell/NewChatDialog.tsx``): host, working directory, and agent all
 come from ``config``, silently falling back to the generic defaults for any
 field the config leaves unset. This replaced the old newest-session inference —
@@ -132,7 +133,7 @@ def _project_config_body() -> str:
 
 
 def test_composer_prefills_from_project_config(seeded_session: tuple[str, str]) -> None:
-    """A ``?project=`` visit seeds host / workspace / agent from stored config.
+    """The project command seeds host / workspace / agent from stored config.
 
     The pinned agent (``ag_pinned_e2e``) and workspace (``/work/configured-repo``)
     come from ``config`` — NOT from the default-ranked Claude Code or a recent
@@ -206,7 +207,14 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
 
-            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
+            await page.goto(f"{base_url}/c/{session_id}")
+            await page.get_by_placeholder("Send a message…").wait_for(
+                state="visible", timeout=30_000
+            )
+            await page.keyboard.press("ControlOrMeta+k")
+            palette = page.get_by_role("dialog")
+            await expect(palette).to_be_visible(timeout=10_000)
+            await palette.get_by_text(f"New session in {_PROJECT_NAME}", exact=True).click()
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
