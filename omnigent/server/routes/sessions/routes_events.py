@@ -906,7 +906,7 @@ def register_events_routes(
                 # per-append overhead outlasts that. Each run of batchable entries is
                 # authorized once and appended in one store call; every other entry
                 # keeps the per-entry path, in order.
-                acks: list[dict[str, bool | str]] = []
+                acks: list[dict[str, bool | str | None]] = []
                 for batchable, run in itertools.groupby(body, key=_is_batchable_external_item):
                     if not batchable:
                         for event in run:
