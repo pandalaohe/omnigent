@@ -31,9 +31,9 @@ network layer (same pattern as
 
 - ``GET /v1/hosts`` → one online host.
 - ``GET /v1/sessions/{id}`` → patched with host + worktree geometry.
-- ``GET /v1/hosts/{id}/filesystem/**`` → 404 for the *worktree directory*
-  (simulating a deleted worktree), 200 for the repo path and everything
-  else (simulating an intact repo).
+- ``GET /v1/hosts/{id}/filesystem?path=<dir>`` → 404 for the *worktree
+  directory* (simulating a deleted worktree), 200 for the repo path and
+  everything else (simulating an intact repo).
 - ``POST /v1/hosts/{id}/runners`` → records the launch body.
 - ``POST /v1/sessions/{id}/fork`` → passes through to the real server.
 
@@ -147,7 +147,7 @@ def test_fork_deleted_worktree_same_name_succeeds(
         # other path (used by the autocomplete on the workspace input) is
         # listable so the form can proceed.
         url = route.request.url
-        # URL-decoded path segment after /filesystem/
+        # The directory travels as the URL-decoded ``?path=`` query value.
         import urllib.parse
 
         decoded_url = urllib.parse.unquote(url)
@@ -184,7 +184,10 @@ def test_fork_deleted_worktree_same_name_succeeds(
         re.compile(rf".*/v1/sessions/{re.escape(session_id)}(\?.*)?$"),
         handle_session_detail,
     )
-    page.route(f"**/v1/hosts/{_HOST_ID}/filesystem/**", handle_filesystem)
+    page.route(
+        re.compile(rf".*/v1/hosts/{_HOST_ID}/filesystem([/?].*)?$"),
+        handle_filesystem,
+    )
     page.route(f"**/v1/hosts/{_HOST_ID}/runners", handle_runners)
     page.route("**/v1/sessions/*/fork", handle_fork)
 
