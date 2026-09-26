@@ -45,6 +45,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
     debug_event,
@@ -68,6 +69,7 @@ from omnigent.harness_aliases import (
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import InstructionDelivery
 from omnigent.harness_plugins import (
+    CLAUDE_NATIVE_CODING_AGENT,
     harness_capabilities,
     load_object,
     model_env_keys,
@@ -1167,6 +1169,9 @@ class _SessionSnapshot:
         ``"cursor-native-ui"``. Used as the sub-agent label when rebuilding a
         work entry for a child the server did not record a ``sub_agent_name``
         for. ``None`` when unbound / the fetch failed.
+    :param wrapper_label: The child's ``omnigent.wrapper`` label, e.g.
+        ``"claude-code-native-ui-subagent"``. ``None`` when the server
+        recorded no label or the fetch failed.
     """
 
     ok: bool
@@ -1177,6 +1182,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    wrapper_label: str | None = None
     worktree: str | None = None
 
 
@@ -3831,6 +3837,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            wrapper_label: str | None = None
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -3857,6 +3864,11 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    raw_labels = body.get("labels")
+                    if isinstance(raw_labels, dict):
+                        raw_wrapper = raw_labels.get(WRAPPER_LABEL_KEY)
+                        if isinstance(raw_wrapper, str) and raw_wrapper:
+                            wrapper_label = raw_wrapper
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -3868,6 +3880,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                wrapper_label=wrapper_label,
                 worktree=worktree,
             )
             if snapshot.ok and snapshot.agent_id is not None:
@@ -3978,6 +3991,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            wrapper_label=snapshot.labels.get(WRAPPER_LABEL_KEY) or None,
             worktree=snapshot.worktree,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
@@ -5916,6 +5930,34 @@ def create_runner_app(
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+        )
+
+    async def _is_mirrored_claude_agent_tool_child(conv_id: str) -> bool:
+        """
+        Return whether *conv_id* is a mirrored Claude Agent-tool sub-agent.
+
+        Claude Code's forwarder mirrors each of its own Agent-tool sub-agents
+        as an Omnigent child session labelled
+        ``CLAUDE_NATIVE_CODING_AGENT.subagent_wrapper_label`` and hands the
+        result back to the parent natively inside the parent's transcript. The
+        runner must not enqueue an inbox entry and wake notice on top of that
+        hand-back. A work entry already registered means an Omnigent-tool
+        dispatch owns the delivery, and a failed or unlabelled snapshot keeps
+        today's delivery behaviour.
+
+        :param conv_id: The child session id, e.g. ``"conv_child123"``.
+        :returns: ``True`` when the child is a Claude Agent-tool mirror with
+            no runner-registered work entry.
+        """
+        if get_subagent_work(conv_id) is not None:
+            return False
+        try:
+            snapshot = await _session_snapshot(conv_id)
+        except Exception:  # noqa: BLE001 — best-effort; keep today's delivery
+            return False
+        return (
+            snapshot.ok
+            and snapshot.wrapper_label == CLAUDE_NATIVE_CODING_AGENT.subagent_wrapper_label
         )
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
@@ -10616,6 +10658,12 @@ def create_runner_app(
                     allow_history_preview_fallback=False,
                 )
             if status in ("idle", "completed", "failed", "stopped", "killed"):
+                if await _is_mirrored_claude_agent_tool_child(conversation_id):
+                    # Claude Code hands a mirrored Agent-tool sub-agent's result
+                    # back to its parent itself (the forwarder derives this edge
+                    # from that hand-back), so an inbox entry and a wake notice
+                    # would deliver it twice.
+                    return Response(status_code=204)
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
             if status in ("idle", "completed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(

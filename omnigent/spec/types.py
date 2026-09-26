@@ -1608,3 +1608,24 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
+
+
+def spec_dispatches_subagents(spec: AgentSpec) -> bool:
+    """
+    Whether *spec* can dispatch sub-agents.
+
+    A dispatching spec receives the sub-agent results as inbox payloads,
+    so it always needs the ``sys_read_inbox`` drain regardless of its
+    ``async_enabled`` kill-switch. The dispatch grants are declared
+    sub-agents (``tools.agents``), ``spawn: true`` (``sys_session_create``),
+    and the ``web_fetch`` builtin, whose built-in web researcher runs
+    through the same path.
+
+    :param spec: The parsed AgentSpec.
+    :returns: ``True`` when the spec can dispatch sub-agents.
+    """
+    return bool(
+        spec.tools.agents
+        or spec.spawn
+        or any(entry.name == "web_fetch" for entry in spec.tools.builtins)
+    )
