@@ -34,7 +34,11 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
-from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+from tests.e2e_ui.start_session.helpers import (
+    commit_landing_workspace_picker,
+    open_landing_workspace_picker,
+    stub_empty_host_picker_data,
+)
 
 _HOST_ID = "host_e2e_cfg"
 _PROJECT_ID = "proj_e2e_cfg"
@@ -756,6 +760,21 @@ async def _route_composer_stubs(
     await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
 
+def _host_roots_body() -> str:
+    """``GET /v1/projects/{id}/host-roots`` — real-host placement for prefill.
+
+    Must match ``_plain_config_body``: prefill only writes a workspace alongside
+    a host it takes from ``roots``.
+    """
+    return json.dumps(
+        {
+            "roots": [{"host_id": _HOST_ID, "workspace": _GIT_REPO, "source": "config"}],
+            "default_host_id": _HOST_ID,
+            "default_host_reason": "config",
+        }
+    )
+
+
 def test_typed_picker_preserves_posix_trailing_space_in_create(
     seeded_session: tuple[str, str],
 ) -> None:
@@ -777,6 +796,16 @@ async def _drive_typed_picker_trailing_space(base_url: str, session_id: str) -> 
                 create_bodies=create_bodies,
                 session_id=session_id,
             )
+
+            # _PROJECT_CFG_RE matches /v1/projects/<id> as a search, so it also
+            # swallows /v1/projects/<id>/host-roots; this later route wins
+            # (Playwright tries the most recently registered match first).
+            async def handle_host_roots(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_host_roots_body()
+                )
+
+            await page.route(f"**/v1/projects/{_PROJECT_ID}/host-roots", handle_host_roots)
 
             async def handle_filesystem(route: Route) -> None:
                 await route.fulfill(
@@ -807,12 +836,12 @@ async def _drive_typed_picker_trailing_space(base_url: str, session_id: str) -> 
                 state="visible", timeout=30_000
             )
 
-            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            await open_landing_workspace_picker(page)
             path_input = page.get_by_test_id("workspace-picker-path-input")
             await path_input.fill(f"  {exact_workspace}")
             await path_input.press("Enter")
             await expect(path_input).to_have_value(exact_workspace)
+            await commit_landing_workspace_picker(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("keep the exact cwd")
             await page.get_by_test_id("new-chat-landing-submit").click()
