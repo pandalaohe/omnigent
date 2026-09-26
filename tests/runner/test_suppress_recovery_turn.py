@@ -110,6 +110,62 @@ class _CatchUpServerClient(_HistoryServerClient):
         return self._Resp({})
 
 
+_TRAILING_ROUTING_DECISION = {
+    "id": "rd_001",
+    "type": "routing_decision",
+    "decision": "continue",
+}
+_ITEMS_PAGE_WITH_TRAILING_ROUTING = {
+    "object": "list",
+    "data": [_PENDING_USER_MESSAGE, _TRAILING_ROUTING_DECISION],
+    "has_more": False,
+}
+
+
+class _TrailingNonInputServerClient(_HistoryServerClient):
+    """History whose last raw item converts to no input item.
+
+    The user message before the routing decision is still the trailing
+    converted item, so the recovery turn starts — but the raw cursor points
+    at the routing decision instead of at the message the turn ran.
+    """
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        if url.rstrip("/").endswith("/items"):
+            return self._Resp(_ITEMS_PAGE_WITH_TRAILING_ROUTING)
+        return await super().get(url, **kwargs)
+
+
+class _GatedHistoryServerClient(_HistoryServerClient):
+    """Gates the two history fetches of the init-replay race.
+
+    The first GET (create_session's fetch) blocks until ``release_init``; the
+    second (the forward's cold-branch load) blocks until ``release_forward``.
+    Holding both open lets the init replay start while the forward is parked
+    after its first dedup check.
+    """
+
+    def __init__(self) -> None:
+        self.init_entered = asyncio.Event()
+        self.forward_entered = asyncio.Event()
+        self.release_init = asyncio.Event()
+        self.release_forward = asyncio.Event()
+        self._calls = 0
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        if url.rstrip("/").endswith(f"/sessions/{SESSION_ID}/items"):
+            call = self._calls
+            self._calls += 1
+            if call == 0:
+                self.init_entered.set()
+                await self.release_init.wait()
+            elif call == 1:
+                self.forward_entered.set()
+                await self.release_forward.wait()
+            return self._Resp(_ITEMS_PAGE)
+        return await super().get(url, **kwargs)
+
+
 def _build_sdk_app(
     server_client: Any,
     resource_registry: SessionResourceRegistry | None = None,
@@ -233,15 +289,14 @@ async def test_suppress_recovery_turn_prevents_recovery_turn_from_history() -> N
 
 
 @pytest.mark.asyncio
-async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history() -> None:
-    """Without suppress_recovery_turn the runner starts a recovery turn from history.
+async def test_recovery_turn_drops_forward_of_its_starting_item() -> None:
+    """A replay turn from history consumes the item the server then forwards.
 
-    This documents the pre-fix behaviour: when the session-init envelope does
-    NOT carry suppress_recovery_turn=True, the runner sees the persisted user
-    message in history and starts a recovery turn immediately.  A subsequent
-    forward then finds an active turn and buffers the message.  After the
-    recovery turn finishes, _check_and_start_next_turn processes the buffered
-    message as a second turn, so the harness is called twice.
+    Without suppress_recovery_turn the runner sees the persisted user message
+    in history and starts a recovery turn from it.  The server's forward of
+    that same item (persisted_item_id) must be dropped as already started:
+    otherwise the message runs twice — either as a second turn, or buffered
+    and replayed after the recovery turn.
     """
     app, _pm, harness = _build_sdk_app(_HistoryServerClient())
 
@@ -262,13 +317,10 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
         )
         _assert_browser_tools_hidden(harness.posted_bodies[0])
 
-        # Now forward the message: since the recovery turn already ran and
-        # _active_turns is now empty, the forward triggers a second turn.
-        # (In the original bug, the forward would have been buffered _during_
-        # the recovery turn and then replayed after it, resulting in two turns.)
+        # The server now forwards the very item the recovery turn started
+        # from; it must be dropped, not run again.
         forward_resp = await client.post(
             f"/v1/sessions/{SESSION_ID}/events",
-            params={"stream": "true"},
             json={
                 "type": "message",
                 "role": "user",
@@ -277,16 +329,155 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
                 "persisted_item_id": "msg_001",
             },
         )
-        assert forward_resp.status_code == 200, (
+        assert forward_resp.status_code == 202, (
             f"Message forward returned {forward_resp.status_code}: {forward_resp.text}"
         )
-        _ = forward_resp.text  # drain
+        assert forward_resp.json().get("status") == "already_started"
 
-        # Second turn ran — harness called twice total.
-        assert len(harness.posted_bodies) == 2, (
-            "Expected two harness calls total (recovery turn + forward-triggered turn); "
+        assert len(harness.posted_bodies) == 1, (
+            "Forward of the recovery turn's own item ran a second harness turn; "
             f"got {len(harness.posted_bodies)}"
         )
+
+        get_resp = await client.get(f"/v1/sessions/{SESSION_ID}")
+        assert get_resp.status_code == 200, get_resp.text
+        assert get_resp.json().get("status") == "idle", (
+            f"the dropped forward must leave the session idle, not failed: {get_resp.json()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovery_turn_drops_forward_when_a_non_input_item_trails() -> None:
+    """The replayed id comes from the converted history, not the raw cursor.
+
+    A routing decision trails the user message: it is the last raw item, while
+    the user message is the last converted input item.  Recording the raw
+    cursor would drop no forward and run the message twice.
+    """
+    app, _pm, harness = _build_sdk_app(_TrailingNonInputServerClient())
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=False),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.sleep(0.1)
+        assert len(harness.posted_bodies) == 1, (
+            "the trailing converted user message must still start a recovery turn; "
+            f"got {len(harness.posted_bodies)} harness call(s)"
+        )
+
+        forward_resp = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "hello from history"}],
+                "persisted_item_id": "msg_001",
+            },
+        )
+        assert forward_resp.status_code == 202, forward_resp.text
+        assert forward_resp.json().get("status") == "already_started", (
+            "the forward of the message the recovery turn replayed must be "
+            f"dropped; got {forward_resp.json()}"
+        )
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+    assert len(harness.posted_bodies) == 1, (
+        f"the replayed message ran the harness {len(harness.posted_bodies)} times"
+    )
+
+
+@pytest.mark.asyncio
+async def test_forward_during_recovery_turn_is_dropped_not_buffered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forward arriving while the replay turn runs must not be buffered.
+
+    The buffered path is the other half of the double-run: the item would be
+    processed again by _check_and_start_next_turn once the recovery turn ends.
+    """
+    started, release = asyncio.Event(), asyncio.Event()
+    original = _ScriptedHarnessClient._StreamHandle.aiter_text
+
+    async def gated_stream(handle: Any) -> Any:
+        started.set()
+        await release.wait()
+        async for frame in original(handle):
+            yield frame
+
+    monkeypatch.setattr(_ScriptedHarnessClient._StreamHandle, "aiter_text", gated_stream)
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=False),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.wait_for(started.wait(), timeout=5)
+        turn = app.state.active_turns.get(SESSION_ID)
+        assert isinstance(turn, asyncio.Task) and not turn.done()
+
+        try:
+            forward_resp = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hello"}],
+                    "persisted_item_id": "msg_001",
+                },
+            )
+            assert forward_resp.status_code == 202, forward_resp.text
+            assert forward_resp.json().get("status") == "already_started"
+            assert not app.state.session_message_buffers.get(SESSION_ID), (
+                "the recovery turn's own forward was buffered and will replay"
+            )
+        finally:
+            release.set()
+            await asyncio.wait_for(turn, timeout=5)
+        assert not app.state.session_message_buffers.get(SESSION_ID)
+    assert len(harness.posted_bodies) == 1, (
+        f"replayed item ran the harness {len(harness.posted_bodies)} times"
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_item_forward_after_recovery_turn_starts_a_turn() -> None:
+    """A forward carrying a different item still runs after the replay turn."""
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=False),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.sleep(0.1)
+        assert len(harness.posted_bodies) == 1
+
+        forward_resp = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "next"}],
+                "persisted_item_id": "msg_002",
+            },
+        )
+        assert forward_resp.status_code == 202, forward_resp.text
+        assert forward_resp.json().get("status") == "accepted", forward_resp.text
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+    assert len(harness.posted_bodies) == 2, (
+        "a forward of a newer item must still start its turn; "
+        f"got {len(harness.posted_bodies)} harness call(s)"
+    )
 
 
 @pytest.mark.asyncio
@@ -317,6 +508,197 @@ async def test_catch_up_turn_hides_browser_tools_without_renderer_evidence() -> 
 
     assert len(harness.posted_bodies) == 1, "catch-up scan did not start one harness turn"
     _assert_browser_tools_hidden(harness.posted_bodies[0])
+
+
+@pytest.mark.asyncio
+async def test_catch_up_replay_drops_forward_of_its_item() -> None:
+    """A forward of the item a catch-up turn replayed must be dropped."""
+    from omnigent.runner.app import _session_histories_ref
+
+    server_client = _CatchUpServerClient()
+    app, _pm, harness = _build_sdk_app(server_client)
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=True),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        _session_histories_ref[SESSION_ID] = []
+        server_client.expose_item = True
+        try:
+            await app.state.catch_up_scan()
+            for _ in range(100):
+                if harness.posted_bodies:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(harness.posted_bodies) == 1, "catch-up scan did not start a turn"
+
+            forward_resp = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hello from history"}],
+                    "persisted_item_id": "msg_001",
+                },
+            )
+            assert forward_resp.status_code == 202, forward_resp.text
+            assert forward_resp.json().get("status") == "already_started"
+            assert not app.state.session_message_buffers.get(SESSION_ID), (
+                "the catch-up turn's own forward was buffered and will replay"
+            )
+            turn = app.state.active_turns.get(SESSION_ID)
+            if turn is not None:
+                await asyncio.wait_for(turn, timeout=5)
+        finally:
+            _session_histories_ref.pop(SESSION_ID, None)
+    assert len(harness.posted_bodies) == 1, (
+        f"catch-up replay ran the harness {len(harness.posted_bodies)} times"
+    )
+
+
+@pytest.mark.asyncio
+async def test_forward_resolution_race_with_catch_up_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replay that starts during content resolution must still win the item.
+
+    The dedup check runs after the resolution await, so a forward that passed
+    the check cannot have been overtaken by a replay that recorded the item
+    while it was parked.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_histories_ref
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = runner_app._resolve_forwarded_message_content
+
+    async def gated_resolve(content: list[Any], **kwargs: Any) -> list[Any]:
+        entered.set()
+        await release.wait()
+        return await original(content, **kwargs)
+
+    monkeypatch.setattr(runner_app, "_resolve_forwarded_message_content", gated_resolve)
+
+    server_client = _CatchUpServerClient()
+    app, _pm, harness = _build_sdk_app(server_client)
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=True),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        _session_histories_ref[SESSION_ID] = []
+        server_client.expose_item = True
+        try:
+            forward = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{SESSION_ID}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": AGENT_ID,
+                        "content": [{"type": "input_text", "text": "hello from history"}],
+                        "persisted_item_id": "msg_001",
+                    },
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=5)
+
+            # The replay starts and records msg_001 while the forward is
+            # parked inside resolution.
+            await app.state.catch_up_scan()
+            for _ in range(100):
+                if harness.posted_bodies:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(harness.posted_bodies) == 1, "catch-up scan did not start a turn"
+
+            release.set()
+            forward_resp = await asyncio.wait_for(forward, timeout=5)
+            assert forward_resp.status_code == 202, forward_resp.text
+            assert forward_resp.json().get("status") == "already_started", (
+                "the forward passed the dedup check before resolution and was "
+                f"not re-checked; got {forward_resp.json()}"
+            )
+            assert not app.state.session_message_buffers.get(SESSION_ID), (
+                "the forward was buffered behind the replay turn and will replay"
+            )
+            turn = app.state.active_turns.get(SESSION_ID)
+            if turn is not None:
+                await asyncio.wait_for(turn, timeout=5)
+        finally:
+            release.set()
+            _session_histories_ref.pop(SESSION_ID, None)
+    assert len(harness.posted_bodies) == 1, (
+        f"the item ran the harness {len(harness.posted_bodies)} times"
+    )
+
+
+@pytest.mark.asyncio
+async def test_forward_rechecks_after_cold_history_load() -> None:
+    """A replay starting during the forward's cold history load must still win.
+
+    The forward passes the dedup check, then awaits the cold-branch history
+    load.  In that window create_session's init replay starts a turn from the
+    same persisted item; without a re-check after the load the forward installs
+    history and starts a second turn.
+    """
+    server_client = _GatedHistoryServerClient()
+    app, _pm, harness = _build_sdk_app(server_client)
+
+    async with _runner_client(app) as client:
+        init = asyncio.create_task(
+            client.post(
+                "/v1/sessions",
+                json=_session_init_payload(suppress_recovery_turn=False),
+            )
+        )
+        try:
+            await asyncio.wait_for(server_client.init_entered.wait(), timeout=5)
+            forward = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{SESSION_ID}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": AGENT_ID,
+                        "content": [{"type": "input_text", "text": "hello"}],
+                        "persisted_item_id": "msg_001",
+                    },
+                )
+            )
+            await asyncio.wait_for(server_client.forward_entered.wait(), timeout=5)
+
+            # The init replay starts and records msg_001 while the forward is
+            # parked in its cold history load.
+            server_client.release_init.set()
+            init_resp = await asyncio.wait_for(init, timeout=5)
+            assert init_resp.status_code == 201, init_resp.text
+
+            server_client.release_forward.set()
+            forward_resp = await asyncio.wait_for(forward, timeout=5)
+            assert forward_resp.status_code == 202, forward_resp.text
+            assert forward_resp.json().get("status") == "already_started", (
+                "the forward was not re-checked after its history load and "
+                f"started a second turn; got {forward_resp.json()}"
+            )
+            assert not app.state.session_message_buffers.get(SESSION_ID)
+        finally:
+            server_client.release_init.set()
+            server_client.release_forward.set()
+
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+    assert len(harness.posted_bodies) == 1, (
+        f"the item ran the harness {len(harness.posted_bodies)} times"
+    )
 
 
 @pytest.mark.asyncio

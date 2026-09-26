@@ -210,6 +210,15 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
+# Raw server item types that survive history conversion; shared by the
+# converter and the trailing-user-item replay check so they cannot drift.
+_HISTORY_INPUT_ITEM_TYPES = (
+    "message",
+    "function_call",
+    "function_call_output",
+    "error",
+)
+
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
@@ -3107,6 +3116,9 @@ def create_runner_app(
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
     _recovery_turn_ids: dict[str, set[str]] = {}
+    # Dropping the server's forward of an item a replay turn already started is
+    # what keeps one posted message from running twice.
+    _replay_started_item_ids: dict[str, str] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -4949,11 +4961,13 @@ def create_runner_app(
             else None
         )
         history: list[_JsonObject]
+        raw_history: list[_JsonObject] = []
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
         else:
-            history = await _load_history_as_input(session_id)
+            raw_history = await _fetch_history_items(session_id)
+            history = await _load_history_as_input(session_id, items=raw_history)
         execution_seen = (
             initially_active
             or _turn_bind_epoch.get(session_id) != initial_turn_epoch
@@ -4996,6 +5010,10 @@ def create_runner_app(
                     _background_tasks.discard,
                 )
                 _background_tasks.add(_turn_task)
+                if last_type == "message" and last_role == "user":
+                    _replay_item_id = _trailing_user_item_id(raw_history)
+                    if _replay_item_id is not None:
+                        _replay_started_item_ids[session_id] = _replay_item_id
 
         if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
             session_id, set()
@@ -5374,6 +5392,7 @@ def create_runner_app(
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
+        _replay_started_item_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
@@ -5526,10 +5545,7 @@ def create_runner_app(
         if last_id:
             _last_server_item_id[session_id] = last_id
 
-    async def _load_history_as_input(
-        session_id: str,
-        drop_item_id: str | None = None,
-    ) -> list[_JsonObject]:
+    async def _fetch_history_items(session_id: str) -> list[_JsonObject]:
         all_items: list[_JsonObject] = []
         after_cursor: str | None = None
         while True:
@@ -5572,6 +5588,15 @@ def create_runner_app(
             if not page.get("has_more", False):
                 break
             after_cursor = last_id
+        return all_items
+
+    async def _load_history_as_input(
+        session_id: str,
+        drop_item_id: str | None = None,
+        *,
+        items: list[_JsonObject] | None = None,
+    ) -> list[_JsonObject]:
+        all_items = await _fetch_history_items(session_id) if items is None else items
 
         if drop_item_id is not None:
             all_items = [it for it in all_items if it.get("id") != drop_item_id]
@@ -5589,6 +5614,44 @@ def create_runner_app(
                     server_client=server_client,
                 )
         return converted
+
+    def _trailing_user_item_id(items: list[_JsonObject]) -> str | None:
+        compaction_idx: int | None = None
+        for i, item in enumerate(items):
+            if item.get("type") == "compaction":
+                compaction_idx = i
+        remaining = items[compaction_idx + 1 :] if compaction_idx is not None else items
+        for item in reversed(remaining):
+            if item.get("type") not in _HISTORY_INPUT_ITEM_TYPES:
+                continue
+            if item.get("type") != "message" or item.get("role", "user") != "user":
+                return None
+            item_id = item.get("id")
+            return item_id if isinstance(item_id, str) and item_id else None
+        return None
+
+    def _forward_of_replayed_item(
+        conversation_id: str,
+        message_body: _JsonObject,
+    ) -> JSONResponse | None:
+        replay_item_id = _replay_started_item_ids.get(conversation_id)
+        if replay_item_id is None or message_body.get("persisted_item_id") != replay_item_id:
+            return None
+        _replay_started_item_ids.pop(conversation_id, None)
+        _logger.info(
+            "post_session_events: dropping forward of item already started "
+            "by a replay turn conv=%s item=%s",
+            conversation_id,
+            replay_item_id,
+            extra={"session_id": conversation_id},
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "already_started",
+                "detail": "A replay turn already started this message.",
+            },
+        )
 
     def _convert_raw_items_to_input(
         items: list[_JsonObject],
@@ -5640,12 +5703,7 @@ def create_runner_app(
         _skipped_types: list[str] = []
         for item in remaining:
             item_type = item.get("type")
-            if item_type not in (
-                "message",
-                "function_call",
-                "function_call_output",
-                "error",
-            ):
+            if item_type not in _HISTORY_INPUT_ITEM_TYPES:
                 _skipped_types.append(str(item_type))
             if item_type == "message":
                 result.append(
@@ -10414,6 +10472,10 @@ def create_runner_app(
                         server_client=server_client,
                     )
 
+                _replayed_forward = _forward_of_replayed_item(conversation_id, message_body)
+                if _replayed_forward is not None:
+                    return _replayed_forward
+
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
                     _awaiting_approval = pending_approvals.has_pending(conversation_id)
@@ -10521,6 +10583,11 @@ def create_runner_app(
                         conversation_id,
                         drop_item_id=persisted_item_id,
                     )
+                    # The history load can outlive a replay turn that records
+                    # this item; re-check before installing history and starting.
+                    _replayed_forward = _forward_of_replayed_item(conversation_id, message_body)
+                    if _replayed_forward is not None:
+                        return _replayed_forward
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
@@ -13784,6 +13851,9 @@ def create_runner_app(
                         _background_tasks.discard,
                     )
                     _background_tasks.add(_turn_task)
+                    _catchup_item_id = _trailing_user_item_id(all_new)
+                    if _catchup_item_id is not None:
+                        _replay_started_item_ids[session_id] = _catchup_item_id
             except (httpx.HTTPError, RuntimeError):
                 _logger.warning(
                     "Catch-up scan failed for %s",
