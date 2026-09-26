@@ -275,6 +275,7 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
     # Imported lazily: utils imports this module at load time.
     from omnigent.db.utils import (
         _build_alembic_config,
+        _get_current_db_heads,
         _get_current_db_revision,
         _get_head_db_revision,
         _run_migrations,
@@ -284,11 +285,11 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
     version = _crdb_server_version(engine)
     _verify_crdb_read_committed(engine, version)
     head = _get_head_db_revision(db_uri)
-    current = _get_current_db_revision(engine)
+    current_heads = _get_current_db_heads(engine)
     tables = set(inspect(engine).get_table_names())
     expected = set(OmnigentBase.metadata.tables) | set(ConversationBase.metadata.tables)
 
-    if current is None:
+    if not current_heads:
         _start_or_resume_crdb_bootstrap(engine, version, tables, expected, head)
         with query_name_scope("omnigent.database.bootstrap_cockroachdb"):
             with engine.connect() as connection:
@@ -319,13 +320,17 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
             _finish_crdb_bootstrap(engine, version)
         return
 
-    _verify_db_revision_is_supported(db_uri, current, head)
-    if not _crdb_revision_is_supported(db_uri, current, head):
-        raise RuntimeError(
-            f"CockroachDB schema revision {current!r} predates Omnigent's CRDB "
-            f"baseline {CRDB_BASELINE_REVISION!r}. Use a new empty database."
-        )
-    if current != head:
+    for revision in current_heads:
+        _verify_db_revision_is_supported(db_uri, revision, head)
+        if not _crdb_revision_is_supported(db_uri, revision, head):
+            raise RuntimeError(
+                f"CockroachDB schema revision {revision!r} predates Omnigent's CRDB "
+                f"baseline {CRDB_BASELINE_REVISION!r}. Use a new empty database."
+            )
+    if current_heads != (head,):
+        # A downgrade through a join migration leaves one row per branch in
+        # alembic_version, so several heads simply mean the database is stale.
+        current = current_heads[0] if len(current_heads) == 1 else current_heads
         _logger.warning(
             "CockroachDB schema is out of date (found revision %r, expected %r); "
             "attempting automatic migration.",
@@ -346,8 +351,9 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
                 f"    omnigent debug db-upgrade {safe_uri!r}\n\n"
                 "to inspect or retry the migration manually."
             ) from exc
-        migrated = _get_current_db_revision(engine)
-        if migrated != head:
+        migrated_heads = _get_current_db_heads(engine)
+        if migrated_heads != (head,):
+            migrated = migrated_heads[0] if len(migrated_heads) == 1 else migrated_heads
             raise RuntimeError(
                 "CockroachDB schema migration did not reach head "
                 f"(started at {current!r}, now at {migrated!r}, expected {head!r}). "
