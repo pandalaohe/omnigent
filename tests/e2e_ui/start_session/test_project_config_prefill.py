@@ -1,8 +1,7 @@
 """E2E: the home composer prefills from a project's stored ``config``.
 
-Choosing ``New session in <name>`` from the command palette navigates to
-``/?project=<name>`` and seeds the composer from that project's stored defaults
-(``web/src/shell/projectPrefill.ts`` +
+Visiting ``/?project=<name>`` seeds the new-session composer from that project's
+stored defaults (``web/src/shell/projectPrefill.ts`` +
 ``web/src/shell/NewChatDialog.tsx``): host, working directory, and agent all
 come from ``config``, silently falling back to the generic defaults for any
 field the config leaves unset. This replaced the old newest-session inference —
@@ -133,7 +132,7 @@ def _project_config_body() -> str:
 
 
 def test_composer_prefills_from_project_config(seeded_session: tuple[str, str]) -> None:
-    """The project command seeds host / workspace / agent from stored config.
+    """A ``?project=`` visit seeds host / workspace / agent from stored config.
 
     The pinned agent (``ag_pinned_e2e``) and workspace (``/work/configured-repo``)
     come from ``config`` — NOT from the default-ranked Claude Code or a recent
@@ -207,14 +206,7 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
 
-            await page.goto(f"{base_url}/c/{session_id}")
-            await page.get_by_placeholder("Send a message…").wait_for(
-                state="visible", timeout=30_000
-            )
-            await page.keyboard.press("ControlOrMeta+k")
-            palette = page.get_by_role("dialog")
-            await expect(palette).to_be_visible(timeout=10_000)
-            await palette.get_by_text(f"New session in {_PROJECT_NAME}", exact=True).click()
+            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
@@ -498,170 +490,9 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
 
 # The worktree-list endpoint the composer probes for the seeded workspace.
 _WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
-# The user's most-recent workspace on the host — a LINKED worktree of the repo
-# whose main tree lives at _MAIN_REPO. Seeded into localStorage so the auto-seed
-# would land here (the pre-fix behavior) unless the fork-fresh redirect fires.
-_MAIN_REPO = "/work/gamma"
-_LINKED_WORKTREE = "/work/gamma-worktrees/feature-x"
-
-
-def _base_branch_config_body() -> str:
-    """``GET /v1/projects/{id}`` whose stored config sets a default base branch."""
-    return json.dumps(
-        {
-            "id": _PROJECT_ID,
-            "name": _PROJECT_NAME,
-            "config": {"host_id": _HOST_ID, "base_branch": "develop"},
-        }
-    )
-
-
-def _worktrees_body() -> str:
-    """``GET /v1/hosts/{id}/worktrees`` — the repo's main tree plus one linked
-    worktree (the recent workspace). The composer's fork-fresh probe reads this
-    to decide the recent path is a worktree and redirect to the main tree."""
-    return json.dumps(
-        {
-            "object": "list",
-            "data": [
-                {"path": _MAIN_REPO, "branch": "main", "is_main": True, "detached": False},
-                {
-                    "path": _LINKED_WORKTREE,
-                    "branch": "feature/x",
-                    "is_main": False,
-                    "detached": False,
-                },
-            ],
-        }
-    )
-
-
-def test_composer_forks_fresh_from_project_default_over_last_worktree(
-    seeded_session: tuple[str, str],
-) -> None:
-    """A project default base branch forks fresh instead of reusing the last worktree.
-
-    Regression: the composer auto-seeds the working directory from the user's
-    most-recent workspace. When that path is an existing (linked) worktree, the
-    branch prefilled from it and the project's stored default base branch was
-    silently dropped — a fresh new-chat continued in the old worktree instead of
-    forking off the default. With a default configured, the composer now probes
-    the recent path, redirects the seed to the repo's MAIN work tree, and
-    auto-names a fresh worktree branch so the create forks off the default:
-    ``git: {branch_name: worktree-<hex>, base_branch: "develop"}`` at the main
-    repo — NOT an ``existing_worktree`` bind in the linked worktree.
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_fork_fresh(base_url, session_id))
-
-
-async def _drive_fork_fresh(base_url: str, session_id: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-
-            async def handle_hosts(route: Route) -> None:
-                await route.fulfill(
-                    status=200, content_type="application/json", body=_hosts_body()
-                )
-
-            async def handle_agents(route: Route) -> None:
-                await route.fulfill(
-                    status=200, content_type="application/json", body=_agents_body()
-                )
-
-            async def handle_projects_list(route: Route) -> None:
-                await route.fulfill(
-                    status=200, content_type="application/json", body=_projects_list_body()
-                )
-
-            async def handle_project_config(route: Route) -> None:
-                await route.fulfill(
-                    status=200, content_type="application/json", body=_base_branch_config_body()
-                )
-
-            async def handle_worktrees(route: Route) -> None:
-                await route.fulfill(
-                    status=200, content_type="application/json", body=_worktrees_body()
-                )
-
-            async def handle_events(route: Route) -> None:
-                await route.fulfill(
-                    status=200,
-                    content_type="application/json",
-                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
-                )
-
-            async def handle_sessions(route: Route) -> None:
-                if route.request.method == "POST":
-                    create_bodies.append(route.request.post_data_json)
-                    await route.fulfill(
-                        status=200,
-                        content_type="application/json",
-                        body=json.dumps({"id": session_id}),
-                    )
-                else:
-                    await route.continue_()
-
-            async def handle_agent_scan(route: Route) -> None:
-                await route.fulfill(
-                    status=200, content_type="application/json", body=json.dumps({"data": []})
-                )
-
-            await page.route("**/v1/hosts", handle_hosts)
-            await page.route("**/v1/agents", handle_agents)
-            await page.route("**/v1/sessions/projects", handle_projects_list)
-            await page.route(_PROJECT_CFG_RE, handle_project_config)
-            await page.route(_WORKTREES_RE, handle_worktrees)
-            await page.route("**/v1/sessions/*/events", handle_events)
-            await page.route(_SESSIONS_RE, handle_sessions)
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
-
-            # The most-recent workspace is a LINKED worktree — the pre-fix
-            # auto-seed would land here and reuse it.
-            await page.add_init_script(
-                f"""window.localStorage.setItem(
-                    "omnigent:recent-workspaces",
-                    JSON.stringify({{ {_HOST_ID}: ["{_LINKED_WORKTREE}"] }})
-                );"""
-            )
-
-            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-
-            # The workspace chip shows the MAIN repo (gamma), not the linked
-            # worktree — proof the fork-fresh redirect fired.
-            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
-                "gamma", timeout=15_000
-            )
-
-            await page.get_by_test_id("new-chat-landing-input").fill("start fresh")
-            await page.get_by_test_id("new-chat-landing-submit").click()
-
-            await _wait_until(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
-            assert body["host_id"] == _HOST_ID, body
-            # Seeded at the MAIN repo, not the linked worktree.
-            assert body["workspace"] == _MAIN_REPO, body
-            git = body.get("git") or {}
-            # A fresh worktree forked off the project default — not a bind.
-            assert re.fullmatch(r"worktree-[0-9a-f]{8}", git.get("branch_name", "")), body
-            assert git.get("base_branch") == "develop", body
-            assert "existing_worktree" not in git, body
-        finally:
-            await browser.close()
-
-
 # A git repo whose main tree is the seeded workspace — the composer's worktree
 # probe reads this to decide the workspace is a git repo and can host a worktree.
 _GIT_REPO = "/work/omnigent"
-# The user-global "always use a worktree" preference key (Settings › Git),
-# mirrors STORAGE_KEY in web/src/lib/worktreeDefaultPreferences.ts.
-_ALWAYS_WORKTREE_KEY = "omnigent:always-use-worktree"
 
 
 def _git_repo_worktrees_body() -> str:
@@ -687,18 +518,6 @@ def _plain_config_body() -> str:
             "id": _PROJECT_ID,
             "name": _PROJECT_NAME,
             "config": {"host_id": _HOST_ID, "workspace": _GIT_REPO},
-        }
-    )
-
-
-def _worktree_off_config_body() -> str:
-    """``GET /v1/projects/{id}`` config that explicitly opts OUT of worktrees
-    (``use_worktree: false``) — this must win over a global default that is on."""
-    return json.dumps(
-        {
-            "id": _PROJECT_ID,
-            "name": _PROJECT_NAME,
-            "config": {"host_id": _HOST_ID, "workspace": _GIT_REPO, "use_worktree": False},
         }
     )
 
@@ -873,119 +692,5 @@ async def _drive_typed_picker_trailing_space(base_url: str, session_id: str) -> 
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == exact_workspace, body
-        finally:
-            await browser.close()
-
-
-def test_global_default_seeds_worktree_when_project_unset(
-    seeded_session: tuple[str, str],
-) -> None:
-    """The user-global "always use a worktree" default seeds a fresh worktree.
-
-    With the global default on and a project that leaves ``use_worktree`` unset,
-    a ``?project=`` visit into a git workspace auto-names a worktree branch and
-    the create posts ``git: {branch_name: worktree-<hex>}`` — the same behavior
-    the per-project toggle produces, now driven by the global default.
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(
-        _drive_global_worktree(base_url, session_id, config_body=_plain_config_body())
-    )
-
-
-async def _drive_global_worktree(base_url: str, session_id: str, *, config_body: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-            await _route_composer_stubs(
-                page, config_body=config_body, create_bodies=create_bodies, session_id=session_id
-            )
-
-            # Turn the global "always use a worktree" default on before load.
-            await page.add_init_script(
-                f"""window.localStorage.setItem("{_ALWAYS_WORKTREE_KEY}", "true");"""
-            )
-
-            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-
-            # The branch chip shows the auto-seeded worktree name — proof the
-            # global default drove a worktree seed for an unset project.
-            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
-                re.compile(r"worktree-[0-9a-f]{8}"), timeout=15_000
-            )
-
-            await page.get_by_test_id("new-chat-landing-input").fill("start here")
-            await page.get_by_test_id("new-chat-landing-submit").click()
-
-            await _wait_until(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
-            # Workspace is still the untouched config seed, so it is omitted
-            # for the server to default-fill; the branch name is generated
-            # client-side and therefore always explicit.
-            assert body["project_id"] == _PROJECT_ID, body
-            assert "workspace" not in body, body
-            git = body.get("git") or {}
-            assert re.fullmatch(r"worktree-[0-9a-f]{8}", git.get("branch_name", "")), body
-        finally:
-            await browser.close()
-
-
-def test_project_opt_out_wins_over_global_default(
-    seeded_session: tuple[str, str],
-) -> None:
-    """A project's explicit ``use_worktree: false`` beats a global default of on.
-
-    With the global default on but the project storing an explicit opt-out, the
-    composer must NOT seed a worktree: the branch chip shows "New worktree"
-    and the create posts no ``git`` block (a plain launch in the workspace).
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_project_opt_out(base_url, session_id))
-
-
-async def _drive_project_opt_out(base_url: str, session_id: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-            await _route_composer_stubs(
-                page,
-                config_body=_worktree_off_config_body(),
-                create_bodies=create_bodies,
-                session_id=session_id,
-            )
-
-            # Global default ON — the project's explicit false must still win.
-            await page.add_init_script(
-                f"""window.localStorage.setItem("{_ALWAYS_WORKTREE_KEY}", "true");"""
-            )
-
-            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-            # Workspace settles first; then assert no worktree branch was seeded.
-            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
-                "omnigent", timeout=15_000
-            )
-            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_text(
-                "New worktree", timeout=15_000
-            )
-
-            await page.get_by_test_id("new-chat-landing-input").fill("start here")
-            await page.get_by_test_id("new-chat-landing-submit").click()
-
-            await _wait_until(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
-            assert body["project_id"] == _PROJECT_ID, body
-            assert "workspace" not in body, body
-            # Explicit opt-out -> a plain launch, no worktree.
-            assert body.get("git") is None, body
         finally:
             await browser.close()
