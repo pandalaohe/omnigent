@@ -17,7 +17,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-import yaml
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
 from websockets.http11 import Response
@@ -619,12 +618,9 @@ async def test_handle_model_options_reports_the_endpoints_wider_catalog(
     _cleanup_host(host)
 
 
-def _make_host_process(config_path: Path | None = None) -> HostProcess:
+def _make_host_process() -> HostProcess:
     """Create a HostProcess with a test identity.
 
-    :param config_path: Config file the host reads its hook/worktree commands
-        from. Defaults to a path that never exists, so no test ever reads the
-        developer's real ``~/.omnigent/config.yaml``.
     :returns: A :class:`HostProcess` for testing.
     """
     identity = HostIdentity(
@@ -634,7 +630,6 @@ def _make_host_process(config_path: Path | None = None) -> HostProcess:
     return HostProcess(
         identity=identity,
         server_url="http://localhost:8000",
-        config_path=config_path or Path("/nonexistent/omnigent-test-config.yaml"),
     )
 
 
@@ -7687,16 +7682,11 @@ async def test_dispatch_assignment_prepare_replies_with_result(
     seen: dict[str, object] = {}
 
     def _fake_prepare(
-        repositories: object,
-        assignment_id: str,
-        *,
-        entry: str | None = None,
-        command: list[str] | None = None,
+        repositories: object, assignment_id: str, *, entry: str | None = None
     ) -> HostAssignmentPrepareResultFrame:
         seen["repositories"] = repositories
         seen["assignment_id"] = assignment_id
         seen["entry"] = entry
-        seen["command"] = command
         return HostAssignmentPrepareResultFrame(
             request_id="",
             status="ok",
@@ -7710,7 +7700,6 @@ async def test_dispatch_assignment_prepare_replies_with_result(
 
     assert seen["assignment_id"] == "asg_x"
     assert seen["entry"] == "/Users/alice/project"
-    assert seen["command"] is None
     assert len(ws.sent) == 1
     result = decode_host_frame(ws.sent[0])
     assert isinstance(result, HostAssignmentPrepareResultFrame)
@@ -7730,11 +7719,7 @@ async def test_dispatch_assignment_prepare_crash_still_answers_failed(
     host = _make_host_process()
 
     def _boom(
-        repositories: object,
-        assignment_id: str,
-        *,
-        entry: str | None = None,
-        command: list[str] | None = None,
+        repositories: object, assignment_id: str, *, entry: str | None = None
     ) -> HostAssignmentPrepareResultFrame:
         raise RuntimeError("disk on fire")
 
@@ -7749,149 +7734,6 @@ async def test_dispatch_assignment_prepare_crash_still_answers_failed(
     assert result.request_id == "req_ap_9"
     assert result.status == "failed"
     assert "disk on fire" in (result.error or "")
-    _cleanup_host(host)
-
-
-_WORKTREE_FAKE = Path(__file__).resolve().parent / "_fake_worktree_command.py"
-
-
-def _worktree_config(tmp_path: Path, command: object) -> Path:
-    """Write a config carrying ``worktree_add_command`` verbatim."""
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        yaml.safe_dump(
-            {"host": {"host_id": "a" * 32, "name": "test-box", "worktree_add_command": command}}
-        )
-    )
-    return config
-
-
-def _configured_worktree_command(tmp_path: Path) -> list[str]:
-    """A loader-valid command list; these dispatch tests never run it."""
-    return [sys.executable, str(_WORKTREE_FAKE), f"--fake-record={tmp_path / 'record.jsonl'}"]
-
-
-async def test_dispatch_create_worktree_passes_configured_command(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The create-worktree dispatch passes the configured item to the creator."""
-    from omnigent.host import connect as connect_module
-
-    command = _configured_worktree_command(tmp_path)
-    host = _make_host_process(_worktree_config(tmp_path, command))
-    seen: dict[str, object] = {}
-
-    def _fake_create_worktree(**kwargs: object) -> object:
-        seen.update(kwargs)
-        return SimpleNamespace(
-            worktree_path="/Users/alice/.worktrees/myrepo/x",
-            branch="x",
-        )
-
-    monkeypatch.setattr(connect_module, "create_worktree", _fake_create_worktree)
-    ws = _FakeTunnel()
-
-    await host._dispatch_host_frame(  # type: ignore[arg-type]
-        ws,
-        HostCreateWorktreeFrame(
-            request_id="req_wt_cmd",
-            repo_path="/Users/alice/myrepo",
-            branch_name="x",
-        ),
-    )
-
-    assert seen["command"] == command
-    result = decode_host_frame(ws.sent[0])
-    assert isinstance(result, HostCreateWorktreeResultFrame)
-    assert result.status == "ok"
-    _cleanup_host(host)
-
-
-async def test_dispatch_create_worktree_malformed_command_never_creates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A malformed item answers failed and create_worktree is never called."""
-    from omnigent.host import connect as connect_module
-
-    host = _make_host_process(_worktree_config(tmp_path, "not-a-list"))
-
-    def _forbidden(**kwargs: object) -> object:
-        raise AssertionError("create_worktree must not run for a malformed item")
-
-    monkeypatch.setattr(connect_module, "create_worktree", _forbidden)
-    ws = _FakeTunnel()
-
-    await host._dispatch_host_frame(  # type: ignore[arg-type]
-        ws,
-        HostCreateWorktreeFrame(
-            request_id="req_wt_bad",
-            repo_path="/Users/alice/myrepo",
-            branch_name="x",
-        ),
-    )
-
-    result = decode_host_frame(ws.sent[0])
-    assert isinstance(result, HostCreateWorktreeResultFrame)
-    assert result.status == "failed"
-    assert "worktree_add_command" in (result.error or "")
-    _cleanup_host(host)
-
-
-async def test_dispatch_assignment_prepare_passes_configured_command(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A configured item reaches assignment prepare as the command argument."""
-    from omnigent.host import assignment_workspace
-
-    command = _configured_worktree_command(tmp_path)
-    host = _make_host_process(_worktree_config(tmp_path, command))
-    seen: dict[str, object] = {}
-
-    def _fake_prepare(
-        repositories: object,
-        assignment_id: str,
-        *,
-        entry: str | None = None,
-        command: list[str] | None = None,
-    ) -> HostAssignmentPrepareResultFrame:
-        seen["command"] = command
-        seen["entry"] = entry
-        return HostAssignmentPrepareResultFrame(request_id="", status="ok", directories={})
-
-    monkeypatch.setattr(assignment_workspace, "prepare", _fake_prepare)
-    ws = _FakeTunnel()
-
-    await host._dispatch_host_frame(ws, _prepare_frame(entry="/Users/alice/project"))  # type: ignore[arg-type]
-
-    assert seen["command"] == command
-    assert seen["entry"] == "/Users/alice/project"
-    result = decode_host_frame(ws.sent[0])
-    assert isinstance(result, HostAssignmentPrepareResultFrame)
-    assert result.status == "ok"
-    _cleanup_host(host)
-
-
-async def test_dispatch_assignment_prepare_malformed_command_never_prepares(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A malformed item answers failed/worktree_failed; prepare is never called."""
-    from omnigent.host import assignment_workspace
-
-    host = _make_host_process(_worktree_config(tmp_path, []))
-
-    def _forbidden(*args: object, **kwargs: object) -> object:
-        raise AssertionError("prepare must not run for a malformed item")
-
-    monkeypatch.setattr(assignment_workspace, "prepare", _forbidden)
-    ws = _FakeTunnel()
-
-    await host._dispatch_host_frame(ws, _prepare_frame())  # type: ignore[arg-type]
-
-    result = decode_host_frame(ws.sent[0])
-    assert isinstance(result, HostAssignmentPrepareResultFrame)
-    assert result.status == "failed"
-    assert result.error_code == "worktree_failed"
-    assert "worktree_add_command" in (result.error or "")
     _cleanup_host(host)
 
 

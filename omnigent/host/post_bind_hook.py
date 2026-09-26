@@ -200,15 +200,13 @@ class PostBindHookRunner:
 
 
 class _CommandConfigError(Exception):
-    """A configured host command is present but not a usable argv list."""
+    """``host.post_bind_command`` is present but not a usable argv list."""
 
 
-def _load_command(config_path: Path, key: str = "post_bind_command") -> list[str] | None:
-    """Read ``host.<key>`` from the host's config file.
+def _load_command(config_path: Path) -> list[str] | None:
+    """Read ``host.post_bind_command`` from the host's config file.
 
     :param config_path: The host's startup config path.
-    :param key: The ``host`` section key to read, e.g.
-        ``"post_bind_command"`` or ``"worktree_add_command"``.
     :returns: The argv list, or ``None`` when the file or key is absent.
     :raises _CommandConfigError: When the key is present but not a non-empty
         list of strings, or the first element is not an absolute path, or the
@@ -220,20 +218,20 @@ def _load_command(config_path: Path, key: str = "post_bind_command") -> list[str
         with open(config_path) as fh:
             cfg = yaml.safe_load(fh)
     except (OSError, yaml.YAMLError) as exc:
-        raise _CommandConfigError(f"could not read host.{key}: {exc}") from exc
+        raise _CommandConfigError(f"could not read host.post_bind_command: {exc}") from exc
     if not isinstance(cfg, dict):
         return None
     host_section = cfg.get("host")
-    if not isinstance(host_section, dict) or key not in host_section:
+    if not isinstance(host_section, dict) or "post_bind_command" not in host_section:
         return None
-    raw = host_section[key]
+    raw = host_section["post_bind_command"]
     if not isinstance(raw, list) or not raw or not all(isinstance(item, str) for item in raw):
-        raise _CommandConfigError(f"host.{key} must be a non-empty list of strings")
+        raise _CommandConfigError("host.post_bind_command must be a non-empty list of strings")
     executable = raw[0]
     if not os.path.isabs(executable):
-        raise _CommandConfigError(f"host.{key} must start with an absolute path")
+        raise _CommandConfigError("host.post_bind_command must start with an absolute path")
     if executable.lower().endswith((".bat", ".cmd")):
-        raise _CommandConfigError(f"host.{key} must not be a .bat/.cmd file")
+        raise _CommandConfigError("host.post_bind_command must not be a .bat/.cmd file")
     return list(raw)
 
 

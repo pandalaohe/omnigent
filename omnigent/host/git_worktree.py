@@ -482,7 +482,6 @@ def create_worktree(
     base_branch: str | None = None,
     existing_branch: bool = False,
     entry: str | None = None,
-    command: list[str] | None = None,
 ) -> CreatedWorktree:
     """Create a git worktree with a new — or existing — branch checked out.
 
@@ -493,11 +492,6 @@ def create_worktree(
     (a worktree whose directory was deleted from disk) are pruned first,
     and the branch is checked out without ``-b`` — the recreate path for a
     deleted worktree.
-
-    With ``command`` (the host's ``host.worktree_add_command``), the same
-    pre-checks run, then the configured command creates the worktree and
-    the built-in layout is not used at all: a command failure refuses the
-    worktree rather than falling back.
 
     :param repo_path: Absolute path inside the source repo — the
         directory the user picked, e.g. ``"/Users/alice/myrepo"``.
@@ -515,17 +509,13 @@ def create_worktree(
         ``<entry>/.worktrees/<main repo name>/<topic>`` and the entry's
         repository gains an ``info/exclude`` line for it; when ``None``,
         today's sibling location under the repo's parent is used.
-    :param command: Configured external worktree command. ``None`` keeps
-        the built-in behaviour; when set, that command creates the
-        worktree (see :func:`omnigent.host.worktree_command.run_worktree_command`).
     :returns: The created worktree's path and branch.
     :raises WorktreeError: If the branch name is invalid, the path is
         not a git repo, the base ref can't be resolved,
         ``git worktree add`` fails (e.g. the branch already exists in
         create mode, is missing or still checked out in
         existing-branch mode), or the worktree directory would resolve
-        outside the entry. With ``command``, any command failure
-        (including no usable path) also raises.
+        outside the entry.
     """
     validate_branch_name(branch_name)
     if existing_branch and base_branch is not None:
@@ -565,46 +555,6 @@ def create_worktree(
         )
     if base_branch is not None:
         _ensure_base_resolvable(repo_root, base_branch)
-    if command is not None:
-        # Imported here: git_worktree is imported by worktree_command, so a
-        # module-level import would be circular.
-        from omnigent.host.worktree_command import run_worktree_command
-
-        if existing_branch:
-            mode = [f"--branch={branch_name}"]
-        else:
-            mode = [f"--new-branch={branch_name}"]
-            if base_branch is not None:
-                mode.append(f"--base={base_branch}")
-        if entry is not None:
-            ensure_entry_excluded(entry)
-        # Snapshot before the call: a path already registered here was not
-        # created by this call, even when the command switched its branch.
-        # The branch pre-checks alone cannot see such an adopted worktree.
-        registered = {
-            os.path.realpath(record.path) for record in list_worktrees(repo_path=repo_root)
-        }
-        # The caller's repo_path, not the resolved repo_root: the command
-        # derives the default base from the source's own HEAD.
-        path = run_worktree_command(
-            command,
-            source=repo_path,
-            topic=branch_name,
-            entry=entry,
-            mode=mode,
-        )
-        path_real = os.path.realpath(path)
-        if path_real in registered or not any(
-            not record.is_main
-            and os.path.realpath(record.path) == path_real
-            and record.branch == branch_name
-            for record in list_worktrees(repo_path=repo_root)
-        ):
-            raise WorktreeError(
-                f"worktree command returned a path that is not a worktree on "
-                f"branch {branch_name}: {path}"
-            )
-        return CreatedWorktree(worktree_path=path, branch=branch_name)
     worktree_path = _resolve_worktree_path(repo_root, branch_name, entry=entry)
     if entry is not None and not _contained_inside(
         os.path.realpath(worktree_path.parent), os.path.realpath(entry)
