@@ -488,6 +488,64 @@ async def test_runtime_system_post_is_not_parsed_for_mentions() -> None:
 
 
 # --------------------------------------------------------------------------
+# Switch and reset lifecycle
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_switch_clears_member_routing_state() -> None:
+    """An in-place agent switch drops the member entries and their obligations."""
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server)
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        await _post_message(client, "@executor first task")
+        await _wait_for_turn_end(app)
+        assert runner_app.list_member_obligations(PARENT)
+        assert runner_app._session_member_entries.get(PARENT)
+
+        # The server drops the member labels on a switch; the runner detects it
+        # from the next turn's different agent id.
+        await _post_message(client, "continue", agent_id="ag_other")
+        await _wait_for_turn_end(app)
+
+    assert runner_app._session_member_entries.get(PARENT) is None
+    assert runner_app.list_member_obligations(PARENT) == []
+    assert PARENT not in runner_app._member_turn_stamps
+
+
+@pytest.mark.asyncio
+async def test_reset_paths_keep_member_entries_for_labelled_session() -> None:
+    """``reset-state`` / ``agent-cache/reset`` keep member routing alive."""
+    server = _MemberServerClient()
+    app, _pm, harness = _build_app(server)
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        await _post_message(client, "@executor first task")
+        await _wait_for_turn_end(app)
+        assert runner_app._session_member_entries.get(PARENT)
+
+        assert (await client.post(f"/v1/sessions/{PARENT}/reset-state")).status_code == 200
+        assert runner_app._session_member_entries.get(PARENT)
+
+        reset_cache = await client.post(
+            f"/v1/sessions/{PARENT}/agent-cache/reset",
+            json={"agent_id": "ag_joint_lead"},
+        )
+        assert reset_cache.status_code == 200
+        assert runner_app._session_member_entries.get(PARENT)
+
+        # Routing still resolves the members after both resets.
+        await _post_message(client, "@executor second task")
+        await _wait_until(lambda: len(harness.posted_bodies) >= 2)
+
+    texts = _ordered_user_texts(harness.posted_bodies[1])
+    assert any("'executor'" in text and "second task" in text for text in texts)
+
+
+# --------------------------------------------------------------------------
 # Met on child create; failure recorded from a failed dispatch
 # --------------------------------------------------------------------------
 

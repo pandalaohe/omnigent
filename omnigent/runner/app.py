@@ -13895,13 +13895,23 @@ def create_runner_app(
             content=session_resource_view_to_dict(resource),
         )
 
-    def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
+    def _clear_session_agent_caches(
+        session_id: str,
+        agent_id: str | None = None,
+        *,
+        clear_member_routing: bool = False,
+    ) -> None:
         _session_spec_cache.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
-        # Member labels drop with an in-place agent switch; so do the entries
-        # the routing note reads.
-        _session_member_entries.pop(session_id, None)
+        if clear_member_routing:
+            # Member labels drop with an in-place agent switch; so do the
+            # entries the routing note reads and the obligations opened
+            # against them. ``reset-state`` and ``agent-cache/reset`` keep
+            # them: the session's labels still hold its members.
+            _session_member_entries.pop(session_id, None)
+            _member_obligations.pop(session_id, None)
+            _member_turn_stamps.pop(session_id, None)
         # Bump so any in-flight fill discards its write rather than reinstating it.
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
         _session_snapshot_cache.pop(session_id, None)
@@ -13921,9 +13931,10 @@ def create_runner_app(
         Both dispatch paths (background ``_run_turn_bg_setup_and_stream`` and
         direct-stream ``_stream_message_to_harness``) call this shared routine
         on an in-conversation agent switch, so the eviction scope cannot
-        diverge between the two paths.
+        diverge between the two paths. The switch is the one case where the
+        member snapshot (and the routing state built on it) is stale.
         """
-        _clear_session_agent_caches(session_id, new_agent_id)
+        _clear_session_agent_caches(session_id, new_agent_id, clear_member_routing=True)
         if process_manager is not None:
             await process_manager.release(session_id)
 
