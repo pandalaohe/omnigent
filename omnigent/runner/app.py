@@ -8289,43 +8289,61 @@ def create_runner_app(
         _interrupted_sessions.discard(conv_id)
         return True
 
-    async def _post_member_notice(session_id: str, role: str, reason: str) -> None:
+    async def _post_member_notice(session_id: str, role: str, reason: str) -> bool:
         """Surface ``"<role> did not run: <reason>"`` as a visible chat notice.
 
         Posts an ``error`` item with ``level: "info"`` (the web UI's neutral
-        notice pill), the same bridge the pi-native notices use. Best-effort:
-        a failed post is logged, never raised.
+        notice pill), the same bridge the pi-native notices use. The notice is
+        the last signal that named work was dropped, so a transient failure
+        retries with the wake-post backoff before giving up; a permanently
+        failed post is logged loudly and the caller drops the obligation anyway
+        — never silence on top of silence.
 
         :param session_id: Session whose chat carries the notice.
         :param role: Member role the work was routed to, e.g. ``"executor"``.
         :param reason: Short cause, e.g. ``"host_offline"`` or a dispatch error.
+        :returns: ``True`` when a 2xx was confirmed.
         """
-        try:
-            resp = await server_client.post(
-                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
-                json={
-                    "type": "external_conversation_item",
-                    "data": {
-                        "item_type": "error",
-                        "item_data": {
-                            "source": "execution",
-                            "code": "member_did_not_run",
-                            "message": f"{role} did not run: {reason}",
-                            "level": "info",
-                        },
-                    },
+        payload = {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "error",
+                "item_data": {
+                    "source": "execution",
+                    "code": "member_did_not_run",
+                    "message": f"{role} did not run: {reason}",
+                    "level": "info",
                 },
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-        except (httpx.HTTPError, RuntimeError):
-            _logger.warning(
-                "Failed to surface member notice for session=%s role=%s",
-                session_id,
-                role,
-                exc_info=True,
-                extra={"session_id": runner_primary_session_id()},
-            )
+            },
+        }
+        for attempt in range(1, _WAKE_POST_MAX_ATTEMPTS + 1):
+            try:
+                resp = await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+                    json=payload,
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return True
+            except (httpx.HTTPError, RuntimeError, asyncio.TimeoutError) as exc:
+                retryable = isinstance(exc, asyncio.TimeoutError) or _wake_post_is_retryable(exc)
+                if attempt >= _WAKE_POST_MAX_ATTEMPTS or not retryable:
+                    _logger.error(
+                        "Member notice undelivered after %d attempt(s): "
+                        "session=%s role=%s error=%r",
+                        attempt,
+                        session_id,
+                        role,
+                        exc,
+                        extra={"session_id": runner_primary_session_id()},
+                    )
+                    return False
+                delay_s = min(
+                    _WAKE_POST_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
+                    _WAKE_POST_RETRY_MAX_DELAY_S,
+                )
+                await _wake_retry_sleep(delay_s)
+        return False
 
     def _schedule_member_notice(
         session_id: str,
@@ -8335,9 +8353,9 @@ def create_runner_app(
     ) -> None:
         """Post one member notice in the background, then drop its records.
 
-        The records are dropped only once the post attempt has finished, so a
-        notice that could not be delivered leaves the obligation standing for
-        the caller's failure handling instead of closing it silently.
+        The records are dropped only after the post has been delivered or its
+        retries are exhausted, so a notice that never landed is at least logged
+        loudly instead of closing the obligation silently.
         """
         try:
             loop = asyncio.get_running_loop()
@@ -8353,8 +8371,13 @@ def create_runner_app(
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)
 
-    def _schedule_member_follow_up(session_id: str, notice: str) -> None:
-        """Send the one ``[System: …]`` follow-up naming a turn's unmet roles."""
+    def _schedule_member_follow_up(session_id: str, roles: str, notice: str, attempt: int) -> None:
+        """Send the one ``[System: …]`` follow-up naming a turn's unmet roles.
+
+        When the POST exhausts its retries, no follow-up turn will ever start,
+        so this request goes straight to the visible notice instead of staying
+        silent until a turn end that will never match.
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -8362,12 +8385,25 @@ def create_runner_app(
 
         async def _send() -> None:
             delivered = await _deliver_subagent_wake_post(server_client, session_id, notice)
-            if not delivered:
-                _logger.warning(
-                    "Member-obligation follow-up POST failed for session=%s after %d attempts",
+            if delivered:
+                return
+            _logger.error(
+                "Member-obligation follow-up undelivered after %d attempts: session=%s roles=%s",
+                _WAKE_POST_MAX_ATTEMPTS,
+                session_id,
+                roles,
+                extra={"session_id": runner_primary_session_id()},
+            )
+            for obligation in open_member_obligations(session_id):
+                if obligation.follow_up_attempt != attempt:
+                    continue
+                if obligation.follow_up_turn is not None:
+                    continue
+                _schedule_member_notice(
                     session_id,
-                    _WAKE_POST_MAX_ATTEMPTS,
-                    extra={"session_id": runner_primary_session_id()},
+                    obligation.role,
+                    "not dispatched after the follow-up",
+                    [obligation],
                 )
 
         task = loop.create_task(_send())
@@ -8420,8 +8456,9 @@ def create_runner_app(
             return
         for obligation in due:
             obligation.follow_up_sent = True
+            obligation.follow_up_attempt = turn
         roles = ", ".join(obligation.role for obligation in due)
-        _schedule_member_follow_up(session_id, member_follow_up_notice(roles))
+        _schedule_member_follow_up(session_id, roles, member_follow_up_notice(roles), turn)
 
     def _settle_member_obligation_for_child(entry: _SubagentWorkEntry) -> None:
         """Close the obligation a completed child met; notice a failed child.

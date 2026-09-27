@@ -658,6 +658,91 @@ async def test_unrelated_turn_end_does_not_consume_the_follow_up() -> None:
     assert records[0].follow_up_turn is None
 
 
+class _FailingEventServerClient(_MemberServerClient):
+    """Server stub that fails the matching event POST a bounded number of times."""
+
+    def __init__(self, event_type: str, failures: int) -> None:
+        """Fail *failures* POSTs of *event_type* with a transient 503."""
+        super().__init__()
+        self._event_type = event_type
+        self._failures = failures
+        self.failed_attempts = 0
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        """Return a 503 for the budgeted failures, then behave like the base."""
+        payload = kwargs.get("json") or {}
+        if payload.get("type") == self._event_type and self._failures > 0:
+            self._failures -= 1
+            self.failed_attempts += 1
+            return httpx.Response(
+                503,
+                json={"error": "unavailable"},
+                request=httpx.Request("POST", f"http://server{url}"),
+            )
+        return await super().post(url, **kwargs)
+
+
+@pytest.fixture
+def _fast_wake_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the wake-post backoff sleeps in the retry tests."""
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner_app, "_wake_retry_sleep", _no_sleep)
+
+
+@pytest.mark.asyncio
+async def test_unreachable_follow_up_posts_the_notice_at_once(
+    _fast_wake_retries: None,
+) -> None:
+    """A follow-up POST that exhausts retries goes straight to the notice."""
+    server = _FailingEventServerClient(event_type="message", failures=100)
+    app, _pm, _harness = _build_app(server)
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        await _post_message(client, "[executor] build the parser")
+        await _wait_until(lambda: bool(_notices(server)))
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
+
+    assert server.failed_attempts == 3
+    assert [notice["data"]["item_data"]["message"] for notice in _notices(server)] == [
+        "executor did not run: not dispatched after the follow-up"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_member_notice_retries_transient_failures(
+    _fast_wake_retries: None,
+) -> None:
+    """A transient notice failure is retried; the record drops after delivery."""
+    gate = asyncio.Event()
+    harness = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ],
+        gate,
+    )
+    server = _FailingEventServerClient(event_type="external_conversation_item", failures=1)
+    app, _pm, _harness = _build_app(server, harness_client=harness)
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        await _post_message(client, "@executor build the parser")
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+        runner_app.mark_member_obligation_failed(PARENT, "executor", "create failed")
+        gate.set()
+        await _wait_until(lambda: bool(_notices(server)))
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
+
+    assert server.failed_attempts == 1
+    assert [notice["data"]["item_data"]["message"] for notice in _notices(server)] == [
+        "executor did not run: create failed"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_failed_dispatch_notices_at_turn_end_without_a_follow_up() -> None:
     """A recorded dispatch failure goes straight to the notice, not a reminder."""
