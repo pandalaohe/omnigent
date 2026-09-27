@@ -1783,10 +1783,9 @@ export function AgentHarnessPicker({
       ? `Other... (${selectedOtherHarness.display_name})`
       : "Other...";
 
-  // Split the Agents group by the user's pins: pinned Agents (Polly + Debby
-  // by default) stay at the top level, in pin order; every other Agent folds
-  // into the "Other..." submenu so a long roster can't crowd out the picks.
-  const { storedIds: pinnedAgentIds } = useAgentPins();
+  // Split the agents group: built-in bundle agents (Polly / Debby) stay inline
+  // in the main list; user-registered custom agents fold into an "Other..."
+  // submenu so a long roster doesn't crowd out the recommended picks.
   const { builtins: bundleEntries, customs: customEntries } = useMemo(
     () => partitionAgentsByKind(agentEntries),
     [agentEntries],
