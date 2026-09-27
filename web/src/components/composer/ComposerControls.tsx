@@ -230,6 +230,8 @@ export const ComposerHarnessTrigger = forwardRef<
     model: string;
     loading?: boolean;
     pending?: boolean;
+    /** Yellow dot warning, e.g. a member session with an unavailable member. */
+    alert?: boolean;
     effort?: string;
     icon?: ReactNode;
     testIdPrefix?: string;
@@ -243,6 +245,7 @@ export const ComposerHarnessTrigger = forwardRef<
     icon,
     loading = false,
     pending = false,
+    alert = false,
     testIdPrefix = "composer",
     labelClassName,
     className,
@@ -308,6 +311,14 @@ export const ComposerHarnessTrigger = forwardRef<
           </span>
         )}
       </span>
+      {alert && (
+        <span
+          role="status"
+          aria-label="A member is unavailable"
+          data-testid={`${testIdPrefix}-members-alert`}
+          className="size-1.5 shrink-0 rounded-full bg-warning"
+        />
+      )}
       <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
     </Button>
   );

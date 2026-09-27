@@ -29,6 +29,7 @@ import {
   SquareTerminalIcon,
   MessagesSquareIcon,
   TriangleAlertIcon,
+  UsersIcon,
   XIcon,
 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -133,6 +134,7 @@ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
+  filterMemberMentions,
   type MentionItem,
   mentionMarkerFor,
   type MentionState,
@@ -140,6 +142,9 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { hasMultipleMembers, parseSessionMembers, type SessionMember } from "@/lib/sessionMembers";
+import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
+import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
   serializeReplyDraft,
@@ -232,6 +237,11 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import {
+  AgentMembersBanner,
+  AgentMembersMenu,
+  EditMemberAgentDialog,
+} from "@/components/composer/AgentMembersMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import {
@@ -2984,6 +2994,23 @@ function ComposerImpl(
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
   const { session: composerSession } = useSession(composerSessionId);
+  // Member roster of a joint Agent session, from the F1a snapshot labels. A
+  // session without valid member labels parses to [] and keeps today's
+  // single-agent composer everywhere below.
+  const sessionMembers = useMemo(
+    () => parseSessionMembers(composerSession?.labels),
+    [composerSession?.labels],
+  );
+  const multiMemberSession = hasMultipleMembers(sessionMembers);
+  const memberTemplateId =
+    composerSession?.labels?.[AGENT_TEMPLATE_LABEL] ?? composerSession?.agentTemplateId ?? null;
+  const { children: composerChildSessions } = useChildSessions(composerSessionId);
+  const [memberEditorOpen, setMemberEditorOpen] = useState(false);
+  const composerAgentName =
+    subAgentName ??
+    agents?.find((agent) => agent.id === selectedAgentId)?.name ??
+    agents?.[0]?.name ??
+    null;
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
@@ -3077,6 +3104,11 @@ function ComposerImpl(
   // so the composer's "@" entry point can't split-brain from the file viewer's
   // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
   const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  // A 2+ member session opens "@" for its Members section no matter the
+  // harness; the file listing itself stays native-only (file mentions keep
+  // working exactly where they work today).
+  const memberMentionEnabled = multiMemberSession;
+  const mentionDetectionEnabled = mentionEnabled || memberMentionEnabled;
   const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
@@ -3308,6 +3340,10 @@ function ComposerImpl(
   // Folders first, filtered by the typed segment, capped (see rankMentionEntries).
   const mentionEntries: WorkspaceFile[] =
     mentionEnabled && mention ? rankMentionEntries(mentionSourceEntries, mentionFilter) : [];
+  // Member rows lead the "@" menu in a 2+ member session, sharing the typed
+  // filter with the file rows (roles are matched the same way).
+  const mentionMembers: SessionMember[] =
+    memberMentionEnabled && mention ? filterMemberMentions(sessionMembers, mentionFilter) : [];
   // True while a mention token is active but its listing hasn't resolved yet:
   // the cold-boot root fetch, or a sub-directory's first load after drilling
   // in. During this window ``mentionEntries`` is transiently empty (so the
@@ -3330,6 +3366,7 @@ function ComposerImpl(
     mentionedItems,
     setMentionedItems,
     attachMention,
+    attachMember,
     openMentionDir,
     removeMentionedItem,
     handleKeyDown: handleMentionKeyDown,
@@ -3338,6 +3375,7 @@ function ComposerImpl(
     mention,
     setMention,
     mentionEntries,
+    mentionMembers,
     text: value,
     setText: (next) => {
       setValue(next);
@@ -4037,7 +4075,7 @@ function ComposerImpl(
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
     setMention(
-      mentionEnabled
+      mentionDetectionEnabled
         ? detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length)
         : null,
     );
@@ -4125,6 +4163,10 @@ function ComposerImpl(
             SubagentComposerTray). Truthy (not just non-null) so an empty
             label never peeks a nameless tray. */}
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+        {/* Unavailable members: a session-level condition, so the notice sits
+            above the composer rather than in the transcript. Self-gates to
+            null when every member can run. */}
+        <AgentMembersBanner members={sessionMembers} />
         <ComposerWorkspaceBar
           data-testid="composer-workspace-controls"
           className={cn(
@@ -4205,7 +4247,11 @@ function ComposerImpl(
                       ? "Waiting for agents…"
                       : isStreaming
                         ? "Send a follow-up (queued) — Esc to stop"
-                        : "Send a message…",
+                        : multiMemberSession
+                          ? composerAgentName === null
+                            ? "@role hands a part to a member"
+                            : `Message ${composerAgentName} — @role hands a part to a member`
+                          : "Send a message…",
           rows: 1,
           disabled:
             ((disabled || unreachable) && sendDisabledReason === null) ||
@@ -4270,17 +4316,20 @@ function ComposerImpl(
                   onRetrySkills={() => void refreshSkills()}
                 />
               )}
-              {/* "@"-file-mention browser — native coding-agent sessions only.
-            Also shown (as a loading row) while the listing is still fetching,
-            so "@" isn't silently dead during runner cold-boot or a drill-in. */}
+              {/* "@"-mention browser: file rows for native coding-agent
+            sessions, led by a Members section in a 2+ member session (any
+            harness). Also shown (as a loading row) while the listing is still
+            fetching, so "@" isn't silently dead during runner cold-boot. */}
               {(mentionOpen || mentionListingPending) && (
                 <FileMentionMenu
                   currentDir={mentionDir}
                   activeIndex={mentionIndex}
                   entries={mentionEntries}
+                  members={mentionMembers}
                   loading={mentionListingPending}
                   onOpenDir={openMentionDir}
                   onAttach={attachMention}
+                  onAttachMember={attachMember}
                 />
               )}
               {/* /btw side-chat overlay — transient question+answer panel,
@@ -4434,12 +4483,7 @@ function ComposerImpl(
                   busy={configBusy}
                   busyRef={configBusyRef}
                   setBusy={setConfigBusy}
-                  agentName={
-                    subAgentName ??
-                    agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                    agents?.[0]?.name ??
-                    null
-                  }
+                  agentName={composerAgentName}
                   harnessLabel={harnessLabel}
                   showModels={showModels}
                   showEffort={showEffort}
@@ -4452,6 +4496,10 @@ function ComposerImpl(
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
+                  members={sessionMembers}
+                  childSessions={composerChildSessions}
+                  templateId={memberTemplateId}
+                  onEditAgent={() => setMemberEditorOpen(true)}
                   // Config changes persist server-side and apply on the next
                   // wake/turn (the runner forward is best-effort), so the gear
                   // stays live wherever a message could be sent — including
@@ -4535,6 +4583,14 @@ function ComposerImpl(
             backendLabel={showClaudeGoalControl ? "Claude" : "Codex"}
           />
         )
+      )}
+      {/* The saved Agent behind this session, opened from the members menu.
+          A save changes the saved Agent only — this session keeps its roster. */}
+      {memberEditorOpen && memberTemplateId !== null && (
+        <EditMemberAgentDialog
+          templateId={memberTemplateId}
+          onClose={() => setMemberEditorOpen(false)}
+        />
       )}
       <ComposerStatusLine codexRateLimits={codexRateLimits} />
     </form>
@@ -5099,6 +5155,10 @@ function SessionHarnessPicker({
   modelLabelOptions,
   modelLabelHostId,
   costRoutingEligible,
+  members,
+  childSessions,
+  templateId,
+  onEditAgent,
   disabled,
   openNonce = 0,
 }: {
@@ -5118,6 +5178,13 @@ function SessionHarnessPicker({
   modelLabelOptions: readonly NativeModelOption[];
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
+  /** Parsed member roster; 2+ members replaces the config controls. */
+  members: readonly SessionMember[];
+  /** This session's child sessions, for the members' "Open" links. */
+  childSessions: readonly ChildSessionInfo[];
+  /** Saved-Agent label value, enabling the menu's "Edit agent". */
+  templateId: string | null;
+  onEditAgent: () => void;
   disabled: boolean;
   openNonce?: number;
 }) {
@@ -5170,18 +5237,28 @@ function SessionHarnessPicker({
     modelLabel: modelSummary,
     costRoutingEligible,
   });
-  const configurable = hasSessionConfig({
-    showModels,
-    showEffort,
-  });
-  const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
-  const label = routingOn
-    ? SMART_ROUTING_LABEL
-    : modelLabelLoading
-      ? ""
-      : compactModelTriggerLabel(
-          modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
-        );
+  // A 2+ member session replaces the harness / model / effort controls with a
+  // read-only members menu: the roster is locked at launch, so there is
+  // nothing here to edit per session (the saved Agent is edited instead).
+  const membersMenu = members.length >= 2;
+  const anyMemberUnavailable = members.some((member) => member.unavailable !== null);
+  const configurable =
+    membersMenu ||
+    hasSessionConfig({
+      showModels,
+      showEffort,
+    });
+  const effortLabel =
+    !membersMenu && showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
+  const label = membersMenu
+    ? compactModelTriggerLabel(agentName ?? "Members")
+    : routingOn
+      ? SMART_ROUTING_LABEL
+      : modelLabelLoading
+        ? ""
+        : compactModelTriggerLabel(
+            modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
+          );
   const availableEfforts =
     effortLevelsFor(
       modelPickerKind === "codex"
@@ -5197,9 +5274,10 @@ function SessionHarnessPicker({
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
       setMenuOpen(true);
-      setConfigOpen(true);
+      // The members menu has no config sub-page to drill into.
+      if (!membersMenu) setConfigOpen(true);
     }
-  }, [openNonce, disabled, configurable]);
+  }, [openNonce, disabled, configurable, membersMenu]);
   useEffect(() => {
     setMenuOpen(false);
     setConfigOpen(false);
@@ -5408,22 +5486,34 @@ function SessionHarnessPicker({
           label: "Configure session",
           model: label,
           effort: effortLabel ?? undefined,
-          icon: <ComposerAgentIcon agent={iconAgent} />,
-          disabled: busy || !configurable,
+          icon: membersMenu ? (
+            <UsersIcon className="size-4 shrink-0" aria-hidden="true" />
+          ) : (
+            <ComposerAgentIcon agent={iconAgent} />
+          ),
+          alert: membersMenu && anyMemberUnavailable,
+          disabled: membersMenu ? busy : busy || !configurable,
           "aria-disabled": disabled || busy || !configurable,
-          className: disabled ? "cursor-default opacity-50" : undefined,
+          className: !membersMenu && disabled ? "cursor-default opacity-50" : undefined,
           testIdPrefix: "composer",
-          "data-testid": "composer-config-gear",
-          loading: modelLabelLoading && !routingOn,
+          "data-testid": membersMenu ? "composer-agent-members-trigger" : "composer-config-gear",
+          loading: !membersMenu && modelLabelLoading && !routingOn,
           pending:
             (sessionModelSeeded || pendingModelChange !== null) &&
             (modelPickerKind === "claude" || modelPickerKind === "codex"),
         }}
-        tooltip={<ComposerConfigTooltipRows rows={summary} />}
+        tooltip={membersMenu ? undefined : <ComposerConfigTooltipRows rows={summary} />}
         tooltipTestId="composer-config-gear-tooltip"
         testId="composer-agent-menu"
       >
-        {isMobile && configOpen ? (
+        {membersMenu ? (
+          <AgentMembersMenu
+            members={members}
+            childSessions={childSessions}
+            agentName={agentName}
+            onEditAgent={templateId !== null ? onEditAgent : undefined}
+          />
+        ) : isMobile && configOpen ? (
           <HarnessPickerConfigPage
             backTestId="composer-agent-config-back"
             testId="composer-agent-config-menu"

@@ -1,6 +1,11 @@
 import { type RefObject, useRef, useState } from "react";
 
-import type { MentionItem, MentionState } from "@/lib/composerMentions";
+import {
+  memberMentionInsertion,
+  type MentionItem,
+  type MentionState,
+} from "@/lib/composerMentions";
+import type { SessionMember } from "@/lib/sessionMembers";
 import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -19,6 +24,12 @@ export interface MentionBrowserParams {
   setMention: (next: MentionState | null) => void;
   /** Current directory's entries — already filtered, folders-first, capped. */
   mentionEntries: WorkspaceFile[];
+  /**
+   * Member rows offered ahead of the file rows (2+ member sessions, already
+   * filtered). Picking one inserts ``@role `` as plain text — a routing name
+   * for the lead, not an attachment chip.
+   */
+  mentionMembers?: readonly SessionMember[];
   /** The textarea value and a setter (which may also flag the draft dirty). */
   text: string;
   setText: (next: string) => void;
@@ -34,6 +45,8 @@ export interface MentionBrowser {
   setMentionedItems: React.Dispatch<React.SetStateAction<MentionItem[]>>;
   /** Attach a file (isDir=false) or whole folder (isDir=true) as a chip. */
   attachMention: (path: string, isDir: boolean) => void;
+  /** Insert ``@role `` for a member row, closing the menu. */
+  attachMember: (role: string) => void;
   /** Drill into a folder: rewrite the token to ``@<dir>/`` and keep browsing. */
   openMentionDir: (path: string) => void;
   removeMentionedItem: (index: number) => void;
@@ -49,16 +62,19 @@ export type MentionKeyboardEvent = Pick<
 >;
 
 /**
- * Shared ``@``-file-mention controller for the in-session composer and the
+ * Shared ``@``-mention controller for the in-session composer and the
  * new-session launcher. Owns the selection index, the tagged-chip list, and
  * the attach/drill/remove + keyboard behaviour; the composer owns the token
- * state and supplies the directory listing (its data source differs).
+ * state and supplies the listings (its data sources differ). Member rows, when
+ * supplied, sit ahead of the file rows in the same index space so one
+ * Arrow/Enter path covers both sections.
  */
 export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser {
   const {
     mention,
     setMention,
     mentionEntries,
+    mentionMembers = [],
     text,
     setText,
     textareaRef,
@@ -66,14 +82,20 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
   const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
-  const mentionOpen = mentionEntries.length > 0;
+  const memberRowCount = mentionMembers.length;
+  const rowCount = memberRowCount + mentionEntries.length;
+  const mentionOpen = rowCount > 0;
 
   // Pre-select the top row whenever the listing changes — lets Enter/Tab act on
   // the top hit without arrowing first. Keyed by type+path so a file and a dir
-  // of the same name stay distinct. (Render-phase state adjustment, the React
+  // of the same name stay distinct, and by role so member rows can't collide
+  // with a file named like a role. (Render-phase state adjustment, the React
   // "store-previous-props" pattern — mirrors the slash menu's reset.)
   const prevMentionMatchesRef = useRef<string[]>([]);
-  const mentionEntryKeys = mentionEntries.map((e) => `${e.type}:${e.path}`);
+  const mentionEntryKeys = [
+    ...mentionMembers.map((member) => `member:${member.role}`),
+    ...mentionEntries.map((e) => `${e.type}:${e.path}`),
+  ];
   if (
     mentionEntryKeys.length !== prevMentionMatchesRef.current.length ||
     mentionEntryKeys.some((k, i) => k !== prevMentionMatchesRef.current[i])
@@ -103,6 +125,23 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     });
   };
 
+  const attachMember = (role: string) => {
+    if (!mention) return;
+    const inserted = memberMentionInsertion(role);
+    setText(text.slice(0, mention.start) + inserted + text.slice(mention.end));
+    setMention(null);
+    setMentionIndex(-1);
+    // The caret lands after the inserted token so the next word keeps flowing.
+    queueMicrotask(() => {
+      const ta = textareaRef.current;
+      if (ta) {
+        const caret = mention.start + inserted.length;
+        ta.setSelectionRange(caret, caret);
+        ta.focus();
+      }
+    });
+  };
+
   const openMentionDir = (path: string) => {
     if (!mention) return;
     const inserted = `@${path}/`;
@@ -129,15 +168,25 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   const handleKeyDown = (e: MentionKeyboardEvent): boolean => {
     if (!mentionOpen) return false;
-    const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
+    const activeMember =
+      mentionIndex >= 0 && mentionIndex < memberRowCount ? mentionMembers[mentionIndex] : undefined;
+    const activeEntry =
+      mentionIndex >= memberRowCount ? mentionEntries[mentionIndex - memberRowCount] : undefined;
     if (eventMatchesShortcutAction(e, "nextSuggestion")) {
       e.preventDefault();
-      setMentionIndex((i) => (i + 1) % mentionEntries.length);
+      setMentionIndex((i) => (i + 1) % rowCount);
       return true;
     }
     if (eventMatchesShortcutAction(e, "previousSuggestion")) {
       e.preventDefault();
-      setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
+      setMentionIndex((i) => (i <= 0 ? rowCount - 1 : i - 1));
+      return true;
+    }
+    // Enter and Tab pick a member row (plain-text routing name; there is no
+    // chip to attach). File rows keep the drill/attach split below.
+    if (eventMatchesShortcutAction(e, "applySuggestion") && activeMember) {
+      e.preventDefault();
+      attachMember(activeMember.role);
       return true;
     }
     // Enter: open a folder (drill in) or attach a file. Tab: attach the
@@ -146,16 +195,16 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       eventMatchesShortcutAction(e, "applySuggestion") &&
       e.key === "Enter" &&
       !isMobile &&
-      active
+      activeEntry
     ) {
       e.preventDefault();
-      if (active.type === "directory") openMentionDir(active.path);
-      else attachMention(active.path, false);
+      if (activeEntry.type === "directory") openMentionDir(activeEntry.path);
+      else attachMention(activeEntry.path, false);
       return true;
     }
-    if (eventMatchesShortcutAction(e, "applySuggestion") && active) {
+    if (eventMatchesShortcutAction(e, "applySuggestion") && activeEntry) {
       e.preventDefault();
-      attachMention(active.path, active.type === "directory");
+      attachMention(activeEntry.path, activeEntry.type === "directory");
       return true;
     }
     if (eventMatchesShortcutAction(e, "dismissSuggestions")) {
@@ -172,6 +221,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     mentionedItems,
     setMentionedItems,
     attachMention,
+    attachMember,
     openMentionDir,
     removeMentionedItem,
     handleKeyDown,

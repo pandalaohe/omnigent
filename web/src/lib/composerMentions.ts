@@ -1,5 +1,6 @@
 import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import type { SessionMember } from "@/lib/sessionMembers";
 
 /**
  * Pure ``@``-file-mention utilities shared by the in-session composer
@@ -89,6 +90,28 @@ export function detectMentionAt(text: string, caret: number): MentionState | nul
 export function mentionMarkerFor(harness: string | null, path: string): string {
   const isCodex = nativeCodingAgentForHarness(harness)?.key === "codex";
   return isCodex ? `[Attached file: ${path}]` : `[Attached: ${path}]`;
+}
+
+/**
+ * The member rows the ``@`` menu offers ahead of file rows, filtered by the
+ * typed segment (roles are matched by substring, like file names). Only a 2+
+ * member session has members to offer, and the lead is listed first (the
+ * parser's order); no member is excluded, unavailable ones included.
+ */
+export function filterMemberMentions(
+  members: readonly SessionMember[],
+  filter: string,
+): SessionMember[] {
+  const needle = filter.toLowerCase();
+  return members.filter((member) => member.role.toLowerCase().includes(needle));
+}
+
+/**
+ * The text a picked member inserts: ``@role `` (with the trailing space the
+ * user would otherwise type to close the token, ready for the next word).
+ */
+export function memberMentionInsertion(role: string): string {
+  return `@${role} `;
 }
 
 /** Default cap on how many mention rows the menu renders for one directory. */
