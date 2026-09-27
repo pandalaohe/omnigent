@@ -57,12 +57,18 @@ async def _dispatch(
     worktree_status: int = 200,
     worktree_body: dict[str, Any] | None = None,
     child_runner_id: str | None = "runner_member",
-) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
+    existing_child: dict[str, Any] | None = None,
+    keep_work: bool = False,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     """
     Drive one named ``sys_session_send`` against a remote-member mock server.
 
+    :param existing_child: When set, the child-sessions lookup returns it, so
+        the send continues that child instead of creating one.
+    :param keep_work: Leave the registered work entry in the registry (the
+        caller cleans up) so it can be handed to the launch reaper.
     :returns: ``(tool_output, create_bodies, calls)`` where *calls* counts the
-        host / worktree lookups.
+        host / worktree lookups and captures the final work entry.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
@@ -81,7 +87,9 @@ async def _dispatch(
             request.method == "GET"
             and path == "/v1/sessions/conv_member_cross_host/child_sessions"
         ):
-            return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200, json={"data": [existing_child] if existing_child is not None else []}
+            )
         if request.method == "GET" and path == "/v1/sessions/conv_member_cross_host":
             return httpx.Response(
                 200,
@@ -91,6 +99,8 @@ async def _dispatch(
                     "host_id": lead_host,
                 },
             )
+        if request.method == "PATCH" and path == f"/v1/sessions/{_CHILD_ID}":
+            return httpx.Response(200, json={"id": _CHILD_ID})
         if request.method == "GET" and path == f"/v1/hosts/{_MEMBER_HOST}":
             calls["host"] += 1
             return httpx.Response(
@@ -147,7 +157,10 @@ async def _dispatch(
         finally:
             work = runner_app.get_subagent_work(_CHILD_ID)
             calls["work_status"] = work.status if work is not None else None
-            runner_app.unregister_subagent_work(_CHILD_ID)
+            if keep_work:
+                calls["work_entry"] = work
+            else:
+                runner_app.unregister_subagent_work(_CHILD_ID)
             runner_app._session_inboxes_ref.pop("conv_member_cross_host", None)
     return output, create_bodies, calls
 
@@ -281,3 +294,116 @@ async def test_snapshot_member_without_host_stays_local(
     assert json.loads(output)["status"] == "launching", output
     assert "host_id" not in bodies[0]
     assert calls == {"host": 0, "worktree": 0, "work_status": "launching"}
+
+
+def _existing_child(*, title: str = "worker:task") -> dict[str, Any]:
+    """A child-session summary the named ``(agent, title)`` lookup matches."""
+    return {"id": _CHILD_ID, "title": title, "labels": {}, "busy": False}
+
+
+@pytest.mark.asyncio
+async def test_continuation_to_an_existing_remote_child_is_marked_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continued remote child must not trip the 180 s launch reaper.
+
+    Its next turn's running edge stays on its own host's runner, so the
+    continuation marks the work started from the child's live session there.
+    """
+    from omnigent.runner import app as runner_app
+
+    try:
+        output, bodies, calls = await _dispatch(
+            monkeypatch,
+            labels=_member_labels(),
+            existing_child=_existing_child(),
+            keep_work=True,
+        )
+
+        payload = json.loads(output)
+        assert payload["status"] == "launching", output
+        assert bodies == [], "a continuation must not create a child"
+        entry = calls["work_entry"]
+        assert entry is not None and entry.status == "running"
+        assert entry.remote is True
+        assert (
+            runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
+            == []
+        )
+        assert runner_app.get_subagent_work(_CHILD_ID) is not None
+    finally:
+        runner_app.unregister_subagent_work(_CHILD_ID)
+        runner_app._session_inboxes_ref.pop("conv_member_cross_host", None)
+
+
+@pytest.mark.asyncio
+async def test_by_id_continuation_of_a_remote_child_is_marked_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A by-session-id send to a remote child gets the same start proof."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    child_id = "conv_child_remote_by_id"
+    calls = {"create": 0, "events": 0, "patch": 0}
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_member_cross_host/labels":
+            return httpx.Response(200, json={"labels": {}})
+        if request.method == "GET" and path == "/v1/sessions/conv_member_cross_host":
+            return httpx.Response(
+                200, json={"id": "conv_member_cross_host", "host_id": _LEAD_HOST, "labels": {}}
+            )
+        if request.method == "GET" and path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "title": "worker:task",
+                    "parent_session_id": "conv_member_cross_host",
+                    "host_id": _MEMBER_HOST,
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
+            calls["patch"] += 1
+            return httpx.Response(200, json={"id": child_id})
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+            calls["events"] += 1
+            return httpx.Response(202, json={"queued": True})
+        if request.method == "POST" and path == "/v1/sessions":
+            calls["create"] += 1
+            return httpx.Response(201, json={"id": "conv_other"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler), base_url="http://server"
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": child_id, "args": "go"}),
+                server_client=server_client,
+                conversation_id="conv_member_cross_host",
+                agent_spec=_spec_with_worker("claude-sdk"),
+                session_inbox=asyncio.Queue(),
+            )
+
+        assert json.loads(output)["status"] == "launching", output
+        assert calls["create"] == 0
+        assert calls["patch"] == 1 and calls["events"] == 1
+        entry = runner_app.get_subagent_work(child_id)
+        assert entry is not None and entry.status == "running"
+        assert entry.remote is True
+        assert (
+            runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
+            == []
+        )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop("conv_member_cross_host", None)

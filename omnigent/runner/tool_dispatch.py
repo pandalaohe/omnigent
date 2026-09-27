@@ -1691,6 +1691,7 @@ async def _send_to_in_flight_child(
     child_display_title: str,
     wrapper_label: str | None,
     created_by: str | None = None,
+    remote: bool = False,
 ) -> str:
     """Steer a message into a sub-agent whose turn is already in flight.
 
@@ -1741,6 +1742,8 @@ async def _send_to_in_flight_child(
     :param child_display_title: Display title for the fan-out registration.
     :param wrapper_label: Optional child ``omnigent.wrapper`` label.
     :param created_by: Human actor that sent the nudge, if known.
+    :param remote: Whether the child runs on another host (its completion
+        then reaches this runner only through the server).
     :returns: A JSON handle on success; a descriptive error string otherwise.
     """
     from omnigent.runner import app as _runner_app
@@ -1793,6 +1796,7 @@ async def _send_to_in_flight_child(
                 wrapper_label=wrapper_label,
                 created_by=created_by,
                 work_id=work_id,
+                remote=remote,
             )
             fresh.status = "running"
             # Best-effort dispatch-id stamp for restart recovery only; the
@@ -2797,6 +2801,38 @@ async def _member_remote_host(
     return None if lead_host == member_host else member_host
 
 
+async def _child_on_another_host(
+    child_host: str | None,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> bool:
+    """
+    Whether a child on *child_host* runs on another host than the caller's.
+
+    Used by the by-session-id send path, whose target can be any direct child
+    (named sends know a member's host from the frozen snapshot instead). A
+    child with no recorded host is local by definition; an unreadable caller
+    session counts as another host, mirroring ``_member_remote_host``, so the
+    reconciliation backstop is armed rather than skipped on a lookup hiccup.
+
+    :param child_host: The child session's ``host_id``, or ``None``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session id.
+    :returns: ``True`` when the child runs on a different host.
+    """
+    if not child_host:
+        return False
+    lead_host: str | None = None
+    try:
+        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
+        if resp.status_code == 200:
+            lead_host = _optional_string(resp.json().get("host_id"))
+    except (httpx.HTTPError, RuntimeError):
+        lead_host = None
+    return lead_host != child_host
+
+
 async def _member_host_dispatch_error(
     role: str,
     host_id: str,
@@ -3114,6 +3150,18 @@ async def _execute_subagent_tool(
     remote_child_bound = False
     child_wrapper_label: str | None = None
     work_id = _runner_app.new_subagent_work_id()
+    # F2b: a snapshot member saved on another host runs THERE, whether this
+    # dispatch creates its child or continues an idle one. The target host
+    # re-checks readiness at create (the snapshot's ``unavailable`` covers
+    # create-time facts) and supplies the worktree; either way the child's
+    # status edges stay on its own host's runner, so this runner needs the
+    # fact to mark the work started and to arm the server-row backstop.
+    remote_host = await _member_remote_host(
+        member_entry,
+        server_client=server_client,
+        conversation_id=conversation_id,
+    )
+    remote_child = remote_host is not None
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -3190,6 +3238,7 @@ async def _execute_subagent_tool(
                 child_display_title=f"{sub_agent_name}:{session_name}",
                 wrapper_label=child_wrapper_label,
                 created_by=dispatch_created_by,
+                remote=remote_child,
             )
     else:
         _auto_ordinal = False
@@ -3221,16 +3270,6 @@ async def _execute_subagent_tool(
             session_name = f"{sub_agent_name}-{ordinal}"
             _auto_ordinal = True
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
-        # F2b: a snapshot member saved on another host runs THERE. The target
-        # host re-checks readiness at dispatch (the snapshot's ``unavailable``
-        # covers create-time facts) and supplies the worktree of the lead's
-        # repository + branch; the local CLI probe and model normalization
-        # below never apply to it.
-        remote_host = await _member_remote_host(
-            member_entry,
-            server_client=server_client,
-            conversation_id=conversation_id,
-        )
         remote_workspace: str | None = None
         if remote_host is not None:
             member_harness = _member_harness_name(
@@ -3626,12 +3665,14 @@ async def _execute_subagent_tool(
         wrapper_label=child_wrapper_label,
         created_by=dispatch_created_by,
         work_id=work_id,
+        remote=remote_child,
     )
-    if remote_child_bound:
+    if remote_child_bound or (existing is not None and remote_child):
         # A remote child's ``running`` edge is emitted on its own host's runner
-        # and never reaches this launch entry; the create's host binding is the
-        # start proof this runner has, so the 180 s launch reaper does not fail
-        # a child that is already working.
+        # and never reaches this launch entry: a new child's create host
+        # binding is the start proof this runner has, and a continued child
+        # already has a live runner there. Either way the 180 s launch reaper
+        # must not fail a child that is already working.
         _runner_app.mark_subagent_work_started(child_session_id)
     # Meet the member obligation here, at registration — before the awaited
     # file copy / first-message POST — so a child whose terminal status lands
@@ -4300,6 +4341,14 @@ async def _send_to_existing_session(
         or "agent"
     )
     instance_title = parsed.title if parsed.title is not None else (display_title or "")
+    # A direct child may itself be a cross-host member; its status edges are
+    # owned by its own host's runner, so a continuation there needs the same
+    # start acknowledgment and server-row backstop as a named dispatch.
+    remote_child = await _child_on_another_host(
+        _optional_string(snap_data.get("host_id")),
+        server_client=server_client,
+        conversation_id=conversation_id,
+    )
     existing_work = _runner_app.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status == "launching":
         # No active turn to inject into yet; a send now could race a parallel
@@ -4327,6 +4376,7 @@ async def _send_to_existing_session(
             child_display_title=display_title or "",
             wrapper_label=_session_wrapper_label(snap_data),
             created_by=created_by,
+            remote=remote_child,
         )
     work_id = _runner_app.new_subagent_work_id()
     stamp_error = await _patch_subagent_label(
@@ -4349,7 +4399,13 @@ async def _send_to_existing_session(
         wrapper_label=_session_wrapper_label(snap_data),
         created_by=created_by,
         work_id=work_id,
+        remote=remote_child,
     )
+    if remote_child:
+        # The continued turn's running edge stays on the child's host; the
+        # child's existing runtime there is the start proof this runner has, so
+        # the launch reaper must not fail it.
+        _runner_app.mark_subagent_work_started(target_session_id)
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
