@@ -21,8 +21,11 @@ resumes from the users still missing a ``settings.version`` row.
 
 Only a version-1 envelope with an object ``settings`` moves. Unknown
 namespace keys are dropped; an undecodable or malformed envelope is skipped
-with a warning; one namespace whose stored value would exceed the 65,535-byte
-BLOB cap is skipped with a warning while its siblings still move.
+with a warning. A namespace whose stored value would exceed the 65,535-byte
+BLOB cap is skipped with a warning while its siblings still move; a user is
+skipped entirely when the row store could not read the moved envelope back
+(a value nesting deeper than 32 levels, a non-JSON value, or a serialized
+``{"version": 1, "settings": ...}`` over the store's 64 KiB read cap).
 
 Downgrade deletes every ``settings.*`` row. The pre-move envelopes survive in
 ``users.preferences``, so a rollback loses only writes made after the move.
@@ -32,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Sequence
 
@@ -54,6 +58,8 @@ _SETTINGS_KEY_PREFIX = "settings."
 _ENVELOPE_VERSION_KEY = f"{_SETTINGS_KEY_PREFIX}version"
 _ENVELOPE_VERSION = 1
 _MAX_STORED_VALUE_BYTES = 65_535
+_MAX_NESTING = 32
+_MAX_ENVELOPE_BYTES = 64 * 1024
 _BATCH_SIZE = 500
 
 # Frozen copy of the store's allowlist at move time: the legacy envelope can
@@ -188,6 +194,31 @@ def _encode_value(value: object) -> str:
     )
 
 
+def _validate_json(value: object, *, depth: int = 0) -> None:
+    """Frozen copy of the row store's read-time JSON check (see the store)."""
+    if depth > _MAX_NESTING:
+        raise ValueError("preferences nesting exceeds 32 levels")
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, int) and not isinstance(value, bool):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("preferences numbers must be finite")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json(item, depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("preferences object keys must be strings")
+            _validate_json(item, depth=depth + 1)
+        return
+    raise ValueError(f"preferences values must be JSON-compatible, got {type(value).__name__}")
+
+
 def _settings_rows(
     workspace_id: int, user_id: str, envelope: object
 ) -> list[tuple[int, str, str, bytes]]:
@@ -223,20 +254,25 @@ def _settings_rows(
             encode(_encode_value(_ENVELOPE_VERSION)) or b"",
         )
     ]
+    written: dict[str, object] = {}
     for namespace, value in settings.items():
         if namespace not in _NAMESPACES:
             continue
         try:
+            # The store rebuilds and validates the whole envelope on read, so
+            # a value it would reject must never reach a row.
+            _validate_json(value)
             stored = encode(_encode_value(value)) or b""
         except (TypeError, ValueError) as exc:
             _logger.warning(
-                "Skipping preferences namespace %s for user %s in workspace %s: %s",
-                namespace,
+                "Skipping preferences move for user %s in workspace %s: "
+                "row store cannot read namespace %s back (%s)",
                 user_id,
                 workspace_id,
+                namespace,
                 exc,
             )
-            continue
+            return []
         if len(stored) > _MAX_STORED_VALUE_BYTES:
             _logger.warning(
                 "Skipping preferences namespace %s for user %s in workspace %s: "
@@ -247,7 +283,23 @@ def _settings_rows(
                 _MAX_STORED_VALUE_BYTES,
             )
             continue
+        written[namespace] = value
         rows.append((workspace_id, user_id, f"{_SETTINGS_KEY_PREFIX}{namespace}", stored))
+    try:
+        # `_settings_rows` must only move what the store can read back: its
+        # whole-envelope size cap drops every namespace when exceeded.
+        readback = _encode_value({"version": _ENVELOPE_VERSION, "settings": written})
+        if len(readback.encode("utf-8")) > _MAX_ENVELOPE_BYTES:
+            raise ValueError("envelope exceeds the store's 64 KiB read cap")
+    except (TypeError, ValueError) as exc:
+        _logger.warning(
+            "Skipping preferences move for user %s in workspace %s: "
+            "row store cannot read the moved envelope back (%s)",
+            user_id,
+            workspace_id,
+            exc,
+        )
+        return []
     return rows
 
 

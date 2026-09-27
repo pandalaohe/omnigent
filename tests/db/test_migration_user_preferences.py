@@ -326,6 +326,114 @@ def test_preferences_move_skips_an_oversized_namespace(
     engine.dispose()
 
 
+def test_preferences_move_skips_a_value_the_row_store_cannot_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A namespace nested past the read limit skips the whole user."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-deep.db")
+    too_deep: object = "leaf"
+    for _ in range(33):
+        too_deep = [too_deep]
+    at_limit: object = "leaf"
+    for _ in range(32):
+        at_limit = [at_limit]
+    _seed_user(
+        engine,
+        "alice",
+        encode(
+            json.dumps(
+                _envelope({"usage_context": too_deep, "context_indicator": "compact"}),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        ),
+    )
+    _seed_user(
+        engine,
+        "bob",
+        encode(
+            json.dumps(
+                _envelope({"usage_context": at_limit}), separators=(",", ":"), sort_keys=True
+            )
+        ),
+    )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {}
+    assert _settings_rows(engine, "bob") == {
+        "version": "1",
+        "usage_context": json.dumps(at_limit, separators=(",", ":")),
+    }
+    assert "Skipping preferences move for user alice" in capsys.readouterr().err
+    engine.dispose()
+
+
+def test_preferences_move_skips_an_envelope_over_the_read_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Namespaces that fit the BLOB cap but combine past 64 KiB skip the user."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-over-cap.db")
+    _seed_user(
+        engine,
+        "alice",
+        encode(
+            json.dumps(
+                _envelope({"usage_context": "u" * 40_000, "context_indicator": "c" * 40_000}),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        ),
+    )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {}
+    assert "Skipping preferences move for user alice" in capsys.readouterr().err
+    engine.dispose()
+
+
+def test_preferences_move_accepts_an_envelope_at_the_read_cap(tmp_path: Path) -> None:
+    """An envelope that serializes to exactly 65,536 bytes still moves."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-at-cap.db")
+    prefix = json.dumps(
+        _envelope({"context_indicator": ""}), separators=(",", ":"), sort_keys=True
+    )
+    padding = "x" * (64 * 1024 - len(prefix.encode("utf-8")))
+    _seed_user(
+        engine,
+        "alice",
+        encode(
+            json.dumps(
+                _envelope({"context_indicator": padding}), separators=(",", ":"), sort_keys=True
+            )
+        ),
+    )
+    _seed_user(
+        engine,
+        "bob",
+        encode(
+            json.dumps(
+                _envelope({"context_indicator": padding + "x"}),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        ),
+    )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {
+        "version": "1",
+        "context_indicator": json.dumps(padding, separators=(",", ":")),
+    }
+    assert _settings_rows(engine, "bob") == {}
+    engine.dispose()
+
+
 def test_preferences_move_fails_when_a_batch_cannot_land(tmp_path: Path) -> None:
     """A batch that keeps failing fails the migration instead of stamping it."""
     uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-fails.db")
