@@ -105,6 +105,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -198,6 +199,7 @@ def register_resources_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     host_registry: HostRegistry | None = None,
+    comment_store: CommentStore | None = None,
 ) -> None:
     """Register the resources routes on router."""
 
@@ -3094,4 +3096,5 @@ def register_resources_routes(
         _stream_download_from_runner=_stream_download_from_runner,
         _read_workspace_via_host=_read_workspace_via_host,
         _runner_path_segment=_runner_path_segment,
+        comment_store=comment_store,
     )

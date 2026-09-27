@@ -24,10 +24,12 @@ import asyncio
 import base64
 import binascii
 import http
+import json
 import logging
 import mimetypes
 import os
 import re
+import secrets
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
@@ -36,7 +38,8 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel, Field, model_validator
 
 from omnigent.artifact_paths import artifact_path_allowed, artifact_segments_valid
 from omnigent.db.db_models import current_workspace_id, workspace_scope
@@ -59,6 +62,7 @@ from omnigent.server.artifact_sharing import (
     REMEMBER_COOKIE_MAX_AGE_SECONDS,
     ArtifactSharingStore,
     KeepShareCode,
+    SharingRecord,
     UnlockFailureBudget,
     gate_key_id,
     grant_valid,
@@ -82,12 +86,17 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
+from omnigent.server.routes._auth_helpers import (
+    visitor_author as _visitor_author,
+)
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._gzip_route import skip_gzip
 from omnigent.server.routes._oauth import RATE_LIMITER_MAX_KEYS, SlidingWindowRateLimiter
+from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes.sessions.routes_resources import _RunnerStreamResponse
 from omnigent.server.schemas import ArtifactOpenRequestEvent
 from omnigent.stores import ConversationStore
+from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.permission_store import PermissionStore
 
 logger = logging.getLogger(__name__)
@@ -194,12 +203,23 @@ _RUNNER_NEEDS_UPDATE_SENTENCE = "The session runner needs an update to serve bun
 _LOAD_FAILED_SENTENCE = "The artifact could not be loaded."
 _EXPIRED_SENTENCE = "This link has expired."
 _TOO_MANY_ATTEMPTS_SENTENCE = "Too many attempts."
+_VISIT_UNAVAILABLE_SENTENCE = "The visitor page is not available on this server."
 
 _PAGE_STATUSES = frozenset({404, 410, 413, 502, 503})
 
 _BODY_CLOSE_RE = re.compile(r"</body\s*>", re.IGNORECASE)
 _HTML_CLOSE_RE = re.compile(r"</html\s*>", re.IGNORECASE)
+_HEAD_CLOSE_RE = re.compile(r"</head\s*>", re.IGNORECASE)
 _SCRIPT_CLOSE_RE = re.compile(r"</script", re.IGNORECASE)
+_SCRIPT_OPEN_RE = re.compile(r"<script\b", re.IGNORECASE)
+_MODULEPRELOAD_LINK_RE = re.compile(
+    r"<link\b(?=[^>]*\brel\s*=\s*[\"']modulepreload[\"'])", re.IGNORECASE
+)
+
+# Visitor comments per link; in-memory and per process, like the other
+# server-side throttles. Keyed by the link's identity, never by visitor.
+_VISITOR_COMMENT_RATE_MAX = 20
+_VISITOR_COMMENT_RATE_WINDOW_SECONDS = 600
 
 
 def _posix_join(root: str, rel: str) -> str:
@@ -425,6 +445,116 @@ def _inject_in_frame_assets(body: bytes, nonce: str) -> bytes | None:
     return (text[:index] + "".join(scripts) + text[index:]).encode("utf-8")
 
 
+def _stamp_script_nonce(html: str, nonce: str) -> str:
+    """Add *nonce* to every ``<script>`` and ``<link rel="modulepreload">``.
+
+    The shell's CSP admits no other script source, so every executable tag
+    the built entry carries must present the nonce the response's CSP names.
+
+    :param html: The shell HTML, already asset-rebased.
+    :param nonce: The per-response nonce.
+    :returns: The HTML with ``nonce`` stamped on each script / preload tag.
+    """
+    stamped = _SCRIPT_OPEN_RE.sub(f'<script nonce="{nonce}"', html)
+    return _MODULEPRELOAD_LINK_RE.sub(f'<link nonce="{nonce}"', stamped)
+
+
+def _escape_json_for_html(payload: str) -> str:
+    """Escape a JSON document so it cannot close its HTML ``<script>`` block.
+
+    ``<`` / ``>`` / ``&`` and the line separators are rewritten to their
+    ``\\u`` escapes; each stays valid JSON while the HTML parser sees no tag
+    boundary or character reference.
+
+    :param payload: The compact JSON text to embed.
+    :returns: The escaped JSON text.
+    """
+    return (
+        payload.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _insert_omni_visit_config(html: str, config_json: str) -> str:
+    """Insert the ``#omni-visit-config`` data block into the shell HTML.
+
+    Placed before ``</head>`` when present, else before the last ``</body>``
+    / ``</html>``, else appended — the same placement ladder the in-frame
+    asset injection uses.
+
+    :param html: The shell HTML.
+    :param config_json: The already-escaped JSON config text.
+    :returns: The HTML carrying the config script tag.
+    """
+    tag = f'<script type="application/json" id="omni-visit-config">{config_json}</script>'
+    index = _last_match_start(_HEAD_CLOSE_RE, html)
+    if index == -1:
+        index = _last_match_start(_BODY_CLOSE_RE, html)
+    if index == -1:
+        index = _last_match_start(_HTML_CLOSE_RE, html)
+    if index == -1:
+        index = len(html)
+    return html[:index] + tag + html[index:]
+
+
+def _visitor_error(
+    status_code: int,
+    reason: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    """Build a visitor-comment refusal, e.g. ``{"reason": "reload"}``.
+
+    :param status_code: HTTP status to answer with.
+    :param reason: Short machine-readable reason, e.g. ``"disabled"``.
+    :param headers: Extra headers merged over the defaults, e.g.
+        ``Retry-After``.
+    :returns: The JSON refusal response.
+    """
+    return JSONResponse(status_code=status_code, content={"reason": reason}, headers=headers)
+
+
+class VisitorCommentRequest(BaseModel):
+    """Request body for ``POST /v1/artifact-comments``.
+
+    :param token: The visitor shell's bare ``g`` token.
+    :param grant: The link's grant from the open gate, or ``None`` when the
+        gate admitted the request without one.
+    :param path: Page path relative to the link's bundle root.
+    :param body: The comment text (at most 4000 characters).
+    :param anchor_content: Plain-text snapshot of the selected range, when
+        the comment anchors text; ``None`` for a whole-page comment.
+    :param start_index: 0-based character offset (inclusive) of the anchor.
+    :param end_index: 0-based character offset (exclusive) of the anchor.
+    :param name: Visitor-supplied display name; optional.
+    """
+
+    token: str
+    grant: str | None = None
+    path: str = Field(max_length=1024)
+    body: str = Field(max_length=4000)
+    anchor_content: str | None = Field(default=None, max_length=2000)
+    start_index: int
+    end_index: int
+    name: str | None = Field(default=None, max_length=40)
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> VisitorCommentRequest:
+        """Reject an inverted or negative anchor range.
+
+        :returns: The validated request unchanged.
+        :raises ValueError: When ``0 <= start_index <= end_index`` fails.
+        """
+        if self.start_index < 0:
+            raise ValueError("start_index must be >= 0")
+        if self.end_index < self.start_index:
+            raise ValueError("end_index must be >= start_index")
+        return self
+
+
 def register_artifact_routes(
     router: APIRouter,
     *,
@@ -437,13 +567,16 @@ def register_artifact_routes(
     _stream_download_from_runner: Callable[[Request, str, Conversation, str], Awaitable[Response]],
     _read_workspace_via_host: Callable[..., Awaitable[dict[str, Any] | None]],
     _runner_path_segment: Callable[..., str],
+    comment_store: CommentStore | None = None,
 ) -> None:
     """Register the artifact capability-URL routes on *router*.
 
     Called from ``register_resources_routes`` so the mint and open paths
     reuse that function's authorization closures. The serve and preflight
     routes live here too, on the same router, so they are mounted under
-    ``/v1`` before the SPA fallback.
+    ``/v1`` before the SPA fallback. The visitor comment POST is registered
+    only when *comment_store* is configured — without a store there is
+    nowhere for a visitor comment to land, so the route does not exist.
 
     :param router: The sessions router to register on.
     :param conversation_store: Store holding conversations and labels.
@@ -455,6 +588,8 @@ def register_artifact_routes(
     :param _stream_download_from_runner: Closure streaming a runner download.
     :param _read_workspace_via_host: Closure reading a workspace over the host.
     :param _runner_path_segment: Closure encoding a runner path segment.
+    :param comment_store: Store visitor comments are inserted into; ``None``
+        leaves the visitor comment route unregistered.
     """
 
     # The gate's per-app state. The sharing store connects on first use, so
@@ -559,6 +694,21 @@ def register_artifact_routes(
             location = f"{location}?{query}"
         return RedirectResponse(location, status_code=303)
 
+    async def _read_gate_record(conv: Conversation) -> tuple[str | None, SharingRecord | None]:
+        """Resolve the link owner and read the record governing *conv*.
+
+        :param conv: The link's session.
+        :returns: ``(owner, record)`` — the gate's inputs, both unresolved as
+            ``None``. The caller treats an unresolved owner as failing closed.
+        """
+        owner = await _resolve_link_owner(conv)
+        record = (
+            await asyncio.to_thread(_get_sharing_store().read_sharing, owner)
+            if owner is not None
+            else None
+        )
+        return owner, record
+
     async def _gate_response(
         request: Request,
         user_id: str | None,
@@ -568,8 +718,8 @@ def register_artifact_routes(
         relpath: str,
         conv: Conversation,
         session_key: bytes,
-    ) -> Response | None:
-        """Apply the owner's external-access gate; ``None`` means serve.
+    ) -> tuple[Response | None, SharingRecord | None]:
+        """Apply the owner's external-access gate.
 
         Decision order (design §2.5): an unexpired panel token passes; a
         valid grant passes; an open gate (no record, or no code) passes; an
@@ -577,41 +727,51 @@ def register_artifact_routes(
         onto a fresh grant; otherwise the share-code form or the sign-in
         page answers. An owner that cannot be resolved fails closed like a
         switched-off gate.
+
+        :returns: ``(decision, record)`` — a ``None`` decision means serve,
+        and the record is the one the decision evaluated (``None`` for a
+        panel token or an unresolvable owner). The visitor shell mints its
+        grants from that record, never from a second read that a settings
+        change could race.
         """
         now = now_epoch()
         if claims.view == "p":
             if claims.expires_at is not None and claims.expires_at > now:
-                return None
-            return _error_page(410, _EXPIRED_SENTENCE)
-        owner = await _resolve_link_owner(conv)
-        record = (
-            await asyncio.to_thread(_get_sharing_store().read_sharing, owner)
-            if owner is not None
-            else None
-        )
+                return None, None
+            return _error_page(410, _EXPIRED_SENTENCE), None
+        owner, record = await _read_gate_record(conv)
         gate_key_identifier = gate_key_id(record.gate_key) if record is not None else ""
         if grant and grant_valid(session_key, token, grant, gate_key_identifier, now):
-            return None
+            return None, record
         if owner is None:
             # Nothing can be consulted, so the gate fails closed: only a
             # logged-in user passing the mint's read rule gets in.
             if _is_login(user_id) and await _identity_allowed(request, claims):
-                return _grant_redirect(request, token, relpath, session_key, gate_key_identifier)
-            return _forbidden_page(request)
+                return (
+                    _grant_redirect(request, token, relpath, session_key, gate_key_identifier),
+                    record,
+                )
+            return _forbidden_page(request), record
         # Gate open: no record (the user default is external on, no code) or
         # external on with no code. A URL whose grant is bad is evaluated
         # here as a bare one.
         if record is None or (record.external and record.code_hash is None):
-            return None
+            return None, record
         if _is_login(user_id) and await _identity_allowed(request, claims):
-            return _grant_redirect(request, token, relpath, session_key, gate_key_identifier)
+            return (
+                _grant_redirect(request, token, relpath, session_key, gate_key_identifier),
+                record,
+            )
         if not record.external:
-            return _forbidden_page(request)
+            return _forbidden_page(request), record
         cookie_name = remember_cookie_name(owner, secure=request.url.scheme == "https")
         cookie = request.cookies.get(cookie_name)
         if cookie and remember_cookie_valid(record.gate_key, owner, cookie, now):
-            return _grant_redirect(request, token, relpath, session_key, gate_key_identifier)
-        return _form_page(401)
+            return (
+                _grant_redirect(request, token, relpath, session_key, gate_key_identifier),
+                record,
+            )
+        return _form_page(401), record
 
     def _remember_cookie_path(request: Request) -> str:
         """The cookie's Path: the artifact route family under the base path."""
@@ -711,7 +871,7 @@ def register_artifact_routes(
         body: bytes,
     ) -> Response:
         """Build an in-memory artifact response, injecting panel assets if due."""
-        if claims.view == "p" and _is_html(content_type):
+        if claims.view in ("p", "h") and _is_html(content_type):
             injected = _inject_in_frame_assets(body, nonce)
             if injected is not None:
                 body = injected
@@ -762,7 +922,7 @@ def register_artifact_routes(
         if content_length is not None and content_length > _MAX_ARTIFACT_BYTES:
             await upstream.aclose()
             return _error_page(413, _TOO_LARGE_SENTENCE)
-        if content_length is None or (claims.view == "p" and _is_html(content_type)):
+        if content_length is None or (claims.view in ("p", "h") and _is_html(content_type)):
             try:
                 body = await _read_stream_bounded(upstream)
             except httpx.HTTPError:
@@ -891,6 +1051,120 @@ def register_artifact_routes(
             status = 404 if exc.status_code in (400, 404) else 502
             return _error_page(status, _sentence_for(status))
 
+    def _visit_shell_response(
+        request: Request,
+        claims: ArtifactTokenClaims,
+        session_key: bytes,
+        token: str,
+        relpath: str,
+        record: SharingRecord | None,
+    ) -> Response:
+        """Render the visitor shell for an admitted ``g`` request.
+
+        Reads the built ``visit.html``, rebases its asset references to the
+        deployment's dist URL, stamps a per-response nonce over every script
+        and module preload, and embeds the visit config. The ``h`` frame and
+        both grants are minted from *record* — the record the gate just
+        evaluated — so a settings change cannot race the shell's grants.
+
+        :param request: The incoming request, for the base path.
+        :param claims: The verified ``g`` claims.
+        :param session_key: The session's artifact-link key.
+        :param token: The bare ``g`` token.
+        :param relpath: The requested HTML path relative to the bundle root.
+        :param record: The sharing record the gate evaluated, or ``None``.
+        :returns: The shell response, or a 503 page when no build exists.
+        """
+        shell = _read_in_frame_asset("visit.html")
+        if shell is None:
+            # A source checkout without a web build has no visitor entry;
+            # answer the link with a clear page instead of a traceback.
+            return _error_page(503, _VISIT_UNAVAILABLE_SENTENCE)
+        base_path = getattr(request.app.state, "base_path", "") or ""
+        # The same rebase the SPA index gets; relative ./assets/ would
+        # otherwise resolve under the artifact path and fetch bundle files.
+        from omnigent.server.app import _rewrite_web_ui_index
+
+        html = _rewrite_web_ui_index(shell, base_path)
+        nonce = secrets.token_urlsafe(16)
+        html = _stamp_script_nonce(html, nonce)
+        h_token = encode_artifact_token(
+            session_key,
+            session_id=claims.session_id,
+            workspace_id=claims.workspace_id,
+            root=claims.root,
+            absolute=claims.absolute,
+            entry=claims.entry,
+            kind=claims.kind,
+            view="h",
+        )
+        # A grant is due exactly when the gate the visitor passed requires
+        # one; an open gate carries none, so the frame URL stays bare.
+        grant: str | None = None
+        frame_grant = ""
+        if record is not None and (not record.external or record.code_hash is not None):
+            now = now_epoch()
+            gate_key_identifier = gate_key_id(record.gate_key)
+            grant = mint_grant(session_key, token, gate_key_identifier, now)
+            frame_grant = f"~{mint_grant(session_key, h_token, gate_key_identifier, now)}"
+        frame_url = (
+            f"{base_path}/v1/artifacts/{h_token}{frame_grant}/{urllib.parse.quote(relpath)}"
+        )
+        config = {
+            "frameUrl": frame_url,
+            "nonce": bridge_nonce(session_key, h_token),
+            "token": token,
+            "grant": grant,
+            "path": relpath,
+            "commentsEnabled": comment_store is not None
+            and (record is None or record.allow_comments),
+        }
+        html = _insert_omni_visit_config(
+            html, _escape_json_for_html(json.dumps(config, separators=(",", ":")))
+        )
+        headers = {
+            "Content-Security-Policy": (
+                f"default-src 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; "
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                "connect-src 'self'; frame-src 'self'; form-action 'none'; "
+                "frame-ancestors 'none'; base-uri 'none'"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Robots-Tag": "noindex",
+        }
+        skip_gzip(request)
+        return Response(content=html.encode("utf-8"), media_type="text/html", headers=headers)
+
+    async def _serve_admitted(
+        request: Request,
+        claims: ArtifactTokenClaims,
+        conv: Conversation,
+        session_key: bytes,
+        token: str,
+        relpath: str,
+        record: SharingRecord | None,
+    ) -> Response:
+        """Serve an admitted request per its view.
+
+        A ``g`` request whose path names HTML renders the visitor shell;
+        every other admitted request (including ``h`` and non-HTML ``g``)
+        goes to the byte readers.
+
+        :param request: The incoming request.
+        :param claims: The verified token claims.
+        :param conv: The link's session.
+        :param session_key: The session's artifact-link key.
+        :param token: The bare token.
+        :param relpath: Requested path relative to the bundle root.
+        :param record: The sharing record the gate evaluated, or ``None``.
+        :returns: The artifact response.
+        """
+        if claims.view == "g" and _is_html(_guess_media_type(relpath)):
+            return _visit_shell_response(request, claims, session_key, token, relpath, record)
+        return await _dispatch_reader(request, claims, conv, session_key, token, relpath)
+
     @router.post(
         "/sessions/{session_id}/artifacts",
         # Internal web-UI flow — hidden from the public API reference.
@@ -913,7 +1187,8 @@ def register_artifact_routes(
 
         :param request: The incoming request, for authorization.
         :param session_id: Session/conversation identifier.
-        :param body: ``{"path": <str>, "base"?: "host", "view": <"panel"|"raw">}``.
+        :param body: ``{"path": <str>, "base"?: "host",
+            "view": <"panel"|"raw"|"visit">}``.
         :returns: ``{"url": <str>, "nonce": <str>, "kind": <"bundle"|"file">}``.
         :raises OmnigentError: 400 invalid path, 403/404 on auth, 409 archived.
         """
@@ -924,9 +1199,9 @@ def register_artifact_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         view = body.get("view", "panel")
-        if view not in ("panel", "raw"):
+        if view not in ("panel", "raw", "visit"):
             raise OmnigentError(
-                "artifacts 'view' must be 'panel' or 'raw'",
+                "artifacts 'view' must be 'panel', 'raw' or 'visit'",
                 code=ErrorCode.INVALID_INPUT,
             )
         absolute, target = _normalize_artifact_path(raw_path, body.get("base"))
@@ -948,7 +1223,12 @@ def register_artifact_routes(
         kind: Literal["b", "f"] = "b" if Path(entry).suffix.lower() in (".html", ".htm") else "f"
         key = await asyncio.to_thread(get_or_create_artifact_key, conversation_store, session_id)
         # A panel token carries an expiry and passes the owner's gate
-        # outright; a raw-view token stays deterministic and gated.
+        # outright; raw-view and visit tokens stay deterministic and gated.
+        # Only an HTML entry can open the visitor shell; any other file keeps
+        # the raw view, so a visit request never widens what a link serves.
+        token_view: Literal["p", "r", "g"] = "p" if view == "panel" else "r"
+        if view == "visit" and kind == "b":
+            token_view = "g"
         expires_at = now_epoch() + _PANEL_TOKEN_TTL_SECONDS if view == "panel" else None
         token = encode_artifact_token(
             key,
@@ -958,7 +1238,7 @@ def register_artifact_routes(
             absolute=absolute,
             entry=entry,
             kind=kind,
-            view="p" if view == "panel" else "r",
+            view=token_view,
             expires_at=expires_at,
         )
         return {
@@ -1092,13 +1372,13 @@ def register_artifact_routes(
                 if isinstance(loaded, Response):
                     return loaded
                 conv, session_key = loaded
-                gate = await _gate_response(
+                gate, record = await _gate_response(
                     request, user_id, claims, bare_token, grant, relpath, conv, session_key
                 )
                 if gate is not None:
                     return gate
-                return await _dispatch_reader(
-                    request, claims, conv, session_key, bare_token, relpath
+                return await _serve_admitted(
+                    request, claims, conv, session_key, bare_token, relpath, record
                 )
             except Exception:
                 # Capability URLs never surface JSON or the shell: any lookup
@@ -1174,15 +1454,11 @@ def register_artifact_routes(
                 if isinstance(loaded, Response):
                     return loaded
                 conv, session_key = loaded
-                owner = await _resolve_link_owner(conv)
-                record = (
-                    await asyncio.to_thread(_get_sharing_store().read_sharing, owner)
-                    if owner is not None
-                    else None
-                )
+                owner, record = await _read_gate_record(conv)
                 # A panel token never enters the unlock flow: it is decided
                 # exactly as the GET route decides it (serve while unexpired,
-                # 410 past it) and issues nothing.
+                # 410 past it) and issues nothing. Every other view (raw and
+                # the visitor views) unlocks through the share code.
                 if (
                     claims.view == "p"
                     or owner is None
@@ -1190,13 +1466,15 @@ def register_artifact_routes(
                     or not record.external
                     or record.code_hash is None
                 ):
-                    gate = await _gate_response(
+                    gate, evaluated = await _gate_response(
                         request, user_id, claims, bare_token, "", relpath, conv, session_key
                     )
                     if gate is not None:
                         return gate
-                    return await _dispatch_reader(
-                        request, claims, conv, session_key, bare_token, relpath
+                    # An open gate still answers with the view it would serve:
+                    # the shell for a g HTML request, bytes otherwise.
+                    return await _serve_admitted(
+                        request, claims, conv, session_key, bare_token, relpath, evaluated
                     )
                 now = time.time()
                 # The attempt is counted before the form is read and the
@@ -1238,11 +1516,12 @@ def register_artifact_routes(
         """
         Return the caller's external-access settings summary.
 
-        No row means the default: external access on, no share code. The
-        stored code hash and gate key never leave the server.
+        No row means the defaults: external access on, no share code, visitor
+        comments on. The stored code hash and gate key never leave the server.
 
         :param request: The incoming request, for the caller identity.
-        :returns: ``{"external": <bool>, "share_code_set": <bool>}``.
+        :returns: ``{"external": <bool>, "share_code_set": <bool>,
+            "allow_comments": <bool>}``.
         :raises OmnigentError: 401 when authentication is required and absent.
         """
         owner = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
@@ -1250,6 +1529,7 @@ def register_artifact_routes(
         return {
             "external": record.external if record is not None else True,
             "share_code_set": record is not None and record.code_hash is not None,
+            "allow_comments": record.allow_comments if record is not None else True,
         }
 
     @router.put(
@@ -1264,15 +1544,18 @@ def register_artifact_routes(
         body: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Update the caller's external-access switch and share code.
+        Update the caller's external-access switch, share code and comments
+        switch.
 
         An absent field keeps its value; ``share_code: null`` clears the
         code; a string is stripped and must be 4–64 characters. Every
-        successful write regenerates the gate key, so every grant and
-        remembered browser dies with it.
+        successful write regenerates the gate key — except one that changes
+        only ``allow_comments``, which keeps it so the switch does not sign
+        open visitors out.
 
         :param request: The incoming request, for the caller identity.
-        :param body: ``{"external"?: <bool>, "share_code"?: <str | null>}``.
+        :param body: ``{"external"?: <bool>, "share_code"?: <str | null>,
+            "allow_comments"?: <bool>}``.
         :returns: The same shape as the GET.
         :raises OmnigentError: 400 invalid input, 401 unauthenticated.
         :raises HTTPException: 429 when the per-owner write rate is exceeded.
@@ -1288,6 +1571,12 @@ def register_artifact_routes(
         if "external" in body and not isinstance(external, bool):
             raise OmnigentError(
                 "artifact-sharing 'external' must be a boolean",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        allow_comments = body.get("allow_comments")
+        if "allow_comments" in body and not isinstance(allow_comments, bool):
+            raise OmnigentError(
+                "artifact-sharing 'allow_comments' must be a boolean",
                 code=ErrorCode.INVALID_INPUT,
             )
         share_code: str | None | KeepShareCode = KEEP_SHARE_CODE
@@ -1313,8 +1602,113 @@ def register_artifact_routes(
             owner,
             external=external if isinstance(external, bool) else None,
             share_code=share_code,
+            allow_comments=allow_comments if isinstance(allow_comments, bool) else None,
         )
         return {
             "external": record.external,
             "share_code_set": record.code_hash is not None,
+            "allow_comments": record.allow_comments,
         }
+
+    if comment_store is not None:
+        # Visitor comments per link, in-memory and per process. Keyed by the
+        # link's identity (session, key, root, entry), never by the visitor,
+        # so one link's flood cannot spend another link's budget.
+        visitor_comment_limiter = SlidingWindowRateLimiter(
+            _VISITOR_COMMENT_RATE_MAX,
+            _VISITOR_COMMENT_RATE_WINDOW_SECONDS,
+            RATE_LIMITER_MAX_KEYS,
+        )
+
+        @router.post(
+            "/artifact-comments",
+            # Internal visitor flow — hidden from the public API reference.
+            include_in_schema=False,
+            response_model=None,
+            dependencies=[
+                Depends(require_trusted_origin),
+                Depends(require_json_content_type),
+            ],
+        )
+        async def add_visitor_comment(
+            request: Request,
+            body: VisitorCommentRequest,
+        ) -> Response:
+            """
+            Record one comment left by a visitor behind a share link.
+
+            The body's token is the authority and its grant the gate
+            credential; no ambient identity is consulted. The target is
+            verified exactly as the serve route verifies it, the owner's
+            current gate must admit the request, the comments switch must be
+            on, and the per-link window must have room. The row is stored on
+            the workspace path the owner's own comments use, authored as
+            ``visitor:<name>``; nothing about the comment is returned.
+
+            :param request: The incoming request, for the Origin check and
+                the unresolvable-owner fallback.
+            :param body: The visitor comment payload.
+            :returns: 201 ``{"ok": true}``, or a JSON refusal (403
+                ``{"reason": "reload"|"disabled"}``, 404, 410, 413/422, 429).
+            """
+            claims = decode_artifact_token(body.token)
+            if claims is None or claims.view != "g":
+                return _visitor_error(404, "not_found")
+            with workspace_scope(claims.workspace_id):
+                loaded = await _load_verified_target(body.token, body.path, claims)
+                if isinstance(loaded, Response):
+                    if loaded.status_code == 410:
+                        return _visitor_error(410, "gone")
+                    return _visitor_error(404, "not_found")
+                conv, session_key = loaded
+                # Only an HTML page can host comment anchors; a non-HTML
+                # path under a bundle stays unserved here, as it is served
+                # as raw bytes there.
+                if not _is_html(_guess_media_type(body.path)):
+                    return _visitor_error(404, "not_found")
+                owner, record = await _read_gate_record(conv)
+                now = now_epoch()
+                gate_key_identifier = gate_key_id(record.gate_key) if record is not None else ""
+                admitted = bool(body.grant) and grant_valid(
+                    session_key,
+                    body.token,
+                    body.grant or "",
+                    gate_key_identifier,
+                    now,
+                )
+                if owner is None:
+                    # Mirror the serve gate: with no resolvable owner only the
+                    # mint's read rule admits a caller, grants included.
+                    if not admitted:
+                        user_id = _get_user_id(request, auth_provider)
+                        admitted = _is_login(user_id) and await _identity_allowed(request, claims)
+                elif record is None or (record.external and record.code_hash is None):
+                    # Open gate: admitted without a grant.
+                    admitted = True
+                if not admitted:
+                    return _visitor_error(403, "reload")
+                if record is not None and not record.allow_comments:
+                    return _visitor_error(403, "disabled")
+                window_key = f"{claims.session_id}:{claims.key_id}:{claims.root}:{claims.entry}"
+                if not visitor_comment_limiter.allow(window_key, time.time()):
+                    return _visitor_error(
+                        429,
+                        "too_many",
+                        headers={"Retry-After": str(_VISITOR_COMMENT_RATE_WINDOW_SECONDS)},
+                    )
+                # The workspace path the owner's own comments carry, so the
+                # row lands in the owner's per-file thread.
+                stored_path = _posix_join(claims.root, body.path)
+                if claims.absolute:
+                    stored_path = "/" + stored_path.lstrip("/")
+                await asyncio.to_thread(
+                    comment_store.add,
+                    conversation_id=claims.session_id,
+                    path=stored_path,
+                    body=body.body,
+                    start_index=body.start_index,
+                    end_index=body.end_index,
+                    anchor_content=body.anchor_content,
+                    created_by=_visitor_author(body.name),
+                )
+                return JSONResponse(status_code=201, content={"ok": True})

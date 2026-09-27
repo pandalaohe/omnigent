@@ -51,15 +51,17 @@ class ArtifactTokenClaims:
     :param entry: Entry path relative to ``root``.
     :param kind: ``"b"`` for a bundle (an HTML entry; descendants allowed) or
         ``"f"`` for a single file.
-    :param view: ``"p"`` for the panel view (in-frame scripts injected) or
-        ``"r"`` for the raw standalone view.
+    :param view: ``"p"`` for the panel view (in-frame scripts injected),
+        ``"r"`` for the raw standalone view, ``"g"`` for the visitor shell
+        (the page a shared link opens for a logged-out visitor) or ``"h"``
+        for the shell's frame (raw bytes plus the comment bridge).
     :param key_id: Identifier of the key that signed the token (see
         :func:`key_id`); distinguishes a revoked token (stale key id) from a
         forged one (bad mac under the current key).
     :param expires_at: Unix seconds after which the token is refused, or
         ``None``. Panel-view tokens carry it so an open panel can be trusted
-        without the external-access gate; raw-view tokens stay deterministic
-        and never carry one.
+        without the external-access gate; raw-view and visitor tokens stay
+        deterministic and never carry one.
     """
 
     session_id: str
@@ -68,7 +70,7 @@ class ArtifactTokenClaims:
     absolute: bool
     entry: str
     kind: Literal["b", "f"]
-    view: Literal["p", "r"]
+    view: Literal["p", "r", "g", "h"]
     key_id: str
     expires_at: int | None = None
 
@@ -97,7 +99,7 @@ def encode_artifact_token(
     absolute: bool,
     entry: str,
     kind: Literal["b", "f"],
-    view: Literal["p", "r"],
+    view: Literal["p", "r", "g", "h"],
     expires_at: int | None = None,
 ) -> str:
     """Encode the capability token for one artifact target.
@@ -105,11 +107,11 @@ def encode_artifact_token(
     Wire form ``a1.<payload>.<mac>``: ``payload`` is compact JSON
     base64url-encoded without padding, ``mac`` is the first 16 bytes of
     HMAC-SHA256(session_key, ``a1.`` + payload) base64url without padding.
-    *expires_at* adds the panel-only expiry claim ``x``; a raw-view token
-    must not carry one, because its URL is meant to be deterministic.
+    *expires_at* adds the panel-only expiry claim ``x``; every other view
+    must not carry one, because those URLs are meant to be deterministic.
 
     :returns: The token, e.g. ``"a1.eyJzIjoi...NiI"``.
-    :raises ValueError: If *expires_at* is set on a raw-view token.
+    :raises ValueError: If *expires_at* is set on a non-panel-view token.
     """
     if expires_at is not None and view != "p":
         raise ValueError("only panel-view tokens carry an expiry")
@@ -146,8 +148,8 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
 
     Returns ``None`` for any malformed input — wrong prefix, bad base64, bad
     JSON, missing or mistyped fields, ``kind`` / ``view`` outside their
-    literal sets, a panel token without its ``x`` expiry, or a raw-view token
-    carrying one — and never raises. Callers pair this with
+    literal sets, a panel token without its ``x`` expiry, or a non-panel
+    token carrying one — and never raises. Callers pair this with
     :func:`verify_artifact_token` before trusting the claims.
 
     :param token: The wire token, e.g. ``"a1.eyJzIjoi...NiI"``.
@@ -188,7 +190,7 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
         or not 0 <= workspace_id <= _WORKSPACE_ID_MAX
     ):
         return None
-    if kind not in ("b", "f") or view not in ("p", "r"):
+    if kind not in ("b", "f") or view not in ("p", "r", "g", "h"):
         return None
     # Presence, not truthiness: an absent ``x`` and a present ``null`` are
     # different wire facts, and only absence means "no expiry claim".
@@ -213,7 +215,7 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
         absolute=bool(absolute),
         entry=entry,
         kind=cast(Literal["b", "f"], kind),
-        view=cast(Literal["p", "r"], view),
+        view=cast(Literal["p", "r", "g", "h"], view),
         key_id=kid,
         expires_at=expires_at,
     )

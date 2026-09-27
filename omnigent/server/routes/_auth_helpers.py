@@ -75,6 +75,37 @@ def attribution_user(user_id: str | None) -> str | None:
     return user_id
 
 
+# The marker prefix on a visitor comment's ``created_by``. No account id
+# contains ``:``, so a prefixed value can never collide with a real identity.
+_VISITOR_AUTHOR_PREFIX = "visitor:"
+_VISITOR_NAME_MAX = 40
+
+
+def visitor_author(name: str | None) -> str:
+    """Map a visitor's submitted display name to its comment author marker.
+
+    Control characters and ``:`` are stripped from *name* (the marker must
+    stay distinguishable from — and unparseable as — a real account id), the
+    rest is trimmed and capped at :data:`_VISITOR_NAME_MAX` characters. An
+    empty or fully stripped name yields the bare ``"visitor:"``.
+
+    :param name: The visitor-supplied display name, or ``None``.
+    :returns: The ``created_by`` value for a visitor comment, e.g.
+        ``"visitor:Alice"``.
+    """
+    cleaned = "".join(char for char in (name or "") if char.isprintable() and char != ":")
+    return f"{_VISITOR_AUTHOR_PREFIX}{cleaned.strip()[:_VISITOR_NAME_MAX]}"
+
+
+def is_visitor_author(created_by: str | None) -> bool:
+    """Whether a comment's ``created_by`` marks it as a visitor comment.
+
+    :param created_by: The stored comment author, or ``None``.
+    :returns: ``True`` for the ``"visitor:"`` marker family.
+    """
+    return isinstance(created_by, str) and created_by.startswith(_VISITOR_AUTHOR_PREFIX)
+
+
 def require_user(
     request: Request,
     auth_provider: AuthProvider | None,

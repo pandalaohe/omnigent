@@ -876,8 +876,10 @@ def create_sessions_router(
         carry the per-session comments fingerprint
         (``comments_count`` / ``comments_updated_at``) so the web app
         can refresh its comment list when another user or the agent
-        mutates comments. ``None`` (e.g. in focused tests or servers
-        without comments wired) emits the no-comments shape.
+        mutates comments, and the artifact routes register the visitor
+        comment POST (``POST /v1/artifact-comments``). ``None`` (e.g. in
+        focused tests or servers without comments wired) emits the
+        no-comments shape and leaves the visitor route unregistered.
     :param runner_tunnel_tokens: The server's runner tunnel-token
         allow-list (same value the tunnel router receives), used to
         authorize runner writes to the policy-owned ``cost_control.*``
@@ -968,6 +970,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         host_registry=host_registry,
+        comment_store=comment_store,
     )
 
     register_browser_routes(
