@@ -190,12 +190,27 @@ def _settings_rows(
 ) -> list[tuple[int, str, str, bytes]]:
     """One user's rows, or [] when the envelope does not qualify."""
     if not isinstance(envelope, dict):
+        _logger.warning(
+            "Skipping preferences move for user %s in workspace %s: envelope is not an object",
+            user_id,
+            workspace_id,
+        )
         return []
     version = envelope.get("version")
     if type(version) is not int or version != _ENVELOPE_VERSION:
+        _logger.warning(
+            "Skipping preferences move for user %s in workspace %s: envelope version is not 1",
+            user_id,
+            workspace_id,
+        )
         return []
     settings = envelope.get("settings")
     if not isinstance(settings, dict):
+        _logger.warning(
+            "Skipping preferences move for user %s in workspace %s: settings is not an object",
+            user_id,
+            workspace_id,
+        )
         return []
     rows: list[tuple[int, str, str, bytes]] = [
         (

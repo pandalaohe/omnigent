@@ -267,6 +267,7 @@ def test_preferences_move_skips_bad_bytes_and_invalid_envelopes(
     warnings = capsys.readouterr().err
     assert "Skipping preferences move for user corrupt" in warnings
     assert "Skipping preferences move for user notjson" in warnings
+    assert "Skipping preferences move for user version2" in warnings
     engine.dispose()
 
 
