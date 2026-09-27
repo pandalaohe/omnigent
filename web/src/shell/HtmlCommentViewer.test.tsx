@@ -110,7 +110,8 @@ function viewerElement(path: string) {
   );
 }
 
-/** Wait for the minted iframe, stub its `contentWindow`, and fire `load`. */
+/** Wait for the minted iframe, stub its `contentWindow`, and fire `load` after
+ * flushing effects so the bridge's `load` listener is already attached. */
 async function openFrame() {
   const iframe = (await screen.findByTitle("HTML preview")) as HTMLIFrameElement;
   const postMessage = vi.fn();
@@ -118,6 +119,7 @@ async function openFrame() {
     configurable: true,
     value: { postMessage },
   });
+  await act(async () => {});
   fireEvent.load(iframe);
   return { iframe, postMessage };
 }
@@ -245,6 +247,16 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
       expect(iframe.getAttribute("src")).toBe("/v1/artifacts/tok2/sub/page2.html"),
     );
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(2);
+
+    // The reloaded document re-handshakes; an init carrying the stale nonce
+    // would leave the bridge deaf and comments silently broken after a refresh.
+    fireEvent.load(iframe);
+    expect(postMessage).toHaveBeenCalledTimes(2);
+    expect(postMessage.mock.calls[1][0]).toMatchObject({
+      source: BRIDGE_SOURCE,
+      nonce: "nonce-2",
+      type: BRIDGE_MSG.init,
+    });
   });
 
   it("ignores a refresh that resolves after the viewer switched files", async () => {
