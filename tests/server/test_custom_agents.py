@@ -558,6 +558,57 @@ async def test_patch_rename_keeps_the_lead_host(
 
 
 @pytest.mark.asyncio
+async def test_patch_rename_onto_a_member_role_is_a_400(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """Renaming the lead onto a worker's role would leave one role with two
+    members, so the PATCH is refused and the row stays untouched."""
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST, _WORKER_HOST)
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        hosted = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster(), "version": 1},
+        )
+        assert hosted.status_code == 200, hosted.text
+        rejected = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"name": "researcher", "version": 2},
+        )
+        detail = await client.get(f"/v1/custom-agents/{agent_id}", headers=headers)
+        renamed = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"name": "renamed-reviewer", "version": 2},
+        )
+
+    assert rejected.status_code == 400, rejected.text
+    assert rejected.json()["error"]["code"] == "invalid_input"
+    assert "researcher" in rejected.json()["error"]["message"]
+    unchanged = detail.json()
+    assert unchanged["name"] == "custom-reviewer"
+    assert unchanged["version"] == 2
+    assert [(member["name"], member["host_id"]) for member in unchanged["members"]] == [
+        ("custom-reviewer", _LEAD_HOST),
+        ("researcher", _WORKER_HOST),
+    ]
+    assert renamed.status_code == 200, renamed.text
+    assert [(member["name"], member["host_id"]) for member in renamed.json()["members"]] == [
+        ("renamed-reviewer", _LEAD_HOST),
+        ("researcher", _WORKER_HOST),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_patch_members_drops_the_host_of_a_removed_role(
     db_uri: str, tmp_path: Path, runtime_init: None
 ) -> None:

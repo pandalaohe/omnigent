@@ -479,9 +479,17 @@ def create_custom_agents_router(
         def update() -> dict[str, Any]:
             data = patch_bundle(artifact_bytes(row["bundle_location"]), changes)
             spec = validate(data)
+            projected = project_members(spec)
+            # The lead is projected first; its role must stay unique across the
+            # roster, which role-keyed hosts, labels, and routing cannot split.
+            lead_name = str(projected[0]["name"])
+            if any(str(member["name"]) == lead_name for member in projected[1:]):
+                raise OmnigentError(
+                    f"lead name {lead_name!r} is already a member role",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             location = bundle_location(agent_id, data)
             artifact_store.put(location, data)
-            projected = project_members(spec)
             if request_members is not None:
                 # A members PATCH is a full roster replacement: each request
                 # member's host is authoritative, except that an omitted
