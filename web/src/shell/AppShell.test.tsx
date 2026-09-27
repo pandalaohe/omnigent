@@ -20,6 +20,7 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
+import { emitArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -4470,6 +4471,9 @@ describe("file navigation request precedence", () => {
         <button type="button" onClick={() => openFile?.("README.md")}>
           Open README
         </button>
+        <button type="button" onClick={() => openFile?.("README.md", { preview: true })}>
+          Preview README
+        </button>
         <button type="button" onClick={() => openFile?.("AGENTS.md", { line: 200, column: 3 })}>
           Cite AGENTS
         </button>
@@ -4567,5 +4571,73 @@ describe("file navigation request precedence", () => {
     expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("line=");
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("column=");
+  });
+
+  it("an explicit preview open sets the request and the next plain open clears it", () => {
+    // The preview intent is per-open: it rides the URL for the agent's
+    // open_in_panel, but a later user click must not reopen in preview.
+    renderNavigationShell();
+    fireEvent.click(screen.getByRole("button", { name: "Preview README" }));
+    expect(screen.getByTestId("url-params")).toHaveTextContent("preview=1");
+    fireEvent.click(screen.getByRole("button", { name: "Open README" }));
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("preview");
+  });
+});
+
+describe("artifact.open_request consumer", () => {
+  function renderArtifactShell() {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    return renderShell("/c/conv_abc");
+  }
+
+  it("opens the viewer for the shown session and ignores another session's request", () => {
+    // The event reaches every SSE client; only the client showing the issuing
+    // session may reveal the file. The delivering conversation rides the bus
+    // because the event payload itself carries no conversation id.
+    renderArtifactShell();
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+
+    act(() => {
+      emitArtifactOpenRequest(
+        { type: "artifact_open_request", path: "reports/other.html", base: "workspace" },
+        "conv_other",
+      );
+    });
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+
+    act(() => {
+      emitArtifactOpenRequest(
+        { type: "artifact_open_request", path: "reports/index.html", base: "workspace" },
+        "conv_abc",
+      );
+    });
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute(
+      "data-path",
+      "reports/index.html",
+    );
+    // The agent's open asks for the rendered preview, not the viewer's sticky
+    // source/diff mode, so the intent rides the open path as ?preview=1.
+    expect(screen.getByTestId("url-params")).toHaveTextContent("preview=1");
+  });
+
+  it("opens host-absolute paths too — the viewer resolves them with base=host", () => {
+    // FileViewer reads host-absolute paths through the same environment route
+    // (`?base=host`), so an owner-only absolute target is openable, not ignored.
+    renderArtifactShell();
+
+    act(() => {
+      emitArtifactOpenRequest(
+        { type: "artifact_open_request", path: "/Users/x/report.html", base: "host" },
+        "conv_abc",
+      );
+    });
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute(
+      "data-path",
+      "/Users/x/report.html",
+    );
   });
 });

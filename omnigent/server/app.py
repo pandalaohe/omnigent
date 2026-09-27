@@ -90,6 +90,7 @@ from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
     publish_server_metrics_periodically,
+    redact_artifact_token,
     set_request_duration_for_access_log,
     set_request_id_for_access_log,
     set_request_session_id_for_access_log,
@@ -2297,7 +2298,7 @@ def create_app(
                 "Request cancelled before a response was sent "
                 "(client disconnect / request teardown): %s %s",
                 request.method,
-                request.url.path,
+                redact_artifact_token(request.url.path),
             )
             return Response(
                 status_code=_HTTP_CLIENT_CLOSED_REQUEST,
@@ -2459,7 +2460,7 @@ def create_app(
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s",
-                request.url.path,
+                redact_artifact_token(request.url.path),
                 exc.message,
                 extra=_error_audit_extra(
                     request,

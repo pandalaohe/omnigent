@@ -60,6 +60,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { emitArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import {
   ApiError,
   approve as approveElicitation,
@@ -6727,6 +6728,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // one while a different conversation is on screen, and claiming at the
       // visible session would be rejected as an owner mismatch.
       emitBrowserActionRequest(event, sourceConversationId);
+      return;
+    case "artifact_open_request":
+      // Agent panel-open: fan out to the shell, which opens the file viewer
+      // only when the delivering conversation is the one on screen. No store
+      // state; no-op without a mounted shell.
+      emitArtifactOpenRequest(event, sourceConversationId);
       return;
     case "session_status": {
       // Captured BEFORE the patch below adopts event.responseId, so a

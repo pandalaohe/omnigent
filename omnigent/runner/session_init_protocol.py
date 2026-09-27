@@ -8,6 +8,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from omnigent.entities import Conversation
+from omnigent.stores.conversation_store import drop_server_secret_labels
 
 SessionInitProtocolVersion: TypeAlias = Literal[2]
 SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 2
@@ -119,7 +120,7 @@ def build_runner_session_init_payload(
             updated_at=conversation.updated_at,
             workspace=conversation.workspace,
             worktree=conversation.worktree,
-            labels=conversation.labels,
+            labels=drop_server_secret_labels(conversation.labels),
             reasoning_effort=conversation.reasoning_effort,
             model_override=conversation.model_override,
             harness_override=conversation.harness_override,

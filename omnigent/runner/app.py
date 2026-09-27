@@ -12570,10 +12570,11 @@ def create_runner_app(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         download: bool = False,
+        within: str | None = Query(default=None),
     ) -> Response:
         await _require_os_env(session_id)
         if download:
-            return await _fs_download(session_id, environment_id, relative_path)
+            return await _fs_download(session_id, environment_id, relative_path, within=within)
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -13217,6 +13218,8 @@ def create_runner_app(
         session_id: str,
         environment_id: str,
         path: str,
+        *,
+        within: str | None = None,
     ) -> StreamingResponse:
         """Serve a file's complete bytes as an attachment.
 
@@ -13228,7 +13231,10 @@ def create_runner_app(
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
-        :returns: The file streamed with ``Content-Disposition: attachment``.
+        :param within: Bundle root the resolved path must fall strictly
+            inside (``""`` = environment root); refused otherwise.
+        :returns: The file streamed with ``Content-Disposition: attachment``
+            and, when *within* was enforced, ``X-Omnigent-Within: enforced``.
         :raises InvalidPath: If the path names a directory.
         :raises FilesystemPathNotFound: If nothing the caller may see exists
             at the path.
@@ -13238,7 +13244,9 @@ def create_runner_app(
         await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
-        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(
+            path, within=within
+        )
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
@@ -13264,15 +13272,20 @@ def create_runner_app(
             if quoted == resolved.name
             else f"attachment; filename*=utf-8''{quoted}"
         )
+        headers = {
+            "Content-Length": str(size),
+            "Content-Disposition": disposition,
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if within is not None:
+            # The server refuses a bundle response without this: an older
+            # runner ignores the ``within`` query and answers unconfined.
+            headers["X-Omnigent-Within"] = "enforced"
         return StreamingResponse(
             _chunks(),
             media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
-            headers={
-                "Content-Length": str(size),
-                "Content-Disposition": disposition,
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
+            headers=headers,
         )
 
     async def _fs_list_or_read(

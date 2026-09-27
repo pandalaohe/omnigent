@@ -5391,6 +5391,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
     re-confirmation would violate the "impossible to enable accidentally"
     contract (#657). It must be dropped so the clone opts in afresh.
     """
+    from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
+
     agent_store.create(
         agent_id="f88a23d7428c44557a974c2e07787713",
         name="fork-instance",
@@ -5409,6 +5411,9 @@ def test_fork_conversation_drops_instance_scoped_labels(
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             "omnigent.goal_state": "active",
+            # The per-session artifact-link secret keys the source's links; the
+            # clone must mint its own key rather than inherit them.
+            ARTIFACT_LINK_KEY_LABEL: "source-secret",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },
@@ -5441,6 +5446,9 @@ def test_fork_conversation_drops_instance_scoped_labels(
     # usage.
     assert fork.labels == {"omnigent.wrapper": "claude-code-native-ui"}, (
         f"Fork must drop instance-scoped labels, kept {fork.labels!r}"
+    )
+    assert ARTIFACT_LINK_KEY_LABEL not in fork.labels, (
+        "Fork must not inherit the source's artifact links"
     )
     assert fork.provider_usage_limits is None, "Fork must not inherit the source's account usage"
     assert fork.session_todos == [], "Fork must not inherit the source's native plan"

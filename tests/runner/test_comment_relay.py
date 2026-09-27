@@ -387,6 +387,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_os_write",
         "sys_os_edit",
         "sys_os_shell",
+        "open_in_panel",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"
@@ -399,6 +400,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "conversation_id" in tools_by_name["sys_session_get_history"]["parameters"]["properties"]
     )
     assert "path" in tools_by_name["sys_os_read"]["parameters"]["properties"]
+    assert "path" in tools_by_name["open_in_panel"]["parameters"]["properties"]
     # A url + token prove the localhost relay HTTP server actually started
     # (start_tool_relay bound a socket), not just that a file was written.
     assert info["url"].startswith("http://127.0.0.1:")

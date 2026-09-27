@@ -547,6 +547,85 @@ async def test_download_rejects_directory_and_missing_path(
     assert resp.json()["error"]["code"] == code
 
 
+def _make_bundle_with_symlink(workspace: Path) -> None:
+    """Create ``bundle/notes.txt`` and ``bundle/shared -> ../private``.
+
+    The symlink stays inside the environment root, so workspace
+    confinement admits it and only the bundle check can refuse it.
+    """
+    bundle = workspace / "bundle"
+    private = workspace / "private"
+    bundle.mkdir()
+    private.mkdir()
+    (bundle / "notes.txt").write_text("inside")
+    (private / "notes.txt").write_text("outside")
+    (bundle / "shared").symlink_to(private, target_is_directory=True)
+
+
+@pytest.mark.asyncio
+async def test_open_download_within_refuses_symlink_escape(workspace: Path) -> None:
+    """``within`` confines a download to the bundle's real directory tree.
+
+    ``bundle/shared -> ../private`` resolves inside the environment root, so
+    only the bundle containment check stops it from serving the sibling
+    directory's bytes through a bundle token.
+    """
+    _make_bundle_with_symlink(workspace)
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    with pytest.raises(FilesystemPathNotFound):
+        await fs.open_download("bundle/shared/notes.txt", within="bundle")
+
+    fobj, resolved, size = await fs.open_download("bundle/notes.txt", within="bundle")
+    try:
+        assert fobj.read() == b"inside"
+    finally:
+        fobj.close()
+    assert resolved == (workspace / "bundle" / "notes.txt").resolve()
+    assert size == len(b"inside")
+
+
+@pytest.mark.asyncio
+async def test_download_within_sets_enforcement_header_only_when_confined(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """The route claims ``X-Omnigent-Within: enforced`` only when ``within`` ran.
+
+    The header is the server's proof that the bundle boundary was applied.
+    The escape request is the proof the query value reached
+    ``open_download``: the header alone would still appear if the route
+    parsed it but dropped it before the check.
+    """
+    _make_bundle_with_symlink(workspace)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+
+    plain = await client.get(f"{base}/bundle/notes.txt", params={"download": "true"})
+    assert plain.status_code == 200
+    assert plain.content == b"inside"
+    assert "x-omnigent-within" not in plain.headers
+
+    enforced = await client.get(
+        f"{base}/bundle/notes.txt", params={"download": "true", "within": "bundle"}
+    )
+    assert enforced.status_code == 200
+    assert enforced.headers["x-omnigent-within"] == "enforced"
+
+    escaped = await client.get(
+        f"{base}/bundle/shared/notes.txt", params={"download": "true", "within": "bundle"}
+    )
+    assert escaped.status_code == 404
+    assert escaped.json()["error"]["code"] == "path_not_found"
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SANDBOX_BACKENDS = [
     pytest.param(

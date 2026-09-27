@@ -24,6 +24,7 @@ from omnigent.server.runner_session_init import (
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
+    ARTIFACT_LINK_KEY_LABEL,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -164,6 +165,24 @@ def test_completed_archive_keeps_runner_fenced_until_unarchive() -> None:
         "revision": 1,
         "archived": True,
     }
+
+
+def test_runner_init_snapshot_omits_the_artifact_link_secret() -> None:
+    """The runner gets every other label but never the artifact-link key.
+
+    The key signs every artifact capability URL of the session; a runner (or
+    anything reading the envelope on the host) holding it could forge links.
+    """
+    conversation = dataclasses.replace(
+        _conversation(),
+        labels={"example": "value", ARTIFACT_LINK_KEY_LABEL: "signing-secret"},
+    )
+
+    payload = build_runner_session_init_payload(conversation, server_version="0.6.0.dev0")
+    envelope = parse_runner_session_init_envelope(payload)
+
+    assert envelope is not None
+    assert envelope.snapshot.labels == {"example": "value"}
 
 
 @pytest.mark.asyncio

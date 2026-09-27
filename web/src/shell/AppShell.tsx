@@ -38,6 +38,7 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { onArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import {
   buildDesignModePrompt,
   dataUrlToFile,
@@ -713,7 +714,8 @@ export function AppShell() {
   // Held-messages panel entry (SCC01-S1 peer messaging) — gated on the
   // server's feature flag; the panel itself reads the open session, so no
   // owner/permission check here beyond having a session to show it for.
-  const showPeerMessages = !!conversationId && isFeatureEnabled(serverInfo, "session_peer_messaging");
+  const showPeerMessages =
+    !!conversationId && isFeatureEnabled(serverInfo, "session_peer_messaging");
   // The live snapshot is authoritative; the sidebar row is only a fallback
   // (it is absent entirely for sub-agent children, which the list omits).
   const wrapperLabel =
@@ -1287,6 +1289,11 @@ export function AppShell() {
           const next = new URLSearchParams(prev);
           next.set("file", path);
           next.delete("comment"); // stale comment belongs to the previous file
+          // The agent's open_in_panel asks for the rendered preview; the intent
+          // rides the open path to the viewer. A plain open clears it so the
+          // sticky source/preview preference applies as usual.
+          if (options?.preview) next.set("preview", "1");
+          else next.delete("preview");
           // A citation's cited line rides along so the viewer can land on it;
           // a plain open clears any previous citation's line.
           if (position?.line != null) next.set("line", String(position.line));
@@ -1322,6 +1329,16 @@ export function AppShell() {
     [commitFileNavigation],
   );
 
+  // An agent `open_in_panel` call reveals a file in the viewer (and the right
+  // panel, via commitFileNavigation) in rendered preview, not the sticky
+  // source/diff mode. Only the conversation on screen reacts.
+  useEffect(() => {
+    return onArtifactOpenRequest((evt, sourceConversationId) => {
+      if (!sourceConversationId || sourceConversationId !== conversationId) return;
+      openFileViewer(evt.path, { preview: true });
+    });
+  }, [conversationId, openFileViewer]);
+
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
   // ``navigate`` — which is bound to the live ``locationPathname`` — rather
@@ -1333,6 +1350,7 @@ export function AppShell() {
         next.delete("file");
         next.delete("diff");
         next.delete("comment");
+        next.delete("preview");
         next.delete("line");
         next.delete("column");
         return next;

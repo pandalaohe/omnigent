@@ -81,6 +81,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.panel import OpenInPanelTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -445,6 +446,13 @@ _ASSIGNMENT_TOOLS = frozenset(
 # none. See omnigent/tools/builtins/browser.py for the schema-only classes.
 _BROWSER_TOOLS = BROWSER_TOOL_NAMES
 
+# Priority 5n: open_in_panel — the artifact-relay panel tool.
+# Runner dispatch POSTs to the server's artifacts/open route, which publishes
+# ``artifact.open_request`` on the session stream. Execution lives HERE (not in
+# Tool.invoke) for the same reason as browser_*: ToolContext carries no
+# server_client. See omnigent/tools/builtins/panel.py for the schema class.
+_PANEL_TOOLS = frozenset({OpenInPanelTool.name()})
+
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the server-side browser-action await (30s) so the
 # runner never severs the still-open POST before the server returns either the
@@ -497,6 +505,10 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # framework-owned schemas for every spec, so the native relay surface is
     # session-static and always includes them.
     | _BROWSER_TOOLS
+    # ``open_in_panel`` rides the relay for the same reason as ``browser_*``:
+    # native sessions see only this surface, and ToolManager auto-registers
+    # the framework-owned schema for every spec.
+    | _PANEL_TOOLS
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
     | _HINDSIGHT_TOOLS
@@ -620,6 +632,7 @@ def build_native_relay_tool_schemas(
             SysAgentDownloadTool,
             SysAddPolicyTool,
             SysPolicyRegistryTool,
+            OpenInPanelTool,
         ):
             fallback_schema = _string_object_dict(_cls().get_schema())
             if fallback_schema is None:
@@ -950,6 +963,9 @@ _ALL_LOCAL_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _ASSIGNMENT_TOOLS
+    # The panel tool executes HERE, including on the ``dispatch=None`` path;
+    # relaying it upstream would skip the artifacts/open POST.
+    | _PANEL_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -5106,6 +5122,59 @@ async def _execute_browser_tool(
     return resp.text
 
 
+async def _open_in_panel_via_rest(
+    args: _JsonObject,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Ask the web UI to open a file in the preview panel.
+
+    Posts to the server's artifacts/open route, which publishes
+    ``artifact.open_request`` on the session stream and answers with the
+    number of subscribed clients the event reached. Every failure becomes a
+    tool-result envelope so a missing route or unavailable server cannot
+    abort the harness session. The result carries no artifact URL — each
+    client mints its own link with its own authorization.
+    """
+    if server_client is None:
+        return json.dumps({"error": "open_in_panel requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": "open_in_panel requires a session id"})
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        return json.dumps({"error": "open_in_panel requires a string 'path'"})
+    body: _JsonObject = {"path": path}
+    if path.startswith("/"):
+        # A leading slash marks an absolute host path. The wire form strips it
+        # and names the base out of band, the same contract the mint route uses.
+        body = {"path": path.lstrip("/"), "base": "host"}
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/artifacts/open",
+            json=body,
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"open_in_panel failed: {exc}"})
+    if response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"open_in_panel returned {response.status_code}",
+                "detail": response.text[:200],
+            }
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"open_in_panel returned invalid JSON: {exc}"})
+    if not isinstance(payload, dict):
+        return json.dumps({"error": "open_in_panel returned a non-object response"})
+    viewers = payload.get("viewers")
+    if not isinstance(viewers, int) or isinstance(viewers, bool):
+        return json.dumps({"error": "open_in_panel response omitted the viewer count"})
+    return f"Asked the web UI to open {path} ({viewers} viewer(s) connected)"
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -7387,6 +7456,12 @@ async def execute_tool(
                 args,
                 server_client=server_client,
                 conversation_id=conversation_id,
+            )
+        elif tool_name in _PANEL_TOOLS:
+            output = await _open_in_panel_via_rest(
+                args,
+                conversation_id,
+                server_client,
             )
         elif _is_spec_local_python_tool(tool_name, agent_spec):
             output = await _execute_local_python_tool(

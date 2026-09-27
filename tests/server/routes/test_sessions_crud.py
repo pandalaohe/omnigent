@@ -792,6 +792,34 @@ async def test_patch_rejects_client_supplied_archived_at_label(
     assert ARCHIVED_AT_LABEL_KEY not in conv.labels
 
 
+async def test_patch_rejects_client_supplied_artifact_link_key_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """``omnigent.artifact_link_key`` is the per-session secret signing artifact
+    capability URLs. A client seed would let the caller choose the key (and
+    read it back), forging links for the session, so it must be rejected and
+    nothing persisted — including through case variants, which the stored key's
+    MySQL collation resolves to the same row."""
+    from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    for key in (ARTIFACT_LINK_KEY_LABEL, "OMNIGENT.ARTIFACT_LINK_KEY"):
+        for value in ("attacker-chosen-key", ""):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"labels": {key: value}},
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert ARTIFACT_LINK_KEY_LABEL not in conv.labels
+    assert "OMNIGENT.ARTIFACT_LINK_KEY" not in conv.labels
+
+
 async def test_list_sessions_pinned_filter(
     client: httpx.AsyncClient,
     db_uri: str,

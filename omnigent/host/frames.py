@@ -49,8 +49,11 @@ WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
 
+# The server gates ``raw``/``within`` reads on this: an old host ignores unknown params silently.
+CAP_FS_READ_RAW = "fs_read_raw"
+
 # Every capability THIS build supports; reported verbatim in the hello frame.
-HOST_CAPABILITIES: list[str] = [CAP_CODEX_SIDE_CHAT, CAP_FILESYSTEM_ATTACHMENTS]
+HOST_CAPABILITIES: list[str] = [CAP_CODEX_SIDE_CHAT, CAP_FILESYSTEM_ATTACHMENTS, CAP_FS_READ_RAW]
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:

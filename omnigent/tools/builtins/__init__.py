@@ -307,6 +307,10 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    # ``open_in_panel`` is framework-owned like the browser tools: always
+    # auto-registered by ``ToolManager._register_panel_tools`` and reserved
+    # here so user specs cannot shadow it. Execution is runner-dispatched.
+    "open_in_panel": None,
 }
 
 # Hindsight long-term memory (optional ``hindsight`` extra). Registered only

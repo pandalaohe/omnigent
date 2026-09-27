@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+// @ts-expect-error jsdom ships no declarations and @types/jsdom is not a dependency
+import { JSDOM } from "jsdom";
+import bridgeSource from "../../public/omni-html-bridge.js?raw";
 import {
   anchorOccurrence,
   BRIDGE_MSG,
@@ -10,26 +13,26 @@ import {
 } from "./htmlCommentBridge";
 
 // ---------------------------------------------------------------------------
-// injectCommentBridge — script/style placement (mirrors prepareHtmlPreviewDoc)
+// injectCommentBridge — script placement (mirrors prepareHtmlPreviewDoc)
 // ---------------------------------------------------------------------------
 
 describe("injectCommentBridge", () => {
   const NONCE = "test-nonce-123";
+  const SCRIPT_OPEN = `<script data-omni-nonce="${NONCE}">`;
 
   it("injects the bridge script before </body> when present", () => {
     const html = "<html><head></head><body><p>hi</p></body></html>";
     const out = injectCommentBridge(html, NONCE);
-    const scriptAt = out.indexOf("<script>");
+    const scriptAt = out.indexOf(SCRIPT_OPEN);
     const bodyCloseAt = out.indexOf("</body>");
     expect(scriptAt).toBeGreaterThan(-1);
     expect(scriptAt).toBeLessThan(bodyCloseAt);
-    expect(out).toContain(NONCE);
   });
 
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
     const out = injectCommentBridge(html, NONCE);
-    expect(out.indexOf("<script>")).toBeLessThan(out.indexOf("</html>"));
+    expect(out.indexOf(SCRIPT_OPEN)).toBeLessThan(out.indexOf("</html>"));
   });
 
   it("appends to a bare fragment with no body/html", () => {
@@ -38,7 +41,7 @@ describe("injectCommentBridge", () => {
     // then appended at the end since there's no </body>/</html> to inject before.
     expect(out).toContain("<p>just a fragment</p>");
     const fragAt = out.indexOf("<p>just a fragment</p>");
-    expect(out.indexOf("<script>")).toBeGreaterThan(fragAt);
+    expect(out.indexOf(SCRIPT_OPEN)).toBeGreaterThan(fragAt);
   });
 
   it("preserves the prepared <base target=_blank> link behavior", () => {
@@ -46,26 +49,38 @@ describe("injectCommentBridge", () => {
     expect(out).toContain('<base target="_blank">');
   });
 
-  it("includes the highlight style for the Custom Highlight ranges", () => {
-    const out = injectCommentBridge("<body></body>", NONCE);
-    expect(out).toContain("::highlight(omni-comment)");
-    expect(out).toContain("::highlight(omni-comment-active)");
-  });
-
-  it("substitutes the nonce, source tag, and message types into the script", () => {
+  it("wraps the shared bridge asset in a nonce-carrying script tag", () => {
     const script = buildBridgeScript(NONCE);
-    expect(script).toContain(NONCE);
-    expect(script).toContain(BRIDGE_SOURCE);
-    expect(script).toContain(BRIDGE_MSG.selection);
-    // Placeholders must be fully replaced.
-    expect(script).not.toContain("__OMNI_NONCE__");
-    expect(script).not.toContain("__OMNI_TYPES__");
+    expect(script.startsWith(SCRIPT_OPEN)).toBe(true);
+    expect(script.endsWith("</script>")).toBe(true);
+    expect(script).toContain(bridgeSource.replace(/<\/script/gi, "<\\/script"));
   });
 
-  it("produces a syntactically valid script (guards template-literal escaping)", () => {
-    // The script body is a template literal; regex/backslash content in it can
-    // silently break parsing. new Function throws on a syntax error.
-    expect(() => new Function(buildBridgeScript(NONCE))).not.toThrow();
+  it("escapes an HTML-special nonce in the attribute", () => {
+    expect(buildBridgeScript('a"b&c<d')).toContain('data-omni-nonce="a&quot;b&amp;c&lt;d"');
+  });
+
+  it("produces a syntactically valid script (guards escaping in the asset)", () => {
+    // The asset runs verbatim in the frame; an escaping typo would only surface
+    // at runtime. new Function throws on a syntax error.
+    expect(() => new Function(bridgeSource)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// omni-html-bridge.js — the asset's inline constants must not drift
+// ---------------------------------------------------------------------------
+
+describe("omni-html-bridge.js constants", () => {
+  it("matches BRIDGE_SOURCE and every BRIDGE_MSG value", () => {
+    const src = /var\s+SRC\s*=\s*"([^"]*)"/.exec(bridgeSource);
+    expect(src?.[1]).toBe(BRIDGE_SOURCE);
+
+    const tBody = /var\s+T\s*=\s*\{([\s\S]*?)\};/.exec(bridgeSource)?.[1] ?? "";
+    const t = new Map([...tBody.matchAll(/(\w+)\s*:\s*"([^"]*)"/g)].map((m) => [m[1], m[2]]));
+    for (const [key, value] of Object.entries(BRIDGE_MSG)) {
+      expect(t.get(key), `T.${key}`).toBe(value);
+    }
   });
 });
 
@@ -129,6 +144,21 @@ describe("parseBridgeMessage", () => {
       type: BRIDGE_MSG.selectionCleared,
     });
     expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.ready }, NONCE)).toEqual({
+      type: BRIDGE_MSG.ready,
+    });
+  });
+
+  it("passes a string pathname through on ready and ignores non-strings", () => {
+    expect(
+      parseBridgeMessage(
+        { ...base, type: BRIDGE_MSG.ready, pathname: "/omni/v1/artifacts/a1.x.y/index.html" },
+        NONCE,
+      ),
+    ).toEqual({
+      type: BRIDGE_MSG.ready,
+      pathname: "/omni/v1/artifacts/a1.x.y/index.html",
+    });
+    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.ready, pathname: 7 }, NONCE)).toEqual({
       type: BRIDGE_MSG.ready,
     });
   });
@@ -297,5 +327,164 @@ describe("anchorOccurrence", () => {
     const withAttr = '<button title="Submit"><!-- Submit --><span>Submit</span></button>';
     const rendered = withAttr.lastIndexOf("Submit");
     expect(anchorOccurrence(withAttr, "Submit", rendered)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// omni-html-bridge.js runtime — handshake and link handling in jsdom
+// ---------------------------------------------------------------------------
+
+describe("omni-html-bridge.js runtime", () => {
+  const NONCE = "n1";
+  const ORIGIN = "http://localhost:3000";
+  const BUNDLE_URL = `${ORIGIN}/omni/v1/artifacts/a1.x.y/index.html`;
+
+  type BridgeWindow = Window & typeof globalThis;
+
+  const windows: BridgeWindow[] = [];
+
+  // Evaluate the asset like the server's inline <script> (data-omni-nonce on
+  // the element, currentScript stubbed since it is valid only mid-run) in a
+  // window of its own, so no test observes another's listeners.
+  function startBridge(url: string, nonce: string | null): BridgeWindow {
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+      url,
+      runScripts: "outside-only",
+    });
+    const win = dom.window as BridgeWindow;
+    windows.push(win);
+    const script = win.document.createElement("script");
+    if (nonce !== null) script.dataset.omniNonce = nonce;
+    Object.defineProperty(win.document, "currentScript", { value: script, configurable: true });
+    try {
+      win.eval(bridgeSource);
+    } finally {
+      delete (win.document as { currentScript?: unknown }).currentScript;
+    }
+    return win;
+  }
+
+  function clickAnchor(win: BridgeWindow, href: string): MouseEvent {
+    const anchor = win.document.createElement("a");
+    anchor.href = href;
+    win.document.body.appendChild(anchor);
+    const ev = new win.MouseEvent("click", { bubbles: true, cancelable: true });
+    anchor.dispatchEvent(ev);
+    anchor.remove();
+    return ev;
+  }
+
+  function stubOpen(win: BridgeWindow) {
+    const open = vi.fn(() => null);
+    win.open = open;
+    return open;
+  }
+
+  afterEach(() => {
+    for (const win of windows) win.close();
+    windows.length = 0;
+  });
+
+  it("registers nothing when the script carries no nonce", async () => {
+    const win = startBridge(BUNDLE_URL, null);
+
+    const channel = new MessageChannel();
+    const onMessage = vi.fn();
+    channel.port2.onmessage = onMessage;
+    win.dispatchEvent(
+      new win.MessageEvent("message", {
+        data: { source: BRIDGE_SOURCE, nonce: NONCE, type: BRIDGE_MSG.init },
+        ports: [channel.port1],
+      }),
+    );
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(onMessage).not.toHaveBeenCalled();
+
+    // No click listener either: an external link is not hijacked.
+    const open = stubOpen(win);
+    const external = clickAnchor(win, "https://example.com/x");
+    expect(open).not.toHaveBeenCalled();
+    expect(external.defaultPrevented).toBe(false);
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("adopts the init port, reports its pathname, and routes links out of the bundle", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+
+    const channel = new MessageChannel();
+    const ready = new Promise<Record<string, unknown>>((resolve) => {
+      channel.port2.onmessage = (ev) => resolve(ev.data as Record<string, unknown>);
+    });
+    win.dispatchEvent(
+      new win.MessageEvent("message", {
+        data: { source: BRIDGE_SOURCE, nonce: NONCE, type: BRIDGE_MSG.init },
+        ports: [channel.port1],
+      }),
+    );
+
+    await expect(ready).resolves.toMatchObject({
+      source: BRIDGE_SOURCE,
+      nonce: NONCE,
+      type: BRIDGE_MSG.ready,
+      pathname: "/omni/v1/artifacts/a1.x.y/index.html",
+    });
+
+    const open = stubOpen(win);
+
+    // Another origin: intercepted into a new tab.
+    const external = clickAnchor(win, "https://example.com/x");
+    expect(open).toHaveBeenCalledWith("https://example.com/x", "_blank", "noopener,noreferrer");
+    expect(external.defaultPrevented).toBe(true);
+
+    // Same bundle: left to the frame (relative resolution intact).
+    open.mockClear();
+    const sibling = clickAnchor(win, "page2.html");
+    expect(open).not.toHaveBeenCalled();
+    expect(sibling.defaultPrevented).toBe(false);
+
+    // Same origin but a different token: still outside this bundle.
+    const otherToken = clickAnchor(win, "/omni/v1/artifacts/OTHER/x.html");
+    expect(open).toHaveBeenCalledWith(
+      "http://localhost:3000/omni/v1/artifacts/OTHER/x.html",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    expect(otherToken.defaultPrevented).toBe(true);
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("treats a link inside the first v1/artifacts bundle as internal when the path nests", () => {
+    const win = startBridge(
+      `${ORIGIN}/omni/v1/artifacts/T/dir/v1/artifacts/folder/index.html`,
+      NONCE,
+    );
+
+    const open = stubOpen(win);
+
+    // Resolves to /omni/v1/artifacts/T/dir/sibling.html — inside bundle T even
+    // though the page path carries a second `v1/artifacts` segment.
+    const sibling = clickAnchor(win, "../../../sibling.html");
+    expect(open).not.toHaveBeenCalled();
+    expect(sibling.defaultPrevented).toBe(false);
+  });
+
+  it("treats a same-path link under a different scheme as external", () => {
+    const win = startBridge("https://localhost:3000/omni/v1/artifacts/T/index.html", NONCE);
+
+    const open = stubOpen(win);
+
+    const insecure = clickAnchor(win, "http://localhost:3000/omni/v1/artifacts/T/page.html");
+    expect(open).toHaveBeenCalledWith(
+      "http://localhost:3000/omni/v1/artifacts/T/page.html",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    expect(insecure.defaultPrevented).toBe(true);
   });
 });

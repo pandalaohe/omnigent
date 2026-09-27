@@ -3520,12 +3520,15 @@ class HostProcess:
 
         r = cast("WorkspaceReader", reader)
         if op == "list_or_read":
+            within = params.get("within")
             return r.list_or_read(
                 str(params.get("path", "")),
                 limit=_coerce_int(params.get("limit", 20)),
                 after=cast("str | None", params.get("after")),
                 before=cast("str | None", params.get("before")),
                 order=str(params.get("order", "desc")),
+                raw=bool(params.get("raw", False)),
+                within=within if isinstance(within, str) else None,
             )
         if op == "changes":
             return r.changes(session_id)

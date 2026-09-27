@@ -290,9 +290,12 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_LOCK_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    ARTIFACT_LINK_KEY_LABEL,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    drop_server_secret_labels,
+    is_artifact_link_key,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
@@ -10370,6 +10373,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    # The artifact-link key signs every artifact capability URL of the
+    # session. A client seed would choose (and later read back) that secret;
+    # only the server-side mint may create or rotate it.
+    if any(is_artifact_link_key(key) for key in labels):
+        raise OmnigentError(
+            f"label {ARTIFACT_LINK_KEY_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _require_cost_control_label_authority(
@@ -10818,11 +10829,11 @@ def _child_session_summary_from_conversation(
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
-    # Child sessions aren't pinnable (the pin affordance lives on top-level
-    # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
-    # defensively so a shared child's summary can never expose another viewer's
-    # pin key. No collapse-to-canonical here: there's no pin to surface.
-    raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
+    # Children aren't pinnable, but strip any per-user ``omnigent.pinned.<user>``
+    # keys so a shared child's summary never exposes another viewer's pin.
+    # ``drop_server_secret_labels`` keeps the artifact-link secret server-side.
+    raw_labels = drop_server_secret_labels(conv.labels)
+    raw_labels = {k: v for k, v in raw_labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
     labels = labels_with_closed_status(raw_labels, conv.title)
     tool: str | None
     session_name: str | None

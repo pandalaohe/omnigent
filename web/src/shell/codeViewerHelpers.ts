@@ -364,12 +364,17 @@ export function detectLang(path: string): BundledLanguage | "text" {
  *   link actually navigates a real tab (see issue #777).
  * - `allow-forms` / `allow-modals` — typical interactive artifacts submit forms
  *   and call `alert`/`confirm`.
+ * - `allow-top-navigation` / `allow-downloads` — full navigation and downloads
+ *   inside the preview (`top-navigation` can navigate the whole omnigent tab
+ *   away; accepted, the preview is a full user-facing browser surface).
  *
- * NOTE: we deliberately omit `allow-same-origin`. The iframe is fed via
- * `srcDoc`, which would otherwise inherit the embedder's origin — combining
- * that with `allow-scripts` would let untrusted artifact code reach into the
- * parent app (cookies, storage, DOM). Withholding it gives the document an
- * opaque origin, so scripts run fully sandboxed away from the host page.
+ * NOTE: we deliberately omit `allow-same-origin`. The preview document runs in
+ * an opaque origin — standalone it is loaded from the artifact URL (whose
+ * response carries a `sandbox` CSP), and embed mode still feeds it via `srcDoc`,
+ * which would otherwise inherit the embedder's origin. Combining a same-origin
+ * document with `allow-scripts` would let untrusted artifact code reach into the
+ * parent app (cookies, storage, DOM), so withholding it is the security-critical
+ * invariant.
  *
  * Accepted trade-offs from these flags: `allow-popups-to-escape-sandbox` lets
  * artifact JS spawn fully-capable new windows (phishing / window-spam surface),
@@ -379,7 +384,7 @@ export function detectLang(path: string): BundledLanguage | "text" {
  * we accept in exchange for links and interactive artifacts behaving normally.
  */
 export const HTML_PREVIEW_SANDBOX =
-  "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals";
+  "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-top-navigation allow-downloads";
 
 /**
  * Prepare HTML artifact content for the preview iframe by forcing every link to

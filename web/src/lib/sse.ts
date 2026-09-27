@@ -9,6 +9,7 @@
 // catch — please add an SSE-parser test when you touch this.
 
 import type {
+  ArtifactOpenRequestEvent,
   BrowserActionRequestEvent,
   ClientTaskCancel,
   CompactionCompleted,
@@ -1027,6 +1028,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ? (rawArgs as Record<string, unknown>)
           : {},
     } satisfies BrowserActionRequestEvent;
+  }
+
+  // Agent panel-open request: asks the web UI to open a file in the preview
+  // panel. The event carries no URL; each client mints its own artifact link.
+  if (eventType === "artifact.open_request") {
+    const path = data.path;
+    if (typeof path !== "string" || !path) return null;
+    return {
+      type: "artifact_open_request",
+      path,
+      base: data.base === "host" ? "host" : "workspace",
+    } satisfies ArtifactOpenRequestEvent;
   }
 
   // MCP-shape elicitation request.

@@ -5,7 +5,7 @@ for a sub-agent row. Every other serialization path collapses per-user pin keys
 via ``_labels_for_viewer``; this one must at least strip them so a shared
 child's summary can never expose another viewer's ``omnigent.pinned.<user>``
 key. Child sessions aren't pinnable, so there's nothing to surface — just the
-strip.
+strip. The same must hold for the server-secret artifact-link key.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from omnigent.server.routes._sessions.common import _SUBAGENT_TERMINAL_STATUS_LA
 from omnigent.server.routes._sessions.helpers import (
     _child_session_summary_from_conversation,
 )
-from omnigent.stores.conversation_store import pinned_label_key
+from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL, pinned_label_key
 
 
 def _child(labels: dict[str, str], *, live_status: str | None = None) -> Conversation:
@@ -32,18 +32,21 @@ def _child(labels: dict[str, str], *, live_status: str | None = None) -> Convers
     )
 
 
-def test_child_summary_strips_per_user_pin_keys() -> None:
-    """A per-user pin key on a child row must not leak into its summary."""
+def test_child_summary_strips_per_user_pin_keys_and_artifact_secret() -> None:
+    """A per-user pin key or the artifact-link secret on a child row must not
+    leak into its summary."""
     conv = _child(
         {
             pinned_label_key("alice@example.com"): "1721760000000",
             pinned_label_key("bob@example.com"): "1721760001000",
+            ARTIFACT_LINK_KEY_LABEL: "signing-secret",
             "omni_project": "Moonshot",
         }
     )
     summary = _child_session_summary_from_conversation(conv, "conv_parent", None)
     # No pin key of any kind survives — not the canonical one, not a per-user one.
     assert not any(k.startswith("omnigent.pinned") for k in summary.labels)
+    assert ARTIFACT_LINK_KEY_LABEL not in summary.labels
     # Unrelated labels are preserved.
     assert summary.labels.get("omni_project") == "Moonshot"
 

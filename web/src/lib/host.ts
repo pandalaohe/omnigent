@@ -204,6 +204,15 @@ export function getOmnigentHostConfig(): OmnigentHostConfig {
   return hostConfig;
 }
 
+/**
+ * True when an embed host owns transport (a custom `fetcher` is installed).
+ * Surfaces that cannot travel through it — an iframe `src` — fall back to
+ * their standalone-only behavior when this is true.
+ */
+export function hasOmnigentHostFetcher(): boolean {
+  return hostConfig.fetcher != null;
+}
+
 export function getOmnigentHostGeneration(): number {
   return hostConfigGeneration;
 }

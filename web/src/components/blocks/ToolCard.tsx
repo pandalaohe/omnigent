@@ -45,7 +45,7 @@ const OUTPUT_PREVIEW_CHAR_LIMIT = 12_000;
  * Tools whose `args.path` field is a workspace file path that the user
  * should be able to click to open in the FileViewer.
  */
-const FILE_PATH_TOOLS = new Set(["sys_os_read", "sys_os_write", "sys_os_edit"]);
+const FILE_PATH_TOOLS = new Set(["sys_os_read", "sys_os_write", "sys_os_edit", "open_in_panel"]);
 
 /**
  * If the string is valid JSON, return its 2-space-indented form.

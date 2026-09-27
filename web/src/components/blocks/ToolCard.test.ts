@@ -160,6 +160,41 @@ describe("ToolCard rendering", () => {
     expect(openFile).toHaveBeenCalledWith("src/a.ts");
   });
 
+  it("links an open_in_panel path so clients that missed the live event can open it", () => {
+    // WHY: the artifact.open_request event only reaches clients subscribed at
+    // emit time; the card's path is the fallback for everyone else, so
+    // open_in_panel must be a file-path tool like sys_os_read.
+    const openFile = vi.fn();
+    render(
+      createElement(
+        TooltipProvider,
+        null,
+        createElement(
+          FileViewerContext.Provider,
+          {
+            value: {
+              openFile,
+              openGithubTab: () => {},
+              isChangedPath: () => false,
+              conversationId: "c1",
+              workspaceRoot: null,
+              workspaceHome: null,
+            },
+          },
+          createElement(ToolCard, {
+            name: "open_in_panel",
+            arguments: { path: "reports/index.html" },
+            output: "Asked the web UI to open reports/index.html (1 viewer(s) connected)",
+            state: "output-available",
+          }),
+        ),
+      ),
+    );
+    const link = screen.getByRole("link", { name: "reports/index.html" });
+    fireEvent.click(link);
+    expect(openFile).toHaveBeenCalledWith("reports/index.html");
+  });
+
   it("does not linkify an absolute file path (FileViewer rejects absolute paths)", () => {
     // WHY: the FileViewer can't resolve absolute paths, so an absolute
     // sys_os_read path must render as plain text, never a clickable link.

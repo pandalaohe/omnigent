@@ -980,6 +980,21 @@ export interface BrowserActionRequestEvent {
   args: Record<string, unknown>;
 }
 
+/**
+ * `artifact.open_request` — the agent's `open_in_panel` tool asks the web UI to
+ * open a file in the preview panel. The payload carries only the path and its
+ * base (never a URL), so each client mints its own artifact link with its own
+ * authorization. The delivering conversation rides the bus alongside, like
+ * `browser.action_request`.
+ */
+export interface ArtifactOpenRequestEvent {
+  type: "artifact_open_request";
+  /** Workspace-relative path, or a host-absolute path when base is "host". */
+  path: string;
+  /** Which root `path` is relative to. */
+  base: "workspace" | "host";
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -1038,4 +1053,5 @@ export type StreamEvent =
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent
-  | BrowserActionRequestEvent;
+  | BrowserActionRequestEvent
+  | ArtifactOpenRequestEvent;

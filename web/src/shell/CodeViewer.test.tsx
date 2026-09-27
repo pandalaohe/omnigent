@@ -88,22 +88,25 @@ function makePdfQuery(
 
 const noopRef = { current: null };
 
-function renderViewer(
+interface RenderViewerOpts {
+  viewMode?: "editor" | "preview" | "source" | "diff";
+  truncated?: boolean;
+  position?: { line: number };
+  onRequestEditMode?: () => void;
+  previewKey?: number;
+}
+
+function viewerElement(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: {
-    viewMode?: "editor" | "preview" | "source" | "diff";
-    truncated?: boolean;
-    position?: { line: number };
-    onRequestEditMode?: () => void;
-  } = {},
+  opts: RenderViewerOpts = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
-  return render(
+  return (
     <CodeViewer
       position={opts.position}
       conversationId="conv_1"
@@ -118,8 +121,18 @@ function renderViewer(
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
-    />,
+      previewKey={opts.previewKey}
+    />
   );
+}
+
+function renderViewer(
+  content: string,
+  panelOpen = true,
+  path = "notes.md",
+  opts: RenderViewerOpts = {},
+) {
+  return render(viewerElement(content, panelOpen, path, opts));
 }
 
 /**
@@ -667,24 +680,69 @@ describe("CodeViewer HTML preview sandbox", () => {
   // untrusted (agent/user-generated), so these assertions lock in the iframe's
   // isolation. A regression here (e.g. adding `allow-same-origin`) would let
   // artifact JS reach the host app's cookies, storage, and credentialed API.
-  it("enables scripts but withholds same-origin, and forces links to a new tab", () => {
-    const { container } = renderViewer(
+  const MINT_URL = "/v1/artifacts/test-token/page.html";
+
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/artifacts")) {
+          return new Response(
+            JSON.stringify({ url: MINT_URL, nonce: "test-nonce", kind: "bundle" }),
+            {
+              status: 200,
+            },
+          );
+        }
+        return new Response("<html><body>doc</body></html>", { status: 200 });
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("loads the minted artifact URL with scripts enabled and same-origin withheld", async () => {
+    renderViewer(
       "<html><head></head><body><a href='https://example.com'>link</a></body></html>",
       true,
       "page.html",
       { viewMode: "preview" },
     );
-    const iframe = container.querySelector('iframe[title="HTML preview"]');
-    expect(iframe).not.toBeNull();
-    const sandbox = iframe!.getAttribute("sandbox") ?? "";
+    const iframe = await screen.findByTitle("HTML preview");
+    const sandbox = iframe.getAttribute("sandbox") ?? "";
     // Full-string lock: any change to the sandbox flags must be deliberate.
     expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
     // #778: scripts must run inside the preview.
     expect(sandbox).toContain("allow-scripts");
     // Security invariant: the artifact must never share the app's origin.
     expect(sandbox).not.toContain("allow-same-origin");
-    // #777: every link opens in a new tab via the injected base tag.
-    expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
+    // Relative resources/links need the real URL as `src` — never the
+    // client-injected srcdoc the standalone path used before the relay.
+    expect(iframe.getAttribute("src")).toBe(MINT_URL);
+    expect(iframe.getAttribute("srcdoc")).toBeNull();
+  });
+
+  it("mounts the preview afresh (and re-mints) when previewKey changes", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    const mintCalls = () =>
+      fetchSpy.mock.calls.filter(([input]) => String(input).endsWith("/artifacts")).length;
+
+    const { rerender } = renderViewer("<html></html>", true, "page.html", {
+      viewMode: "preview",
+      previewKey: 0,
+    });
+    await screen.findByTitle("HTML preview");
+    expect(mintCalls()).toBe(1);
+
+    // A bumped previewKey (revoke) must replace the preview component, not
+    // just re-render it — only a remount re-runs the entry mint.
+    rerender(
+      viewerElement("<html></html>", true, "page.html", { viewMode: "preview", previewKey: 1 }),
+    );
+    await waitFor(() => expect(mintCalls()).toBe(2));
   });
 });
 

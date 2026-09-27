@@ -41,6 +41,7 @@ from omnigent.spec.types import (
     Phase,
     PhaseSelector,
 )
+from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -366,6 +367,42 @@ guardrails:
     conv_refetched = conversation_store.get_conversation(conv.id)
     assert conv_refetched is not None
     assert conv_refetched.labels == {"integrity": "1", "sensitivity": "public"}
+
+
+def test_build_never_seeds_the_artifact_link_key(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A bundle label definition for the server-reserved artifact-link key is
+    dropped before seeding: only the server-side mint may create the secret
+    that signs the session's artifact links. A case-variant spelling folds onto
+    the same stored row on MySQL, so it is dropped too. A sibling declared
+    label still seeds."""
+    agent_dir = _write_spec(
+        tmp_path,
+        f"""
+spec_version: 1
+name: reserved-label
+guardrails:
+  labels:
+    integrity: "1"
+    {ARTIFACT_LINK_KEY_LABEL}: "attacker-key"
+    {ARTIFACT_LINK_KEY_LABEL.upper()}: "attacker-key-variant"
+""",
+    )
+    spec = parse(agent_dir)
+    conv = conversation_store.create_conversation()
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+
+    assert engine.labels == {"integrity": "1"}
+    conv_refetched = conversation_store.get_conversation(conv.id)
+    assert conv_refetched is not None
+    assert conv_refetched.labels == {"integrity": "1"}
+    assert ARTIFACT_LINK_KEY_LABEL not in conv_refetched.labels
 
 
 def test_build_skips_labels_without_initial(

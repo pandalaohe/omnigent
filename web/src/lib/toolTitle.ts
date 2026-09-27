@@ -39,6 +39,9 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   sys_os_write: (args) => withPath("Write", args.path),
   sys_os_edit: (args) => withPath("Edit", args.path),
 
+  // Artifact-relay panel tool — same path-as-body treatment as sys_os_*.
+  open_in_panel: (args) => withPath("Open", args.path),
+
   // Sub-agent session tools — single-quote the `<tool> - <session>`
   // pair so it reads as one identity.
   sys_session_send: (args) => {

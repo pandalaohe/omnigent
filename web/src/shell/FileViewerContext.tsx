@@ -13,7 +13,14 @@ export interface FilePosition {
   column?: number;
 }
 
-export type OpenFileOptions = Partial<FilePosition>;
+export type OpenFileOptions = Partial<FilePosition> & {
+  /**
+   * Show a previewable (markdown/html/notebook) file in its rendered preview
+   * for this open, overriding the sticky source/preview preference and any
+   * active diff. Set by the agent's `open_in_panel` panel-open.
+   */
+  preview?: boolean;
+};
 
 export type FileNavigationGuard = (
   path: string,

@@ -695,6 +695,7 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.schemas import (
     AgentObject,
+    ArtifactOpenRequestEvent,
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
     BrowserActionRequestEvent,

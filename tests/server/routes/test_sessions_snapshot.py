@@ -551,6 +551,30 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_omits_the_artifact_link_secret() -> None:
+    """GET /sessions/{id} must not carry the per-session artifact-link key: it
+    signs every artifact URL of the session, so a viewer holding it could forge
+    links. Ordinary labels still ride through."""
+    from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
+
+    session_id = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={ARTIFACT_LINK_KEY_LABEL: "signing-secret", "kept": "yes"},
+    )
+    conv_store = _ConversationStore([], conversations={session_id: conv})
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert ARTIFACT_LINK_KEY_LABEL not in snapshot.labels
+    assert snapshot.labels.get("kept") == "yes"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "message",
     [

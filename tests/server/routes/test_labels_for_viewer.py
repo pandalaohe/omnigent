@@ -6,13 +6,16 @@ per-user pins (``omnigent.pinned.<user>``) and per-repo sandbox workspaces
 (``omnigent.sandbox.repo.<index>``). The repo collapse is load-bearing for the
 fork dialog, which reads the bare key — without it, forking a session created
 after per-repo storage would see no repo and clone an empty sandbox.
+
+The artifact-link secret must never be presented: it signs the session's
+artifact capability URLs, so a viewer holding it could forge links.
 """
 
 from __future__ import annotations
 
 from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
 from omnigent.server.routes._sessions.orchestration import _labels_for_viewer
-from omnigent.stores.conversation_store import pinned_label_key
+from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL, pinned_label_key
 
 
 def test_collapses_per_repo_labels_to_the_bare_space_joined_key() -> None:
@@ -48,3 +51,15 @@ def test_still_collapses_the_pin_family() -> None:
     # This viewer's pin surfaces as the canonical bare key; others' don't leak.
     assert viewer.get("omnigent.pinned") == "1721760000000"
     assert not any(k.startswith("omnigent.pinned.") for k in viewer)
+
+
+def test_drops_the_artifact_link_secret() -> None:
+    """The per-session artifact-link key must never reach a viewer — it signs
+    every artifact URL of the session, so a holder could forge links."""
+    viewer = _labels_for_viewer(
+        {ARTIFACT_LINK_KEY_LABEL: "signing-secret", "kept": "yes"},
+        None,
+    )
+
+    assert ARTIFACT_LINK_KEY_LABEL not in viewer
+    assert viewer == {"kept": "yes"}
