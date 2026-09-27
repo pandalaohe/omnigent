@@ -1704,11 +1704,11 @@ async def test_entry_project_lists_worktrees_and_reserves_on_checkout(
         env["conversations"].create_conversation(
             conversation_id=conversation_id,
             agent_id=env["agent_id"],
-            project_id=env["project"].id,
-            host_id=HOST,
-            workspace=ENTRY,
+            project_id=body.project_id,
+            host_id=body.host_id,
+            workspace=body.workspace,
             worktree=body.workspace,
-            git_branch="review-branch",
+            git_branch=body.git.branch_name,
             title="Hand-off: Review code",
         )
         return SimpleNamespace(id=conversation_id)
@@ -1726,7 +1726,10 @@ async def test_entry_project_lists_worktrees_and_reserves_on_checkout(
     assert response.json()["state"] == "delivered"
     # The worktree list runs on the checkout, never on the entry.
     assert listed == [CHECKOUT]
+    assert captured[0].project_id == env["project"].id
+    assert captured[0].host_id == HOST
     assert captured[0].workspace == matched
+    assert captured[0].git.branch_name == "review-branch"
     assert captured[0].git.existing_worktree is True
     record = env["handoffs"].get(response.json()["handoff_id"])
     assert record is not None
@@ -1734,6 +1737,7 @@ async def test_entry_project_lists_worktrees_and_reserves_on_checkout(
     assert record.worktree == matched
     assert f"Worktree: {matched}. Make every change and commit there." in record.brief
     assert response.json()["checkout"] == CHECKOUT
+    assert response.json()["session"]["workspace"] == matched
     assert response.json()["session"]["worktree"] == matched
     # The reservation key is (host, checkout, branch), not the entry root.
     assert env["handoffs"].find_branch_reservation(HOST, CHECKOUT, "review-branch") is not None
@@ -1792,11 +1796,11 @@ async def test_entry_project_new_branch_sends_entry_workspace(
         env["conversations"].create_conversation(
             conversation_id=conversation_id,
             agent_id=env["agent_id"],
-            project_id=env["project"].id,
-            host_id=HOST,
+            project_id=body.project_id,
+            host_id=body.host_id,
             workspace=ENTRY,
             worktree=planned,
-            git_branch="review-branch",
+            git_branch=body.git.branch_name,
             title="Hand-off: Review code",
         )
         return SimpleNamespace(id=conversation_id)
@@ -1815,9 +1819,12 @@ async def test_entry_project_new_branch_sends_entry_workspace(
     assert listed == [CHECKOUT]
     # New-branch receivers keep the entry as the launch directory; the
     # custom-line resolver sources the worktree from the checkout.
+    assert captured[0].project_id == env["project"].id
+    assert captured[0].host_id == HOST
     assert captured[0].workspace == ENTRY
     assert captured[0].git.branch_name == "review-branch"
     assert captured[0].git.base_branch == "main"
+    assert captured[0].git.existing_worktree is False
     record = env["handoffs"].get(response.json()["handoff_id"])
     assert record is not None
     assert record.checkout == CHECKOUT and record.root == ENTRY
@@ -1846,7 +1853,7 @@ async def test_entry_project_reuses_receiver_by_effective_worktree(
         agent_id=env["agent_id"],
         project_id=env["project"].id,
         host_id=HOST,
-        workspace=ENTRY,
+        workspace=matched,
         worktree=matched,
         git_branch="review-branch",
         title="receiver",
@@ -1891,7 +1898,7 @@ async def test_entry_project_mismatched_worktree_receiver_is_refused(
         agent_id=env["agent_id"],
         project_id=env["project"].id,
         host_id=HOST,
-        workspace=ENTRY,
+        workspace="/other-worktree",
         worktree="/other-worktree",
         git_branch="review-branch",
         title="receiver",
@@ -1930,7 +1937,7 @@ async def test_entry_project_reuse_without_branch_needs_plain_workspace(
         agent_id=env["agent_id"],
         project_id=env["project"].id,
         host_id=HOST,
-        workspace=ENTRY,
+        workspace="/entry-worktrees/some-branch",
         worktree="/entry-worktrees/some-branch",
         title="worktree receiver",
     )
