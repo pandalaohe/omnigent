@@ -1,9 +1,12 @@
 """Persistence for versioned, user-scoped web preferences.
 
-The server stores one small JSON envelope on the authenticated user's row.
-Namespace updates run in a single database transaction, so concurrent clients
-cannot observe a partially-written preference set. The store owns structural
-and size validation as a defence-in-depth boundary for non-HTTP callers.
+Each namespace lives in one row of the shared ``preferences`` table under the
+``settings.<namespace>`` key, next to a ``settings.version`` marker row that
+records the envelope version and marks the envelope initialized. Reads assemble
+those rows back into the version-1 envelope. Namespace updates run in a single
+database transaction, so concurrent clients cannot observe a partially-written
+preference set. The store owns structural and size validation as a
+defence-in-depth boundary for non-HTTP callers.
 """
 
 from __future__ import annotations
@@ -12,12 +15,25 @@ import json
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias
 
+import zstandard
+from sqlalchemy import LargeBinary, delete, select, type_coerce
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+from sqlalchemy.sql.dml import Insert
 
-from omnigent.db.db_models import SqlUser, current_workspace_id
-from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
+from omnigent.db.account_authority import lock_account
+from omnigent.db.compression import decode
+from omnigent.db.db_models import SqlPreference, current_workspace_id
+from omnigent.db.utils import (
+    get_or_create_engine,
+    make_named_managed_session_maker,
+    run_write_transaction,
+)
 
 USER_PREFERENCE_VERSION = 1
 USER_PREFERENCES_MAX_BYTES = 64 * 1024
@@ -30,10 +46,27 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "usage_context",
         "agent_badges",
         "approval_timeout",
+        "agent_pins",
     }
 )
 
+# This store shares the ``preferences`` table with unrelated keys (project
+# ordering), so its rows carry the ``settings.`` prefix. The version row is not
+# a namespace: its presence marks an initialized envelope, distinguishing
+# "never initialized" from an explicit all-defaults envelope.
+_SETTINGS_KEY_PREFIX = "settings."
+_ENVELOPE_VERSION_KEY = f"{_SETTINGS_KEY_PREFIX}version"
+
 PreferencesEnvelope: TypeAlias = dict[str, Any]
+
+
+class UserPreferencesValidationError(ValueError):
+    """A preferences payload violates the persisted envelope contract."""
+
+
+class UserPreferencesUserNotFoundError(LookupError):
+    """The authenticated account no longer has a backing user row."""
+
 
 APPROVAL_TIMEOUT_NAMESPACE = "approval_timeout"
 APPROVAL_TIMEOUT_DEFAULT_MINUTES = 50
@@ -63,7 +96,7 @@ def read_approval_timeout(
 
     The hook path must never fail on a malformed preference row: a
     missing store / owner / namespace, a non-object value, an invalid
-    field, or a row that fails envelope validation all resolve to the
+    field, or a row that fails store validation all resolve to the
     50-minute, stop-enabled default. ``timeoutMinutes`` is clamped to
     1..1380 so the server always answers before the host-side client
     budgets give up.
@@ -101,14 +134,6 @@ def read_approval_timeout(
     raw_stop = value.get("stopTurn")
     stop_turn = raw_stop if isinstance(raw_stop, bool) else True
     return ApprovalTimeout(timeout_s=timeout_s, stop_turn=stop_turn)
-
-
-class UserPreferencesValidationError(ValueError):
-    """A preferences payload violates the persisted envelope contract."""
-
-
-class UserPreferencesUserNotFoundError(LookupError):
-    """The authenticated account no longer has a backing user row."""
 
 
 def _validate_json(value: Any, *, depth: int = 0) -> None:
@@ -182,10 +207,13 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
     return copied
 
 
-def _serialize(envelope: PreferencesEnvelope) -> str:
-    validated = validate_preferences_envelope(envelope)
+def _settings_key(namespace: str) -> str:
+    return f"{_SETTINGS_KEY_PREFIX}{namespace}"
+
+
+def _encode_value(value: Any) -> str:
     return json.dumps(
-        validated,
+        value,
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
@@ -193,22 +221,76 @@ def _serialize(envelope: PreferencesEnvelope) -> str:
     )
 
 
-def _deserialize(raw: str) -> PreferencesEnvelope:
-    try:
-        value = json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise UserPreferencesValidationError("stored preferences are invalid JSON") from exc
-    return validate_preferences_envelope(value)
+def _read_settings(session: Session, user_id: str) -> tuple[dict[str, Any], bool]:
+    """Read the user's namespace rows and whether an envelope was initialized.
+
+    Values are decoded from raw bytes so a corrupt compression frame raises the
+    store's own validation error instead of failing inside the ORM result
+    processor.
+    """
+    rows = session.execute(
+        select(
+            SqlPreference.key,
+            type_coerce(SqlPreference.value, LargeBinary),
+        ).where(
+            SqlPreference.workspace_id == current_workspace_id(),
+            SqlPreference.user_id == user_id,
+            SqlPreference.key.startswith(_SETTINGS_KEY_PREFIX),
+        )
+    ).all()
+    settings: dict[str, Any] = {}
+    for key, raw in rows:
+        try:
+            text = decode(raw, max_decoded_bytes=USER_PREFERENCES_MAX_BYTES)
+        except (ValueError, zstandard.ZstdError) as exc:
+            raise UserPreferencesValidationError("stored preferences are invalid JSON") from exc
+        if key == _ENVELOPE_VERSION_KEY:
+            continue
+        try:
+            settings[key[len(_SETTINGS_KEY_PREFIX) :]] = json.loads(text or "")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise UserPreferencesValidationError("stored preferences are invalid JSON") from exc
+    return settings, bool(rows)
+
+
+def _assemble_envelope(settings: dict[str, Any]) -> PreferencesEnvelope:
+    """Rebuild and validate the whole envelope from decoded namespace values."""
+    return validate_preferences_envelope(
+        {"version": USER_PREFERENCE_VERSION, "settings": settings}
+    )
+
+
+def _require_user_row(session: Session, user_id: str, create_if_missing: bool) -> None:
+    """Fail closed when an accounts-mode caller outlived its user row.
+
+    The locking read of the account is the write transaction's first statement,
+    ordered before any ``preferences`` row: a concurrent ``delete_user`` either
+    tombstones the account first (this rejects it) or waits for this
+    transaction and deletes the rows it wrote. A missing row is still never
+    created here: header/OIDC identities can sync preferences without one,
+    matching upstream's project-order rows.
+    """
+    if create_if_missing:
+        return
+    row = lock_account(session, user_id)
+    if row is None or row.deleted_at is not None:
+        raise UserPreferencesUserNotFoundError(user_id)
 
 
 class SqlAlchemyUserPreferencesStore:
-    """SQLAlchemy repository for current-user preferences."""
+    """SQLAlchemy repository for current-user preferences.
+
+    Lock order: an accounts-mode write locks the caller's account row first,
+    then a write upserts the ``settings.version`` row before reading any
+    ``settings.*`` row, so the per-user row lock is held across read and write.
+    """
 
     def __init__(self, storage_location: str) -> None:
         self._engine = get_or_create_engine(storage_location)
+        self._dialect = self._engine.dialect.name
         # BEGIN IMMEDIATE closes SQLite's read-then-write race. Other dialects
-        # pair the transaction with SELECT FOR UPDATE below.
-        self._read_session = make_named_managed_session_maker(
+        # pair the transaction with the per-user version-row upsert in writes.
+        self._session = make_named_managed_session_maker(
             self._engine,
             query_name_prefix="omnigent.user_preferences_store",
         )
@@ -218,13 +300,46 @@ class SqlAlchemyUserPreferencesStore:
             immediate=True,
         )
 
+    def _upsert_row(self, session: Session, *, user_id: str, key: str, value: str) -> None:
+        """Write one row with the backend's native upsert."""
+        values = {
+            "workspace_id": current_workspace_id(),
+            "user_id": user_id,
+            "key": key,
+            "value": value,
+        }
+        stmt: Insert
+        if self._dialect == "mysql":
+            stmt = (
+                mysql_insert(SqlPreference).values(**values).on_duplicate_key_update(value=value)
+            )
+        elif self._dialect == "sqlite":
+            stmt = (
+                sqlite_insert(SqlPreference)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id", "key"],
+                    set_={"value": value},
+                )
+            )
+        else:
+            stmt = (
+                pg_insert(SqlPreference)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id", "key"],
+                    set_={"value": value},
+                )
+            )
+        session.execute(stmt)
+
     def get(self, user_id: str) -> PreferencesEnvelope | None:
-        """Return the user's envelope, preserving NULL as uninitialized."""
-        with self._read_session("get") as session:
-            row = session.get(SqlUser, (current_workspace_id(), user_id))
-            if row is None or row.preferences is None:
+        """Return the user's envelope, or ``None`` when it was never initialized."""
+        with self._session("read_user_preferences") as session:
+            settings, initialized = _read_settings(session, user_id)
+            if not initialized:
                 return None
-            return _deserialize(row.preferences)
+            return _assemble_envelope(settings)
 
     def initialize(
         self,
@@ -235,32 +350,44 @@ class SqlAlchemyUserPreferencesStore:
     ) -> PreferencesEnvelope:
         """Set the full envelope only when this user is still uninitialized.
 
-        Repeated/racing first-device migrations are idempotent: once any
-        client wins, later calls receive the already-persisted value instead
-        of overwriting it with stale localStorage.
+        Repeated/racing first-device migrations are idempotent: once any client
+        wins, later calls receive the already-persisted value instead of
+        overwriting it with stale localStorage. The version row is the
+        first-write lock: only one concurrent writer can insert it, and the
+        loser retries into the winner's envelope.
         """
-        encoded = _serialize(envelope)
+        validated = validate_preferences_envelope(envelope)
+
+        def write(session: Session) -> PreferencesEnvelope:
+            _require_user_row(session, user_id, create_if_missing)
+            settings, initialized = _read_settings(session, user_id)
+            if initialized:
+                return _assemble_envelope(settings)
+            workspace_id = current_workspace_id()
+            session.add(
+                SqlPreference(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    key=_ENVELOPE_VERSION_KEY,
+                    value=_encode_value(USER_PREFERENCE_VERSION),
+                )
+            )
+            session.add_all(
+                SqlPreference(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    key=_settings_key(namespace),
+                    value=_encode_value(value),
+                )
+                for namespace, value in validated["settings"].items()
+            )
+            return validated
+
         for attempt in range(2):
             try:
-                with self._write_session("initialize") as session:
-                    row = session.get(
-                        SqlUser,
-                        (current_workspace_id(), user_id),
-                        with_for_update=self._engine.dialect.name != "sqlite",
-                    )
-                    if row is None:
-                        if not create_if_missing:
-                            raise UserPreferencesUserNotFoundError(user_id)
-                        row = SqlUser(id=user_id, is_admin=False, preferences=encoded)
-                        session.add(row)
-                        # SELECT FOR UPDATE cannot lock a missing PostgreSQL row.
-                        # Flush now so a racing first writer is handled below.
-                        session.flush()
-                        return _deserialize(encoded)
-                    if row.preferences is None:
-                        row.preferences = encoded
-                        return _deserialize(encoded)
-                    return _deserialize(row.preferences)
+                return run_write_transaction(
+                    self._write_session, "initialize_user_preferences", write
+                )
             except IntegrityError:
                 if attempt == 1:
                     raise
@@ -280,38 +407,45 @@ class SqlAlchemyUserPreferencesStore:
         if value is not None:
             _validate_json(value)
 
-        for attempt in range(2):
-            try:
-                with self._write_session("patch_namespace") as session:
-                    row = session.get(
-                        SqlUser,
-                        (current_workspace_id(), user_id),
-                        with_for_update=self._engine.dialect.name != "sqlite",
+        def write(session: Session) -> PreferencesEnvelope:
+            _require_user_row(session, user_id, create_if_missing)
+            # Lock before reading: accounts mode already holds the account row;
+            # the version-row upsert then blocks a concurrent patch of this
+            # user until this transaction commits, so the read below sees
+            # every committed sibling row.
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_ENVELOPE_VERSION_KEY,
+                value=_encode_value(USER_PREFERENCE_VERSION),
+            )
+            settings, _initialized = _read_settings(session, user_id)
+            if value is None:
+                settings.pop(namespace, None)
+            else:
+                existing = settings.get(namespace)
+                if isinstance(existing, dict) and isinstance(value, dict):
+                    settings[namespace] = {**existing, **deepcopy(value)}
+                else:
+                    settings[namespace] = deepcopy(value)
+            merged = _assemble_envelope(settings)
+            if namespace in merged["settings"]:
+                self._upsert_row(
+                    session,
+                    user_id=user_id,
+                    key=_settings_key(namespace),
+                    value=_encode_value(merged["settings"][namespace]),
+                )
+            else:
+                session.execute(
+                    delete(SqlPreference).where(
+                        SqlPreference.workspace_id == current_workspace_id(),
+                        SqlPreference.user_id == user_id,
+                        SqlPreference.key == _settings_key(namespace),
                     )
-                    if row is None:
-                        if not create_if_missing:
-                            raise UserPreferencesUserNotFoundError(user_id)
-                        row = SqlUser(id=user_id, is_admin=False)
-                        session.add(row)
-                        session.flush()
-                    current = (
-                        _deserialize(row.preferences)
-                        if row.preferences is not None
-                        else {"version": USER_PREFERENCE_VERSION, "settings": {}}
-                    )
-                    settings = cast(dict[str, Any], current["settings"])
-                    if value is None:
-                        settings.pop(namespace, None)
-                    else:
-                        existing = settings.get(namespace)
-                        if isinstance(existing, dict) and isinstance(value, dict):
-                            settings[namespace] = {**existing, **deepcopy(value)}
-                        else:
-                            settings[namespace] = deepcopy(value)
-                    encoded = _serialize(current)
-                    row.preferences = encoded
-                    return _deserialize(encoded)
-            except IntegrityError:
-                if attempt == 1:
-                    raise
-        raise AssertionError("unreachable")
+                )
+            return merged
+
+        return run_write_transaction(
+            self._write_session, "patch_user_preferences_namespace", write
+        )

@@ -28,6 +28,7 @@ import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
+import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
@@ -68,6 +69,7 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
+  const { data: customAgents } = useCustomAgents(open);
   const { data: hosts } = useHosts({ enabled: open });
   const info = useServerInfo();
   // Gates the "new sandbox each run" option: only servers that can actually
@@ -92,21 +94,47 @@ export function CreateScheduledTaskDialog({
   // `*-native-ui` agent's id, exactly what the interactive dialog sends.
   //
   // Scheduled tasks create sessions from the selected agent. Model + effort are
-  // offered for native coding agents that support them (see `showModelEffort`
-  // below), reusing lightweight scheduled-local pickers rather than the
-  // interactive dialog's 26-prop HarnessConfigModal (bound to smart-routing /
-  // cost-control / per-turn model loading — disproportionate for a saved task).
+  // offered for native coding agents and SDK agents that support them (see
+  // `showModelEffort` below), reusing lightweight scheduled-local pickers rather
+  // than the interactive dialog's 26-prop HarnessConfigModal (bound to
+  // smart-routing / cost-control / per-turn model loading — disproportionate
+  // for a saved task).
   // "" = unselected → `model_override` / `reasoning_effort` / `permission_mode`
   // are omitted so the fire path uses the agent's configured defaults. Permission
-  // mode is offered for native coding agents that support it (Claude Code); each
-  // fire launches a fresh session, so the whole launch vocabulary is valid —
-  // including the launch-only `dontAsk` / `bypassPermissions`.
+  // mode is offered for Claude Code, Claude SDK, and Codex SDK agents; each fire
+  // launches a fresh session, so the whole Claude launch vocabulary is valid —
+  // including the launch-only `dontAsk` / `bypassPermissions` — while Codex SDK
+  // uses its approval presets.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
-  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
+  // Saved library Agents join the picker as in New Chat. A session row backed by
+  // one gives way to it unless it is the edited task's agent or the current pick
+  // (a late catalog must not swap the pick); a kept row hides its library twin.
+  const agentList = useMemo(() => {
+    const libraryAgents = customAgents ?? [];
+    const liveTemplateIds = new Set(libraryAgents.map((agent) => agent.id));
+    const sourceAgents = (agents ?? []).filter(
+      (agent) =>
+        !agent.templateId ||
+        !liveTemplateIds.has(agent.templateId) ||
+        agent.id === editingTask?.agentId ||
+        agent.id === pickedAgentId,
+    );
+    const retainedTemplateIds = new Set(
+      sourceAgents
+        .map((agent) => agent.templateId)
+        .filter((id): id is string => id !== undefined && liveTemplateIds.has(id)),
+    );
+    return selectableSessionAgents([
+      ...sourceAgents,
+      ...libraryAgents
+        .filter((agent) => !retainedTemplateIds.has(agent.id))
+        .map(customAgentForPicker),
+    ]);
+  }, [agents, customAgents, editingTask?.agentId, pickedAgentId]);
   const harnessEntries = useMemo(
     () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
     [agentList],
@@ -136,11 +164,19 @@ export function CreateScheduledTaskDialog({
   const agentChanged =
     isEdit && effectiveAgentId !== null && effectiveAgentId !== editingTask?.agentId;
 
+  // The selected saved Agent's roster, lead first. Read from the catalog row —
+  // the picker's `AvailableAgent` carries no members; null → no line.
+  const selectedCustomAgent = (customAgents ?? []).find((a) => a.id === effectiveAgentId);
+  const customAgentMembers =
+    selectedCustomAgent?.members && selectedCustomAgent.members.length > 0
+      ? [...selectedCustomAgent.members].sort((a, b) => Number(b.lead) - Number(a.lead))
+      : null;
+
   function handleSelectAgent(agent: AvailableAgent) {
     setPickedAgentId(agent.id);
     // Keep the per-agent settings in step with the pick: they don't transfer
-    // across harnesses (a model id is provider-bound; permission mode is
-    // Claude-only), so a switch drops them, mirroring the server's clear on a
+    // across harnesses (model ids and permission vocabularies are harness-bound),
+    // so a switch drops them, mirroring the server's clear on a
     // rebind. Landing back on the task's own agent is NOT a switch, so restore
     // the values the dialog opened with — otherwise re-picking the current agent
     // (or switching away and back) would wipe them with no rebind to justify it.
@@ -152,13 +188,19 @@ export function CreateScheduledTaskDialog({
 
   // Model + effort are surfaced only for native coding agents that carry the
   // model/effort surface — the same `permissionMode` capability the interactive
-  // dialog gates its Model/Effort/Permissions block on (Claude Code). Agents
-  // without it (plain SDK agents like Polly, or native harnesses with no
+  // dialog gates its Model/Effort/Permissions block on (Claude Code) — and for
+  // Claude SDK and Codex SDK agents. Agents without it (native harnesses with no
   // model-picker surface) show no model/effort controls, exactly like
   // interactive. Resolved from the full agent list so a task bound to an agent
   // the picker hides still gates on its real capabilities.
   const modelEffortAgent = agents?.find((a) => a.id === effectiveAgentId);
-  const showModelEffort = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
+  const nativePermissionMode = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
+  const modelEffortHarness: "claude-native" | "claude-sdk" | "codex" | null = nativePermissionMode
+    ? "claude-native"
+    : modelEffortAgent?.harness === "claude-sdk" || modelEffortAgent?.harness === "codex"
+      ? modelEffortAgent.harness
+      : null;
+  const showModelEffort = modelEffortHarness !== null;
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
   // The agent picker and host/schedule Selects portal dropdowns OUTSIDE DialogContent.
@@ -274,6 +316,11 @@ export function CreateScheduledTaskDialog({
   // the user gets inline feedback instead of a 400. In sandbox mode there is no
   // host/workspace pairing at all, so the rule doesn't apply.
   const workspaceWithoutHost = !sandboxMode && workspace.trim() !== "" && hostId === "";
+  // A saved Agent runs from its bundle on a connected computer (a server 400 on
+  // sandbox targets): the sandbox option is disabled while one is picked, and a
+  // pick beside an already-selected sandbox blocks submit until a host is chosen.
+  const libraryAgentSelected = effectiveAgentId?.startsWith("ca_") ?? false;
+  const sandboxAgentConflict = sandboxMode && libraryAgentSelected;
   // Block submit on an invalid schedule (bad interval, empty multi-select) so
   // the form never posts an RRULE the server's validate_rrule would 400.
   const scheduleInvalid = scheduleUnsupported || validateSchedule(schedule) !== null;
@@ -283,6 +330,7 @@ export function CreateScheduledTaskDialog({
     prompt.trim() !== "" &&
     (isEdit || effectiveAgentId !== null) &&
     !workspaceWithoutHost &&
+    !sandboxAgentConflict &&
     !scheduleInvalid &&
     !mutationPending;
 
@@ -479,6 +527,14 @@ export function CreateScheduledTaskDialog({
                 triggerLabelClassName="max-w-none text-ui"
               />
             </div>
+            {customAgentMembers && (
+              // Saved Agent roster: names only, lead first (Model / Effort are per-member).
+              <p className="text-sm text-muted-foreground" data-testid="task-agent-members">
+                {customAgentMembers
+                  .map((member) => (member.lead ? `${member.name} (Lead)` : member.name))
+                  .join(", ")}
+              </p>
+            )}
             {agentChanged && (
               <p className="text-sm text-muted-foreground">
                 Future runs use {agentLabel}; past runs keep the agent they ran with
@@ -491,12 +547,14 @@ export function CreateScheduledTaskDialog({
             )}
           </div>
 
-          {/* Model + reasoning effort + permission mode — only for native
-              coding agents that carry the model/effort surface (Claude Code).
-              Unselected controls fall back to the agent's configured defaults. */}
+          {/* Model + reasoning effort + permission mode — for native coding
+              agents that carry the model/effort surface (Claude Code) and
+              Claude SDK / Codex SDK agents. Unselected controls fall back to
+              the agent's configured defaults. */}
           {showModelEffort && (
             <div data-testid="task-model-effort-field">
               <ModelEffortFields
+                harness={modelEffortHarness}
                 model={pickedModel}
                 effort={pickedEffort}
                 permissionMode={pickedPermission}
@@ -507,9 +565,10 @@ export function CreateScheduledTaskDialog({
                 onSelectOpenChange={handleSelectOpenChange}
               />
               <p className="mt-1.5 text-sm text-muted-foreground">
-                Leave on Default to use the agent&apos;s configured model, effort, and permission
-                mode. Automations run unattended, so a prompting mode (Manual or Plan) will wait for
-                approval that never comes.
+                Leave these controls on their defaults to use the agent&apos;s configured model,
+                effort, and permission mode. Automations run unattended, so prompting modes (Manual
+                or Plan for Claude; Default or Read only for Codex SDK) will wait for approval that
+                never comes.
               </p>
             </div>
           )}
@@ -569,7 +628,11 @@ export function CreateScheduledTaskDialog({
                   Resolve at fire time
                 </SelectItem>
                 {(managedSandboxesEnabled || sandboxMode) && (
-                  <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
+                  <SelectItem
+                    value={SANDBOX_HOST}
+                    disabled={libraryAgentSelected}
+                    data-testid="task-host-sandbox-option"
+                  >
                     {sandboxLabel}
                   </SelectItem>
                 )}
@@ -585,6 +648,11 @@ export function CreateScheduledTaskDialog({
                 ? "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
                 : "Leave unset to run on your connected host when the task fires."}
             </p>
+            {libraryAgentSelected && (managedSandboxesEnabled || sandboxMode) && (
+              <p className="text-sm text-muted-foreground" data-testid="task-host-sandbox-note">
+                Custom agents require a connected computer
+              </p>
+            )}
           </div>
 
           {!sandboxMode && hostId !== "" && (

@@ -5,12 +5,24 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 export const CUSTOM_AGENTS_QUERY_KEY = ["custom-agents"] as const;
 export const AGENT_TEMPLATE_LABEL = "omnigent:agent-template-id";
 
+/** One member of a saved joint Agent; the lead is the Agent itself. */
+export interface CustomAgentMember {
+  name: string;
+  description: string | null;
+  harness: string;
+  model: string | null;
+  reasoning_effort: string | null;
+  lead: boolean;
+}
+
 export interface CustomAgent {
   id: string;
   name: string;
   description: string | null;
   harness: string | null;
   model: string | null;
+  /** Roster projected from the bundle: lead first, then each sub-agent. */
+  members: CustomAgentMember[] | null;
   version: number;
   created_at: number;
   updated_at: number | null;
@@ -23,13 +35,20 @@ export interface CustomAgentDetail extends CustomAgent {
 async function checked(response: Response): Promise<Response> {
   if (response.ok) return response;
   let message = `Agent request failed (${response.status})`;
+  let code: string | undefined;
   try {
     const body = await response.json();
-    if (typeof body.detail === "string") message = body.detail;
+    if (typeof body.error?.message === "string") {
+      message = body.error.message;
+      if (typeof body.error.code === "string") code = body.error.code;
+    } else if (typeof body.detail === "string") {
+      /* FastAPI's HTTPException shape, e.g. the multipart size/type rejects. */
+      message = body.detail;
+    }
   } catch {
     /* Keep the status when the server returns a non-JSON error. */
   }
-  throw new Error(message);
+  throw Object.assign(new Error(message), { status: response.status, code });
 }
 
 export async function listCustomAgents(): Promise<CustomAgent[]> {
@@ -42,7 +61,9 @@ export async function listCustomAgents(): Promise<CustomAgent[]> {
       await authenticatedFetch(`/v1/custom-agents?limit=100&offset=${result.length}`),
     );
     const page = (await response.json()) as { data: CustomAgent[]; has_more: boolean };
-    if (!Array.isArray(page.data)) throw new Error("Invalid custom Agent catalog");
+    if (!Array.isArray(page.data) || typeof page.has_more !== "boolean") {
+      throw new Error("Invalid custom Agent catalog");
+    }
     result.push(...page.data);
     hasMore = page.has_more && page.data.length > 0;
   }
@@ -99,9 +120,24 @@ export async function importCustomAgent(sessionId: string): Promise<CustomAgentD
   ).json();
 }
 
+/** Copy a built-in Agent into the library as an editable `ca_` Agent. */
+export async function duplicateBuiltinAgent(id: string): Promise<CustomAgentDetail> {
+  return (
+    await checked(
+      await authenticatedFetch("/v1/custom-agents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_agent_id: id }),
+      }),
+    )
+  ).json();
+}
+
 export async function updateCustomAgent(
   id: string,
-  changes: Pick<CustomAgentDetail, "name" | "description" | "instructions" | "version">,
+  changes: Pick<CustomAgentDetail, "name" | "description" | "instructions" | "version"> & {
+    members?: CustomAgentMember[] | null;
+  },
 ): Promise<CustomAgentDetail> {
   return (
     await checked(

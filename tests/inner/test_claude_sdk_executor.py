@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     TextChunk,
     ToolCallComplete,
@@ -2231,6 +2232,238 @@ class TestSkillsFilterTranslation(unittest.TestCase):
 
 
 class TestStreamEventStreaming(unittest.TestCase):
+    def test_effort_rebuilds_client_before_prompt_and_model_only_reuses_it(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        clients = []
+        prompts = []
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            @staticmethod
+            def tool(name, desc, params):
+                return lambda handler: handler
+
+            @staticmethod
+            def create_sdk_mcp_server(**kwargs):
+                return kwargs
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+                    self.closed = False
+                    self.model_changes = []
+                    clients.append(self)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    prompts.append(prompt)
+
+                async def receive_response(self):
+                    yield _ResultMessage("claude-session-a", "done")
+
+                async def set_model(self, model):
+                    self.model_changes.append(model)
+
+                async def disconnect(self):
+                    self.closed = True
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+
+            async def _allow_elicitation(_tool_name, _tool_input):
+                return True
+
+            executor._elicitation_handler = _allow_elicitation
+            original_build_prompt = executor._build_prompt
+
+            def _checked_prompt(messages, *, resume_session):
+                if len(prompts) == 2:
+                    self.assertTrue(clients[0].closed)
+                    self.assertFalse(resume_session)
+                if len(prompts) == 4:
+                    self.assertTrue(clients[1].closed)
+                    self.assertFalse(resume_session)
+                if len(prompts) == 5:
+                    self.assertTrue(clients[2].closed)
+                    self.assertFalse(resume_session)
+                return original_build_prompt(messages, resume_session=resume_session)
+
+            first = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+            second = [
+                *first,
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "follow up", "session_id": "session-a"},
+            ]
+            third = [
+                *second,
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "new effort", "session_id": "session-a"},
+            ]
+            fourth = [
+                *third,
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "new model", "session_id": "session-a"},
+            ]
+            fifth = [
+                *fourth,
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "new permission", "session_id": "session-a"},
+            ]
+            sixth = [
+                *fifth,
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "configured default", "session_id": "session-a"},
+            ]
+            tool_specs = [
+                {"name": "sleep", "description": "sleep", "parameters": {"type": "object"}}
+            ]
+            with (
+                patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
+                patch.object(executor, "_build_prompt", side_effect=_checked_prompt),
+            ):
+                for messages, effort, model, mode in [
+                    (first, "high", None, "plan"),
+                    (second, "high", None, "plan"),
+                    (third, "max", None, "plan"),
+                    (fourth, "max", "picked", "plan"),
+                    (fifth, "max", "picked", "bypassPermissions"),
+                    (sixth, "max", "picked", None),
+                ]:
+                    events = [
+                        event
+                        async for event in executor.run_turn(
+                            messages,
+                            tool_specs,
+                            "",
+                            ExecutorConfig(
+                                model=model,
+                                permission_mode=mode,
+                                extra={"reasoning_effort": effort},
+                            ),
+                        )
+                    ]
+                    self.assertIsInstance(events[-1], TurnComplete)
+                    if mode == "bypassPermissions":
+                        with patch.object(
+                            executor, "_can_use_tool_for_permission", new_callable=AsyncMock
+                        ) as elicitation:
+                            await clients[-1].options.can_use_tool("sleep", {}, None)
+                            elicitation.assert_not_awaited()
+                    if messages is sixth:
+                        with patch.object(
+                            executor, "_can_use_tool_for_permission", new_callable=AsyncMock
+                        ) as elicitation:
+                            await clients[-1].options.can_use_tool("sleep", {}, None)
+                            elicitation.assert_awaited_once()
+
+            self.assertEqual(prompts[1], "follow up")
+            self.assertIn("hello", prompts[2])
+            self.assertIn("follow up", prompts[2])
+            self.assertEqual(
+                [client.options.effort for client in clients], ["high", "max", "max", "max"]
+            )
+            self.assertEqual(
+                [client.options.permission_mode for client in clients],
+                ["plan", "plan", "bypassPermissions", "auto"],
+            )
+            self.assertEqual(clients[0].options.allowed_tools, [])
+            self.assertEqual(clients[2].options.allowed_tools, ["mcp__omnigent__sleep"])
+            self.assertIsNotNone(clients[1].options.can_use_tool)
+            self.assertEqual(prompts[3], "new model")
+            self.assertEqual(clients[1].model_changes, ["picked"])
+            self.assertIn("hello", prompts[4])
+            self.assertIn("new model", prompts[4])
+            self.assertEqual(executor._permission_mode, "auto")
+
+        _run(_t())
+
+    def test_live_tool_gates_keep_each_sessions_permission_mode(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        clients = []
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+                    clients.append(self)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    yield _ResultMessage("sdk-session", "done")
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            executor._elicitation_handler = AsyncMock(return_value=True)
+            turns = [
+                ("session-a", "default", "first"),
+                ("session-b", "bypassPermissions", "second"),
+                ("session-a", "default", "third"),
+            ]
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                for session_id, mode, prompt in turns:
+                    messages = [{"role": "user", "content": prompt, "session_id": session_id}]
+                    events = [
+                        event
+                        async for event in executor.run_turn(
+                            messages, [], "", ExecutorConfig(permission_mode=mode)
+                        )
+                    ]
+                    self.assertIsInstance(events[-1], TurnComplete)
+
+            self.assertEqual(len(clients), 2)
+            with patch.object(
+                executor, "_can_use_tool_for_permission", new_callable=AsyncMock
+            ) as elicitation:
+                await clients[0].options.can_use_tool("Bash", {}, None)
+                elicitation.assert_awaited_once()
+                await clients[1].options.can_use_tool("Bash", {}, None)
+                elicitation.assert_awaited_once()
+
+        _run(_t())
+
     def test_live_clients_are_reused_per_omnigent_session(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -4861,8 +5094,10 @@ class TestToolCallPolicyGate(unittest.TestCase):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
-            # Bound-method identity differs per access; compare equality.
-            self.assertEqual(captured["can_use_tool"], executor._can_use_tool_gate)
+            self.assertEqual(captured["can_use_tool"].func, executor._can_use_tool_gate)
+            self.assertEqual(
+                captured["can_use_tool"].keywords["permission_mode"], "bypassPermissions"
+            )
             self.assertIsNotNone(captured["can_use_tool"])
 
         _run(_t())

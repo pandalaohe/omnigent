@@ -158,9 +158,8 @@ export const NATIVE_CODING_AGENTS = [
     //
     // `devinMode` owns Devin's own Model + Effort rows. It is deliberately the
     // ONLY capability here:
-    //   * `permissionMode` would render Claude's vocabulary AND the server
-    //     hard-gates the `permission_mode` FIELD to claude-native agents
-    //     (_PERMISSION_MODE_HARNESS in routes/_session_create_validation.py).
+    //   * `permissionMode` would render Claude's vocabulary; Devin's four
+    //     rungs are not accepted by that field.
     //     `devinPermission` instead carries Devin's own four rungs
     //     (auto/accept-edits/smart/dangerous) as `terminal_launch_args`, the
     //     same channel cursor/agy/codex modes use, so no gated field is sent.

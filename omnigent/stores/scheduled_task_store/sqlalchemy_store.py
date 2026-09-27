@@ -36,6 +36,27 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 # Distinct from None, which means "set the column to NULL."
 _UNSET: Any = object()
 
+# Saved library Agent ids (custom_agents.id) are minted as ``ca_<hex>``; a task
+# binding one stores it in ``custom_agent_id`` and leaves ``agent_id`` NULL.
+_LIBRARY_AGENT_ID_PREFIX = "ca_"
+
+
+def _binding_columns(agent_id: str) -> tuple[str | None, str | None]:
+    """Split the entity's single agent id into its ``(agent_id, custom_agent_id)`` columns."""
+    if agent_id.startswith(_LIBRARY_AGENT_ID_PREFIX):
+        return None, agent_id
+    return agent_id, None
+
+
+def _bound_agent_id(row: SqlScheduledTask) -> str:
+    """The entity-visible agent id — whichever binding column the row set."""
+    # Exactly one is set: the store writes only one, and the CHECK rejects
+    # every other combination.
+    if row.custom_agent_id is not None:
+        return row.custom_agent_id
+    assert row.agent_id is not None
+    return row.agent_id
+
 
 def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
     """
@@ -50,7 +71,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         prompt=row.prompt,
         user_id=row.user_id,
         account_generation=row.account_generation,
-        agent_id=row.agent_id,
+        agent_id=_bound_agent_id(row),
         timezone=row.timezone,
         created_at=row.created_at,
         workspace_id=row.workspace_id or DEFAULT_WORKSPACE_ID,
@@ -150,6 +171,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         def write(session: Session) -> ScheduledTask:
             generation = require_active_account(session, user_id)
+            agent_column, custom_agent_column = _binding_columns(agent_id)
             row = SqlScheduledTask(
                 account_generation=generation,
                 id=scheduled_task_id,
@@ -157,7 +179,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 prompt=prompt,
                 rrule=rrule,
                 user_id=user_id,
-                agent_id=agent_id,
+                agent_id=agent_column,
+                custom_agent_id=custom_agent_column,
                 timezone=timezone,
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
@@ -291,7 +314,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         managed-sandbox execution). Passing ``rrule`` updates the recurring
         trigger and ``agent_id`` rebinds the task to a different agent
         (switching the harness future firings run); ``None`` leaves either
-        unchanged.
+        unchanged. A rebind also switches the binding column — a ``ca_`` id is
+        written to ``custom_agent_id`` (clearing ``agent_id``), any other id to
+        ``agent_id`` (clearing ``custom_agent_id``).
         """
         updated_at = now_epoch()
 
@@ -311,8 +336,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if rrule is not None and row.rrule != rrule:
                 row.rrule = rrule
                 changed = True
-            if agent_id is not None and row.agent_id != agent_id:
-                row.agent_id = agent_id
+            if agent_id is not None and _bound_agent_id(row) != agent_id:
+                # A rebind switches columns (a ca_ id clears agent_id and vice
+                # versa) so exactly one binding stays set.
+                row.agent_id, row.custom_agent_id = _binding_columns(agent_id)
                 changed = True
             if timezone is not None and row.timezone != timezone:
                 row.timezone = timezone

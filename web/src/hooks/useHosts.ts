@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { isSandboxHostChoice, readLastHostChoice } from "@/lib/hostPreferences";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -427,6 +428,22 @@ export async function setHostDefaultWorkspace(
     const body = (await res.json().catch(() => ({}))) as { detail?: string };
     throw new Error(body.detail ?? `Couldn't save the default folder (HTTP ${res.status}).`);
   }
+}
+
+/**
+ * Host the new-session landing composer is currently on: the persisted last
+ * explicit pick, else the first online host, else null. Surfaces that need a
+ * host for their model options but render outside the landing composer (the
+ * create-Agent dialog today) reuse this so their options match New Chat's.
+ */
+export function useNewChatHostId(): string | null {
+  const { data: hosts } = useHosts();
+  const stored = readLastHostChoice();
+  // A sandbox pick — the bare sentinel or a per-provider choice — is not a
+  // host id, so it can't name a host to probe for model options; fall through
+  // to the first online host instead of polling a nonexistent one.
+  if (stored !== null && !isSandboxHostChoice(stored)) return stored;
+  return hosts?.find((host) => host.status === "online")?.host_id ?? null;
 }
 
 async function fetchHostModelOptions(

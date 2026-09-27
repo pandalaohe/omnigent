@@ -199,7 +199,7 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
             SqlPreference(workspace_id=workspace_id, user_id=user_id, key=key, value="{}")
             for workspace_id in (101, 102)
             for user_id in ("alice", "bob")
-            for key in ("project_order", "theme")
+            for key in ("project_order", "theme", "settings.keyboard_shortcuts")
         )
         session.commit()
 
@@ -215,8 +215,37 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
     assert remaining == {
         (workspace_id, user_id, key)
         for workspace_id, user_id in ((101, "bob"), (102, "alice"), (102, "bob"))
-        for key in ("project_order", "theme")
+        for key in ("project_order", "theme", "settings.keyboard_shortcuts")
     }
+
+
+def test_tombstoned_account_rejects_preference_writes(db_uri: str) -> None:
+    """A deleted account's tombstone fences its preferences writes out."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlPreference
+    from omnigent.server.user_preferences_store import (
+        SqlAlchemyUserPreferencesStore,
+        UserPreferencesUserNotFoundError,
+    )
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    accounts.create_user_with_password("alice", "test-password-hash")
+    assert accounts.delete_user("alice") is True
+
+    with pytest.raises(UserPreferencesUserNotFoundError):
+        store.patch_namespace(
+            "alice",
+            "keyboard_shortcuts",
+            {"enabled": True},
+            create_if_missing=False,
+        )
+
+    with Session(accounts._engine) as session:
+        rows = session.scalars(select(SqlPreference).where(SqlPreference.user_id == "alice")).all()
+    assert rows == []
 
 
 def test_cleanup_failure_rolls_back_revocation(

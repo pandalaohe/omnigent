@@ -49,11 +49,17 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     current_global_instructions_text,
+    get_runner_client,
     pending_elicitations,
     user_session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.sdk_permission_modes import (
+    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODES,
+)
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -102,6 +108,7 @@ from omnigent.server.routes._errors import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.routes._session_create_validation import CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CLAUDE_NATIVE_PERMISSION_MODES,
@@ -159,6 +166,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
     _reset_runner_resources_after_switch,
+    _resolve_harness,
     _same_provider_family,
     _session_status_cache,
     _session_status_from_cache,
@@ -2635,6 +2643,7 @@ def register_core_routes(
             requested_codex_collaboration_mode = body.collaboration_mode
         permission_mode_requested = "permission_mode" in body.model_fields_set
         requested_permission_mode: str | None = None
+        sdk_permission_mode = False
         if permission_mode_requested:
             if body.permission_mode is None:
                 raise OmnigentError(
@@ -2659,10 +2668,21 @@ def register_core_routes(
                 from omnigent.harnesses.devin_native.bridge import DEVIN_PERMISSION_MODES
 
                 allowed_permission_modes = DEVIN_PERMISSION_MODES
+            elif wrapper_for_permission_mode is None and (
+                await asyncio.to_thread(
+                    _resolve_harness,
+                    conv_for_permission_mode,
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+                == "claude-sdk"
+            ):
+                allowed_permission_modes = tuple(CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES)
+                sdk_permission_mode = True
             else:
                 raise OmnigentError(
                     "permission_mode is only supported for claude-native and "
-                    "devin-native sessions",
+                    "devin-native or claude-sdk sessions",
                     code=ErrorCode.INVALID_INPUT,
                 )
             if body.permission_mode not in allowed_permission_modes:
@@ -2673,15 +2693,11 @@ def register_core_routes(
             requested_permission_mode = body.permission_mode
         approval_mode_requested = "approval_mode" in body.model_fields_set
         requested_codex_approval_mode: str | None = None
+        sdk_approval_mode = False
         if approval_mode_requested:
             if body.approval_mode is None:
                 raise OmnigentError(
                     "approval_mode must be a non-empty string",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            if body.approval_mode not in CODEX_NATIVE_PERMISSION_VALUES:
-                raise OmnigentError(
-                    f"approval_mode must be one of {sorted(CODEX_NATIVE_PERMISSION_VALUES)}",
                     code=ErrorCode.INVALID_INPUT,
                 )
             conv_for_approval_mode = await asyncio.to_thread(
@@ -2692,10 +2708,28 @@ def register_core_routes(
                 raise _session_not_found()
             if (
                 conv_for_approval_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
             ):
+                allowed_approval_modes = CODEX_NATIVE_PERMISSION_VALUES
+            elif conv_for_approval_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) is None and (
+                await asyncio.to_thread(
+                    _resolve_harness,
+                    conv_for_approval_mode,
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+                == "codex"
+            ):
+                allowed_approval_modes = CODEX_SDK_APPROVAL_MODES
+                sdk_approval_mode = True
+            else:
                 raise OmnigentError(
-                    "approval_mode is only supported for codex-native sessions",
+                    "approval_mode is only supported for codex-native or codex sessions",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.approval_mode not in allowed_approval_modes:
+                raise OmnigentError(
+                    f"approval_mode must be one of {sorted(allowed_approval_modes)}",
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_codex_approval_mode = body.approval_mode
@@ -3076,9 +3110,17 @@ def register_core_routes(
                     conversation_store,
                     runner_router,
                 )
-        # The runner applies native settings live. Silent startup metadata
-        # writes skip both recovery and forwarding to avoid recursive launches.
+        # The runner applies native settings live and caches SDK settings for the
+        # next turn. Silent startup metadata writes skip both recovery and
+        # forwarding to avoid recursive launches.
         live_forward = not body.silent
+        sdk_runner_bound = False
+        if live_forward and (sdk_permission_mode or sdk_approval_mode):
+            sdk_runner_bound = (
+                updated.runner_id is not None
+                or await _get_runner_client(session_id, runner_router) is not None
+                or get_runner_client() is not None
+            )
         if live_forward and (effort is not None or clear_effort):
             await _forward_session_change_to_runner(
                 session_id,
@@ -3148,7 +3190,11 @@ def register_core_routes(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        if requested_permission_mode is not None and live_forward:
+        if (
+            requested_permission_mode is not None
+            and live_forward
+            and (not sdk_permission_mode or sdk_runner_bound)
+        ):
             _mode_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -3157,6 +3203,15 @@ def register_core_routes(
                     "permission_mode": requested_permission_mode,
                 },
             )
+            if (
+                sdk_permission_mode
+                and _mode_result is not None
+                and _mode_result.status_code == 204
+            ):
+                raise OmnigentError(
+                    "SDK permission mode was not applied by the runner; try again",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             # Raises unless the runner confirms the switch, so the label can
             # never claim a mode Claude isn't in. Stores the mode it reached.
             _confirmed_permission_mode = _require_permission_mode_forward(
@@ -3164,25 +3219,34 @@ def register_core_routes(
                 requested_permission_mode,
                 _mode_result,
             )
-            labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
-            # The launcher restores the mode from terminal_launch_args, not the
-            # label above, so pin the confirmed mode there too — otherwise a
-            # relaunch reopens in the launch mode, which is Claude's default
-            # (manual) for a session created without --permission-mode. Merge
-            # against ``updated`` (the post-write row), not the pre-update
-            # snapshot, so a combined PATCH that also set terminal_launch_args
-            # keeps those.
-            _merged_permission_args = _pin_claude_permission_launch_args(
-                updated.terminal_launch_args,
-                _confirmed_permission_mode,
-            )
-            if updated.terminal_launch_args != _merged_permission_args:
-                await asyncio.to_thread(
-                    conversation_store.update_conversation,
-                    session_id,
-                    terminal_launch_args=_merged_permission_args,
+            if not sdk_permission_mode:
+                labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = (
+                    _confirmed_permission_mode
                 )
-        if requested_codex_approval_mode is not None and live_forward:
+                # The launcher restores the mode from terminal_launch_args, not the
+                # label above, so pin the confirmed mode there too — otherwise a
+                # relaunch reopens in the launch mode, which is Claude's default
+                # (manual) for a session created without --permission-mode. Merge
+                # against ``updated`` (the post-write row), not the pre-update
+                # snapshot, so a combined PATCH that also set terminal_launch_args
+                # keeps those.
+                _merged_permission_args = _pin_claude_permission_launch_args(
+                    updated.terminal_launch_args,
+                    _confirmed_permission_mode,
+                )
+                if updated.terminal_launch_args != _merged_permission_args:
+                    await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        session_id,
+                        terminal_launch_args=_merged_permission_args,
+                    )
+        if requested_permission_mode is not None and sdk_permission_mode and live_forward:
+            labels_to_set[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = requested_permission_mode
+        if (
+            requested_codex_approval_mode is not None
+            and live_forward
+            and (not sdk_approval_mode or sdk_runner_bound)
+        ):
             _approval_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -3191,6 +3255,15 @@ def register_core_routes(
                     "approval_mode": requested_codex_approval_mode,
                 },
             )
+            if (
+                sdk_approval_mode
+                and _approval_result is not None
+                and _approval_result.status_code == 204
+            ):
+                raise OmnigentError(
+                    "SDK approval mode was not applied by the runner; try again",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             # Raises unless the runner drove the /permissions popup, so the label
             # can never claim a preset the Codex TUI wasn't switched to. Codex owns
             # the durable approval state (its own session config); the label is the
@@ -3200,7 +3273,12 @@ def register_core_routes(
                 requested_codex_approval_mode,
                 _approval_result,
             )
-            labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
+            if not sdk_approval_mode:
+                labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = (
+                    requested_codex_approval_mode
+                )
+        if requested_codex_approval_mode is not None and sdk_approval_mode and live_forward:
+            labels_to_set[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before
@@ -3227,10 +3305,20 @@ def register_core_routes(
                 session_id,
                 labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
             )
+        if CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY in labels_to_set:
+            _publish_permission_mode(
+                session_id,
+                labels_to_set[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY],
+            )
         if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
             _publish_codex_approval_mode(
                 session_id,
                 labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY],
+            )
+        if CODEX_SDK_APPROVAL_MODE_LABEL_KEY in labels_to_set:
+            _publish_codex_approval_mode(
+                session_id,
+                labels_to_set[CODEX_SDK_APPROVAL_MODE_LABEL_KEY],
             )
         # Archiving means "get this out of my way", which contradicts a pin
         # ("keep it at the top"), so drop the archiver's own pin — otherwise the

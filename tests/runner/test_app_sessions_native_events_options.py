@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.entities import Conversation
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
@@ -20,6 +21,7 @@ from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -469,6 +471,90 @@ async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
     assert resp.status_code == 204, (
         f"Non-native permission_mode_change must 204 no-op; got {resp.status_code}: {resp.text}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "field", "initial", "changed", "label_key", "event_type"),
+    [
+        (
+            "claude-sdk",
+            "permission_mode",
+            "plan",
+            "bypassPermissions",
+            "omnigent.claude_sdk.permission_mode",
+            "permission_mode_change",
+        ),
+        (
+            "codex",
+            "approval_mode",
+            "read-only",
+            "full-access",
+            "omnigent.codex_sdk.approval_mode",
+            "codex_approval_mode_change",
+        ),
+    ],
+)
+async def test_sdk_permission_snapshot_and_event_reach_next_turn(
+    harness: str, field: str, initial: str, changed: str, label_key: str, event_type: str
+) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(frames)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    sid = uuid.uuid4().hex
+    agent_id = uuid.uuid4().hex
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        agent_id=agent_id,
+        root_conversation_id=sid,
+        labels={label_key: initial},
+    )
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json=build_runner_session_init_payload(conv, server_version="0.6.0")
+        )
+        assert created.status_code == 201, created.text
+        for index, value in enumerate((initial, changed), start=1):
+            if index == 2:
+                updated = await client.post(
+                    f"/v1/sessions/{sid}/events", json={"type": event_type, field: value}
+                )
+                assert updated.status_code == 200, updated.text
+                assert updated.json() == {field: value}
+            turn = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"turn {index}"}],
+                    "model": "t",
+                },
+            )
+            assert turn.status_code in (200, 202), turn.text
+            for _ in range(100):
+                if len(harness_client.posted_bodies) >= index:
+                    break
+                await asyncio.sleep(0.02)
+            assert len(harness_client.posted_bodies) >= index
+            assert harness_client.posted_bodies[index - 1][field] == value
 
 
 @pytest.mark.asyncio

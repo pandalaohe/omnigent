@@ -10,19 +10,31 @@ from __future__ import annotations
 import uuid
 
 import pytest
+import sqlalchemy as sa
 
-from omnigent.db.db_models import workspace_scope
+from omnigent.db.db_models import uuid_to_bytes, workspace_scope
+from omnigent.db.utils import get_or_create_engine
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
-# scheduled_tasks.id / scheduled_task_runs.id / scheduled_task_id are Uuid16
-# columns (16 raw bytes), read back as bare 32-char hex strings. ``_uid`` maps a
-# readable seed to a deterministic bare-hex UUID so tests stay legible while the
-# store still round-trips real UUIDs. agent_id / user_id / conversation_id
-# stay plain strings — those columns are still ``String``.
+# scheduled_tasks.id / agent_id / scheduled_task_runs.id / scheduled_task_id are
+# Uuid16 columns (16 raw bytes), read back as bare 32-char hex strings. ``_uid``
+# maps a readable seed to a deterministic bare-hex UUID so tests stay legible
+# while the store still round-trips real UUIDs. custom_agent_id / user_id /
+# conversation_id are plain strings.
 def _uid(seed: str) -> str:
     """Deterministic bare 32-char hex UUID string from a short readable seed."""
     return uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex
+
+
+def _raw_binding(db_uri: str, task_id: str) -> tuple[object, object]:
+    """Read a task's ``(agent_id, custom_agent_id)`` columns, bypassing the entity map."""
+    engine = get_or_create_engine(db_uri)
+    with engine.connect() as conn:
+        return conn.execute(
+            sa.text('SELECT "agent_id", "custom_agent_id" FROM "scheduled_tasks" WHERE id = :id'),
+            {"id": uuid_to_bytes(task_id)},
+        ).one()
 
 
 @pytest.fixture()
@@ -76,6 +88,34 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.last_run_conversation_id is None
     assert task.created_at > 0
     assert task.updated_at is None
+
+
+def test_create_library_agent_round_trips_through_custom_agent_column(
+    store: SqlAlchemyScheduledTaskStore,
+    db_uri: str,
+) -> None:
+    """A ``ca_`` id binds ``custom_agent_id``; ``agent_id`` stays NULL.
+
+    The entity exposes one ``agent_id`` string, while the row keeps the column
+    its id shape belongs to — the binary column never receives a non-uuid.
+    """
+    ca_id = "ca_1234567890abcdef1234567890abcdef"
+    task = store.create(
+        scheduled_task_id=_uid("st_library"),
+        name="library",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=ca_id,
+        timezone="UTC",
+    )
+    assert task.agent_id == ca_id
+    reread = store.get(_uid("st_library"))
+    assert reread is not None and reread.agent_id == ca_id
+
+    agent_column, custom_agent_column = _raw_binding(db_uri, _uid("st_library"))
+    assert agent_column is None
+    assert custom_agent_column == ca_id
 
 
 def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -467,6 +507,41 @@ def test_update_rebinds_agent_and_keeps_run_history(
     assert [r.id for r in runs] == [_uid("sr_old")]
     # The completed run keeps the conversation it actually ran in.
     assert runs[0].conversation_id == _uid("conv_old")
+
+
+def test_update_rebind_switches_the_binding_column(
+    store: SqlAlchemyScheduledTaskStore,
+    db_uri: str,
+) -> None:
+    """Rebinding to a ``ca_`` id (and back) moves the value between columns.
+
+    A rebind must clear the other column, or the row would hold two bindings
+    and trip ``ck_scheduled_tasks_agent_binding``.
+    """
+    stored_agent = _uid("ag_column_switch")
+    ca_id = "ca_abcdefabcdefabcdefabcdefabcdefab"
+    store.create(
+        scheduled_task_id=_uid("st_switch"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=stored_agent,
+        timezone="UTC",
+    )
+
+    updated = store.update(_uid("st_switch"), agent_id=ca_id)
+    assert updated is not None and updated.agent_id == ca_id
+    agent_column, custom_agent_column = _raw_binding(db_uri, _uid("st_switch"))
+    assert agent_column is None
+    assert custom_agent_column == ca_id
+
+    switched_back = _uid("ag_column_switch_back")
+    updated = store.update(_uid("st_switch"), agent_id=switched_back)
+    assert updated is not None and updated.agent_id == switched_back
+    agent_column, custom_agent_column = _raw_binding(db_uri, _uid("st_switch"))
+    assert agent_column == uuid_to_bytes(switched_back)
+    assert custom_agent_column is None
 
 
 def test_update_omitting_agent_id_leaves_the_binding_unchanged(

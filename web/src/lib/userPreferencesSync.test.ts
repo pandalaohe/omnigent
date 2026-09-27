@@ -114,6 +114,21 @@ describe("user preference synchronization", () => {
     expect(readApprovalTimeoutPreferences()).toEqual({ timeoutMinutes: 5, stopTurn: false });
   });
 
+  it("collects and hydrates the Agent pins namespace", async () => {
+    const pins = { ids: ["ag_polly", "ca_reviewer"] };
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify(pins));
+    expect(collectLocalUserPreferences().settings.agent_pins).toEqual(pins);
+
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { agent_pins: { ids: ["ca_reviewer"] } } },
+      vi.fn(),
+    );
+
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins") ?? "null")).toEqual({
+      ids: ["ca_reviewer"],
+    });
+  });
+
   it("cancels queued sync when switching to an older Server", async () => {
     vi.useFakeTimers();
     const currentServer = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));

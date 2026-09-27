@@ -1122,6 +1122,7 @@ describe("Composer slash-command submit routing", () => {
     { kind: "opencode", reset: true },
     { kind: "acp", reset: true },
     { kind: "configured", reset: true },
+    { kind: "sdk", reset: true },
     { kind: null, reset: true },
     { kind: null, reset: true, terminalFirst: true, harness: "claude-sdk" },
     { kind: "codex", reset: false },
@@ -1188,7 +1189,10 @@ describe("Composer slash-command submit routing", () => {
       setModel.mockClear();
       fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
       await waitFor(() =>
-        expect(setModel).toHaveBeenCalledWith(row.reset ? null : "primary", expect.anything()),
+        expect(setModel).toHaveBeenCalledWith(
+          row.reset && row.kind !== "sdk" ? null : "primary",
+          expect.anything(),
+        ),
       );
     }
   });
@@ -4923,6 +4927,7 @@ describe("Composer config gear", () => {
     "devin",
     "acp",
     "configured",
+    "sdk",
   ] as const)("selects alternate and reapplies the %s default row", async (modelPickerKind) => {
     const options = [
       { id: "primary", displayName: "Primary", isDefault: true },
@@ -5158,6 +5163,62 @@ describe("Composer config gear", () => {
     expect(screen.getByTestId("composer-agent-models")).toBeTruthy();
     expect(screen.queryByTestId("composer-config-smart-routing")).toBeNull();
   });
+
+  it.each([
+    { harness: "claude-sdk", efforts: ["low", "medium", "high", "xhigh", "max"] },
+    { harness: "codex", efforts: ["high", "max", "ultra"] },
+  ])(
+    "shows server models and $harness efforts in the SDK composer",
+    async ({ harness, efforts }) => {
+      const options = [
+        { id: "old", displayName: "Old", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+        {
+          id: "new",
+          displayName: "New",
+          supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })),
+        },
+      ];
+      const setModel = vi.fn().mockResolvedValue(undefined);
+      const setEffort = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({
+        sessionHarness: harness,
+        sessionModelOverride: "new",
+        llmModel: "old",
+        setModel,
+        setEffort,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            modelPickerKind: "sdk",
+            showModels: true,
+            showEffort: true,
+            effortLevels: efforts,
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      expect(screen.getByTestId("composer-agent-model-new")).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+      expect(screen.getByRole("menuitemcheckbox", { name: "Old (running)" })).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+      fireEvent.click(screen.getByTestId("composer-agent-model-old"));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith("old", { expectConfirmation: false }),
+      );
+      await openSessionEfforts();
+      for (const effort of efforts) {
+        expect(screen.getByTestId(`composer-agent-effort-${effort}`)).toBeVisible();
+      }
+      fireEvent.click(screen.getByTestId(`composer-agent-effort-${efforts[0]}`));
+      await waitFor(() => expect(setEffort).toHaveBeenCalledWith(efforts[0]));
+    },
+  );
 
   it("serializes immediate model and effort changes", async () => {
     // Claude-native types /model and /effort as separate terminal commands, so

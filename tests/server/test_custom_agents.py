@@ -13,7 +13,7 @@ import pytest
 import yaml
 from starlette.requests import HTTPConnection
 
-from omnigent.db.utils import generate_agent_id
+from omnigent.db.utils import builtin_agent_id, generate_agent_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
@@ -21,6 +21,7 @@ from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.custom_agent_bundles import patch_bundle
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.routes import custom_agents as custom_agents_routes
+from omnigent.spec.parser import _ConfigYamlLoader
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -33,7 +34,11 @@ class HeaderAuth(AuthProvider):
         return request.headers.get("x-test-user")
 
 
-def bundle(config: str | None = None) -> bytes:
+def bundle(
+    config: str | None = None,
+    subagent: str | None = None,
+    extra: dict[str, bytes] | None = None,
+) -> bytes:
     entries = {
         "config.yaml": (
             config
@@ -58,6 +63,9 @@ tools:
         "tools/helper.py": b"# Preserve this bundled executable verbatim\n",
         "assets/data.bin": bytes(range(256)),
     }
+    if subagent is not None:
+        entries["agents/researcher/config.yaml"] = subagent.encode()
+    entries.update(extra or {})
     out = io.BytesIO()
     with tarfile.open(fileobj=out, mode="w:gz") as archive:
         for name, data in entries.items():
@@ -68,9 +76,65 @@ tools:
     return out.getvalue()
 
 
+def joint_bundle() -> bytes:
+    return bundle(
+        """spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, model: lead-model, reasoning_effort: high, config: {harness: codex}}
+""",
+        """spec_version: 1
+name: researcher
+description: Research support
+executor: {type: omnigent, model: research-model, reasoning_effort: medium,
+  config: {harness: claude-sdk}}
+""",
+    )
+
+
+_FLAT_AGENT_YAML = """name: flat-reviewer
+description: Flat description
+prompt: Flat instructions
+executor:
+  harness: codex
+  model: test-model
+"""
+
+
+def flat_bundle(config: str) -> bytes:
+    """A single-file saved Agent: one root ``agent.yaml``, no ``config.yaml``."""
+    out = io.BytesIO()
+    data = config.encode()
+    with tarfile.open(fileobj=out, mode="w:gz") as archive:
+        info = tarfile.TarInfo("agent.yaml")
+        info.size = len(data)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(data))
+    return out.getvalue()
+
+
 def members(data: bytes) -> dict[str, tuple[bytes, int]]:
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
         return {m.name: (archive.extractfile(m).read(), m.mode) for m in archive if m.isfile()}
+
+
+def roster_member(
+    name: str,
+    *,
+    lead: bool = False,
+    harness: str = "codex",
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    description: str | None = None,
+) -> dict[str, object]:
+    return {
+        "name": name,
+        "description": description,
+        "harness": harness,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "lead": lead,
+    }
 
 
 def make_app(db_uri: str, tmp_path: Path):
@@ -88,6 +152,1061 @@ def make_app(db_uri: str, tmp_path: Path):
         permission_store=permissions,
     )
     return app, artifacts, agents, conversations, permissions
+
+
+@pytest.mark.asyncio
+async def test_create_single_member_projection(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    data = bundle("""spec_version: 1
+name: solo
+executor: {type: omnigent, model: solo-model, reasoning_effort: high, config: {harness: codex}}
+""")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", data)},
+        )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["members"] == [
+        {
+            "name": "solo",
+            "description": None,
+            "harness": "codex",
+            "model": "solo-model",
+            "reasoning_effort": "high",
+            "lead": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_multi_member_projection(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", joint_bundle())},
+        )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["members"] == [
+        {
+            "name": "custom-reviewer",
+            "description": "Lead reviewer",
+            "harness": "codex",
+            "model": "lead-model",
+            "reasoning_effort": "high",
+            "lead": True,
+        },
+        {
+            "name": "researcher",
+            "description": "Research support",
+            "harness": "claude-sdk",
+            "model": "research-model",
+            "reasoning_effort": "medium",
+            "lead": False,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_returns_stored_members_without_artifact_read(
+    db_uri: str, tmp_path: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", joint_bundle())},
+        )
+        assert created.status_code == 201, created.text
+        CustomAgentsStore(db_uri).create(
+            "alice",
+            {
+                "id": "ca_legacy_list",
+                "name": "legacy",
+                "harness": "codex",
+                "bundle_location": "unused",
+            },
+        )
+
+        def unexpected_get(_location: str) -> bytes:
+            raise AssertionError("list read an artifact")
+
+        monkeypatch.setattr(artifacts, "get", unexpected_get)
+        listed = await client.get("/v1/custom-agents", headers={"x-test-user": "alice"})
+
+    assert listed.status_code == 200, listed.text
+    rows = {row["id"]: row for row in listed.json()["data"]}
+    assert rows[created.json()["id"]]["members"] == created.json()["members"]
+    assert rows["ca_legacy_list"]["members"] is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_detail_backfills_members_without_version_change(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    data = joint_bundle()
+    agent_id = "ca_legacy_detail"
+    location = bundle_location(agent_id, data)
+    artifacts.put(location, data)
+    before = CustomAgentsStore(db_uri).create(
+        "alice",
+        {
+            "id": agent_id,
+            "name": "custom-reviewer",
+            "description": "Lead reviewer",
+            "harness": "codex",
+            "model": "lead-model",
+            "bundle_location": location,
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        detail = await client.get(
+            f"/v1/custom-agents/{agent_id}", headers={"x-test-user": "alice"}
+        )
+        listed = await client.get("/v1/custom-agents", headers={"x-test-user": "alice"})
+
+    assert detail.status_code == 200, detail.text
+    assert [member["reasoning_effort"] for member in detail.json()["members"]] == [
+        "high",
+        "medium",
+    ]
+    assert detail.json()["members"][1]["model"] == "research-model"
+    assert listed.json()["data"][0]["members"] == detail.json()["members"]
+    assert detail.json()["version"] == before["version"]
+    assert detail.json()["updated_at"] == before["updated_at"]
+
+
+@pytest.mark.asyncio
+async def test_patch_rederives_lead_model_from_bundle(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    data = bundle("""spec_version: 1
+name: custom-reviewer
+executor: {type: omnigent, model: newer-model, config: {harness: codex}}
+""")
+    agent_id = "ca_stale_model"
+    location = bundle_location(agent_id, data)
+    artifacts.put(location, data)
+    CustomAgentsStore(db_uri).create(
+        "alice",
+        {
+            "id": agent_id,
+            "name": "custom-reviewer",
+            "harness": "codex",
+            "model": "older-model",
+            "bundle_location": location,
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers={"x-test-user": "alice"},
+            json={"name": "renamed"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == "newer-model"
+    assert response.json()["members"][0]["model"] == "newer-model"
+
+
+@pytest.mark.asyncio
+async def test_patch_members_rewrites_bundle_row_and_projection(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle()
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="claude-sdk",
+            model="lead-2",
+            reasoning_effort="high",
+            description="Joint lead",
+        ),
+        roster_member(
+            "researcher",
+            harness="codex",
+            model="research-model",
+            reasoning_effort="medium",
+            description="Research support",
+        ),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", original)},
+        )
+        assert created.status_code == 201, created.text
+        agent_id = created.json()["id"]
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers={"x-test-user": "alice"},
+            json={"members": roster, "description": "Joint lead", "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["members"] == roster
+        assert response.json()["harness"] == "claude-sdk"
+        assert response.json()["model"] == "lead-2"
+        assert response.json()["description"] == "Joint lead"
+        assert response.json()["version"] == 2
+        downloaded = (
+            await client.get(
+                f"/v1/custom-agents/{agent_id}/contents", headers={"x-test-user": "alice"}
+            )
+        ).content
+
+    before, after = members(original), members(downloaded)
+    root = yaml.safe_load(after["config.yaml"][0])
+    original_root = yaml.safe_load(before["config.yaml"][0])
+    assert root["executor"]["config"]["harness"] == "claude-sdk"
+    assert root["executor"]["model"] == "lead-2"
+    assert root["executor"]["reasoning_effort"] == "high"
+    assert root["tools"]["agents"] == ["researcher"]
+    assert root["tools"]["remote"] == original_root["tools"]["remote"]
+    assert root["spawn"] is True
+    for name in ("prompts/custom.md", "tools/helper.py", "assets/data.bin"):
+        assert after[name] == before[name]
+    sub = yaml.safe_load(after["agents/researcher/config.yaml"][0])
+    assert sub["name"] == "researcher"
+    assert sub["description"] == "Research support"
+    assert sub["executor"]["config"]["harness"] == "codex"
+    assert sub["executor"]["model"] == "research-model"
+    assert sub["executor"]["reasoning_effort"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_patch_members_stale_version_writes_nothing(
+    db_uri: str, tmp_path: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle()
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member("custom-reviewer", lead=True, harness="codex", model="lead-2"),
+        roster_member("researcher", harness="codex", model="research-model"),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        agent_id = created.json()["id"]
+        writes: list[str] = []
+        original_put = artifacts.put
+
+        def record_put(location: str, data: bytes) -> None:
+            writes.append(location)
+            original_put(location, data)
+
+        monkeypatch.setattr(artifacts, "put", record_put)
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": roster, "version": 2},
+        )
+        contents = await client.get(f"/v1/custom-agents/{agent_id}/contents", headers=headers)
+
+    assert response.status_code == 409, response.text
+    assert writes == []
+    assert contents.content == original
+    row = CustomAgentsStore(db_uri).get("alice", agent_id)
+    assert row["version"] == 1
+    assert (row["harness"], row["model"]) == ("codex", "test-model")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param(
+            {"members": [roster_member("researcher")], "version": 1},
+            id="no-lead",
+        ),
+        pytest.param(
+            {
+                "members": [
+                    roster_member("custom-reviewer", lead=True),
+                    roster_member("researcher", lead=True),
+                ],
+                "version": 1,
+            },
+            id="two-leads",
+        ),
+        pytest.param(
+            {
+                "members": [
+                    roster_member("custom-reviewer", lead=True),
+                    roster_member("researcher"),
+                    roster_member("researcher"),
+                ],
+                "version": 1,
+            },
+            id="duplicate-names",
+        ),
+        pytest.param(
+            {
+                "members": [
+                    roster_member("custom-reviewer", lead=True),
+                    roster_member("researcher"),
+                ]
+            },
+            id="missing-version",
+        ),
+        pytest.param(
+            {
+                "members": [
+                    roster_member("other-name", lead=True),
+                    roster_member("researcher"),
+                ],
+                "version": 1,
+            },
+            id="lead-name-mismatch",
+        ),
+        pytest.param(
+            {
+                "members": [
+                    roster_member("custom-reviewer", lead=True, description="Different"),
+                    roster_member("researcher"),
+                ],
+                "version": 1,
+            },
+            id="lead-description-mismatch",
+        ),
+    ],
+)
+async def test_patch_members_rejects_invalid_roster(
+    db_uri: str, tmp_path: Path, runtime_init: None, changes: dict[str, object]
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", bundle())},
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers={"x-test-user": "alice"},
+            json=changes,
+        )
+
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.asyncio
+async def test_patch_members_rejects_flat_single_file_agent(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = flat_bundle(_FLAT_AGENT_YAML)
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "flat-reviewer",
+            lead=True,
+            harness="claude-sdk",
+            model="lead-2",
+        )
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        agent_id = created.json()["id"]
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        contents = await client.get(f"/v1/custom-agents/{agent_id}/contents", headers=headers)
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["message"] == (
+        "Members can only be edited on a directory Agent bundle (config.yaml); "
+        "this Agent is a single YAML file"
+    )
+    assert contents.status_code == 200
+    assert contents.content == original
+
+
+@pytest.mark.asyncio
+async def test_patch_scalars_on_flat_single_file_agent(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = flat_bundle(_FLAT_AGENT_YAML)
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        agent_id = created.json()["id"]
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"name": "flat-renamed"},
+        )
+        contents = await client.get(f"/v1/custom-agents/{agent_id}/contents", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "flat-renamed"
+    assert response.json()["members"][0]["name"] == "flat-renamed"
+    edited = yaml.safe_load(members(contents.content)["agent.yaml"][0])
+    assert edited["name"] == "flat-renamed"
+    assert edited["prompt"] == "Flat instructions"
+    assert edited["executor"]["model"] == "test-model"
+
+
+@pytest.mark.asyncio
+async def test_patch_members_preserves_imported_sub_agent_config_keys(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle(
+        """spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, model: lead-model, reasoning_effort: high, config: {harness: codex}}
+""",
+        """spec_version: 1
+name: researcher
+description: Research support
+executor: {type: omnigent, model: old-model, reasoning_effort: low, config: {harness: codex}}
+params:
+  keep: me
+""",
+        extra={"agents/researcher/notes.md": b"Keep this file\n"},
+    )
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="lead-2",
+            reasoning_effort="high",
+            description="Lead reviewer",
+        ),
+        roster_member(
+            "researcher",
+            harness="codex",
+            model="new-model",
+            reasoning_effort="high",
+            description="Research support",
+        ),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", original)},
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers={"x-test-user": "alice"},
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        downloaded = (
+            await client.get(
+                f"/v1/custom-agents/{created.json()['id']}/contents",
+                headers={"x-test-user": "alice"},
+            )
+        ).content
+
+    after = members(downloaded)
+    sub = yaml.safe_load(after["agents/researcher/config.yaml"][0])
+    assert sub["params"] == {"keep": "me"}
+    assert sub["description"] == "Research support"
+    assert sub["executor"]["model"] == "new-model"
+    assert sub["executor"]["reasoning_effort"] == "high"
+    assert sub["executor"]["config"]["harness"] == "codex"
+    assert after["agents/researcher/notes.md"][0] == b"Keep this file\n"
+    assert yaml.safe_load(after["config.yaml"][0])["executor"]["model"] == "lead-2"
+
+
+@pytest.mark.asyncio
+async def test_patch_members_drops_role_removed_from_roster(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    lead = roster_member(
+        "custom-reviewer",
+        lead=True,
+        harness="codex",
+        model="lead-model",
+        reasoning_effort="high",
+        description="Lead reviewer",
+    )
+    researcher = roster_member(
+        "researcher",
+        harness="claude-sdk",
+        model="research-model",
+        reasoning_effort="medium",
+        description="Research support",
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers=headers,
+            files={"bundle": ("agent.tar.gz", joint_bundle())},
+        )
+        assert created.status_code == 201, created.text
+        agent_id = created.json()["id"]
+        added = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": [lead, researcher], "version": 1},
+        )
+        assert added.status_code == 200, added.text
+        assert added.json()["version"] == 2
+        trimmed = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": [lead], "version": 2},
+        )
+        assert trimmed.status_code == 200, trimmed.text
+        assert trimmed.json()["members"] == [lead]
+        assert trimmed.json()["version"] == 3
+        downloaded = (
+            await client.get(f"/v1/custom-agents/{agent_id}/contents", headers=headers)
+        ).content
+
+    with tarfile.open(fileobj=io.BytesIO(downloaded)) as archive:
+        assert not any(member.name.startswith("agents/researcher") for member in archive)
+    root = yaml.safe_load(members(downloaded)["config.yaml"][0])
+    assert "agents" not in root["tools"]
+    assert root["spawn"] is True
+
+
+@pytest.mark.asyncio
+async def test_patch_members_detaches_aliased_executor(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle("""spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: &exec {type: omnigent, model: old-model, config: {harness: codex}}
+params:
+  original: *exec
+""")
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="claude-sdk",
+            model="new-model",
+            description="Lead reviewer",
+        )
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        downloaded = (
+            await client.get(f"/v1/custom-agents/{created.json()['id']}/contents", headers=headers)
+        ).content
+
+    parsed = yaml.load(members(downloaded)["config.yaml"][0], Loader=_ConfigYamlLoader)
+    assert parsed["executor"]["model"] == "new-model"
+    assert parsed["params"]["original"]["model"] == "old-model"
+    assert parsed["params"]["original"]["config"]["harness"] == "codex"
+
+
+@pytest.mark.asyncio
+async def test_patch_members_keeps_unrelated_block_style_tools_keys(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle(
+        """spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor:
+  type: omnigent
+  model: lead-model
+  config:
+    harness: codex
+tools:
+  agents:
+    - researcher
+  remote:
+    type: mcp
+    url: https://example.invalid/mcp
+""",
+        """spec_version: 1
+name: researcher
+description: Research support
+executor:
+  type: omnigent
+  model: research-model
+  config:
+    harness: claude-sdk
+""",
+    )
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="lead-model",
+            description="Lead reviewer",
+        ),
+        roster_member(
+            "researcher",
+            harness="claude-sdk",
+            model="research-model",
+            description="Research support",
+        ),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        downloaded = (
+            await client.get(f"/v1/custom-agents/{created.json()['id']}/contents", headers=headers)
+        ).content
+
+    root = yaml.safe_load(members(downloaded)["config.yaml"][0])
+    assert root["tools"]["agents"] == ["researcher"]
+    assert root["tools"]["remote"] == {"type": "mcp", "url": "https://example.invalid/mcp"}
+    assert validate_agent_bundle(downloaded).tools.agents == ["researcher"]
+
+
+@pytest.mark.asyncio
+async def test_patch_members_removes_legacy_sub_agent_llm_model(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle(
+        """spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, model: lead-model, config: {harness: codex}}
+""",
+        """spec_version: 1
+name: researcher
+description: Research support
+executor: {type: omnigent, config: {harness: codex}}
+llm: {model: old-model, reasoning_effort: high}
+""",
+    )
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="lead-model",
+            description="Lead reviewer",
+        ),
+        roster_member("researcher", harness="codex", description="Research support"),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["members"][1]["model"] is None
+        assert response.json()["members"][1]["reasoning_effort"] is None
+        downloaded = (
+            await client.get(f"/v1/custom-agents/{created.json()['id']}/contents", headers=headers)
+        ).content
+
+    sub = yaml.safe_load(members(downloaded)["agents/researcher/config.yaml"][0])
+    assert "llm" not in sub
+    assert "model" not in sub["executor"]
+    assert "reasoning_effort" not in sub["executor"]
+
+
+@pytest.mark.asyncio
+async def test_patch_members_keeps_legacy_root_llm_block_valid(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle("""spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, config: {harness: codex}}
+llm: {model: old-model, temperature: 0.7}
+""")
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="new-model",
+            description="Lead reviewer",
+        )
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        assert [member["model"] for member in response.json()["members"]] == ["new-model"]
+        downloaded = (
+            await client.get(f"/v1/custom-agents/{created.json()['id']}/contents", headers=headers)
+        ).content
+
+    root = yaml.load(members(downloaded)["config.yaml"][0], Loader=_ConfigYamlLoader)
+    assert root["llm"] == {"model": "new-model", "temperature": 0.7}
+    assert validate_agent_bundle(downloaded).executor.model == "new-model"
+
+
+@pytest.mark.asyncio
+async def test_patch_members_rejects_clearing_legacy_root_llm_model(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle("""spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, config: {harness: codex}}
+llm: {model: old-model, temperature: 0.7}
+""")
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member("custom-reviewer", lead=True, harness="codex", description="Lead reviewer")
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        agent_id = created.json()["id"]
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        contents = await client.get(f"/v1/custom-agents/{agent_id}/contents", headers=headers)
+
+    assert response.status_code == 400, response.text
+    message = response.json()["error"]["message"]
+    assert "custom-reviewer" in message
+    assert "legacy llm block requires a model" in message
+    assert contents.content == original
+    assert CustomAgentsStore(db_uri).get("alice", agent_id)["version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_patch_members_matches_sub_agent_by_yaml_name(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle(
+        """spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, model: lead-model, config: {harness: codex}}
+""",
+        extra={
+            "agents/research-dir/config.yaml": b"""spec_version: 1
+name: researcher
+description: Research support
+executor: {type: omnigent, model: old-model, config: {harness: codex}}
+""",
+            "agents/research-dir/notes.md": b"Keep this file\n",
+        },
+    )
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="lead-model",
+            description="Lead reviewer",
+        ),
+        roster_member(
+            "researcher",
+            harness="claude-sdk",
+            model="new-model",
+            description="Research support",
+        ),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        downloaded = (
+            await client.get(f"/v1/custom-agents/{created.json()['id']}/contents", headers=headers)
+        ).content
+
+    after = members(downloaded)
+    assert "agents/researcher/config.yaml" not in after
+    assert after["agents/research-dir/notes.md"][0] == b"Keep this file\n"
+    sub = yaml.safe_load(after["agents/research-dir/config.yaml"][0])
+    assert sub["name"] == "researcher"
+    assert sub["description"] == "Research support"
+    assert sub["executor"]["model"] == "new-model"
+    assert sub["executor"]["config"]["harness"] == "claude-sdk"
+
+
+@pytest.mark.asyncio
+async def test_patch_members_moves_new_role_off_retained_directory(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle(
+        """spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, model: lead-model, config: {harness: codex}}
+""",
+        extra={
+            "agents/research-dir/config.yaml": b"""spec_version: 1
+name: researcher
+description: Research support
+executor: {type: omnigent, model: old-model, config: {harness: codex}}
+params:
+  keep: me
+""",
+            "agents/research-dir/notes.md": b"Keep this file\n",
+        },
+    )
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="lead-model",
+            description="Lead reviewer",
+        ),
+        roster_member(
+            "researcher",
+            harness="claude-sdk",
+            model="new-model",
+            description="Research support",
+        ),
+        roster_member(
+            "research-dir",
+            harness="codex",
+            model="dir-model",
+            description="Directory support",
+        ),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["members"] == roster
+        downloaded = (
+            await client.get(f"/v1/custom-agents/{created.json()['id']}/contents", headers=headers)
+        ).content
+
+    after = members(downloaded)
+    assert after["agents/research-dir/notes.md"][0] == b"Keep this file\n"
+    retained = yaml.safe_load(after["agents/research-dir/config.yaml"][0])
+    assert retained["name"] == "researcher"
+    assert retained["params"] == {"keep": "me"}
+    assert retained["executor"]["config"]["harness"] == "claude-sdk"
+    assert retained["executor"]["model"] == "new-model"
+    added = yaml.safe_load(after["agents/research-dir-2/config.yaml"][0])
+    assert added["name"] == "research-dir"
+    assert added["executor"]["config"]["harness"] == "codex"
+    assert added["executor"]["model"] == "dir-model"
+    assert validate_agent_bundle(downloaded).tools.agents == ["researcher", "research-dir"]
+
+
+@pytest.mark.asyncio
+async def test_patch_members_reuses_dropped_role_directory(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle(
+        """spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {type: omnigent, model: lead-model, config: {harness: codex}}
+""",
+        extra={
+            "agents/old-dir/config.yaml": b"""spec_version: 1
+name: old
+description: Old support
+executor: {type: omnigent, model: old-model, config: {harness: codex}}
+""",
+            "agents/old-dir/extra.txt": b"Drop this file\n",
+        },
+    )
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="lead-model",
+            description="Lead reviewer",
+        ),
+        roster_member(
+            "old-dir",
+            harness="codex",
+            model="dir-model",
+            description="Directory support",
+        ),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        downloaded = (
+            await client.get(f"/v1/custom-agents/{created.json()['id']}/contents", headers=headers)
+        ).content
+
+    after = members(downloaded)
+    assert {name for name in after if name.startswith("agents/old-dir/")} == {
+        "agents/old-dir/config.yaml"
+    }
+    added = yaml.safe_load(after["agents/old-dir/config.yaml"][0])
+    assert added["name"] == "old-dir"
+    assert added["executor"]["model"] == "dir-model"
+    assert validate_agent_bundle(downloaded).tools.agents == ["old-dir"]
+
+
+@pytest.mark.asyncio
+async def test_patch_members_preserves_request_order(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = bundle()
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="lead-model",
+            description="Original description",
+        ),
+        roster_member("zulu", harness="codex", model="zulu-model", description="Zulu support"),
+        roster_member("alpha", harness="codex", model="alpha-model", description="Alpha support"),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.patch(
+            f"/v1/custom-agents/{created.json()['id']}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["members"] == roster
 
 
 @pytest.mark.asyncio
@@ -171,7 +1290,7 @@ async def test_import_requires_owner_and_retains_archive(
     db_uri: str, tmp_path: Path, runtime_init: None
 ) -> None:
     app, artifacts, agents, conversations, permissions = make_app(db_uri, tmp_path)
-    original = bundle()
+    original = joint_bundle()
     runtime_id = generate_agent_id()
     location = bundle_location(runtime_id, original)
     artifacts.put(location, original)
@@ -195,6 +1314,7 @@ async def test_import_requires_owner_and_retains_archive(
             "/v1/custom-agents", headers={"x-test-user": "alice"}, json=payload
         )
         assert created.status_code == 201, created.text
+        assert created.json()["members"][1]["reasoning_effort"] == "medium"
         contents = await client.get(
             f"/v1/custom-agents/{created.json()['id']}/contents", headers={"x-test-user": "alice"}
         )
@@ -220,6 +1340,165 @@ async def test_import_requires_owner_and_retains_archive(
             content="{}",
         )
         assert bad_type.status_code == 415
+
+
+@pytest.mark.asyncio
+async def test_duplicate_builtin_agent_from_agent_id(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    alice = {"x-test-user": "alice"}
+    source = joint_bundle()
+    builtin_id = builtin_agent_id("polly")
+    location = bundle_location(builtin_id, source)
+    artifacts.put(location, source)
+    agents.create(builtin_id, "polly", location)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        builtin = next(
+            agent
+            for agent in (await client.get("/v1/agents", headers=alice)).json()["data"]
+            if agent["id"] == builtin_id
+        )
+        response = await client.post(
+            "/v1/custom-agents", headers=alice, json={"source_agent_id": builtin_id}
+        )
+        assert response.status_code == 201, response.text
+        copy = response.json()
+        assert copy["id"].startswith("ca_")
+        expected_members = [
+            {
+                "name": "custom-reviewer",
+                "description": "Lead reviewer",
+                "harness": "codex",
+                "model": "lead-model",
+                "reasoning_effort": "high",
+                "lead": True,
+            },
+            {
+                "name": "researcher",
+                "description": "Research support",
+                "harness": "claude-sdk",
+                "model": "research-model",
+                "reasoning_effort": "medium",
+                "lead": False,
+            },
+        ]
+        # The copy's projection is the built-in's own catalog projection.
+        assert builtin["members"] == expected_members
+        assert copy["members"] == builtin["members"]
+        # The bundle is copied byte-for-byte; no session label step runs.
+        contents = await client.get(f"/v1/custom-agents/{copy['id']}/contents", headers=alice)
+        assert contents.status_code == 200, contents.text
+        assert contents.content == source
+
+        patched = await client.patch(
+            f"/v1/custom-agents/{copy['id']}",
+            headers=alice,
+            json={"members": copy["members"], "version": copy["version"]},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["version"] == copy["version"] + 1
+        assert patched.json()["members"] == copy["members"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_builtin_agent_rejects_unknown_and_session_scoped_ids(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, agents, conversations, _permissions = make_app(db_uri, tmp_path)
+    alice = {"x-test-user": "alice"}
+    source = joint_bundle()
+    runtime_id = generate_agent_id()
+    location = bundle_location(runtime_id, source)
+    artifacts.put(location, source)
+    conversations.create_session_with_agent(
+        agent_id=runtime_id,
+        agent_name="custom-reviewer",
+        agent_bundle_location=location,
+        agent_description=None,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for source_agent_id in (generate_agent_id(), runtime_id):
+            response = await client.post(
+                "/v1/custom-agents", headers=alice, json={"source_agent_id": source_agent_id}
+            )
+            assert response.status_code == 404, response.text
+            assert response.json()["error"]["message"] == "Built-in Agent not found"
+
+        # A registered template with a random id (e.g. ``--agent``) is a
+        # template row, yet not a built-in.
+        template_id = generate_agent_id()
+        template_location = bundle_location(template_id, source)
+        artifacts.put(template_location, source)
+        agents.create(template_id, "operator-template", template_location)
+        response = await client.post(
+            "/v1/custom-agents", headers=alice, json={"source_agent_id": template_id}
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["message"] == "Built-in Agent not found"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_builtin_agent_rejects_orphaned_session_agent(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, agents, conversations, _permissions = make_app(db_uri, tmp_path)
+    alice = {"x-test-user": "alice"}
+    source = joint_bundle()
+    runtime_id = generate_agent_id()
+    location = bundle_location(runtime_id, source)
+    artifacts.put(location, source)
+    snapshot = conversations.create_session_with_agent(
+        agent_id=runtime_id,
+        agent_name="custom-reviewer",
+        agent_bundle_location=location,
+        agent_description=None,
+    )
+    # A session delete commits its conversation rows first; when the separate
+    # agent-cleanup transaction fails, the session-kind row survives with no
+    # conversation left to derive session_id from.
+    from sqlalchemy import delete as sa_delete
+
+    from omnigent.db.db_models import SqlConversation
+    from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+
+    engine = get_or_create_engine(db_uri)
+    with make_managed_session_maker(engine)() as session:
+        session.execute(
+            sa_delete(SqlConversation).where(SqlConversation.id == snapshot.conversation.id)
+        )
+    orphan = agents.get(runtime_id)
+    assert orphan is not None and orphan.session_id is None
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/custom-agents", headers=alice, json={"source_agent_id": runtime_id}
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["message"] == "Built-in Agent not found"
+        listed = await client.get("/v1/custom-agents", headers=alice)
+        assert listed.json()["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_import_source_requires_exactly_one_field(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    alice = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for payload in ({}, {"source_session_id": "conv_x", "source_agent_id": "ag_x"}):
+            response = await client.post("/v1/custom-agents", headers=alice, json=payload)
+            assert response.status_code == 422, response.text
+            assert "source_session_id" in response.json()["detail"]
+            assert "source_agent_id" in response.json()["detail"]
 
 
 def test_patch_block_scalar_keeps_following_yaml_and_empty_instructions() -> None:

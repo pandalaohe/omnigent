@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { PlusIcon } from "lucide-react";
+import { PinIcon, PinOffIcon, PlusIcon } from "lucide-react";
+
+import { AgentEditor, BuiltinAgentView, memberSettings } from "@/components/AgentEditor";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import {
@@ -8,18 +10,34 @@ import {
   writeAgentBadgePreferences,
   type AgentBadgeValue,
 } from "@/lib/agentBadgePreferences";
-import { partitionAgentsByKind, selectableSessionAgents } from "@/lib/agentGrouping";
+import {
+  isAcpHarnessAgent,
+  isSdkAgent,
+  partitionAgentsByKind,
+  selectableSessionAgents,
+} from "@/lib/agentGrouping";
+import {
+  MAX_PINNED_AGENTS,
+  resolvePinnedAgentIds,
+  unpinAgent,
+  useAgentPins,
+} from "@/lib/agentPins";
+import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { buildAgentBundle } from "@/lib/agentBundle";
 import {
   CUSTOM_AGENTS_QUERY_KEY,
   createCustomAgent,
+  customAgentForPicker,
   deleteCustomAgent,
+  duplicateBuiltinAgent,
   getCustomAgent,
   importCustomAgent,
   updateCustomAgent,
   useCustomAgents,
   type CustomAgent,
+  type CustomAgentMember,
 } from "@/lib/customAgentsApi";
+import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
 import { AgentBadge } from "./AgentBadge";
 import { AgentBadgeEditor } from "./AgentBadgeEditor";
 import { Button } from "./ui/button";
@@ -34,7 +52,53 @@ import {
   DialogFooter,
   DialogDescription,
 } from "./ui/dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { CreateAgentDialog } from "@/shell/CreateAgentDialog";
+
+const PIN_LIMIT_HINT = `Up to ${MAX_PINNED_AGENTS} Agents can be pinned`;
+
+// Pin toggle for one Agent row: toggles wait for both Agent lists, and
+// unpinned rows past the cap show a hint. A disabled button swallows pointer
+// events, so the tooltip hangs off a wrapper span.
+function PinToggle({
+  agentId,
+  name,
+  pinned,
+  canPin,
+  ready,
+  onToggle,
+}: {
+  agentId: string;
+  name: string;
+  pinned: boolean;
+  canPin: boolean;
+  ready: boolean;
+  onToggle: (agentId: string) => void;
+}) {
+  const capBlocked = !pinned && !canPin;
+  const disabled = capBlocked || !ready;
+  const button = (
+    <Button
+      variant="ghost"
+      size="sm"
+      aria-label={`${pinned ? "Unpin" : "Pin"} ${name}`}
+      aria-pressed={pinned}
+      disabled={disabled}
+      onClick={() => onToggle(agentId)}
+    >
+      {pinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+    </Button>
+  );
+  if (!capBlocked || !ready) return button;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex">{button}</span>
+      </TooltipTrigger>
+      <TooltipContent>{PIN_LIMIT_HINT}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 function saveBadge(agentId: string, value: AgentBadgeValue | null) {
   const preferences = readAgentBadgePreferences();
@@ -48,19 +112,85 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "The Agent could not be saved.";
 }
 
+/** One-line roster summary for a saved Agent; `members` arrives lead-first. */
+function rosterSummary(members: CustomAgentMember[], labels: Record<string, string>): string {
+  const [lead, ...others] = members;
+  if (others.length === 0) return memberSettings(lead, labels);
+  return `${members.length} members · ${lead.name} (Lead), ${others
+    .map((member) => member.name)
+    .join(", ")}`;
+}
+
+function builtinSubtitle(agent: AvailableAgent): string {
+  const count = agent.members?.length ?? 0;
+  return [agent.description, count > 1 ? `${count} members` : null, "read-only"]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/**
+ * A built-in with an editable roster. Harness-backed built-ins (native CLIs,
+ * ACP agents) are flat executor specs with no member settings, so they only
+ * get a badge surface here.
+ */
+function isMemberBuiltin(agent: AvailableAgent): boolean {
+  return !isNativeCodingAgent(agent) && !isAcpHarnessAgent(agent);
+}
+
 export function AgentsSettings() {
   const queryClient = useQueryClient();
   const catalog = useCustomAgents();
   const available = useAvailableAgents();
   const preferences = useAgentBadgePreferences();
-  const { builtins } = partitionAgentsByKind(selectableSessionAgents(available.data ?? []));
+  const harnessLabels = useBrainHarnessLabels();
+  // The Built-in list is the picker's built-in partition, harness rows
+  // included; only the member-Agent rows carry the layer's controls.
+  const builtinAgents = useMemo(
+    () => partitionAgentsByKind(selectableSessionAgents(available.data ?? [])).builtins,
+    [available.data],
+  );
+  const memberBuiltinAgents = useMemo(() => builtinAgents.filter(isMemberBuiltin), [builtinAgents]);
+  // Pins address rows the way the picker does: a built-in by its /v1/agents
+  // id, a saved Agent by its `ca_` id via customAgentForPicker. Toggling
+  // writes the whole resolved list, materializing the Polly + Debby default.
+  const { storedIds: storedPinnedIds, setPinnedIds } = useAgentPins();
+  // Toggling writes the list resolved against the rows on screen, so it waits
+  // for both lists: saving a partial roster would drop pins it cannot see.
+  const pinsReady =
+    available.data !== undefined &&
+    !available.error &&
+    catalog.data !== undefined &&
+    !catalog.error;
+  const customAgentRows = useMemo(() => catalog.data ?? [], [catalog.data]);
+  // SDK product built-ins live in New Chat's own SDK section and are not pin
+  // candidates there, so Settings must not offer or count those pins either.
+  const pinnableBuiltinAgents = useMemo(
+    () => memberBuiltinAgents.filter((agent) => !isSdkAgent(agent)),
+    [memberBuiltinAgents],
+  );
+  const pinCandidates = useMemo(
+    () => [...pinnableBuiltinAgents, ...customAgentRows.map(customAgentForPicker)],
+    [pinnableBuiltinAgents, customAgentRows],
+  );
+  const pinnedIds = useMemo(
+    () => resolvePinnedAgentIds(storedPinnedIds, pinCandidates),
+    [storedPinnedIds, pinCandidates],
+  );
+  const pinnedIdSet = useMemo(() => new Set(pinnedIds), [pinnedIds]);
+  const atPinLimit = pinnedIds.length >= MAX_PINNED_AGENTS;
+  function togglePin(agentId: string) {
+    setPinnedIds(
+      pinnedIdSet.has(agentId) ? pinnedIds.filter((id) => id !== agentId) : [...pinnedIds, agentId],
+    );
+  }
   const [createOpen, setCreateOpen] = useState(false);
   const [newBadge, setNewBadge] = useState<AgentBadgeValue | null>(null);
   const [newBadgeValid, setNewBadgeValid] = useState(true);
-  const [editing, setEditing] = useState<{ id: string; name: string; custom: boolean } | null>(
-    null,
-  );
+  const [editing, setEditing] = useState<CustomAgent | null>(null);
+  const [badgeEditing, setBadgeEditing] = useState<{ id: string; name: string } | null>(null);
+  const [viewing, setViewing] = useState<AvailableAgent | null>(null);
   const [deleting, setDeleting] = useState<CustomAgent | null>(null);
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -92,6 +222,21 @@ export function AgentsSettings() {
     }
   }
 
+  async function duplicateBuiltin(agent: AvailableAgent) {
+    if (duplicatingId !== null) return;
+    setDuplicatingId(agent.id);
+    setError(null);
+    try {
+      const copy = await duplicateBuiltinAgent(agent.id);
+      await refresh();
+      setEditing(copy);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setDuplicatingId(null);
+    }
+  }
+
   return (
     <section aria-label="Agents" className="mx-auto w-full max-w-3xl space-y-7">
       <div>
@@ -110,7 +255,7 @@ export function AgentsSettings() {
         />
       </div>
       <div>
-        <h2 className="mb-2 text-sm text-muted-foreground">Built-in agents</h2>
+        <h2 className="mb-2 text-sm text-muted-foreground">Built-in</h2>
         {available.isLoading && (
           <p role="status" className="text-sm text-muted-foreground">
             Loading agents…
@@ -121,20 +266,65 @@ export function AgentsSettings() {
             {errorText(available.error)}
           </p>
         )}
-        {builtins.map((agent) => (
-          <div key={agent.id} className="flex min-h-12 items-center gap-2.5 border-b py-2">
-            <AgentBadge agentId={agent.id} />
-            <span className="min-w-0 flex-1 truncate text-sm">{agent.display_name}</span>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setEditing({ id: agent.id, name: agent.display_name, custom: false })}
-              aria-label={`Edit badge for ${agent.display_name}`}
-            >
-              Edit badge
-            </Button>
-          </div>
-        ))}
+        {builtinAgents.map((agent) => {
+          const memberControls = isMemberBuiltin(agent);
+          return (
+            <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
+              <AgentBadge agentId={agent.id} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm">{agent.display_name}</div>
+                {memberControls && (
+                  <div className="truncate text-xs text-muted-foreground">
+                    {builtinSubtitle(agent)}
+                  </div>
+                )}
+              </div>
+              {memberControls && !isSdkAgent(agent) && (
+                <PinToggle
+                  agentId={agent.id}
+                  name={agent.display_name}
+                  pinned={pinnedIdSet.has(agent.id)}
+                  canPin={!atPinLimit}
+                  ready={pinsReady}
+                  onToggle={togglePin}
+                />
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
+                aria-label={`Edit badge for ${agent.display_name}`}
+              >
+                Edit badge
+              </Button>
+              {memberControls && (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label={`View ${agent.display_name}`}
+                    disabled={duplicatingId !== null}
+                    onClick={() => {
+                      setError(null);
+                      setViewing(agent);
+                    }}
+                  >
+                    View
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label={`Duplicate ${agent.display_name}`}
+                    disabled={duplicatingId !== null}
+                    onClick={() => void duplicateBuiltin(agent)}
+                  >
+                    Duplicate
+                  </Button>
+                </>
+              )}
+            </div>
+          );
+        })}
       </div>
       <div>
         <div className="mb-2 flex items-center justify-between gap-3">
@@ -168,37 +358,66 @@ export function AgentsSettings() {
         {catalog.data?.length === 0 && (
           <p className="py-4 text-sm text-muted-foreground">No custom agents yet.</p>
         )}
-        {catalog.data?.map((agent) => (
-          <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
-            <AgentBadge agentId={agent.id} />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm">{agent.name}</div>
-              {agent.description && (
-                <div className="truncate text-xs text-muted-foreground">{agent.description}</div>
-              )}
+        {catalog.data?.map((agent) => {
+          const members = agent.members;
+          return (
+            <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
+              <AgentBadge agentId={agent.id} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm">{agent.name}</div>
+                {members && members.length > 0 ? (
+                  <>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {rosterSummary(members, harnessLabels)}
+                    </div>
+                    {agent.description && (
+                      <div className="truncate text-xs text-muted-foreground">
+                        {agent.description}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  agent.description && (
+                    <div className="truncate text-xs text-muted-foreground">
+                      {agent.description}
+                    </div>
+                  )
+                )}
+              </div>
+              <PinToggle
+                agentId={agent.id}
+                name={agent.name}
+                pinned={pinnedIdSet.has(agent.id)}
+                canPin={!atPinLimit}
+                ready={pinsReady}
+                onToggle={togglePin}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`Edit ${agent.name}`}
+                onClick={() => {
+                  setError(null);
+                  setEditing(agent);
+                }}
+              >
+                Edit
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-destructive"
+                aria-label={`Delete ${agent.name}`}
+                onClick={() => {
+                  setError(null);
+                  setDeleting(agent);
+                }}
+              >
+                Delete
+              </Button>
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-label={`Edit ${agent.name}`}
-              onClick={() => setEditing({ id: agent.id, name: agent.name, custom: true })}
-            >
-              Edit
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-destructive"
-              aria-label={`Delete ${agent.name}`}
-              onClick={() => {
-                setError(null);
-                setDeleting(agent);
-              }}
-            >
-              Delete
-            </Button>
-          </div>
-        ))}
+          );
+        })}
       </div>
       {sessionAgents.length > 0 && !catalog.error && (
         <details className="text-sm">
@@ -221,7 +440,7 @@ export function AgentsSettings() {
           ))}
         </details>
       )}
-      {error && !deleting && (
+      {error && !deleting && !viewing && (
         <p role="alert" className="text-sm text-destructive">
           {error}
         </p>
@@ -243,12 +462,35 @@ export function AgentsSettings() {
           await refresh();
         }}
       />
-      {editing && (
+      {badgeEditing && (
         <AgentSettingsEditor
+          key={badgeEditing.id}
+          agent={{ ...badgeEditing, custom: false }}
+          onClose={() => setBadgeEditing(null)}
+          onSaved={refresh}
+        />
+      )}
+      {editing && (
+        <SavedAgentEditor
           key={editing.id}
           agent={editing}
           onClose={() => setEditing(null)}
           onSaved={refresh}
+        />
+      )}
+      {viewing && (
+        <BuiltinAgentView
+          key={viewing.id}
+          agent={viewing}
+          onClose={() => {
+            setViewing(null);
+            setError(null);
+          }}
+          onDuplicated={async (copy) => {
+            await refresh();
+            setViewing(null);
+            setEditing(copy);
+          }}
         />
       )}
       <Dialog
@@ -283,6 +525,7 @@ export function AgentsSettings() {
                 setError(null);
                 try {
                   await deleteCustomAgent(deleting.id);
+                  unpinAgent(deleting.id);
                   await refresh();
                   setDeleting(null);
                 } catch (cause) {
@@ -420,5 +663,35 @@ function AgentSettingsEditor({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Edit a saved Agent's roster plus its optional badge. */
+function SavedAgentEditor({
+  agent,
+  onClose,
+  onSaved,
+}: {
+  agent: CustomAgent;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [badge, setBadge] = useState<AgentBadgeValue | null>(
+    () => readAgentBadgePreferences().entries[agent.id] ?? null,
+  );
+  const [badgeValid, setBadgeValid] = useState(true);
+  return (
+    <AgentEditor
+      agent={agent}
+      onClose={onClose}
+      onSaved={async () => {
+        saveBadge(agent.id, badge);
+        await onSaved();
+      }}
+      extraFields={
+        <AgentBadgeEditor value={badge} onChange={setBadge} onValidityChange={setBadgeValid} />
+      }
+      submitDisabled={!badgeValid}
+    />
   );
 }

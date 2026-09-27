@@ -71,7 +71,11 @@ import {
   useInstallingHarnesses,
   type Host,
 } from "@/hooks/useHosts";
-import { useCustomAgents } from "@/lib/customAgentsApi";
+import {
+  useCustomAgents,
+  type CustomAgentDetail,
+  type CustomAgentMember,
+} from "@/lib/customAgentsApi";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -192,6 +196,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
+  useNewChatHostId: vi.fn(() => null),
   fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
@@ -1502,6 +1507,16 @@ function selectAgent(agentId: string): void {
   closeMenu();
 }
 
+/** Give the open Create-Agent dialog a model so its submit enables. */
+async function chooseCreateAgentModel(): Promise<void> {
+  const trigger = screen.getByTestId("agent-member-trigger");
+  if (trigger.getAttribute("data-state") === "closed") {
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: "mouse" });
+  }
+  fireEvent.click(screen.getByTestId("agent-member-model"));
+  fireEvent.click(await screen.findByTestId("agent-member-model-opus"));
+}
+
 function openPermissions(): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-chip"), { button: 0 });
 }
@@ -2406,9 +2421,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeVisible());
     fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
-    fireEvent.change(screen.getByTestId("create-agent-model"), {
-      target: { value: "configured-model" },
-    });
+    await chooseCreateAgentModel();
     fireEvent.click(screen.getByTestId("create-agent-submit"));
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("my-agent"),
@@ -9076,9 +9089,10 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
     fireEvent.click(createItem);
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeVisible());
-    for (const field of ["name", "description", "harness", "model", "instructions", "add-mcp"]) {
+    for (const field of ["name", "description", "instructions", "add-mcp"]) {
       expect(screen.getByTestId(`create-agent-${field}`)).toBeVisible();
     }
+    expect(screen.getByTestId("agent-member-trigger")).toBeVisible();
   });
 
   it("cancels a custom agent without replacing the selected agent", async () => {
@@ -9121,9 +9135,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
     fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
-    fireEvent.change(screen.getByTestId("create-agent-model"), {
-      target: { value: "claude-sonnet-4-20250514" },
-    });
+    await chooseCreateAgentModel();
     fireEvent.click(screen.getByTestId("create-agent-submit"));
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent"),
@@ -9153,10 +9165,339 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Agent picker: Edit on a saved Agent / a built-in
+//
+// The Agents group reuses the harness rows' Edit affordance, but editing means
+// "edit this Agent", not "configure this run": a saved Agent opens the Settings
+// editor, a built-in opens the read-only view that can duplicate it. Rows that
+// are neither keep today's behavior.
+// ---------------------------------------------------------------------------
+
+describe("NewChatLandingScreen Edit on Agent rows", () => {
+  const member = (name: string, overrides: Partial<CustomAgentMember> = {}): CustomAgentMember => ({
+    name,
+    description: null,
+    harness: "claude-sdk",
+    model: null,
+    reasoning_effort: null,
+    lead: false,
+    ...overrides,
+  });
+
+  const savedAgent: CustomAgentDetail = {
+    id: "ca_release_reviewer",
+    name: "Release reviewer",
+    description: "Checks release candidates",
+    harness: "codex",
+    model: null,
+    members: null,
+    version: 2,
+    created_at: 10,
+    updated_at: 11,
+    instructions: "Review carefully.",
+  };
+
+  const builtinPolly: AvailableAgent = {
+    id: "ag_polly",
+    name: "polly",
+    display_name: "Polly",
+    description: "Multi-agent coding",
+    harness: "claude-sdk",
+    skills: [],
+    builtin: true,
+    members: [
+      member("polly", { description: "Plans the work", model: "opus", lead: true }),
+      member("codex", { harness: "codex-native", reasoning_effort: "high" }),
+    ],
+  };
+
+  const pollyCopy: CustomAgentDetail = {
+    id: "ca_polly_copy",
+    name: "Polly copy",
+    description: "Multi-agent coding",
+    harness: "claude-sdk",
+    model: "opus",
+    members: [
+      member("polly", { model: "opus", lead: true }),
+      member("codex", { harness: "codex-native", reasoning_effort: "high" }),
+    ],
+    version: 1,
+    created_at: 20,
+    updated_at: null,
+    instructions: "Lead the crew.",
+  };
+
+  const sessionWriter: AvailableAgent = {
+    id: "ag_session_writer",
+    name: "writer",
+    display_name: "Writer",
+    description: null,
+    harness: null,
+    skills: [],
+    sessionId: "conv_writer",
+  };
+
+  /** The library the real `useCustomAgents` hook reads: the editor's detail /
+   *  save and the duplicate POST mutate it, so a refresh is observable in the
+   *  picker row instead of being asserted through a query-client spy. */
+  let library: CustomAgentDetail[];
+
+  function jsonResponse(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  function mockAgentLibrary(): void {
+    library = [savedAgent];
+    authenticatedFetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.startsWith("/v1/custom-agents?")) {
+        return jsonResponse({ data: library, has_more: false });
+      }
+      if (method === "POST" && url === "/v1/custom-agents") {
+        const copy = { ...pollyCopy };
+        library = [...library, copy];
+        return jsonResponse(copy);
+      }
+      const id = /^\/v1\/custom-agents\/([^/?]+)$/.exec(url)?.[1];
+      const row = library.find((candidate) => candidate.id === id);
+      if (row === undefined) throw new Error(`unexpected Agent request: ${method} ${url}`);
+      if (method === "PATCH") {
+        const changes = JSON.parse(String(init?.body)) as Partial<CustomAgentDetail>;
+        const updated = { ...row, ...changes, version: row.version + 1 };
+        library = library.map((candidate) => (candidate.id === row.id ? updated : candidate));
+        return jsonResponse(updated);
+      }
+      return jsonResponse(row);
+    });
+  }
+
+  beforeEach(async () => {
+    setupLandingMocks();
+    mockAgentLibrary();
+    mockAgents([...DEFAULT_LANDING_AGENTS, builtinPolly, sessionWriter]);
+    vi.mocked(useCustomAgents).mockImplementation(
+      (await vi.importActual<typeof CustomAgentsApiModule>("@/lib/customAgentsApi"))
+        .useCustomAgents,
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  function openCustomAgents(): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+  }
+
+  it("opens the editor on a saved Agent and refreshes its row on save", async () => {
+    renderLanding();
+    openCustomAgents();
+    // A saved Agent exposes no run-config knobs on this line, so its Edit
+    // opens the definition editor directly — the picker commits the row's pick
+    // first, which the save must then preserve.
+    fireEvent.click(await screen.findByTestId("new-chat-landing-agent-config-ca_release_reviewer"));
+
+    const editor = await screen.findByTestId("agent-editor");
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Release reviewer",
+    );
+    const name = await within(editor).findByRole("textbox", { name: "Name" });
+    await waitFor(() => expect(name).not.toBeDisabled());
+    fireEvent.change(name, { target: { value: "Release reviewer II" } });
+    fireEvent.click(within(editor).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(screen.queryByTestId("agent-editor")).toBeNull());
+    const patch = authenticatedFetchMock.mock.calls.find(
+      ([url, init]) =>
+        url === "/v1/custom-agents/ca_release_reviewer" &&
+        (init as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(patch).toBeDefined();
+    expect(JSON.parse(String((patch![1] as RequestInit).body))).toMatchObject({
+      name: "Release reviewer II",
+      version: 2,
+    });
+    // The save invalidated the catalog and the picker re-read it: the row's
+    // new name is showing while the selection it held is unchanged.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Release reviewer II",
+      ),
+    );
+  });
+
+  it("keeps a config-editable built-in's flyout and views it from its first item", async () => {
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(await screen.findByTestId("new-chat-landing-agent-config-ag_polly"));
+
+    // The built-in is config-editable, so its Edit still opens the run-config
+    // flyout — with the Agent action as its first item.
+    expect(await screen.findByTestId("new-chat-landing-config-harness")).toBeVisible();
+    const action = await screen.findByTestId("new-chat-landing-agent-action-ag_polly");
+    expect(action).toHaveTextContent("View agent…");
+    fireEvent.click(action);
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-chat-landing-agent-action-ag_polly")).toBeNull(),
+    );
+
+    const view = await screen.findByRole("dialog");
+    expect(within(view).getByText("Built-in · read-only")).toBeInTheDocument();
+    expect(within(view).getAllByTestId("builtin-member-row")).toHaveLength(2);
+    fireEvent.click(within(view).getByRole("button", { name: "Duplicate to edit" }));
+
+    expect(await screen.findByTestId("agent-editor")).toBeInTheDocument();
+    const post = authenticatedFetchMock.mock.calls.find(
+      ([url, init]) =>
+        url === "/v1/custom-agents" && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(post).toBeDefined();
+    expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({
+      source_agent_id: "ag_polly",
+    });
+    expect(screen.queryAllByTestId("builtin-member-row")).toHaveLength(0);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Polly copy",
+      ),
+    );
+  });
+
+  it("duplicates a built-in on a sandbox without moving the pick to the disabled copy", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "New Sandbox",
+      ),
+    );
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    fireEvent.pointerDown(picker, { button: 0 });
+    fireEvent.click(await screen.findByTestId("new-chat-landing-agent-config-ag_polly"));
+    fireEvent.click(await screen.findByTestId("new-chat-landing-agent-action-ag_polly"));
+
+    const view = await screen.findByRole("dialog");
+    fireEvent.click(within(view).getByRole("button", { name: "Duplicate to edit" }));
+
+    // The copy is created and opened for editing...
+    expect(await screen.findByTestId("agent-editor")).toBeInTheDocument();
+    const post = authenticatedFetchMock.mock.calls.find(
+      ([url, init]) =>
+        url === "/v1/custom-agents" && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(post).toBeDefined();
+    // ...but the pick stays on the built-in: a sandbox disables `ca_` rows, so
+    // selecting the fresh copy would leave Start blocked.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Polly"),
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-select")).not.toHaveTextContent("Polly copy");
+  });
+
+  it("leaves a session-scoped Agent row without Edit", () => {
+    renderLanding();
+    openCustomAgents();
+    const row = screen.getByTestId("new-chat-landing-agent-ag_session_writer");
+    expect(row).toBeInTheDocument();
+    expect(row).not.toHaveAttribute("aria-description");
+    expect(screen.queryByTestId("new-chat-landing-agent-config-ag_session_writer")).toBeNull();
+  });
+});
+
+// Pinned Agents: the "Agents" group shows the stored pins at its top level
+// and folds every other Agent into the "Other..." submenu; nothing stored
+// yet means the shipped Polly + Debby default.
+
+describe("NewChatLandingScreen pinned Agents", () => {
+  const polly: AvailableAgent = {
+    id: "ag_polly",
+    name: "polly",
+    display_name: "Polly",
+    description: null,
+    harness: "claude-sdk",
+    skills: [],
+  };
+  const debby: AvailableAgent = {
+    id: "ag_debby",
+    name: "debby",
+    display_name: "Debby",
+    description: null,
+    harness: "claude-sdk",
+    skills: [],
+  };
+  const saved: AvailableAgent = {
+    id: "ca_reviewer",
+    name: "Reviewer",
+    display_name: "Reviewer",
+    description: null,
+    harness: "claude-sdk",
+    skills: [],
+    builtin: false,
+  };
+
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  function openPicker(): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  }
+
+  it("defaults to Polly + Debby on top and keeps a saved Agent inside Other...", () => {
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly, debby, saved]);
+    renderLanding();
+    openPicker();
+
+    expect(screen.getByTestId("new-chat-landing-agent-ag_polly")).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-agent-ag_debby")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-agent-ca_reviewer")).toBeNull();
+    const submenu = screen.getByTestId("new-chat-landing-custom-agents");
+    expect(submenu).toHaveTextContent("Other...");
+    fireEvent.click(submenu);
+    expect(screen.getByTestId("new-chat-landing-agent-ca_reviewer")).toBeInTheDocument();
+  });
+
+  it("promotes a stored pin and moves Polly into Other...", () => {
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: ["ca_reviewer"] }));
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly, debby, saved]);
+    renderLanding();
+    openPicker();
+
+    expect(screen.getByTestId("new-chat-landing-agent-ca_reviewer")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-agent-ag_polly")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(screen.getByTestId("new-chat-landing-agent-ag_polly")).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-agent-ag_debby")).toBeInTheDocument();
+  });
+
+  it("labels Other... with the selected submenu Agent", () => {
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [] }));
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly]);
+    renderLanding();
+    openPicker();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_polly"));
+    closeMenu();
+    openPicker();
+    expect(screen.getByTestId("new-chat-landing-custom-agents")).toHaveTextContent(
+      "Other... (Polly)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Mobile drill-in navigation
 //
 // Touch devices can't hover, so the desktop submenu flyouts ("More" for
-// needs-setup harnesses, custom-agent "Other...") are unreachable there. Below the
+// needs-setup harnesses, "Other...") are unreachable there. Below the
 // `md` breakpoint the picker swaps its contents in place: tapping the row
 // drills into that group's page with a Back row. jsdom's matchMedia mock
 // reports non-mobile, so these tests force the `max-width` query to match.
@@ -9267,8 +9608,8 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
   });
 
-  it("drills into the custom-agent Other page in place and returns via Back", () => {
-    // A custom (non-builtin) agent lands in the custom-agent group.
+  it("drills into the Other page in place and returns via Back", () => {
+    // An unpinned custom agent lands in the Other group.
     mockAgents([
       {
         id: "a1",
@@ -9293,6 +9634,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
     // Tapping drills into the page in place (Claude Code inline row is gone).
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(screen.getByTestId("new-chat-landing-page-back")).toHaveTextContent("Other");
     expect(screen.getByTestId("new-chat-landing-agent-ag_custom")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-agent-a1")).toBeNull();
     // Back returns to the main list.
@@ -10503,6 +10845,270 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     ["Polly", "ag_polly"],
   ] as const;
 
+  const sdkCodexModels = {
+    ...SUCCESS_QUERY_STATE,
+    data: [
+      {
+        id: "codex-default",
+        displayName: "Codex default",
+        isDefault: true,
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+      },
+      {
+        id: "codex-light",
+        displayName: "Codex light",
+        supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+      },
+    ],
+  };
+
+  function mockSdkModels(): void {
+    mockModelQueries((harness) =>
+      harness === "codex" ? sdkCodexModels : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+  }
+
+  it.each([
+    ["Claude SDK", "claude-sdk", "Auto", "permission_mode", "auto"],
+    ["Codex", "codex", "Default", "approval_mode", "default"],
+  ])("shows and sends the %s permission default", async (label, harness, chip, field, mode) => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: `conv_${harness}_permission` }),
+    } as Response);
+    renderLanding();
+    if (harness === "codex") {
+      openAgentConfig("ag_debby");
+      pickSelectOption("new-chat-landing-config-harness", label);
+      saveConfig();
+    }
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      `Permission mode: ${chip}`,
+    );
+    openPermissions();
+    expect(screen.getByTestId("new-chat-landing-permission-option-default")).toBeVisible();
+    if (harness === "claude-sdk") {
+      expect(
+        screen.getByTestId("new-chat-landing-permission-option-bypassPermissions"),
+      ).toBeVisible();
+    } else {
+      expect(screen.getByTestId("new-chat-landing-permission-option-read-only")).toBeVisible();
+    }
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.harness_override).toBe(harness === "codex" ? "codex" : undefined);
+    expect(body[field]).toBe(mode);
+  });
+
+  it("keeps SDK permission picks separate when switching the Agent SDK harness", async () => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_permission_pick" }),
+    } as Response);
+    renderLanding();
+    pickPermissionOption("bypassPermissions");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Bypass permissions",
+    );
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Codex");
+    saveConfig();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Default",
+    );
+    pickPermissionOption("read-only");
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Claude SDK");
+    saveConfig();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Bypass permissions",
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.permission_mode).toBe("bypassPermissions");
+    expect(body.approval_mode).toBeUndefined();
+  });
+
+  it("pins the Codex SDK host default row and its advertised Ultra effort", async () => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_codex" }),
+    } as Response);
+    renderLanding();
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Codex");
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex", true, {
+      poll: true,
+    });
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Models");
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("Effort");
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-codex-default"));
+    expect(screen.getByTestId("new-chat-landing-agent-model-codex-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-ultra")).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-ultra"));
+    expect(screen.getByTestId("new-chat-landing-agent-ag_debby")).toHaveTextContent(
+      "Codex default Ultra",
+    );
+    saveConfig();
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Codex default");
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Ultra");
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      harness_override: "codex",
+      model_override: "codex-default",
+      reasoning_effort: "ultra",
+    });
+    expect(readHarnessOptions("codex")).toMatchObject({
+      model: "codex-default",
+      effort: "ultra",
+    });
+  });
+
+  it("keeps a saved Codex SDK model and effort when host model options fail", async () => {
+    mockModelQueries((harness) =>
+      harness === "codex"
+        ? {
+            ...SUCCESS_QUERY_STATE,
+            status: "error",
+            isError: true,
+            isSuccess: false,
+            error: new Error("Host model options unavailable"),
+            data: undefined,
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    localStorage.setItem(LAST_AGENT_KEY, "ag_debby");
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_debby: "codex" }));
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ codex: { model: "codex-default", effort: "ultra" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_failed_catalog" }),
+    } as Response);
+
+    renderLanding();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex", true, {
+      poll: true,
+    });
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      harness_override: "codex",
+      model_override: "codex-default",
+      reasoning_effort: "ultra",
+    });
+    expect(readHarnessOptions("codex")).toMatchObject({
+      model: "codex-default",
+      effort: "ultra",
+    });
+  });
+
+  it("drops a saved Codex SDK model and effort when the host catalog is empty", async () => {
+    mockModelQueries((harness) =>
+      harness === "codex" ? { ...SUCCESS_QUERY_STATE, data: [] } : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    localStorage.setItem(LAST_AGENT_KEY, "ag_debby");
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_debby: "codex" }));
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ codex: { model: "codex-default", effort: "ultra" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_empty_catalog" }),
+    } as Response);
+
+    renderLanding();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex", true, {
+      poll: true,
+    });
+    const { body } = await submitAndReadBody();
+    expect(body.harness_override).toBe("codex");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("keeps Harness default unpinned and drops an unsupported Codex SDK effort", async () => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_default" }),
+    } as Response);
+    renderLanding();
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Codex");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-codex-default"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-ultra"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-codex-light"));
+    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-ultra")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    saveConfig();
+    const { body } = await submitAndReadBody();
+    expect(body.harness_override).toBe("codex");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("uses the Claude SDK ladder and restores each SDK's own picks on switching", async () => {
+    mockSdkModels();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sdk_claude" }),
+    } as Response);
+    renderLanding();
+    openAgentConfig("ag_debby");
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "claude-sdk", true, {
+      poll: true,
+    });
+    expect(screen.getByTestId("new-chat-landing-agent-effort-max")).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-ultra")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-opus"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    pickSelectOption("new-chat-landing-config-harness", "Codex");
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    pickSelectOption("new-chat-landing-config-harness", "Claude SDK");
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-max")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    saveConfig();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      model_override: "opus",
+      reasoning_effort: "max",
+    });
+    expect(body.harness_override).toBeUndefined();
+  });
+
   it("shows the selected SDK in Polly's trigger and session-info tooltip", async () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("ag_polly");
@@ -10520,15 +11126,14 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
   });
 
   it.each(BOTH_BUNDLES)(
-    "%s's config menu is the brain-harness row alone, led by Smart Routing",
+    "%s's config offers SDK model and effort below the Smart Routing choice",
     (_name, agentId) => {
       renderLanding({ smart_routing_enabled: true });
       openAgentConfig(agentId);
       expect(screen.getByTestId("new-chat-landing-config-harness")).toHaveTextContent("Agent SDK");
-      // claude-sdk isn't a routable native harness, so none of the per-harness
-      // knobs (which is where the per-turn routing Model option lives) apply.
-      expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-      expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+      expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+      expect(screen.queryByTestId("new-chat-landing-agent-model-smart-routing")).toBeNull();
       expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
       const harness = screen.getByTestId("new-chat-landing-config-harness");
       expect(harness.textContent).toContain("Claude SDK");
@@ -10659,7 +11264,7 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     draftSmartRouting("ag_debby");
     pickSelectOption("new-chat-landing-config-harness", "Codex");
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain("Codex");
-    // A brain pick never adds rows, so the row set is the same either way.
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
     expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-config-harness")).toHaveTextContent("Agent SDK");
   });

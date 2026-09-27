@@ -197,4 +197,26 @@ describe("buildAgentBundle", () => {
     expect(yaml).toContain("harness: openai-agents");
     expect(yaml).toContain("model: gpt-4o");
   });
+
+  it("writes reasoning_effort under executor when set and omits it when not", async () => {
+    const withEffort = await extractConfigYaml(
+      await buildAgentBundle({
+        name: "effort-agent",
+        harness: "claude-sdk",
+        model: "claude-sonnet-4-20250514",
+        reasoningEffort: "high",
+      }),
+    );
+    expect(withEffort).toContain("executor:");
+    expect(withEffort).toContain("  reasoning_effort: high");
+
+    const withoutEffort = await extractConfigYaml(
+      await buildAgentBundle({
+        name: "plain-agent",
+        harness: "claude-sdk",
+        model: "claude-sonnet-4-20250514",
+      }),
+    );
+    expect(withoutEffort).not.toContain("reasoning_effort");
+  });
 });

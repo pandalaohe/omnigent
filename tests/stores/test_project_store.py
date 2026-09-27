@@ -477,7 +477,18 @@ def test_order_updates_preserve_other_preferences(store: SqlAlchemyProjectStore)
     from omnigent.db.db_models import SqlPreference
 
     with Session(store._engine) as session:
-        session.add(SqlPreference(workspace_id=0, user_id="local", key="theme", value='"dark"'))
+        session.add_all(
+            [
+                SqlPreference(workspace_id=0, user_id="local", key="theme", value='"dark"'),
+                SqlPreference(
+                    workspace_id=0,
+                    user_id="local",
+                    key="settings.keyboard_shortcuts",
+                    value='{"enabled":true}',
+                ),
+                SqlPreference(workspace_id=0, user_id="local", key="settings.version", value="1"),
+            ]
+        )
         session.commit()
     assert store.get_order(user_id=None) is None
     for order in (None, [], None, []):
@@ -486,6 +497,12 @@ def test_order_updates_preserve_other_preferences(store: SqlAlchemyProjectStore)
             preference = session.get(SqlPreference, (0, "local", "theme"))
             assert preference is not None
             assert preference.value == '"dark"'
+            shortcuts = session.get(SqlPreference, (0, "local", "settings.keyboard_shortcuts"))
+            assert shortcuts is not None
+            assert shortcuts.value == '{"enabled":true}'
+            version = session.get(SqlPreference, (0, "local", "settings.version"))
+            assert version is not None
+            assert version.value == "1"
 
 
 def test_alphabetical_mode_retains_manual_order(store: SqlAlchemyProjectStore) -> None:

@@ -47,9 +47,7 @@ describe("effortLevelsForConv", () => {
   });
 
   it("returns the default 3-level set for non-claude-native conversations", () => {
-    // Non-native harnesses (claude-sdk, codex, openai-agents, ...) keep the
-    // existing low/medium/high options — we only changed CN, not the
-    // shared default.
+    // With no harness evidence, keep the shared default.
     const conv = { labels: {} };
     expect(effortLevelsForConv(conv)).toEqual(["low", "medium", "high"]);
   });
@@ -86,12 +84,18 @@ describe("effortLevelsForConv", () => {
     ]);
   });
 
-  it("keeps the default set for label-less sessions on other harnesses", () => {
+  it("uses the SDK harness ladder without a wrapper label", () => {
     expect(effortLevelsForConv({ labels: {}, harness: "claude-sdk" })).toEqual([
       "low",
       "medium",
       "high",
+      "xhigh",
+      "max",
     ]);
+    expect(
+      effortLevelsForConv({ labels: {}, harness: "codex" }, CODEX_MODEL_OPTIONS, "gpt-5.5"),
+    ).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(effortLevelsForConv({ labels: {}, harness: "codex" }, [], "gpt-5.5")).toEqual([]);
   });
 
   it("returns an empty Codex-native effort set until Codex options load", () => {
@@ -135,9 +139,9 @@ describe("shouldShowModelPicker", () => {
     ).toBe(false);
   });
 
-  it("returns false for label-less sessions on other harnesses", () => {
-    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
-    expect(shouldShowModelPicker({ labels: {}, harness: "codex" })).toBe(false);
+  it("returns true for label-less SDK sessions", () => {
+    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(true);
+    expect(shouldShowModelPicker({ labels: {}, harness: "codex" })).toBe(true);
   });
 
   it("returns false for the old terminal-ui gate that was rejected on review", () => {
@@ -202,9 +206,9 @@ describe("shouldShowEffortPicker", () => {
     ).toBe(false);
   });
 
-  it("returns false for label-less sessions on other harnesses", () => {
-    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
-    expect(shouldShowEffortPicker({ labels: {}, harness: "codex" })).toBe(false);
+  it("returns true for label-less SDK sessions", () => {
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" })).toBe(true);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "codex" })).toBe(true);
   });
 
   it("returns false for custom agents and missing labels", () => {

@@ -9890,11 +9890,13 @@ describe("chatStore — session configuration scope", () => {
 
   interface SnapshotOverrides {
     labels?: Record<string, string>;
+    harness?: string;
     reasoning_effort?: string | null;
     model_override?: string | null;
     cost_control_mode_override?: "on" | "off" | null;
     parent_session_id?: string | null;
     model_options?: Record<string, unknown>[];
+    inference_configured?: boolean;
   }
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
@@ -9910,11 +9912,13 @@ describe("chatStore — session configuration scope", () => {
           created_at: 0,
           items: [],
           labels: overrides.labels ?? {},
+          harness: overrides.harness,
           reasoning_effort: overrides.reasoning_effort ?? null,
           model_override: overrides.model_override ?? null,
           cost_control_mode_override: overrides.cost_control_mode_override ?? null,
           parent_session_id: overrides.parent_session_id ?? null,
           model_options: overrides.model_options ?? [],
+          inference_configured: overrides.inference_configured,
         });
       }
       return defaultFetchHandler(input, init);
@@ -10508,6 +10512,35 @@ describe("chatStore — session configuration scope", () => {
     expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
   });
 
+  it.each(["claude-sdk", "codex"])("PATCHes effort on an active %s session", async (harness) => {
+    const id = `conv_${harness}_effort`;
+    seedSession(id, []);
+    withSnapshot(id, { labels: {}, harness });
+    await useChatStore.getState().switchTo(id);
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setEffort("high");
+
+    expect(patchCallsFor(id)).toEqual([{ reasoning_effort: "high" }]);
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+  });
+
+  it.each(["claude-sdk", "codex"])(
+    "does not PATCH effort on a configured %s session",
+    async (harness) => {
+      const id = `conv_${harness}_configured_effort`;
+      seedSession(id, []);
+      withSnapshot(id, { labels: {}, harness, inference_configured: true });
+      await useChatStore.getState().switchTo(id);
+      fetchMock.mockClear();
+
+      await useChatStore.getState().setEffort("high");
+
+      expect(patchCallsFor(id)).toEqual([]);
+      expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    },
+  );
+
   it("hydrates Codex Plan mode from the session label", async () => {
     seedSession("conv_plan", []);
     withSnapshot("conv_plan", {
@@ -10592,6 +10625,60 @@ describe("chatStore — session configuration scope", () => {
     await useChatStore.getState().switchTo("conv_approval_hydrate");
 
     expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+  });
+
+  it.each([
+    [
+      "claude-sdk",
+      "omnigent.claude_sdk.permission_mode",
+      "auto",
+      "bypassPermissions",
+      "permission_mode",
+    ],
+    ["codex", "omnigent.codex_sdk.approval_mode", "default", "full-access", "approval_mode"],
+  ])(
+    "hydrates and PATCHes %s permissions using SDK labels",
+    async (harness, label, initial, picked, field) => {
+      const id = `conv_${harness}_permission`;
+      seedSession(id, []);
+      withSnapshot(id, { labels: { [label]: initial }, harness });
+      await useChatStore.getState().switchTo(id);
+      const key = harness === "claude-sdk" ? "claudePermissionMode" : "codexApprovalMode";
+      expect(useChatStore.getState()[key]).toBe(initial);
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          return mockResponse({
+            id,
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            harness,
+            labels: { [label]: picked },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      fetchMock.mockClear();
+
+      if (harness === "claude-sdk") await useChatStore.getState().setClaudePermissionMode(picked);
+      else await useChatStore.getState().setCodexApprovalMode(picked);
+
+      expect(patchCallsFor(id)).toEqual([{ [field]: picked }]);
+      expect(useChatStore.getState()[key]).toBe(picked);
+    },
+  );
+
+  it.each([
+    ["claude-sdk", "claudePermissionMode"],
+    ["codex", "codexApprovalMode"],
+  ] as const)("leaves an unlabelled %s permission chip unset", async (harness, key) => {
+    const id = `conv_${harness}_permission_unset`;
+    seedSession(id, []);
+    withSnapshot(id, { labels: {}, harness });
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState()[key]).toBe("");
   });
 
   it("leaves Codex approval mode empty when the label is absent", async () => {
@@ -16279,6 +16366,7 @@ describe("beginLocalConversation — optimistic model seed", () => {
     const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
       modelOverride: "opus[1m]",
       reasoningEffort: "high",
+      claudePermissionMode: "auto",
       harness: "claude-sdk",
       boundAgentId: "agent_xyz",
       boundAgentName: "Debby",
@@ -16288,6 +16376,7 @@ describe("beginLocalConversation — optimistic model seed", () => {
     expect(state.sessionModelOverride).toBe("opus[1m]");
     expect(state.sessionModelSeeded).toBe(true);
     expect(state.sessionReasoningEffort).toBe("high");
+    expect(state.claudePermissionMode).toBe("auto");
     expect(state.sessionHarness).toBe("claude-sdk");
     expect(state.boundAgentId).toBe("agent_xyz");
     expect(state.boundAgentName).toBe("Debby");
@@ -16310,6 +16399,16 @@ describe("beginLocalConversation — optimistic model seed", () => {
     expect(state.llmModel).toBe("claude-opus-4-8");
     expect(state.sessionHarness).toBe("claude-sdk");
     expect(state.boundAgentName).toBe("Polly");
+  });
+
+  it("seeds the Codex SDK permission pick into the temporary composer", () => {
+    seedConversationsCache([]);
+    beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      harness: "codex",
+      codexApprovalMode: "read-only",
+    });
+    expect(useChatStore.getState().codexApprovalMode).toBe("read-only");
   });
 
   it("carries the routing flag + identity so the composer renders routing, not a model", () => {

@@ -550,9 +550,10 @@ async def test_handle_model_options_devin_probe_failure_still_warns(
     assert record.exc_info[1] is failure
 
 
+@pytest.mark.parametrize("harness", ["codex-native", "codex"])
 @pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
 async def test_handle_model_options_codex_probe_failure_is_failed(
-    monkeypatch: pytest.MonkeyPatch, failure: str
+    monkeypatch: pytest.MonkeyPatch, failure: str, harness: str
 ) -> None:
     """No Codex catalog means the model-options lookup failed.
 
@@ -571,7 +572,7 @@ async def test_handle_model_options_codex_probe_failure_is_failed(
     host = _make_host_process()
 
     result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+        HostModelOptionsFrame(request_id="req_models", harness=harness),
     )
 
     assert result == HostModelOptionsResultFrame(
@@ -6419,8 +6420,9 @@ async def test_drain_runner_stop_tasks_removes_completed_tasks_before_callbacks(
     assert not host._runner_stop_tasks
 
 
+@pytest.mark.parametrize("harness", ["codex-native", "codex"])
 async def test_handle_model_options_serves_codex_probe_rows_and_caches(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, harness: str
 ) -> None:
     """A Databricks-routed Codex request is answered by the harness probe.
 
@@ -6429,15 +6431,16 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
     from the fingerprint cache — the harness is booted once.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.host import connect as host_connect
 
-    monkeypatch.setattr(
-        "omnigent.host.connect._model_configuration_source_for_harness",
-        lambda _harness: {
+    def _source(requested_harness: str) -> dict[str, str]:
+        return {
             "kind": "subscription",
             "label": "Subscription",
-            "name": "codex",
-        },
-    )
+            "name": requested_harness,
+        }
+
+    monkeypatch.setattr(host_connect, "_model_configuration_source_for_harness", _source)
     monkeypatch.setattr(
         codex_native_app_server,
         "resolve_native_codex_launch",
@@ -6460,10 +6463,10 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
     host = _make_host_process()
 
     first = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_1", harness="codex-native"),
+        HostModelOptionsFrame(request_id="req_1", harness=harness),
     )
     second = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_2", harness="codex-native"),
+        HostModelOptionsFrame(request_id="req_2", harness=harness),
     )
 
     assert first == HostModelOptionsResultFrame(
@@ -6476,7 +6479,7 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
                 "source": {
                     "kind": "subscription",
                     "label": "Subscription",
-                    "name": "codex",
+                    "name": harness,
                 },
             },
             {
@@ -6486,7 +6489,7 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
                 "source": {
                     "kind": "subscription",
                     "label": "Subscription",
-                    "name": "codex",
+                    "name": harness,
                 },
             },
         ],

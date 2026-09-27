@@ -48,6 +48,7 @@ from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
+    ElicitationResult,
     InjectionConsumedEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
@@ -186,7 +187,12 @@ class ExecutorAdapter(HarnessApp):
         if request.max_output_tokens is not None:
             extra["max_tokens"] = int(request.max_output_tokens)
         # model_override is the per-request override; takes precedence over the spec default.
-        config = ExecutorConfig(model=request.model_override, extra=extra)
+        config = ExecutorConfig(
+            model=request.model_override,
+            permission_mode=request.permission_mode,
+            approval_mode=request.approval_mode,
+            extra=extra,
+        )
         tools = _normalize_tool_schemas(request.tools or [])
         system_prompt = request.instructions or ""
         # Install stable bridges once on first use — the SDK closure-captures them from the first
@@ -203,6 +209,13 @@ class ExecutorAdapter(HarnessApp):
         ):
             executor._elicitation_choice_handler = (  # type: ignore[attr-defined]
                 self._stable_elicitation_choice_handler
+            )
+        if (
+            hasattr(executor, "_raw_elicitation_handler")
+            and executor._raw_elicitation_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._raw_elicitation_handler = (  # type: ignore[attr-defined]
+                self._stable_raw_elicitation_handler
             )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
@@ -697,6 +710,16 @@ class ExecutorAdapter(HarnessApp):
             return None
         answer = (result.content or {}).get("answer")
         return answer if isinstance(answer, str) else None
+
+    async def _stable_raw_elicitation_handler(
+        self, params: ElicitationRequestParams
+    ) -> ElicitationResult | None:
+        ctx = self._current_ctx
+        if ctx is None:
+            _logger.error("raw elicitation callback fired with no active turn context; declining")
+            return None
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        return await ctx.elicit(elicitation_id, params)
 
     async def _stable_policy_evaluator(
         self,

@@ -137,6 +137,93 @@ async def test_list_builtin_agents_returns_registered_templates(
     # Same degradation for skills: an unreadable spec yields an empty
     # list, not an error and not invented entries.
     assert all(a["skills"] == [] for a in body["data"])
+    # And for members: an unreadable spec reports the roster as unknown
+    # (null), never an empty list — an empty list would claim the agent
+    # has no members.
+    assert all(a["members"] is None for a in body["data"])
+
+
+async def test_list_builtin_agents_projects_members_from_spec(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/agents`` projects a joint Agent's roster from its bundle:
+    the lead (root spec) first, then each sub-agent with its own
+    harness, model, and reasoning effort.
+
+    polly is the shipped joint built-in, and its workers are native
+    harnesses (``claude-native``, ``codex-native``, …) — the catalog
+    must report each worker's own ids, not the root executor's. A
+    sub-agent's executor is where they live, so this proves the route
+    walks ``spec.sub_agents`` rather than echoing the root for every
+    role.
+    """
+    bundle = build_agent_bundle(
+        name="polly",
+        description="Plans and splits the work.",
+        executor={"type": "omnigent", "model": "lead-model", "config": {"harness": "claude-sdk"}},
+        sub_agents=[
+            {
+                "name": "claude_code",
+                "description": "Claude Code worker.",
+                "executor": {
+                    "type": "omnigent",
+                    "model": "opus",
+                    "reasoning_effort": "high",
+                    "config": {"harness": "claude-native"},
+                },
+            },
+            {
+                "name": "codex",
+                "description": "Codex worker.",
+                "executor": {
+                    "type": "omnigent",
+                    "model": "gpt-5",
+                    "config": {"harness": "codex-native"},
+                },
+            },
+        ],
+    )
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="7f4d9a9d9f5d4b6f9e7a2c1d3b8e6a40",
+        name="polly",
+        bundle=bundle,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "7f4d9a9d9f5d4b6f9e7a2c1d3b8e6a40")
+    assert entry["members"] == [
+        {
+            "name": "polly",
+            "description": "Plans and splits the work.",
+            "harness": "claude-sdk",
+            "model": "lead-model",
+            "reasoning_effort": None,
+            "lead": True,
+        },
+        {
+            "name": "claude_code",
+            "description": "Claude Code worker.",
+            "harness": "claude-native",
+            "model": "opus",
+            "reasoning_effort": "high",
+            "lead": False,
+        },
+        {
+            "name": "codex",
+            "description": "Codex worker.",
+            "harness": "codex-native",
+            "model": "gpt-5",
+            "reasoning_effort": None,
+            "lead": False,
+        },
+    ]
 
 
 @pytest.mark.parametrize(

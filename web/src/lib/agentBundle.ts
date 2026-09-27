@@ -31,6 +31,8 @@ export interface AgentBundleInput {
   harness: string;
   /** Model identifier, e.g. "claude-sonnet-4-20250514". Required by the omnigent executor. */
   model: string;
+  /** Default reasoning effort under `executor:`, e.g. "high"; omitted when unset. */
+  reasoningEffort?: string;
   /** MCP server declarations to include as inline tools entries. */
   mcpServers?: MCPServerInput[];
 }
@@ -54,6 +56,9 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   lines.push("executor:");
   lines.push("  type: omnigent");
   lines.push(`  model: ${input.model}`);
+  if (input.reasoningEffort) {
+    lines.push(`  reasoning_effort: ${yamlQuote(input.reasoningEffort)}`);
+  }
   lines.push("  config:");
   lines.push(`    harness: ${input.harness}`);
   lines.push("");

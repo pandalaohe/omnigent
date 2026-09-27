@@ -58,13 +58,26 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.sdk_permission_modes import (
+    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODES,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.host_registry import host_owner_scope
+from omnigent.server.library_agent_launch import (
+    LibraryAgentLaunch,
+    is_library_agent_id,
+    launch_library_agent,
+    load_library_agent_bundle,
+)
 from omnigent.server.routes._session_create_validation import (
+    CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
     validate_session_permission_mode,
+    validate_uploaded_bundle_host_workspace,
 )
 from omnigent.server.schemas import SessionEventInput
 
@@ -147,6 +160,10 @@ class FireDeps:
     # ``app.state``, read per fire for the default-public-sessions policy.
     # ``None`` (tests, embedders) leaves every fired session private.
     app_state: Any | None = None
+    # Owner-scoped saved-Agent library. With this (and ``artifact_store``) a
+    # task may target a ``ca_`` Agent; ``None`` leaves ``ca_`` ids unknown, as
+    # before.
+    custom_agents_store: Any | None = None
 
 
 @dataclass
@@ -697,23 +714,22 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
-_PERMISSION_MODE_HARNESS = "claude-native"
-
-
-async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
-    """Derive the native-terminal ``--permission-mode`` args for a task.
+async def _permission_mode_harness(deps: FireDeps, task: ScheduledTask) -> str | None:
+    """Resolve the harness for native launch args or SDK permission labels.
 
     Mirrors how the interactive New Chat dialog builds ``terminal_launch_args``:
     a set permission mode becomes ``["--permission-mode", <value>]``, which the
-    runner appends to Claude Code's argv. ``None`` (agent default) sets nothing.
+    runner appends to Claude Code's argv. SDK modes instead become labels on the
+    session. ``None`` (agent default) sets nothing.
 
     Fail-safe on harness: only Claude Code accepts ``--permission-mode``, so the
     flag is injected ONLY when the task's agent is confirmed ``claude-native``.
     If the harness can't be resolved (no cache / bundle / a load error), the flag
     is omitted rather than injected — a session that just uses the agent's own
-    default is strictly safer than one launched with an unknown flag. This makes
-    the Claude-only guarantee hold regardless of whether the create/update/fire
-    capability gates ran, so a mis-stamped non-Claude row can never break a fire.
+    default is strictly safer than one launched with an unknown flag. The SDK
+    label is likewise omitted without a confirmed matching harness and mode.
+    This guarantee holds regardless of whether the create/update/fire capability
+    gates ran, so a mis-stamped row cannot break a fire or apply a wrong SDK mode.
     """
     if task.permission_mode is None:
         return None
@@ -731,19 +747,17 @@ async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> l
         harness = canonicalize_harness(raw_harness) or raw_harness
     except Exception:
         _logger.exception(
-            "scheduled fire: could not resolve harness for task %s; omitting --permission-mode",
+            "scheduled fire: could not resolve harness for task %s; omitting permission mode",
             task.id,
         )
         return None
-    if harness != _PERMISSION_MODE_HARNESS:
-        return None
-    return ["--permission-mode", task.permission_mode]
+    return harness
 
 
 async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
     """Read ``executor.reasoning_effort`` from the task's agent spec.
 
-    Fail-safe like :func:`_permission_mode_launch_args`: a task with no explicit
+    Fail-safe like :func:`_permission_mode_harness`: a task with no explicit
     effort inherits the spec default, and any load failure yields ``None`` (the
     harness default) rather than breaking the fire. The spec value is validated
     at spec load, so it needs no re-validation here.
@@ -820,15 +834,77 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
         return {}
 
 
+def _is_library_agent_task(deps: FireDeps, task: ScheduledTask) -> bool:
+    """Whether the task targets a saved library Agent this server can launch.
+
+    Requires both stores: with either unwired a ``ca_`` task takes the stored
+    agent path, where the unknown id fails validation as it did before.
+    """
+    return (
+        deps.custom_agents_store is not None
+        and deps.artifact_store is not None
+        and is_library_agent_id(task.agent_id)
+    )
+
+
+async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
+    """Create the fired session from the task's saved library Agent.
+
+    There is no ``agents`` row to bind: the saved bundle is copied into a fresh
+    session-scoped ``ag_`` agent, with the task's model / effort / permission
+    overrides applied and the template label recording the source ``ca_`` id.
+    """
+    custom_agents_store = deps.custom_agents_store
+    assert custom_agents_store is not None  # gated by _is_library_agent_task
+    result = await launch_library_agent(
+        custom_agents_store=custom_agents_store,
+        artifact_store=deps.artifact_store,
+        conversation_store=deps.conversation_store,
+        owner=task.user_id,
+        agent_id=task.agent_id,
+        launch=LibraryAgentLaunch(
+            title=task.name,
+            host_id=task.host_id,
+            workspace=task.workspace,
+            model_override=task.model_override,
+            reasoning_effort=task.reasoning_effort,
+            permission_mode=task.permission_mode,
+        ),
+    )
+    conv: Conversation | None = await asyncio.to_thread(
+        deps.conversation_store.get_conversation, result.session_id
+    )
+    if conv is None:
+        raise OmnigentError(
+            f"created session {result.session_id!r} not found",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+    return conv
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
-    """Create a conversation bound to the task's agent, carrying the stored spec."""
+    """Create a conversation bound to the task's agent, carrying the stored spec.
+
+    A ``ca_`` task goes through the library-Agent launch operation, which mints
+    a session-scoped ``ag_`` copy of the saved bundle; everything else binds the
+    task's stored agent directly.
+    """
+    if _is_library_agent_task(deps, task):
+        return await _create_library_agent_session(deps, task)
+    harness = await _permission_mode_harness(deps, task)
+    permission_mode = task.permission_mode
+    launch_args = (
+        ["--permission-mode", permission_mode]
+        if harness == "claude-native" and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
+        else None
+    )
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
-        terminal_launch_args=await _permission_mode_launch_args(deps, task),
+        terminal_launch_args=launch_args,
     )
     reasoning_effort = task.reasoning_effort
     if reasoning_effort is None:
@@ -848,6 +924,18 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     # the override reload above) so the labels land on the conversation returned
     # to the launch/dispatch caller, not a stale pre-label reload of it.
     labels = await _presentation_labels(deps, task)
+    if (
+        harness == "claude-sdk"
+        and permission_mode is not None
+        and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
+    ):
+        labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = permission_mode
+    elif (
+        harness == "codex"
+        and permission_mode is not None
+        and permission_mode in CODEX_SDK_APPROVAL_MODES
+    ):
+        labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = permission_mode
     if labels:
         await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
         conv.labels.update(labels)
@@ -988,37 +1076,64 @@ async def _validate_fire_session_inputs(
     """Validate stored task fields before creating a conversation."""
     try:
         owner = task.user_id
-        agent = await validate_session_agent(
-            user_id=owner,
-            agent_id=task.agent_id,
-            agent_store=deps.agent_store,
-            permission_store=deps.permission_store,
-            conversation_store=deps.conversation_store,
-        )
+        agent = None
+        library_spec = None
+        if _is_library_agent_task(deps, task):
+            # Owner-scoped lookup, so a deleted Agent (or another owner's id)
+            # fails this fire with the same not-found reason a missing stored
+            # agent produces.
+            custom_agents_store = deps.custom_agents_store
+            assert custom_agents_store is not None  # gated by _is_library_agent_task
+            library_spec, _bundle = await load_library_agent_bundle(
+                custom_agents_store=custom_agents_store,
+                artifact_store=deps.artifact_store,
+                owner=owner,
+                agent_id=task.agent_id,
+            )
+        else:
+            agent = await validate_session_agent(
+                user_id=owner,
+                agent_id=task.agent_id,
+                agent_store=deps.agent_store,
+                permission_store=deps.permission_store,
+                conversation_store=deps.conversation_store,
+            )
         validate_session_model_metadata(
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
         )
         validate_session_permission_mode(task.permission_mode)
         # NB: the harness gate for permission_mode is enforced fail-safe in
-        # _permission_mode_launch_args (the flag is injected only for a confirmed
-        # claude-native agent), so a mis-stamped non-Claude row degrades to "no
-        # flag" rather than failing the whole fire here.
+        # _permission_mode_harness and _create_session (the flag is injected only
+        # for a confirmed claude-native agent, while SDK labels require a matching
+        # harness and vocabulary), so a mis-stamped row degrades to no override
+        # rather than failing the whole fire here.
         if validate_workspace:
             if task.host_id is None or task.workspace is None:
                 return (
                     "scheduled tasks connected-host execution requires host_id and workspace",
                     "missing_execution_input",
                 )
-            await validate_existing_host_workspace(
-                user_id=owner,
-                host_id=task.host_id,
-                workspace=task.workspace,
-                agent=agent,
-                agent_cache=deps.agent_cache,
-                host_store=deps.host_store,
-                host_registry=deps.host_registry,
-            )
+            if library_spec is not None:
+                os_env = getattr(library_spec, "os_env", None)
+                await validate_uploaded_bundle_host_workspace(
+                    user_id=owner,
+                    host_id=task.host_id,
+                    workspace=task.workspace,
+                    spec_cwd=getattr(os_env, "cwd", None) if os_env is not None else None,
+                    host_store=deps.host_store,
+                    host_registry=deps.host_registry,
+                )
+            else:
+                await validate_existing_host_workspace(
+                    user_id=owner,
+                    host_id=task.host_id,
+                    workspace=task.workspace,
+                    agent=agent,
+                    agent_cache=deps.agent_cache,
+                    host_store=deps.host_store,
+                    host_registry=deps.host_registry,
+                )
     except OmnigentError as exc:
         return exc.message, exc.code
     except Exception:
@@ -1223,7 +1338,10 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
             tunnel_registry=deps.tunnel_registry,
             provider=None,
             agent_store=deps.agent_store,
-            agent_id=task.agent_id,
+            # The created session's bound agent — the same id as the task's for
+            # a stored agent, and the session-scoped ``ag_`` copy for a saved
+            # library Agent.
+            agent_id=conv.agent_id,
         )
         if launch is not None and launch.error is not None:
             raise RuntimeError(f"managed sandbox launch failed: {launch.error}")

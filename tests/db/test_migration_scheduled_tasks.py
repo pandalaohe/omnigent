@@ -26,6 +26,8 @@ from omnigent.db.utils import (
 )
 
 _PREVIOUS_HEAD = "9d820f91deef"
+# The revision the scheduled-task binding migration (c4b2d3e4f5a6) revises.
+_PRE_BINDING_HEAD = "c1a6e2f4b610"
 
 
 @pytest.fixture
@@ -58,6 +60,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "rrule",
         "user_id",
         "agent_id",
+        "custom_agent_id",
         "account_generation",
         "model_override",
         "reasoning_effort",
@@ -301,6 +304,241 @@ def test_scheduled_task_runs_status_stored_as_smallint(db_engine: Engine) -> Non
     """The ``status`` column is an integer type, not a VARCHAR."""
     cols = {c["name"]: c for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")}
     assert "INT" in str(cols["status"]["type"]).upper()
+
+
+def test_library_agent_binding_keeps_legacy_bytes_and_round_trips_ca_ids(
+    tmp_path: Path,
+) -> None:
+    """The additive binding column leaves stored-agent bytes and admits ``ca_`` ids.
+
+    Migration ``c4b2d3e4f5a6`` adds ``custom_agent_id`` and makes ``agent_id``
+    nullable instead of retyping the binary column. A row written before the
+    migration must read back the same 16 raw bytes, and a saved library Agent
+    id must round-trip through the new text column with ``agent_id`` NULL.
+    """
+    db_path = tmp_path / "library-binding.db"
+    uri = f"sqlite:///{db_path}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    legacy_bytes = bytes.fromhex("ab" * 16)
+
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _PRE_BINDING_HEAD)
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_tasks "
+                "(id, name, prompt, rrule, user_id, agent_id, timezone, created_at) "
+                "VALUES (X'00000000000000000000000000000001', 'n', 'p', "
+                "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, :agent_id, 'UTC', 1)"
+            ),
+            {"agent_id": legacy_bytes},
+        )
+        command.upgrade(config, "head")
+
+    with engine.begin() as conn:
+        agent_id, custom_agent_id = conn.execute(
+            sa.text(
+                "SELECT agent_id, custom_agent_id FROM scheduled_tasks "
+                "WHERE id = X'00000000000000000000000000000001'"
+            )
+        ).one()
+        assert agent_id == legacy_bytes
+        assert custom_agent_id is None
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_tasks "
+                "(id, name, prompt, rrule, user_id, agent_id, custom_agent_id, "
+                " timezone, created_at) "
+                "VALUES (X'00000000000000000000000000000002', 'n', 'p', "
+                "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, NULL, "
+                ":custom_agent_id, 'UTC', 1)"
+            ),
+            {"custom_agent_id": "ca_1234567890abcdef1234567890abcdef"},
+        )
+        library_id = conn.execute(
+            sa.text(
+                "SELECT custom_agent_id FROM scheduled_tasks "
+                "WHERE id = X'00000000000000000000000000000002'"
+            )
+        ).scalar_one()
+    assert library_id == "ca_1234567890abcdef1234567890abcdef"
+
+    engine.dispose()
+    clear_engine_cache()
+
+
+def test_agent_binding_check_requires_exactly_one_column(db_engine: Engine) -> None:
+    """``ck_scheduled_tasks_agent_binding`` rejects neither and both bindings.
+
+    The store writes exactly one of ``agent_id`` / ``custom_agent_id``; the
+    CHECK makes that a database invariant, so a raw write with zero or two
+    bindings fails instead of persisting an unlaunchable row.
+    """
+    with pytest.raises(IntegrityError):
+        with db_engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO scheduled_tasks "
+                    "(id, name, prompt, rrule, user_id, timezone, created_at) "
+                    "VALUES (X'000000000000000000000000000000b0', 'n', 'p', "
+                    "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, 'UTC', 1)"
+                )
+            )
+    with pytest.raises(IntegrityError):
+        with db_engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO scheduled_tasks "
+                    "(id, name, prompt, rrule, user_id, agent_id, custom_agent_id, "
+                    " timezone, created_at) "
+                    "VALUES (X'000000000000000000000000000000b1', 'n', 'p', "
+                    "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, 'ag', 'ca_0', 'UTC', 1)"
+                )
+            )
+
+
+def test_downgrade_drops_library_agent_tasks_and_restores_not_null(tmp_path: Path) -> None:
+    """Downgrade deletes ``ca_``-bound tasks with their runs, keeps stored rows.
+
+    A ``ca_`` task has no pre-change representation, so it goes with its run
+    history (the store's task deletion drops the same rows). The stored-agent
+    row survives, which lets ``agent_id`` go back to NOT NULL.
+    """
+    db_path = tmp_path / "library-binding-downgrade.db"
+    uri = f"sqlite:///{db_path}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    legacy_bytes = bytes.fromhex("cd" * 16)
+
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_tasks "
+                "(id, name, prompt, rrule, user_id, agent_id, timezone, created_at) "
+                "VALUES (X'00000000000000000000000000000011', 'n', 'p', "
+                "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, :agent_id, 'UTC', 1)"
+            ),
+            {"agent_id": legacy_bytes},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_task_runs "
+                "(id, scheduled_task_id, status, scheduled_at) "
+                "VALUES (X'00000000000000000000000000000021', "
+                "X'00000000000000000000000000000011', 1, 1)"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_tasks "
+                "(id, name, prompt, rrule, user_id, agent_id, custom_agent_id, "
+                " timezone, created_at) "
+                "VALUES (X'00000000000000000000000000000012', 'n', 'p', "
+                "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, NULL, "
+                "'ca_1234567890abcdef1234567890abcdef', 'UTC', 1)"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_task_runs "
+                "(id, scheduled_task_id, status, scheduled_at) "
+                "VALUES (X'00000000000000000000000000000022', "
+                "X'00000000000000000000000000000012', 1, 1)"
+            )
+        )
+        config.attributes["connection"] = conn
+        command.downgrade(config, _PRE_BINDING_HEAD)
+
+    with engine.begin() as conn:
+        tasks = conn.execute(sa.text("SELECT agent_id FROM scheduled_tasks")).scalars().all()
+        assert tasks == [legacy_bytes]
+        runs = (
+            conn.execute(sa.text("SELECT scheduled_task_id FROM scheduled_task_runs"))
+            .scalars()
+            .all()
+        )
+        assert runs == [bytes.fromhex("00000000000000000000000000000011")]
+
+    # agent_id is required again: a row with no binding column has nowhere to go.
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO scheduled_tasks "
+                    "(id, name, prompt, rrule, user_id, timezone, created_at) "
+                    "VALUES (X'00000000000000000000000000000013', 'n', 'p', "
+                    "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, 'UTC', 1)"
+                )
+            )
+
+    engine.dispose()
+    clear_engine_cache()
+
+
+def test_downgrade_keeps_other_workspaces_runs_with_same_task_id(tmp_path: Path) -> None:
+    """Downgrade correlates runs by ``(workspace_id, scheduled_task_id)``.
+
+    Task keys are ``(workspace_id, id)``, so a stored-agent task in a second
+    workspace can reuse the library-bound task's id. Only the library-bound
+    workspace's task and runs may be deleted; the other workspace's matching-id
+    task and its runs must survive.
+    """
+    db_path = tmp_path / "library-binding-workspaces.db"
+    uri = f"sqlite:///{db_path}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    legacy_bytes = bytes.fromhex("ef" * 16)
+    task_id = "X'00000000000000000000000000000031'"
+
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_tasks "
+                "(workspace_id, id, name, prompt, rrule, user_id, agent_id, "
+                " custom_agent_id, timezone, created_at) "
+                f"VALUES (1, {task_id}, 'n', 'p', "
+                "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, NULL, "
+                "'ca_1234567890abcdef1234567890abcdef', 'UTC', 1)"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_task_runs "
+                "(workspace_id, id, scheduled_task_id, status, scheduled_at) "
+                f"VALUES (1, X'00000000000000000000000000000041', {task_id}, 1, 1)"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_tasks "
+                "(workspace_id, id, name, prompt, rrule, user_id, agent_id, "
+                " timezone, created_at) "
+                f"VALUES (2, {task_id}, 'n', 'p', "
+                "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', NULL, :agent_id, 'UTC', 1)"
+            ),
+            {"agent_id": legacy_bytes},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO scheduled_task_runs "
+                "(workspace_id, id, scheduled_task_id, status, scheduled_at) "
+                f"VALUES (2, X'00000000000000000000000000000042', {task_id}, 1, 1)"
+            )
+        )
+        config.attributes["connection"] = conn
+        command.downgrade(config, _PRE_BINDING_HEAD)
+
+    with engine.begin() as conn:
+        tasks = conn.execute(sa.text("SELECT workspace_id, agent_id FROM scheduled_tasks")).all()
+        assert tasks == [(2, legacy_bytes)]
+        runs = conn.execute(
+            sa.text("SELECT workspace_id, scheduled_task_id FROM scheduled_task_runs")
+        ).all()
+        assert runs == [(2, bytes.fromhex("00000000000000000000000000000031"))]
+
+    engine.dispose()
+    clear_engine_cache()
 
 
 def test_downgrade_drops_both_tables(tmp_path: Path) -> None:

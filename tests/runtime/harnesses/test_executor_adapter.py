@@ -1772,6 +1772,8 @@ async def test_executor_adapter_builds_config_from_request() -> None:
             assert config is not None
             captured["model"] = config.model
             captured["extra"] = dict(config.extra)
+            captured["permission_mode"] = config.permission_mode
+            captured["approval_mode"] = config.approval_mode
             yield TurnComplete(response="ok")
 
     adapter = ExecutorAdapter(executor_factory=lambda: _CaptureExecutor())
@@ -1784,11 +1786,15 @@ async def test_executor_adapter_builds_config_from_request() -> None:
         model="my_coding_agent",  # agent routing name, not an LLM
         input="hi",
         reasoning={"effort": "medium"},
+        permission_mode="plan",
+        approval_mode="read-only",
         max_output_tokens=65536,
     )
     await adapter.run_turn(request, ctx)
     assert captured["extra"] == {"reasoning_effort": "medium", "max_tokens": 65536}
     assert captured["model"] is None
+    assert captured["permission_mode"] == "plan"
+    assert captured["approval_mode"] == "read-only"
 
 
 @pytest.mark.asyncio
@@ -2418,6 +2424,26 @@ async def test_elicitation_choice_handler_declines_without_a_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_raw_elicitation_handler_returns_verdict_without_cancelling_turn() -> None:
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    params = ElicitationRequestParams(mode="form", message="Approve command")
+    ctx = _ElicitingTurnContext(ElicitationResult(action="decline"))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    assert await adapter._stable_raw_elicitation_handler(params) == ctx.reply
+    assert len(ctx.seen) == 1
+    assert ctx.seen[0][0].startswith("elicit_")
+    assert ctx.seen[0][1] is params
+    assert not ctx.cancelled.was_set
+
+    adapter._current_ctx = None
+    assert await adapter._stable_raw_elicitation_handler(params) is None
+
+
+@pytest.mark.asyncio
 async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> None:
     """The choice bridge reaches executors that accept it, and only those.
 
@@ -2459,7 +2485,15 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
         ):
             yield TurnComplete(response="ok")
 
-    for executor, expected in ((_ChoiceCapableExecutor(), True), (_BinaryOnlyExecutor(), False)):
+    class _RawCapableExecutor(_BinaryOnlyExecutor):
+        def __init__(self) -> None:
+            self._raw_elicitation_handler = None
+
+    for executor, expected in (
+        (_ChoiceCapableExecutor(), True),
+        (_BinaryOnlyExecutor(), False),
+        (_RawCapableExecutor(), False),
+    ):
         adapter = ExecutorAdapter(executor_factory=lambda e=executor: e)  # type: ignore[misc]
         ctx = TurnContext(
             response_id="resp_bridge", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
@@ -2470,6 +2504,9 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
         assert installed is expected, type(executor).__name__
         # The yes/no bridge is installed on both — the choice bridge is additive.
         assert getattr(executor, "_elicitation_handler", None) is not None
+        assert (getattr(executor, "_raw_elicitation_handler", None) is not None) == isinstance(
+            executor, _RawCapableExecutor
+        )
 
 
 def test_translate_event_emits_subagent_started() -> None:

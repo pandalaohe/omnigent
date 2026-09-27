@@ -117,6 +117,11 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
+from omnigent.sdk_permission_modes import (
+    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODES,
+)
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -160,6 +165,7 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
+    CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
     validate_session_agent,
     validate_session_model_metadata,
 )
@@ -10234,6 +10240,44 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    sdk_permission_labels: dict[str, str] = {}
+    if body.permission_mode is not None or body.approval_mode is not None:
+        if body.sub_agent_name is not None or body.parent_session_id is not None:
+            raise OmnigentError(
+                "permission_mode and approval_mode are only supported for top-level sessions",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        resolved_harness = await asyncio.to_thread(
+            _create_resolved_harness, agent, harness_override, agent_cache
+        )
+        if body.permission_mode is not None:
+            if resolved_harness != "claude-sdk":
+                raise OmnigentError(
+                    "permission_mode is only supported for claude-sdk sessions, "
+                    f"not {resolved_harness!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.permission_mode not in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES:
+                raise OmnigentError(
+                    "permission_mode must be one of "
+                    f"{sorted(CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            sdk_permission_labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = body.permission_mode
+        if body.approval_mode is not None:
+            if resolved_harness != "codex":
+                raise OmnigentError(
+                    "approval_mode is only supported for codex sessions, "
+                    f"not {resolved_harness!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.approval_mode not in CODEX_SDK_APPROVAL_MODES:
+                raise OmnigentError(
+                    f"approval_mode must be one of {sorted(CODEX_SDK_APPROVAL_MODES)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            sdk_permission_labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = body.approval_mode
+
     inference_snapshot = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
@@ -10574,6 +10618,9 @@ async def _create_session_from_existing_agent(
 
         initial_labels[AUTO_HARNESS_LABEL_KEY] = "1"
 
+    if sdk_permission_labels:
+        initial_labels.update(sdk_permission_labels)
+
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
     )
@@ -10867,6 +10914,9 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = refreshed
+    # ``allow_host_fill=False``: the create route's host launch (and its
+    # revocation admission) runs after this response, so the response must
+    # not start a host fill.
     response = await _get_session_snapshot(
         conversation_store,
         conv.id,
@@ -10875,6 +10925,7 @@ async def _create_session_from_existing_agent(
         liveness_lookup=liveness_lookup,
         conversation=conv,
         request=request,
+        allow_host_fill=False,
     )
     return response, conv
 
@@ -11506,11 +11557,13 @@ async def _fetch_model_options(
     session_id: str,
     conv: Conversation,
     agent_store: AgentStore | None = None,
+    *,
+    allow_host_fill: bool = True,
 ) -> list[dict[str, Any]]:
     """
-    Resolve the Web UI model-picker options for a native session.
+    Resolve the Web UI model-picker options for a session.
 
-    Three shapes:
+    Catalog sources:
 
     * **codex-native / cursor-native / kiro-native** — a *live* catalog only
       the bound runner can read from the installed CLI. This stays
@@ -11524,6 +11577,8 @@ async def _fetch_model_options(
       With no runner bound and a cold cache (server restart while the
       session slept), the session's host resolves a pre-launch preview
       instead — the same source the new-session picker uses.
+    * **claude-sdk / codex** — the session's host resolves the catalog;
+      SDK runners do not serve model options.
     * **acp** — the deployment's curated provider ``models:`` shortlist from
       the session's explicit provider (provider default first). Local to the
       server, so a cold cache re-resolves inline with no runner round trip.
@@ -11538,6 +11593,11 @@ async def _fetch_model_options(
     :param conv: Conversation row whose labels identify the wrapper.
     :param agent_store: Optional store for the ACP spec lookup; resolves
         from the runtime globals when ``None``.
+    :param allow_host_fill: When ``False``, never start the background
+        SDK host fill. The session-create response passes ``False``: its
+        host launch runs afterwards and may still be refused by the
+        revocation admission, so that response must not push a host frame.
+        Ordinary snapshots keep the fill.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -11557,6 +11617,23 @@ async def _fetch_model_options(
         # resolved from the spec instead of a runner-owned catalog.
         if _resolve_harness_impl_is_acp(conv, agent_store):
             return await _load_acp_model_options(session_id, conv, agent_store)
+        from omnigent.harness_aliases import canonicalize_harness
+
+        harness = canonicalize_harness(_resolve_harness(conv, agent_store=agent_store))
+        if harness in {"claude-sdk", "codex"} and conv.host_id is not None:
+            cached = _model_options_cache.get(session_id)
+            if cached is not None:
+                return cached
+            if allow_host_fill and session_id not in _model_options_inflight:
+                task = asyncio.create_task(
+                    _load_model_options_from_host(session_id, conv.host_id, harness)
+                )
+                _model_options_inflight[session_id] = task
+
+                def _clear_sdk_options_inflight(_task: asyncio.Task[None]) -> None:
+                    _model_options_inflight.pop(session_id, None)
+
+                task.add_done_callback(_clear_sdk_options_inflight)
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -11573,7 +11650,9 @@ async def _fetch_model_options(
             and conv.host_id is not None
             and session_id not in _model_options_inflight
         ):
-            task = asyncio.create_task(_load_model_options_from_host(session_id, conv.host_id))
+            task = asyncio.create_task(
+                _load_model_options_from_host(session_id, conv.host_id, "claude-native")
+            )
             _model_options_inflight[session_id] = task
 
             def _clear_host_options_inflight(_task: asyncio.Task[None]) -> None:
@@ -11936,6 +12015,7 @@ async def _get_session_snapshot(
     viewer_id: str | None = None,
     request: Request | None = None,
     include_usage: bool = True,
+    allow_host_fill: bool = True,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -11976,6 +12056,11 @@ async def _get_session_snapshot(
         overlays for this session before building the response. Browser
         reloads use this so a refresh re-reads current live-session
         capabilities instead of serving stale AP-process caches.
+    :param allow_host_fill: When ``False``, the snapshot starts no
+        background SDK host catalog fill (see
+        :func:`_fetch_model_options`). The session-create response passes
+        ``False`` because its host launch still has to pass the
+        revocation admission after this snapshot is built.
     :returns: The fully populated :class:`SessionResponse`.
     :raises OmnigentError: 404 if no session exists, 500 if the
         underlying conversation has no agent binding
@@ -12164,7 +12249,9 @@ async def _get_session_snapshot(
         if not conv.reported_model:
             llm_model = conv.model_override or catalog.get("default_model")
     else:
-        model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
+        model_options = await _fetch_model_options(
+            runner_client, session_id, conv, agent_store, allow_host_fill=allow_host_fill
+        )
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.

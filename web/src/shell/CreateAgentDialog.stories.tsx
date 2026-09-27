@@ -38,6 +38,7 @@ export const EmptyForm: Story = {};
 
 export const FilledReadyToCreate: Story = {
   play: async ({ canvasElement }) => {
+    canvasElement.ownerDocument.body.style.pointerEvents = "auto";
     const body = within(canvasElement.ownerDocument.body);
     await fireEvent.change(body.getByTestId("create-agent-name"), {
       target: { value: "polly-helper" },
@@ -45,12 +46,15 @@ export const FilledReadyToCreate: Story = {
     await fireEvent.change(body.getByTestId("create-agent-description"), {
       target: { value: "Helps triage sessions" },
     });
-    await fireEvent.change(body.getByTestId("create-agent-model"), {
-      target: { value: "claude-sonnet-5" },
-    });
     await fireEvent.change(body.getByTestId("create-agent-instructions"), {
       target: { value: "Summarize failed runs and recommend the next action." },
     });
+    await fireEvent.pointerDown(body.getByTestId("agent-member-trigger"), {
+      button: 0,
+      pointerType: "mouse",
+    });
+    await fireEvent.click(await body.findByTestId("agent-member-model"));
+    await fireEvent.click(await body.findByTestId("agent-member-model-opus"));
   },
 };
 

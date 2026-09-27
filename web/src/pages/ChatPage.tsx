@@ -99,7 +99,8 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
 import { createSideChat, retrySession } from "@/lib/sessionsApi";
-import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
+import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
@@ -117,6 +118,7 @@ import {
   nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
+  nativeCodingAgentForWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import {
@@ -280,7 +282,8 @@ import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { isSdkHarnessSession, supportsEffortControl } from "@/lib/sessionCapabilities";
+import { sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
@@ -1154,9 +1157,11 @@ export function ChatPage() {
       effortLevelsForConv(
         capabilitySource,
         codexModelOptions,
-        llmModel ?? sessionModelOverrideForEffort,
+        modelPickerKind === "sdk"
+          ? (sessionModelOverrideForEffort ?? llmModel)
+          : (llmModel ?? sessionModelOverrideForEffort),
       ),
-    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort],
+    [capabilitySource, codexModelOptions, llmModel, modelPickerKind, sessionModelOverrideForEffort],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -3021,17 +3026,23 @@ function ComposerImpl(
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
   const devinPermissionControl = modelPickerKind === "devin";
-  const permissionOptions = showClaudePermissionMode
-    ? devinPermissionControl
-      ? DEVIN_NATIVE_PERMISSION_MODES
-      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
-    : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
+  const sdkPermissionControl = modelPickerKind === "sdk";
+  const permissionOptions =
+    (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
+    (showClaudePermissionMode
+      ? devinPermissionControl
+        ? DEVIN_NATIVE_PERMISSION_MODES
+        : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+      : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS);
   const permissionLabel = showClaudePermissionMode
     ? devinPermissionControl
       ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
         claudePermissionMode)
       : claudePermissionModeLabel(claudePermissionMode)
-    : codexApprovalModeLabel(codexApprovalMode);
+    : sdkPermissionControl
+      ? (permissionOptions.find((mode) => mode.value === codexApprovalMode)?.label ??
+        codexApprovalMode)
+      : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
     if (isReadOnly || unreachable || configBusyRef.current) return;
     configBusyRef.current = true;
@@ -3206,7 +3217,7 @@ function ComposerImpl(
   const supportsModelReset =
     !!inferenceConfigured ||
     (modelPickerKind
-      ? ["opencode", "acp", "configured"].includes(modelPickerKind)
+      ? ["opencode", "acp", "configured", "sdk"].includes(modelPickerKind)
       : !isNativeWrapper);
   // /compact is functional for native wrappers (claude-native,
   // codex-native), which inject the slash command into the terminal, and
@@ -4758,22 +4769,17 @@ export function unboundSessionResumableInApp(params: {
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 
-/** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
-const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-
-/** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
-const PI_NATIVE_EFFORT_LEVELS = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
-
 type NativeModelPickerKind =
-  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "kiro"
+  | "opencode"
+  | "pi"
+  | "devin"
+  | "acp"
+  | "configured"
+  | "sdk";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4864,34 +4870,23 @@ export function effortLevelsForConv(
         labels?: Record<string, string | null> | null;
         harness?: string | null;
         parentSessionId?: string | null;
+        inferenceConfigured?: boolean;
       }
     | null
     | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
-  switch (effectiveWrapperLabel(conv)) {
-    case "claude-code-native-ui":
-      return CLAUDE_NATIVE_EFFORT_LEVELS;
-    case "devin-native-ui":
-      // Devin encodes effort as a model-variant suffix, and the rung set is
-      // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a different
-      // Fusion model), so derive it from the selected model's catalog entry —
-      // its `supportedReasoningEfforts` — rather than a fixed ladder.
-      return codexEffortLevelsForModel(codexModelOptions, currentModel);
-    case "codex-native-ui":
-      return codexEffortLevelsForModel(codexModelOptions, currentModel);
-    case "pi-native-ui":
-      return PI_NATIVE_EFFORT_LEVELS;
-    default:
-      return EFFORT_LEVELS;
-  }
+  const harness =
+    nativeCodingAgentForWrapper(effectiveWrapperLabel(conv))?.harness ??
+    (isSdkHarnessSession(conv) ? conv?.harness : null);
+  return effortLevelsFor(harness, codexModelOptions, currentModel) ?? EFFORT_LEVELS;
 }
 
 /**
- * Which native model picker should be visible for *conv*?
+ * Which model picker should be visible for *conv*?
  *
- * Gated on the wrapper label, not `omnigent.ui === "terminal"`:
+ * Native pickers are gated on the wrapper label, not `omnigent.ui === "terminal"`:
  * other terminal-first wrappers may not be Claude/Codex-native (see
  * `TerminalFirstContext.tsx`).
  */
@@ -4936,6 +4931,7 @@ export function modelPickerKindForConv(
       return "pi";
     default:
       if (conv?.inferenceConfigured) return "configured";
+      if (isSdkHarnessSession(conv)) return "sdk";
       // Generic ACP sessions carry no wrapper label; the server canonicalizes
       // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
       if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
@@ -4966,7 +4962,13 @@ export function shouldShowModelPicker(
  */
 export function shouldShowEffortPicker(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        inferenceConfigured?: boolean;
+      }
+    | null
+    | undefined,
 ): boolean {
   return supportsEffortControl(conv);
 }
@@ -4978,37 +4980,55 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
- * True when the claude-native permission-mode picker should be visible.
+ * True when the Claude permission-mode picker should be visible.
  *
- * Claude-native sessions only: the switch drives Claude Code's own
- * shift+tab cycle, which no other harness has.
+ * Native Claude switches through its shift+tab cycle; Claude SDK updates
+ * the session's next-turn permission mode.
  *
- * :param conv: Session-like object carrying `labels`; a missing session
- *     or missing labels fails closed.
- * :returns: True only for sessions running the claude-native wrapper.
+ * :param conv: Session-like object carrying its harness and labels;
+ *     a missing session fails closed.
+ * :returns: True for native Claude, Claude SDK, and Devin sessions.
  */
 export function shouldShowPermissionModeControl(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        inferenceConfigured?: boolean;
+      }
+    | null
+    | undefined,
 ): boolean {
   // Devin cycles its own rungs with Shift+Tab, which the runner drives, so it
   // gets the same control — with its own vocabulary (see `permissionOptions`).
-  return isClaudeNativeSession(conv) || modelPickerKindForConv(conv) === "devin";
+  return (
+    isClaudeNativeSession(conv) ||
+    modelPickerKindForConv(conv) === "devin" ||
+    (isSdkHarnessSession(conv) && conv?.harness === "claude-sdk")
+  );
 }
 
 /**
- * True when the codex-native approval-mode picker should be visible.
+ * True when the Codex approval-mode picker should be visible.
  *
- * Codex-native sessions only: the switch drives Codex's own approval/sandbox
- * presets (the ``/permissions`` popup), which no other harness has.
+ * Native Codex drives its ``/permissions`` popup; Codex SDK updates the
+ * session's next-turn approval mode.
  *
- * :param conv: Session-like object carrying `labels`; a missing session or
- *     missing labels fails closed.
- * :returns: True only for sessions running the codex-native wrapper.
+ * :param conv: Session-like object carrying its harness and labels;
+ *     a missing session fails closed.
+ * :returns: True for native Codex or Codex SDK sessions.
  */
 export function shouldShowCodexApprovalModeControl(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        inferenceConfigured?: boolean;
+      }
+    | null
+    | undefined,
 ): boolean {
-  return isCodexNativeSession(conv);
+  return isCodexNativeSession(conv) || (isSdkHarnessSession(conv) && conv?.harness === "codex");
 }
 
 /**
@@ -5112,9 +5132,11 @@ function SessionHarnessPicker({
   const pendingModelChange = useChatStore((state) => state.pendingModelChange);
   const sessionModelSeeded = useChatStore((state) => state.sessionModelSeeded);
   const selectedEffort = useSessionEffort();
+  const sessionModelOverride = useChatStore((state) => state.sessionModelOverride);
   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
   const {
+    llmModel,
     effectiveModel,
     modelLabel,
     modelLabelLoading,
@@ -5161,9 +5183,15 @@ function SessionHarnessPicker({
           modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
         );
   const availableEfforts =
-    modelPickerKind === "codex"
-      ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
-      : effortLevels;
+    effortLevelsFor(
+      modelPickerKind === "codex"
+        ? "codex-native"
+        : modelPickerKind === "sdk"
+          ? sessionHarness
+          : null,
+      codexModelOptions,
+      pickerSelectedModel,
+    ) ?? effortLevels;
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
@@ -5204,9 +5232,16 @@ function SessionHarnessPicker({
       });
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (
-        modelPickerKind === "codex" &&
-        selectedEffort !== null &&
-        !codexEffortLevelsForModel(codexModelOptions, modelId).includes(selectedEffort)
+        reconcileEffortOnModelChange(
+          modelPickerKind === "codex"
+            ? "codex-native"
+            : modelPickerKind === "sdk"
+              ? sessionHarness
+              : null,
+          codexModelOptions,
+          modelId,
+          selectedEffort,
+        ) !== selectedEffort
       )
         await store.setEffort(null);
       if (
@@ -5286,11 +5321,32 @@ function SessionHarnessPicker({
                     onSelect: () =>
                       composerFusion !== undefined && model.id === composerFusionOption?.id
                         ? selectFusionModel(composerFusion.default)
-                        : selectModel(supportsModelReset && model.isDefault ? null : model.id),
+                        : selectModel(
+                            supportsModelReset && modelPickerKind !== "sdk" && model.isDefault
+                              ? null
+                              : model.id,
+                          ),
                     testId: `composer-agent-model-${model.id}`,
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
                   })),
+                  ...(modelPickerKind === "sdk" &&
+                  sessionModelOverride &&
+                  llmModel &&
+                  (findNativeModelOption(codexModelOptions, sessionModelOverride)?.id ??
+                    sessionModelOverride) !==
+                    (findNativeModelOption(codexModelOptions, llmModel)?.id ?? llmModel)
+                    ? [
+                        {
+                          key: "__running__",
+                          label: `${nativeModelLabel(findNativeModelOption(codexModelOptions, llmModel) ?? { id: llmModel })} (running)`,
+                          checked: false,
+                          disabled: true,
+                          className: "whitespace-normal break-words",
+                          data: { "data-model-id": llmModel },
+                        },
+                      ]
+                    : []),
                   ...(pickerSelectedModel &&
                   !isFusionModelUid(pickerSelectedModel) &&
                   !modelOptions.some((model) => model.id === pickerSelectedModel)
@@ -5486,7 +5542,7 @@ function useSessionEffort(): string | null {
  * modal, and the gear hover summary so all three agree on what "the current
  * model" is (the resolution differs by wrapper — see the inline notes).
  *
- * @param modelPickerKind Native picker family, or ``null`` for SDK/bundle.
+ * @param modelPickerKind Picker family, or ``null`` for sessions without one.
  * @param codexModelOptions Server-provided model options (codex/cursor/…).
  */
 function useResolvedComposerModel(
@@ -5503,7 +5559,7 @@ function useResolvedComposerModel(
   const llmModel = useChatStore((s) => s.llmModel);
   const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
 
-  // Native model pickers populate from the snapshot's runner-backed
+  // Session model pickers populate from the snapshot's runner-backed
   // ``model_options`` field. Claude's rows are the aliases pinned to the
   // launch-time Databricks catalog; Codex carries richer effort metadata.
   const usesServerModelOptions =
@@ -5515,7 +5571,8 @@ function useResolvedComposerModel(
     modelPickerKind === "opencode" ||
     modelPickerKind === "devin" ||
     modelPickerKind === "acp" ||
-    modelPickerKind === "configured";
+    modelPickerKind === "configured" ||
+    modelPickerKind === "sdk";
   const modelOptions: readonly {
     id: string;
     model?: string;
@@ -5554,11 +5611,11 @@ function useResolvedComposerModel(
   // on a web pick (which also drives a live ``/model`` switch); opencode/pi
   // mirror both ways into ``model_override``. Those wrappers keep their
   // override-derived surface until they adopt reported-model semantics.
-  // SDK/bundle agents (no native picker) resolve the session override or the
-  // bound default.
+  // SDK/bundle agents resolve the session override or the bound default.
   const pickerSelectedModel = isReportedModelPicker
     ? (reportedRowId ?? requestedRowId)
-    : (sessionModelOverride ?? (modelPickerKind === "configured" ? llmModel : null));
+    : (sessionModelOverride ??
+      (modelPickerKind === "configured" || modelPickerKind === "sdk" ? llmModel : null));
   const effectiveModel = sessionModelSeeded
     ? (sessionModelOverride ?? llmModel)
     : nativeVendorOwnsModel

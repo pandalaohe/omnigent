@@ -17,6 +17,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { AgentMemberTrigger } from "@/components/AgentMemberTrigger";
+import { useNewChatHostId } from "@/hooks/useHosts";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
 
@@ -130,15 +133,15 @@ export function CreateAgentDialog({
   submitDisabled?: boolean;
 }) {
   const brainHarnessLabels = useBrainHarnessLabels();
-  const harnessOptions = Object.entries(brainHarnessLabels).map(([value, label]) => ({
-    value,
-    label,
-  }));
+  const harnessOptions = Object.entries(brainHarnessLabels).map(([id, label]) => ({ id, label }));
+  const hostId = useNewChatHostId();
+  const { trackValueChange } = useOmnigentAnalytics();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [instructions, setInstructions] = useState("");
   const [harness, setHarness] = useState(DEFAULT_HARNESS);
-  const [model, setModel] = useState("");
+  const [model, setModel] = useState<string | null>(null);
+  const [effort, setEffort] = useState<string | null>(null);
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -149,7 +152,8 @@ export function CreateAgentDialog({
     setDescription("");
     setInstructions("");
     setHarness(DEFAULT_HARNESS);
-    setModel("");
+    setModel(null);
+    setEffort(null);
     setMcpEntries([]);
     setNextKey(0);
   }
@@ -176,7 +180,7 @@ export function CreateAgentDialog({
 
   async function handleSubmit() {
     const trimmedName = name.trim();
-    if (!trimmedName || !model.trim() || saving || submitDisabled) return;
+    if (!trimmedName || model === null || saving || submitDisabled) return;
     setSaving(true);
     setError(null);
 
@@ -186,7 +190,8 @@ export function CreateAgentDialog({
         description: description.trim() || undefined,
         instructions: instructions.trim() || undefined,
         harness,
-        model: model.trim(),
+        model,
+        reasoningEffort: effort ?? undefined,
         mcpServers: toMCPInputs(mcpEntries),
       });
       reset();
@@ -198,7 +203,7 @@ export function CreateAgentDialog({
     }
   }
 
-  const canSubmit = name.trim().length > 0 && model.trim().length > 0;
+  const canSubmit = name.trim().length > 0 && model !== null;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -247,45 +252,36 @@ export function CreateAgentDialog({
             />
           </div>
 
-          {/* Harness */}
+          {/* Harness / model / effort of the lead member (the bundle root). */}
           <div className="flex flex-col gap-1.5">
-            <label className="text-sm font-medium text-muted-foreground">
-              Harness <span className="text-destructive">*</span>
-            </label>
-            <Select
-              value={harness}
-              onValueChange={setHarness}
-              componentId="create_agent.harness"
-              valueHasNoPii
-            >
-              <SelectTrigger data-testid="create-agent-harness" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {harnessOptions.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Model */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-model"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              Model <span className="text-destructive">*</span>
-            </label>
-            <Input
-              id="create-agent-model"
-              data-testid="create-agent-model"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="claude-sonnet-4-20250514"
+            <span className="text-sm font-medium text-muted-foreground">
+              Harness, model, effort
+            </span>
+            <AgentMemberTrigger
+              harness={harness}
+              model={model}
+              effort={effort}
+              harnessOptions={harnessOptions}
+              hostId={hostId}
+              onChange={(next) => {
+                if (next.harness !== harness) {
+                  // Keeps the event the trigger replaced (a Select) emitted:
+                  // same componentId, kind, and non-PII harness id.
+                  trackValueChange("create_agent.harness", "select", next.harness, {
+                    valueHasNoPii: true,
+                  });
+                }
+                setHarness(next.harness);
+                setModel(next.model);
+                setEffort(next.effort);
+              }}
+              disabled={saving}
             />
+            {model === null && (
+              <p className="text-xs text-muted-foreground">
+                Pick a model — the omnigent executor requires one.
+              </p>
+            )}
           </div>
 
           {/* Instructions / System Prompt */}

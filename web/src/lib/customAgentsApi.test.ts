@@ -7,6 +7,7 @@ vi.mock("./identity", () => ({ authenticatedFetch: mocks.authenticatedFetch }));
 import {
   createCustomAgent,
   deleteCustomAgent,
+  duplicateBuiltinAgent,
   getCustomAgent,
   importCustomAgent,
   listCustomAgents,
@@ -20,6 +21,7 @@ const detail: CustomAgentDetail = {
   description: null,
   harness: "codex",
   model: null,
+  members: null,
   version: 4,
   created_at: 1,
   updated_at: null,
@@ -94,11 +96,35 @@ describe("customAgentsApi", () => {
     );
   });
 
+  it("duplicates a built-in Agent by its source id", async () => {
+    mocks.authenticatedFetch.mockResolvedValue(jsonResponse(detail));
+
+    await expect(duplicateBuiltinAgent("ag_builtin_polly")).resolves.toEqual(detail);
+    expect(mocks.authenticatedFetch).toHaveBeenCalledWith("/v1/custom-agents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_agent_id: "ag_builtin_polly" }),
+    });
+  });
+
   it("surfaces server detail errors and falls back to the HTTP status", async () => {
     mocks.authenticatedFetch.mockResolvedValueOnce(
       jsonResponse({ detail: "Version conflict" }, 409),
     );
     await expect(getCustomAgent(detail.id)).rejects.toThrow("Version conflict");
+
+    // The Agent routes' own envelope; the editor keys its reload off the status.
+    mocks.authenticatedFetch.mockResolvedValueOnce(
+      jsonResponse(
+        { error: { code: "conflict", message: "Custom Agent changed; reload before saving" } },
+        409,
+      ),
+    );
+    await expect(getCustomAgent(detail.id)).rejects.toMatchObject({
+      message: "Custom Agent changed; reload before saving",
+      status: 409,
+      code: "conflict",
+    });
 
     mocks.authenticatedFetch.mockResolvedValueOnce(
       new Response("upstream failed", { status: 502 }),

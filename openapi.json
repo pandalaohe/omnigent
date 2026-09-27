@@ -48,6 +48,70 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AgentMember": {
+        "additionalProperties": false,
+        "description": "One member of a joint Agent; the lead is the bundle's root spec.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 8192,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "harness": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Harness",
+            "type": "string"
+          },
+          "lead": {
+            "title": "Lead",
+            "type": "boolean"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          }
+        },
+        "required": [
+          "name",
+          "harness",
+          "lead"
+        ],
+        "title": "AgentMember",
+        "type": "object"
+      },
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
@@ -105,6 +169,22 @@
             "description": "Whether the MCP list can be edited through the session UI. Built-in template agents are read-only; session-scoped uploaded agents are editable.",
             "title": "Mcp Servers Editable",
             "type": "boolean"
+          },
+          "members": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Roster projected from the bundle: the lead (root spec) first, then each sub-agent, each as `{name, description, harness, model, reasoning_effort, lead}` (see `omnigent.server.custom_agent_bundles.project_members`). `None` when the bundle cannot be loaded.",
+            "title": "Members"
           },
           "name": {
             "description": "Human-readable agent name, e.g. `\"research-agent\"`.",
@@ -2427,6 +2507,20 @@
               }
             ],
             "title": "Instructions"
+          },
+          "members": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/AgentMember"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Members"
           },
           "name": {
             "anyOf": [
@@ -9870,7 +9964,7 @@
                 "type": "null"
               }
             ],
-            "description": "Codex-native approval mode to switch a running session to, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"` \u2014 Codex's own `/permissions` presets (the set is codex-version-dependent, so an older build may not offer every one). Only valid for sessions stamped with the codex-native wrapper label. The runner applies it by driving Codex's `/permissions` popup and confirms the switch echoed before returning, so a failure to reach the mode surfaces as an error. The confirmed mode is stored on the read-back label only (Codex owns the durable approval state), so it is not written to `terminal_launch_args`. Omitted leaves unchanged.",
+            "description": "Codex-native approval mode to switch a running session to, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"` \u2014 Codex's own `/permissions` presets (the set is codex-version-dependent, so an older build may not offer every one). Only valid for sessions stamped with the codex-native wrapper label. The runner applies it by driving Codex's `/permissions` popup and confirms the switch echoed before returning, so a failure to reach the mode surfaces as an error. The confirmed mode is stored on the read-back label only (Codex owns the durable approval state), so it is not written to `terminal_launch_args`. Omitted leaves unchanged. Codex SDK sessions accept `\"default\"`, `\"full-access\"`, and `\"read-only\"`, applied from the next turn.",
             "title": "Approval Mode"
           },
           "archive_locked": {
@@ -9969,7 +10063,7 @@
                 "type": "null"
               }
             ],
-            "description": "Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
+            "description": "Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged. Claude SDK sessions accept all Claude Code launch modes, applied from the next turn.",
             "title": "Permission Mode"
           },
           "project_id": {
@@ -10325,7 +10419,8 @@
                 "context_indicator",
                 "usage_context",
                 "agent_badges",
-                "approval_timeout"
+                "approval_timeout",
+                "agent_pins"
               ]
             },
             "title": "Settings",
@@ -11436,17 +11531,35 @@
             "application/json": {
               "schema": {
                 "additionalProperties": false,
+                "description": "Duplicate a source Agent: a session snapshot or a built-in row.",
                 "properties": {
+                  "source_agent_id": {
+                    "anyOf": [
+                      {
+                        "maxLength": 256,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Source Agent Id"
+                  },
                   "source_session_id": {
-                    "maxLength": 256,
-                    "minLength": 1,
-                    "title": "Source Session Id",
-                    "type": "string"
+                    "anyOf": [
+                      {
+                        "maxLength": 256,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Source Session Id"
                   }
                 },
-                "required": [
-                  "source_session_id"
-                ],
                 "title": "CustomAgentImport",
                 "type": "object"
               }
@@ -13071,6 +13184,7 @@
                     "propertyNames": {
                       "enum": [
                         "agent_badges",
+                        "agent_pins",
                         "approval_timeout",
                         "context_indicator",
                         "keyboard_shortcuts",
@@ -13149,7 +13263,8 @@
                 "context_indicator",
                 "usage_context",
                 "agent_badges",
-                "approval_timeout"
+                "approval_timeout",
+                "agent_pins"
               ],
               "title": "Namespace",
               "type": "string"

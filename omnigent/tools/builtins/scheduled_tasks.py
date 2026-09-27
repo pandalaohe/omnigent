@@ -96,10 +96,11 @@ class SysScheduledTaskCreateTool(Tool):
                         "permission_mode": {
                             "type": "string",
                             "description": (
-                                "Optional permission mode for native coding agents that "
-                                "support one (Claude Code): 'default', 'auto', "
-                                "'acceptEdits', 'plan', 'dontAsk', or 'bypassPermissions'. "
-                                "Runs are unattended, so a prompting mode ('default'/'plan') "
+                                "Optional permission mode for Claude Code or Claude SDK "
+                                "('default', 'auto', 'acceptEdits', 'plan', 'dontAsk', "
+                                "'bypassPermissions'), or Codex SDK ('default', "
+                                "'full-access', 'read-only'). "
+                                "Runs are unattended, so a prompting mode "
                                 "stalls waiting for approval — prefer an auto-running mode. "
                                 "Omit for the agent default."
                             ),
@@ -232,9 +233,10 @@ class SysScheduledTaskUpdateTool(Tool):
                         "permission_mode": {
                             "type": "string",
                             "description": (
-                                "New permission mode for native coding agents (Claude "
-                                "Code): 'default', 'auto', 'acceptEdits', 'plan', "
-                                "'dontAsk', or 'bypassPermissions'."
+                                "New permission mode for Claude Code or Claude SDK "
+                                "('default', 'auto', 'acceptEdits', 'plan', 'dontAsk', "
+                                "'bypassPermissions'), or Codex SDK ('default', "
+                                "'full-access', 'read-only')."
                             ),
                         },
                         "max_cost_usd": {

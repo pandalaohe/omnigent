@@ -33,7 +33,7 @@ from collections.abc import (
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.errors import HarnessTransportClosedError
@@ -47,8 +47,14 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
 from omnigent.spec.types import RetryPolicy
-from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
+from omnigent.util.reasoning_effort import (
+    CODEX_EFFORTS,
+    CODEX_NATIVE_EFFORTS,
+    EFFORT_ALIASES,
+    validate_effort,
+)
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -80,6 +86,9 @@ from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOO
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is unset.
@@ -113,6 +122,9 @@ CodexEnqueuedContent: TypeAlias = Any  # type: ignore[explicit-any]
 CodexToolExecutor: TypeAlias = Callable[
     [str, ToolArgs],
     Awaitable[CodexToolResult] | CodexToolResult,
+]
+CodexElicitationHandler: TypeAlias = Callable[
+    ["ElicitationRequestParams"], Awaitable["ElicitationResult | None"]
 ]
 
 # When the app-server is silent for this long we emit a warning,
@@ -2403,6 +2415,7 @@ class _CodexAppServerSession:
         cwd: str | None,
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
+        raw_elicitation_handler: CodexElicitationHandler | None = None,
         codex_config_overrides: list[str] | None = None,
         retry_policy: RetryPolicy | None = None,
         disable_native_tools: bool = False,
@@ -2413,6 +2426,7 @@ class _CodexAppServerSession:
         self._cwd = cwd
         self._env = env
         self._tool_executor = tool_executor
+        self._raw_elicitation_handler = raw_elicitation_handler
         self._codex_config_overrides = list(codex_config_overrides or [])
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
@@ -2699,6 +2713,55 @@ class _CodexAppServerSession:
             )
         return formatted
 
+    async def _answer_server_request(
+        self, message: CodexMessage, active_turn_id: str | None
+    ) -> bool:
+        if "id" not in message or "method" not in message or message["method"] == "item/tool/call":
+            return False
+
+        from omnigent.server.routes._codex_elicitation import (
+            _CODEX_ELICITATION_ADAPTERS,
+            parse_codex_elicitation_request,
+        )
+        from omnigent.server.schemas import ElicitationResult
+
+        request_id = message["id"]
+        method = message["method"]
+        if not isinstance(method, str) or method not in _CODEX_ELICITATION_ADAPTERS:
+            await self._send_error(
+                request_id, -32601, f"Unsupported Codex elicitation request method: {method!r}"
+            )
+            return True
+        try:
+            request = parse_codex_elicitation_request(message)
+        except Exception as exc:  # noqa: BLE001 — malformed requests still need a reply
+            await self._send_error(request_id, -32602, str(exc))
+            return True
+
+        request_turn_id = request.codex_params.get("turnId")
+        if (
+            self._raw_elicitation_handler is None
+            or active_turn_id is None
+            or self.active_turn_id is None
+            or (isinstance(request_turn_id, str) and request_turn_id != active_turn_id)
+        ):
+            result = ElicitationResult(action="decline")
+        else:
+            try:
+                result = await self._raw_elicitation_handler(request.params)
+            except Exception as exc:  # noqa: BLE001 — handler failures need a reply
+                await self._send_error(request_id, -32603, str(exc))
+                return True
+            if result is None:
+                result = ElicitationResult(action="decline")
+        try:
+            payload = request.build_response(result)
+        except Exception as exc:  # noqa: BLE001 — malformed verdicts need a reply
+            await self._send_error(request_id, -32602, str(exc))
+            return True
+        await self._send_response(request.request_id, payload)
+        return True
+
     async def _drain_turn_completed_tail(
         self,
         *,
@@ -2731,6 +2794,8 @@ class _CodexAppServerSession:
                 # A completed turn remains successful when its process exits.
                 return final_response
             self._record_event(message)
+            if await self._answer_server_request(message, None):
+                continue
             params = message.get("params", {})
             if not isinstance(params, dict):
                 continue
@@ -2776,6 +2841,7 @@ class _CodexAppServerSession:
         cwd: str,
         sandbox: str,
         reasoning_effort: str | None = None,
+        approval_mode: str | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
@@ -2890,6 +2956,10 @@ class _CodexAppServerSession:
         if effort_via_turn_start:
             turn_params["effort"] = reasoning_effort
             turn_params["summary"] = "detailed"
+        if approval_mode is not None:
+            approval_policy, sandbox_type = CODEX_SDK_TURN_POLICIES[approval_mode]
+            turn_params["approvalPolicy"] = approval_policy
+            turn_params["sandboxPolicy"] = {"type": sandbox_type}
         start_response = await self._request(
             "turn/start",
             turn_params,
@@ -2920,6 +2990,9 @@ class _CodexAppServerSession:
                         raw_queued_turn_id = queued_turn.get("id")
                 if isinstance(raw_queued_turn_id, str):
                     queued_turn_id = raw_queued_turn_id
+            if "id" in queued_message and "method" in queued_message:
+                retained_events.append(queued_message)
+                continue
             if queued_turn_id is not None and queued_turn_id == active_turn_id:
                 retaining_current_turn = True
             if retaining_current_turn:
@@ -3048,6 +3121,9 @@ class _CodexAppServerSession:
                 raw_method = message.get("method")
                 method: str | None = raw_method if isinstance(raw_method, str) else None
                 params = message.get("params", {})
+
+                if await self._answer_server_request(message, active_turn_id):
+                    continue
 
                 if method == "item/started":
                     if not _event_turn_matches(params):
@@ -3410,13 +3486,16 @@ class _CodexAppServerSession:
             raise RuntimeError(str(error))
         return response
 
-    async def _send_response(self, request_id: int, result: CodexParams) -> None:
+    async def _send_response(self, request_id: int | str, result: CodexParams) -> None:
         await self._send_message(
             {
                 "id": request_id,
                 "result": result,
             }
         )
+
+    async def _send_error(self, request_id: int | str, code: int, message: str) -> None:
+        await self._send_message({"id": request_id, "error": {"code": code, "message": message}})
 
     async def _send_message(self, payload: CodexMessage) -> None:
         assert self._proc is not None and self._proc.stdin is not None
@@ -3584,6 +3663,7 @@ class _AppSessionFactory(Protocol):
         cwd: str | None,
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
+        raw_elicitation_handler: CodexElicitationHandler | None,
         codex_config_overrides: list[str] | None,
         retry_policy: RetryPolicy,
         disable_native_tools: bool,
@@ -3598,6 +3678,7 @@ def _default_app_session_factory(
     cwd: str | None,
     env: dict[str, str],
     tool_executor: CodexToolExecutor | None,
+    raw_elicitation_handler: CodexElicitationHandler | None,
     codex_config_overrides: list[str] | None,
     retry_policy: RetryPolicy,
     disable_native_tools: bool,
@@ -3609,6 +3690,7 @@ def _default_app_session_factory(
         cwd=cwd,
         env=env,
         tool_executor=tool_executor,
+        raw_elicitation_handler=raw_elicitation_handler,
         codex_config_overrides=codex_config_overrides,
         retry_policy=retry_policy,
         disable_native_tools=disable_native_tools,
@@ -3844,6 +3926,7 @@ class CodexExecutor(Executor):
             # key accepts "live", "cached", or "disabled".
             self._codex_config_overrides.append('web_search="disabled"')
         self._tool_executor: CodexToolExecutor | None = None
+        self._raw_elicitation_handler: CodexElicitationHandler | None = None
         self._session_states: dict[str, _CodexSessionState] = {}
         self._app_session_factory: _AppSessionFactory = (
             app_session_factory
@@ -3976,6 +4059,7 @@ class CodexExecutor(Executor):
             cwd=effective_cwd,
             env=self._env,
             tool_executor=self._tool_executor,
+            raw_elicitation_handler=self._raw_elicitation_handler,
             codex_config_overrides=self._codex_config_overrides,
             retry_policy=self._retry_policy,
             disable_native_tools=self._disable_native_tools,
@@ -3999,13 +4083,12 @@ class CodexExecutor(Executor):
         # cfg.model (per-request /model override) wins over the spec default.
         # An unresolved default comes from the active provider catalog.
         # On the cli-config path (model_provider_override set) the codex binary
-        # owns its own model list via its config.toml — omnigent does not pass a
-        # model override to thread/create, letting the binary use its configured
-        # default. Passing an unresolvable alias (e.g. gpt-5.6) would cause the
-        # binary to call UC and get a validation error.
+        # owns its own model list via its config.toml. Without a per-turn pick,
+        # let the binary use its configured default instead of passing a spec
+        # alias (e.g. gpt-5.6) that UC may reject.
         model = cfg.model or self._model_override
         if self._model_provider_override is not None:
-            model = None
+            model = cfg.model
         elif model is None:
             if self._gateway_uses_databricks_profile:
                 resolution = await run_sync_on_thread(
@@ -4030,7 +4113,7 @@ class CodexExecutor(Executor):
         )
         try:
             reasoning_effort = validate_effort(
-                cfg.extra.get("reasoning_effort"), "codex", CODEX_EFFORTS
+                cfg.extra.get("reasoning_effort"), "codex", CODEX_NATIVE_EFFORTS
             )
         except ValueError as exc:
             yield ExecutorError(message=describe_exception(exc), retryable=False)
@@ -4055,6 +4138,7 @@ class CodexExecutor(Executor):
                 cwd=effective_cwd,
                 sandbox=sandbox_mode,
                 reasoning_effort=reasoning_effort,
+                approval_mode=cfg.approval_mode,
             ):
                 yield event
         except HarnessTransportClosedError:

@@ -44,9 +44,8 @@ def test_max_coerces_to_xhigh_for_codex() -> None:
 def test_codex_native_accepts_max_and_ultra() -> None:
     """Codex-native honors the real per-model ladder — max/ultra pass through.
 
-    The SDK/Responses codex ladder still caps at ``xhigh`` (see the tests
-    above), but codex-native drives the real codex process, which accepts
-    Sol's ``max``/``ultra``, so they must not fold to ``xhigh``.
+    Explicit SDK and native turns use the codex process's full ladder; only
+    the copied ChatGPT-app default is normalized against ``CODEX_EFFORTS``.
     """
     assert validate_effort("ultra", "codex", CODEX_NATIVE_EFFORTS) == "ultra"
     assert validate_effort("max", "codex", CODEX_NATIVE_EFFORTS) == "max"
@@ -245,11 +244,9 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     # pi declares its own family, so it resolves to a real vocabulary.
     assert efforts_for_harness("pi") == PI_EFFORTS
     assert efforts_for_harness("pi-native") == PI_EFFORTS
-    # codex-native drives the real codex process, which takes Sol's max/ultra;
-    # sharing the SDK codex family (capped at xhigh) dropped a session created
-    # at ultra to Codex's default before its first turn.
+    # SDK and native both drive the codex process and preserve max/ultra.
     assert efforts_for_harness("codex-native") == CODEX_NATIVE_EFFORTS
-    assert efforts_for_harness("codex") == CODEX_EFFORTS
+    assert efforts_for_harness("codex") == CODEX_NATIVE_EFFORTS
     # Known, but declared EffortFamily.NONE.
     assert efforts_for_harness("opencode-native") == frozenset()
     # Not in the registry at all — unclassifiable, not unsupported.

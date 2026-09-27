@@ -10,11 +10,19 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.formparsers import MultiPartException
 
+from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_OWNER,
@@ -23,11 +31,12 @@ from omnigent.server.auth import (
     local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
-from omnigent.server.custom_agent_bundles import MAX_BUNDLE_BYTES, patch_bundle
+from omnigent.server.custom_agent_bundles import MAX_BUNDLE_BYTES, patch_bundle, project_members
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.spec.validator import _AGENT_NAME_PATTERN
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
@@ -36,11 +45,32 @@ MAX_MULTIPART_REQUEST_BYTES = MAX_BUNDLE_BYTES + 1024 * 1024
 _INSTRUCTIONS_CACHE_SIZE = 256
 
 
+class AgentMember(BaseModel):
+    """One member of a joint Agent; the lead is the bundle's root spec."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=256)
+    description: str | None = Field(default=None, max_length=8192)
+    harness: str = Field(min_length=1, max_length=128)
+    model: str | None = Field(default=None, max_length=512)
+    reasoning_effort: str | None = None
+    lead: bool
+
+    @field_validator("name")
+    @classmethod
+    def valid_role_name(cls, value: str) -> str:
+        # The spec's own agent-name rule: a role is also an archive path segment.
+        if not _AGENT_NAME_PATTERN.match(value):
+            raise ValueError("name must match [a-zA-Z0-9_-]+ (no dots, slashes, or whitespace)")
+        return value
+
+
 class CustomAgentPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=8192)
     instructions: str | None = Field(default=None, max_length=262144)
+    members: list[AgentMember] | None = None
     version: int | None = Field(default=None, ge=1)
 
     @field_validator("name")
@@ -52,8 +82,19 @@ class CustomAgentPatch(BaseModel):
 
 
 class CustomAgentImport(BaseModel):
+    """Duplicate a source Agent: a session snapshot or a built-in row."""
+
     model_config = ConfigDict(extra="forbid")
-    source_session_id: str = Field(min_length=1, max_length=256)
+    source_session_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_agent_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def exactly_one_source(self) -> CustomAgentImport:
+        # The two sources carry different ownership rules; exactly one must
+        # be named so the handler picks a branch without guessing.
+        if (self.source_session_id is None) == (self.source_agent_id is None):
+            raise ValueError("exactly one of source_session_id or source_agent_id is required")
+        return self
 
 
 def create_custom_agents_router(
@@ -119,7 +160,12 @@ def create_custom_agents_router(
         cache_instructions(location, spec.instructions)
         return spec.instructions
 
-    def detail(row: dict[str, Any]) -> dict[str, Any]:
+    def detail(owner_id: str, row: dict[str, Any]) -> dict[str, Any]:
+        if row["members"] is None:
+            location = row["bundle_location"]
+            spec = validate(artifact_bytes(location))
+            cache_instructions(location, spec.instructions)
+            row = store.backfill_members(owner_id, row["id"], location, project_members(spec))
         return {
             **public(row),
             "instructions": instructions_for(row["bundle_location"]),
@@ -138,6 +184,7 @@ def create_custom_agents_router(
                 "description": spec.description,
                 "harness": spec.executor.harness_kind,
                 "model": spec.executor.model,
+                "members": project_members(spec),
                 "bundle_location": location,
             },
         )
@@ -221,27 +268,44 @@ def create_custom_agents_router(
             try:
                 body = CustomAgentImport.model_validate(await request.json())
             except (ValueError, ValidationError) as exc:
-                raise HTTPException(422, "source_session_id is required") from exc
-            user_id = require_user(request, auth_provider)
-            if auth_provider is not None and permission_store is None:
-                raise OmnigentError(
-                    "Session ownership checks unavailable", code=ErrorCode.FORBIDDEN
+                raise HTTPException(
+                    422, "exactly one of source_session_id or source_agent_id is required"
+                ) from exc
+            if body.source_session_id is not None:
+                user_id = require_user(request, auth_provider)
+                if auth_provider is not None and permission_store is None:
+                    raise OmnigentError(
+                        "Session ownership checks unavailable", code=ErrorCode.FORBIDDEN
+                    )
+                await require_access(
+                    user_id,
+                    body.source_session_id,
+                    LEVEL_OWNER,
+                    permission_store,
+                    conversation_store,
                 )
-            await require_access(
-                user_id, body.source_session_id, LEVEL_OWNER, permission_store, conversation_store
-            )
-            conv = await asyncio.to_thread(
-                conversation_store.get_conversation, body.source_session_id
-            )
-            agent = (
-                await asyncio.to_thread(agent_store.get, conv.agent_id)
-                if conv and conv.agent_id
-                else None
-            )
-            if agent is None or agent.session_id is None:
-                raise OmnigentError("Custom session Agent not found", code=ErrorCode.NOT_FOUND)
-            data = await asyncio.to_thread(artifact_bytes, agent.bundle_location)
-            source_session_id = body.source_session_id
+                conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, body.source_session_id
+                )
+                agent = (
+                    await asyncio.to_thread(agent_store.get, conv.agent_id)
+                    if conv and conv.agent_id
+                    else None
+                )
+                if agent is None or agent.session_id is None:
+                    raise OmnigentError("Custom session Agent not found", code=ErrorCode.NOT_FOUND)
+                data = await asyncio.to_thread(artifact_bytes, agent.bundle_location)
+                source_session_id = body.source_session_id
+            else:
+                # Only seeded built-ins carry the deterministic, name-derived
+                # id; session-scoped copies and uploads get random ids.
+                assert body.source_agent_id is not None
+                source_agent_id = body.source_agent_id
+                require_user(request, auth_provider)
+                agent = await asyncio.to_thread(agent_store.get, source_agent_id)
+                if agent is None or agent.id != builtin_agent_id(agent.name):
+                    raise OmnigentError("Built-in Agent not found", code=ErrorCode.NOT_FOUND)
+                data = await asyncio.to_thread(artifact_bytes, agent.bundle_location)
         else:
             raise HTTPException(415, "Use application/json or multipart/form-data")
         created = await asyncio.to_thread(persist_new, owner_id, data)
@@ -260,7 +324,7 @@ def create_custom_agents_router(
     @router.get("/custom-agents/{agent_id}")
     async def get_custom_agent(request: Request, agent_id: str) -> dict[str, Any]:
         row = await asyncio.to_thread(store.get, owner(request), agent_id)
-        return await asyncio.to_thread(detail, row)
+        return await asyncio.to_thread(detail, owner(request), row)
 
     @router.get(
         "/custom-agents/{agent_id}/contents",
@@ -283,9 +347,40 @@ def create_custom_agents_router(
             raise OmnigentError(
                 "Custom Agent changed; reload before saving", code=ErrorCode.CONFLICT
             )
+        if "members" in body.model_fields_set:
+            members = body.members or []
+            if not members:
+                raise OmnigentError(
+                    "members must include at least one member", code=ErrorCode.INVALID_INPUT
+                )
+            if body.version is None:
+                raise OmnigentError(
+                    "version is required when patching members", code=ErrorCode.INVALID_INPUT
+                )
+            roles = [member.name for member in members]
+            if len(set(roles)) != len(roles):
+                raise OmnigentError("member names must be unique", code=ErrorCode.INVALID_INPUT)
+            leads = [member for member in members if member.lead]
+            if len(leads) != 1:
+                raise OmnigentError(
+                    "members must include exactly one lead", code=ErrorCode.INVALID_INPUT
+                )
+            resulting_name = body.name if body.name is not None else row["name"]
+            if leads[0].name != resulting_name:
+                raise OmnigentError(
+                    "lead member name must match the Agent name", code=ErrorCode.INVALID_INPUT
+                )
+            resulting_description = (
+                body.description if "description" in body.model_fields_set else row["description"]
+            )
+            if leads[0].description != resulting_description:
+                raise OmnigentError(
+                    "lead member description must match the Agent description",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         changes = body.model_dump(exclude_unset=True, exclude={"version"})
         if not changes:
-            return await asyncio.to_thread(detail, row)
+            return await asyncio.to_thread(detail, owner_id, row)
 
         def update() -> dict[str, Any]:
             data = patch_bundle(artifact_bytes(row["bundle_location"]), changes)
@@ -299,6 +394,9 @@ def create_custom_agents_router(
                 {
                     "name": spec.name,
                     "description": spec.description,
+                    "harness": spec.executor.harness_kind,
+                    "model": spec.executor.model,
+                    "members": project_members(spec),
                     "bundle_location": location,
                 },
             )

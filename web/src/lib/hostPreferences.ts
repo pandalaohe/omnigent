@@ -61,6 +61,16 @@ export function sandboxHostChoiceProvider(choice: string): string | null | undef
 }
 
 /**
+ * Whether `choice` is a sandbox pick in either stored form — the bare
+ * {@link SANDBOX_HOST_CHOICE} sentinel or a per-provider
+ * {@link sandboxHostChoice}. For consumers that only need "not a host id";
+ * use {@link sandboxHostChoiceProvider} when the provider itself matters.
+ */
+export function isSandboxHostChoice(choice: string): boolean {
+  return choice === SANDBOX_HOST_CHOICE || sandboxHostChoiceProvider(choice) !== undefined;
+}
+
+/**
  * Read the user's last explicit host choice on the landing composer: a host
  * id, the {@link SANDBOX_HOST_CHOICE} sentinel, or `null` when nothing is
  * stored, on a server render (no `window`), or when storage is inaccessible —
