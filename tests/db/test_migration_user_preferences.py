@@ -2,12 +2,69 @@
 
 from __future__ import annotations
 
+import json
+import secrets
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from omnigent.db.compression import encode
+from omnigent.db.db_models import SqlPreference
 from omnigent.db.utils import _build_alembic_config
+
+_PRE_MOVE_REVISION = "c4b2d3e4f5a6"
+_SETTINGS_KEY_PREFIX = "settings."
+
+
+def _seed_user(
+    engine: sa.Engine,
+    user_id: str,
+    value: bytes | str | None,
+    *,
+    workspace_id: int = 0,
+) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO users (workspace_id, id, is_admin, preferences) "
+                "VALUES (:workspace_id, :id, false, :value)"
+            ),
+            {"workspace_id": workspace_id, "id": user_id, "value": value},
+        )
+
+
+def _stored_value(engine: sa.Engine, user_id: str) -> bytes | str | None:
+    """The raw ``users.preferences`` value, exactly as stored."""
+    with engine.connect() as connection:
+        return connection.scalar(
+            sa.text("SELECT preferences FROM users WHERE id = :id"), {"id": user_id}
+        )
+
+
+def _settings_rows(engine: sa.Engine, user_id: str) -> dict[str, str]:
+    """The user's settings rows, decompressed, keyed without the prefix."""
+    with Session(engine) as session:
+        rows = session.scalars(select(SqlPreference).where(SqlPreference.user_id == user_id)).all()
+    return {
+        row.key[len(_SETTINGS_KEY_PREFIX) :]: row.value
+        for row in rows
+        if row.key.startswith(_SETTINGS_KEY_PREFIX)
+    }
+
+
+def _envelope(settings: dict[str, object]) -> dict[str, object]:
+    return {"version": 1, "settings": settings}
+
+
+def _upgrade_to_pre_move(tmp_path: Path, name: str) -> tuple[str, object, sa.Engine]:
+    uri = f"sqlite:///{tmp_path / name}"
+    config = _build_alembic_config(uri)
+    command.upgrade(config, _PRE_MOVE_REVISION)
+    return uri, config, sa.create_engine(uri)
 
 
 def test_users_preferences_column_is_nullable_binary(db_uri: str) -> None:
@@ -110,4 +167,194 @@ def test_deletion_claim_migration_round_trips_and_rebuilds_lock_mirror(tmp_path:
             )
             == 1
         )
+    engine.dispose()
+
+
+def test_preferences_envelope_moves_into_settings_rows(tmp_path: Path) -> None:
+    """A framed envelope becomes settings.version + one settings.<ns> row."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-envelope.db")
+    envelope = _envelope({"keyboard_shortcuts": {"enabled": True}, "context_indicator": "compact"})
+    text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    stored = encode(text)
+    assert stored is not None
+    _seed_user(engine, "alice", stored)
+    _seed_user(engine, "bob", None)
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {
+        "version": "1",
+        "keyboard_shortcuts": '{"enabled":true}',
+        "context_indicator": '"compact"',
+    }
+    assert _settings_rows(engine, "bob") == {}
+    # The envelope column is deliberately untouched for image rollback.
+    assert _stored_value(engine, "alice") == stored
+    engine.dispose()
+
+
+def test_preferences_move_accepts_legacy_plaintext(tmp_path: Path) -> None:
+    """A pre-compression envelope (unframed UTF-8) still moves."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-plaintext.db")
+    envelope = _envelope({"usage_context": {"visible": False}})
+    raw = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    _seed_user(engine, "alice", raw.encode("utf-8"))
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {
+        "version": "1",
+        "usage_context": '{"visible":false}',
+    }
+    engine.dispose()
+
+
+def test_preferences_move_writes_version_for_empty_settings(tmp_path: Path) -> None:
+    """An explicitly initialized all-defaults envelope moves to the marker row."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-empty.db")
+    _seed_user(engine, "alice", encode('{"settings":{},"version":1}'))
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {"version": "1"}
+    engine.dispose()
+
+
+def test_preferences_move_skips_unknown_namespaces(tmp_path: Path) -> None:
+    """Namespaces outside the allowlist are dropped, siblings still move."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-unknown.db")
+    _seed_user(
+        engine,
+        "alice",
+        encode(
+            json.dumps(
+                _envelope({"agent_pins": {"ids": ["ag_polly"]}, "not_allowed": {"x": 1}}),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        ),
+    )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {
+        "version": "1",
+        "agent_pins": '{"ids":["ag_polly"]}',
+    }
+    engine.dispose()
+
+
+def test_preferences_move_skips_bad_bytes_and_invalid_envelopes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Corrupt frames and non-envelopes are warned about and skipped."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-bad.db")
+    _seed_user(engine, "corrupt", b"\x00\x09broken-frame")
+    _seed_user(engine, "notjson", b"preserve-custom-preferences")
+    _seed_user(engine, "version2", encode('{"settings":{},"version":2}'))
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "corrupt") == {}
+    assert _settings_rows(engine, "notjson") == {}
+    assert _settings_rows(engine, "version2") == {}
+    assert _stored_value(engine, "notjson") == b"preserve-custom-preferences"
+    warnings = capsys.readouterr().err
+    assert "Skipping preferences move for user corrupt" in warnings
+    assert "Skipping preferences move for user notjson" in warnings
+    engine.dispose()
+
+
+def test_preferences_move_is_idempotent_when_version_row_exists(tmp_path: Path) -> None:
+    """A user with a settings.version row is never overwritten by a move."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-idempotent.db")
+    _seed_user(
+        engine, "alice", encode('{"settings":{"usage_context":{"visible":true}},"version":1}')
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO preferences (workspace_id, user_id, key, value) "
+                "VALUES (0, 'alice', 'settings.version', :value)"
+            ),
+            {"value": encode("1")},
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO preferences (workspace_id, user_id, key, value) "
+                "VALUES (0, 'alice', 'settings.context_indicator', :value)"
+            ),
+            {"value": encode('"compact"')},
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {"version": "1", "context_indicator": '"compact"'}
+    engine.dispose()
+
+
+def test_preferences_move_skips_an_oversized_namespace(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One namespace over the BLOB cap is skipped; its sibling still moves."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-oversized.db")
+    padding = secrets.token_urlsafe(96_000)
+    _seed_user(
+        engine,
+        "alice",
+        encode(
+            json.dumps(
+                _envelope({"usage_context": padding, "context_indicator": "compact"}),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        ),
+    )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {"version": "1", "context_indicator": '"compact"'}
+    assert "stored value exceeds 65535 bytes" in capsys.readouterr().err
+    engine.dispose()
+
+
+def test_preferences_move_downgrade_removes_only_settings_rows(tmp_path: Path) -> None:
+    """Downgrade deletes settings.* and leaves users.preferences in place."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-downgrade.db")
+    stored = encode('{"settings":{"usage_context":{"visible":true}},"version":1}')
+    assert stored is not None
+    _seed_user(engine, "alice", stored)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO preferences (workspace_id, user_id, key, value) "
+                "VALUES (0, 'alice', 'project_order', :value)"
+            ),
+            {"value": encode('{"sort_mode":"alphabetical"}')},
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    command.downgrade(config, _PRE_MOVE_REVISION)
+    engine = sa.create_engine(uri)
+    assert _settings_rows(engine, "alice") == {}
+    assert "preferences" in sa.inspect(engine).get_table_names()
+    with engine.connect() as connection:
+        assert (
+            connection.scalar(
+                sa.text(
+                    "SELECT value FROM preferences "
+                    "WHERE user_id = 'alice' AND key = 'project_order'"
+                )
+            )
+            is not None
+        )
+    assert _stored_value(engine, "alice") == stored
     engine.dispose()
