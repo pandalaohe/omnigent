@@ -1399,6 +1399,7 @@ export function AgentHarnessPicker({
   onEditSavedAgent,
   onViewBuiltinAgent,
   leadHostByAgentId,
+  hosts,
   pendingAgent,
   pendingAgentId,
   onSelectPending,
@@ -1442,6 +1443,10 @@ export function AgentHarnessPicker({
   /** Saved Agents' lead host (null = session host), for host-first "Other…"
    *  ordering: an Agent that would run on the selected host leads the list. */
   leadHostByAgentId?: ReadonlyMap<string, string | null>;
+  /** The user's hosts (any status). A saved Agent whose lead host is here
+   *  resolves its row readiness against that host — the one picking it moves
+   *  the chip to — instead of the currently selected one. */
+  hosts?: readonly Host[];
   pendingAgent: AgentBundleInput | null;
   pendingAgentId: string;
   onSelectPending: () => void;
@@ -1696,7 +1701,17 @@ export function AgentHarnessPicker({
     const summary = details || entrySummaries?.[agent.id] || "Default";
     const configEditable =
       selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
-    const readiness = harnessReadinessOnHost(agent.harness, host);
+    // A saved Agent whose lead has a known host runs there: picking it moves
+    // the chip to that host, so its readiness must be judged against it — the
+    // row would otherwise be disabled on the selected host and never pickable.
+    // An unknown/deleted lead host keeps the current host (the chip stays).
+    const leadHostId = agent.id.startsWith("ca_") ? leadHostByAgentId?.get(agent.id) : null;
+    const leadHost =
+      leadHostId != null && leadHostId !== host?.host_id
+        ? hosts?.find((entry) => entry.host_id === leadHostId)
+        : undefined;
+    const readinessHost = leadHost ?? host;
+    const readiness = harnessReadinessOnHost(agent.harness, readinessHost);
     // A saved Agent without a harness id launches from its bundle, so the
     // null-harness readiness verdict does not apply to it.
     const unavailable =
@@ -1708,7 +1723,7 @@ export function AgentHarnessPicker({
     const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
     const warningMessage = harnessWarningMessage(
       agent.display_name,
-      host?.name,
+      readinessHost?.name,
       readiness.reason,
       agent.harness,
     );
@@ -7408,6 +7423,7 @@ export function NewChatLandingScreen() {
                         onEditSavedAgent={handleEditSavedAgent}
                         onViewBuiltinAgent={setViewingBuiltinAgent}
                         leadHostByAgentId={savedAgentLeadHosts}
+                        hosts={allHosts}
                         pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                         pendingAgentId={PENDING_AGENT_ID}
                         onSelectPending={handleSelectPending}

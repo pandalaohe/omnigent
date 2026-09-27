@@ -5691,6 +5691,28 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("judges a saved Agent's row against its lead host, not the selected one", async () => {
+    // machine-1 (selected) cannot run the lead harness; the Agent's lead host
+    // machine-2 can. The row must stay pickable: picking it moves the chip.
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "claude-sdk": false } } as Host,
+      { ...host("online", 2), configured_harnesses: { "claude-sdk": true } } as Host,
+    ]);
+    mockCustomAgents([savedAgentRow("ca_crew", "Crew", "host_2")]);
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [] }));
+    renderLanding();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    const row = screen.getByTestId("new-chat-landing-agent-ca_crew");
+    expect(row).not.toHaveAttribute("aria-disabled", "true");
+
+    fireEvent.click(row);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/),
+    );
+  });
+
   it("draws the SDK mark before the vendor logo, yielding to a user badge", () => {
     mockAllFourHarnessesReady();
     mockCodexCollisionAgents();
