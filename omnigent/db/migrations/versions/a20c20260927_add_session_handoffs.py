@@ -1,7 +1,7 @@
 """Add durable session hand-off records.
 
-Revision ID: a17c20260923
-Revises: a16c20260923
+Revision ID: a20c20260927
+Revises: a19c20260926
 """
 
 from __future__ import annotations
@@ -13,8 +13,8 @@ from alembic import op
 
 from omnigent.db.db_models import Uuid16
 
-revision: str = "a17c20260923"
-down_revision: str | None = "a16c20260923"
+revision: str = "a20c20260927"
+down_revision: str | None = "a19c20260926"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -32,6 +32,8 @@ def upgrade() -> None:
         sa.Column("project_id", Uuid16(), nullable=False),
         sa.Column("host_id", Uuid16(), nullable=True),
         sa.Column("root", sa.Text(), nullable=True),
+        sa.Column("checkout", sa.Text(), nullable=True),
+        sa.Column("worktree", sa.Text(), nullable=True),
         sa.Column("git_branch", sa.String(255), nullable=True),
         sa.Column("git_plan", sa.LargeBinary(), nullable=True),
         sa.Column("state", sa.String(32), nullable=False),

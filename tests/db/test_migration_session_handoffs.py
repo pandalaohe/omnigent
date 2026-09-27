@@ -16,7 +16,7 @@ def test_single_head_includes_session_handoffs() -> None:
     heads = script.get_heads()
     assert len(heads) == 1
     lineage = {revision.revision for revision in script.iterate_revisions(heads[0], "base")}
-    assert "a17c20260923" in lineage
+    assert "a20c20260927" in lineage
 
 
 def test_upgrade_and_downgrade_session_handoffs(tmp_path: Path) -> None:
@@ -39,6 +39,8 @@ def test_upgrade_and_downgrade_session_handoffs(tmp_path: Path) -> None:
         "project_id",
         "host_id",
         "root",
+        "checkout",
+        "worktree",
         "git_branch",
         "git_plan",
         "state",

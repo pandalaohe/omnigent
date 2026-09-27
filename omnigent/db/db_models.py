@@ -2437,6 +2437,8 @@ class SqlSessionHandoff(OmnigentBase):
     project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     root: Mapped[str | None] = mapped_column(Text, nullable=True)
+    checkout: Mapped[str | None] = mapped_column(Text, nullable=True)
+    worktree: Mapped[str | None] = mapped_column(Text, nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     git_plan: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False)

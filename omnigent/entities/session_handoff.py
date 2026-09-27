@@ -28,6 +28,8 @@ class SessionHandoff:
     expires_at: int
     host_id: str | None = None
     root: str | None = None
+    checkout: str | None = None
+    worktree: str | None = None
     git_branch: str | None = None
     git_plan: dict | None = None
     reason: str | None = None
