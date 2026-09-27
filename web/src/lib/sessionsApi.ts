@@ -67,6 +67,12 @@ export interface PostEventResponse {
    *  user message, so no `session.input.consumed` will follow. */
   denied?: boolean;
   /**
+   * Whether the server forwarded the item to a live runner. `false` means
+   * it was only persisted (e.g. a native-terminal message whose runner
+   * never came online), so no agent will read it. Absent on older servers.
+   */
+  forwarded?: boolean;
+  /**
    * Server-assigned pending-input id for a native-terminal web
    * message, e.g. ``"pending_a1b2c3"``. It identifies the snapshot's
    * replayed pending-input bubble on rebind and is the
@@ -465,6 +471,7 @@ function postEventResponseFromWire(wire: {
   queued: boolean;
   item_id?: string;
   denied?: boolean;
+  forwarded?: boolean;
   pending_id?: string;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
@@ -473,6 +480,7 @@ function postEventResponseFromWire(wire: {
     queued: wire.queued,
     itemId: wire.item_id,
     denied: wire.denied,
+    forwarded: wire.forwarded,
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,
@@ -542,6 +550,25 @@ export async function createSession(
       ...backgroundSessionTitlesRequestHeaders(),
     },
     body: JSON.stringify(body),
+  });
+  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
+ * Start a fresh session continuing an archived one.
+ *
+ * The server creates it on the archived session's host and launch
+ * directory, with the same project and run configuration, and clones a
+ * session-scoped agent into a new row. Idempotent: while the successor
+ * exists and is not archived, a repeat call returns that same session.
+ *
+ * @param sessionId - The archived session to continue, e.g. "conv_abc123".
+ * @throws ApiError 409 when the session is not archived.
+ */
+export async function continueArchivedSession(sessionId: string): Promise<Session> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/continue`, {
+    method: "POST",
+    headers: { "X-Omnigent-Client": getClientSurface() },
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
@@ -1586,6 +1613,7 @@ export async function postEvent(
       queued: boolean;
       item_id?: string;
       denied?: boolean;
+      forwarded?: boolean;
       pending_id?: string;
       recovered?: boolean;
       recovery?: PostEventResponse["recovery"];

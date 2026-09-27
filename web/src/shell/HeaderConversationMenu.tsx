@@ -48,6 +48,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useQueryClient } from "@tanstack/react-query";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { unhandledCommentsDeleteLine } from "@/lib/comments";
+import { useComments } from "@/hooks/useComments";
 import { effectiveWorktree } from "@/lib/types";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
@@ -130,6 +132,10 @@ export function HeaderConversationMenu({
   const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
+  // Unhandled comments die with the session; fetch them when the delete
+  // confirmation opens so the dialog can name the count.
+  const { data: deleteComments } = useComments(deleteOpen ? conversation.id : undefined);
+  const deleteCommentsLine = unhandledCommentsDeleteLine(deleteComments ?? []);
   const [archivePending, setArchivePending] = useState(false);
   const mountedRef = useRef(false);
   const archiveRequestRef = useRef(false);
@@ -539,6 +545,9 @@ export function HeaderConversationMenu({
               removed. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
+          {deleteCommentsLine !== null && (
+            <p className="text-sm text-muted-foreground">{deleteCommentsLine}</p>
+          )}
           {gitBranch !== null && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <p className="text-sm text-muted-foreground">

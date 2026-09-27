@@ -40,6 +40,7 @@ const sendMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
   sendMock.mockReset();
+  sendMock.mockResolvedValue(true);
   vi.mocked(useChatStore.getState).mockReturnValue({
     send: sendMock,
   } as unknown as ReturnType<typeof useChatStore.getState>);
@@ -80,10 +81,14 @@ describe("commentsQueryKey", () => {
 });
 
 describe("fetchComments", () => {
-  it("GETs the session list endpoint with no path query", async () => {
+  it("GETs the session list endpoint with include_visitor_drafts=1", async () => {
+    // Without the flag the server omits visitor drafts — the owner's panels
+    // and inbox would silently lose every unsent visitor comment.
     fetchMock.mockResolvedValueOnce(mockResponse([]));
     await fetchComments("conv_1");
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_1/comments");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/comments?include_visitor_drafts=1",
+    );
   });
 
   it("appends an encoded path query when filtering to one file", async () => {
@@ -92,7 +97,7 @@ describe("fetchComments", () => {
     fetchMock.mockResolvedValueOnce(mockResponse([]));
     await fetchComments("conv with space", "src/a b.ts");
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv%20with%20space/comments?path=src%2Fa%20b.ts",
+      "/v1/sessions/conv%20with%20space/comments?include_visitor_drafts=1&path=src%2Fa%20b.ts",
     );
   });
 
@@ -128,7 +133,9 @@ describe("useComments", () => {
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual(comments);
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_1/comments");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/comments?include_visitor_drafts=1",
+    );
   });
 });
 
@@ -256,10 +263,13 @@ describe("useSendCommentsToAgent", () => {
     });
   }
 
-  it("POSTs the comment ids to the send endpoint", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ formatted_message: "msg", sent_comment_ids: ["c1"] }),
-    );
+  const sendResponse = {
+    formatted_message: "please address these",
+    sent_comment_ids: ["c1", "c2"],
+  };
+
+  it("POSTs the comment ids with mark_addressed: false", async () => {
+    fetchMock.mockResolvedValue(mockResponse(sendResponse));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const { result } = renderSend(queryClient);
     result.current.mutate({ comment_ids: ["c1"], instruction: "fix" });
@@ -268,24 +278,56 @@ describe("useSendCommentsToAgent", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_1/comments/send");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(init.body as string)).toEqual({ comment_ids: ["c1"], instruction: "fix" });
+    // Formatting must not mark: the comments become addressed only after
+    // the message actually reached the agent.
+    expect(JSON.parse(init.body as string)).toEqual({
+      comment_ids: ["c1"],
+      instruction: "fix",
+      mark_addressed: false,
+    });
   });
 
-  it("dispatches the formatted message to the agent via the chat store on success", async () => {
+  it("dispatches the message pinned to the session, then marks the sent ids", async () => {
     // The whole point of this hook: the server-formatted message is sent
-    // to the agent immediately, no manual send. Regressing this leaves
-    // comments queued but never delivered.
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ formatted_message: "please address these", sent_comment_ids: ["c1"] }),
-    );
+    // to the agent immediately, pinned to the session whose comments were
+    // formatted, and the comments are marked only after delivery.
+    fetchMock.mockResolvedValue(mockResponse(sendResponse));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderSend(queryClient);
-    result.current.mutate({ comment_ids: ["c1"] });
+    result.current.mutate({ comment_ids: ["c1", "c2"] });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1");
+    expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1", [], {
+      pinnedConversationId: "conv_1",
+    });
+    const patchCalls = fetchMock.mock.calls.filter(
+      ([, init]) => (init as RequestInit).method === "PATCH",
+    );
+    expect(patchCalls.map(([url]) => String(url))).toEqual([
+      "/v1/sessions/conv_1/comments/c1",
+      "/v1/sessions/conv_1/comments/c2",
+    ]);
+    for (const [, init] of patchCalls) {
+      expect(JSON.parse((init as RequestInit).body as string)).toEqual({ status: "addressed" });
+    }
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
+  });
+
+  it("marks nothing when the message was not delivered", async () => {
+    sendMock.mockResolvedValue(false);
+    fetchMock.mockResolvedValueOnce(mockResponse(sendResponse));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1", "c2"] });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toMatchObject({ delivered: false });
+    expect(
+      fetchMock.mock.calls.filter(([, init]) => (init as RequestInit).method === "PATCH"),
+    ).toEqual([]);
+    expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
   it("throws on non-2xx and never dispatches to the agent", async () => {

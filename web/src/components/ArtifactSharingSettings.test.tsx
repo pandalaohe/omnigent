@@ -15,7 +15,10 @@ vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 const fetchMock = vi.mocked(authenticatedFetch);
 const toastMock = vi.mocked(showToast);
 
-function sharingResponse(state: { external: boolean; share_code_set: boolean }, status = 200) {
+function sharingResponse(
+  state: { external: boolean; share_code_set: boolean; allow_comments?: boolean },
+  status = 200,
+) {
   return new Response(JSON.stringify(state), {
     status,
     headers: { "Content-Type": "application/json" },
@@ -110,6 +113,31 @@ describe("ArtifactSharingSettings", () => {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ share_code: null }),
+    });
+  });
+
+  it("toggles visitor comments with an allow_comments-only PUT", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        sharingResponse({ external: true, share_code_set: false, allow_comments: true }),
+      )
+      .mockResolvedValueOnce(
+        sharingResponse({ external: true, share_code_set: false, allow_comments: false }),
+      );
+    render(<ArtifactSharingSettings />);
+
+    const toggle = await screen.findByRole("switch", { name: "Visitor comments" });
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    // Only the changed field may travel: the server keeps the gate key when
+    // a write touches allow_comments alone, so the switch never signs a
+    // visitor out.
+    expect(fetchMock).toHaveBeenLastCalledWith("/v1/artifact-sharing", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allow_comments: false }),
     });
   });
 

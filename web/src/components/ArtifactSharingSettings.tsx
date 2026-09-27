@@ -14,6 +14,9 @@ import { authenticatedFetch } from "@/lib/identity";
 interface SharingState {
   external: boolean;
   share_code_set: boolean;
+  /** Whether shared-link visitors may leave comments. Absent on older
+   *  servers that predate the switch; treated as on (the server default). */
+  allow_comments?: boolean;
 }
 
 const MIN_SHARE_CODE_LENGTH = 4;
@@ -50,7 +53,11 @@ export function ArtifactSharingSettings() {
   }, [reloadKey]);
 
   const save = useCallback(
-    async (patch: { external?: boolean; share_code?: string | null }): Promise<boolean> => {
+    async (patch: {
+      external?: boolean;
+      share_code?: string | null;
+      allow_comments?: boolean;
+    }): Promise<boolean> => {
       setSaving(true);
       try {
         setState(
@@ -138,6 +145,16 @@ export function ArtifactSharingSettings() {
             </Button>
           )}
         </div>
+      </div>
+      <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
+        <span className="text-sm font-medium text-foreground">Visitor comments</span>
+        <Switch
+          aria-label="Visitor comments"
+          checked={state.allow_comments ?? true}
+          disabled={saving}
+          onCheckedChange={(allow_comments) => void save({ allow_comments })}
+          className="shrink-0"
+        />
       </div>
     </div>
   );

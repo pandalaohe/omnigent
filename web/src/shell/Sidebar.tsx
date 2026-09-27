@@ -159,6 +159,8 @@ import {
   useStopSession,
 } from "@/hooks/useConversations";
 import { useHosts, type Host } from "@/hooks/useHosts";
+import { useComments } from "@/hooks/useComments";
+import { bulkCommentsDeleteLine, unhandledCommentsDeleteLine } from "@/lib/comments";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
@@ -4260,6 +4262,10 @@ function ConversationRowImpl({
   const [menuOpen, setMenuOpen] = useState(false);
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
+  // Unhandled comments die with the session; fetch them when the delete
+  // confirmation opens so the dialog can name the count.
+  const { data: deleteComments } = useComments(deleteOpen ? conversation.id : undefined);
+  const deleteCommentsLine = unhandledCommentsDeleteLine(deleteComments ?? []);
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
@@ -5056,6 +5062,9 @@ function ConversationRowImpl({
                 be removed. This cannot be undone.
               </DialogDescription>
             </DialogHeader>
+            {deleteCommentsLine !== null && (
+              <p className="text-sm text-muted-foreground">{deleteCommentsLine}</p>
+            )}
             {gitBranch !== null && (
               <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
                 <p className="text-sm text-muted-foreground">
@@ -6078,6 +6087,9 @@ function BulkActionBar({
     ownedSelected.length > 0 && ownedSelected.length !== count
       ? `Delete ${ownedSelected.length}`
       : "Delete";
+  const deleteCommentsLine = bulkCommentsDeleteLine(
+    ownedSelected.reduce((total, c) => total + (c.comments_count ?? 0), 0),
+  );
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [moveSearch, setMoveSearch] = useState("");
@@ -6399,6 +6411,9 @@ function BulkActionBar({
               be undone.
             </DialogDescription>
           </DialogHeader>
+          {deleteCommentsLine !== null && (
+            <p className="text-sm text-muted-foreground">{deleteCommentsLine}</p>
+          )}
           {worktreeSelected.length > 0 && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <p className="text-sm text-muted-foreground">

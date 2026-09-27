@@ -43,9 +43,12 @@ export function commentsQueryKey(sessionId: string, path?: string) {
 }
 
 export async function fetchComments(sessionId: string, path?: string): Promise<Comment[]> {
+  // Visitor drafts are hidden from the agent-facing read path unless the
+  // owner's client asks for them; the owner's panels and inbox need to see
+  // them before they are sent.
   const url = path
-    ? `/v1/sessions/${encodeURIComponent(sessionId)}/comments?path=${encodeURIComponent(path)}`
-    : `/v1/sessions/${encodeURIComponent(sessionId)}/comments`;
+    ? `/v1/sessions/${encodeURIComponent(sessionId)}/comments?include_visitor_drafts=1&path=${encodeURIComponent(path)}`
+    : `/v1/sessions/${encodeURIComponent(sessionId)}/comments?include_visitor_drafts=1`;
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Comment[];
@@ -165,20 +168,40 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
+          // Format the message without marking: the comments become
+          // addressed only once the agent actually received it.
+          body: JSON.stringify({ ...payload, mark_addressed: false }),
         },
       );
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as {
+      const data = (await res.json()) as {
         formatted_message: string;
         sent_comment_ids: string[];
       };
-    },
-    onSuccess: (data) => {
-      void useChatStore.getState().send(data.formatted_message, agentId);
-      void queryClient.invalidateQueries({
+      // Pin delivery to the session whose comments were formatted, so a send
+      // that resolves after the user switched chats still marks the right
+      // comments only when it landed there.
+      const delivered = await useChatStore
+        .getState()
+        .send(data.formatted_message, agentId, [], { pinnedConversationId: sessionId });
+      if (!delivered) return { ...data, delivered };
+      await Promise.all(
+        data.sent_comment_ids.map(async (commentId) => {
+          const patch = await authenticatedFetch(
+            `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ status: "addressed" }),
+            },
+          );
+          if (!patch.ok) throw new Error(`${patch.status} ${patch.statusText}`);
+        }),
+      );
+      await queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });
+      return { ...data, delivered };
     },
   });
 }

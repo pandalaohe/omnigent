@@ -3,6 +3,7 @@ import { CheckIcon, Link2Icon, WandSparklesIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
+import { commentAuthorLabel, isVisitorAuthor } from "@/lib/comments";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
@@ -117,10 +118,14 @@ export function CommentsPanel({
   // too; this just hides the affordances). A comment with no recorded author
   // (legacy comments, or single-user/local mode where currentAuthorId is null)
   // stays editable by any editor, matching the server's `created_by is None`
-  // fallback.
+  // fallback. Visitor comments are the exception: the server lets an editor
+  // delete them but keeps body edits author-only, so Delete shows and Edit
+  // never does.
   const currentAuthorId = getCurrentAuthorId();
   const canModify = (c: Comment): boolean =>
     canEdit && (c.created_by == null || c.created_by === currentAuthorId);
+  const canDelete = (c: Comment): boolean =>
+    canModify(c) || (canEdit && isVisitorAuthor(c.created_by));
   const activeSelectionStart = activeSelection?.start_index;
   const activeSelectionEnd = activeSelection?.end_index;
   const activeAnchorContent = activeSelection?.anchor_content ?? "";
@@ -408,7 +413,7 @@ export function CommentsPanel({
                     isSelected={isSelected}
                     cardRef={isSelected ? selectedCardRef : undefined}
                     onClick={() => onClickComment(c)}
-                    onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
+                    onDelete={canDelete(c) ? () => onDeleteComment(c.id) : undefined}
                     onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
                     onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
                     now={currentTime}
@@ -432,7 +437,7 @@ export function CommentsPanel({
                   isSelected={isSelected}
                   cardRef={isSelected ? selectedCardRef : undefined}
                   onClick={() => onClickComment(c)}
-                  onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
+                  onDelete={canDelete(c) ? () => onDeleteComment(c.id) : undefined}
                   onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
                   now={currentTime}
                 />
@@ -512,6 +517,7 @@ function CommentCard({
   }, [c.id, c.body, editing]);
 
   const statusLabel = c.status === "addressed" ? "Addressed" : null;
+  const authorLabel = commentAuthorLabel(c.created_by);
 
   function startEdit() {
     setEditBody(c.body);
@@ -601,18 +607,16 @@ function CommentCard({
             <div className="flex min-w-0 items-center gap-1.5">
               <span
                 className="inline-flex size-4 shrink-0 items-center justify-center rounded-full text-[8px] font-semibold uppercase"
-                style={avatarStyle(c.created_by ?? "You")}
+                style={avatarStyle(authorLabel)}
               >
-                {(c.created_by ?? "Y")[0].toUpperCase()}
+                {authorLabel[0].toUpperCase()}
               </span>
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <span className="truncate text-sm text-muted-foreground">
-                      {c.created_by ?? "You"}
-                    </span>
+                    <span className="truncate text-sm text-muted-foreground">{authorLabel}</span>
                   </TooltipTrigger>
-                  <TooltipContent>{c.created_by ?? "You"}</TooltipContent>
+                  <TooltipContent>{authorLabel}</TooltipContent>
                 </Tooltip>
               </TooltipProvider>
             </div>

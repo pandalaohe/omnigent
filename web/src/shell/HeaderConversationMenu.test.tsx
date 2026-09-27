@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   exportTranscript: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
+  deleteComments: [] as { status: string; created_by: string | null }[],
 }));
 
 vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
@@ -44,6 +45,12 @@ vi.mock("./archiveUndoToast", () => ({
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
+}));
+
+// The delete confirmation reads the session's comments to name what dies with
+// it; tests drive the list directly instead of standing up a fetch.
+vi.mock("@/hooks/useComments", () => ({
+  useComments: () => ({ data: mocks.deleteComments }),
 }));
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
@@ -144,6 +151,7 @@ beforeEach(() => {
   setOmnigentHostConfig({});
   mocks.isMobile = false;
   mocks.projects = [{ id: "project-1", name: "Sprint 42" }];
+  mocks.deleteComments = [];
   vi.clearAllMocks();
 });
 
@@ -271,6 +279,35 @@ describe("HeaderConversationMenu", () => {
       id: "conv-1",
       deleteBranch: true,
     });
+  });
+
+  it("names the unhandled comments in the delete confirmation", async () => {
+    mocks.deleteComments = [
+      { status: "draft", created_by: "visitor:Alice" },
+      { status: "draft", created_by: "visitor:" },
+      { status: "draft", created_by: "me@example.com" },
+      { status: "addressed", created_by: "visitor:Bob" },
+    ];
+    renderMenu();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByText("3 unhandled comments (2 from visitors) will be deleted."),
+    ).toBeInTheDocument();
+  });
+
+  it("omits the comments line when nothing is unhandled", async () => {
+    mocks.deleteComments = [{ status: "addressed", created_by: null }];
+    renderMenu();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByText(/unhandled comments/)).toBeNull();
   });
 
   it("archives from the distinctly labelled mobile action, then returns home", async () => {

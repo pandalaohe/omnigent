@@ -1060,6 +1060,25 @@ describe("FileViewer artifact links", () => {
     });
   });
 
+  it("mints the visit view for HTML files so the link can carry comments", async () => {
+    authenticatedFetchMock.mockResolvedValue(
+      jsonResponse({ url: "/v1/artifacts/tok/page.html", nonce: "n1", kind: "file" }),
+    );
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    renderViewer({ open: true, path: "page.html" });
+    fireEvent.click(screen.getByRole("button", { name: "Copy file link" }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    // The copy action is the commentable link; "Open in new tab" below keeps
+    // minting raw, so a page-only address stays one action away.
+    expect(JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      path: "page.html",
+      view: "visit",
+    });
+  });
+
   it("hides the artifact link and revoke actions in embed mode", () => {
     vi.mocked(hasOmnigentHostFetcher).mockReturnValue(true);
     renderViewer({ open: true });

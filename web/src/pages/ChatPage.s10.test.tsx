@@ -34,6 +34,10 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
 }));
+
+// The archived-comments banner reads session comments via a TanStack query
+// hook; stub it so bare Composer renders don't need a QueryClientProvider.
+vi.mock("@/hooks/useComments", () => ({ useComments: () => ({ data: [] }) }));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: () => ({
     branch: null,

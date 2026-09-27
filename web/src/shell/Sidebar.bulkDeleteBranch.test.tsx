@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import type * as UseCommentsModule from "@/hooks/useComments";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the branch table in the sidebar's bulk-delete modal (selection
 // mode). Contract: worktree sessions among the selection each get a table row
@@ -67,6 +68,14 @@ vi.mock("@/hooks/useConversations", () => ({
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+
+// The delete confirmation reads the session's comments; this file's rows hold
+// none, so the count line stays out of the dialogs it asserts on. Keep the
+// module's other exports (useCommentInbox shares them through the provider).
+vi.mock("@/hooks/useComments", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseCommentsModule>();
+  return { ...actual, useComments: () => ({ data: [] }) };
+});
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
@@ -167,6 +176,27 @@ describe("bulk-delete branch list", () => {
     expect(within(dialog).getByText("feat/alpha")).toBeInTheDocument();
     expect(within(dialog).getByText("feat/beta")).toBeInTheDocument();
     expect(within(dialog).queryByText("feat/gamma")).not.toBeInTheDocument();
+  });
+
+  it("names the comments that die with the selected sessions", () => {
+    mockConversations([
+      { ...WORKTREE_A, comments_count: 3 },
+      { ...WORKTREE_B, comments_count: 2 },
+      PLAIN,
+    ]);
+    renderSidebar();
+    const dialog = selectAllAndOpenDeleteDialog();
+
+    expect(
+      within(dialog).getByText("These sessions hold 5 comments; they will be deleted."),
+    ).toBeInTheDocument();
+  });
+
+  it("omits the comments line when the sessions hold none", () => {
+    renderSidebar();
+    const dialog = selectAllAndOpenDeleteDialog();
+
+    expect(within(dialog).queryByText(/comments; they will be deleted/)).toBeNull();
   });
 
   it("defaults every branch unchecked, so a plain confirm deletes no branch", () => {

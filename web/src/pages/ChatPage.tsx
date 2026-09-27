@@ -226,6 +226,7 @@ import {
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
+import { useComments } from "@/hooks/useComments";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
@@ -242,6 +243,7 @@ import {
   AgentMembersMenu,
   EditMemberAgentDialog,
 } from "@/components/composer/AgentMembersMenu";
+import { ArchivedCommentsBanner } from "@/components/ArchivedCommentsBanner";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import {
@@ -2994,6 +2996,11 @@ function ComposerImpl(
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
   const { session: composerSession } = useSession(composerSessionId);
+  // Archived sessions keep their unhandled comments; fetch them (visitor
+  // drafts included) for the continuation banner above the composer.
+  const { data: archivedComments } = useComments(
+    composerSession?.archived === true ? (composerSessionId ?? undefined) : undefined,
+  );
   // Member roster of a joint Agent session, from the F1a snapshot labels. A
   // session without valid member labels parses to [] and keeps today's
   // single-agent composer everywhere below.
@@ -4173,6 +4180,15 @@ function ComposerImpl(
             above the composer rather than in the transcript. Self-gates to
             null when every member can run. */}
         {multiMemberSession && <AgentMembersBanner members={sessionMembers} />}
+        {composerSession?.archived === true && (
+          <ArchivedCommentsBanner
+            sessionId={composerSession.id}
+            title={composerSession.title ?? "untitled session"}
+            directory={composerSession.worktree ?? composerSession.workspace ?? ""}
+            agentId={composerSession.agentId ?? null}
+            comments={archivedComments ?? []}
+          />
+        )}
         <ComposerWorkspaceBar
           data-testid="composer-workspace-controls"
           className={cn(
@@ -4761,7 +4777,7 @@ export function dispatchInitialPrompt(
     agentId: string,
     files: File[],
     opts?: { composerParts?: ComposerDraftPart[] },
-  ) => Promise<void>,
+  ) => Promise<unknown>,
   sendSlashCommand: (name: string, args: string, agentId: string) => Promise<void>,
 ): void {
   if (prompt.skill && (prompt.files?.length ?? 0) === 0) {

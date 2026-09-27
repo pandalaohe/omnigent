@@ -1068,7 +1068,7 @@ export interface AppChatState {
 
 /** Actions exposed on the root store. */
 export interface ChatActions {
-  send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<boolean>;
   clearSideChatToOpen: () => void;
   /** Open a generic side chat as a rail tab under `parentId`, seeding its
    *  composer with `draft` (the typed `/side` question) so it isn't lost while
@@ -2249,13 +2249,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     try {
       await waitForPrior();
-      if (initialDraft && !initialSendPending()) return;
+      if (initialDraft && !initialSendPending()) return false;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
+      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return false;
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -2269,7 +2269,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         (block): block is Extract<ContentBlock, { type: "input_image" | "input_file" }> =>
           block.type === "input_image" || block.type === "input_file",
       );
-      if (initialDraft && !initialSendPending()) return;
+      if (initialDraft && !initialSendPending()) return false;
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -2352,8 +2352,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // poll — picks up server-side title auto-gen and any runner_id /
       // status transitions that happen during the turn.
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      // Delivered means the server accepted the message AND forwarded it to a
+      // runner. A policy denial, or a native-terminal failure persisted with
+      // no runner attached ({queued: true, forwarded: false}), means the
+      // agent never read it.
+      return !postResult.denied && !(postResult.queued && postResult.forwarded === false);
     } catch (err) {
-      if (initialDraft && !initialDispatched && !initialSendPending()) return;
+      if (initialDraft && !initialDispatched && !initialSendPending()) return false;
       const { message, code } = describeSendFailure(err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
@@ -2439,6 +2444,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
         }
       }
+      // The message never reached a runner.
+      return false;
     } finally {
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.

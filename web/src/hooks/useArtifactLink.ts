@@ -12,7 +12,9 @@ import { authenticatedFetch } from "@/lib/identity";
 import { stripInjectedScripts } from "@/lib/stripInjectedScripts";
 import { browseLocationBase } from "@/hooks/useWorkspaceChangedFiles";
 
-export type ArtifactView = "panel" | "raw";
+/** `visit` serves the commentable visitor shell for HTML entries (the
+ *  server falls back to raw bytes for every other file). */
+export type ArtifactView = "panel" | "raw" | "visit";
 
 /** Mint response of `POST /v1/sessions/{sid}/artifacts`. */
 export interface MintedArtifactLink {

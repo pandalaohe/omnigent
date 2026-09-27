@@ -622,9 +622,16 @@ function FileViewerBody({
   // Copy the standalone artifact URL — a capability link to the file's bytes,
   // independent of the viewer's own URL. Standalone-only: embed mode's API
   // transport does not reach the artifact route.
+  //
+  // HTML files mint the visit view instead, so the recipient gets the shell
+  // that can leave comments; "Open in new tab" keeps the raw view, so the
+  // page-only address stays one action away.
   const copyArtifactLink = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
-    mintArtifactLink(conversationId, { path, view: "raw" }).then(
+    mintArtifactLink(conversationId, {
+      path,
+      view: detectLang(path) === "html" ? "visit" : "raw",
+    }).then(
       (artifact) => {
         navigator.clipboard.writeText(window.location.origin + withBasePath(artifact.url)).then(
           () => {
