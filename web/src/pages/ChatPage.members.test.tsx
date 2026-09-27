@@ -362,6 +362,19 @@ describe("unavailable members", () => {
     );
   });
 
+  it("shows no banner for a one-member session with an unavailable label", () => {
+    // A one-member session has no member menu, so it keeps its normal controls
+    // and must not gain a members banner from a stray label.
+    sessionSnapshot.labels = {
+      [`${MEMBER_KEY}architect`]: memberLabel({ lead: true, unavailable: "host_offline" }),
+    };
+    renderComposer({ showModels: true, showEffort: true, modelPickerKind: "claude" });
+    expect(screen.queryByTestId("agent-members-banner")).toBeNull();
+    expect(screen.queryByTestId("composer-members-alert")).toBeNull();
+    expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
+    expect(textarea().placeholder).toBe("Send a message…");
+  });
+
   it("renders no dot or banner when every member can run", () => {
     sessionSnapshot.labels = multiMemberLabels();
     renderComposer();

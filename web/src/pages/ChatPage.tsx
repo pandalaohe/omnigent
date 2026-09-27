@@ -4168,10 +4168,11 @@ function ComposerImpl(
             SubagentComposerTray). Truthy (not just non-null) so an empty
             label never peeks a nameless tray. */}
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-        {/* Unavailable members: a session-level condition, so the notice sits
+        {/* Unavailable members: a session-level condition of a 2+ member
+            session (the same gate as the members menu), so the notice sits
             above the composer rather than in the transcript. Self-gates to
             null when every member can run. */}
-        <AgentMembersBanner members={sessionMembers} />
+        {multiMemberSession && <AgentMembersBanner members={sessionMembers} />}
         <ComposerWorkspaceBar
           data-testid="composer-workspace-controls"
           className={cn(
