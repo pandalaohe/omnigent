@@ -11,6 +11,7 @@ over-cap key or value is a 400, never truncated. The scheduled
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tarfile
@@ -292,6 +293,92 @@ async def test_missing_default_row_keeps_model_null(
     )
 
     assert entries["researcher"]["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_host_store_failure_still_writes_labels_without_availability(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising host store degrades to missing facts, never a failed create."""
+    _arm_host(member_server.hosts)
+
+    def _broken_get_host(_host_id: str) -> None:
+        raise RuntimeError("host store down")
+
+    monkeypatch.setattr(member_server.hosts, "get_host", _broken_get_host)
+
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert entries == {
+        "custom-reviewer": {
+            "host": _HOST_ID,
+            "harness": "codex",
+            "model": "lead-model",
+            "effort": "high",
+            "lead": True,
+        },
+        "researcher": {
+            "host": _HOST_ID,
+            "harness": "claude-sdk",
+            "model": "worker-model",
+            "effort": "medium",
+            "lead": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_lookup_failure_still_writes_declared_models(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising catalog lookup degrades to no catalog, never a failed create."""
+    _arm_host(member_server.hosts)
+
+    from omnigent.server.routes._sessions import helpers
+
+    async def _broken_options(_host_id: str, _harness: str) -> None:
+        raise RuntimeError("catalog down")
+
+    monkeypatch.setattr(helpers, "_host_model_options_via_registry", _broken_options)
+
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert entries["custom-reviewer"]["model"] == "lead-model"
+    assert entries["researcher"]["model"] == "worker-model"
+    assert "unavailable" not in entries["custom-reviewer"]
+    assert "unavailable" not in entries["researcher"]
+
+
+@pytest.mark.asyncio
+async def test_catalog_lookups_for_distinct_harnesses_run_concurrently(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every needed catalog is in flight together: one lookup timeout, not N."""
+    _arm_host(member_server.hosts)
+
+    from omnigent.server.routes._sessions import helpers
+
+    started: list[str] = []
+    both_started = asyncio.Event()
+    timed_out: list[str] = []
+
+    async def _gate(_host_id: str, harness: str) -> None:
+        started.append(harness)
+        if len(started) >= 2:
+            both_started.set()
+            return
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=2.0)
+        except TimeoutError:
+            timed_out.append(harness)
+
+    monkeypatch.setattr(helpers, "_host_model_options_via_registry", _gate)
+
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert sorted(started) == ["claude-sdk", "codex"]
+    assert timed_out == []
+    assert entries["researcher"]["model"] == "worker-model"
 
 
 @pytest.mark.asyncio

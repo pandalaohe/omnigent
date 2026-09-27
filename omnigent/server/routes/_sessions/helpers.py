@@ -10429,6 +10429,10 @@ async def _member_snapshot_labels(
     stays null. The session host is the member host until F2a adds per-member
     hosts. A value that would exceed a label column is a 400, never truncated.
 
+    Resolution is best-effort: a failed host-store or catalog lookup logs a
+    warning and leaves that fact out of the labels, so a transient resolver
+    failure never aborts the create.
+
     :param spec: The uploaded bundle's validated spec.
     :param host_id: The session's target host, or ``None`` for a hostless
         session (no liveness, readiness, or catalog resolution then).
@@ -10443,15 +10447,24 @@ async def _member_snapshot_labels(
     members = project_members(spec)
     if len(members) < 2:
         return {}
-    host = (
-        await asyncio.to_thread(host_store.get_host, host_id)
-        if host_id is not None and host_store is not None
-        else None
-    )
-    if host is not None and not host_is_live(host):
-        host = None
-    catalogs: dict[str, list[dict[str, Any]] | None] = {}
-    labels: dict[str, str] = {}
+    host: Host | None = None
+    host_lookup_failed = False
+    if host_id is not None and host_store is not None:
+        try:
+            host = await asyncio.to_thread(host_store.get_host, host_id)
+        except Exception:  # noqa: BLE001 — a resolver failure must not abort the create
+            host_lookup_failed = True
+            _logger.warning(
+                "member snapshot: host lookup failed for %s; writing labels "
+                "without host availability or catalog defaults",
+                host_id,
+                exc_info=True,
+            )
+        else:
+            if host is not None and not host_is_live(host):
+                host = None
+
+    prepared: list[tuple[str, dict[str, Any], str | None]] = []
     for member in members:
         role = str(member["name"])
         harness = member.get("harness")
@@ -10463,7 +10476,7 @@ async def _member_snapshot_labels(
             "lead": bool(member.get("lead")),
         }
         reason: str | None = None
-        if host_id is not None:
+        if host_id is not None and not host_lookup_failed:
             if host is None:
                 reason = MEMBER_UNAVAILABLE_HOST_OFFLINE
             elif isinstance(harness, str) and harness:
@@ -10474,19 +10487,44 @@ async def _member_snapshot_labels(
                         if isinstance(reported, str) and reported
                         else MEMBER_UNAVAILABLE_HARNESS_NOT_CONFIGURED
                     )
-        model = entry["model"]
-        if (
-            reason is None
-            and host is not None
-            and host_id is not None
-            and isinstance(harness, str)
-            and harness
-        ):
-            if harness not in catalogs:
-                catalogs[harness] = await _host_model_options_via_registry(host_id, harness)
-            catalog = catalogs[harness]
+        prepared.append((role, entry, reason))
+
+    # One catalog lookup per needed harness, all in flight together: a create
+    # waits at most one lookup timeout instead of one per harness.
+    catalogs: dict[str, list[dict[str, Any]] | None] = {}
+    if host is not None and host_id is not None:
+
+        async def _fetch_catalog(harness: str) -> list[dict[str, Any]] | None:
+            try:
+                return await _host_model_options_via_registry(host_id, harness)
+            except Exception:  # noqa: BLE001 — a resolver failure must not abort the create
+                _logger.warning(
+                    "member snapshot: catalog lookup failed for host %s harness "
+                    "%s; writing labels without the catalog default",
+                    host_id,
+                    harness,
+                    exc_info=True,
+                )
+                return None
+
+        needed = sorted(
+            {
+                str(entry["harness"])
+                for _, entry, reason in prepared
+                if reason is None and isinstance(entry["harness"], str) and entry["harness"]
+            }
+        )
+        results = await asyncio.gather(*(_fetch_catalog(harness) for harness in needed))
+        catalogs = dict(zip(needed, results, strict=True))
+
+    labels: dict[str, str] = {}
+    for role, entry, reason in prepared:
+        harness = entry["harness"]
+        if reason is None and isinstance(harness, str):
+            catalog = catalogs.get(harness)
             if catalog is not None:
                 rows = [row for row in catalog if isinstance(row, Mapping)]
+                model = entry["model"]
                 if model is None or model == "default":
                     default_row = next((row for row in rows if row.get("isDefault") is True), None)
                     entry["model"] = (
