@@ -17,7 +17,7 @@
 import { useMemo } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, useSearchParams } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
@@ -103,6 +103,7 @@ vi.mock("./CommentsPanel", () => ({
     onClickComment,
     onAddressAll,
     onAddComment,
+    onCopyCommentLink,
     comments,
     addressedComments,
     activeSelection,
@@ -111,6 +112,7 @@ vi.mock("./CommentsPanel", () => ({
     onClickComment?: (comment: any) => void;
     onAddressAll?: () => void;
     onAddComment?: (body: string) => void;
+    onCopyCommentLink?: (commentId: string) => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     comments?: any[];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -133,6 +135,11 @@ vi.mock("./CommentsPanel", () => ({
       ))}
       <button type="button" aria-label="add comment" onClick={() => onAddComment?.("body text")} />
       <button type="button" aria-label="address all comments" onClick={onAddressAll} />
+      <button
+        type="button"
+        aria-label="copy comment link"
+        onClick={() => onCopyCommentLink?.("c1")}
+      />
     </div>
   ),
 }));
@@ -1549,6 +1556,221 @@ describe("FileViewer view-preference persistence across refresh", () => {
     // storage (which holds false). If the URL override were dropped the viewer
     // would be absent.
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+  });
+});
+
+describe("FileViewer agent preview request", () => {
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+
+  it("shows the preview for an explicit request despite the sticky mode and an active diff", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "source",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+
+    // A plain open keeps the stored source preference...
+    const plain = render(viewerTree({ open: true, path: "page.html" }));
+    expect(viewModeOf()).toBe("source");
+    plain.unmount();
+
+    // ...while the agent's panel-open request (?preview=1 on the open path)
+    // shows the rendered preview, and the first explicit mode choice ends it.
+    render(viewerTree({ open: true, path: "page.html", initialSearch: "preview=1" }));
+    expect(viewModeOf()).toBe("preview");
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(viewModeOf()).toBe("source");
+    cleanup();
+
+    // The request also leaves diff mode: with the file changed and the diff
+    // preference on, a plain open shows diff while the request shows preview.
+    writeFileViewPreferences({
+      diffActive: true,
+      diffLayout: "unified",
+      previewableViewMode: "source",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: {
+        available: true,
+        data: [{ path: "page.html", name: "page.html", status: "modified", bytes: 10 }],
+      },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    try {
+      const diffed = render(viewerTree({ open: true, path: "page.html" }));
+      // The diff viewer is lazily mounted; wait for it instead of the code viewer.
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      diffed.unmount();
+
+      render(viewerTree({ open: true, path: "page.html", initialSearch: "preview=1" }));
+      expect(viewModeOf()).toBe("preview");
+    } finally {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [
+            {
+              path: "file1.py",
+              bytes: 10,
+              modified_at: null,
+              name: "file1.py",
+              status: "modified",
+            },
+          ],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+    }
+  });
+
+  it("asks before an agent preview open discards unsaved rich-editor edits", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    let guard: FileNavigationGuard | undefined;
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return vi.fn();
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "notes.md" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    render(<GuardedViewer />);
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+
+    const navigate = vi.fn();
+    act(() => guard!("notes.md", { preview: true }, navigate));
+
+    // The request would swap the dirty editor for the preview, so it must ask
+    // first (like a citation line); cancelling keeps the draft and the editor.
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+    expect(draft).toHaveValue("Unsaved draft");
+  });
+
+  it("does not carry the request to the neighbour tab after the previewed tab closes", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "source",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+
+    // The agent opens report.html in preview; consuming the request strips it
+    // from the URL the tab close will operate on.
+    const view = render(
+      viewerTree({ open: true, path: "report.html", initialSearch: "file=report.html&preview=1" }),
+    );
+    expect(viewModeOf()).toBe("preview");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("preview");
+
+    // Closing report.html activates its neighbour README: the stored Source
+    // preference applies again, not the closed tab's request.
+    view.rerender(viewerTree({ open: true, path: "README.md" }));
+    expect(viewModeOf()).toBe("source");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("preview");
+
+    // A later plain open of report.html (clicking its tab again) must not
+    // re-apply the request — it named one open.
+    view.rerender(viewerTree({ open: true, path: "report.html" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("returns to the chosen mode when View source follows a request that displaced diff", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    writeFileViewPreferences({
+      diffActive: true,
+      diffLayout: "unified",
+      previewableViewMode: "preview",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: {
+        available: true,
+        data: [{ path: "page.html", name: "page.html", status: "modified", bytes: 10 }],
+      },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    try {
+      render(
+        viewerTree({ open: true, path: "page.html", initialSearch: "file=page.html&preview=1" }),
+      );
+      expect(viewModeOf()).toBe("preview");
+
+      // The request left diff mode; choosing a surface must land on it instead
+      // of snapping back to the diff preference the request displaced.
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(viewModeOf()).toBe("source");
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    } finally {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [
+            {
+              path: "file1.py",
+              bytes: 10,
+              modified_at: null,
+              name: "file1.py",
+              status: "modified",
+            },
+          ],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+    }
+  });
+
+  it("copies a comment link without the one-shot request after it is consumed", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    window.history.replaceState({}, "", "/?file=page.html&preview=1");
+    try {
+      render(
+        <QueryClientProvider
+          client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+        >
+          <BrowserRouter>
+            <FileViewer open conversationId="conv_1" path="page.html" onClose={vi.fn()} />
+          </BrowserRouter>
+        </QueryClientProvider>,
+      );
+      expect(viewModeOf()).toBe("preview");
+      fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+      fireEvent.click(screen.getByRole("button", { name: "copy comment link" }));
+
+      // The copied URL is read from the live location; the consumed request
+      // must be gone by then so the link doesn't force preview on reload.
+      const copied = String(writeText.mock.calls[0]?.[0]);
+      expect(copied).toContain("comment=c1");
+      expect(copied).not.toContain("preview");
+    } finally {
+      cleanup();
+      window.history.replaceState({}, "", "/");
+    }
   });
 });
 

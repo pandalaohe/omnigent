@@ -217,6 +217,10 @@ class ToolManager:
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
         self._register_browser_tools()
+        # The artifact-relay panel tool is framework-owned too: always
+        # auto-registered so any agent can open a file in the user's web
+        # preview panel without the spec opting in.
+        self._register_panel_tools()
 
     def _register_policy_tools(self) -> None:
         """
@@ -654,6 +658,20 @@ class ToolManager:
             BrowserScreenshotTool,
         ):
             self._tools[_cls.name()] = _cls()
+
+    def _register_panel_tools(self) -> None:
+        """
+        Auto-register ``open_in_panel``.
+
+        Framework-owned and always available so any agent can open a file
+        in the user's web preview panel without the spec opting in. The
+        class is schema-only; execution lives in the runner dispatch
+        (``omnigent/runner/tool_dispatch.py``), which needs the runner's
+        ``server_client`` that ``ToolContext`` does not carry.
+        """
+        from omnigent.tools.builtins.panel import OpenInPanelTool
+
+        self._tools[OpenInPanelTool.name()] = OpenInPanelTool()
 
     def _register_os_env_tools(self, *, schema_only: bool = False) -> None:
         """

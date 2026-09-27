@@ -15,12 +15,15 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from omnigent.runner.app import (
     TurnDispatch,
     _merge_request_client_tools,
     _schema_tool_name,
     _should_dispatch_tool_locally,
 )
+from omnigent.runner.tool_dispatch import should_dispatch_locally
 
 
 def _schema(name: str) -> dict[str, Any]:
@@ -218,19 +221,22 @@ def test_legacy_path_relays_unknown_tool() -> None:
     )
 
 
-def test_legacy_path_dispatches_builtin() -> None:
+@pytest.mark.parametrize("tool_name", ["load_skill", "open_in_panel"])
+def test_legacy_path_dispatches_builtin(tool_name: str) -> None:
     """A runner builtin dispatches locally even on the legacy path.
 
     Guards that narrowing the dispatch condition didn't accidentally stop
     dispatching genuine builtins (``is_runner_builtin``) when no
-    TurnDispatch is present.
+    TurnDispatch is present. The registry lookup is the real one: a builtin
+    missing from it (``open_in_panel`` before its union fix) relays the call
+    upstream and the tool never runs.
     """
     assert (
         _should_dispatch_tool_locally(
-            "load_skill",
+            tool_name,
             dispatch=None,
             is_mcp=False,
-            is_runner_builtin=True,
+            is_runner_builtin=should_dispatch_locally(tool_name),
             is_spec_local=False,
         )
         is True

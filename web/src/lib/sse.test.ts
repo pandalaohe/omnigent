@@ -520,3 +520,37 @@ describe("parseEvent — response.elicitation_resolved", () => {
     } satisfies ElicitationResolved);
   });
 });
+
+describe("parseEvent — artifact.open_request", () => {
+  it("maps the agent panel-open request with its base", () => {
+    // The runner's open_in_panel tool asks the web UI to show a file; the
+    // event carries path + base only (never a URL), so the consumer mints its
+    // own link. Dropping the event here would make the tool a silent no-op.
+    expect(
+      parseEvent("artifact.open_request", {
+        path: "reports/index.html",
+        base: "workspace",
+      }),
+    ).toEqual({
+      type: "artifact_open_request",
+      path: "reports/index.html",
+      base: "workspace",
+    });
+    expect(
+      parseEvent("artifact.open_request", {
+        path: "/Users/x/report.html",
+        base: "host",
+      }),
+    ).toEqual({
+      type: "artifact_open_request",
+      path: "/Users/x/report.html",
+      base: "host",
+    });
+  });
+
+  it("rejects a request without a usable path", () => {
+    expect(parseEvent("artifact.open_request", {})).toBeNull();
+    expect(parseEvent("artifact.open_request", { path: "" })).toBeNull();
+    expect(parseEvent("artifact.open_request", { path: 7 })).toBeNull();
+  });
+});

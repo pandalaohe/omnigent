@@ -155,6 +155,10 @@ def test_builtin_names_size_matches_registry() -> None:
                 "browser_click",
                 "browser_type",
                 "browser_screenshot",
+                # Artifact-relay panel tool: always registered (schema-only;
+                # execution is runner-dispatched via the _PANEL_TOOLS branch
+                # in runner/tool_dispatch.py).
+                "open_in_panel",
             }
         )
         == BUILTIN_NAMES

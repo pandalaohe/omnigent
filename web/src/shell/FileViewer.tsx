@@ -377,6 +377,24 @@ function FileViewerBody({
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(searchParams.get("diff") === "1");
   const initialCommentIdRef = useRef(searchParams.get("comment"));
+  // The agent's open_in_panel rides a one-shot ?preview=1 on the open path; the
+  // owning viewer consumes it into a local override for that path (see below).
+  // The override never persists — it dies with the path or a user mode choice.
+  const [previewOverridePath, setPreviewOverridePath] = useState<string | null>(null);
+  // Ends an explicit preview request so the user's own mode choice takes
+  // effect — both the local override and a not-yet-consumed URL request.
+  const clearPreviewRequest = useCallback(() => {
+    setPreviewOverridePath(null);
+    if (!ownsUrl || !searchParams.has("preview")) return;
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("preview");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [ownsUrl, searchParams, setSearchParams]);
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -484,13 +502,16 @@ function FileViewerBody({
   } | null>(null);
   // TOC panel state (for markdown preview)
   const [tocOpen, setTocOpen] = useState(false);
-  // Reset selection state whenever the file changes.
+  // Reset per-file state whenever the file changes. A preview override names
+  // one open, so it must not follow to another file — nor re-apply when the
+  // same path is opened plainly later.
   useEffect(() => {
     setActiveSelection(null);
     setFrame(null);
     handleDirtyChange(false);
     setSaveStatus("idle");
     setTocOpen(false);
+    setPreviewOverridePath(null);
   }, [path, handleDirtyChange]);
   // A selection belongs to one page; the preview frame reporting a different
   // page (in-frame navigation) invalidates it. Returning to a page that has an
@@ -825,6 +846,24 @@ function FileViewerBody({
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
+  // Consume a preview request when this viewer owns the URL: record the override
+  // for the path it opened, leave diff mode, and strip the param so the request
+  // can't leak into a copied link, a neighbour tab, or a later plain open.
+  useEffect(() => {
+    if (!ownsUrl || searchParams.get("preview") !== "1") return;
+    if (isPreviewable) {
+      setPreviewOverridePath(path);
+      setDiffActive(false);
+    }
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("preview");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [ownsUrl, searchParams, isPreviewable, path, setSearchParams]);
   // A ?comment= deep link to a markdown file must open on the rich-text editor
   // so the comment's anchor highlight is visible in context — the whole point
   // of following the link. The editor is forced regardless of the user's sticky
@@ -850,8 +889,9 @@ function FileViewerBody({
   // directly (mirrors the toolbar's switchTo for the non-editor case).
   const handleRequestEditMode = useCallback(() => {
     setDeepLinkBiasPath(null);
+    clearPreviewRequest();
     setPreviewableViewMode("editor");
-  }, []);
+  }, [clearPreviewRequest]);
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
@@ -891,16 +931,27 @@ function FileViewerBody({
     appliedPosition !== dismissedPosition && !isFilePositionDismissed(appliedPosition)
       ? appliedPosition
       : undefined;
-  // Citations preserve diff mode; previewable files need source to expose line numbers.
-  const viewMode: "editor" | "preview" | "source" | "diff" =
-    diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
+  // Citations preserve diff mode; previewable files need source to expose line
+  // numbers. A one-shot preview request (the agent's open_in_panel) outranks both:
+  // the unconsumed ?preview=1 covers the first render, the override the rest.
+  const previewRequested = searchParams.get("preview") === "1";
+  const previewActive = isPreviewable && (previewRequested || previewOverridePath === path);
+  const viewMode: "editor" | "preview" | "source" | "diff" = previewActive
+    ? "preview"
+    : diffActive && isDiffAvailable
+      ? "diff"
+      : filePosition
+        ? "source"
+        : fileViewMode;
   const diffViewActive = viewMode === "diff";
 
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   useLayoutEffect(() => {
     if (!open || !registerNavigationGuard) return;
     return registerNavigationGuard((destination, options, navigate) => {
-      if (destination !== path || (options?.line && viewMode === "editor")) {
+      // A line citation or a preview request leaves the editor, so both must
+      // confirm unsaved edits; any other open of the same path is a no-op.
+      if (destination !== path || ((options?.line || options?.preview) && viewMode === "editor")) {
         guardDirty(navigate);
       } else {
         navigate();
@@ -1135,6 +1186,7 @@ function FileViewerBody({
       // cancels leaves both the bias and the editor intact.
       const apply = () => {
         setDeepLinkBiasPath(null);
+        clearPreviewRequest();
         dismissFilePosition(position);
         setDismissedPosition(position);
         setPreviewableViewMode(mode);
@@ -1198,6 +1250,7 @@ function FileViewerBody({
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
       onSelect: () => {
+        clearPreviewRequest();
         dismissFilePosition(position);
         setDismissedPosition(position);
         setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
@@ -1244,6 +1297,7 @@ function FileViewerBody({
       active: viewMode === "diff",
       onSelect: () =>
         guardDirty(() => {
+          clearPreviewRequest();
           dismissFilePosition(position);
           setDismissedPosition(position);
           setDiffActive(viewMode !== "diff");

@@ -91,6 +91,10 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        # The artifact-relay panel tool is always auto-registered
+        # (framework-owned) like the browser tools. Schema-only;
+        # runner-dispatched.
+        "open_in_panel",
     }
 )
 
