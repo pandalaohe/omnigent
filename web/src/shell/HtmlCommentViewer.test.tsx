@@ -36,7 +36,7 @@ describe("HtmlCommentViewer", () => {
     const { container } = renderViewer("<html><head></head><body><p>doc</p></body></html>");
     const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
     const srcDoc = iframe.getAttribute("srcdoc") ?? "";
-    expect(srcDoc).toContain("<script>");
+    expect(srcDoc).toContain('<script data-omni-nonce="');
     expect(srcDoc).toContain("omni-html-comment");
     expect(srcDoc).toContain('<base target="_blank">');
   });
