@@ -175,44 +175,45 @@ class SqlAlchemySessionHandoffStore(SessionHandoffStore):
                 or 0
             )
 
-    def _newest(self, operation: str, *predicates: Any) -> SessionHandoff | None:
-        with self._session(operation) as session:
-            row = session.scalars(
-                select(SqlSessionHandoff)
-                .where(
-                    SqlSessionHandoff.workspace_id == current_workspace_id(),
-                    *predicates,
-                )
-                .order_by(desc(SqlSessionHandoff.created_at), desc(SqlSessionHandoff.id))
-                .limit(1)
-            ).first()
-            return _record_to_entity(row) if row is not None else None
+    def _newest(self, session: Session, *predicates: Any) -> SessionHandoff | None:
+        row = session.scalars(
+            select(SqlSessionHandoff)
+            .where(
+                SqlSessionHandoff.workspace_id == current_workspace_id(),
+                *predicates,
+            )
+            .order_by(desc(SqlSessionHandoff.created_at), desc(SqlSessionHandoff.id))
+            .limit(1)
+        ).first()
+        return _record_to_entity(row) if row is not None else None
 
     def find_unfinished_duplicate(
         self,
         sender_session_id: str,
         brief_hash: str,
     ) -> SessionHandoff | None:
-        return self._newest(
-            "find_unfinished_duplicate_handoff",
-            SqlSessionHandoff.sender_session_id == sender_session_id,
-            SqlSessionHandoff.brief_hash == brief_hash,
-            SqlSessionHandoff.state.in_(HANDOFF_UNFINISHED_STATES),
-        )
+        with self._session("find_unfinished_duplicate_handoff") as session:
+            return self._newest(
+                session,
+                SqlSessionHandoff.sender_session_id == sender_session_id,
+                SqlSessionHandoff.brief_hash == brief_hash,
+                SqlSessionHandoff.state.in_(HANDOFF_UNFINISHED_STATES),
+            )
 
     def find_binding_for_receiver(self, session_id: str) -> SessionHandoff | None:
-        return self._newest(
-            "find_receiver_handoff_binding",
-            SqlSessionHandoff.receiver_session_id == session_id,
-            or_(
-                SqlSessionHandoff.state.in_(HANDOFF_UNFINISHED_STATES),
-                and_(
-                    SqlSessionHandoff.state == "expired",
-                    SqlSessionHandoff.reason == "no_report",
-                    SqlSessionHandoff.reported_at.is_(None),
+        with self._session("find_receiver_handoff_binding") as session:
+            return self._newest(
+                session,
+                SqlSessionHandoff.receiver_session_id == session_id,
+                or_(
+                    SqlSessionHandoff.state.in_(HANDOFF_UNFINISHED_STATES),
+                    and_(
+                        SqlSessionHandoff.state == "expired",
+                        SqlSessionHandoff.reason == "no_report",
+                        SqlSessionHandoff.reported_at.is_(None),
+                    ),
                 ),
-            ),
-        )
+            )
 
     def find_branch_reservation(
         self,
@@ -220,13 +221,14 @@ class SqlAlchemySessionHandoffStore(SessionHandoffStore):
         checkout: str,
         branch: str,
     ) -> SessionHandoff | None:
-        return self._newest(
-            "find_handoff_branch_reservation",
-            SqlSessionHandoff.host_id == host_id,
-            SqlSessionHandoff.checkout == checkout,
-            SqlSessionHandoff.git_branch == branch,
-            SqlSessionHandoff.state.in_(HANDOFF_UNFINISHED_STATES),
-        )
+        with self._session("find_handoff_branch_reservation") as session:
+            return self._newest(
+                session,
+                SqlSessionHandoff.host_id == host_id,
+                SqlSessionHandoff.checkout == checkout,
+                SqlSessionHandoff.git_branch == branch,
+                SqlSessionHandoff.state.in_(HANDOFF_UNFINISHED_STATES),
+            )
 
     def list_for_sender(
         self,
