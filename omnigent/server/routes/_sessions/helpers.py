@@ -10426,8 +10426,9 @@ async def _member_snapshot_labels(
     a member's dispatch overrides and to refuse work routed to a member that
     cannot run. The model is the member's own, or — for none / ``"default"`` —
     the host catalog's ``isDefault`` row for that harness; without a catalog it
-    stays null. The session host is the member host until F2a adds per-member
-    hosts. A value that would exceed a label column is a 400, never truncated.
+    stays null, never the literal ``"default"``. The session host is the member
+    host until F2a adds per-member hosts. A value that would exceed a label
+    column is a 400, never truncated.
 
     Resolution is best-effort: a failed host-store or catalog lookup logs a
     warning and leaves that fact out of the labels, so a transient resolver
@@ -10468,10 +10469,16 @@ async def _member_snapshot_labels(
     for member in members:
         role = str(member["name"])
         harness = member.get("harness")
+        # None / "default" mean "let the catalog decide"; the literal must never
+        # reach the runner, which treats a snapshot model as an explicit
+        # override. The catalog step fills the isDefault row when one exists.
+        member_model = member.get("model")
+        if member_model == "default":
+            member_model = None
         entry: dict[str, Any] = {
             "host": host_id,
             "harness": harness,
-            "model": member.get("model"),
+            "model": member_model,
             "effort": member.get("reasoning_effort"),
             "lead": bool(member.get("lead")),
         }
@@ -10525,7 +10532,7 @@ async def _member_snapshot_labels(
             if catalog is not None:
                 rows = [row for row in catalog if isinstance(row, Mapping)]
                 model = entry["model"]
-                if model is None or model == "default":
+                if model is None:
                     default_row = next((row for row in rows if row.get("isDefault") is True), None)
                     entry["model"] = (
                         _member_model_id(default_row) if default_row is not None else None

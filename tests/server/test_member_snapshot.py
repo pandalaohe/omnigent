@@ -382,6 +382,34 @@ async def test_catalog_lookups_for_distinct_harnesses_run_concurrently(
 
 
 @pytest.mark.asyncio
+async def test_hostless_default_model_is_null(member_server: _MemberServer) -> None:
+    """A hostless create stores null, never the literal ``"default"``."""
+    entries = await _member_labels_after_create(
+        member_server, joint_bundle(worker_model="default"), metadata={}
+    )
+
+    assert entries["researcher"]["model"] is None
+    assert entries["custom-reviewer"]["model"] == "lead-model"
+
+
+@pytest.mark.asyncio
+async def test_live_host_without_catalog_default_model_is_null(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A harness with no catalog row keeps ``"default"`` as null, not literal."""
+    _arm_host(member_server.hosts)
+    _stub_catalog(monkeypatch, {"codex": [{"id": "lead-model", "model": "lead-model"}]})
+
+    entries = await _member_labels_after_create(
+        member_server, joint_bundle(worker_model="default")
+    )
+
+    assert entries["researcher"]["model"] is None
+    assert "unavailable" not in entries["researcher"]
+    assert entries["custom-reviewer"]["model"] == "lead-model"
+
+
+@pytest.mark.asyncio
 async def test_offline_host_marks_every_member_host_offline(
     member_server: _MemberServer,
 ) -> None:
