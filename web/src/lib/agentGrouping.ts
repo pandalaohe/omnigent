@@ -39,6 +39,31 @@ export function isSdkAgent(agent: Pick<AvailableAgent, "name" | "harness">): boo
   return SDK_PRODUCT_AGENTS.get(agent.name) === agent.harness;
 }
 
+/** The vendor product mark an SDK harness runs, keyed by harness spelling. */
+export const SDK_HARNESS_ICON_KINDS: ReadonlyMap<string, "claude" | "codex"> = new Map([
+  ["claude-sdk", "claude"],
+  ["codex", "codex"],
+]);
+
+/**
+ * The vendor whose product mark an SDK row / trigger draws, or null when the
+ * agent is not an SDK product.
+ *
+ * A named agent must match the SDK product pair ({@link isSdkAgent}); an
+ * anonymous harness-only trigger (an `AgentMemberTrigger` icon, a session
+ * icon with no resolved agent name) is recognized by the harness spelling
+ * alone. A composed agent on an SDK harness (Polly) keeps its own identity.
+ *
+ * @param agent - Agent to classify (only `name` / `harness` are read).
+ */
+export function sdkProductVendor(
+  agent: Pick<AvailableAgent, "name" | "harness">,
+): "claude" | "codex" | null {
+  if (isSdkAgent(agent)) return agent.harness === "codex" ? "codex" : "claude";
+  if (!agent.name && agent.harness) return SDK_HARNESS_ICON_KINDS.get(agent.harness) ?? null;
+  return null;
+}
+
 // Fallback only: builtin ACP CLI harness ids for servers whose harness catalog
 // doesn't report `capabilities.integration_mode`. NOT the source of truth — a
 // new builtin ACP row needs no entry here, because `useAvailableAgents` stamps

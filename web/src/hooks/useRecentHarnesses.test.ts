@@ -1,7 +1,12 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useRecentHarnesses } from "./useRecentHarnesses";
+import {
+  RECENT_AGENTS_KEY,
+  RECENT_SDK_KEY,
+  useRecentHarnesses,
+  useRecentIds,
+} from "./useRecentHarnesses";
 
 const KEY = "omnigent:recent-harnesses";
 
@@ -90,5 +95,50 @@ describe("useRecentHarnesses", () => {
     // the promotion; only persistence is lost.
     act(() => result.current.addRecentHarness("pi-native"));
     expect(result.current.recentHarnesses).toEqual([]);
+  });
+});
+
+describe("useRecentIds (keyed)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps separate keys isolated, including their notifications", () => {
+    const sdk = renderHook(() => useRecentIds(RECENT_SDK_KEY));
+    const agents = renderHook(() => useRecentIds(RECENT_AGENTS_KEY));
+    const native = renderHook(() => useRecentHarnesses());
+
+    act(() => sdk.result.current.addRecentId("codex"));
+
+    expect(sdk.result.current.recentIds).toEqual(["codex"]);
+    expect(agents.result.current.recentIds).toEqual([]);
+    expect(native.result.current.recentHarnesses).toEqual([]);
+    expect(JSON.parse(localStorage.getItem(RECENT_SDK_KEY) ?? "[]")).toEqual(["codex"]);
+    expect(localStorage.getItem(RECENT_AGENTS_KEY)).toBeNull();
+    // The native key keeps its own storage spelling.
+    act(() => native.result.current.addRecentHarness("codex-native"));
+    expect(native.result.current.recentHarnesses).toEqual(["codex-native"]);
+    expect(sdk.result.current.recentIds).toEqual(["codex"]);
+  });
+
+  it("de-duplicates, caps at four, and ignores a malformed stored value", () => {
+    localStorage.setItem(RECENT_AGENTS_KEY, "{not json");
+    const { result } = renderHook(() => useRecentIds(RECENT_AGENTS_KEY));
+    expect(result.current.recentIds).toEqual([]);
+
+    for (const id of ["a", "b", "c", "d", "e"]) {
+      act(() => result.current.addRecentId(id));
+    }
+    expect(result.current.recentIds).toEqual(["e", "d", "c", "b"]);
+
+    act(() => result.current.addRecentId("c"));
+    expect(result.current.recentIds).toEqual(["c", "e", "d", "b"]);
+  });
+
+  it("reads non-string members out of a stored list instead of crashing", () => {
+    localStorage.setItem(RECENT_SDK_KEY, JSON.stringify(["codex", 7, null]));
+    const { result } = renderHook(() => useRecentIds(RECENT_SDK_KEY));
+    expect(result.current.recentIds).toEqual(["codex"]);
   });
 });

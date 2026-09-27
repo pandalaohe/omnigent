@@ -2606,6 +2606,16 @@ describe("Composer effort slash-command visibility", () => {
     expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
   });
 
+  it("draws the SDK mark before the vendor logo on an SDK session's config trigger", () => {
+    useChatStore.setState({ sessionHarness: "claude-sdk" });
+    render(<Composer {...composerProps({ isNativeWrapper: false })} />);
+    const trigger = screen.getByTestId("composer-config-gear");
+    const mark = within(trigger).getByTestId("sdk-mark");
+    const img = trigger.querySelector("img");
+    expect(img).toBeTruthy();
+    expect(mark.compareDocumentPosition(img!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("hides /compact for a non-native, non-claude-sdk session", () => {
     // Other in-process SDK harnesses (openai-agents) have no /compact path
     // yet, so the command stays hidden.

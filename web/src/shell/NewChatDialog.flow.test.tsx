@@ -1785,6 +1785,54 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("records an SDK launch under recent-sdk, not the native harness list", async () => {
+    setAgents([
+      agent({ id: "ag_codex_sdk", name: "codex-sdk", display_name: "Codex SDK", harness: "codex" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_codex_sdk" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    selectAgent("ag_codex_sdk");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    // The SDK group's own list, keyed by the harness id; the native list stays
+    // untouched so a recent SDK Codex can't promote native Codex.
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("omnigent:recent-sdk") ?? "[]")).toEqual(["codex"]),
+    );
+    expect(localStorage.getItem("omnigent:recent-harnesses")).toBeNull();
+  });
+
+  it("records a composed Agent launch under recent-agents", async () => {
+    setAgents([
+      agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" }),
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    selectAgent("ag_polly");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("omnigent:recent-agents") ?? "[]")).toEqual([
+        "ag_polly",
+      ]),
+    );
+    expect(localStorage.getItem("omnigent:recent-harnesses")).toBeNull();
+    expect(localStorage.getItem("omnigent:recent-sdk")).toBeNull();
+  });
+
   it("does not record a harness when the create fails", async () => {
     // Only a successful launch earns a primary slot — a failed create must not
     // promote the harness the user merely attempted.

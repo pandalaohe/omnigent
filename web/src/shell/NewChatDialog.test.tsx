@@ -105,6 +105,7 @@ import {
   readNewChatPickerOptionsCache,
   readNewChatWorkspaceCache,
 } from "@/lib/newChatPickerCache";
+import { writeAgentBadgePreferences } from "@/lib/agentBadgePreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { clearSessionDrafts } from "@/lib/sessionDrafts";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -5482,6 +5483,175 @@ describe("NewChatLandingScreen", () => {
     ]) {
       expect(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     }
+  });
+
+  /** The four rows involved in the Codex recents collision (scenario 18). */
+  function mockCodexCollisionAgents(): void {
+    mockAgents([
+      {
+        id: "a_native_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_native_codex",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [],
+      },
+      {
+        id: "a_codex_sdk",
+        name: "codex-sdk",
+        display_name: "Codex SDK",
+        description: null,
+        harness: "codex",
+        skills: [],
+      },
+      {
+        id: "a_claude_sdk",
+        name: "claude-sdk",
+        display_name: "Claude SDK",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+  }
+
+  function mockAllFourHarnessesReady(): void {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: {
+          "claude-native": true,
+          "codex-native": true,
+          "claude-sdk": true,
+          codex: true,
+        },
+      } as Host,
+    ]);
+  }
+
+  function follows(first: HTMLElement, second: HTMLElement): boolean {
+    return Boolean(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
+  }
+
+  it("keeps a recent SDK Codex out of the native Harnesses ranking", () => {
+    mockAllFourHarnessesReady();
+    mockCodexCollisionAgents();
+    // The bare `codex` id is the SDK harness; it must not alias onto native
+    // Codex's recentIndex (the pre-F0 collision).
+    localStorage.setItem("omnigent:recent-sdk", JSON.stringify(["codex"]));
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+
+    // Native recents are empty → the fixed order leads, unpromoted.
+    expect(
+      follows(
+        screen.getByTestId("new-chat-landing-agent-a_native_claude"),
+        screen.getByTestId("new-chat-landing-agent-a_native_codex"),
+      ),
+    ).toBe(true);
+    // The SDK group ranks its own list: Codex SDK first.
+    expect(
+      follows(
+        screen.getByTestId("new-chat-landing-agent-a_codex_sdk"),
+        screen.getByTestId("new-chat-landing-agent-a_claude_sdk"),
+      ),
+    ).toBe(true);
+  });
+
+  it("ranks each group from its own recents list", () => {
+    mockAllFourHarnessesReady();
+    mockCodexCollisionAgents();
+    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["codex-native"]));
+    localStorage.setItem("omnigent:recent-sdk", JSON.stringify(["claude-sdk"]));
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+
+    // Native: the recent Codex leads Claude Code.
+    expect(
+      follows(
+        screen.getByTestId("new-chat-landing-agent-a_native_codex"),
+        screen.getByTestId("new-chat-landing-agent-a_native_claude"),
+      ),
+    ).toBe(true);
+    // SDK: the recent Claude SDK flips the display order; the native Codex
+    // recent did not reach this group.
+    expect(
+      follows(
+        screen.getByTestId("new-chat-landing-agent-a_claude_sdk"),
+        screen.getByTestId("new-chat-landing-agent-a_codex_sdk"),
+      ),
+    ).toBe(true);
+  });
+
+  it("orders unpinned Agents by recent-agents before the standing order", () => {
+    const saved = (id: string, name: string): AvailableAgent => ({
+      id,
+      name,
+      display_name: name,
+      description: null,
+      harness: "claude-sdk",
+      skills: [],
+      builtin: false,
+    });
+    mockAgents([...DEFAULT_LANDING_AGENTS, saved("ca_alpha", "Alpha"), saved("ca_beta", "Beta")]);
+    // No pins → every Agent folds into "Other..."; Beta launched most recently.
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [] }));
+    localStorage.setItem("omnigent:recent-agents", JSON.stringify(["ca_beta"]));
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+
+    expect(
+      follows(
+        screen.getByTestId("new-chat-landing-agent-ca_beta"),
+        screen.getByTestId("new-chat-landing-agent-ca_alpha"),
+      ),
+    ).toBe(true);
+  });
+
+  it("draws the SDK mark before the vendor logo, yielding to a user badge", () => {
+    mockAllFourHarnessesReady();
+    mockCodexCollisionAgents();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const codex = screen.getByTestId("new-chat-landing-agent-a_codex_sdk");
+    const claude = screen.getByTestId("new-chat-landing-agent-a_claude_sdk");
+
+    expect(within(codex).getByTestId("sdk-mark")).toHaveClass(
+      "size-[17px]",
+      "text-muted-foreground",
+    );
+    expect(within(claude).getByTestId("sdk-mark")).toBeInTheDocument();
+    // The grey catalog glyph is replaced by the vendor product logo.
+    expect(decodeURIComponent(codex.querySelector("img")?.getAttribute("src") ?? "")).toContain(
+      "#B1A7FF",
+    );
+    expect(decodeURIComponent(claude.querySelector("img")?.getAttribute("src") ?? "")).toContain(
+      "M20.998 10.949H24v3.102",
+    );
+
+    // A user badge (MOD-s25) owns the slot: no mark, badge + vendor logo only.
+    closeMenu();
+    writeAgentBadgePreferences({
+      version: 1,
+      enabled: true,
+      entries: {
+        a_codex_sdk: { label: "研", borderColor: "#8b5cf6", textColor: "theme" },
+      },
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const badged = screen.getByTestId("new-chat-landing-agent-a_codex_sdk");
+    expect(within(badged).queryByTestId("sdk-mark")).toBeNull();
+    expect(within(badged).getByTestId("agent-badge")).toHaveTextContent("研");
+    expect(badged.querySelector("img")).toBeTruthy();
   });
 
   it("disables native rows on Windows while leaving the SDK row selectable", async () => {

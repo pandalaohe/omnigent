@@ -295,7 +295,12 @@ import { readLastCreatedWorkspace, writeLastCreatedWorkspace } from "@/lib/lastC
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
-import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
+import {
+  useRecentHarnesses,
+  useRecentIds,
+  RECENT_AGENTS_KEY,
+  RECENT_SDK_KEY,
+} from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -1500,6 +1505,11 @@ export function AgentHarnessPicker({
   const queryClient = useQueryClient();
   const info = useServerInfo();
   const { recentHarnesses } = useRecentHarnesses();
+  // The two Codex rows are ranked from separate lists: a recent native Codex
+  // must not promote the SDK row and vice versa (the bare `codex` id is the
+  // SDK harness, while native Codex stores `codex-native`).
+  const { recentIds: recentSdkHarnesses } = useRecentIds(RECENT_SDK_KEY);
+  const { recentIds: recentAgentIds } = useRecentIds(RECENT_AGENTS_KEY);
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
   // The badge is the Agent's optional visual identity; Smart Routing has no
@@ -1799,8 +1809,26 @@ export function AgentHarnessPicker({
     () => partitionAgentsByKind(agentEntries),
     [agentEntries],
   );
-  const sdkEntries = bundleEntries.filter(isSdkAgent);
-  const composedEntries = bundleEntries.filter((entry) => !isSdkAgent(entry));
+  const sdkEntries = useMemo(() => bundleEntries.filter(isSdkAgent), [bundleEntries]);
+  const composedEntries = useMemo(
+    () => bundleEntries.filter((entry) => !isSdkAgent(entry)),
+    [bundleEntries],
+  );
+  // SDK rows rank from `recent-sdk` alone, then fall back to the current
+  // display order. `hideUnconfigured` stays false: SDK membership never
+  // depends on the host, so an unreported harness keeps its row (with the
+  // usual readiness badge) instead of disappearing.
+  const rankedSdkEntries = useMemo(() => {
+    const { primary, more } = rankHarnessRows({
+      entries: sdkEntries,
+      host,
+      recentHarnesses: recentSdkHarnesses,
+      hideUnconfigured: false,
+      selectedId: effectiveAgentId,
+      promotedId: promotedHarnessId,
+    });
+    return [...primary, ...more];
+  }, [sdkEntries, host, recentSdkHarnesses, effectiveAgentId, promotedHarnessId]);
 
   // Split the Agents group by the user's pins: pinned Agents (Polly + Debby
   // by default) stay at the top level, in pin order; every other Agent folds
@@ -1814,14 +1842,24 @@ export function AgentHarnessPicker({
   const { pinnedEntries, otherEntries } = useMemo(() => {
     const pinnedIds = resolvePinnedAgentIds(pinnedAgentIds, pinCandidates);
     const pinned = new Set(pinnedIds);
+    const recentRank = new Map(recentAgentIds.map((id, index) => [id, index]));
     return {
       pinnedEntries: pinnedIds
         .map((id) => pinCandidates.find((agent) => agent.id === id))
         .filter((agent): agent is AvailableAgent => agent !== undefined),
-      // Keep the built-ins-then-customs order so the submenu stays predictable.
-      otherEntries: pinCandidates.filter((agent) => !pinned.has(agent.id)),
+      // Unpinned Agents: most recently launched first, then the current
+      // built-ins-then-customs order for anything never launched (a stable
+      // sort keeps ties in their incoming order). Host-first ordering needs
+      // the member host, which arrives with F2a.
+      otherEntries: pinCandidates
+        .filter((agent) => !pinned.has(agent.id))
+        .sort(
+          (first, second) =>
+            (recentRank.get(first.id) ?? Number.POSITIVE_INFINITY) -
+            (recentRank.get(second.id) ?? Number.POSITIVE_INFINITY),
+        ),
     };
-  }, [pinnedAgentIds, pinCandidates]);
+  }, [pinnedAgentIds, pinCandidates, recentAgentIds]);
 
   // "Create custom agent" is reachable on any non-sandbox target (a managed
   // sandbox has no create path for an uploaded bundle), unless the embedder
@@ -1915,7 +1953,11 @@ export function AgentHarnessPicker({
       {visibleCachedPreview.smartRouting ? (
         <WandSparklesIcon className="size-4" aria-hidden="true" />
       ) : (
-        <ComposerAgentIcon agent={visibleCachedPreview.agent} />
+        // The id lets the SDK mark yield to a user badge set on this row's
+        // Agent (MOD-s25).
+        <ComposerAgentIcon
+          agent={{ ...visibleCachedPreview.agent, id: effectiveAgentId ?? undefined }}
+        />
       )}
     </span>
   ) : (
@@ -2119,10 +2161,10 @@ export function AgentHarnessPicker({
               <DropdownMenuSeparator />
             </>
           )}
-          {sdkEntries.length > 0 && (
+          {rankedSdkEntries.length > 0 && (
             <>
               <PickerSectionHeader>SDK</PickerSectionHeader>
-              {sdkEntries.map((agent) => renderEntry(agent, "agent"))}
+              {rankedSdkEntries.map((agent) => renderEntry(agent, "agent"))}
             </>
           )}
           {/* Agents group — the pinned Agents (Polly / Debby by default). */}
@@ -2854,6 +2896,8 @@ export function NewChatLandingScreen() {
     [selectedHostId],
   );
   const { addRecentHarness } = useRecentHarnesses();
+  const { addRecentId: addRecentSdkHarness } = useRecentIds(RECENT_SDK_KEY);
+  const { addRecentId: addRecentAgent } = useRecentIds(RECENT_AGENTS_KEY);
 
   const allHosts = hosts ?? [];
   const onlineHosts = allHosts.filter((h) => h.status === "online");
@@ -6149,7 +6193,18 @@ export function NewChatLandingScreen() {
       }
       const launchedHarness =
         selectedNativeHarness ?? (isAcpHarnessAgent(selectedAgent) ? selectedAgent?.harness : null);
-      if (launchedHarness) addRecentHarness(launchedHarness);
+      if (launchedHarness) {
+        addRecentHarness(launchedHarness);
+      } else if (selectedAgent && isSdkAgent(selectedAgent)) {
+        // The standalone SDK products rank their own list, keyed by their
+        // harness id (`claude-sdk` / `codex`) so the native Codex recents stay
+        // untouched.
+        if (selectedAgent.harness) addRecentSdkHarness(selectedAgent.harness);
+      } else if (selectedAgent && selectedAgent.id !== PENDING_AGENT_ID) {
+        // A composed built-in or saved Agent: the Agents group ranks by the id
+        // the picker addresses it by. A pending upload has no stable id yet.
+        addRecentAgent(selectedAgent.id);
+      }
       // SDK invocations resolve on the runner after create; native CLIs
       // receive plain text. An inline attachment makes the prompt more than
       // its text, so a skill match on that text would drop the files.

@@ -128,7 +128,7 @@ export function AgentMemberTrigger({
         label: [harnessLabel, modelLabel, effortLabel].filter(Boolean).join(" · "),
         model: modelLabel,
         effort: effortLabel,
-        icon: <ComposerAgentIcon agent={{ name: "", harness }} />,
+        icon: <ComposerAgentIcon agent={{ name: "", harness }} sdkMarkClassName="size-[15px]" />,
         testIdPrefix: "agent-member",
         disabled,
         "data-testid": "agent-member-trigger",
