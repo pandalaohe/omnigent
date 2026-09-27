@@ -39,11 +39,13 @@ import {
   CloudOffIcon,
   CodeIcon,
   Columns2Icon,
+  CopyIcon,
   DownloadIcon,
   EyeIcon,
   EyeOffIcon,
   FileDiffIcon,
   Link2Icon,
+  Link2OffIcon,
   ListIcon,
   Loader2Icon,
   MessageSquareTextIcon,
@@ -78,6 +80,10 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { useFileDiff } from "@/hooks/useFileDiff";
+import { mintArtifactLink } from "@/hooks/useArtifactLink";
+import { authenticatedFetch } from "@/lib/identity";
+import { withBasePath } from "@/lib/basePath";
+import { hasOmnigentHostFetcher } from "@/lib/host";
 import {
   type Comment,
   useAddComment,
@@ -109,6 +115,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { draftSelection, getCommentDraft } from "./commentDrafts";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -360,6 +367,9 @@ function FileViewerBody({
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
+  // Embed hosts carry API calls through a fetcher that an iframe `src` or a
+  // top-level artifact URL cannot travel; those surfaces stay on srcdoc.
+  const isEmbed = hasOmnigentHostFetcher();
   const [searchParams, setSearchParams] = useSearchParams();
   const isMobile = useIsMobileViewport();
   const ownsUrl = viewport === undefined || (viewport === "mobile") === isMobile;
@@ -414,15 +424,25 @@ function FileViewerBody({
   // comment thread — and fall back to the opened file when no frame is up.
   const [frame, setFrame] = useState<{ path: string; source: string } | null>(null);
   const commentPath = frame?.path ?? path;
+  // Latest page for post settlement: by the time a request lands, an in-frame
+  // navigation may already have pointed the viewer at another page.
+  const commentPathRef = useRef(commentPath);
+  commentPathRef.current = commentPath;
   const commentsQuery = useComments(conversationId, commentPath);
   const addComment = useAddComment(conversationId);
   const updateComment = useUpdateComment(conversationId);
   const deleteComment = useDeleteComment(conversationId);
   const commentsInitializedRef = useRef(false);
   const linkedCommentAppliedRef = useRef(false);
-  const viewModeInitializedRef = useRef(false);
+  // Last (path, viewMode) the mode-change effect saw, so it can tell an explicit
+  // mode switch from a mode that only changed because the viewed file did.
+  const prevViewModeRef = useRef<{ path: string; viewMode: string } | null>(null);
   const prevOpenRef = useRef(open);
   const [activeSelection, setActiveSelection] = useState<ActiveSelection | null>(null);
+  // Latest selection for post settlement: the user may pick another range while
+  // the request is in flight, and its resolution must not dismiss that range.
+  const activeSelectionRef = useRef(activeSelection);
+  activeSelectionRef.current = activeSelection;
   // Measured width of the code/diff content area. Drives whether the
   // split/unified toggle is offered: split is only usable at >= the Monaco
   // breakpoint, so below it we hide the toggle to avoid a no-op control.
@@ -450,9 +470,14 @@ function FileViewerBody({
   // Auto-save lifecycle reported up from the Monaco editor, shown as a status
   // chip in the toolbar (the editor itself no longer has a Save button).
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
-  // Brief "copied" feedback for the copy-link button.
+  // Brief "copied" feedback for the copy-link buttons.
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
+  const [fileLinkCopied, setFileLinkCopied] = useState(false);
+  const fileLinkCopiedTimerRef = useRef<number>(0);
+  // Bumped on revoke so the HTML preview remounts and mints a fresh link.
+  const [previewKey, setPreviewKey] = useState(0);
+  const [revokeOpen, setRevokeOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<{
     apply: () => void;
     cancel?: () => void;
@@ -468,10 +493,12 @@ function FileViewerBody({
     setTocOpen(false);
   }, [path, handleDirtyChange]);
   // A selection belongs to one page; the preview frame reporting a different
-  // page (in-frame navigation) invalidates it.
+  // page (in-frame navigation) invalidates it. Returning to a page that has an
+  // unsent draft restores its anchor so the composer shows that draft.
   useEffect(() => {
-    setActiveSelection(null);
-  }, [commentPath]);
+    const draft = getCommentDraft(conversationId, commentPath);
+    setActiveSelection(draft ? draftSelection(draft) : null);
+  }, [conversationId, commentPath]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
   // When navigating via < > arrows (path changes while already open), the
@@ -528,6 +555,7 @@ function FileViewerBody({
   useEffect(
     () => () => {
       window.clearTimeout(linkCopiedTimerRef.current);
+      window.clearTimeout(fileLinkCopiedTimerRef.current);
     },
     [],
   );
@@ -536,19 +564,90 @@ function FileViewerBody({
     downloadWorkspaceFile(conversationId, path).catch(() => toast.error("Download failed"));
   }, [conversationId, path]);
 
-  // Pop the HTML artifact into its own browser tab. The artifact is rendered in
-  // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
-  // stays isolated from the host app — full-window rendering, no origin sharing.
+  // Pop the HTML artifact into its own browser tab, full-window. Standalone this
+  // is the raw-view artifact URL (an opaque origin via the response's CSP
+  // sandbox); embed mode keeps the srcdoc shell (see openHtmlArtifactInNewTab).
   const openHtmlInNewTab = useCallback(() => {
-    const data = fileQuery.data;
-    if (!data) return;
-    const opened = openHtmlArtifactInNewTab(data.content, path.split("/").pop() ?? path);
-    if (!opened) {
-      // window.open returned null — almost always a popup blocker. There's no
-      // toast surface here, so log it rather than failing silently.
-      console.warn("Open in new tab: the browser blocked the popup window.");
+    if (isEmbed) {
+      const data = fileQuery.data;
+      if (!data) return;
+      const opened = openHtmlArtifactInNewTab(data.content, path.split("/").pop() ?? path);
+      if (!opened) {
+        // window.open returned null — almost always a popup blocker. There's no
+        // toast surface here, so log it rather than failing silently.
+        console.warn("Open in new tab: the browser blocked the popup window.");
+      }
+      return;
     }
-  }, [fileQuery.data, path]);
+    // Open the tab synchronously so the click keeps its popup privilege; the
+    // async mint below would otherwise be treated as a scripted popup.
+    const win = window.open("about:blank", "_blank");
+    if (!win) {
+      console.warn("Open in new tab: the browser blocked the popup window.");
+      return;
+    }
+    win.opener = null;
+    mintArtifactLink(conversationId, { path, view: "raw" }).then(
+      (artifact) => {
+        win.location.href = window.location.origin + withBasePath(artifact.url);
+      },
+      () => {
+        win.close();
+        toast.error("Failed to open in new tab");
+      },
+    );
+  }, [conversationId, fileQuery.data, isEmbed, path]);
+
+  // Copy the standalone artifact URL — a capability link to the file's bytes,
+  // independent of the viewer's own URL. Standalone-only: embed mode's API
+  // transport does not reach the artifact route.
+  const copyArtifactLink = useCallback(() => {
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
+    mintArtifactLink(conversationId, { path, view: "raw" }).then(
+      (artifact) => {
+        navigator.clipboard.writeText(window.location.origin + withBasePath(artifact.url)).then(
+          () => {
+            setFileLinkCopied(true);
+            window.clearTimeout(fileLinkCopiedTimerRef.current);
+            fileLinkCopiedTimerRef.current = window.setTimeout(
+              () => setFileLinkCopied(false),
+              2000,
+            );
+          },
+          (err) => {
+            console.warn("Failed to copy file link", err);
+            toast.error("Failed to copy file link");
+          },
+        );
+      },
+      (err) => {
+        console.warn("Failed to mint file link", err);
+        toast.error("Failed to copy file link");
+      },
+    );
+  }, [conversationId, path]);
+
+  // Revoke every artifact link for this session (rotates the session key
+  // server-side), then remount the preview so it mints a fresh link.
+  const revokeLinks = useCallback(() => {
+    setRevokeOpen(false);
+    authenticatedFetch(`/v1/sessions/${encodeURIComponent(conversationId)}/artifacts/revoke`, {
+      method: "POST",
+    }).then(
+      (res) => {
+        if (res.status !== 204) {
+          toast.error("Failed to revoke links");
+          return;
+        }
+        toast.success("Links revoked");
+        setPreviewKey((key) => key + 1);
+      },
+      (err) => {
+        console.warn("Failed to revoke links", err);
+        toast.error("Failed to revoke links");
+      },
+    );
+  }, [conversationId]);
 
   const copyFileLink = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
@@ -940,13 +1039,20 @@ function FileViewerBody({
     contentWidth === null || contentWidth === 0 || contentWidth >= MONACO_SPLIT_BREAKPOINT;
   useEffect(() => {
     if (viewMode !== "editor") handleDirtyChange(false);
-    // Skip on mount — only clear when the user actively switches modes.
-    // Clearing on mount would race with the linked-comment effect.
-    if (viewModeInitializedRef.current && (viewMode === "editor" || viewMode === "preview")) {
+    // Only an explicit switch on the same file clears the selection; a mode
+    // change that came with file navigation must not undo a restored draft
+    // anchor, and skipping on mount avoids racing the linked-comment effect.
+    const prev = prevViewModeRef.current;
+    if (
+      prev &&
+      prev.path === path &&
+      prev.viewMode !== viewMode &&
+      (viewMode === "editor" || viewMode === "preview")
+    ) {
       setActiveSelection(null);
     }
-    viewModeInitializedRef.current = true;
-  }, [viewMode, handleDirtyChange]);
+    prevViewModeRef.current = { path, viewMode };
+  }, [path, viewMode, handleDirtyChange]);
 
   // Sync diff state to URL. Skip when already in sync to avoid clobbering ?file=
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
@@ -1182,6 +1288,17 @@ function FileViewerBody({
       onSelect: downloadFile,
     });
   }
+  // Standalone only: the revoke route lives behind the same API transport the
+  // embed fetcher would have to carry, and read-only viewers get a 403 anyway.
+  if (!isEmbed && canEdit) {
+    settingsMenu.push({
+      key: "revoke-links",
+      label: "Revoke links",
+      icon: <Link2OffIcon className="size-4" />,
+      active: false,
+      onSelect: () => setRevokeOpen(true),
+    });
+  }
   if (viewMode === "diff") {
     settingsMenu.push({
       key: "wrap-lines",
@@ -1221,6 +1338,21 @@ function FileViewerBody({
     ),
     onSelect: copyFileLink,
   });
+  // The artifact URL is a different link from the app's own file deep link
+  // above: it serves the file's bytes and dies on revoke.
+  if (!isEmbed) {
+    toolbarActions.push({
+      key: "copy-file-link",
+      label: "Copy file link",
+      tooltip: fileLinkCopied ? "Copied!" : "Copy file link",
+      icon: fileLinkCopied ? (
+        <CheckIcon className="size-4 text-green-500" />
+      ) : (
+        <CopyIcon className="size-4" />
+      ),
+      onSelect: copyArtifactLink,
+    });
+  }
 
   const showNavButtons = currentNavIdx !== -1 && navigableFiles.length > 1 && !!onNavigateTo;
   const {
@@ -1661,6 +1793,7 @@ function FileViewerBody({
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
               onFrameChange={setFrame}
+              previewKey={previewKey}
             />
           )}
         </div>
@@ -1670,19 +1803,32 @@ function FileViewerBody({
             addressedComments={addressedComments}
             activeSelection={activeSelection}
             pendingBodyRef={pendingBodyRef}
+            conversationId={conversationId}
+            commentPath={commentPath}
             onCopyCommentLink={copyCommentLink}
-            onAddComment={(body) => {
-              if (activeSelection == null) return;
-              addComment.mutate(
-                {
-                  path: commentPath,
-                  start_index: activeSelection.start_index,
-                  end_index: activeSelection.end_index,
-                  body,
-                  anchor_content: activeSelection.anchor_content,
-                },
-                { onSuccess: () => setActiveSelection(null) },
-              );
+            onAddComment={async (body) => {
+              const selection = activeSelection;
+              if (selection == null) return;
+              // Reject to the panel on failure so it keeps the draft for retry.
+              await addComment.mutateAsync({
+                path: commentPath,
+                start_index: selection.start_index,
+                end_index: selection.end_index,
+                body,
+                anchor_content: selection.anchor_content,
+              });
+              // Dismiss only the selection this post came from; a selection the
+              // user picked while the post was pending must survive it.
+              const current = activeSelectionRef.current;
+              if (
+                current != null &&
+                commentPathRef.current === commentPath &&
+                current.start_index === selection.start_index &&
+                current.end_index === selection.end_index &&
+                current.anchor_content === selection.anchor_content
+              ) {
+                setActiveSelection(null);
+              }
             }}
             canAddress={canEdit && sender !== null}
             onAddressAll={() => {
@@ -1762,6 +1908,21 @@ function FileViewerBody({
               }}
             >
               Discard changes
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={revokeOpen} onOpenChange={setRevokeOpen}>
+        <DialogContent showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>Revoke links?</DialogTitle>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRevokeOpen(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={revokeLinks}>
+              Revoke
             </Button>
           </DialogFooter>
         </DialogContent>

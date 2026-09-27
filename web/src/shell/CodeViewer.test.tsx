@@ -88,22 +88,25 @@ function makePdfQuery(
 
 const noopRef = { current: null };
 
-function renderViewer(
+interface RenderViewerOpts {
+  viewMode?: "editor" | "preview" | "source" | "diff";
+  truncated?: boolean;
+  position?: { line: number };
+  onRequestEditMode?: () => void;
+  previewKey?: number;
+}
+
+function viewerElement(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: {
-    viewMode?: "editor" | "preview" | "source" | "diff";
-    truncated?: boolean;
-    position?: { line: number };
-    onRequestEditMode?: () => void;
-  } = {},
+  opts: RenderViewerOpts = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
-  return render(
+  return (
     <CodeViewer
       position={opts.position}
       conversationId="conv_1"
@@ -118,8 +121,18 @@ function renderViewer(
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
-    />,
+      previewKey={opts.previewKey}
+    />
   );
+}
+
+function renderViewer(
+  content: string,
+  panelOpen = true,
+  path = "notes.md",
+  opts: RenderViewerOpts = {},
+) {
+  return render(viewerElement(content, panelOpen, path, opts));
 }
 
 /**
@@ -710,6 +723,26 @@ describe("CodeViewer HTML preview sandbox", () => {
     // client-injected srcdoc the standalone path used before the relay.
     expect(iframe.getAttribute("src")).toBe(MINT_URL);
     expect(iframe.getAttribute("srcdoc")).toBeNull();
+  });
+
+  it("mounts the preview afresh (and re-mints) when previewKey changes", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    const mintCalls = () =>
+      fetchSpy.mock.calls.filter(([input]) => String(input).endsWith("/artifacts")).length;
+
+    const { rerender } = renderViewer("<html></html>", true, "page.html", {
+      viewMode: "preview",
+      previewKey: 0,
+    });
+    await screen.findByTitle("HTML preview");
+    expect(mintCalls()).toBe(1);
+
+    // A bumped previewKey (revoke) must replace the preview component, not
+    // just re-render it — only a remount re-runs the entry mint.
+    rerender(
+      viewerElement("<html></html>", true, "page.html", { viewMode: "preview", previewKey: 1 }),
+    );
+    await waitFor(() => expect(mintCalls()).toBe(2));
   });
 });
 

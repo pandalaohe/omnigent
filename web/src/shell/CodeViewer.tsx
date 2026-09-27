@@ -444,6 +444,11 @@ export interface CodeViewerProps {
    * preview surface goes away).
    */
   onFrameChange?: (frame: { path: string; source: string } | null) => void;
+  /**
+   * Remounts the HTML preview when bumped, so it mints a fresh artifact link
+   * (e.g. after the user revokes links).
+   */
+  previewKey?: number;
 }
 
 export function CodeViewer({
@@ -467,6 +472,7 @@ export function CodeViewer({
   onTocToggle,
   onRequestEditMode,
   onFrameChange,
+  previewKey,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -849,6 +855,7 @@ export function CodeViewer({
   if (viewMode === "preview" && lang === "html") {
     return (
       <HtmlCommentViewer
+        key={previewKey}
         conversationId={conversationId}
         path={path}
         content={content}

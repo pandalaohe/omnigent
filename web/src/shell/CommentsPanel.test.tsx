@@ -6,12 +6,13 @@
 //   3. Link button appears for addressed comments too (after switching the tab).
 //   4. No link button is rendered when onCopyCommentLink is omitted.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { CommentsPanel } from "./CommentsPanel";
+import { clearCommentDraft, getCommentDraft } from "./commentDrafts";
 
 // CommentsPanel reads the current user's identity (getCurrentAuthorId) to
 // decide whose comments expose Edit/Delete. Mock it so author-ownership tests
@@ -556,5 +557,177 @@ describe("CommentsPanel active-comment reveal", () => {
     fireEvent.click(screen.getByText("Comment c2"));
 
     expect(onClickComment).toHaveBeenCalledWith(addressed);
+  });
+});
+
+// ── Unsent drafts per page ──────────────────────────────────────────────────
+//
+// The composer's unsent body is kept per (conversation, page), so switching
+// files — including an agent-driven switch — leaves it recoverable on return.
+// Posting the comment drops it.
+
+describe("CommentsPanel unsent drafts", () => {
+  const SELECTION: ActiveSelection = {
+    start_index: 10,
+    end_index: 20,
+    anchor_content: "selected text",
+  };
+
+  function draftablePanel(props: {
+    path: string;
+    selection: ActiveSelection | null;
+    onAddComment?: (body: string) => void | Promise<void>;
+  }) {
+    return (
+      <CommentsPanel
+        comments={[]}
+        addressedComments={[]}
+        activeSelection={props.selection}
+        onAddComment={props.onAddComment ?? vi.fn()}
+        onAddressAll={vi.fn()}
+        onEditComment={vi.fn()}
+        onDeleteComment={vi.fn()}
+        onClickComment={vi.fn()}
+        canAddress={false}
+        addressPending={false}
+        conversationId="conv_1"
+        commentPath={props.path}
+      />
+    );
+  }
+
+  it("restores an unsent draft when its page comes back", () => {
+    const { rerender } = render(draftablePanel({ path: "a.html", selection: SELECTION }));
+    fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {
+      target: { value: "draft on A" },
+    });
+
+    // The viewer switches to another page, then back to the drafted one.
+    rerender(draftablePanel({ path: "b.html", selection: null }));
+    rerender(draftablePanel({ path: "a.html", selection: SELECTION }));
+
+    expect(screen.getByPlaceholderText("Add a comment…")).toHaveValue("draft on A");
+    clearCommentDraft("conv_1", "a.html");
+  });
+
+  it("clears the draft when the comment is posted", () => {
+    const { rerender } = render(draftablePanel({ path: "a.html", selection: SELECTION }));
+    fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {
+      target: { value: "to post" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add Comment" }));
+
+    rerender(draftablePanel({ path: "b.html", selection: null }));
+    rerender(draftablePanel({ path: "a.html", selection: SELECTION }));
+
+    expect(screen.getByPlaceholderText("Add a comment…")).toHaveValue("");
+  });
+
+  it("does not restore a draft onto a different selection with the same offsets", () => {
+    const { rerender } = render(draftablePanel({ path: "a.html", selection: SELECTION }));
+    fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {
+      target: { value: "draft on selected text" },
+    });
+
+    // Same page, same offsets, different selected text: the draft belongs to
+    // the other selection and must not leak into this composer.
+    rerender(
+      draftablePanel({
+        path: "a.html",
+        selection: { ...SELECTION, anchor_content: "different text" },
+      }),
+    );
+
+    expect(screen.getByPlaceholderText("Add a comment…")).toHaveValue("");
+    clearCommentDraft("conv_1", "a.html");
+  });
+
+  it("keeps the draft when the post is rejected", async () => {
+    const onAddComment = vi.fn(() => Promise.reject(new Error("post failed")));
+    const { rerender } = render(
+      draftablePanel({ path: "a.html", selection: SELECTION, onAddComment }),
+    );
+    fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {
+      target: { value: "keep me" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add Comment" }));
+    await waitFor(() => expect(onAddComment).toHaveBeenCalledWith("keep me"));
+
+    rerender(draftablePanel({ path: "b.html", selection: null, onAddComment }));
+    rerender(draftablePanel({ path: "a.html", selection: SELECTION, onAddComment }));
+
+    expect(screen.getByPlaceholderText("Add a comment…")).toHaveValue("keep me");
+    clearCommentDraft("conv_1", "a.html");
+  });
+
+  it("sends once while a post is pending and puts the text back on rejection", async () => {
+    let rejectPost!: (err: Error) => void;
+    const onAddComment = vi.fn(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectPost = reject;
+        }),
+    );
+    render(draftablePanel({ path: "a.html", selection: SELECTION, onAddComment }));
+    const composer = screen.getByPlaceholderText("Add a comment…");
+    fireEvent.change(composer, { target: { value: "keep me" } });
+
+    // Enter and the button both send once; the emptied composer has nothing
+    // left for a second send while the first post is still in flight.
+    fireEvent.keyDown(composer, { key: "Enter" });
+    expect(onAddComment).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(composer, { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Add Comment" }));
+    expect(onAddComment).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      rejectPost(new Error("post failed"));
+    });
+
+    // The rejected text returns to the composer, and the draft stays stored.
+    expect(composer).toHaveValue("keep me");
+    expect(getCommentDraft("conv_1", "a.html")).toEqual({ ...SELECTION, body: "keep me" });
+    clearCommentDraft("conv_1", "a.html");
+  });
+
+  it("keeps a newer draft when an earlier post resolves late", async () => {
+    let resolvePost!: () => void;
+    const onAddComment = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePost = resolve;
+        }),
+    );
+    const { rerender } = render(
+      draftablePanel({ path: "a.html", selection: SELECTION, onAddComment }),
+    );
+    fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {
+      target: { value: "first" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add Comment" }));
+    expect(onAddComment).toHaveBeenCalledWith("first");
+
+    // The user moves to another range and types while the first post is pending.
+    const NEWER_SELECTION: ActiveSelection = {
+      start_index: 40,
+      end_index: 50,
+      anchor_content: "other text",
+    };
+    rerender(draftablePanel({ path: "a.html", selection: NEWER_SELECTION, onAddComment }));
+    fireEvent.change(screen.getByPlaceholderText("Add a comment…"), {
+      target: { value: "newer draft" },
+    });
+
+    await act(async () => {
+      resolvePost();
+    });
+
+    // The late success leaves both the newer draft and its stored copy alone.
+    expect(screen.getByPlaceholderText("Add a comment…")).toHaveValue("newer draft");
+    expect(getCommentDraft("conv_1", "a.html")).toEqual({
+      ...NEWER_SELECTION,
+      body: "newer draft",
+    });
+    clearCommentDraft("conv_1", "a.html");
   });
 });

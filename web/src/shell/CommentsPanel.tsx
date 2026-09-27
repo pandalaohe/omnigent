@@ -7,6 +7,7 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
+import { clearCommentDraft, getCommentDraft, setCommentDraft } from "./commentDrafts";
 import { displayAnchorContent } from "./pdfCommentHelpers";
 
 function avatarStyle(name: string): { backgroundColor: string; color: string } {
@@ -37,7 +38,8 @@ export interface CommentsPanelProps {
   comments: Comment[];
   addressedComments: Comment[];
   activeSelection: ActiveSelection | null;
-  onAddComment: (body: string) => void;
+  /** A returned promise delays the composer/draft clear until the post lands. */
+  onAddComment: (body: string) => void | Promise<void>;
   onAddressAll: () => void;
   onEditComment: (id: string, body: string) => void;
   onDeleteComment: (id: string) => void;
@@ -64,12 +66,26 @@ export interface CommentsPanelProps {
    * a draft before deciding to clear the pending mark on click-away.
    */
   pendingBodyRef?: RefObject<string>;
+  /** Conversation owning the page; with `commentPath`, keys the unsent draft. */
+  conversationId?: string;
+  /** Page the comments (and any unsent draft) belong to. */
+  commentPath?: string;
   /** Fixed wall clock for deterministic embeds and tests. Defaults to now. */
   now?: Date;
 }
 
 type Tab = "open" | "addressed";
 const TABS: Tab[] = ["open", "addressed"];
+
+/** Add-comment composer anchor and body, keyed the way a stored draft is. */
+interface ComposerSnapshot {
+  conversationId?: string;
+  commentPath?: string;
+  start_index?: number;
+  end_index?: number;
+  anchor_content: string;
+  body: string;
+}
 
 export function CommentsPanel({
   comments,
@@ -84,6 +100,8 @@ export function CommentsPanel({
   addressPending,
   canEdit = true,
   pendingBodyRef,
+  conversationId,
+  commentPath,
   onCopyCommentLink,
   now,
 }: CommentsPanelProps) {
@@ -105,12 +123,111 @@ export function CommentsPanel({
     canEdit && (c.created_by == null || c.created_by === currentAuthorId);
   const activeSelectionStart = activeSelection?.start_index;
   const activeSelectionEnd = activeSelection?.end_index;
+  const activeAnchorContent = activeSelection?.anchor_content ?? "";
   const activeCommentId = activeSelection?.comment_id;
 
+  // An unsent draft follows its page and its anchor: switching files clears the
+  // composer, and returning restores the body only against the selection it was
+  // typed on — offsets alone can collide across different HTML selections.
   useEffect(() => {
+    const draft =
+      conversationId && commentPath ? getCommentDraft(conversationId, commentPath) : undefined;
+    const restored =
+      activeCommentId == null &&
+      draft &&
+      draft.start_index === activeSelectionStart &&
+      draft.end_index === activeSelectionEnd &&
+      draft.anchor_content === activeAnchorContent
+        ? draft.body
+        : "";
+    setBody(restored);
+    if (pendingBodyRef) pendingBodyRef.current = restored;
+  }, [
+    activeSelectionStart,
+    activeSelectionEnd,
+    activeAnchorContent,
+    activeCommentId,
+    pendingBodyRef,
+    conversationId,
+    commentPath,
+  ]);
+
+  const persistDraft = (text: string) => {
+    if (!conversationId || !commentPath) return;
+    if (activeSelectionStart == null || activeSelectionEnd == null) return;
+    setCommentDraft(conversationId, commentPath, {
+      start_index: activeSelectionStart,
+      end_index: activeSelectionEnd,
+      anchor_content: activeSelection?.anchor_content ?? "",
+      body: text,
+    });
+  };
+
+  // A post settles after the composer may have moved on, so the settlement
+  // reads the live composer from this ref rather than the submit closure.
+  const composerSnapshot = (): ComposerSnapshot => ({
+    conversationId,
+    commentPath,
+    start_index: activeSelectionStart,
+    end_index: activeSelectionEnd,
+    anchor_content: activeAnchorContent,
+    body,
+  });
+  const composerRef = useRef<ComposerSnapshot>(composerSnapshot());
+  composerRef.current = composerSnapshot();
+
+  // Delete the stored draft only while it is still the one the post sent; a
+  // draft typed while the post was in flight belongs to the user.
+  const clearPostedDraft = (posted: ComposerSnapshot) => {
+    if (!posted.conversationId || !posted.commentPath) return;
+    const stored = getCommentDraft(posted.conversationId, posted.commentPath);
+    if (
+      stored &&
+      stored.start_index === posted.start_index &&
+      stored.end_index === posted.end_index &&
+      stored.anchor_content === posted.anchor_content &&
+      stored.body.trim() === posted.body
+    ) {
+      clearCommentDraft(posted.conversationId, posted.commentPath);
+    }
+  };
+
+  // A rejected post returns its text to the composer only while the composer is
+  // still the same, empty one; otherwise the stored draft restores it on return.
+  const restoreRejectedDraft = (text: string, posted: ComposerSnapshot) => {
+    const current = composerRef.current;
+    if (
+      current.conversationId !== posted.conversationId ||
+      current.commentPath !== posted.commentPath ||
+      current.start_index !== posted.start_index ||
+      current.end_index !== posted.end_index ||
+      current.anchor_content !== posted.anchor_content ||
+      current.body.trim() !== ""
+    ) {
+      return;
+    }
+    setBody(text);
+    if (pendingBodyRef) pendingBodyRef.current = text;
+  };
+
+  // Submitting clears the composer before the post lands, so nothing is left to
+  // send twice; the stored draft survives until the post settles.
+  const submitComment = () => {
+    const text = body.trim();
+    if (!text) return;
+    const posted = { ...composerSnapshot(), body: text };
+    const result = onAddComment(text);
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
-  }, [activeSelectionStart, activeSelectionEnd, activeCommentId, pendingBodyRef]);
+    if (result && typeof result.then === "function") {
+      void result.then(
+        () => clearPostedDraft(posted),
+        () => restoreRejectedDraft(text, posted),
+      );
+      return;
+    }
+    clearPostedDraft(posted);
+  };
 
   // Auto-focus the textarea when a new pending selection appears (no existing
   // comment at that range) so the user can start typing immediately.
@@ -253,13 +370,12 @@ export function CommentsPanel({
                 onChange={(e) => {
                   setBody(e.target.value);
                   if (pendingBodyRef) pendingBodyRef.current = e.target.value;
+                  persistDraft(e.target.value);
                 }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey && body.trim()) {
                     e.preventDefault();
-                    onAddComment(body.trim());
-                    setBody("");
-                    if (pendingBodyRef) pendingBodyRef.current = "";
+                    submitComment();
                   }
                 }}
               />
@@ -268,11 +384,7 @@ export function CommentsPanel({
                 size="xs"
                 className="w-full"
                 disabled={!body.trim()}
-                onClick={() => {
-                  onAddComment(body.trim());
-                  setBody("");
-                  if (pendingBodyRef) pendingBodyRef.current = "";
-                }}
+                onClick={submitComment}
               >
                 Add Comment
               </Button>

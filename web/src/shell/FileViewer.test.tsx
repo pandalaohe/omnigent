@@ -23,7 +23,7 @@ import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
 
 const codeViewerRenders = vi.hoisted(() => vi.fn());
-const addCommentMutate = vi.hoisted(() => vi.fn());
+const addCommentMutateAsync = vi.hoisted(() => vi.fn());
 
 // ── Mock heavy child components ───────────────────────────────────────────────
 
@@ -32,6 +32,8 @@ vi.mock("./CodeViewer", () => ({
   // routed to (preview / editor / source) without mounting the real viewer.
   // The "make dirty" button lets a test drive the editor's unsaved-edits signal
   // (onDirtyChange) so the mode-switch / navigation guard can be exercised.
+  // `data-preview-key` exposes the revoke counter; the keyed remount of the
+  // preview is asserted against the real CodeViewer in CodeViewer.test.tsx.
   CodeViewer: ({
     path,
     position,
@@ -40,6 +42,7 @@ vi.mock("./CodeViewer", () => ({
     onDirtyChange,
     onSetActiveSelection,
     onFrameChange,
+    previewKey,
   }: {
     path: string;
     position?: { line: number };
@@ -52,6 +55,7 @@ vi.mock("./CodeViewer", () => ({
       anchor_content: string;
     }) => void;
     onFrameChange?: (frame: { path: string; source: string } | null) => void;
+    previewKey?: number;
   }) => {
     codeViewerRenders({ path, position });
     return (
@@ -59,6 +63,7 @@ vi.mock("./CodeViewer", () => ({
         data-testid="code-viewer"
         data-view-mode={viewMode}
         data-search-open={String(!!searchOpen)}
+        data-preview-key={String(previewKey ?? "")}
       >
         <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
         <button
@@ -73,6 +78,13 @@ vi.mock("./CodeViewer", () => ({
           aria-label="select text"
           onClick={() =>
             onSetActiveSelection?.({ start_index: 0, end_index: 4, anchor_content: "page" })
+          }
+        />
+        <button
+          type="button"
+          aria-label="select other text"
+          onClick={() =>
+            onSetActiveSelection?.({ start_index: 10, end_index: 14, anchor_content: "other" })
           }
         />
         {viewMode === "editor" && (
@@ -103,9 +115,14 @@ vi.mock("./CommentsPanel", () => ({
     comments?: any[];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     addressedComments?: any[];
-    activeSelection?: { comment_id?: string } | null;
+    activeSelection?: { comment_id?: string; start_index?: number; end_index?: number } | null;
   }) => (
-    <div data-testid="comments-panel" data-active-comment-id={activeSelection?.comment_id ?? ""}>
+    <div
+      data-testid="comments-panel"
+      data-active-comment-id={activeSelection?.comment_id ?? ""}
+      data-active-start={activeSelection?.start_index ?? ""}
+      data-active-end={activeSelection?.end_index ?? ""}
+    >
       {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
           key={c.id}
@@ -152,7 +169,7 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
 
 vi.mock("@/hooks/useComments", () => ({
   useComments: vi.fn(),
-  useAddComment: vi.fn(() => ({ mutate: addCommentMutate })),
+  useAddComment: vi.fn(() => ({ mutateAsync: addCommentMutateAsync })),
   useUpdateComment: vi.fn(() => ({ mutate: vi.fn() })),
   useDeleteComment: vi.fn(() => ({ mutate: vi.fn() })),
 }));
@@ -166,7 +183,9 @@ vi.mock("@/hooks/useFileDiff", () => ({
   useFileDiff: vi.fn(() => ({ data: { before: "old", after: "new" } })),
 }));
 
-vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  // `browseLocationBase` is re-exported for useArtifactLink's path handling.
+  ...(await importOriginal<typeof workspaceChangedFilesModule>()),
   useWorkspaceChangedFiles: vi.fn(() => ({
     data: {
       available: true,
@@ -203,6 +222,21 @@ vi.mock("@/store/chatStore", () => ({
   ),
 }));
 
+// Artifact link mint / revoke go through authenticatedFetch; the host fetcher
+// presence decides standalone vs embed behavior.
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof identityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
+vi.mock("@/lib/host", async (importOriginal) => ({
+  ...(await importOriginal<typeof hostModule>()),
+  hasOmnigentHostFetcher: vi.fn(() => false),
+}));
+vi.mock("sonner", async (importOriginal) => {
+  const actual = await importOriginal<typeof sonnerModule>();
+  return { ...actual, toast: { ...actual.toast, error: vi.fn(), success: vi.fn() } };
+});
+
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
@@ -216,9 +250,18 @@ import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext
 import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
+import { authenticatedFetch } from "@/lib/identity";
+import type * as identityModule from "@/lib/identity";
+import { hasOmnigentHostFetcher } from "@/lib/host";
+import type * as hostModule from "@/lib/host";
+import { toast } from "sonner";
+import type * as sonnerModule from "sonner";
+import type * as workspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import { clearCommentDraft, setCommentDraft } from "./commentDrafts";
 
 const useCommentsMock = vi.mocked(useComments);
 const useOptionalCommentSenderMock = vi.mocked(useOptionalCommentSender);
+const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 
 function makeCommentsQuery(data: Comment[] | undefined) {
   return { data } as ReturnType<typeof useComments>;
@@ -317,12 +360,15 @@ beforeEach(() => {
   // can't leak into another that asserts the hardcoded defaults.
   localStorage.clear();
   vi.mocked(useIsMobileViewport).mockReturnValue(false);
+  authenticatedFetchMock.mockReset();
+  vi.mocked(hasOmnigentHostFetcher).mockReturnValue(false);
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.unstubAllGlobals();
+  delete window.__OMNIGENT_BASE_PATH__;
   // Restore any getBoundingClientRect spy installed by the width-gating tests.
   vi.restoreAllMocks();
 });
@@ -947,6 +993,278 @@ describe("FileViewer copy-link button", () => {
     renderViewer({ open: true });
 
     expect(screen.getByRole("button", { name: "Copy link to file" })).toBeInTheDocument();
+  });
+});
+
+// ── Artifact links: copy / open in new tab / revoke ─────────────────────────
+//
+// Standalone, the file viewer also exposes the artifact capability URL: a
+// "Copy file link" action (raw view for any file type) and, for HTML, "Open in
+// new tab" pointing at the same URL. Embed mode cannot reach the artifact route
+// through its fetcher, so both actions and "Revoke links" are standalone-only.
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** A popup a test controls, shaped like the window `openHtmlInNewTab` touches. */
+function fakePopup() {
+  const doc = document.implementation.createHTMLDocument("popup");
+  return {
+    document: doc,
+    location: { href: "" },
+    // Non-null on purpose: the test only passes if production severs the
+    // back-reference, not because the fake already started without one.
+    opener: {} as unknown,
+    close: vi.fn(),
+  };
+}
+
+describe("FileViewer artifact links", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const openSettingsMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+
+  it("copies the standalone artifact URL composed from origin + basePath", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    authenticatedFetchMock.mockResolvedValue(
+      jsonResponse({ url: "/v1/artifacts/tok/file1.py", nonce: "n1", kind: "file" }),
+    );
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    renderViewer({ open: true });
+    fireEvent.click(screen.getByRole("button", { name: "Copy file link" }));
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        `${window.location.origin}/proxy/6767/v1/artifacts/tok/file1.py`,
+      ),
+    );
+    expect(JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      path: "file1.py",
+      view: "raw",
+    });
+  });
+
+  it("hides the artifact link and revoke actions in embed mode", () => {
+    vi.mocked(hasOmnigentHostFetcher).mockReturnValue(true);
+    renderViewer({ open: true });
+
+    expect(screen.queryByRole("button", { name: "Copy file link" })).toBeNull();
+    openSettingsMenu();
+    expect(screen.queryByRole("menuitem", { name: "Revoke links" })).toBeNull();
+    // The rest of the settings menu still behaves as before.
+    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+  });
+
+  it("opens the tab synchronously, then points it at the artifact URL once minted", async () => {
+    const popup = fakePopup();
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    let resolveMint!: (res: Response) => void;
+    authenticatedFetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveMint = resolve;
+      }),
+    );
+
+    renderViewer({ open: true, path: "page.html" });
+    fireEvent.click(screen.getByRole("button", { name: "Open in new tab" }));
+
+    // The blank tab is opened before the mint can resolve (popup blockers), and
+    // it keeps no back-reference to the shell.
+    expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(popup.opener).toBeNull();
+
+    resolveMint(jsonResponse({ url: "/v1/artifacts/tok/page.html", nonce: "n1", kind: "bundle" }));
+    await waitFor(() =>
+      expect(popup.location.href).toBe(`${window.location.origin}/v1/artifacts/tok/page.html`),
+    );
+    expect(JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      path: "page.html",
+      view: "raw",
+    });
+  });
+
+  it("closes the opened tab and shows a failure notice when the mint fails", async () => {
+    const popup = fakePopup();
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    authenticatedFetchMock.mockResolvedValue(new Response(null, { status: 403 }));
+
+    renderViewer({ open: true, path: "page.html" });
+    fireEvent.click(screen.getByRole("button", { name: "Open in new tab" }));
+
+    await waitFor(() => expect(popup.close).toHaveBeenCalled());
+    expect(popup.location.href).toBe("");
+    expect(toast.error).toHaveBeenCalledWith("Failed to open in new tab");
+  });
+
+  it("keeps the srcdoc popup in embed mode", () => {
+    vi.mocked(hasOmnigentHostFetcher).mockReturnValue(true);
+    const popup = fakePopup();
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+
+    renderViewer({ open: true, path: "page.html" });
+    fireEvent.click(screen.getByRole("button", { name: "Open in new tab" }));
+
+    // The embed path writes the prepared document into an iframe instead of
+    // navigating the tab; no artifact request is made.
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    const frame = popup.document.querySelector("iframe");
+    expect(frame?.getAttribute("srcdoc")).toContain('<base target="_blank">');
+    expect(popup.location.href).toBe("");
+  });
+
+  it("revokes on confirm and bumps the preview key", async () => {
+    authenticatedFetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+
+    renderViewer({ open: true, path: "page.html" });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-preview-key", "0");
+
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Revoke links" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+
+    // The bumped key is what remounts the preview; CodeViewer.test.tsx proves
+    // the real CodeViewer turns it into a fresh preview mount + mint.
+    await waitFor(() =>
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-preview-key", "1"),
+    );
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+    expect(authenticatedFetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_1/artifacts/revoke");
+    expect(authenticatedFetchMock.mock.calls[0][1]).toMatchObject({ method: "POST" });
+    expect(toast.success).toHaveBeenCalledWith("Links revoked");
+  });
+
+  it("does not post when the revoke dialog is cancelled", () => {
+    renderViewer({ open: true });
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Revoke links" }));
+    expect(screen.getByText("Revoke links?")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(screen.queryByText("Revoke links?")).toBeNull();
+  });
+
+  it("shows a failure notice when revoke is refused", async () => {
+    authenticatedFetchMock.mockResolvedValue(new Response(null, { status: 403 }));
+    renderViewer({ open: true });
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Revoke links" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Failed to revoke links"));
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileViewer unsent comment drafts", () => {
+  it("restores a draft's anchor when returning to its file", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    setCommentDraft("conv_1", "file1.py", {
+      start_index: 10,
+      end_index: 20,
+      anchor_content: "hello",
+      body: "unsent draft",
+    });
+
+    const { rerender } = renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "10");
+
+    // The agent (or the user) switches to another file: no draft there, so the
+    // composer anchor goes away.
+    rerender(viewerTree({ open: true, path: "b.py" }));
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "");
+
+    rerender(viewerTree({ open: true, path: "file1.py" }));
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "10");
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-end", "20");
+
+    clearCommentDraft("conv_1", "file1.py");
+  });
+
+  it("restores the draft when a file-type switch changes the view mode and back", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    setCommentDraft("conv_1", "page.html", {
+      start_index: 0,
+      end_index: 4,
+      anchor_content: "page",
+      body: "html draft",
+    });
+
+    // page.html opens in preview mode; b.py in source.
+    const { rerender } = renderViewer({ open: true, path: "page.html" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "0");
+
+    rerender(viewerTree({ open: true, path: "b.py" }));
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "");
+
+    // Back on the HTML page the mode returns to preview; that mode change came
+    // with the navigation, so it must not clear the restored draft anchor.
+    rerender(viewerTree({ open: true, path: "page.html" }));
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "0");
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-end", "4");
+
+    clearCommentDraft("conv_1", "page.html");
+  });
+});
+
+// ── Comment post settlement ─────────────────────────────────────────────────
+//
+// A post resolves after the user may have moved on. Success dismisses the
+// selection the post came from, but a selection picked while it was in flight
+// belongs to the user and must survive the late resolution.
+
+describe("FileViewer comment post settlement", () => {
+  function deferredPost() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  it("dismisses the submitted selection but not one picked while the post was pending", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const firstPost = deferredPost();
+    const secondPost = deferredPost();
+    addCommentMutateAsync
+      .mockReturnValueOnce(firstPost.promise)
+      .mockReturnValueOnce(secondPost.promise);
+
+    renderViewer({ open: true, path: "file1.py" });
+
+    // A post from the current selection still dismisses it on success.
+    fireEvent.click(screen.getByRole("button", { name: "select text" }));
+    fireEvent.click(screen.getByRole("button", { name: "add comment" }));
+    await act(async () => {
+      firstPost.resolve();
+    });
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "");
+
+    // The second post's selection is replaced while the request is in flight.
+    fireEvent.click(screen.getByRole("button", { name: "select text" }));
+    fireEvent.click(screen.getByRole("button", { name: "add comment" }));
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "0");
+    fireEvent.click(screen.getByRole("button", { name: "select other text" }));
+
+    await act(async () => {
+      secondPost.resolve();
+    });
+
+    // The late success must not erase the newer selection.
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-start", "10");
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-end", "14");
   });
 });
 
@@ -2139,14 +2457,13 @@ describe("FileViewer comments follow the preview frame", () => {
     fireEvent.click(screen.getByRole("button", { name: "select text" }));
     fireEvent.click(screen.getByRole("button", { name: "add comment" }));
 
-    expect(addCommentMutate).toHaveBeenCalledWith(
+    expect(addCommentMutateAsync).toHaveBeenCalledWith(
       expect.objectContaining({
         path: "linked/page2.html",
         start_index: 0,
         end_index: 4,
         body: "body text",
       }),
-      expect.anything(),
     );
   });
 });
