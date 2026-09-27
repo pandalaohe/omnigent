@@ -20,6 +20,7 @@ import asyncio
 from collections.abc import Iterator
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
@@ -1301,3 +1302,153 @@ async def test_untracked_sub_agent_terminal_reports_to_the_server(
         )
         await asyncio.sleep(0.05)
         assert len(server_client.posts) == before
+
+
+class _FlakyChildReportServerClient(_SnapshotServerClient):
+    """A server client whose child-event POST fails the first *failures* times."""
+
+    def __init__(
+        self, child_body: dict[str, Any], parent_body: dict[str, Any] | None, *, failures: int
+    ) -> None:
+        super().__init__(child_body, parent_body)
+        self._failures = failures
+        self.attempts = 0
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        if url.rstrip("/").endswith(f"/v1/sessions/{CHILD_SESSION_ID}/events"):
+            self.attempts += 1
+            if self.attempts <= self._failures:
+                raise httpx.ConnectError("server unreachable")
+        return await super().post(url, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_untracked_terminal_report_retries_with_wake_backoff(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient report failure retries with the wake-post backoff, then lands."""
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runner_app, "_wake_retry_sleep", _record_sleep)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    server_client = _FlakyChildReportServerClient(
+        _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        _parent_snapshot(parent_session_id=None),
+        failures=1,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        init = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": CHILD_SESSION_ID,
+                "agent_id": "ag_reviewer",
+                "sub_agent_name": "reviewer",
+            },
+        )
+        assert init.status_code == 201, init.text
+        app.state.mark_subagent_terminal_and_wake(
+            CHILD_SESSION_ID, status="completed", output="review complete: LGTM"
+        )
+        reports: list[dict[str, Any]] = []
+        for _ in range(200):
+            reports = [
+                kwargs.get("json")
+                for url, kwargs in server_client.posts
+                if url.rstrip("/").endswith(f"/v1/sessions/{CHILD_SESSION_ID}/events")
+            ]
+            if reports:
+                break
+            await asyncio.sleep(0.01)
+
+    assert server_client.attempts == 2, "the failed report must be retried once"
+    assert sleeps == [runner_app._WAKE_POST_RETRY_BASE_DELAY_S]
+    assert reports and reports[-1]["data"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_started_remote_work_is_reconciled_once_from_the_server_row(
+    _clean_subagent_registry: None,
+) -> None:
+    """A lost cross-host terminal report is rebuilt from the server row once.
+
+    The child's own runner posts the terminal edge to the server; when that
+    report is lost, the parent runner's entry stays ``running`` and no local
+    edge ever arrives. The periodic reconciliation must read the server's
+    completed child row and deliver the result exactly once — the later
+    successful report (forwarded to this runner) must not deliver it again.
+    """
+    child = _child_summary(current_task_status="completed")
+    server_client = _RecoveryServerClient([child])
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
+
+    runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        work_id=DISPATCH_ID,
+        remote=True,
+    )
+    runner_app.mark_subagent_work_started(CHILD_SESSION_ID)
+    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None and entry.status == "running"
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+
+    await app.state.reconcile_pending_subagent_results()
+
+    assert inbox.qsize() == 1
+    payload = inbox.get_nowait()
+    assert payload["work_id"] == DISPATCH_ID
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["status"] == "completed"
+    assert payload["output"] == "review complete: LGTM"
+
+    late = app.state.mark_subagent_terminal_and_wake(
+        CHILD_SESSION_ID, status="completed", output="review complete: LGTM"
+    )
+    assert late.delivered and not late.delivered_now
+    assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_same_host_started_work_stays_local(
+    _clean_subagent_registry: None,
+) -> None:
+    """A same-host running entry is not polled; its own local edge owns delivery."""
+    child = _child_summary(current_task_status="completed")
+    server_client = _RecoveryServerClient([child])
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
+
+    runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        work_id=DISPATCH_ID,
+    )
+    runner_app.mark_subagent_work_started(CHILD_SESSION_ID)
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+
+    await app.state.reconcile_pending_subagent_results()
+
+    assert inbox.empty()
+    assert server_client.requests == []

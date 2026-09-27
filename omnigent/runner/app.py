@@ -1757,6 +1757,11 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param remote: Whether the child runs on another host (cross-host
+        member). Its ``running``/terminal edges are emitted by the
+        child's own runner, so this runner only learns of completion
+        from the server — making the entry eligible for the server
+        reconciliation backstop even while non-terminal.
     """
 
     parent_session_id: str
@@ -1771,6 +1776,7 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    remote: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2047,6 +2053,7 @@ def register_subagent_work(
     wrapper_label: str | None = None,
     created_by: str | None = None,
     work_id: str | None = None,
+    remote: bool = False,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -2066,6 +2073,8 @@ def register_subagent_work(
         known from the parent turn context.
     :param work_id: Dispatch id already stamped on the child session,
         e.g. ``"subagent_a1b2c3d4e5f6"``; ``None`` mints a new one.
+    :param remote: Whether the child runs on another host; see
+        :attr:`_SubagentWorkEntry.remote`.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -2084,6 +2093,7 @@ def register_subagent_work(
         title=title,
         wrapper_label=wrapper_label,
         created_by=created_by,
+        remote=remote,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
@@ -2341,6 +2351,21 @@ async def _fetch_latest_assistant_text(
         params["after"] = page["last_id"]
 
 
+def _subagent_result_awaits_server(entry: _SubagentWorkEntry) -> bool:
+    """Whether the server row is a live delivery source for this entry.
+
+    ``waiting`` entries await a completion that already happened elsewhere. A
+    ``running`` entry whose child runs on another host never receives the
+    child's own terminal edge on this runner (the child's runner owns it), so
+    the server row is the backstop when that report is lost; a same-host
+    ``running`` entry keeps today's local-edge delivery.
+
+    :param entry: Work entry to classify.
+    :returns: ``True`` when reconciliation may rebuild its result.
+    """
+    return entry.status == "waiting" or (entry.status == "running" and entry.remote)
+
+
 async def _recover_subagent_results_from_server(
     *,
     server_client: httpx.AsyncClient,
@@ -2354,7 +2379,9 @@ async def _recover_subagent_results_from_server(
     parent's ``sys_read_inbox`` drain writes that id back as the delivered
     id. A terminal child whose two ids differ was never drained, so its
     result is rebuilt from the child transcript and queued again under the
-    same dispatch id, letting the eventual drain close the loop.
+    same dispatch id, letting the eventual drain close the loop. This scan
+    also reconstructs a started cross-host child's result, whose terminal
+    edge its own runner owns and may have failed to report.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param parent_id: Parent session whose inbox was recreated, e.g.
@@ -2377,9 +2404,9 @@ async def _recover_subagent_results_from_server(
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
         existing = get_subagent_work(child_id)
-        if (existing is not None and existing.status != "waiting") or (
-            child_id in _drained_delivered_subagent_children
-        ):
+        if (
+            existing is not None and not _subagent_result_awaits_server(existing)
+        ) or child_id in _drained_delivered_subagent_children:
             continue
         labels = child.get("labels")
         dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
@@ -2397,9 +2424,10 @@ async def _recover_subagent_results_from_server(
             elif output is None and status == "killed":
                 output = "Sub-agent was killed before producing a reliable final result."
         # A forwarded completion or newer dispatch may arrive during the history read.
+        latest = get_subagent_work(child_id)
         if (
-            get_subagent_work(child_id) is not existing
-            or (existing is not None and existing.status != "waiting")
+            latest is not existing
+            or (existing is not None and not _subagent_result_awaits_server(existing))
             or child_id in _drained_delivered_subagent_children
         ):
             continue
@@ -6436,14 +6464,21 @@ def create_runner_app(
     app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
 
     async def _reconcile_pending_subagent_results() -> None:
-        """Refresh only recovered work with no local execution or completion edge."""
+        """Refresh work whose result can only come from the server row.
+
+        Covers ``waiting`` entries and started cross-host work: a remote
+        child's terminal edge is emitted on its own host's runner, so this
+        runner's only proof of completion is the server's child row.
+        """
         parents = {
             entry.parent_session_id
             for entry in list(_subagent_work_by_child.values())
-            if entry.status == "waiting"
+            if _subagent_result_awaits_server(entry)
         }
         for parent_id in parents:
-            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
+            if not any(
+                _subagent_result_awaits_server(entry) for entry in list_subagent_work(parent_id)
+            ):
                 continue
             _subagent_recovery_done.discard(parent_id)
             await _recover_undrained_subagent_results(parent_id)
@@ -9316,7 +9351,9 @@ def create_runner_app(
         delivery has no parent inbox to reach; posting the edge to the server
         routes it through the parent-runner forward. The same report recovers a
         local child whose work entry a restart wiped, one polling interval
-        sooner than the reconciliation backstop.
+        sooner than the reconciliation backstop. Transient failures retry with
+        the same bounded backoff as the parent wake POST; the server-side
+        forward dedupes a repeated terminal, so a retry cannot double-deliver.
 
         :param child_session_id: The sub-agent child session id.
         :param status: Server-vocabulary status, e.g. ``"completed"``.
@@ -9324,20 +9361,50 @@ def create_runner_app(
         """
         from omnigent.native._native_post_delivery import post_external_session_status
 
-        try:
-            await post_external_session_status(
-                server_client,
-                session_id=child_session_id,
-                status=status,
-                output=output,
-            )
-        except Exception:  # noqa: BLE001 — the polling backstop re-delivers
-            _logger.warning(
-                "Failed to report an untracked sub-agent terminal status for %s",
-                child_session_id,
-                exc_info=True,
-                extra={"session_id": child_session_id},
-            )
+        for attempt in range(1, _WAKE_POST_MAX_ATTEMPTS + 1):
+            try:
+                await post_external_session_status(
+                    server_client,
+                    session_id=child_session_id,
+                    status=status,
+                    output=output,
+                )
+                return
+            except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+                retryable = isinstance(exc, asyncio.TimeoutError) or _wake_post_is_retryable(exc)
+                last_attempt = attempt >= _WAKE_POST_MAX_ATTEMPTS
+                _logger.debug(
+                    "Sub-agent terminal report attempt %d/%d for %s failed (retryable=%s): %r",
+                    attempt,
+                    _WAKE_POST_MAX_ATTEMPTS,
+                    child_session_id,
+                    retryable,
+                    exc,
+                    extra={"session_id": child_session_id},
+                )
+                if last_attempt or not retryable:
+                    _logger.warning(
+                        "Failed to report an untracked sub-agent terminal status for %s "
+                        "after %d attempt(s); the parent runner's polling recovery "
+                        "remains the backstop",
+                        child_session_id,
+                        attempt,
+                        extra={"session_id": child_session_id},
+                    )
+                    return
+                delay_s = min(
+                    _WAKE_POST_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
+                    _WAKE_POST_RETRY_MAX_DELAY_S,
+                )
+                await _wake_retry_sleep(delay_s)
+            except Exception:  # noqa: BLE001 — unexpected; the polling backstop re-delivers
+                _logger.warning(
+                    "Failed to report an untracked sub-agent terminal status for %s",
+                    child_session_id,
+                    exc_info=True,
+                    extra={"session_id": child_session_id},
+                )
+                return
 
     def _post_untracked_subagent_terminal_soon(
         child_session_id: str, *, status: str, output: str | None
