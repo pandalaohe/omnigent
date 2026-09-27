@@ -2717,6 +2717,44 @@ def _member_dispatch_lock_error(
     return None
 
 
+def _note_member_obligation_outcome(
+    conversation_id: str | None,
+    args: _JsonObject,
+    output: str,
+) -> None:
+    """Record a named dispatch's outcome against the turn's member obligations.
+
+    A ``sys_session_send`` naming a role the user addressed in this turn's
+    message meets that role's obligation on a successful launch, and records
+    the failure reason the turn-end handling later quotes. A role with no open
+    obligation (or a by-id send) is left alone.
+
+    :param conversation_id: Parent session id, or ``None`` in bare tests.
+    :param args: Parsed dispatch arguments (``agent`` names the role).
+    :param output: The tool's returned string.
+    """
+    from omnigent.runner import app as _runner_app
+
+    if conversation_id is None:
+        return
+    role = args.get("agent")
+    if not isinstance(role, str) or not role:
+        return
+    if role not in _runner_app.list_member_obligations(conversation_id):
+        return
+    if output.startswith("Error:"):
+        reason = output.splitlines()[0].removeprefix("Error:").strip() or "dispatch failed"
+        _runner_app.mark_member_obligation_failed(conversation_id, role, reason)
+        return
+    try:
+        payload = json.loads(output)
+    except ValueError:
+        return
+    child_session_id = payload.get("task_id") if isinstance(payload, dict) else None
+    if isinstance(child_session_id, str) and child_session_id:
+        _runner_app.mark_member_obligation_met(conversation_id, role, child_session_id)
+
+
 async def _execute_subagent_tool(
     args: _JsonObject,
     *,
@@ -7418,6 +7456,7 @@ async def execute_tool(
                 publish_event=publish_event,
                 session_inbox=session_inbox,
             )
+            _note_member_obligation_outcome(conversation_id, args, output)
         elif tool_name in _HANDOFF_TOOLS:
             if not _peer_messaging_enabled_for(conversation_id):
                 return json.dumps({"error": f"tool {tool_name!r} is not enabled"})

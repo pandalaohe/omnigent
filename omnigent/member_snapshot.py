@@ -10,7 +10,8 @@ server routes and the runner agree on the shape.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 MEMBER_LABEL_PREFIX = "omnigent.member."
@@ -55,3 +56,29 @@ def member_entries_from_labels(labels: Mapping[str, str] | None) -> dict[str, di
         if role and entry is not None:
             entries[role] = entry
     return entries
+
+
+def parse_role_mentions(text: str, roles: Iterable[str]) -> list[tuple[str, str]]:
+    """Return ``(role, segment)`` for each ``@role`` / ``[role]`` mention.
+
+    ``@role`` and ``[role]`` are equivalent, and only exact role names match —
+    so a web ``[Attached: …]`` preamble (or any other bracketed text) never
+    parses as a mention. A mention's segment is the text between it and the
+    next mention, stripped; the text before the first mention belongs to no
+    pair. Repeated mentions yield repeated pairs.
+    """
+    role_list = {role for role in roles if isinstance(role, str) and role}
+    if not text or not role_list:
+        return []
+    ordered_roles = sorted(role_list, key=lambda role: (-len(role), role))
+    alternation = "|".join(re.escape(role) for role in ordered_roles)
+    pattern = re.compile(
+        rf"(?:(?<![\w@-])@(?P<at>{alternation})(?![\w-]))|(?:\[(?P<square>{alternation})\])"
+    )
+    matches = list(pattern.finditer(text))
+    pairs: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        role = match.group("at") or match.group("square")
+        segment_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        pairs.append((role, text[match.end() : segment_end].strip()))
+    return pairs

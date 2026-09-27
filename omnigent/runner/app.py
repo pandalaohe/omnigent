@@ -86,6 +86,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.member_snapshot import member_entries_from_labels, parse_role_mentions
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -1795,6 +1796,86 @@ _subagent_recovery_locks: dict[str, asyncio.Lock] = {}
 # Per-(parent, agent_type) monotonic ordinal counter for structured
 # sub-agent names (e.g. "researcher-1", "researcher-2").
 _subagent_ordinal_counters: dict[tuple[str, str], int] = {}
+
+
+@dataclasses.dataclass
+class MemberObligation:
+    """One named member's dispatch obligation for a joint-agent lead turn.
+
+    A user message that names a non-lead member creates an obligation for the
+    lead's turn: the lead owes that member a ``sys_session_send`` dispatch.
+    ``child_session_id`` is set once a child for the role launches (the
+    obligation is then met and waits for that child's terminal result), and
+    ``failure_reason`` records a dispatch attempt that errored. ``followed_up``
+    marks a role the runner already sent its one reminder about.
+    """
+
+    role: str
+    child_session_id: str | None = None
+    failure_reason: str | None = None
+    followed_up: bool = False
+
+
+# Live obligations per session, keyed by role. Entries live only between a
+# user turn that named members and the dispatch (or the notice that drops them).
+_member_obligations: dict[str, dict[str, MemberObligation]] = {}
+
+# Member snapshot entries per session, seeded from the init envelope's labels
+# (the runner sees them at session init). The message hot path reads them to
+# route ``@role`` mentions without a server round-trip per user message; they
+# are immutable for a session and drop with the labels on an agent switch.
+_session_member_entries: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def set_session_member_entries(session_id: str, labels: Mapping[str, str] | None) -> None:
+    """Record (or clear) the member entries a session's labels carry."""
+    entries = member_entries_from_labels(labels)
+    if entries:
+        _session_member_entries[session_id] = entries
+    else:
+        _session_member_entries.pop(session_id, None)
+
+
+def list_member_obligations(session_id: str) -> dict[str, MemberObligation]:
+    """Return the session's open member obligations, keyed by role."""
+    return _member_obligations.get(session_id, {})
+
+
+def record_member_obligation(session_id: str, role: str) -> MemberObligation:
+    """Start (or return) *role*'s dispatch obligation for *session_id*."""
+    obligations = _member_obligations.setdefault(session_id, {})
+    obligation = obligations.get(role)
+    if obligation is None:
+        obligation = MemberObligation(role=role)
+        obligations[role] = obligation
+    return obligation
+
+
+def mark_member_obligation_met(session_id: str, role: str, child_session_id: str) -> None:
+    """Record that a child session for *role* launched successfully."""
+    obligation = list_member_obligations(session_id).get(role)
+    if obligation is None:
+        return
+    obligation.child_session_id = child_session_id
+    obligation.failure_reason = None
+
+
+def mark_member_obligation_failed(session_id: str, role: str, reason: str) -> None:
+    """Record a failed dispatch attempt for *role*, unless one already met it."""
+    obligation = list_member_obligations(session_id).get(role)
+    if obligation is None or obligation.child_session_id is not None:
+        return
+    obligation.failure_reason = reason
+
+
+def drop_member_obligation(session_id: str, role: str) -> None:
+    """Forget *role*'s obligation, and the session entry once it empties."""
+    obligations = _member_obligations.get(session_id)
+    if obligations is None:
+        return
+    obligations.pop(role, None)
+    if not obligations:
+        _member_obligations.pop(session_id, None)
 
 
 def next_subagent_ordinal(parent_session_id: str, agent_type: str) -> int:
@@ -4081,6 +4162,7 @@ def create_runner_app(
         global _server_version
         _server_version = envelope.server_version
         snapshot = envelope.snapshot
+        set_session_member_entries(session_id, snapshot.labels)
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
             status_code=200,
@@ -5590,6 +5672,8 @@ def create_runner_app(
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
+        _member_obligations.pop(session_id, None)
+        _session_member_entries.pop(session_id, None)
         if filesystem_registry is not None:
             filesystem_registry.unregister_conversation(session_id)
         for _task, evt in _session_async_tasks.pop(session_id, {}).values():
@@ -8129,6 +8213,188 @@ def create_runner_app(
         _interrupted_sessions.discard(conv_id)
         return True
 
+    async def _post_member_notice(session_id: str, role: str, reason: str) -> None:
+        """Surface ``"<role> did not run: <reason>"`` as a visible chat notice.
+
+        Posts an ``error`` item with ``level: "info"`` (the web UI's neutral
+        notice pill), the same bridge the pi-native notices use. Best-effort:
+        a failed post is logged, never raised.
+
+        :param session_id: Session whose chat carries the notice.
+        :param role: Member role the work was routed to, e.g. ``"executor"``.
+        :param reason: Short cause, e.g. ``"host_offline"`` or a dispatch error.
+        """
+        try:
+            resp = await server_client.post(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "error",
+                        "item_data": {
+                            "source": "execution",
+                            "code": "member_did_not_run",
+                            "message": f"{role} did not run: {reason}",
+                            "level": "info",
+                        },
+                    },
+                },
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+        except (httpx.HTTPError, RuntimeError):
+            _logger.warning(
+                "Failed to surface member notice for session=%s role=%s",
+                session_id,
+                role,
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
+
+    def _schedule_member_notice(session_id: str, role: str, reason: str) -> None:
+        """Post one member notice in the background, off the caller's path."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(_post_member_notice(session_id, role, reason))
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
+    def _schedule_member_follow_up(session_id: str, notice: str) -> None:
+        """Send the one ``[System: …]`` follow-up naming a turn's unmet roles."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _send() -> None:
+            delivered = await _deliver_subagent_wake_post(server_client, session_id, notice)
+            if not delivered:
+                _logger.warning(
+                    "Member-obligation follow-up POST failed for session=%s after %d attempts",
+                    session_id,
+                    _WAKE_POST_MAX_ATTEMPTS,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+
+        task = loop.create_task(_send())
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
+    def _handle_member_turn_end(session_id: str) -> None:
+        """Nudge a lead's unmet member work once, then surface a notice.
+
+        Called at the lead's turn end (non-native proxy stream end, native idle
+        edge). Unmet roles get exactly one follow-up input naming them; the
+        next turn end that still finds them unmet — or a recorded dispatch
+        failure — posts ``"<role> did not run: <reason>"`` and drops the
+        obligation, so the routing never stays silent.
+        """
+        unmet = [
+            obligation
+            for obligation in list_member_obligations(session_id).values()
+            if obligation.child_session_id is None
+        ]
+        if not unmet:
+            return
+        exhausted = [
+            obligation
+            for obligation in unmet
+            if obligation.followed_up or obligation.failure_reason is not None
+        ]
+        if exhausted:
+            for obligation in exhausted:
+                reason = obligation.failure_reason or "not dispatched after the follow-up"
+                _schedule_member_notice(session_id, obligation.role, reason)
+                drop_member_obligation(session_id, obligation.role)
+            return
+        for obligation in unmet:
+            obligation.followed_up = True
+        roles = ", ".join(obligation.role for obligation in unmet)
+        _schedule_member_follow_up(
+            session_id,
+            "[System: member roles named in this turn were not dispatched: "
+            f"{roles}. Dispatch each role with sys_session_send(agent=<role>) "
+            "before finishing; this reminder is runtime-generated.]",
+        )
+
+    def _settle_member_obligation_for_child(entry: _SubagentWorkEntry) -> None:
+        """Close the obligation a completed child met; notice a failed child.
+
+        The obligation closes when the child's terminal result reaches the
+        lead. A non-``completed`` result is a failed run, so it turns into the
+        visible notice instead of a silent close.
+        """
+        obligation = next(
+            (
+                candidate
+                for candidate in list_member_obligations(entry.parent_session_id).values()
+                if candidate.child_session_id == entry.child_session_id
+            ),
+            None,
+        )
+        if obligation is None:
+            return
+        drop_member_obligation(entry.parent_session_id, obligation.role)
+        if entry.status != "completed":
+            reason = entry.output or f"sub-agent {entry.status}"
+            _schedule_member_notice(
+                entry.parent_session_id, obligation.role, reason.splitlines()[0]
+            )
+
+    async def _member_routing_note_for_turn(
+        session_id: str,
+        message_body: Mapping[str, Any],
+    ) -> str | None:
+        """Record a turn's member obligations and build the lead's note.
+
+        ``@role`` / ``[role]`` mentions of a non-lead member become open
+        obligations for the turn, and the returned note tells the lead to
+        dispatch each one with ``sys_session_send``. A named member the server
+        marked unavailable gets its notice immediately instead of a note (no
+        dispatch is expected). ``None`` when the session has fewer than two
+        member snapshot entries, the message is not a user message, or it
+        names no non-lead role — so an ordinary session behaves exactly as
+        before.
+        """
+        if message_body.get("role", "user") != "user":
+            return None
+        content = message_body.get("content")
+        if not isinstance(content, list):
+            return None
+        text = "\n".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "input_text"
+            and isinstance(block.get("text"), str)
+        )
+        if not text.strip():
+            return None
+        entries = _session_member_entries.get(session_id) or {}
+        if len(entries) < 2:
+            return None
+        lead_roles = {role for role, entry in entries.items() if entry.get("lead") is True}
+        existing_roles = list_member_obligations(session_id)
+        note_lines: list[str] = []
+        seen: set[str] = set()
+        for role, segment in parse_role_mentions(text, entries):
+            if role in seen or role in lead_roles or role in existing_roles:
+                continue
+            seen.add(role)
+            unavailable = entries[role].get("unavailable")
+            if isinstance(unavailable, str) and unavailable:
+                await _post_member_notice(session_id, role, unavailable)
+                continue
+            record_member_obligation(session_id, role)
+            note_lines.append(
+                f"[System: the user addressed member {role!r} (its part: {segment!r}); "
+                f"dispatch it with sys_session_send(agent={role!r}) before you finish "
+                "this turn; this note is runtime-generated.]"
+            )
+        return "\n".join(note_lines) if note_lines else None
+
     def _on_proxy_stream_end(
         conv_id: str,
         *,
@@ -8218,6 +8484,13 @@ def create_runner_app(
                 status="completed",
                 output=_extract_last_assistant_text(conv_id),
             )
+        # A joint-agent lead's turn end: nudge once for roles the user named
+        # that never ran, and notice them if a later turn still finds them unmet.
+        # A native lead's turn end is its idle edge (handled on the
+        # external_session_status path); this stream end only proves the prompt
+        # was typed, so it must not treat the work as finished.
+        if not was_interrupted and not _is_native_harness(conv_id):
+            _handle_member_turn_end(conv_id)
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(
@@ -8841,6 +9114,8 @@ def create_runner_app(
         ack = mark_subagent_work_terminal(child_session_id, status=status, output=output)
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
+        if ack.entry is not None and ack.delivered:
+            _settle_member_obligation_for_child(ack.entry)
         return ack
 
     # Seam for the entrypoint's launch reaper (and tests): terminal delivery
@@ -10771,6 +11046,19 @@ def create_runner_app(
                             },
                         )
 
+                # Joint-agent routing: a message naming non-lead members becomes
+                # this turn's obligations, and the lead's input gains the note
+                # telling it to dispatch each with sys_session_send. Ordinary
+                # sessions get ``None`` and are untouched. Placed after the
+                # buffering branches so only the turn that starts here records
+                # obligations.
+                _member_note = await _member_routing_note_for_turn(conversation_id, message_body)
+                if _member_note and isinstance(message_body.get("content"), list):
+                    message_body["content"] = [
+                        {"type": "input_text", "text": _member_note},
+                        *message_body["content"],
+                    ]
+
                 new_item = {
                     "type": "message",
                     "role": message_body.get("role", "user"),
@@ -10926,6 +11214,10 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+                if status == "idle":
+                    # A native lead's turn end is the forwarder's idle edge, the
+                    # counterpart of _on_proxy_stream_end for non-native leads.
+                    _handle_member_turn_end(conversation_id)
             if status in ("idle", "completed", "failed", "stopped", "killed"):
                 if await _is_mirrored_claude_agent_tool_child(conversation_id):
                     # Claude Code hands a mirrored Agent-tool sub-agent's result
@@ -13444,6 +13736,9 @@ def create_runner_app(
         _session_spec_cache.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
+        # Member labels drop with an in-place agent switch; so do the entries
+        # the routing note reads.
+        _session_member_entries.pop(session_id, None)
         # Bump so any in-flight fill discards its write rather than reinstating it.
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
         _session_snapshot_cache.pop(session_id, None)
