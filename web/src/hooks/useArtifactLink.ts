@@ -18,6 +18,8 @@ export interface MintedArtifactLink {
   url: string;
   nonce: string;
   kind: "bundle" | "file";
+  /** Unix seconds when a panel-view token dies; null for the raw view. */
+  expires_at: number | null;
 }
 
 /** An HTTP status from the mint or the artifact read, so callers can branch. */
@@ -51,7 +53,12 @@ export async function mintArtifactLink(
     },
   );
   if (!res.ok) throw new ArtifactLinkError(res.status);
-  return (await res.json()) as MintedArtifactLink;
+  const link = (await res.json()) as MintedArtifactLink;
+  // A server older than the expiry field omits it; treat that as no expiry.
+  return {
+    ...link,
+    expires_at: typeof link.expires_at === "number" ? link.expires_at : null,
+  };
 }
 
 /**
@@ -79,14 +86,20 @@ export interface ArtifactEntry {
   url: string;
   nonce: string;
   source: string;
+  expires_at: number | null;
 }
 
 /**
  * Mint the panel view for `path` and read its bytes. A 410 mints once more and
  * retries once: the link can be revoked between the panel opening and the
- * fetch, and a fresh mint for a live key is deterministic.
+ * fetch, and a fresh mint for a live key is deterministic. Exported so the
+ * viewer's pre-expiry refresh can reload the frame under a fresh token and
+ * nonce.
  */
-async function fetchArtifactEntry(conversationId: string, path: string): Promise<ArtifactEntry> {
+export async function fetchArtifactEntry(
+  conversationId: string,
+  path: string,
+): Promise<ArtifactEntry> {
   let link = await mintArtifactLink(conversationId, { path, view: "panel" });
   let source: string;
   try {
@@ -96,11 +109,11 @@ async function fetchArtifactEntry(conversationId: string, path: string): Promise
     link = await mintArtifactLink(conversationId, { path, view: "panel" });
     source = await fetchArtifactSource(link.url, link.nonce);
   }
-  return { url: link.url, nonce: link.nonce, source };
+  return { url: link.url, nonce: link.nonce, source, expires_at: link.expires_at };
 }
 
 /** Map a failed entry load to the panel's one-line message. */
-function artifactErrorMessage(err: unknown): string {
+export function artifactErrorMessage(err: unknown): string {
   const status = err instanceof ArtifactLinkError ? err.status : 0;
   switch (status) {
     case 404:

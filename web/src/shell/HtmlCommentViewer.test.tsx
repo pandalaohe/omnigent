@@ -32,6 +32,9 @@ const NONCE = "nonce-1";
 const ENTRY_URL = "/v1/artifacts/tok/index.html";
 const ENTRY_PATH = "reports/index.html";
 const LINKED_URL = "/v1/artifacts/tok/sub/page2.html";
+const OTHER_URL = "/v1/artifacts/tokB/other.html";
+const OTHER_PATH = "reports/other.html";
+const OTHER_BODY = `<html><body><p>other</p><script data-omni-nonce="nonce-b">bridge()</script></body></html>`;
 
 const ENTRY_BODY = `<html><body><p>entry</p><script data-omni-nonce="${NONCE}">bridge()</script></body></html>`;
 const ENTRY_SOURCE = "<html><body><p>entry</p></body></html>";
@@ -40,8 +43,8 @@ const LINKED_SOURCE = "<html><body><p>page two</p><p>page two</p></body></html>"
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 
-function mintResponse(url = ENTRY_URL, nonce = NONCE) {
-  return new Response(JSON.stringify({ url, nonce, kind: "bundle" }), {
+function mintResponse(url = ENTRY_URL, nonce = NONCE, expiresAt: number | null = null) {
+  return new Response(JSON.stringify({ url, nonce, kind: "bundle", expires_at: expiresAt }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
@@ -92,6 +95,21 @@ function renderViewer(
   return { ...utils, onFrameChange, onSetActiveSelection };
 }
 
+/** The viewer for one path, for tests that rerender it onto another path. */
+function viewerElement(path: string) {
+  return (
+    <HtmlCommentViewer
+      conversationId="conv_1"
+      path={path}
+      content={ENTRY_SOURCE}
+      truncated={false}
+      comments={[]}
+      activeSelection={null}
+      onSetActiveSelection={() => {}}
+    />
+  );
+}
+
 /** Wait for the minted iframe, stub its `contentWindow`, and fire `load`. */
 async function openFrame() {
   const iframe = (await screen.findByTitle("HTML preview")) as HTMLIFrameElement;
@@ -135,6 +153,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
   vi.unstubAllGlobals();
   delete window.__OMNIGENT_BASE_PATH__;
@@ -197,6 +216,124 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     expect(screen.queryByTitle("HTML preview")).toBeNull();
     // Exactly one re-mint — no unbounded retry loop.
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-mints a near-expiry panel link and reloads the frame at its current page", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const expiresAt = Math.floor(Date.now() / 1000) + 5 * 60 + 30;
+    const REFRESHED_URL = "/v1/artifacts/tok2/index.html";
+    authenticatedFetchMock
+      .mockResolvedValueOnce(mintResponse(ENTRY_URL, NONCE, expiresAt))
+      .mockResolvedValueOnce(mintResponse(REFRESHED_URL, "nonce-2", expiresAt + 12 * 3600));
+    artifactResponses.set(REFRESHED_URL, new Response(ENTRY_BODY, { status: 200 }));
+
+    const { onFrameChange } = renderViewer();
+    const { iframe, postMessage } = await openFrame();
+    await sendFromFrame(postMessage, { type: BRIDGE_MSG.ready, pathname: LINKED_URL });
+    await waitFor(() =>
+      expect(onFrameChange).toHaveBeenLastCalledWith(
+        expect.objectContaining({ path: "reports/sub/page2.html" }),
+      ),
+    );
+
+    // Past the 5-minute lead: the fresh token's prefix serves the linked page.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40_000);
+    });
+
+    await waitFor(() =>
+      expect(iframe.getAttribute("src")).toBe("/v1/artifacts/tok2/sub/page2.html"),
+    );
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a refresh that resolves after the viewer switched files", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const expiresAt = Math.floor(Date.now() / 1000) + 5 * 60 + 30;
+    const refreshMint = deferred<Response>();
+    let entryMints = 0;
+    authenticatedFetchMock.mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { path: string };
+      if (body.path === OTHER_PATH) return mintResponse(OTHER_URL, "nonce-b");
+      entryMints += 1;
+      return entryMints === 1 ? mintResponse(ENTRY_URL, NONCE, expiresAt) : refreshMint.promise;
+    });
+    artifactResponses.set(OTHER_URL, new Response(OTHER_BODY, { status: 200 }));
+    artifactResponses.set(
+      "/v1/artifacts/tok2/index.html",
+      new Response(ENTRY_BODY, { status: 200 }),
+    );
+
+    const { rerender } = render(viewerElement(ENTRY_PATH));
+    await screen.findByTitle("HTML preview");
+
+    // Start the near-expiry refresh, then switch files while it is in flight.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40_000);
+    });
+    rerender(viewerElement(OTHER_PATH));
+    await waitFor(() =>
+      expect(screen.getByTitle("HTML preview").getAttribute("src")).toBe(OTHER_URL),
+    );
+
+    await act(async () => {
+      refreshMint.resolve(
+        mintResponse("/v1/artifacts/tok2/index.html", "nonce-2", expiresAt + 12 * 3600),
+      );
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(screen.getByTitle("HTML preview").getAttribute("src")).toBe(OTHER_URL);
+  });
+
+  it("ignores a refresh that fails after the viewer switched files", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const expiresAt = Math.floor(Date.now() / 1000) + 5 * 60 + 30;
+    const refreshMint = deferred<Response>();
+    let entryMints = 0;
+    authenticatedFetchMock.mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { path: string };
+      if (body.path === OTHER_PATH) return mintResponse(OTHER_URL, "nonce-b");
+      entryMints += 1;
+      return entryMints === 1 ? mintResponse(ENTRY_URL, NONCE, expiresAt) : refreshMint.promise;
+    });
+    artifactResponses.set(OTHER_URL, new Response(OTHER_BODY, { status: 200 }));
+
+    const { rerender } = render(viewerElement(ENTRY_PATH));
+    await screen.findByTitle("HTML preview");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40_000);
+    });
+    rerender(viewerElement(OTHER_PATH));
+    await waitFor(() =>
+      expect(screen.getByTitle("HTML preview").getAttribute("src")).toBe(OTHER_URL),
+    );
+
+    await act(async () => {
+      refreshMint.resolve(new Response("down", { status: 503 }));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(screen.queryByText("Host offline")).toBeNull();
+    expect(screen.getByTitle("HTML preview").getAttribute("src")).toBe(OTHER_URL);
+  });
+
+  it("does not schedule a refresh when the panel link has no expiry", async () => {
+    vi.useFakeTimers();
+    renderViewer();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+    });
+
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -544,6 +681,41 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     await waitFor(() =>
       expect(screen.queryByText("Comments are unavailable for this preview")).toBeNull(),
     );
+  });
+
+  it("drops the bridge ready timer when a failed refresh removes the frame", async () => {
+    vi.useFakeTimers();
+    // Refresh fires inside the 4 s ready window, so the timer is still pending
+    // when the failure unmounts the frame.
+    const expiresAt = Math.floor(Date.now() / 1000) + 5 * 60 + 3;
+    authenticatedFetchMock
+      .mockResolvedValueOnce(mintResponse(ENTRY_URL, NONCE, expiresAt))
+      .mockResolvedValueOnce(new Response("down", { status: 503 }));
+    renderViewer();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    const iframe = screen.getByTitle("HTML preview") as HTMLIFrameElement;
+    const postMessage = vi.fn();
+    Object.defineProperty(iframe, "contentWindow", {
+      configurable: true,
+      value: { postMessage },
+    });
+    fireEvent.load(iframe);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_500);
+    });
+    expect(screen.queryByTitle("HTML preview")).toBeNull();
+    expect(screen.getByText("Host offline")).toBeTruthy();
+
+    // Past when the ready timer would have fired: it must not have outlived
+    // the frame it belonged to.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(screen.queryByText("Comments are unavailable for this preview")).toBeNull();
   });
 });
 

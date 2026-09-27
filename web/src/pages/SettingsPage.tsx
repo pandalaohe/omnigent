@@ -116,6 +116,7 @@ import {
 import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutEditor } from "@/components/KeyboardShortcutEditor";
 import { ApprovalTimeoutSettings } from "@/components/ApprovalTimeoutSettings";
+import { ArtifactSharingSettings } from "@/components/ArtifactSharingSettings";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
 import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
@@ -1712,6 +1713,10 @@ function GeneralSection() {
         <h2 className="mt-3 text-ui font-medium">Terminal</h2>
         <div className="rounded-xl border border-border bg-card p-4">
           <TerminalClipboardControl />
+        </div>
+        <h2 className="mt-3 text-ui font-medium">Links</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ArtifactSharingSettings />
         </div>
       </div>
     </Section>

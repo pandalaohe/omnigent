@@ -19,7 +19,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
-import { fetchArtifactSource, useArtifactEntry } from "@/hooks/useArtifactLink";
+import {
+  artifactErrorMessage,
+  type ArtifactEntry,
+  fetchArtifactEntry,
+  fetchArtifactSource,
+  useArtifactEntry,
+} from "@/hooks/useArtifactLink";
 import { getEmbedRoot, hasOmnigentHostFetcher } from "@/lib/host";
 import { withBasePath } from "@/lib/basePath";
 import { randomUUID } from "@/lib/randomUUID";
@@ -90,6 +96,12 @@ const ARTIFACT_TAIL_RE = /\/v1\/artifacts\/[^/]+\/(.*)$/;
 /** How long after an iframe load we wait for the bridge's `ready`. */
 const BRIDGE_READY_TIMEOUT_MS = 4000;
 
+/** Re-mint a panel token this long before its expiry. */
+const PANEL_REFRESH_LEAD_MS = 5 * 60 * 1000;
+
+/** Largest delay `setTimeout` accepts (32-bit signed milliseconds). */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
 /** Directory of the entry (posix); "/" for a root-level absolute entry. */
 function bundleRoot(entryPath: string): string {
   const slash = entryPath.lastIndexOf("/");
@@ -132,6 +144,12 @@ function artifactUrlPrefix(url: string): string | null {
   return match ? match[1] : null;
 }
 
+/** Still-encoded bundle-relative path inside a minted artifact URL. */
+function artifactTail(url: string): string | null {
+  const match = ARTIFACT_TAIL_RE.exec(url);
+  return match ? match[1] : null;
+}
+
 export function HtmlCommentViewer({
   conversationId,
   path,
@@ -155,9 +173,21 @@ export function HtmlCommentViewer({
   }, [isEmbed, content]);
 
   const load = useArtifactEntry(conversationId, path, !isEmbed);
-  const entry = load?.status === "ready" ? load.entry : null;
-  const errorMessage = load?.status === "error" ? load.message : null;
+  // A re-minted entry for the same file, swapped in when the panel token nears
+  // expiry; null while the hook's own entry stands. Both outcomes are keyed
+  // like the hook's load so a settlement that raced a file switch is ignored.
+  const loadKey = `${conversationId}\u0000${path}`;
+  const [refreshed, setRefreshed] = useState<{ key: string; entry: ArtifactEntry } | null>(null);
+  const [refreshError, setRefreshError] = useState<{ key: string; message: string } | null>(null);
+  const refreshedEntry = refreshed?.key === loadKey ? refreshed.entry : null;
+  const entry = refreshedEntry ?? (load?.status === "ready" ? load.entry : null);
+  const refreshErrorMessage = refreshError?.key === loadKey ? refreshError.message : null;
+  const errorMessage = refreshErrorMessage ?? (load?.status === "error" ? load.message : null);
   const nonce = embedDoc?.nonce ?? entry?.nonce ?? null;
+  // The preview renders an iframe only in these states; the bridge effect below
+  // takes this as a lifetime input so its channel and ready timer cannot
+  // outlive a frame removed by a refresh failure.
+  const frameVisible = embedDoc !== null || (entry !== null && refreshErrorMessage === null);
 
   // The page the frame currently displays: the entry once loaded, then whatever
   // the bridge reports after in-frame navigation. A navigation starts a fresh
@@ -171,6 +201,9 @@ export function HtmlCommentViewer({
   // Path last reported for display, mirrored by showPage so a `ready` can tell
   // a replaced document from the entry's own first handshake.
   const displayedPathRef = useRef<string | null>(null);
+  // Bundle-relative path (`ready` tail) of the page last reported by the
+  // bridge, so a pre-expiry re-mint can reload the frame where it stands.
+  const frameTailRef = useRef<string | null>(null);
   // A mount's first frame document is the entry; a later `load` replaces it.
   const entryDocumentLoadedRef = useRef(false);
   const [bridgeMissing, setBridgeMissing] = useState(false);
@@ -205,16 +238,55 @@ export function HtmlCommentViewer({
     navGenRef.current += 1;
     sourcePendingRef.current = false;
     entryDocumentLoadedRef.current = false;
+    frameTailRef.current = null;
+    setRefreshed(null);
+    setRefreshError(null);
     showPage(null);
     setBridgeMissing(false);
   }, [conversationId, path, isEmbed, showPage]);
 
-  // The entry's source is known as soon as its fetch lands.
+  // The entry's source is known as soon as its fetch lands. A refresh replaces
+  // the entry while the frame may stand on a linked page: that page's own
+  // source stays authoritative until its reload reports and refetches.
   useEffect(() => {
     if (!entry) return;
+    if (displayedPathRef.current !== null && displayedPathRef.current !== path) return;
     sourcePendingRef.current = false;
     showPage({ path, source: entry.source });
   }, [entry, path, showPage]);
+
+  // Panel tokens die 12 h after their mint; re-mint shortly before that and let
+  // the iframe reload at the page it currently shows. A failed re-mint surfaces
+  // the panel's error state — no silent retry loop.
+  useEffect(() => {
+    if (isEmbed || !entry || entry.expires_at === null) return;
+    let cancelled = false;
+    const delay = Math.max(
+      0,
+      Math.min(entry.expires_at * 1000 - Date.now() - PANEL_REFRESH_LEAD_MS, MAX_TIMEOUT_MS),
+    );
+    const timer = window.setTimeout(() => {
+      fetchArtifactEntry(conversationId, path).then(
+        (fresh) => {
+          if (cancelled) return;
+          const tail = frameTailRef.current ?? artifactTail(entry.url);
+          const prefix = artifactUrlPrefix(fresh.url);
+          setRefreshed({
+            key: loadKey,
+            entry: prefix && tail ? { ...fresh, url: prefix + tail } : fresh,
+          });
+        },
+        (err: unknown) => {
+          if (cancelled) return;
+          setRefreshError({ key: loadKey, message: artifactErrorMessage(err) });
+        },
+      );
+    }, delay);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [conversationId, path, isEmbed, entry, loadKey]);
 
   // Lift the displayed page so comments are read/written under its path; the
   // frame going away falls comments back to the viewer's own file.
@@ -225,6 +297,8 @@ export function HtmlCommentViewer({
 
   // Establish the MessageChannel once the iframe document has loaded. Parent-
   // initiated handshake (post init on load) avoids a ready/listen race.
+  // `frameVisible` is only a lifetime input: when it flips false the cleanup
+  // below must close the channel and drop a pending ready timer.
   useEffect(() => {
     const iframe = iframeRef.current;
     if (!iframe || !nonce) return;
@@ -250,6 +324,7 @@ export function HtmlCommentViewer({
       const framePage = framePageFor(pathname, path);
       if (!framePage || !entry) return;
       const { pagePath } = framePage;
+      frameTailRef.current = framePage.tail;
       // A ready naming another page means the frame replaced its document:
       // drop the previous page's selection and floating composer. The entry's
       // first handshake names the page shown, keeping a parent-applied one.
@@ -407,7 +482,7 @@ export function HtmlCommentViewer({
       channel?.port1.close();
       portRef.current = null;
     };
-  }, [nonce, isEmbed, path, entry, showPage]);
+  }, [nonce, isEmbed, path, entry, showPage, frameVisible]);
 
   // Push comment-list changes into the frame.
   useEffect(() => {
@@ -439,31 +514,32 @@ export function HtmlCommentViewer({
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, []);
 
-  const preview = entry ? (
-    <iframe
-      ref={iframeRef}
-      src={withBasePath(entry.url)}
-      sandbox={HTML_PREVIEW_SANDBOX}
-      title="HTML preview"
-      className="w-full h-full border-0"
-    />
-  ) : embedDoc ? (
-    <iframe
-      ref={iframeRef}
-      srcDoc={embedDoc.srcDoc}
-      sandbox={HTML_PREVIEW_SANDBOX}
-      title="HTML preview"
-      className="w-full h-full border-0"
-    />
-  ) : errorMessage ? (
-    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-      {errorMessage}
-    </div>
-  ) : (
-    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-      Loading…
-    </div>
-  );
+  const preview =
+    entry && !refreshError ? (
+      <iframe
+        ref={iframeRef}
+        src={withBasePath(entry.url)}
+        sandbox={HTML_PREVIEW_SANDBOX}
+        title="HTML preview"
+        className="w-full h-full border-0"
+      />
+    ) : embedDoc ? (
+      <iframe
+        ref={iframeRef}
+        srcDoc={embedDoc.srcDoc}
+        sandbox={HTML_PREVIEW_SANDBOX}
+        title="HTML preview"
+        className="w-full h-full border-0"
+      />
+    ) : errorMessage ? (
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+        {errorMessage}
+      </div>
+    ) : (
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+        Loading…
+      </div>
+    );
 
   return (
     <div className="flex h-full flex-col">
