@@ -201,6 +201,27 @@ def create_custom_agents_router(
             merged.append({**member, "host_id": host_id} if host_id else member)
         return merged
 
+    def scalar_member_hosts(
+        stored: list[dict[str, Any]] | None, projected: list[dict[str, Any]]
+    ) -> dict[str, str | None]:
+        """Recover stored hosts for a scalar PATCH's rebuilt roster.
+
+        Hosts merge by role, but a rename rewrites the lead's role name. The
+        lead is the stored member flagged ``lead``, so its host follows the
+        renamed role instead of dropping with the old name.
+        """
+        hosts = hosts_by_role(stored)
+        stored_lead = next((member for member in stored or [] if member.get("lead")), None)
+        projected_lead = next((member for member in projected if member["lead"]), None)
+        if (
+            stored_lead is not None
+            and stored_lead.get("host_id")
+            and projected_lead is not None
+            and str(projected_lead["name"]) not in hosts
+        ):
+            hosts[str(projected_lead["name"])] = stored_lead["host_id"]
+        return hosts
+
     async def validate_member_hosts(user_id: str | None, host_ids: set[str]) -> None:
         """Refuse a host id the owner cannot use; an offline host is accepted."""
         for host_id in sorted(host_ids):
@@ -443,6 +464,7 @@ def create_custom_agents_router(
             spec = validate(data)
             location = bundle_location(agent_id, data)
             artifact_store.put(location, data)
+            projected = project_members(spec)
             if request_members is not None:
                 # A members PATCH is a full roster replacement: each request
                 # member's host (or its absence) is authoritative.
@@ -450,7 +472,7 @@ def create_custom_agents_router(
             else:
                 # A scalar PATCH rebuilds the column from the bundle, which
                 # never carries hosts, so carry the stored ones over by role.
-                member_hosts = hosts_by_role(row["members"])
+                member_hosts = scalar_member_hosts(row["members"], projected)
             updated = store.update(
                 owner_id,
                 agent_id,
@@ -460,7 +482,7 @@ def create_custom_agents_router(
                     "description": spec.description,
                     "harness": spec.executor.harness_kind,
                     "model": spec.executor.model,
-                    "members": merge_member_hosts(project_members(spec), member_hosts),
+                    "members": merge_member_hosts(projected, member_hosts),
                     "bundle_location": location,
                 },
             )
