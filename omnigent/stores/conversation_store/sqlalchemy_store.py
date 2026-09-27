@@ -29,6 +29,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy import cast as sql_cast
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
@@ -101,6 +102,7 @@ from omnigent.stores.conversation_store import (
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVE_LOCK_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    ARTIFACT_LINK_KEY_LABEL,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -1629,6 +1631,82 @@ class SqlAlchemyConversationStore(ConversationStore):
             _upsert_labels(session, conversation_id, stable_updates, stamp)
 
         run_write_transaction(self._conv_session_immediate, "set_labels", write)
+
+    def insert_label_if_absent(
+        self,
+        conversation_id: str,
+        key: str,
+        value: str,
+    ) -> str:
+        """
+        Insert a label only while its key is absent; return the stored value.
+
+        First-writer-wins creation of a per-session secret (the
+        artifact-link key): concurrent first creators each attempt the
+        insert, exactly one wins, and every caller signs with the value
+        actually stored. An upsert would let the losers overwrite the
+        winner, minting links against a key another caller never sees.
+
+        Dialect-aware like :meth:`set_labels`: SQLite / PostgreSQL-family
+        databases use ``INSERT ... ON CONFLICT DO NOTHING``, other dialects
+        insert inside a SAVEPOINT and treat the duplicate-key error as the
+        lost race.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param key: The label key to create, e.g.
+            ``"omnigent.artifact_link_key"``.
+        :param value: Value to store when the key is absent.
+        :returns: The stored value — the pre-existing one when another
+            writer won the race.
+        """
+        stamp = now_epoch()
+        workspace_id = current_workspace_id()
+        row = {
+            "workspace_id": workspace_id,
+            "conversation_id": conversation_id,
+            "key": key,
+            "value": value[:LABEL_VALUE_MAX_LEN],
+            "updated_at": stamp,
+        }
+
+        def write(session: Session) -> str:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            stored_query = select(SqlConversationLabel.value).where(
+                SqlConversationLabel.workspace_id == workspace_id,
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == key,
+            )
+            if dialect == "sqlite" or is_postgresql_family(dialect):
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as guarded_insert
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as guarded_insert
+
+                session.execute(
+                    guarded_insert(SqlConversationLabel)
+                    .values(row)
+                    .on_conflict_do_nothing(
+                        index_elements=["workspace_id", "conversation_id", "key"]
+                    )
+                )
+            else:
+                # Generic dialects (MySQL reachable): the insert is the race
+                # arbiter; its SAVEPOINT isolates the loser's duplicate-key
+                # error, and the locking read sees the winner under any snapshot.
+                try:
+                    with session.begin_nested():
+                        session.add(SqlConversationLabel(**row))
+                except IntegrityError:
+                    pass
+                stored_query = stored_query.with_for_update()
+            return session.execute(stored_query).scalar_one()
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "insert_label_if_absent",
+            write,
+        )
 
     def claim_conversation_deletion(
         self,
@@ -4488,6 +4566,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     if archived:
                         _upsert_labels(
                             ap_sess, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now
+                        )
+                        # Archive revokes every artifact link: old tokens then
+                        # mismatch the missing stored key (410), and unarchive
+                        # leaves it absent so the next mint creates a new key.
+                        ap_sess.execute(
+                            delete(SqlConversationLabel).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.key == ARTIFACT_LINK_KEY_LABEL,
+                            )
                         )
                     else:
                         ap_sess.execute(

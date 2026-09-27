@@ -13,6 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -27,7 +28,14 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import (
+    ARTIFACT_LINK_KEY_LABEL,
+    ConversationStore,
+    drop_server_secret_labels,
+    is_artifact_link_key,
+)
+
+_logger = logging.getLogger(__name__)
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -128,7 +136,10 @@ class PolicyEngine:
         # approving once covers the whole tree — a sub-agent runs as its own
         # conversation. Defaults to ``conversation_id`` for a top-level session.
         self._root_conversation_id = root_conversation_id or conversation_id
-        self._labels = dict(initial_labels)
+        # The artifact-link secret must not be readable by any policy: gate
+        # conditions, function callables' ``context.labels``, and denial
+        # reasons all draw from this cache.
+        self._labels = drop_server_secret_labels(dict(initial_labels))
         self._session_state: dict[str, Any] = dict(initial_session_state or {})
         self._usage: dict[str, float] = dict(
             initial_usage
@@ -510,7 +521,9 @@ class PolicyEngine:
         parity — "unschema'd labels set freely"). The engine
         applies the filtered dict in a single UPSERT through
         the store so either every surviving write lands or
-        none do.
+        none do. A write for the server-reserved artifact-link
+        key is dropped with a warning — no policy may seed or
+        rotate the artifact-link secret.
 
         :param set_labels: Mapping of label key to new value.
             No-op on empty dict. Writes update both the hot
@@ -519,6 +532,13 @@ class PolicyEngine:
         """
         if not set_labels:
             return
+        if any(is_artifact_link_key(key) for key in set_labels):
+            _logger.warning(
+                "Dropping policy label write for server-reserved key %r (conversation %s)",
+                ARTIFACT_LINK_KEY_LABEL,
+                self._conversation_id,
+            )
+            set_labels = drop_server_secret_labels(set_labels)
         filtered = self._filter_schema_valid(set_labels)
         if not filtered:
             return

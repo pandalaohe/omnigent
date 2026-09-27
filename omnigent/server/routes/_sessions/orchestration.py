@@ -389,6 +389,7 @@ from omnigent.stores.conversation_store import (
     NameAlreadyExistsError,
     NativeRecoveryItemSkipped,
     NativeReplayConflictError,
+    drop_server_secret_labels,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -1562,11 +1563,16 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
       ``omnigent.sandbox.repo`` as the space-joined list so clients that read
       the bare key (e.g. the fork dialog) see every repo.
 
+    The artifact-link secret (``ARTIFACT_LINK_KEY_LABEL``) is never presented:
+    it keys every artifact URL of the session, so a viewer holding it could
+    forge links.
+
     :param labels: The stored conversation labels.
     :param user_id: The requesting viewer, or ``None`` in single-user mode.
     :returns: A copy with the pin and sandbox-repo families collapsed to their
-        canonical bare keys.
+        canonical bare keys, and server-secret keys removed.
     """
+    labels = drop_server_secret_labels(labels)
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
     repos = read_managed_repo_workspaces(labels)

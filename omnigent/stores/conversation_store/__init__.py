@@ -3,6 +3,7 @@
 import hashlib
 import math
 import time
+import unicodedata
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -194,6 +195,42 @@ def pinned_label_key(user_id: str | None) -> str:
 # match that fallback's unit.
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
+# Per-session secret keying artifact-link tokens; server-internal (never
+# client-settable, never shown to viewers). Deleting or rotating it revokes
+# every link of the session.
+ARTIFACT_LINK_KEY_LABEL = "omnigent.artifact_link_key"
+
+
+def is_artifact_link_key(key: str) -> bool:
+    """
+    Return whether ``key`` is the server-reserved artifact-link key.
+
+    :param key: A label key to test.
+    :returns: ``True`` for :data:`ARTIFACT_LINK_KEY_LABEL` and every
+        case-, accent- or surrounding-whitespace variant of it.
+    """
+    # MySQL's default utf8mb4_0900_ai_ci collation matches keys case- and
+    # accent-insensitively, so a variant spelling can select and overwrite the
+    # stored canonical row; normalize before comparing to catch every collision.
+    normalized = unicodedata.normalize("NFKD", key.strip()).casefold()
+    plain = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return plain == ARTIFACT_LINK_KEY_LABEL
+
+
+def drop_server_secret_labels(labels: dict[str, str]) -> dict[str, str]:
+    """
+    Remove server-secret label keys from a label map headed elsewhere.
+
+    ``ARTIFACT_LINK_KEY_LABEL`` is the per-session secret that signs artifact
+    capability URLs: any holder of the value can forge links for the session,
+    so it must never leave the server — not in a session payload, a label
+    response, a runner init snapshot, or a policy's label view.
+
+    :param labels: The stored conversation labels.
+    :returns: A copy with every server-secret key removed.
+    """
+    return {key: value for key, value in labels.items() if not is_artifact_link_key(key)}
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -215,6 +252,10 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 #     typed re-confirmation and no banner, violating the "impossible to
 #     enable accidentally" contract (#657). Dropping it forces each session
 #     that runs bypass to make its own explicit opt-in.
+#
+#   * Per-session secret — :data:`ARTIFACT_LINK_KEY_LABEL`. Inheriting it
+#     would keep the source's links valid against a new session context whose
+#     viewers never held them; the clone mints its own key on first use.
 _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
@@ -225,6 +266,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.goal_state",
         "omnigent.last_provider_usage_limits",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        ARTIFACT_LINK_KEY_LABEL,
     }
 )
 
@@ -1200,6 +1242,32 @@ class ConversationStore(ABC):
             audit trails aligned with the enforcement site
             rather than wall-clock drift between evaluate()
             and the actual DB write.
+        """
+        ...
+
+    @abstractmethod
+    def insert_label_if_absent(
+        self,
+        conversation_id: str,
+        key: str,
+        value: str,
+    ) -> str:
+        """
+        Insert a label only while its key is absent; return the stored value.
+
+        First-writer-wins creation of a per-session secret (the
+        artifact-link key): concurrent first creators each attempt the
+        insert, exactly one wins, and every caller signs with the value
+        actually stored. An upsert would let the losers overwrite the
+        winner, minting links against a key another caller never sees.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param key: The label key to create, e.g.
+            ``"omnigent.artifact_link_key"``.
+        :param value: Value to store when the key is absent.
+        :returns: The stored value — the pre-existing one when another
+            writer won the race.
         """
         ...
 

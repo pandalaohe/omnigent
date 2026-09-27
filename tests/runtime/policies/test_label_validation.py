@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import LabelDef
+from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -121,3 +122,35 @@ def test_apply_label_writes_values_only_free_transitions(
     # Out-of-enum still rejected.
     engine.apply_label_writes({"role": "root"})
     assert engine.labels["role"] == "guest"
+
+
+def test_apply_label_writes_refuses_the_artifact_link_key(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A policy cannot seed or rotate the artifact-link secret.
+
+    The key signs every artifact capability URL of the session, so writing it
+    from a policy would let that policy mint links for viewers. The write is
+    dropped from both the hot cache and the persisted labels; the other key in
+    the same batch still lands.
+    """
+    conv = conversation_store.create_conversation()
+    engine = PolicyEngine(
+        policies=[],
+        label_defs={},
+        ask_timeout=30,
+        conversation_id=conv.id,
+        initial_labels={},
+        conversation_store=conversation_store,
+    )
+
+    engine.apply_label_writes({ARTIFACT_LINK_KEY_LABEL: "forged", "kept": "1"})
+    # The stored key's MySQL collation folds case variants onto the same row,
+    # so a case-variant write must be dropped too, not just the exact spelling.
+    engine.apply_label_writes({"OMNIGENT.ARTIFACT_LINK_KEY": "forged-again"})
+
+    assert engine.labels == {"kept": "1"}
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
+    assert ARTIFACT_LINK_KEY_LABEL not in stored.labels
+    assert stored.labels == {"kept": "1"}

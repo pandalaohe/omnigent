@@ -17,7 +17,11 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
 )
-from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    ARCHIVED_AT_LABEL_KEY,
+    ARTIFACT_LINK_KEY_LABEL,
+    is_artifact_link_key,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -146,6 +150,43 @@ def test_set_labels_many_keys_atomic(
     # All 20 keys present — partial commits would leave some
     # missing; transaction rollback would leave none.
     assert got.labels == updates
+
+
+def test_insert_label_if_absent_first_writer_wins(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The first insert stores the value; a second call returns it instead of
+    overwriting. First-writer-wins creation is what lets concurrent first
+    artifact-link mints converge on one key — an upsert would let the second
+    writer silently replace the key the first caller already signed with."""
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.insert_label_if_absent(conv.id, ARTIFACT_LINK_KEY_LABEL, "first")
+    second = conversation_store.insert_label_if_absent(conv.id, ARTIFACT_LINK_KEY_LABEL, "second")
+
+    assert first == "first"
+    # The loser gets the winner's value back, not its own.
+    assert second == "first"
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels[ARTIFACT_LINK_KEY_LABEL] == "first"
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        (ARTIFACT_LINK_KEY_LABEL, True),
+        ("OMNIGENT.ARTIFACT_LINK_KEY", True),
+        ("omnigent.artifact_link_kéy", True),
+        ("  omnigent.artifact_link_key\t", True),
+        ("unrelated", False),
+    ],
+)
+def test_is_artifact_link_key_matches_collation_variants(key: str, expected: bool) -> None:
+    """The label key column's MySQL collation treats case- and accent-variants
+    as the same key, so the reserved-key predicate must match them too; an
+    exact string compare would let a variant overwrite the stored secret row."""
+    assert is_artifact_link_key(key) is expected
 
 
 # ── Survival across conversation_items churn ───────────
@@ -471,6 +512,26 @@ def test_archive_stamps_archived_at_once_and_clears_on_unarchive(
     restored = conversation_store.get_conversation(conv.id)
     assert restored is not None
     assert ARCHIVED_AT_LABEL_KEY not in restored.labels
+
+
+def test_archive_deletes_artifact_link_key_and_unarchive_leaves_it_absent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Archiving revokes every artifact link by deleting the session key in the
+    same transaction, and unarchiving must not revive them — the key stays
+    absent so the next mint creates a fresh one (old tokens → revoked)."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {ARTIFACT_LINK_KEY_LABEL: "stored-key"})
+
+    conversation_store.update_conversation(conv.id, archived=True)
+    archived = conversation_store.get_conversation(conv.id)
+    assert archived is not None
+    assert ARTIFACT_LINK_KEY_LABEL not in archived.labels
+
+    conversation_store.update_conversation(conv.id, archived=False)
+    restored = conversation_store.get_conversation(conv.id)
+    assert restored is not None
+    assert ARTIFACT_LINK_KEY_LABEL not in restored.labels
 
 
 def test_fork_does_not_inherit_archived_at_label(

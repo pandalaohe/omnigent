@@ -32,6 +32,7 @@ from omnigent.spec.types import (
     PhaseSelector,
     PolicyAction,
 )
+from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -195,6 +196,31 @@ async def test_event_context_carries_labels_snapshot(
     # corrupt the engine's hot cache (a shared reference would).
     bucket["event"]["context"]["labels"]["integrity"] = "0"
     assert engine.labels["integrity"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_event_context_omits_the_artifact_link_secret(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A stored artifact-link key never reaches a policy.
+
+    The key signs every artifact capability URL of the session, and a policy
+    can surface what it reads (e.g. in a denial reason published to viewers),
+    so it must be absent from the event's label context and the hot cache —
+    even when the persisted conversation labels carry it.
+    """
+    bucket: dict[str, Any] = {}
+    policy = _capturing_policy(bucket)
+    engine = _build(
+        conversation_store,
+        [policy],
+        initial_labels={"kept": "yes", ARTIFACT_LINK_KEY_LABEL: "stored-secret"},
+    )
+
+    await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
+
+    assert bucket["event"]["context"]["labels"] == {"kept": "yes"}
+    assert ARTIFACT_LINK_KEY_LABEL not in engine.labels
 
 
 # ── Engine labels still work correctly ──

@@ -47,7 +47,12 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import (
+    ARTIFACT_LINK_KEY_LABEL,
+    ConversationStore,
+    drop_server_secret_labels,
+    is_artifact_link_key,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -964,6 +969,16 @@ def _seed_and_load_labels(
         for key, ldef in label_defs.items()
         if ldef.initial is not None and key not in existing
     }
+    if any(is_artifact_link_key(key) for key in to_seed):
+        # The artifact-link key is minted server-side; a bundle must not seed
+        # (nor a policy later rotate) the secret that signs its links.
+        _logger.warning(
+            "Refusing to seed server-reserved key %r from the agent's label definitions "
+            "(conversation %s)",
+            ARTIFACT_LINK_KEY_LABEL,
+            conversation_id,
+        )
+        to_seed = drop_server_secret_labels(to_seed)
     if to_seed:
         conversation_store.set_labels(conversation_id, to_seed)
         # Re-read to pick up the freshly seeded values plus any
