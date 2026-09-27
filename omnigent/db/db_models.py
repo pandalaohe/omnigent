@@ -2474,10 +2474,10 @@ class SqlSessionHandoff(OmnigentBase):
             "ix_session_handoffs_branch_state",
             "workspace_id",
             "host_id",
-            "root",
+            "checkout",
             "git_branch",
             "state",
-            mysql_length={"root": 191},
+            mysql_length={"checkout": 191},
         ),
     )
 

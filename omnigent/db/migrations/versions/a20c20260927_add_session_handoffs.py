@@ -62,14 +62,14 @@ def upgrade() -> None:
         ("sender_created", ["sender_session_id", "created_at"]),
         ("receiver_state", ["receiver_session_id", "state"]),
         ("state_expires", ["state", "expires_at"]),
-        ("branch_state", ["host_id", "root", "git_branch", "state"]),
+        ("branch_state", ["host_id", "checkout", "git_branch", "state"]),
     ):
         if name == "branch_state":
             op.create_index(
                 f"ix_session_handoffs_{name}",
                 "session_handoffs",
                 ["workspace_id", *columns],
-                mysql_length={"root": 191},
+                mysql_length={"checkout": 191},
             )
         else:
             op.create_index(
