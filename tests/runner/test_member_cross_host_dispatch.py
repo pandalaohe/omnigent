@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any
 
@@ -453,6 +454,7 @@ class _LivenessServerClient:
         missing: bool = False,
         fail: bool = False,
         server_error: bool = False,
+        during_read: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """
         Configure the child read's answer.
@@ -461,16 +463,21 @@ class _LivenessServerClient:
         :param missing: Answer 404 (session gone).
         :param fail: Raise a transport error.
         :param server_error: Answer 503.
+        :param during_read: Hook awaited while the read is in flight, to race
+            the runner's work registry before the answer is applied.
         """
         self._status = status
         self._missing = missing
         self._fail = fail
         self._server_error = server_error
+        self._during_read = during_read
         self.reads: list[tuple[str, dict[str, Any]]] = []
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         """Record the read, then answer from the configured shape."""
         self.reads.append((url, dict(kwargs.get("params") or {})))
+        if self._during_read is not None:
+            await self._during_read()
         if self._fail:
             raise httpx.ConnectError("server unreachable")
         if self._missing:
@@ -689,6 +696,72 @@ async def test_remote_member_liveness_skips_a_failed_server_read(
     assert failed == [entry]
     assert len(retry.reads) == 1
     assert inbox.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_remote_member_liveness_stands_down_when_completion_lands_during_the_read(
+    _clean_subagent_registry: None,
+) -> None:
+    """A completion that lands while the read is in flight is never overwritten."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_member_cross_host"] = inbox
+
+    async def _complete() -> None:
+        runner_app.mark_subagent_work_terminal(_CHILD_ID, status="completed", output="late result")
+
+    server_client = _LivenessServerClient(status="idle", during_read=_complete)
+    failed = await runner_app.check_remote_member_liveness(
+        server_client=server_client,  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 601.0,
+    )
+
+    assert failed == []
+    assert entry.status == "completed"
+    payload = inbox.get_nowait()
+    assert payload["status"] == "completed"
+    assert payload["output"] == "late result"
+    assert inbox.empty()
+    assert server_client.reads == [(f"/v1/sessions/{_CHILD_ID}", _LIVENESS_READ_PARAMS)]
+
+
+@pytest.mark.asyncio
+async def test_remote_member_liveness_leaves_a_replacement_dispatch_untouched(
+    _clean_subagent_registry: None,
+) -> None:
+    """A new dispatch for the same child during the read keeps its own outcome."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_member_cross_host"] = inbox
+
+    async def _replace() -> None:
+        runner_app.register_subagent_work(
+            parent_session_id="conv_member_cross_host",
+            child_session_id=_CHILD_ID,
+            agent="worker",
+            title="task-2",
+            remote=True,
+            host_id=_MEMBER_HOST,
+        )
+        runner_app.mark_subagent_work_started(_CHILD_ID)
+
+    server_client = _LivenessServerClient(status="idle", during_read=_replace)
+    failed = await runner_app.check_remote_member_liveness(
+        server_client=server_client,  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 601.0,
+    )
+
+    assert failed == []
+    current = runner_app.get_subagent_work(_CHILD_ID)
+    assert current is not None and current is not entry
+    assert current.status == "running"
+    assert inbox.empty()
 
 
 @pytest.mark.asyncio

@@ -2737,6 +2737,13 @@ async def check_remote_member_liveness(
                 extra={"session_id": entry.child_session_id},
             )
             continue
+        # The awaited read can race the registry: a completion may have landed,
+        # or a new dispatch replaced this entry. Fail only the same, still-live
+        # entry the stale read described.
+        if _subagent_work_by_child.get(entry.child_session_id) is not entry:
+            continue
+        if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+            continue
         if resp.status_code == 404:
             live = False
         elif resp.status_code == 200:
