@@ -3568,6 +3568,9 @@ def create_app(
     if custom_agents_store is None and isinstance(agent_store, SqlAlchemyAgentStore):
         custom_agents_store = CustomAgentsStore(agent_store.storage_location)
     if custom_agents_store is not None:
+        # The session create path reads a multipart create's template id from
+        # this store to resolve the template members' hosts.
+        app.state.custom_agents_store = custom_agents_store
         app.include_router(
             create_custom_agents_router(
                 custom_agents_store,
@@ -3576,6 +3579,7 @@ def create_app(
                 conversation_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
+                host_store=host_store,
             ),
             prefix="/v1",
             tags=["custom-agents"],

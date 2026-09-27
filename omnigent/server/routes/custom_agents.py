@@ -39,6 +39,7 @@ from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.spec.validator import _AGENT_NAME_PATTERN
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 
 MAX_MULTIPART_REQUEST_BYTES = MAX_BUNDLE_BYTES + 1024 * 1024
@@ -46,7 +47,11 @@ _INSTRUCTIONS_CACHE_SIZE = 256
 
 
 class AgentMember(BaseModel):
-    """One member of a joint Agent; the lead is the bundle's root spec."""
+    """One member of a joint Agent; the lead is the bundle's root spec.
+
+    ``host_id`` is library-only: it lives in the stored members projection and
+    never enters the portable bundle.
+    """
 
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=256)
@@ -55,6 +60,7 @@ class AgentMember(BaseModel):
     model: str | None = Field(default=None, max_length=512)
     reasoning_effort: str | None = None
     lead: bool
+    host_id: str | None = Field(default=None, max_length=256)
 
     @field_validator("name")
     @classmethod
@@ -105,6 +111,7 @@ def create_custom_agents_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    host_store: HostStore | None = None,
 ) -> APIRouter:
     router = APIRouter()
     instructions_cache: OrderedDict[str, str | None] = OrderedDict()
@@ -170,6 +177,43 @@ def create_custom_agents_router(
             **public(row),
             "instructions": instructions_for(row["bundle_location"]),
         }
+
+    def hosts_by_role(rows: list[dict[str, Any]] | None) -> dict[str, str | None]:
+        """Recover ``{role: host_id}`` from stored or request members."""
+        hosts: dict[str, str | None] = {}
+        for row in rows or []:
+            name = row.get("name")
+            if isinstance(name, str):
+                hosts[name] = row.get("host_id")
+        return hosts
+
+    def merge_member_hosts(
+        projected: list[dict[str, Any]], hosts: dict[str, str | None]
+    ) -> list[dict[str, Any]]:
+        """Fold library-only host ids into a freshly projected roster.
+
+        Hosts merge by role, so a rewrite that keeps a role keeps its host and a
+        role that disappeared (or was renamed) drops it.
+        """
+        merged: list[dict[str, Any]] = []
+        for member in projected:
+            host_id = hosts.get(str(member["name"]))
+            merged.append({**member, "host_id": host_id} if host_id else member)
+        return merged
+
+    async def validate_member_hosts(user_id: str | None, host_ids: set[str]) -> None:
+        """Refuse a host id the owner cannot use; an offline host is accepted."""
+        for host_id in sorted(host_ids):
+            host = (
+                await asyncio.to_thread(host_store.get_host, host_id)
+                if host_store is not None
+                else None
+            )
+            if host is None or (user_id is not None and host.user_id != user_id):
+                raise OmnigentError(
+                    f"unknown host {host_id!r}; pick one of your hosts or the session host",
+                    code=ErrorCode.INVALID_INPUT,
+                )
 
     def persist_new(owner_id: str, data: bytes) -> dict[str, Any]:
         spec = validate(data)
@@ -342,6 +386,7 @@ def create_custom_agents_router(
         request: Request, agent_id: str, body: CustomAgentPatch
     ) -> dict[str, Any]:
         owner_id = owner(request)
+        user_id = require_user(request, auth_provider)
         row = await asyncio.to_thread(store.get, owner_id, agent_id)
         if body.version is not None and body.version != row["version"]:
             raise OmnigentError(
@@ -378,15 +423,34 @@ def create_custom_agents_router(
                     "lead member description must match the Agent description",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            await validate_member_hosts(
+                user_id, {member.host_id for member in members if member.host_id}
+            )
         changes = body.model_dump(exclude_unset=True, exclude={"version"})
         if not changes:
             return await asyncio.to_thread(detail, owner_id, row)
+        request_members: list[dict[str, Any]] | None = changes.get("members")
+        if request_members is not None:
+            # The host id is library-only; the bundle's member rewrite must
+            # never see it.
+            changes["members"] = [
+                {key: value for key, value in member.items() if key != "host_id"}
+                for member in request_members
+            ]
 
         def update() -> dict[str, Any]:
             data = patch_bundle(artifact_bytes(row["bundle_location"]), changes)
             spec = validate(data)
             location = bundle_location(agent_id, data)
             artifact_store.put(location, data)
+            if request_members is not None:
+                # A members PATCH is a full roster replacement: each request
+                # member's host (or its absence) is authoritative.
+                member_hosts = hosts_by_role(request_members)
+            else:
+                # A scalar PATCH rebuilds the column from the bundle, which
+                # never carries hosts, so carry the stored ones over by role.
+                member_hosts = hosts_by_role(row["members"])
             updated = store.update(
                 owner_id,
                 agent_id,
@@ -396,7 +460,7 @@ def create_custom_agents_router(
                     "description": spec.description,
                     "harness": spec.executor.harness_kind,
                     "model": spec.executor.model,
-                    "members": project_members(spec),
+                    "members": merge_member_hosts(project_members(spec), member_hosts),
                     "bundle_location": location,
                 },
             )

@@ -26,6 +26,7 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 
@@ -126,8 +127,9 @@ def roster_member(
     model: str | None = None,
     reasoning_effort: str | None = None,
     description: str | None = None,
+    host_id: str | None = None,
 ) -> dict[str, object]:
-    return {
+    member: dict[str, object] = {
         "name": name,
         "description": description,
         "harness": harness,
@@ -135,9 +137,12 @@ def roster_member(
         "reasoning_effort": reasoning_effort,
         "lead": lead,
     }
+    if host_id is not None:
+        member["host_id"] = host_id
+    return member
 
 
-def make_app(db_uri: str, tmp_path: Path):
+def make_app(db_uri: str, tmp_path: Path, *, host_store: HostStore | None = None):
     artifacts = LocalArtifactStore(str(tmp_path / "custom-artifacts"))
     agents = SqlAlchemyAgentStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -150,6 +155,7 @@ def make_app(db_uri: str, tmp_path: Path):
         AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "custom-cache"),
         auth_provider=HeaderAuth(),
         permission_store=permissions,
+        host_store=host_store,
     )
     return app, artifacts, agents, conversations, permissions
 
@@ -398,6 +404,261 @@ async def test_patch_members_rewrites_bundle_row_and_projection(
     assert sub["executor"]["config"]["harness"] == "codex"
     assert sub["executor"]["model"] == "research-model"
     assert sub["executor"]["reasoning_effort"] == "medium"
+
+
+_LEAD_HOST = "a1" * 16
+_WORKER_HOST = "b2" * 16
+
+
+def _arm_hosts(hosts: HostStore, *host_ids: str, owner: str = "alice") -> None:
+    for host_id in host_ids:
+        hosts.upsert_on_connect(host_id, f"laptop-{host_id[:4]}", owner)
+
+
+async def _create_joint(client: httpx.AsyncClient, headers: dict[str, str]) -> str:
+    created = await client.post(
+        "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", joint_bundle())}
+    )
+    assert created.status_code == 201, created.text
+    return str(created.json()["id"])
+
+
+def _hosted_roster() -> list[dict[str, object]]:
+    return [
+        roster_member(
+            "custom-reviewer",
+            lead=True,
+            harness="codex",
+            model="lead-model",
+            description="Lead reviewer",
+            host_id=_LEAD_HOST,
+        ),
+        roster_member(
+            "researcher",
+            harness="claude-sdk",
+            model="research-model",
+            description="Research support",
+            host_id=_WORKER_HOST,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_patch_members_stores_host_ids_outside_the_bundle(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """Member hosts live in the members column: returned by the API, absent
+    from every bundle byte (the downloaded archive included)."""
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST, _WORKER_HOST)
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    roster = _hosted_roster()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["members"] == roster
+        listed = await client.get("/v1/custom-agents", headers=headers)
+        detail = await client.get(f"/v1/custom-agents/{agent_id}", headers=headers)
+        downloaded = await client.get(f"/v1/custom-agents/{agent_id}/contents", headers=headers)
+
+    assert [member["host_id"] for member in listed.json()["data"][0]["members"]] == [
+        _LEAD_HOST,
+        _WORKER_HOST,
+    ]
+    assert [member["host_id"] for member in detail.json()["members"]] == [
+        _LEAD_HOST,
+        _WORKER_HOST,
+    ]
+    archive = members(downloaded.content)
+    for path in ("config.yaml", "agents/researcher/config.yaml"):
+        assert b"host_id" not in archive[path][0]
+    assert _LEAD_HOST.encode() not in downloaded.content
+
+
+@pytest.mark.asyncio
+async def test_patch_scalars_keep_member_hosts_by_role(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """A scalar PATCH rebuilds the members column from the bundle; the stored
+    hosts ride along by role."""
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST, _WORKER_HOST)
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        hosted = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster(), "version": 1},
+        )
+        assert hosted.status_code == 200, hosted.text
+        renamed = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"description": "Retitled", "version": 2},
+        )
+
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["description"] == "Retitled"
+    assert [(member["name"], member["host_id"]) for member in renamed.json()["members"]] == [
+        ("custom-reviewer", _LEAD_HOST),
+        ("researcher", _WORKER_HOST),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_patch_members_drops_the_host_of_a_removed_role(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST, _WORKER_HOST)
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        hosted = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster(), "version": 1},
+        )
+        assert hosted.status_code == 200, hosted.text
+        solo = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster()[:1], "version": 2},
+        )
+
+    assert solo.status_code == 200, solo.text
+    assert solo.json()["members"] == _hosted_roster()[:1]
+
+
+@pytest.mark.asyncio
+async def test_patch_members_clears_a_host_cleared_to_session_host(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """An explicit null host on a request member clears the stored host."""
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST, _WORKER_HOST)
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        hosted = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster(), "version": 1},
+        )
+        assert hosted.status_code == 200, hosted.text
+        cleared_roster = [{**member, "host_id": None} for member in _hosted_roster()]
+        cleared = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": cleared_roster, "version": 2},
+        )
+
+    assert cleared.status_code == 200, cleared.text
+    assert all("host_id" not in member for member in cleared.json()["members"])
+
+
+@pytest.mark.asyncio
+async def test_patch_members_unknown_host_is_a_400(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """A host id that resolves to no row is refused before any write."""
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST)
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster(), "version": 1},
+        )
+        detail = await client.get(f"/v1/custom-agents/{agent_id}", headers=headers)
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_input"
+    assert _WORKER_HOST in response.text
+    assert detail.json()["version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_patch_members_accepts_an_offline_host(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """Offline is a save-time warning, not a rejection."""
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST, _WORKER_HOST)
+    hosts.set_offline(_LEAD_HOST)
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster(), "version": 1},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["members"][0]["host_id"] == _LEAD_HOST
+
+
+@pytest.mark.asyncio
+async def test_patch_members_rejects_another_users_host(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST, _WORKER_HOST, owner="bob")
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster(), "version": 1},
+        )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_input"
 
 
 @pytest.mark.asyncio

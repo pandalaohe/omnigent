@@ -50,7 +50,7 @@
       },
       "AgentMember": {
         "additionalProperties": false,
-        "description": "One member of a joint Agent; the lead is the bundle's root spec.",
+        "description": "One member of a joint Agent; the lead is the bundle's root spec.\n\n`host_id` is library-only: it lives in the stored members projection and\nnever enters the portable bundle.",
         "properties": {
           "description": {
             "anyOf": [
@@ -69,6 +69,18 @@
             "minLength": 1,
             "title": "Harness",
             "type": "string"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
           },
           "lead": {
             "title": "Lead",
