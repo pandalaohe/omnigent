@@ -17023,6 +17023,60 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/member-worktree": {
+      "get": {
+        "description": "Resolve a session's branch worktree on a target host (SCC06 F2b).\n\nA joint-agent member saved on another host runs there in the checkout\nof the same repository and branch the lead session is working in. The\nrunner resolving a remote member dispatch calls this before creating\nthe child: the repository is mapped to *host_id* through the lead\nsession's project, and the lead's recorded branch is matched against\nthat host's worktrees. Every missing fact is a 4xx naming it, so the\nmember dispatch fails loud instead of running somewhere else.\n\n**Returns:** `{session_id, host_id, workspace, repository, branch}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403/404 without read access to the session; 400/409 when the project, host directory, branch, or worktree is missing.",
+        "operationId": "get_session_member_worktree_v1_sessions__session_id__member_worktree_get",
+        "parameters": [
+          {
+            "description": "The lead session id, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target host to resolve the worktree on.",
+            "in": "query",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Member Worktree",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/model-override/reset": {
       "post": {
         "description": "Retire a rejected pick after fallback without replacing a newer selection.",

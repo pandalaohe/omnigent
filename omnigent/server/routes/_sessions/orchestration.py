@@ -10357,6 +10357,11 @@ async def _create_session_from_existing_agent(
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
+            if body.host_id is not None and body.host_id != parent_conv.host_id:
+                # Cross-host member child (SCC06 F2b): the parent's runner
+                # cannot serve the member's host. Leave it unbound so the
+                # create route's host launch starts a runner on that host.
+                inherited_runner_id = None
             if (
                 "project_id" not in request_fields_set
                 and parent_conv.project_id is not None

@@ -2750,6 +2750,142 @@ def _note_member_dispatch_failure(
     )
 
 
+def _member_dispatch_unavailable_error(role: str, host_id: str, reason: str) -> str:
+    """Return the tool error for a member that cannot run on its host (D-M9).
+
+    :param role: The named sub-agent role, e.g. ``"researcher"``.
+    :param host_id: The member's target host id.
+    :param reason: Why the member cannot run there, e.g. ``"the host is
+        offline"``.
+    :returns: An error string naming role, host, and reason.
+    """
+    return f"Error: member {role!r} cannot run on host {host_id!r}: {reason}"
+
+
+async def _member_remote_host(
+    member_entry: _JsonObject | None,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> str | None:
+    """
+    Return the member's host when it differs from the lead session's host.
+
+    A member snapshot whose ``host`` is unset runs on the lead's host — the
+    existing local path. When it is set, the lead session's own ``host_id``
+    decides: equal means the same host (unchanged), anything else is a remote
+    dispatch. An unreadable lead session counts as a different host so the
+    member's target-host checks are never skipped on a lookup hiccup.
+
+    :param member_entry: The role's parsed member snapshot entry, or ``None``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The lead session id.
+    :returns: The remote host id, or ``None`` for a same-host member.
+    """
+    if member_entry is None:
+        return None
+    member_host = member_entry.get("host")
+    if not isinstance(member_host, str) or not member_host:
+        return None
+    lead_host: str | None = None
+    try:
+        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
+        if resp.status_code == 200:
+            lead_host = _optional_string(resp.json().get("host_id"))
+    except (httpx.HTTPError, RuntimeError):
+        lead_host = None
+    return None if lead_host == member_host else member_host
+
+
+async def _member_host_dispatch_error(
+    role: str,
+    host_id: str,
+    harness: str | None,
+    *,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """
+    Re-check the member's target host at dispatch time.
+
+    The snapshot's ``unavailable`` reason covers create-time facts; this reads
+    the host's current status through the server so a host that went offline
+    (or lost the harness) is refused at dispatch. A readiness map that says
+    nothing about the member harness does not block, mirroring the snapshot
+    writer's rule.
+
+    :param role: The named sub-agent role, e.g. ``"researcher"``.
+    :param host_id: The member's target host id.
+    :param harness: The member's frozen harness, or ``None`` to skip the
+        harness check.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: An error string naming role, host, and reason, or ``None`` when
+        the host is online and the harness is reported ready.
+    """
+    try:
+        resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
+    except httpx.HTTPError as exc:
+        return _member_dispatch_unavailable_error(
+            role, host_id, f"host lookup failed: {type(exc).__name__}: {exc}"
+        )
+    if resp.status_code == 404:
+        return _member_dispatch_unavailable_error(role, host_id, "the host is not registered")
+    if resp.status_code in (401, 403):
+        return _member_dispatch_unavailable_error(
+            role, host_id, "the host is not accessible to this session's owner"
+        )
+    if resp.status_code != 200:
+        return _member_dispatch_unavailable_error(
+            role, host_id, f"host lookup returned {resp.status_code}"
+        )
+    body = resp.json()
+    if body.get("status") != "online":
+        return _member_dispatch_unavailable_error(role, host_id, "the host is offline")
+    readiness = body.get("configured_harnesses")
+    if harness and isinstance(readiness, dict):
+        reported = readiness.get(harness)
+        if reported is not None and reported is not True:
+            reason = reported if isinstance(reported, str) and reported else "not configured"
+            return _member_dispatch_unavailable_error(
+                role, host_id, f"harness {harness!r} is not ready there ({reason})"
+            )
+    return None
+
+
+async def _member_workspace_on_host(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    host_id: str,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve the lead session's branch worktree on the member's host.
+
+    Calls the server's member-worktree route, which maps the lead's project
+    repository to *host_id* and matches the lead's recorded branch against the
+    host's worktrees.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The lead session id.
+    :param host_id: The member's target host id.
+    :returns: ``(workspace, error)`` — the worktree path, or a reason string
+        naming the missing fact.
+    """
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{conversation_id}/member-worktree",
+            params={"host_id": host_id},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return None, f"worktree lookup failed: {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        detail = _omnigent_error_message(resp) or f"worktree lookup returned {resp.status_code}"
+        return None, detail
+    workspace = _optional_string(resp.json().get("workspace"))
+    if not workspace:
+        return None, "worktree lookup returned no workspace"
+    return workspace, None
+
+
 async def _execute_subagent_tool(
     args: _JsonObject,
     *,
@@ -2975,6 +3111,7 @@ async def _execute_subagent_tool(
             return existing
     assert not isinstance(existing, str)
     created_child = False
+    remote_child_bound = False
     child_wrapper_label: str | None = None
     work_id = _runner_app.new_subagent_work_id()
     if existing is not None:
@@ -3084,6 +3221,36 @@ async def _execute_subagent_tool(
             session_name = f"{sub_agent_name}-{ordinal}"
             _auto_ordinal = True
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
+        # F2b: a snapshot member saved on another host runs THERE. The target
+        # host re-checks readiness at dispatch (the snapshot's ``unavailable``
+        # covers create-time facts) and supplies the worktree of the lead's
+        # repository + branch; the local CLI probe and model normalization
+        # below never apply to it.
+        remote_host = await _member_remote_host(
+            member_entry,
+            server_client=server_client,
+            conversation_id=conversation_id,
+        )
+        remote_workspace: str | None = None
+        if remote_host is not None:
+            member_harness = _member_harness_name(
+                member_entry.get("harness") if member_entry is not None else None
+            )
+            host_error = await _member_host_dispatch_error(
+                str(sub_agent_name),
+                remote_host,
+                member_harness or child_harness,
+                server_client=server_client,
+            )
+            if host_error is not None:
+                return host_error
+            remote_workspace, workspace_error = await _member_workspace_on_host(
+                server_client, conversation_id, remote_host
+            )
+            if workspace_error is not None:
+                return _member_dispatch_unavailable_error(
+                    str(sub_agent_name), remote_host, workspace_error
+                )
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
         # and the requested harness must canonicalize into OMNIGENT_HARNESSES.
@@ -3137,10 +3304,12 @@ async def _execute_subagent_tool(
         # parent sees as a generic "turn failed" inbox item that hides the
         # cause), and the orchestrator may re-dispatch into the same wall. The
         # which-probe here reads the same PATH the harness boot uses, so the
-        # verdict can't disagree with the real launch.
+        # verdict can't disagree with the real launch. A remote member's
+        # harness runs on its own host — the target-host readiness check above
+        # is the only probe that can judge it.
         from omnigent.onboarding.harness_install import missing_harness_cli
 
-        if child_harness is not None:
+        if child_harness is not None and remote_host is None:
             missing_cli = missing_harness_cli(child_harness)
             if missing_cli is not None:
                 # Non-npm CLIs (e.g. cursor-agent) carry an ``install_hint``
@@ -3171,6 +3340,12 @@ async def _execute_subagent_tool(
         }
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
+        if remote_host is not None:
+            # The child is created on the member's host in the resolved
+            # worktree; with no inherited runner, the server's JSON-create host
+            # launch starts a runner there (F2b).
+            create_body["host_id"] = remote_host
+            create_body["workspace"] = remote_workspace
         if model is not None:
             # Reject up front when the child harness would silently
             # ignore the persisted override — no silent drops.
@@ -3181,21 +3356,31 @@ async def _execute_subagent_tool(
                     f"{child_harness or 'unknown'!r} has no model-override "
                     "plumbing. Omit 'model' to use the harness default."
                 )
-            mismatch = _dispatch_model_mismatch(child_harness, model) if child_harness else None
-            if mismatch is not None:
-                return (
-                    f"Error: sys_session_send 'model' rejected for sub-agent "
-                    f"{sub_agent_name!r}: {mismatch}"
+            if remote_host is None:
+                mismatch = (
+                    _dispatch_model_mismatch(child_harness, model) if child_harness else None
                 )
+                if mismatch is not None:
+                    return (
+                        f"Error: sys_session_send 'model' rejected for sub-agent "
+                        f"{sub_agent_name!r}: {mismatch}"
+                    )
             # Family guard first (on the requested id, so the error
             # quotes what the caller sent), then mechanical
             # canonical<->gateway-local normalization. The normalized
-            # id is what the server persists as model_override.
-            create_body["model_override"] = _normalize_subagent_model(
-                model,
-                sub_agent_name=str(sub_agent_name),
-                agent_spec=agent_spec,
-                harness=child_harness,
+            # id is what the server persists as model_override. A remote
+            # member's frozen model is already the target host's spelling
+            # (the lock above only ever passes the snapshot value), so it
+            # is used as is.
+            create_body["model_override"] = (
+                model
+                if remote_host is not None
+                else _normalize_subagent_model(
+                    model,
+                    sub_agent_name=str(sub_agent_name),
+                    agent_spec=agent_spec,
+                    harness=child_harness,
+                )
             )
         else:
             # No explicit per-dispatch model. A snapshot member runs the
@@ -3214,11 +3399,17 @@ async def _execute_subagent_tool(
             )
             if snapshot_model is not None:
                 if harness_supports_model_override(child_harness):
-                    create_body["model_override"] = _normalize_subagent_model(
-                        snapshot_model,
-                        sub_agent_name=str(sub_agent_name),
-                        agent_spec=agent_spec,
-                        harness=child_harness,
+                    # A remote member's frozen model is the target host's
+                    # spelling; only a same-host member is normalized here.
+                    create_body["model_override"] = (
+                        snapshot_model
+                        if remote_host is not None
+                        else _normalize_subagent_model(
+                            snapshot_model,
+                            sub_agent_name=str(sub_agent_name),
+                            agent_spec=agent_spec,
+                            harness=child_harness,
+                        )
                     )
             elif member_entry is None:
                 inherited = await _inherited_parent_model(
@@ -3338,6 +3529,11 @@ async def _execute_subagent_tool(
             return "Error: server did not return child session_id"
         child_wrapper_label = _session_wrapper_label(child_data)
         created_child = True
+        # The create bound a runner on the member's host: the closest local
+        # proof of a live remote launch (its first ``running`` edge stays on
+        # that host). Without it the launch reaper would fail a remote child
+        # that is already working.
+        remote_child_bound = remote_host is not None and bool(child_data.get("runner_id"))
 
         # Attach a subagent_cost_budget policy to the child when requested.
         # Non-fatal: the child session is still usable without the budget.
@@ -3431,6 +3627,12 @@ async def _execute_subagent_tool(
         created_by=dispatch_created_by,
         work_id=work_id,
     )
+    if remote_child_bound:
+        # A remote child's ``running`` edge is emitted on its own host's runner
+        # and never reaches this launch entry; the create's host binding is the
+        # start proof this runner has, so the 180 s launch reaper does not fail
+        # a child that is already working.
+        _runner_app.mark_subagent_work_started(child_session_id)
     # Meet the member obligation here, at registration — before the awaited
     # file copy / first-message POST — so a child whose terminal status lands
     # during that window still finds its record; the teardown paths below turn

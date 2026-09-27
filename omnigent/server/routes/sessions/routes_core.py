@@ -107,6 +107,7 @@ from omnigent.server.routes._errors import (
     STALE_CURSOR_RESPONSE,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._member_placement import resolve_member_worktree_on_host
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._session_create_validation import CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
 from omnigent.server.routes._sessions.common import (
@@ -1522,6 +1523,67 @@ def register_core_routes(
             # user's pin key to a native harness bridge).
             labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
         )
+
+    @router.get(
+        "/sessions/{session_id}/member-worktree",
+        response_model=None,
+    )
+    async def get_session_member_worktree(
+        request: Request,
+        response: Response,
+        session_id: str,
+        host_id: str = Query(min_length=1, max_length=128),
+    ) -> dict[str, Any]:
+        """
+        Resolve a session's branch worktree on a target host (SCC06 F2b).
+
+        A joint-agent member saved on another host runs there in the checkout
+        of the same repository and branch the lead session is working in. The
+        runner resolving a remote member dispatch calls this before creating
+        the child: the repository is mapped to *host_id* through the lead
+        session's project, and the lead's recorded branch is matched against
+        that host's worktrees. Every missing fact is a 4xx naming it, so the
+        member dispatch fails loud instead of running somewhere else.
+
+        :param request: The incoming FastAPI request (for ``app.state``).
+        :param response: The FastAPI response (for cache headers).
+        :param session_id: The lead session id, e.g. ``"conv_abc123"``.
+        :param host_id: Target host to resolve the worktree on.
+        :returns: ``{session_id, host_id, workspace, repository, branch}``.
+        :raises OmnigentError: 403/404 without read access to the session;
+            400/409 when the project, host directory, branch, or worktree is
+            missing.
+        """
+        response.headers["Cache-Control"] = "no-store"
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        resolved = await resolve_member_worktree_on_host(
+            conversation=conv,
+            host_id=host_id,
+            user_id=user_id,
+            project_store=project_store,
+            binding_store=getattr(request.app.state, "project_host_binding_store", None),
+            host_registry=(
+                host_registry
+                if host_registry is not None
+                else getattr(request.app.state, "host_registry", None)
+            ),
+            feature_flags=getattr(request.app.state, "feature_flags", None),
+        )
+        return {
+            "session_id": session_id,
+            "host_id": host_id,
+            "workspace": resolved.workspace,
+            "repository": resolved.repository,
+            "branch": resolved.branch,
+        }
 
     # ── GET /sessions ───────────────────────────────────────────
 

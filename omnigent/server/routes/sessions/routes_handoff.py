@@ -99,6 +99,54 @@ def derived_handoff_session_id(handoff_id: str) -> str:
     return hashlib.sha256(f"handoff:{handoff_id}".encode()).hexdigest()[:32]
 
 
+def match_worktree_branch(
+    worktrees: list[dict[str, Any]] | None,
+    branch: str | None,
+) -> str | None:
+    """Return the path of the worktree checking out *branch*, or ``None``.
+
+    The branch-match rule shared by the hand-off create and cross-host member
+    placement (F2b): a session's branch maps to the worktree on the target
+    host that has it checked out. ``list_worktrees_and_match_branch`` applies
+    it to a fresh listing.
+
+    :param worktrees: Host worktree rows (``path`` / ``branch`` / …), or
+        ``None`` when the listing was skipped or failed best-effort.
+    :param branch: Branch to match, or ``None`` for no match.
+    :returns: The matching worktree's path, or ``None``.
+    """
+    if not branch or worktrees is None:
+        return None
+    match = next((w for w in worktrees if w.get("branch") == branch), None)
+    return str(match["path"]) if match and match.get("path") is not None else None
+
+
+async def list_worktrees_and_match_branch(
+    *,
+    host_registry: Any,
+    host_conn: Any,
+    repo_path: str,
+    branch: str | None,
+) -> tuple[list[dict[str, object]], str | None]:
+    """List a host repository's worktrees and match *branch* in one step.
+
+    Shared by S2's ``start_handoff`` (which also uses the full list for its
+    branch-exists / new-branch checks) and cross-host member placement (F2b),
+    so the listing and the branch-match rule exist once.
+
+    :param host_registry: Server host registry (frame transport).
+    :param host_conn: Live host connection to list on.
+    :param repo_path: Absolute repository path on the host.
+    :param branch: Branch to match, or ``None`` for no match.
+    :returns: ``(worktrees, matched_path)``.
+    :raises WorktreeProxyError: When the host reports a listing failure.
+    """
+    worktrees = await list_worktrees_on_host(
+        host_registry=host_registry, host_conn=host_conn, repo_path=repo_path
+    )
+    return worktrees, match_worktree_branch(worktrees, branch)
+
+
 def _store_id(value: str) -> bool:
     try:
         uuid_to_bytes(value)
@@ -901,6 +949,7 @@ def register_handoff_routes(
             workspace = root_workspace
             git: dict[str, Any] | None = None
             worktrees: list[dict[str, Any]] | None = None
+            matched_worktree: str | None = None
             host_conn = host_registry.get(host_id) if host_registry else None
             need_list = bool(branch) or bool(project.config.get("use_worktree"))
             if not branch and project.config.get("use_worktree") and host_conn is None:
@@ -909,8 +958,11 @@ def register_handoff_routes(
                 )
             if need_list and host_conn:
                 try:
-                    worktrees = await list_worktrees_on_host(
-                        host_registry=host_registry, host_conn=host_conn, repo_path=repo
+                    worktrees, matched_worktree = await list_worktrees_and_match_branch(
+                        host_registry=host_registry,
+                        host_conn=host_conn,
+                        repo_path=repo,
+                        branch=branch if body.existing_branch else None,
                     )
                 except WorktreeProxyError as exc:
                     if not body.branch and "not a git" in str(exc).lower():
@@ -919,11 +971,8 @@ def register_handoff_routes(
                         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
                     else:
                         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
-            matched_worktree: str | None = None
             if branch and body.existing_branch:
-                match = next((w for w in (worktrees or []) if w.get("branch") == branch), None)
-                if match:
-                    matched_worktree = str(match["path"])
+                if matched_worktree is not None:
                     workspace = matched_worktree
                     git = {"branch_name": branch, "existing_worktree": True}
                 else:
