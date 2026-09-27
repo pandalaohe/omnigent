@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -30,7 +29,9 @@ from omnigent.server.project_placement import (
     host_roots,
     load_bindings,
     load_eligible_host_ids,
+    load_entries,
     root_on_host,
+    same_canonical_path,
 )
 from omnigent.server.routes._auth_helpers import get_user_id as _get_user_id
 from omnigent.server.routes._auth_helpers import (
@@ -115,6 +116,8 @@ def format_handoff_brief(
     workspace: str,
     branch: str | None,
     dirty_paths: int | None,
+    *,
+    worktree: str | None = None,
 ) -> str:
     plan = record.git_plan or {}
     source = plan.get("source", {})
@@ -124,10 +127,15 @@ def format_handoff_brief(
         if dirty_paths
         else ""
     )
+    location = (
+        f"Worktree: {worktree}. Make every change and commit there."
+        if worktree
+        else f"Workspace: {workspace}"
+    )
     lines = [
         f'[Hand-off {record.id} · project "{project_name}" · until {_utc(record.expires_at)}]',
         f'When done, call sys_handoff_report(handoff_id="{record.id}", status="completed"|"incomplete"|"failed", summary=…, done=[…], not_done=[…], artifacts=[…]) once. For progress or questions use sys_session_send to the sender with correlation_id="{record.id}". Onward hand-off: {"permitted within this deadline" if record.allow_onward else "not permitted"}.',
-        f"Workspace: {workspace}{branch_part}{dirty_part}",
+        f"{location}{branch_part}{dirty_part}",
         "",
         f"Task: {source.get('task', '')}",
     ]
@@ -266,6 +274,7 @@ def register_handoff_routes(
             "state": record.state,
             "reason": record.reason,
             "disposition": disposition,
+            "checkout": record.checkout,
             "session": {
                 "id": record.receiver_session_id,
                 "title": title_without_closed_marker(receiver.title)
@@ -276,6 +285,7 @@ def register_handoff_routes(
                 "workspace": receiver.workspace
                 if receiver
                 else plan.get("workspace", record.root),
+                "worktree": receiver.worktree if receiver else record.worktree,
                 "git_branch": record.git_branch,
                 "agent": plan.get("agent_name"),
                 "created": record.create_session,
@@ -536,8 +546,14 @@ def register_handoff_routes(
                         receiver.workspace,
                         receiver.git_branch,
                         (record.disclosure or {}).get("dirty_paths"),
+                        worktree=receiver.worktree,
                     )
-                    if await transition(record, "open", None, brief=brief) and back_notice:
+                    if (
+                        await transition(
+                            record, "open", None, brief=brief, worktree=receiver.worktree
+                        )
+                        and back_notice
+                    ):
                         await notice(await get_record(hid))
                     continue
                 if record.state == "open":
@@ -786,8 +802,9 @@ def register_handoff_routes(
                     )
                 project = matches[0]
             bindings = await load_bindings(binding_store, project.id)
+            entries = await load_entries(binding_store, project.id)
             gates_on = bindings_apply(project, flags)
-            roots = host_roots(project, bindings, gates_on=gates_on)
+            roots = host_roots(project, bindings, gates_on=gates_on, entries=entries)
             eligible = await load_eligible_host_ids(host_store, owner, (r.host_id for r in roots))
             candidates = []
             for candidate_root in roots:
@@ -818,9 +835,10 @@ def register_handoff_routes(
                 host_id = default_host(project, roots, eligible_host_ids=eligible).host_id
                 if host_id is None:
                     return _problem("needs_input", "host_required", candidates)
-            root = root_on_host(project, bindings, host_id, gates_on=gates_on)
+            root = root_on_host(project, bindings, host_id, gates_on=gates_on, entries=entries)
             if root is None:
                 return _problem("needs_input", "no_root", candidates)
+            repo = root.checkout if root.source == "entry" and root.checkout else root.workspace
             agent_key = body.agent or project.config.get("agent_id")
             if not isinstance(agent_key, str) or not agent_key:
                 return _problem("needs_input", "agent_required")
@@ -878,7 +896,8 @@ def register_handoff_routes(
             hid = uuid.uuid4().hex
             branch = body.branch
             generated = False
-            workspace = root.workspace
+            root_workspace = root.workspace
+            workspace = root_workspace
             git: dict[str, Any] | None = None
             worktrees: list[dict[str, Any]] | None = None
             host_conn = host_registry.get(host_id) if host_registry else None
@@ -890,7 +909,7 @@ def register_handoff_routes(
             if need_list and host_conn:
                 try:
                     worktrees = await list_worktrees_on_host(
-                        host_registry=host_registry, host_conn=host_conn, repo_path=root.workspace
+                        host_registry=host_registry, host_conn=host_conn, repo_path=repo
                     )
                 except WorktreeProxyError as exc:
                     if not body.branch and "not a git" in str(exc).lower():
@@ -899,10 +918,12 @@ def register_handoff_routes(
                         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
                     else:
                         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            matched_worktree: str | None = None
             if branch and body.existing_branch:
                 match = next((w for w in (worktrees or []) if w.get("branch") == branch), None)
                 if match:
-                    workspace = str(match["path"])
+                    matched_worktree = str(match["path"])
+                    workspace = matched_worktree
                     git = {"branch_name": branch, "existing_worktree": True}
                 else:
                     git = {"branch_name": branch, "existing_branch": True}
@@ -920,7 +941,7 @@ def register_handoff_routes(
                 git = {"branch_name": branch, "base_branch": base}
             if branch:
                 reservation = await asyncio.to_thread(
-                    store.find_branch_reservation, host_id, root.workspace, branch
+                    store.find_branch_reservation, host_id, repo, branch
                 )
                 if reservation:
                     return _problem(
@@ -965,10 +986,19 @@ def register_handoff_routes(
                 ):
                     return False
                 if branch:
-                    if not body.existing_branch or conv.git_branch != branch:
+                    if (
+                        not body.existing_branch
+                        or matched_worktree is None
+                        or conv.git_branch != branch
+                        or not same_canonical_path(
+                            conv.worktree or conv.workspace or "", matched_worktree
+                        )
+                    ):
                         return False
-                elif conv.git_branch or os.path.normpath(conv.workspace or "") != os.path.normpath(
-                    root.workspace
+                elif (
+                    conv.git_branch
+                    or conv.worktree
+                    or not same_canonical_path(conv.workspace or "", root_workspace)
                 ):
                     return False
                 if not explicit and (await peer.true_state(conv))[0] != "idle":
@@ -1046,6 +1076,8 @@ def register_handoff_routes(
                 expires_at=expires_at,
                 host_id=host_id,
                 root=root.workspace,
+                checkout=repo,
+                worktree=selected.worktree if selected else None,
                 git_branch=branch,
                 git_plan=plan,
                 parent_handoff_id=parent.id if parent else None,
@@ -1058,6 +1090,7 @@ def register_handoff_routes(
                 selected.workspace if selected else workspace,
                 selected.git_branch if selected else branch,
                 dirty,
+                worktree=selected.worktree if selected else None,
             )
             brief_limit = 16000 - _BRIEF_WORKSPACE_ALLOWANCE
             if len(record.brief) > brief_limit:

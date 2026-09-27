@@ -59,7 +59,7 @@ class SessionHandoffStore(ABC):
     def find_branch_reservation(
         self,
         host_id: str,
-        root: str,
+        checkout: str,
         branch: str,
     ) -> SessionHandoff | None: ...
 

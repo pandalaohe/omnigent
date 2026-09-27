@@ -74,10 +74,24 @@ def test_counts_duplicate_branch_and_sender_list(store: SqlAlchemySessionHandoff
     sender = _uid("sender-a")
     host = _uid("host-a")
     first = store.create(
-        _record("first", created_at=100, host_id=host, root="/root", git_branch="main")
+        _record(
+            "first",
+            created_at=100,
+            host_id=host,
+            root="/root",
+            checkout="/root",
+            git_branch="main",
+        )
     )
     second = store.create(
-        _record("second", created_at=200, host_id=host, root="/root", git_branch="main")
+        _record(
+            "second",
+            created_at=200,
+            host_id=host,
+            root="/root",
+            checkout="/root",
+            git_branch="main",
+        )
     )
     store.create(_record("terminal", created_at=300, state="completed"))
     assert store.count_unfinished("owner-a") == 2
@@ -87,6 +101,8 @@ def test_counts_duplicate_branch_and_sender_list(store: SqlAlchemySessionHandoff
     assert store.find_unfinished_duplicate(sender, "missing") is None
     assert store.find_branch_reservation(host, "/root", "main").id == second.id  # type: ignore[union-attr]
     assert store.find_branch_reservation(host, "/root", "other") is None
+    # The reservation follows the checkout, never the entry root.
+    assert store.find_branch_reservation(host, "/other-checkout", "main") is None
     assert [r.id for r in store.list_for_sender(sender, 100, 2)] == [
         _uid("handoff-terminal"),
         second.id,

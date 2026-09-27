@@ -24,6 +24,12 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
+    SqlAlchemyProjectHostBindingStore,
+)
+from omnigent.stores.project_repository_store.sqlalchemy_store import (
+    SqlAlchemyProjectRepositoryStore,
+)
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.stores.session_handoff_store.sqlalchemy_store import SqlAlchemySessionHandoffStore
 
@@ -72,7 +78,8 @@ def handoff_env(db_uri: str) -> dict[str, Any]:
     app = FastAPI()
     app.state.peer_message_store = peers
     app.state.host_store = host_store
-    app.state.project_host_binding_store = None
+    bindings_store = SqlAlchemyProjectHostBindingStore(db_uri)
+    app.state.project_host_binding_store = bindings_store
     app.state.host_registry = host_registry
     event_state: dict[str, Any] = {"outcome": {"queued": True}, "error": None}
 
@@ -143,6 +150,7 @@ def handoff_env(db_uri: str) -> dict[str, Any]:
         "agent_id": agent_id,
         "host_store": host_store,
         "host_registry": host_registry,
+        "bindings_store": bindings_store,
         "event_state": event_state,
         "offline_ids": offline_ids,
         "conversations": conversations,
@@ -169,6 +177,9 @@ def _record(
     sender_id: str | None = None,
     receiver_id: str | None = None,
     branch: str | None = None,
+    root: str = "/repo",
+    checkout: str = "/repo",
+    worktree: str | None = None,
 ) -> Any:
     from omnigent.db.utils import now_epoch
     from omnigent.entities import SessionHandoff
@@ -190,7 +201,9 @@ def _record(
         updated_at=now,
         expires_at=now + 3600,
         host_id="1" * 32,
-        root="/repo",
+        root=root,
+        checkout=checkout,
+        worktree=worktree,
         git_branch=branch,
         git_plan={
             "agent_id": env["agent_id"],
@@ -1636,3 +1649,319 @@ async def test_generated_branch_needs_explicit_base(
         )
     assert response.status_code == 200
     assert response.json()["reason"] == "base_branch_required"
+
+
+ENTRY = "/entry"
+CHECKOUT = "/checkout-repo"
+HOST = "1" * 32
+
+
+def _wire_entry_project(env: dict[str, Any]) -> None:
+    """Give the fixture project an entry and a primary checkout on its host."""
+    repo = SqlAlchemyProjectRepositoryStore(env["handoffs"].storage_location).upsert(
+        project_id=env["project"].id,
+        name="checkout-repo",
+        remote_url="git@example.com:checkout-repo.git",
+        default_branch="main",
+    )
+    env["bindings_store"].upsert(
+        project_id=env["project"].id,
+        host_id=HOST,
+        name="primary",
+        repository_id=repo.id,
+        workspace=CHECKOUT,
+        is_primary=True,
+    )
+    env["bindings_store"].put_entry(env["project"].id, HOST, ENTRY)
+
+
+def _start_body(**overrides: Any) -> dict[str, Any]:
+    return {"project": "Target", "task": "Review code", **overrides}
+
+
+@pytest.mark.asyncio
+async def test_entry_project_lists_worktrees_and_reserves_on_checkout(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    _wire_entry_project(env)
+    monkeypatch.setattr(env["host_registry"], "get", lambda _hid: SimpleNamespace())
+    listed: list[str] = []
+    matched = "/checkout-repo-worktrees/review-branch"
+
+    async def worktrees(*, repo_path: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        listed.append(repo_path)
+        return [{"branch": "review-branch", "path": matched}]
+
+    monkeypatch.setattr(routes_handoff, "list_worktrees_on_host", worktrees)
+    captured: list[Any] = []
+
+    async def create_session(*args: Any, conversation_id: str, **_kwargs: Any) -> Any:
+        body = args[3]
+        captured.append(body)
+        env["conversations"].create_conversation(
+            conversation_id=conversation_id,
+            agent_id=env["agent_id"],
+            project_id=env["project"].id,
+            host_id=HOST,
+            workspace=ENTRY,
+            worktree=body.workspace,
+            git_branch="review-branch",
+            title="Hand-off: Review code",
+        )
+        return SimpleNamespace(id=conversation_id)
+
+    monkeypatch.setattr(routes_handoff, "_create_session_from_existing_agent", create_session)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json=_start_body(branch="review-branch", existing_branch=True),
+            headers=_headers(env["sender_token"]),
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "delivered"
+    # The worktree list runs on the checkout, never on the entry.
+    assert listed == [CHECKOUT]
+    assert captured[0].workspace == matched
+    assert captured[0].git.existing_worktree is True
+    record = env["handoffs"].get(response.json()["handoff_id"])
+    assert record is not None
+    assert record.root == ENTRY and record.checkout == CHECKOUT
+    assert record.worktree == matched
+    assert f"Worktree: {matched}. Make every change and commit there." in record.brief
+    assert response.json()["checkout"] == CHECKOUT
+    assert response.json()["session"]["worktree"] == matched
+    # The reservation key is (host, checkout, branch), not the entry root.
+    assert env["handoffs"].find_branch_reservation(HOST, CHECKOUT, "review-branch") is not None
+    assert env["handoffs"].find_branch_reservation(HOST, ENTRY, "review-branch") is None
+
+
+@pytest.mark.asyncio
+async def test_entry_project_reservation_blocks_on_checkout(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = handoff_env
+    _wire_entry_project(env)
+    env["handoffs"].create(_record(env, branch="review-branch", root=ENTRY, checkout=CHECKOUT))
+    monkeypatch.setattr(env["host_registry"], "get", lambda _hid: SimpleNamespace())
+
+    async def worktrees(**_kwargs: Any) -> list[dict[str, Any]]:
+        return [{"branch": "review-branch", "path": "/checkout-repo-worktrees/review-branch"}]
+
+    from omnigent.server.routes.sessions import routes_handoff
+
+    monkeypatch.setattr(routes_handoff, "list_worktrees_on_host", worktrees)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json=_start_body(branch="review-branch", existing_branch=True),
+            headers=_headers(env["sender_token"]),
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["reason"] == "branch_in_use"
+
+
+@pytest.mark.asyncio
+async def test_entry_project_new_branch_sends_entry_workspace(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    _wire_entry_project(env)
+    monkeypatch.setattr(env["host_registry"], "get", lambda _hid: SimpleNamespace())
+    planned = "/entry/.worktrees/checkout-repo/review-branch"
+    listed: list[str] = []
+
+    async def worktrees(*, repo_path: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        listed.append(repo_path)
+        return [{"branch": "main", "path": CHECKOUT}]
+
+    monkeypatch.setattr(routes_handoff, "list_worktrees_on_host", worktrees)
+    captured: list[Any] = []
+
+    async def create_session(*args: Any, conversation_id: str, **_kwargs: Any) -> Any:
+        body = args[3]
+        captured.append(body)
+        env["conversations"].create_conversation(
+            conversation_id=conversation_id,
+            agent_id=env["agent_id"],
+            project_id=env["project"].id,
+            host_id=HOST,
+            workspace=ENTRY,
+            worktree=planned,
+            git_branch="review-branch",
+            title="Hand-off: Review code",
+        )
+        return SimpleNamespace(id=conversation_id)
+
+    monkeypatch.setattr(routes_handoff, "_create_session_from_existing_agent", create_session)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json=_start_body(branch="review-branch", base_branch="main"),
+            headers=_headers(env["sender_token"]),
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "delivered"
+    assert listed == [CHECKOUT]
+    # New-branch receivers keep the entry as the launch directory; the
+    # custom-line resolver sources the worktree from the checkout.
+    assert captured[0].workspace == ENTRY
+    assert captured[0].git.branch_name == "review-branch"
+    assert captured[0].git.base_branch == "main"
+    record = env["handoffs"].get(response.json()["handoff_id"])
+    assert record is not None
+    assert record.checkout == CHECKOUT and record.root == ENTRY
+    assert record.worktree == planned
+    assert f"Worktree: {planned}. Make every change and commit there." in record.brief
+    assert response.json()["session"]["workspace"] == ENTRY
+    assert response.json()["session"]["worktree"] == planned
+
+
+@pytest.mark.asyncio
+async def test_entry_project_reuses_receiver_by_effective_worktree(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    _wire_entry_project(env)
+    monkeypatch.setattr(env["host_registry"], "get", lambda _hid: SimpleNamespace())
+    matched = "/checkout-repo-worktrees/review-branch"
+
+    async def worktrees(**_kwargs: Any) -> list[dict[str, Any]]:
+        return [{"branch": "review-branch", "path": matched}]
+
+    monkeypatch.setattr(routes_handoff, "list_worktrees_on_host", worktrees)
+    candidate = env["conversations"].create_conversation(
+        agent_id=env["agent_id"],
+        project_id=env["project"].id,
+        host_id=HOST,
+        workspace=ENTRY,
+        worktree=matched,
+        git_branch="review-branch",
+        title="receiver",
+    )
+    env["permissions"].grant(ALICE, candidate.id, LEVEL_OWNER)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json=_start_body(branch="review-branch", existing_branch=True),
+            headers=_headers(env["sender_token"]),
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["disposition"] == "started"
+    assert response.json()["disclosure"]["reused"] is True
+    assert response.json()["session"]["id"] == candidate.id
+    assert response.json()["session"]["worktree"] == matched
+    record = env["handoffs"].get(response.json()["handoff_id"])
+    assert record is not None and record.worktree == matched
+    assert f"Worktree: {matched}. Make every change and commit there." in record.brief
+
+
+@pytest.mark.asyncio
+async def test_entry_project_mismatched_worktree_receiver_is_refused(
+    handoff_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_handoff
+
+    env = handoff_env
+    _wire_entry_project(env)
+    monkeypatch.setattr(env["host_registry"], "get", lambda _hid: SimpleNamespace())
+    matched = "/checkout-repo-worktrees/review-branch"
+
+    async def worktrees(**_kwargs: Any) -> list[dict[str, Any]]:
+        return [{"branch": "review-branch", "path": matched}]
+
+    monkeypatch.setattr(routes_handoff, "list_worktrees_on_host", worktrees)
+    # Same branch, but not the planned worktree: the candidate must not be
+    # silently reused for a different directory.
+    candidate = env["conversations"].create_conversation(
+        agent_id=env["agent_id"],
+        project_id=env["project"].id,
+        host_id=HOST,
+        workspace=ENTRY,
+        worktree="/other-worktree",
+        git_branch="review-branch",
+        title="receiver",
+    )
+    env["permissions"].grant(ALICE, candidate.id, LEVEL_OWNER)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json=_start_body(branch="review-branch", existing_branch=True),
+            headers=_headers(env["sender_token"]),
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["disposition"] == "needs_input"
+    assert response.json()["reason"] == "branch_in_use"
+    assert [c["id"] for c in response.json()["candidates"]] == [candidate.id]
+    assert env["handoffs"].list_for_sender(env["sender"].id, 0, 20) == []
+
+
+@pytest.mark.asyncio
+async def test_entry_project_reuse_without_branch_needs_plain_workspace(
+    handoff_env: dict[str, Any],
+) -> None:
+    env = handoff_env
+    _wire_entry_project(env)
+    plain = env["conversations"].create_conversation(
+        agent_id=env["agent_id"],
+        project_id=env["project"].id,
+        host_id=HOST,
+        workspace=ENTRY,
+        title="plain receiver",
+    )
+    env["permissions"].grant(ALICE, plain.id, LEVEL_OWNER)
+    with_worktree = env["conversations"].create_conversation(
+        agent_id=env["agent_id"],
+        project_id=env["project"].id,
+        host_id=HOST,
+        workspace=ENTRY,
+        worktree="/entry-worktrees/some-branch",
+        title="worktree receiver",
+    )
+    env["permissions"].grant(ALICE, with_worktree.id, LEVEL_OWNER)
+    env["offline_ids"].add(with_worktree.id)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json=_start_body(),
+            headers=_headers(env["sender_token"]),
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["disposition"] == "started"
+    assert response.json()["disclosure"]["reused"] is True
+    assert response.json()["session"]["id"] == plain.id
+
+
+def test_format_handoff_brief_names_worktree_or_workspace(
+    handoff_env: dict[str, Any],
+) -> None:
+    from omnigent.server.routes.sessions.routes_handoff import format_handoff_brief
+
+    record = _record(handoff_env)
+    worktree_brief = format_handoff_brief(
+        record, "Target", ENTRY, "review-branch", 2, worktree="/wt/review-branch"
+    )
+    assert "Worktree: /wt/review-branch. Make every change and commit there." in worktree_brief
+    assert " · branch review-branch" in worktree_brief
+    assert "2 uncommitted paths present" in worktree_brief
+    workspace_brief = format_handoff_brief(record, "Target", ENTRY, None, None)
+    assert "Workspace: /entry" in workspace_brief
+    assert "Worktree:" not in workspace_brief

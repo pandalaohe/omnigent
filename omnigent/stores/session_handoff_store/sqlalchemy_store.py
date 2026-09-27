@@ -217,13 +217,13 @@ class SqlAlchemySessionHandoffStore(SessionHandoffStore):
     def find_branch_reservation(
         self,
         host_id: str,
-        root: str,
+        checkout: str,
         branch: str,
     ) -> SessionHandoff | None:
         return self._newest(
             "find_handoff_branch_reservation",
             SqlSessionHandoff.host_id == host_id,
-            SqlSessionHandoff.root == root,
+            SqlSessionHandoff.checkout == checkout,
             SqlSessionHandoff.git_branch == branch,
             SqlSessionHandoff.state.in_(HANDOFF_UNFINISHED_STATES),
         )
