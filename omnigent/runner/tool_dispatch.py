@@ -2717,45 +2717,33 @@ def _member_dispatch_lock_error(
     return None
 
 
-def _note_member_obligation_outcome(
+def _note_member_dispatch_failure(
     conversation_id: str | None,
-    args: _JsonObject,
-    output: str,
+    role: object,
+    error: str,
+    *,
+    force: bool = False,
 ) -> None:
-    """Record a named dispatch's outcome against the turn's member obligations.
+    """Record a dispatch failure against the turn's member obligations.
 
-    A ``sys_session_send`` naming a role the user addressed in this turn's
-    message meets that role's obligation on a successful launch, and records
-    the failure reason the turn-end handling later quotes. A role with no open
-    obligation (or a by-id send) is left alone.
-
-    :param conversation_id: Parent session id, or ``None`` in bare tests.
-    :param args: Parsed dispatch arguments (``agent`` names the role).
-    :param output: The tool's returned string.
+    A ``sys_session_send`` naming a role the user addressed meets that role's
+    obligation at child registration (inside ``_execute_subagent_tool``), so
+    this only records failures: a dispatch that errored before registration,
+    or a post-registration teardown (*force*) whose spawned child is gone. The
+    turn-end handling quotes the first error line. A role with no obligation
+    (or a by-id send) is left alone.
     """
     from omnigent.runner import app as _runner_app
 
-    if conversation_id is None:
-        return
-    role = args.get("agent")
-    if not isinstance(role, str) or not role:
+    if conversation_id is None or not isinstance(role, str) or not role:
         return
     if not any(
         obligation.role == role
         for obligation in _runner_app.list_member_obligations(conversation_id)
     ):
         return
-    if output.startswith("Error:"):
-        reason = output.splitlines()[0].removeprefix("Error:").strip() or "dispatch failed"
-        _runner_app.mark_member_obligation_failed(conversation_id, role, reason)
-        return
-    try:
-        payload = json.loads(output)
-    except ValueError:
-        return
-    child_session_id = payload.get("task_id") if isinstance(payload, dict) else None
-    if isinstance(child_session_id, str) and child_session_id:
-        _runner_app.mark_member_obligation_met(conversation_id, role, child_session_id)
+    reason = error.splitlines()[0].removeprefix("Error:").strip() or "dispatch failed"
+    _runner_app.mark_member_obligation_failed(conversation_id, role, reason, force=force)
 
 
 async def _execute_subagent_tool(
@@ -3439,6 +3427,14 @@ async def _execute_subagent_tool(
         created_by=dispatch_created_by,
         work_id=work_id,
     )
+    # Meet the member obligation here, at registration — before the awaited
+    # file copy / first-message POST — so a child whose terminal status lands
+    # during that window still finds its record; the teardown paths below turn
+    # it back into a failure.
+    if conversation_id is not None:
+        _runner_app.mark_member_obligation_met(
+            conversation_id, str(sub_agent_name), child_session_id
+        )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=child_session_id,
@@ -3466,6 +3462,9 @@ async def _execute_subagent_tool(
             child_session_id,
             created_child=created_child,
         )
+        _note_member_dispatch_failure(
+            conversation_id, sub_agent_name, copy_result.error, force=True
+        )
         if teardown_warning is not None:
             return f"{copy_result.error}\n{teardown_warning}"
         return copy_result.error
@@ -3489,6 +3488,7 @@ async def _execute_subagent_tool(
             created_child=created_child,
         )
         error = f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
+        _note_member_dispatch_failure(conversation_id, sub_agent_name, error, force=True)
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error
@@ -3501,6 +3501,7 @@ async def _execute_subagent_tool(
         error = (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
+        _note_member_dispatch_failure(conversation_id, sub_agent_name, error, force=True)
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error
@@ -7470,7 +7471,8 @@ async def execute_tool(
                 publish_event=publish_event,
                 session_inbox=session_inbox,
             )
-            _note_member_obligation_outcome(conversation_id, args, output)
+            if output.startswith("Error:"):
+                _note_member_dispatch_failure(conversation_id, args.get("agent"), output)
         elif tool_name in _HANDOFF_TOOLS:
             if not _peer_messaging_enabled_for(conversation_id):
                 return json.dumps({"error": f"tool {tool_name!r} is not enabled"})

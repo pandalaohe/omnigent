@@ -496,11 +496,15 @@ async def _run_named_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     *,
     create_status: int,
+    during_child_post: Callable[[], None] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Drive one named ``sys_session_send`` against a mock server.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param create_status: Status the child-create POST answers.
+    :param during_child_post: Hook fired inside the child-message POST, i.e.
+        the registration window between the child registration and the tool's
+        return.
     :returns: ``(tool_output, create_bodies)``.
     """
     from types import SimpleNamespace
@@ -546,6 +550,8 @@ async def _run_named_dispatch(
                 return httpx.Response(create_status, json={"error": "boom"})
             return httpx.Response(201, json={"id": WORKER_CHILD})
         if request.method == "POST" and request.url.path == f"/v1/sessions/{WORKER_CHILD}/events":
+            if during_child_post is not None:
+                during_child_post()
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -596,6 +602,36 @@ async def test_failed_child_create_records_the_reason(monkeypatch: pytest.Monkey
     assert obligation.child_session_id is None
     assert obligation.failure_reason is not None
     assert "failed to create child session" in obligation.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_terminal_during_registration_window_settles_the_obligation(
+    monkeypatch: pytest.MonkeyPatch,
+    _clean_subagent_registry: None,
+) -> None:
+    """A child that reaches terminal before the launch returns still notices."""
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server)
+    runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
+    runner_app._session_inboxes_ref[PARENT] = asyncio.Queue()
+
+    def _fire_terminal() -> None:
+        app.state.mark_subagent_terminal_and_wake(
+            WORKER_CHILD, status="failed", output="fast failure"
+        )
+
+    output, _create_bodies = await _run_named_dispatch(
+        monkeypatch,
+        create_status=201,
+        during_child_post=_fire_terminal,
+    )
+
+    assert json.loads(output)["status"] == "launching"
+    await _wait_until(lambda: bool(_notices(server)))
+    await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
+    assert _notices(server)[0]["data"]["item_data"]["message"] == (
+        "executor did not run: fast failure"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -813,7 +849,7 @@ async def test_child_failure_posts_the_notice_and_closes(
 async def test_child_completion_closes_without_a_notice(
     _clean_subagent_registry: None,
 ) -> None:
-    """A completed child closes the obligation silently."""
+    """A completed child settles the obligation silently, keeping the record."""
     server = _MemberServerClient()
     app, _pm, _harness = _build_app(server)
 
@@ -835,10 +871,66 @@ async def test_child_completion_closes_without_a_notice(
                 "data": {"status": "completed", "output": "all done"},
             },
         )
-        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
+        await _wait_until(
+            lambda: any(
+                obligation.settled for obligation in runner_app.list_member_obligations(PARENT)
+            )
+        )
         await asyncio.sleep(0.05)
 
     assert _notices(server) == []
+    # The record is retained: a later completed→failed upgrade must notice.
+    assert [obligation.settled for obligation in runner_app.list_member_obligations(PARENT)] == [
+        True
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_child_upgrade_to_failed_still_notices(
+    _clean_subagent_registry: None,
+) -> None:
+    """The registry's completed→failed upgrade still yields the member notice."""
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server)
+
+    async with _runner_client(app) as client:
+        runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
+        runner_app.mark_member_obligation_met(PARENT, WORKER_ROLE, WORKER_CHILD)
+        runner_app._session_inboxes_ref[PARENT] = asyncio.Queue()
+        runner_app.register_subagent_work(
+            parent_session_id=PARENT,
+            child_session_id=WORKER_CHILD,
+            agent=WORKER_ROLE,
+            title="task",
+        )
+
+        await client.post(
+            f"/v1/sessions/{WORKER_CHILD}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "looks done"},
+            },
+        )
+        await _wait_until(
+            lambda: any(
+                obligation.settled for obligation in runner_app.list_member_obligations(PARENT)
+            )
+        )
+        assert _notices(server) == []
+
+        await client.post(
+            f"/v1/sessions/{WORKER_CHILD}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": "Error: late failure"},
+            },
+        )
+        await _wait_until(lambda: bool(_notices(server)))
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
+
+    assert _notices(server)[0]["data"]["item_data"]["message"] == (
+        "executor did not run: Error: late failure"
+    )
 
 
 # --------------------------------------------------------------------------

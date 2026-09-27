@@ -8461,11 +8461,14 @@ def create_runner_app(
         _schedule_member_follow_up(session_id, roles, member_follow_up_notice(roles), turn)
 
     def _settle_member_obligation_for_child(entry: _SubagentWorkEntry) -> None:
-        """Close the obligation a completed child met; notice a failed child.
+        """Settle the obligations a child met when its terminal result lands.
 
-        The obligation closes when the child's terminal result reaches the
-        lead. A non-``completed`` result is a failed run, so it turns into the
-        visible notice instead of a silent close.
+        A ``completed`` delivery closes the records but keeps them: the
+        registry upgrades a completed child to ``failed`` when the real
+        failure edge lands (``completed`` outranks ``failed``), and that
+        upgrade must still yield the visible notice. Any other terminal status
+        marks the records settled and posts ``"<role> did not run: <reason>"``
+        — one notice per child, dropped once it is delivered.
         """
         matching = [
             obligation
@@ -8474,9 +8477,9 @@ def create_runner_app(
         ]
         if not matching:
             return
+        for obligation in matching:
+            obligation.settled = True
         if entry.status == "completed":
-            for obligation in matching:
-                drop_member_obligation(entry.parent_session_id, obligation)
             return
         reason = entry.output or f"sub-agent {entry.status}"
         _schedule_member_notice(
