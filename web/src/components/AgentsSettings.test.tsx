@@ -173,6 +173,15 @@ const builtinClaudeNative: AvailableAgent = {
   builtin: true,
 };
 
+const builtinAcp: AvailableAgent = {
+  ...builtinClaudeNative,
+  id: "ag_builtin_grok",
+  name: "grok",
+  display_name: "Grok",
+  harness: "grok",
+  acpHarness: true,
+};
+
 function renderSettings() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
@@ -346,14 +355,23 @@ describe("AgentsSettings", () => {
     expect(screen.getByRole("button", { name: "Duplicate Debby" })).toBeEnabled();
   });
 
-  it("keeps harness-backed built-ins out of the Built-in group", () => {
-    mocks.available = [builtinPolly, builtinClaudeNative];
+  it("keeps harness built-ins in the Built-in list with only their badge surface", () => {
+    mocks.available = [builtinPolly, builtinClaudeNative, builtinAcp];
     renderSettings();
 
     const builtins = screen.getByRole("heading", { name: "Built-in" }).parentElement;
     expect(builtins).not.toBeNull();
     expect(within(builtins!).getByText("Polly")).toBeInTheDocument();
-    expect(within(builtins!).queryByText("Claude Code")).not.toBeInTheDocument();
+    for (const name of ["Claude Code", "Grok"]) {
+      expect(within(builtins!).getByText(name)).toBeInTheDocument();
+      expect(
+        within(builtins!).getByRole("button", { name: `Edit badge for ${name}` }),
+      ).toBeInTheDocument();
+      expect(within(builtins!).queryByRole("button", { name: `View ${name}` })).toBeNull();
+      expect(within(builtins!).queryByRole("button", { name: `Duplicate ${name}` })).toBeNull();
+      expect(within(builtins!).queryByRole("button", { name: `Pin ${name}` })).toBeNull();
+      expect(within(builtins!).queryByRole("button", { name: `Unpin ${name}` })).toBeNull();
+    }
   });
 
   it("shows a built-in's roster, lead first, in a read-only dialog", async () => {

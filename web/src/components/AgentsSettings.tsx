@@ -10,7 +10,11 @@ import {
   writeAgentBadgePreferences,
   type AgentBadgeValue,
 } from "@/lib/agentBadgePreferences";
-import { isAcpHarnessAgent } from "@/lib/agentGrouping";
+import {
+  isAcpHarnessAgent,
+  partitionAgentsByKind,
+  selectableSessionAgents,
+} from "@/lib/agentGrouping";
 import {
   MAX_PINNED_AGENTS,
   resolvePinnedAgentIds,
@@ -123,22 +127,28 @@ function builtinSubtitle(agent: AvailableAgent): string {
     .join(" · ");
 }
 
+/**
+ * A built-in with an editable roster. Harness-backed built-ins (native CLIs,
+ * ACP agents) are flat executor specs with no member settings, so they only
+ * get a badge surface here.
+ */
+function isMemberBuiltin(agent: AvailableAgent): boolean {
+  return !isNativeCodingAgent(agent) && !isAcpHarnessAgent(agent);
+}
+
 export function AgentsSettings() {
   const queryClient = useQueryClient();
   const catalog = useCustomAgents();
   const available = useAvailableAgents();
   const preferences = useAgentBadgePreferences();
   const harnessLabels = useBrainHarnessLabels();
-  // Harness-backed built-ins are flat executor specs, not editable member
-  // Agents — the same Harnesses/Agents split NewChatDialog draws.
+  // The Built-in list is the picker's built-in partition, harness rows
+  // included; only the member-Agent rows carry the layer's controls.
   const builtinAgents = useMemo(
-    () =>
-      (available.data ?? []).filter(
-        (agent) =>
-          agent.builtin === true && !isNativeCodingAgent(agent) && !isAcpHarnessAgent(agent),
-      ),
+    () => partitionAgentsByKind(selectableSessionAgents(available.data ?? [])).builtins,
     [available.data],
   );
+  const memberBuiltinAgents = useMemo(() => builtinAgents.filter(isMemberBuiltin), [builtinAgents]);
   // Pins address rows the way the picker does: a built-in by its /v1/agents
   // id, a saved Agent by its `ca_` id via customAgentForPicker. Toggling
   // writes the whole resolved list, materializing the Polly + Debby default.
@@ -152,8 +162,8 @@ export function AgentsSettings() {
     !catalog.error;
   const customAgentRows = useMemo(() => catalog.data ?? [], [catalog.data]);
   const pinCandidates = useMemo(
-    () => [...builtinAgents, ...customAgentRows.map(customAgentForPicker)],
-    [builtinAgents, customAgentRows],
+    () => [...memberBuiltinAgents, ...customAgentRows.map(customAgentForPicker)],
+    [memberBuiltinAgents, customAgentRows],
   );
   const pinnedIds = useMemo(
     () => resolvePinnedAgentIds(storedPinnedIds, pinCandidates),
@@ -249,52 +259,65 @@ export function AgentsSettings() {
             {errorText(available.error)}
           </p>
         )}
-        {builtinAgents.map((agent) => (
-          <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
-            <AgentBadge agentId={agent.id} />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm">{agent.display_name}</div>
-              <div className="truncate text-xs text-muted-foreground">{builtinSubtitle(agent)}</div>
+        {builtinAgents.map((agent) => {
+          const memberControls = isMemberBuiltin(agent);
+          return (
+            <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
+              <AgentBadge agentId={agent.id} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm">{agent.display_name}</div>
+                {memberControls && (
+                  <div className="truncate text-xs text-muted-foreground">
+                    {builtinSubtitle(agent)}
+                  </div>
+                )}
+              </div>
+              {memberControls && (
+                <PinToggle
+                  agentId={agent.id}
+                  name={agent.display_name}
+                  pinned={pinnedIdSet.has(agent.id)}
+                  canPin={!atPinLimit}
+                  ready={pinsReady}
+                  onToggle={togglePin}
+                />
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
+                aria-label={`Edit badge for ${agent.display_name}`}
+              >
+                Edit badge
+              </Button>
+              {memberControls && (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label={`View ${agent.display_name}`}
+                    disabled={duplicatingId !== null}
+                    onClick={() => {
+                      setError(null);
+                      setViewing(agent);
+                    }}
+                  >
+                    View
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label={`Duplicate ${agent.display_name}`}
+                    disabled={duplicatingId !== null}
+                    onClick={() => void duplicateBuiltin(agent)}
+                  >
+                    Duplicate
+                  </Button>
+                </>
+              )}
             </div>
-            <PinToggle
-              agentId={agent.id}
-              name={agent.display_name}
-              pinned={pinnedIdSet.has(agent.id)}
-              canPin={!atPinLimit}
-              ready={pinsReady}
-              onToggle={togglePin}
-            />
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
-              aria-label={`Edit badge for ${agent.display_name}`}
-            >
-              Edit badge
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-label={`View ${agent.display_name}`}
-              disabled={duplicatingId !== null}
-              onClick={() => {
-                setError(null);
-                setViewing(agent);
-              }}
-            >
-              View
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-label={`Duplicate ${agent.display_name}`}
-              disabled={duplicatingId !== null}
-              onClick={() => void duplicateBuiltin(agent)}
-            >
-              Duplicate
-            </Button>
-          </div>
-        ))}
+          );
+        })}
       </div>
       <div>
         <div className="mb-2 flex items-center justify-between gap-3">
