@@ -8,6 +8,9 @@ import { AgentEditor } from "./AgentEditor";
 const mocks = vi.hoisted(() => ({
   getCustomAgent: vi.fn(),
   updateCustomAgent: vi.fn(),
+  useHosts: vi.fn(),
+  useHostModelOptions: vi.fn(),
+  useNewChatHostId: vi.fn(),
 }));
 
 vi.mock("@/lib/customAgentsApi", () => ({
@@ -21,8 +24,9 @@ vi.mock("@/lib/agentLabels", () => ({
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
-  useNewChatHostId: () => null,
-  useHostModelOptions: () => ({ data: undefined }),
+  useNewChatHostId: mocks.useNewChatHostId,
+  useHosts: mocks.useHosts,
+  useHostModelOptions: mocks.useHostModelOptions,
 }));
 
 const agent: CustomAgent = {
@@ -66,6 +70,20 @@ const crewDetail: CustomAgentDetail = {
     },
   ],
   instructions: "Ship small changes.",
+};
+
+/** One user host with a status, shaped like the `useHosts` rows. */
+function host(hostId: string, name: string, status: "online" | "offline") {
+  return { host_id: hostId, name, owner: "me", status };
+}
+
+/** Two-member detail whose members carry saved library hosts. */
+const hostedDetail: CustomAgentDetail = {
+  ...crewDetail,
+  members: [
+    { ...crewDetail.members![0], host_id: "host_a" },
+    { ...crewDetail.members![1], host_id: "host_b" },
+  ],
 };
 
 function renderEditor(detail: CustomAgentDetail, client?: QueryClient) {
@@ -119,6 +137,12 @@ beforeEach(() => {
   mocks.getCustomAgent.mockReset();
   mocks.updateCustomAgent.mockReset();
   mocks.updateCustomAgent.mockResolvedValue(legacyDetail);
+  mocks.useHosts.mockReset();
+  mocks.useHosts.mockReturnValue({ data: [] });
+  mocks.useHostModelOptions.mockReset();
+  mocks.useHostModelOptions.mockReturnValue({ data: undefined });
+  mocks.useNewChatHostId.mockReset();
+  mocks.useNewChatHostId.mockReturnValue(null);
 });
 
 afterEach(() => {
@@ -149,6 +173,7 @@ describe("AgentEditor", () => {
             model: "sonnet",
             reasoning_effort: "high",
             lead: true,
+            host_id: null,
           },
           {
             name: "reviewer",
@@ -157,6 +182,7 @@ describe("AgentEditor", () => {
             model: null,
             reasoning_effort: null,
             lead: false,
+            host_id: null,
           },
         ],
       }),
@@ -197,6 +223,7 @@ describe("AgentEditor", () => {
         model: null,
         reasoning_effort: null,
         lead: false,
+        host_id: null,
       });
     });
   });
@@ -432,5 +459,72 @@ describe("AgentEditor", () => {
       screen.getByText("reviewer was a saved member — undo its removal or save first"),
     ).toBeInTheDocument();
     expect(saveButton()).toBeDisabled();
+  });
+
+  it("lists the user's hosts in Host › and sends a picked host", async () => {
+    mocks.useHosts.mockReturnValue({
+      data: [host("host_a", "machine-a", "online"), host("host_b", "machine-b", "offline")],
+    });
+    renderEditor(hostedDetail);
+    await awaitLoaded();
+
+    openTrigger(within(leadRow()).getByTestId("agent-member-trigger"));
+    fireEvent.click(screen.getByTestId("agent-member-host"));
+    expect(await screen.findByTestId("agent-member-host-session")).toBeVisible();
+    expect(screen.getByTestId("agent-member-host-host_a")).toBeVisible();
+    expect(screen.getByTestId("agent-member-host-host_b")).toHaveTextContent("machine-b · offline");
+    fireEvent.click(screen.getByTestId("agent-member-host-session"));
+    fireEvent.click(saveButton());
+
+    await waitFor(() => {
+      const [, patch] = mocks.updateCustomAgent.mock.calls.at(-1) as [
+        string,
+        { members: { host_id: string | null }[] },
+      ];
+      expect(patch.members[0].host_id).toBeNull();
+      expect(patch.members[1].host_id).toBe("host_b");
+    });
+  });
+
+  it("warns on an offline member host and still saves", async () => {
+    mocks.useHosts.mockReturnValue({
+      data: [host("host_a", "machine-a", "online"), host("host_b", "machine-b", "offline")],
+    });
+    renderEditor(hostedDetail);
+    await awaitLoaded();
+
+    const warnings = screen.getAllByTestId("agent-member-host-warning");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toHaveTextContent("machine-b is offline");
+    expect(saveButton()).not.toBeDisabled();
+
+    fireEvent.change(screen.getByTestId("agent-editor-name"), {
+      target: { value: "release-crew-2" },
+    });
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mocks.updateCustomAgent).toHaveBeenCalledTimes(1));
+  });
+
+  it("resolves each member's catalog against its own host", async () => {
+    mocks.useHosts.mockReturnValue({
+      data: [host("host_a", "machine-a", "online"), host("host_b", "machine-b", "online")],
+    });
+    renderEditor(hostedDetail);
+    await awaitLoaded();
+
+    expect(mocks.useHostModelOptions.mock.calls).toContainEqual(["host_a", "claude-sdk", true]);
+    expect(mocks.useHostModelOptions.mock.calls).toContainEqual(["host_b", "codex-native", true]);
+  });
+
+  it("falls back to the New Chat host for a member without one", async () => {
+    mocks.useNewChatHostId.mockReturnValue("host_session");
+    renderEditor(crewDetail);
+    await awaitLoaded();
+
+    expect(mocks.useHostModelOptions.mock.calls).toContainEqual([
+      "host_session",
+      "claude-sdk",
+      true,
+    ]);
   });
 });

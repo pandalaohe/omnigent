@@ -13,6 +13,8 @@ export interface CustomAgentMember {
   model: string | null;
   reasoning_effort: string | null;
   lead: boolean;
+  /** Saved host for this member; absent/null = the session's picked host. */
+  host_id?: string | null;
 }
 
 export interface CustomAgent {

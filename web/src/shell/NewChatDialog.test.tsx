@@ -1218,6 +1218,39 @@ function mockAgents(
   } as unknown as ReturnType<typeof useAvailableAgents>);
 }
 
+/** A `useCustomAgents` row whose lead member carries `leadHostId`. */
+function savedAgentRow(id: string, name: string, leadHostId: string | null): CustomAgentDetail {
+  const lead: CustomAgentMember = {
+    name,
+    description: null,
+    harness: "claude-sdk",
+    model: null,
+    reasoning_effort: null,
+    lead: true,
+    host_id: leadHostId,
+  };
+  return {
+    id,
+    name,
+    description: null,
+    harness: "claude-sdk",
+    model: null,
+    members: [lead],
+    version: 1,
+    created_at: 1,
+    updated_at: null,
+    instructions: null,
+  };
+}
+
+function mockCustomAgents(rows: CustomAgentDetail[]): void {
+  vi.mocked(useCustomAgents).mockReturnValue({
+    data: rows,
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useCustomAgents>);
+}
+
 function mockModelQueries(
   resultForHarness: (harness: string) => Partial<ReturnType<typeof useHostModelOptions>>,
 ) {
@@ -5617,6 +5650,45 @@ describe("NewChatLandingScreen", () => {
         screen.getByTestId("new-chat-landing-agent-ca_alpha"),
       ),
     ).toBe(true);
+  });
+
+  it("orders unpinned Agents on the selected host before the recent-agents order", () => {
+    mockHosts([host("online"), host("online", 2)]);
+    mockAgents(DEFAULT_LANDING_AGENTS);
+    // Beta launched most recently, but Alpha's lead host (host_1) is the
+    // selected host, so Alpha leads "Other...".
+    mockCustomAgents([
+      savedAgentRow("ca_alpha", "Alpha", "host_1"),
+      savedAgentRow("ca_beta", "Beta", null),
+    ]);
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [] }));
+    localStorage.setItem("omnigent:recent-agents", JSON.stringify(["ca_beta"]));
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+
+    expect(
+      follows(
+        screen.getByTestId("new-chat-landing-agent-ca_alpha"),
+        screen.getByTestId("new-chat-landing-agent-ca_beta"),
+      ),
+    ).toBe(true);
+  });
+
+  it("moves the host chip to a picked saved Agent's lead host", async () => {
+    mockHosts([host("online"), host("online", 2)]);
+    mockCustomAgents([savedAgentRow("ca_crew", "Crew", "host_2")]);
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [] }));
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-1/);
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ca_crew"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/),
+    );
   });
 
   it("draws the SDK mark before the vendor logo, yielding to a user badge", () => {

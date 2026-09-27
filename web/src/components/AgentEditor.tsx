@@ -15,7 +15,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
-import { useNewChatHostId } from "@/hooks/useHosts";
+import { useHosts, useNewChatHostId, type Host } from "@/hooks/useHosts";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import {
   duplicateBuiltinAgent,
@@ -65,6 +65,8 @@ interface MemberDraft {
   harness: string;
   model: string | null;
   effort: string | null;
+  /** The member's saved host; null = the session's selected host. */
+  hostId: string | null;
   /** Loaded from the saved roster: the server keys its config dir by this name. */
   saved: boolean;
 }
@@ -77,6 +79,7 @@ function draftFromMember(member: CustomAgentMember, key: number): MemberDraft {
     harness: member.harness,
     model: member.model,
     effort: member.reasoning_effort,
+    hostId: member.host_id ?? null,
     saved: true,
   };
 }
@@ -93,6 +96,7 @@ function initialMembers(detail: CustomAgentDetail): MemberDraft[] {
       harness: detail.harness ?? DEFAULT_HARNESS,
       model: detail.model,
       effort: null,
+      hostId: null,
       saved: true,
     },
   ];
@@ -111,6 +115,7 @@ function memberPayload(
     model: member.model,
     reasoning_effort: member.effort,
     lead: index === 0,
+    host_id: member.hostId,
   }));
 }
 
@@ -118,7 +123,8 @@ function memberPayload(
  * Roster identity without the lead's Agent-level name/description: a scalar
  * PATCH preserves the bundle bytes, while a `members` PATCH re-dumps the
  * member configs and drops their comments, so a name-only edit must not
- * count as a roster change.
+ * count as a roster change. The member host only lives in the members column,
+ * so a host change is a roster change.
  */
 function rosterSignature(members: MemberDraft[]): string {
   return JSON.stringify(
@@ -128,12 +134,28 @@ function rosterSignature(members: MemberDraft[]): string {
       harness: member.harness,
       model: member.model,
       effort: member.effort,
+      hostId: member.hostId,
     })),
   );
 }
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "The Agent could not be saved.";
+}
+
+/**
+ * A member whose saved host cannot currently run it. Hosts load
+ * asynchronously (`undefined`), so an unloaded list never warns.
+ */
+function memberHostWarning(member: MemberDraft, hosts: Host[] | undefined): string | null {
+  if (member.hostId === null || hosts === undefined) return null;
+  const host = hosts.find((entry) => entry.host_id === member.hostId);
+  const role = member.name.trim();
+  if (host === undefined) {
+    return `${role}: host ${member.hostId} is unavailable — saving keeps it; this member runs there once the host returns.`;
+  }
+  if (host.status === "online") return null;
+  return `${role}: ${host.name} is offline — saving keeps it; this member can't run until it reconnects.`;
 }
 
 /** A PATCH conflict means the row moved; the caller reloads the detail. */
@@ -173,7 +195,9 @@ export function AgentEditor({
     queryFn: () => getCustomAgent(agent.id),
     staleTime: 0,
   });
-  const hostId = useNewChatHostId();
+  const sessionHostId = useNewChatHostId();
+  const { data: hostList } = useHosts();
+  const hosts = useMemo(() => hostList ?? [], [hostList]);
   const brainHarnessLabels = useBrainHarnessLabels();
   const leadHarnessOptions = Object.entries(brainHarnessLabels).map(([id, label]) => ({
     id,
@@ -305,6 +329,7 @@ export function AgentEditor({
         harness: lead.harness,
         model: null,
         effort: null,
+        hostId: null,
         saved: false,
       },
     ]);
@@ -416,7 +441,9 @@ export function AgentEditor({
                     model={member.model}
                     effort={member.effort}
                     harnessOptions={leadHarnessOptions}
-                    hostId={hostId}
+                    hostId={member.hostId}
+                    sessionHostId={sessionHostId}
+                    hosts={hosts}
                     onChange={(next) => updateMember(member.key, next)}
                     disabled={unavailable || busy}
                   />
@@ -455,7 +482,9 @@ export function AgentEditor({
                       model={member.model}
                       effort={member.effort}
                       harnessOptions={memberHarnessOptions}
-                      hostId={hostId}
+                      hostId={member.hostId}
+                      sessionHostId={sessionHostId}
+                      hosts={hosts}
                       onChange={(next) => updateMember(member.key, next)}
                       disabled={unavailable || busy}
                     />
@@ -490,6 +519,19 @@ export function AgentEditor({
                 </div>
               ),
             )}
+            {members.map((member) => {
+              const warning = memberHostWarning(member, hostList);
+              return warning === null ? null : (
+                <p
+                  key={`host-warning-${member.key}`}
+                  role="alert"
+                  data-testid="agent-member-host-warning"
+                  className="text-xs text-amber-700 dark:text-amber-300"
+                >
+                  {warning}
+                </p>
+              );
+            })}
             {leadModelMissing && (
               <p className="text-xs text-muted-foreground">
                 Pick a model — the omnigent executor requires one.

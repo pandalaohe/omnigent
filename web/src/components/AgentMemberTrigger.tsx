@@ -5,7 +5,7 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import { HarnessPicker, HarnessPickerConfigRow } from "@/components/composer/HarnessPicker";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { useHostModelOptions } from "@/hooks/useHosts";
+import { useHostModelOptions, type Host } from "@/hooks/useHosts";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
@@ -13,20 +13,23 @@ import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffort
 /** Menu key for the "Default" (null) row in the Model and Effort submenus. */
 const DEFAULT_ROW_KEY = "__default__";
 
-/** The harness / model / effort triple a member trigger reports. */
+/** The host / harness / model / effort quadruple a member trigger reports. */
 export interface AgentMemberValue {
   harness: string;
   model: string | null;
   effort: string | null;
+  /** The member's saved host; null = the session's selected host. */
+  hostId: string | null;
 }
 
-type Section = "harness" | "model" | "effort";
+type Section = "host" | "harness" | "model" | "effort";
 
 /**
  * Compact per-member runtime trigger: harness icon, model, and effort in one
- * button whose menu holds Harness › / Model › / Effort › submenus, the rows
- * the New Chat flyout and the composer configure sessions with. The Agent
- * editor mounts one per member; the create dialog mounts it for the lead.
+ * button whose menu holds Host › / Harness › / Model › / Effort › submenus,
+ * the rows the New Chat flyout and the composer configure sessions with. The
+ * Agent editor mounts one per member; the create dialog mounts it for the lead
+ * (without the Host section: an unsaved bundle has nowhere to keep a host).
  */
 export function AgentMemberTrigger({
   harness,
@@ -34,6 +37,8 @@ export function AgentMemberTrigger({
   effort,
   harnessOptions,
   hostId,
+  sessionHostId,
+  hosts,
   onChange,
   disabled = false,
 }: {
@@ -42,8 +47,12 @@ export function AgentMemberTrigger({
   effort: string | null;
   /** `{id, label}` rows for the Harness submenu, in menu order. */
   harnessOptions: readonly { id: string; label: string }[];
-  /** Host whose live catalog supplies the models; null = static defaults. */
+  /** The member's saved host; null = the session host (the catalog fallback). */
   hostId: string | null;
+  /** The New Chat host, used as the catalog source when no member host is set. */
+  sessionHostId: string | null;
+  /** The user's hosts; when provided the Host › section lists them. */
+  hosts?: readonly Host[];
   onChange: (next: AgentMemberValue) => void;
   disabled?: boolean;
 }) {
@@ -62,7 +71,14 @@ export function AgentMemberTrigger({
   useEffect(() => {
     if (section !== "model") setManualModelEntry(false);
   }, [section]);
-  const { data: hostModelOptions } = useHostModelOptions(hostId, harness, hostId !== null);
+  // A member's own host decides its catalog; without one the New Chat host
+  // does, exactly as before the per-member host existed.
+  const catalogHostId = hostId ?? sessionHostId;
+  const { data: hostModelOptions } = useHostModelOptions(
+    catalogHostId,
+    harness,
+    catalogHostId !== null,
+  );
   const rows = useMemo(() => hostModelOptions ?? [], [hostModelOptions]);
   // Same option sources as the scheduled-task fields: the host catalog, else
   // the static Claude aliases for a Claude harness. The current value is
@@ -87,18 +103,27 @@ export function AgentMemberTrigger({
       : (modelOptions.find((option) => option.id === model)?.label ?? model);
   const effortLabel =
     effort !== null && effortLevels !== null ? normalizeEffortLabel(effort) : undefined;
+  const memberHost = hosts?.find((host) => host.host_id === hostId);
+  const hostLabel =
+    hostId === null
+      ? "Session host"
+      : (memberHost?.name ?? hostId) + (memberHost?.status === "offline" ? " (offline)" : "");
 
   const selectHarness = (id: string) => {
-    if (id !== harness) onChange({ harness: id, model: null, effort: null });
+    if (id !== harness) onChange({ harness: id, model: null, effort: null, hostId });
   };
   const selectModel = (nextModel: string | null) =>
     onChange({
       harness,
       model: nextModel,
       effort: reconcileEffortOnModelChange(harness, rows, nextModel, effort),
+      hostId,
     });
   const selectEffort = (nextEffort: string | null) =>
-    onChange({ harness, model, effort: nextEffort });
+    onChange({ harness, model, effort: nextEffort, hostId });
+  const selectHost = (nextHostId: string | null) => {
+    if (nextHostId !== hostId) onChange({ harness, model, effort, hostId: nextHostId });
+  };
   const commitModelDraft = () => {
     const trimmed = modelDraft.trim();
     if (trimmed === "") return;
@@ -137,6 +162,40 @@ export function AgentMemberTrigger({
       contentSide="bottom"
       testId="agent-member-menu"
     >
+      {hosts !== undefined && (
+        <HarnessPickerConfigRow
+          label="Host"
+          value={hostLabel}
+          testId="agent-member-host"
+          configTestId="agent-member-host-menu"
+          {...submenuProps("host")}
+        >
+          <ComposerConfigSections
+            extra={[
+              {
+                testId: "agent-member-hosts",
+                header: "Host",
+                choices: [
+                  {
+                    key: DEFAULT_ROW_KEY,
+                    label: "Session host",
+                    checked: hostId === null,
+                    onSelect: () => selectHost(null),
+                    testId: "agent-member-host-session",
+                  },
+                  ...hosts.map((host) => ({
+                    key: host.host_id,
+                    label: host.status === "online" ? host.name : `${host.name} · offline`,
+                    checked: host.host_id === hostId,
+                    onSelect: () => selectHost(host.host_id),
+                    testId: `agent-member-host-${host.host_id}`,
+                  })),
+                ],
+              },
+            ]}
+          />
+        </HarnessPickerConfigRow>
+      )}
       <HarnessPickerConfigRow
         label="Harness"
         value={harnessLabel}

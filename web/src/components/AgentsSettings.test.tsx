@@ -74,6 +74,7 @@ vi.mock("@/lib/agentLabels", () => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useNewChatHostId: () => null,
+  useHosts: () => ({ data: [] }),
   useHostModelOptions: () => ({ data: undefined }),
 }));
 vi.mock("@/lib/analytics", () => ({

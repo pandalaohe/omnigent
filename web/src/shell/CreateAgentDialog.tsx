@@ -262,7 +262,8 @@ export function CreateAgentDialog({
               model={model}
               effort={effort}
               harnessOptions={harnessOptions}
-              hostId={hostId}
+              hostId={null}
+              sessionHostId={hostId}
               onChange={(next) => {
                 if (next.harness !== harness) {
                   // Keeps the event the trigger replaced (a Select) emitted:

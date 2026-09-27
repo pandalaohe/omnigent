@@ -1398,6 +1398,7 @@ export function AgentHarnessPicker({
   onSelectAgent,
   onEditSavedAgent,
   onViewBuiltinAgent,
+  leadHostByAgentId,
   pendingAgent,
   pendingAgentId,
   onSelectPending,
@@ -1438,6 +1439,9 @@ export function AgentHarnessPicker({
   onEditSavedAgent?: (agent: AvailableAgent) => void;
   /** Edit affordance for a built-in composed Agent row; omitted → no Edit. */
   onViewBuiltinAgent?: (agent: AvailableAgent) => void;
+  /** Saved Agents' lead host (null = session host), for host-first "Other…"
+   *  ordering: an Agent that would run on the selected host leads the list. */
+  leadHostByAgentId?: ReadonlyMap<string, string | null>;
   pendingAgent: AgentBundleInput | null;
   pendingAgentId: string;
   onSelectPending: () => void;
@@ -1843,23 +1847,29 @@ export function AgentHarnessPicker({
     const pinnedIds = resolvePinnedAgentIds(pinnedAgentIds, pinCandidates);
     const pinned = new Set(pinnedIds);
     const recentRank = new Map(recentAgentIds.map((id, index) => [id, index]));
+    const selectedHostKey = host?.host_id ?? null;
+    const hostRank = (agent: AvailableAgent): number =>
+      selectedHostKey !== null && leadHostByAgentId?.get(agent.id) === selectedHostKey ? 0 : 1;
     return {
       pinnedEntries: pinnedIds
         .map((id) => pinCandidates.find((agent) => agent.id === id))
         .filter((agent): agent is AvailableAgent => agent !== undefined),
-      // Unpinned Agents: most recently launched first, then the current
-      // built-ins-then-customs order for anything never launched (a stable
-      // sort keeps ties in their incoming order). Host-first ordering needs
-      // the member host, which arrives with F2a.
+      // Unpinned Agents: an Agent whose lead host is the selected host first,
+      // then most recently launched, then the current built-ins-then-customs
+      // order for anything never launched (a stable sort keeps ties in their
+      // incoming order).
       otherEntries: pinCandidates
         .filter((agent) => !pinned.has(agent.id))
-        .sort(
-          (first, second) =>
+        .sort((first, second) => {
+          const hostDelta = hostRank(first) - hostRank(second);
+          if (hostDelta !== 0) return hostDelta;
+          return (
             (recentRank.get(first.id) ?? Number.POSITIVE_INFINITY) -
-            (recentRank.get(second.id) ?? Number.POSITIVE_INFINITY),
-        ),
+            (recentRank.get(second.id) ?? Number.POSITIVE_INFINITY)
+          );
+        }),
     };
-  }, [pinnedAgentIds, pinCandidates, recentAgentIds]);
+  }, [pinnedAgentIds, pinCandidates, recentAgentIds, host, leadHostByAgentId]);
 
   // "Create custom agent" is reachable on any non-sandbox target (a managed
   // sandbox has no create path for an uploaded bundle), unless the embedder
@@ -2360,6 +2370,16 @@ export function NewChatLandingScreen() {
   // The fork's managed agent library: server-side custom agents that are not
   // in the session-derived catalog. Merged into the picker below.
   const customCatalog = useCustomAgents();
+  // Each saved Agent's lead host (null = the session's picked host): the
+  // picker's host-first "Other…" ordering, and picking an Agent moves the
+  // host chip to its lead host.
+  const savedAgentLeadHosts = useMemo(() => {
+    const map = new Map<string, string | null>();
+    for (const row of customCatalog.data ?? []) {
+      map.set(row.id, row.members?.find((member) => member.lead)?.host_id ?? null);
+    }
+    return map;
+  }, [customCatalog.data]);
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
   const {
@@ -5428,6 +5448,16 @@ export function NewChatLandingScreen() {
           : null,
       );
     }
+    // A saved Agent whose lead has a host runs there: move the host chip to
+    // that host when it is still known. The user can pick another host after.
+    const leadHostId = savedAgentLeadHosts.get(agent.id) ?? null;
+    if (
+      leadHostId !== null &&
+      leadHostId !== selectedHostId &&
+      allHosts.some((entry) => entry.host_id === leadHostId)
+    ) {
+      selectHost(leadHostId);
+    }
   };
   const handleSelectPending = () => {
     agentExplicitlySelectedRef.current = true;
@@ -7377,6 +7407,7 @@ export function NewChatLandingScreen() {
                         onSelectAgent={handleSelectAgent}
                         onEditSavedAgent={handleEditSavedAgent}
                         onViewBuiltinAgent={setViewingBuiltinAgent}
+                        leadHostByAgentId={savedAgentLeadHosts}
                         pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                         pendingAgentId={PENDING_AGENT_ID}
                         onSelectPending={handleSelectPending}
