@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import httpx
@@ -488,6 +488,150 @@ async def test_runtime_system_post_is_not_parsed_for_mentions() -> None:
 
     assert _ordered_user_texts(harness.posted_bodies[1]) == [wake, follow_up]
     assert runner_app.list_member_obligations(PARENT) == []
+
+
+# --------------------------------------------------------------------------
+# Consumed injections (review r2 finding 1: mid-turn messages must route)
+# --------------------------------------------------------------------------
+
+
+class _InjectionHarnessClient(_ScriptedHarnessClient):
+    """Harness fake whose blocked turn consumes forwarded injections.
+
+    The stream yields ``response.created``, waits for :attr:`inject_gate`,
+    emits one ``injection.consumed`` event per body forwarded over the
+    inherited ``post`` (so the ids are real), then waits for
+    :attr:`finish_gate` before completing. Turns other than ``block_turn``
+    complete immediately.
+    """
+
+    def __init__(self, *, block_turn: int = 0) -> None:
+        """Block the stream of ``block_turn``; every other turn completes."""
+        super().__init__([])
+        self._block_turn = block_turn
+        self.inject_gate = asyncio.Event()
+        self.finish_gate = asyncio.Event()
+        self._streams = 0
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Record the turn body; gate the blocked turn's consumption and end."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        turn = self._streams
+        self._streams += 1
+        client = self
+
+        class _Ctx:
+            status_code = 200
+
+            async def __aenter__(self) -> Any:
+                return _Handle()
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        class _Handle:
+            status_code = 200
+
+            async def aiter_text(self) -> AsyncIterator[str]:
+                yield _sse({"type": "response.created", "response": {"id": f"resp_{turn}"}})
+                if turn == client._block_turn:
+                    await client.inject_gate.wait()
+                    for body in list(client.patched_events):
+                        injection_id = body.get("injection_id")
+                        if injection_id:
+                            yield _sse(
+                                {"type": "injection.consumed", "injection_id": injection_id}
+                            )
+                    await client.finish_gate.wait()
+                yield _sse({"type": "response.completed", "response": {"id": f"resp_{turn}"}})
+
+        return _Ctx()
+
+
+@pytest.mark.asyncio
+async def test_injected_request_binds_to_the_running_turn() -> None:
+    """A mid-turn ``@role`` injection opens its obligation and gets the follow-up."""
+    harness = _InjectionHarnessClient()
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server, harness_client=harness)
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        assert (await _post_message(client, "start the work")).status_code == 202
+        await _wait_until(lambda: app.state.live_response_id.get(PARENT) == "resp_0")
+        assert (
+            await _post_message(client, "@executor handle the injected request")
+        ).status_code == 202
+        await _wait_until(lambda: any(b.get("injection_id") for b in harness.patched_events))
+
+        harness.inject_gate.set()
+        await _wait_until(lambda: bool(runner_app.list_member_obligations(PARENT)))
+        obligation = runner_app.list_member_obligations(PARENT)[0]
+        assert obligation.role == "executor"
+        assert obligation.request_turn == runner_app._member_turn_stamps[PARENT]
+
+        harness.finish_gate.set()
+        await _wait_until(lambda: bool(_events_of_type(server, "message")))
+        await _wait_for_turn_end(app)
+        assert obligation.follow_up_sent is True
+        assert obligation.follow_up_turn is None
+
+        # The server hands the follow-up back; that turn's end notices.
+        follow_up_text = _events_of_type(server, "message")[0]["data"]["content"][0]["text"]
+        await _post_message(client, follow_up_text)
+        await _wait_until(lambda: bool(_notices(server)))
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
+
+    injected = next(body for body in harness.patched_events if body.get("injection_id"))
+    assert _ordered_user_texts(injected) == ["@executor handle the injected request"]
+    assert [notice["data"]["item_data"]["message"] for notice in _notices(server)] == [
+        "executor did not run: not dispatched after the follow-up"
+    ]
+    # Never a second follow-up.
+    assert len(_events_of_type(server, "message")) == 1
+
+
+@pytest.mark.asyncio
+async def test_injected_follow_up_binds_to_the_running_turn() -> None:
+    """A follow-up consumed mid-turn binds ``follow_up_turn`` and its end notices."""
+    harness = _InjectionHarnessClient(block_turn=1)
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server, harness_client=harness)
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        assert (await _post_message(client, "[executor] build the parser")).status_code == 202
+        await _wait_until(lambda: bool(_events_of_type(server, "message")))
+        follow_up_text = _events_of_type(server, "message")[0]["data"]["content"][0]["text"]
+        obligation = runner_app.list_member_obligations(PARENT)[0]
+        assert obligation.follow_up_sent is True
+        assert obligation.follow_up_turn is None
+
+        # A later user turn is running when the follow-up lands; it is injected.
+        assert (await _post_message(client, "keep going")).status_code == 202
+        await _wait_until(lambda: app.state.live_response_id.get(PARENT) == "resp_1")
+        assert (await _post_message(client, follow_up_text)).status_code == 202
+        await _wait_until(lambda: any(b.get("injection_id") for b in harness.patched_events))
+
+        harness.inject_gate.set()
+        await _wait_until(
+            lambda: runner_app.list_member_obligations(PARENT)[0].follow_up_turn is not None
+        )
+        assert (
+            runner_app.list_member_obligations(PARENT)[0].follow_up_turn
+            == runner_app._member_turn_stamps[PARENT]
+        )
+
+        harness.finish_gate.set()
+        await _wait_until(lambda: bool(_notices(server)))
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
+
+    assert [notice["data"]["item_data"]["message"] for notice in _notices(server)] == [
+        "executor did not run: not dispatched after the follow-up"
+    ]
+    # Never a second follow-up.
+    assert len(_events_of_type(server, "message")) == 1
 
 
 # --------------------------------------------------------------------------

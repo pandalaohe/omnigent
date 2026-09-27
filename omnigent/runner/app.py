@@ -8494,6 +8494,8 @@ def create_runner_app(
     def _route_member_inputs(
         session_id: str,
         bodies: Sequence[Mapping[str, Any]],
+        *,
+        injected: bool = False,
     ) -> str | None:
         """Record the starting turn's member obligations and build its note.
 
@@ -8503,14 +8505,22 @@ def create_runner_app(
         lead to dispatch each one with ``sys_session_send``. The runner's own
         ``[System: …]`` wake and follow-up posts are never parsed for mentions;
         a member follow-up instead binds the obligations it names to this turn,
-        whose end settles them. ``None`` when the session has fewer than two
-        member snapshot entries or no body adds a note — so an ordinary session
-        behaves exactly as before.
+        whose end settles them. With *injected*, the bodies were consumed
+        inside the turn already running: their requests bind to that turn's
+        stamp instead of starting a new one, and the caller drops the returned
+        note — the harness already holds the body the note cannot join.
+        ``None`` when the session has fewer than two member snapshot entries or
+        no body adds a note — so an ordinary session behaves exactly as before.
         """
         entries = _session_member_entries.get(session_id) or {}
         if len(entries) < 2:
             return None
-        turn = advance_member_turn(session_id)
+        if injected:
+            turn = _member_turn_stamps.get(session_id)
+            if turn is None:
+                return None
+        else:
+            turn = advance_member_turn(session_id)
         lead_roles = {role for role, entry in entries.items() if entry.get("lead") is True}
         note_lines: list[str] = []
         for body in bodies:
@@ -10595,6 +10605,15 @@ def create_runner_app(
                                                     "content": _m.get("content", []),
                                                 }
                                             )
+                                        # A consumed injection never drains into a
+                                        # turn of its own, so route it here, bound
+                                        # to the turn it was injected into: its
+                                        # requests join that turn's end (one
+                                        # follow-up if unmet), and an injected
+                                        # follow-up body binds the records it
+                                        # names to that turn. The note has no
+                                        # body left to join, so it is dropped.
+                                        _route_member_inputs(conv_id, _consumed, injected=True)
                                     continue
                                 if _evt_type == "response.output_text.delta":
                                     delta = event.get("delta")
