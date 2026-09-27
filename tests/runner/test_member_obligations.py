@@ -473,17 +473,20 @@ async def test_second_request_naming_a_busy_role_gets_its_own_obligation(
 
 @pytest.mark.asyncio
 async def test_runtime_system_post_is_not_parsed_for_mentions() -> None:
-    """The runner's own ``[System: …]`` wake posts never route mentions."""
+    """The runner's own ``[System: …]`` wake / follow-up posts never route."""
     server = _MemberServerClient()
     app, _pm, harness = _build_app(server)
     wake = "[System: sub-agent finished] @executor look at its result"
+    follow_up = f"{runner_app.member_follow_up_notice('executor')} @executor please"
 
     async with _runner_client(app) as client:
         await _seed_session(client, labels=_member_labels())
         await _post_message(client, wake)
         await _wait_until(lambda: bool(harness.posted_bodies))
+        await _post_message(client, follow_up)
+        await _wait_until(lambda: len(harness.posted_bodies) >= 2)
 
-    assert _ordered_user_texts(harness.posted_bodies[0]) == [wake]
+    assert _ordered_user_texts(harness.posted_bodies[1]) == [wake, follow_up]
     assert runner_app.list_member_obligations(PARENT) == []
 
 
