@@ -92,6 +92,27 @@ executor: {type: omnigent, model: research-model, reasoning_effort: medium,
     )
 
 
+_FLAT_AGENT_YAML = """name: flat-reviewer
+description: Flat description
+prompt: Flat instructions
+executor:
+  harness: codex
+  model: test-model
+"""
+
+
+def flat_bundle(config: str) -> bytes:
+    """A single-file saved Agent: one root ``agent.yaml``, no ``config.yaml``."""
+    out = io.BytesIO()
+    data = config.encode()
+    with tarfile.open(fileobj=out, mode="w:gz") as archive:
+        info = tarfile.TarInfo("agent.yaml")
+        info.size = len(data)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(data))
+    return out.getvalue()
+
+
 def members(data: bytes) -> dict[str, tuple[bytes, int]]:
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
         return {m.name: (archive.extractfile(m).read(), m.mode) for m in archive if m.isfile()}
@@ -501,6 +522,76 @@ async def test_patch_members_rejects_invalid_roster(
         )
 
     assert response.status_code == 400, response.text
+
+
+@pytest.mark.asyncio
+async def test_patch_members_rejects_flat_single_file_agent(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = flat_bundle(_FLAT_AGENT_YAML)
+    headers = {"x-test-user": "alice"}
+    roster = [
+        roster_member(
+            "flat-reviewer",
+            lead=True,
+            harness="claude-sdk",
+            model="lead-2",
+        )
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        agent_id = created.json()["id"]
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": roster, "version": 1},
+        )
+        contents = await client.get(f"/v1/custom-agents/{agent_id}/contents", headers=headers)
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["message"] == (
+        "Members can only be edited on a directory Agent bundle (config.yaml); "
+        "this Agent is a single YAML file"
+    )
+    assert contents.status_code == 200
+    assert contents.content == original
+
+
+@pytest.mark.asyncio
+async def test_patch_scalars_on_flat_single_file_agent(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, _artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    original = flat_bundle(_FLAT_AGENT_YAML)
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents", headers=headers, files={"bundle": ("agent.tar.gz", original)}
+        )
+        assert created.status_code == 201, created.text
+        agent_id = created.json()["id"]
+        response = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"name": "flat-renamed"},
+        )
+        contents = await client.get(f"/v1/custom-agents/{agent_id}/contents", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "flat-renamed"
+    assert response.json()["members"][0]["name"] == "flat-renamed"
+    edited = yaml.safe_load(members(contents.content)["agent.yaml"][0])
+    assert edited["name"] == "flat-renamed"
+    assert edited["prompt"] == "Flat instructions"
+    assert edited["executor"]["model"] == "test-model"
 
 
 @pytest.mark.asyncio

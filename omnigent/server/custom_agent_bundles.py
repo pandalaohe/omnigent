@@ -289,7 +289,9 @@ def patch_bundle(bundle: bytes, changes: dict[str, Any]) -> bytes:
     the root config and each touched ``agents/<role>/config.yaml`` with the
     spec parser's loader and re-dumps them, so comments in those files are
     lost; roles dropped from the roster lose their archive entries. Every
-    other archive member is copied unchanged either way.
+    other archive member is copied unchanged either way. A ``members`` change
+    on a single-file Agent (no ``config.yaml``) is rejected: a flat Agent has
+    no ``agents/<role>/`` tree to persist the roster in.
     """
     with tempfile.TemporaryDirectory() as temp:
         root = extract_safe(bundle, Path(temp) / "bundle")
@@ -320,6 +322,12 @@ def patch_bundle(bundle: bytes, changes: dict[str, Any]) -> bytes:
                 fields["instructions"] = path
             replacements[config.name] = _patch_yaml_fields(raw, fields).encode("utf-8")
         else:
+            if config.name != "config.yaml":
+                raise OmnigentError(
+                    "Members can only be edited on a directory Agent bundle "
+                    "(config.yaml); this Agent is a single YAML file",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             _rewrite_members(root, config, raw, members, fields, replacements, dropped)
 
     output = io.BytesIO()
