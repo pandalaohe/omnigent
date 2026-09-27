@@ -20,6 +20,7 @@ from omnigent.server.artifact_links import (
 
 _KEY = b"\x11" * 32
 _ROTATED_KEY = b"\x22" * 32
+_EXPIRY = 1_800_000_000
 
 
 def _token(key: bytes = _KEY, **overrides: object) -> str:
@@ -33,6 +34,8 @@ def _token(key: bytes = _KEY, **overrides: object) -> str:
         "view": "p",
     }
     fields.update(overrides)
+    if fields["view"] == "p":
+        fields.setdefault("expires_at", _EXPIRY)
     return encode_artifact_token(key, **fields)  # type: ignore[arg-type]
 
 
@@ -48,6 +51,8 @@ def _payload_segment(claims: ArtifactTokenClaims, **overrides: object) -> str:
         "i": claims.key_id,
         "w": claims.workspace_id,
     }
+    if claims.expires_at is not None:
+        fields["x"] = claims.expires_at
     fields.update(overrides)
     raw = json.dumps(fields, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -69,6 +74,15 @@ def test_round_trip_preserves_every_claim() -> None:
         key_id=key_id(_KEY),
     )
     assert verify_artifact_token(claims, token, _KEY) == "ok"
+
+
+def test_round_trip_preserves_the_panel_expiry() -> None:
+    token = _token()
+    claims = decode_artifact_token(token)
+
+    assert claims is not None
+    assert claims.view == "p"
+    assert claims.expires_at == _EXPIRY
 
 
 def test_tampered_payload_is_forged() -> None:
@@ -128,6 +142,7 @@ _VALID_PAYLOAD: dict[str, object] = {
     "v": "p",
     "i": "0123abcd",
     "w": 0,
+    "x": _EXPIRY,
 }
 
 _MALFORMED_TOKENS = [
@@ -156,12 +171,39 @@ _MALFORMED_TOKENS = [
     "a1." + _payload_b64({**_VALID_PAYLOAD, "w": True}) + ".mac",
     "a1." + _payload_b64({**_VALID_PAYLOAD, "w": -1}) + ".mac",
     "a1." + _payload_b64({**_VALID_PAYLOAD, "w": 2**63}) + ".mac",
+    # A panel token must carry its expiry; a raw-view token must not.
+    "a1." + _payload_b64({k: v for k, v in _VALID_PAYLOAD.items() if k != "x"}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "v": "r"}) + ".mac",
+    # A raw-view token must not carry the key at all, even as null.
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "v": "r", "x": None}) + ".mac",
+    # ``x`` must be a plain int inside the 64-bit range.
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "x": True}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "x": -1}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "x": 2**63}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "x": "1800000000"}) + ".mac",
 ]
 
 
 @pytest.mark.parametrize("token", _MALFORMED_TOKENS)
 def test_malformed_tokens_decode_to_none_without_raising(token: str) -> None:
     assert decode_artifact_token(token) is None
+
+
+def test_panel_token_without_expiry_and_raw_token_with_expiry_decode_to_none() -> None:
+    """The expiry claim is panel-only: each view refuses the other's shape."""
+    panel_without_x = (
+        "a1." + _payload_b64({k: v for k, v in _VALID_PAYLOAD.items() if k != "x"}) + ".mac"
+    )
+    raw_with_x = "a1." + _payload_b64({**_VALID_PAYLOAD, "v": "r"}) + ".mac"
+
+    assert decode_artifact_token(panel_without_x) is None
+    assert decode_artifact_token(raw_with_x) is None
+
+
+def test_encode_refuses_an_expiry_on_a_raw_token() -> None:
+    """A raw-view URL stays deterministic, so an expiry is a caller bug."""
+    with pytest.raises(ValueError, match="panel-view"):
+        _token(view="r", expires_at=_EXPIRY)
 
 
 def test_non_string_token_decodes_to_none() -> None:

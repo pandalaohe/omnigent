@@ -1,4 +1,4 @@
-"""Artifact capability-URL routes: mint, revoke, open and serve.
+"""Artifact capability-URL routes: mint, revoke, open, serve and gate.
 
 The web UI mints a signed, session-bound token for one workspace file
 (``POST /v1/sessions/{sid}/artifacts``) and loads the file from
@@ -9,6 +9,13 @@ artifact-link key label, and pulls the bytes from the session's runner
 its filesystem tunnel. A bundle token (an HTML entry) serves the entry's
 folder and descendants; the reader enforces containment with ``within``
 and the server refuses a response that does not confirm it.
+
+The session owner's external-access gate runs between the path rules and
+the read (``artifact_sharing``): a panel token passes outright while its
+expiry lasts, an authorized logged-in visitor and a remembered browser are
+redirected onto a short-lived grant, and everyone else meets the share-code
+form or the sign-in page. The settings routes (``/v1/artifact-sharing``) and
+the unlock POST that issues those credentials live here too.
 """
 
 from __future__ import annotations
@@ -21,17 +28,19 @@ import logging
 import mimetypes
 import os
 import re
+import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from omnigent.artifact_paths import artifact_path_allowed, artifact_segments_valid
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import CAP_FS_READ_RAW
@@ -45,15 +54,37 @@ from omnigent.server.artifact_links import (
     rotate_artifact_key,
     verify_artifact_token,
 )
-from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.artifact_sharing import (
+    KEEP_SHARE_CODE,
+    REMEMBER_COOKIE_MAX_AGE_SECONDS,
+    ArtifactSharingStore,
+    KeepShareCode,
+    UnlockFailureBudget,
+    gate_key_id,
+    grant_valid,
+    issue_remember_cookie,
+    mint_grant,
+    remember_cookie_name,
+    remember_cookie_valid,
+    verify_share_code,
+)
+from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
+)
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
+from omnigent.server.routes._auth_helpers import (
+    require_user as _require_user,
+)
+from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._gzip_route import skip_gzip
+from omnigent.server.routes._oauth import RATE_LIMITER_MAX_KEYS, SlidingWindowRateLimiter
 from omnigent.server.routes.sessions.routes_resources import _RunnerStreamResponse
 from omnigent.server.schemas import ArtifactOpenRequestEvent
 from omnigent.stores import ConversationStore
@@ -67,6 +98,53 @@ _ENVIRONMENT_ID = "default"
 # Per-file ceiling for a served artifact. The runner announces the size in
 # Content-Length; a body without one is read into a buffer no larger than this.
 _MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
+
+# Panel tokens live long enough to keep an open panel working without a
+# redirect; the viewer re-mints before they expire.
+_PANEL_TOKEN_TTL_SECONDS = 12 * 60 * 60
+
+# The owner walk for a sub-agent session: past this depth the chain is
+# treated as unresolvable, which fails the gate closed.
+_OWNER_CHAIN_MAX_HOPS = 8
+
+# Settings writes per owner and unlock failures per owner; both windows are
+# per process, like the other in-memory throttles in the server.
+_SHARING_WRITE_RATE_MAX = 20
+_SHARING_WRITE_RATE_WINDOW_SECONDS = 60
+_UNLOCK_FAILURE_MAX = 10
+_UNLOCK_FAILURE_WINDOW_SECONDS = 600
+_UNLOCK_FAILURE_MAX_KEYS = 10_000
+
+_GATE_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+    "frame-ancestors 'self'; base-uri 'none'"
+)
+
+# Headers on the gate's own pages. The artifact sandbox CSP would force an
+# opaque origin, which would post the form with ``Origin: null``; these pages
+# carry their own CSP instead and none of the artifact CORS/disposition
+# headers.
+_GATE_HEADERS: dict[str, str] = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": _GATE_CSP,
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Robots-Tag": "noindex",
+}
+
+_FORM_PAGE_TEMPLATE = (
+    '<!doctype html>\n<html><head><meta charset="utf-8">'
+    "<title>{status} {reason}</title></head>"
+    "<body><h1>{status} {reason}</h1>"
+    '<form method="post"><input type="password" name="code">'
+    '<button type="submit">Open</button></form></body></html>\n'
+)
+
+_FORBIDDEN_PAGE_TEMPLATE = (
+    '<!doctype html>\n<html><head><meta charset="utf-8">'
+    "<title>403 Forbidden</title></head>"
+    '<body><h1>403 Forbidden</h1><p><a href="{root}/">Home</a></p></body></html>\n'
+)
 
 # In-frame scripts injected into panel-view HTML, in order. RPB03 appends
 # its annotation asset here; an asset missing from disk is skipped.
@@ -114,6 +192,8 @@ _HOST_OFFLINE_SENTENCE = "The session host is offline."
 _HOST_NEEDS_UPDATE_SENTENCE = "The session host needs an update to serve bundle files."
 _RUNNER_NEEDS_UPDATE_SENTENCE = "The session runner needs an update to serve bundle files."
 _LOAD_FAILED_SENTENCE = "The artifact could not be loaded."
+_EXPIRED_SENTENCE = "This link has expired."
+_TOO_MANY_ATTEMPTS_SENTENCE = "Too many attempts."
 
 _PAGE_STATUSES = frozenset({404, 410, 413, 502, 503})
 
@@ -179,6 +259,40 @@ def _error_page(status: int, sentence: str) -> HTMLResponse:
         status_code=status,
         headers=dict(_SECURITY_HEADERS),
     )
+
+
+def _gate_page(status: int, body: str) -> HTMLResponse:
+    """Build a static gate page with the gate's own security headers."""
+    return HTMLResponse(content=body, status_code=status, headers=dict(_GATE_HEADERS))
+
+
+def _form_page(status: int) -> HTMLResponse:
+    """The share-code form: one password field, one button, no echo.
+
+    The form has no ``action``, so it posts back to the current URL.
+    """
+    reason = http.HTTPStatus(status).phrase
+    return _gate_page(status, _FORM_PAGE_TEMPLATE.format(status=status, reason=reason))
+
+
+def _forbidden_page(request: Request) -> HTMLResponse:
+    """The sign-in page when the gate is switched off, with a link home."""
+    base_path = getattr(request.app.state, "base_path", "") or ""
+    return _gate_page(403, _FORBIDDEN_PAGE_TEMPLATE.format(root=base_path))
+
+
+def _parse_token_segment(token: str) -> tuple[str, str]:
+    """Split an artifact path segment into the bare token and the grant.
+
+    The grant rides after the token on base64url output, which never
+    contains ``~``, so the first ``~`` is the boundary. Every token use
+    (decode, verify, bridge nonce) takes the bare token.
+
+    :param token: The ``<token>`` or ``<token>~<grant>`` path segment.
+    :returns: ``(bare_token, grant)``, with ``""`` when no grant is present.
+    """
+    bare, separator, grant = token.partition("~")
+    return bare, grant if separator else ""
 
 
 def _normalize_artifact_path(path: str, base: object) -> tuple[bool, str]:
@@ -343,12 +457,220 @@ def register_artifact_routes(
     :param _runner_path_segment: Closure encoding a runner path segment.
     """
 
+    # The gate's per-app state. The sharing store connects on first use, so
+    # an app that never serves an artifact pays nothing; the two throttles are
+    # in-memory and per process, like the other server-side limiters.
+    sharing_store: ArtifactSharingStore | None = None
+    sharing_write_limiter = SlidingWindowRateLimiter(
+        _SHARING_WRITE_RATE_MAX, _SHARING_WRITE_RATE_WINDOW_SECONDS, RATE_LIMITER_MAX_KEYS
+    )
+    unlock_failures = UnlockFailureBudget(
+        max_failures=_UNLOCK_FAILURE_MAX,
+        window_seconds=_UNLOCK_FAILURE_WINDOW_SECONDS,
+        max_keys=_UNLOCK_FAILURE_MAX_KEYS,
+    )
+
+    def _get_sharing_store() -> ArtifactSharingStore:
+        """Return (creating once per router) the owner-settings store."""
+        nonlocal sharing_store
+        if sharing_store is None:
+            sharing_store = ArtifactSharingStore(conversation_store.storage_location)
+        return sharing_store
+
     async def _authorize_edit(request: Request, session_id: str) -> None:
         """Require edit level on *session_id*, like the browser bridge routes."""
         user_id = _get_user_id(request, auth_provider)
         await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+
+    async def _resolve_link_owner(conv: Conversation) -> str | None:
+        """Resolve the user whose sharing settings govern *conv*'s links.
+
+        Sub-agent sessions carry no grant of their own, so the walk follows
+        ``parent_conversation_id`` until a grant appears. An unresolved owner
+        is not an error the visitor can see: the caller treats it as the
+        switch being off, and grants are signed with an empty gate-key id.
+
+        :param conv: The link's session.
+        :returns: The owner's user id, ``RESERVED_USER_LOCAL`` when no auth
+            provider is configured, or ``None``.
+        """
+        if auth_provider is None:
+            return RESERVED_USER_LOCAL
+        current = conv
+        for _ in range(_OWNER_CHAIN_MAX_HOPS):
+            owner = await asyncio.to_thread(_get_session_owner_id, current.id, permission_store)
+            if owner is not None:
+                return owner
+            parent_id = current.parent_conversation_id
+            if parent_id is None:
+                return None
+            parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+            if parent is None:
+                return None
+            current = parent
+        return None
+
+    def _is_login(user_id: str | None) -> bool:
+        """Whether *user_id* is a real identity, not a reserved sentinel."""
+        return user_id is not None and user_id != RESERVED_USER_LOCAL
+
+    async def _identity_allowed(request: Request, claims: ArtifactTokenClaims) -> bool:
+        """Whether the request's identity passes the mint's read rule.
+
+        The rule is the one the mint applied (``_authorize_browse_read`` with
+        the joined root+entry; an absolute target always takes the owner
+        check). The request carries the identity, so the provider resolves it
+        again inside the token's workspace scope — the same identity the
+        route read before entering that scope.
+
+        :param request: The incoming request, for the auth provider.
+        :param claims: The verified token claims.
+        :returns: ``True`` when the read rule admits the caller.
+        """
+        if claims.absolute:
+            target = "/" + _posix_join(claims.root.lstrip("/"), claims.entry)
+        else:
+            target = _posix_join(claims.root, claims.entry)
+        try:
+            await _authorize_browse_read(claims.session_id, request, target)
+        except OmnigentError:
+            return False
+        return True
+
+    def _grant_redirect(
+        request: Request,
+        token: str,
+        relpath: str,
+        session_key: bytes,
+        gate_key_identifier: str,
+    ) -> Response:
+        """303 the visitor onto the same URL carrying a fresh grant.
+
+        The location is path-only (the host belongs to the client) and keeps
+        the original query string.
+        """
+        grant = mint_grant(session_key, token, gate_key_identifier, now_epoch())
+        base_path = getattr(request.app.state, "base_path", "") or ""
+        location = f"{base_path}/v1/artifacts/{token}~{grant}/{urllib.parse.quote(relpath)}"
+        query = request.url.query
+        if query:
+            location = f"{location}?{query}"
+        return RedirectResponse(location, status_code=303)
+
+    async def _gate_response(
+        request: Request,
+        user_id: str | None,
+        claims: ArtifactTokenClaims,
+        token: str,
+        grant: str,
+        relpath: str,
+        conv: Conversation,
+        session_key: bytes,
+    ) -> Response | None:
+        """Apply the owner's external-access gate; ``None`` means serve.
+
+        Decision order (design §2.5): an unexpired panel token passes; a
+        valid grant passes; an open gate (no record, or no code) passes; an
+        authorized logged-in visitor and a remembered browser are redirected
+        onto a fresh grant; otherwise the share-code form or the sign-in
+        page answers. An owner that cannot be resolved fails closed like a
+        switched-off gate.
+        """
+        now = now_epoch()
+        if claims.view == "p":
+            if claims.expires_at is not None and claims.expires_at > now:
+                return None
+            return _error_page(410, _EXPIRED_SENTENCE)
+        owner = await _resolve_link_owner(conv)
+        record = (
+            await asyncio.to_thread(_get_sharing_store().read_sharing, owner)
+            if owner is not None
+            else None
+        )
+        gate_key_identifier = gate_key_id(record.gate_key) if record is not None else ""
+        if grant and grant_valid(session_key, token, grant, gate_key_identifier, now):
+            return None
+        if owner is None:
+            # Nothing can be consulted, so the gate fails closed: only a
+            # logged-in user passing the mint's read rule gets in.
+            if _is_login(user_id) and await _identity_allowed(request, claims):
+                return _grant_redirect(request, token, relpath, session_key, gate_key_identifier)
+            return _forbidden_page(request)
+        # Gate open: no record (the user default is external on, no code) or
+        # external on with no code. A URL whose grant is bad is evaluated
+        # here as a bare one.
+        if record is None or (record.external and record.code_hash is None):
+            return None
+        if _is_login(user_id) and await _identity_allowed(request, claims):
+            return _grant_redirect(request, token, relpath, session_key, gate_key_identifier)
+        if not record.external:
+            return _forbidden_page(request)
+        cookie_name = remember_cookie_name(owner, secure=request.url.scheme == "https")
+        cookie = request.cookies.get(cookie_name)
+        if cookie and remember_cookie_valid(record.gate_key, owner, cookie, now):
+            return _grant_redirect(request, token, relpath, session_key, gate_key_identifier)
+        return _form_page(401)
+
+    def _remember_cookie_path(request: Request) -> str:
+        """The cookie's Path: the artifact route family under the base path."""
+        base_path = getattr(request.app.state, "base_path", "") or ""
+        return f"{base_path}/v1/artifacts/"
+
+    def _attach_remember_cookie(
+        response: Response, request: Request, owner: str, gate_key: str
+    ) -> None:
+        """Set the artifact-scoped remember cookie on a successful unlock."""
+        secure = request.url.scheme == "https"
+        response.set_cookie(
+            remember_cookie_name(owner, secure=secure),
+            issue_remember_cookie(gate_key, owner, now_epoch()),
+            max_age=REMEMBER_COOKIE_MAX_AGE_SECONDS,
+            path=_remember_cookie_path(request),
+            httponly=True,
+            samesite="lax",
+            secure=secure,
+        )
+
+    async def _load_verified_target(
+        token: str,
+        relpath: str,
+        claims: ArtifactTokenClaims,
+    ) -> tuple[Conversation, bytes] | Response:
+        """Load and verify the token target; a :class:`Response` is a refusal.
+
+        Covers the shared head of GET and POST: conversation lookup,
+        archive, key verification and the lexical path rules. Must run
+        inside the token's workspace scope.
+
+        :param token: The bare token (no grant suffix).
+        :param relpath: The URL-decoded request path.
+        :param claims: Claims decoded from *token*.
+        :returns: ``(conversation, session_key)`` or an error page.
+        """
+        conv = await asyncio.to_thread(conversation_store.get_conversation, claims.session_id)
+        if conv is None:
+            return _error_page(404, _NOT_FOUND_SENTENCE)
+        if conv.archived:
+            return _error_page(410, _REVOKED_SENTENCE)
+        key = read_artifact_key(conv.labels)
+        verdict = verify_artifact_token(claims, token, key)
+        if verdict == "revoked":
+            return _error_page(410, _REVOKED_SENTENCE)
+        if verdict != "ok" or key is None:
+            return _error_page(404, _NOT_FOUND_SENTENCE)
+        segments = relpath.split("/")
+        if not artifact_segments_valid(segments):
+            return _error_page(404, _NOT_FOUND_SENTENCE)
+        is_entry = relpath == claims.entry
+        if claims.kind == "f":
+            # A file token serves exactly its entry.
+            if not is_entry:
+                return _error_page(404, _NOT_FOUND_SENTENCE)
+        elif not is_entry and not artifact_path_allowed(segments):
+            return _error_page(404, _NOT_FOUND_SENTENCE)
+        return conv, key
 
     def _artifact_runner_url(
         session_id: str,
@@ -524,6 +846,51 @@ def register_artifact_routes(
         content_type = payload.get("content_type") or _guess_media_type(relpath)
         return _render_buffered(request, claims, nonce, content_type, body)
 
+    async def _dispatch_reader(
+        request: Request,
+        claims: ArtifactTokenClaims,
+        conv: Conversation,
+        session_key: bytes,
+        token: str,
+        relpath: str,
+    ) -> Response:
+        """Serve from the runner, falling back to the host when offline.
+
+        The bare token is what feeds ``bridge_nonce``; the grant suffix is
+        never part of the injected nonce.
+        """
+        # ``within`` applies to bundle sub-resources only: the entry itself
+        # is authorized by the mint, and a directly opened dotfile is a file
+        # token (served as-is).
+        sub_resource = claims.kind == "b" and relpath != claims.entry
+        nonce = bridge_nonce(session_key, token)
+        try:
+            return await _serve_from_runner(
+                request,
+                claims.session_id,
+                conv,
+                claims,
+                relpath,
+                sub_resource=sub_resource,
+                nonce=nonce,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                status = _page_status(exc.http_status)
+                return _error_page(status, _sentence_for(status))
+            return await _serve_from_host(
+                request,
+                claims.session_id,
+                conv,
+                claims,
+                relpath,
+                sub_resource=sub_resource,
+                nonce=nonce,
+            )
+        except HTTPException as exc:
+            status = 404 if exc.status_code in (400, 404) else 502
+            return _error_page(status, _sentence_for(status))
+
     @router.post(
         "/sessions/{session_id}/artifacts",
         # Internal web-UI flow — hidden from the public API reference.
@@ -580,6 +947,9 @@ def register_artifact_routes(
         root = f"/{parent}" if absolute else parent
         kind: Literal["b", "f"] = "b" if Path(entry).suffix.lower() in (".html", ".htm") else "f"
         key = await asyncio.to_thread(get_or_create_artifact_key, conversation_store, session_id)
+        # A panel token carries an expiry and passes the owner's gate
+        # outright; a raw-view token stays deterministic and gated.
+        expires_at = now_epoch() + _PANEL_TOKEN_TTL_SECONDS if view == "panel" else None
         token = encode_artifact_token(
             key,
             session_id=session_id,
@@ -589,11 +959,13 @@ def register_artifact_routes(
             entry=entry,
             kind=kind,
             view="p" if view == "panel" else "r",
+            expires_at=expires_at,
         )
         return {
             "url": f"/v1/artifacts/{token}/{urllib.parse.quote(entry)}",
             "nonce": bridge_nonce(key, token),
             "kind": "bundle" if kind == "b" else "file",
+            "expires_at": expires_at,
         }
 
     @router.post(
@@ -693,6 +1065,49 @@ def register_artifact_routes(
             },
         )
 
+    async def _serve_with_gate(
+        request: Request,
+        user_id: str | None,
+        token: str,
+        relpath: str,
+    ) -> Response:
+        """Run the shared head (verify, path rules, gate) then the readers.
+
+        :param request: The incoming request.
+        :param user_id: Identity read before the workspace scope, or ``None``.
+        :param token: The token segment, possibly carrying a grant suffix.
+        :param relpath: Path relative to the bundle root (URL-decoded).
+        :returns: The artifact response, refusal page, or redirect.
+        """
+        bare_token, grant = _parse_token_segment(token)
+        claims = decode_artifact_token(bare_token)
+        if claims is None:
+            return _error_page(404, _NOT_FOUND_SENTENCE)
+        # Stores scope every row by ``current_workspace_id()``, so the token's
+        # minting workspace must be rebound or a link minted in workspace N
+        # finds no conversation.
+        with workspace_scope(claims.workspace_id):
+            try:
+                loaded = await _load_verified_target(bare_token, relpath, claims)
+                if isinstance(loaded, Response):
+                    return loaded
+                conv, session_key = loaded
+                gate = await _gate_response(
+                    request, user_id, claims, bare_token, grant, relpath, conv, session_key
+                )
+                if gate is not None:
+                    return gate
+                return await _dispatch_reader(
+                    request, claims, conv, session_key, bare_token, relpath
+                )
+            except Exception:
+                # Capability URLs never surface JSON or the shell: any lookup
+                # or reader fault answered as the page contract. The token
+                # stays out of the log, so it cannot leak through an
+                # aggregator.
+                logger.exception("artifact serve failed for session %s", claims.session_id)
+                return _error_page(502, _LOAD_FAILED_SENTENCE)
+
     @router.get(
         "/artifacts/{token}/{relpath:path}",
         # Internal serve route — hidden from the public API reference.
@@ -703,87 +1118,203 @@ def register_artifact_routes(
         """
         Serve one artifact file (or bundle sub-resource) by capability URL.
 
-        The token is the only credential: no cookie or user auth is read.
-        The runner is the primary byte source; a runner that is offline
-        falls back to the host tunnel, and either reader must confirm
-        bundle containment (``X-Omnigent-Within`` / ``within_enforced``)
-        before the bytes are served. Every failure is a static HTML page,
-        never JSON and never the SPA.
+        The token is the credential; the owner's external-access gate runs
+        after the path rules and before any read, answering a redirect, the
+        share-code form, or a sign-in page for a closed gate. The runner is
+        the primary byte source; a runner that is offline falls back to the
+        host tunnel, and either reader must confirm bundle containment
+        (``X-Omnigent-Within`` / ``within_enforced``) before the bytes are
+        served. Every failure is a static HTML page, never JSON and never
+        the SPA.
 
-        :param request: The incoming request, for the gzip opt-out.
-        :param token: The signed artifact token.
+        :param request: The incoming request.
+        :param token: The signed artifact token, optionally ``~`` a grant.
         :param relpath: Path relative to the bundle root (URL-decoded).
-        :returns: The file bytes with the artifact security headers, or an
-            HTML error page (404 / 410 / 413 / 502 / 503).
+        :returns: The file bytes with the artifact security headers, or a
+            page (303 / 401 / 403 / 404 / 410 / 413 / 502 / 503).
         """
-        claims = decode_artifact_token(token)
+        # The identity is read before entering the token's workspace scope:
+        # the provider's per-connection cache is keyed by the ambient
+        # workspace id, and the gate's owner lookup runs under the token's.
+        user_id = _get_user_id(request, auth_provider)
+        return await _serve_with_gate(request, user_id, token, relpath)
+
+    @router.post(
+        "/artifacts/{token}/{relpath:path}",
+        # Internal unlock flow — the share-code form posts to the current URL.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def unlock_artifact(request: Request, token: str, relpath: str) -> Response:
+        """
+        Submit the share code and receive a grant plus a remember cookie.
+
+        The token is checked as the GET route checks it (404 / 410 pages).
+        The owner's *current* record must have external access on and a code
+        set; otherwise nothing is issued and the GET decision answers (403
+        when off, the bytes when open). Each attempt claims a slot of the
+        owner's failure budget before the code is verified, and a match
+        releases it. A correct code sets the remember cookie and 303s onto a
+        fresh grant; a wrong one returns the form again with no hint. A
+        spent budget refuses further attempts with a 429 page.
+
+        :param request: The incoming request carrying the form body.
+        :param token: The signed artifact token, optionally ``~`` a grant.
+        :param relpath: Path relative to the bundle root (URL-decoded).
+        :returns: 303 with the cookie, or a refusal page.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        bare_token, _grant = _parse_token_segment(token)
+        claims = decode_artifact_token(bare_token)
         if claims is None:
             return _error_page(404, _NOT_FOUND_SENTENCE)
-        # The route reads no identity: stores scope every row by
-        # ``current_workspace_id()``, so the token's minting workspace must be
-        # rebound or a link minted in workspace N finds no conversation.
         with workspace_scope(claims.workspace_id):
-            conv = await asyncio.to_thread(conversation_store.get_conversation, claims.session_id)
-            if conv is None:
-                return _error_page(404, _NOT_FOUND_SENTENCE)
-            if conv.archived:
-                return _error_page(410, _REVOKED_SENTENCE)
-            key = read_artifact_key(conv.labels)
-            verdict = verify_artifact_token(claims, token, key)
-            if verdict == "revoked":
-                return _error_page(410, _REVOKED_SENTENCE)
-            if verdict != "ok" or key is None:
-                return _error_page(404, _NOT_FOUND_SENTENCE)
-            segments = relpath.split("/")
-            if not artifact_segments_valid(segments):
-                return _error_page(404, _NOT_FOUND_SENTENCE)
-            is_entry = relpath == claims.entry
-            if claims.kind == "f":
-                # A file token serves exactly its entry.
-                if not is_entry:
-                    return _error_page(404, _NOT_FOUND_SENTENCE)
-            elif not is_entry and not artifact_path_allowed(segments):
-                return _error_page(404, _NOT_FOUND_SENTENCE)
-            # ``within`` applies to bundle sub-resources only: the entry itself
-            # is authorized by the mint, and a directly opened dotfile is a file
-            # token (served as-is).
-            sub_resource = claims.kind == "b" and not is_entry
-            nonce = bridge_nonce(key, token)
-
-            async def _dispatch_reader() -> Response:
-                """Serve from the runner, falling back to the host when offline."""
-                try:
-                    return await _serve_from_runner(
-                        request,
-                        claims.session_id,
-                        conv,
-                        claims,
-                        relpath,
-                        sub_resource=sub_resource,
-                        nonce=nonce,
-                    )
-                except OmnigentError as exc:
-                    if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
-                        status = _page_status(exc.http_status)
-                        return _error_page(status, _sentence_for(status))
-                    return await _serve_from_host(
-                        request,
-                        claims.session_id,
-                        conv,
-                        claims,
-                        relpath,
-                        sub_resource=sub_resource,
-                        nonce=nonce,
-                    )
-                except HTTPException as exc:
-                    status = 404 if exc.status_code in (400, 404) else 502
-                    return _error_page(status, _sentence_for(status))
-
             try:
-                return await _dispatch_reader()
+                loaded = await _load_verified_target(bare_token, relpath, claims)
+                if isinstance(loaded, Response):
+                    return loaded
+                conv, session_key = loaded
+                owner = await _resolve_link_owner(conv)
+                record = (
+                    await asyncio.to_thread(_get_sharing_store().read_sharing, owner)
+                    if owner is not None
+                    else None
+                )
+                # A panel token never enters the unlock flow: it is decided
+                # exactly as the GET route decides it (serve while unexpired,
+                # 410 past it) and issues nothing.
+                if (
+                    claims.view == "p"
+                    or owner is None
+                    or record is None
+                    or not record.external
+                    or record.code_hash is None
+                ):
+                    gate = await _gate_response(
+                        request, user_id, claims, bare_token, "", relpath, conv, session_key
+                    )
+                    if gate is not None:
+                        return gate
+                    return await _dispatch_reader(
+                        request, claims, conv, session_key, bare_token, relpath
+                    )
+                now = time.time()
+                # The attempt is counted before the form is read and the
+                # verify runs; recording only failures afterwards let N
+                # parallel wrong codes all pass the spent-budget check.
+                if not unlock_failures.reserve(owner, now):
+                    return _gate_page(
+                        429,
+                        _ERROR_PAGE_TEMPLATE.format(
+                            status=429,
+                            reason=http.HTTPStatus(429).phrase,
+                            sentence=_TOO_MANY_ATTEMPTS_SENTENCE,
+                        ),
+                    )
+                form = await request.form()
+                code = form.get("code")
+                submitted = code.strip() if isinstance(code, str) else ""
+                if not await asyncio.to_thread(verify_share_code, submitted, record.code_hash):
+                    return _form_page(401)
+                unlock_failures.release(owner, now)
+                response = _grant_redirect(
+                    request, bare_token, relpath, session_key, gate_key_id(record.gate_key)
+                )
+                _attach_remember_cookie(response, request, owner, record.gate_key)
+                return response
             except Exception:
-                # Capability URLs never surface JSON or the shell: any reader
-                # fault answered as the page contract. The token stays out of
-                # the log, so it cannot leak through an aggregator.
-                logger.exception("artifact serve failed for session %s", claims.session_id)
+                # The unlock flow answers pages only; a lookup fault must not
+                # surface JSON. The token stays out of the log.
+                logger.exception("artifact unlock failed for session %s", claims.session_id)
                 return _error_page(502, _LOAD_FAILED_SENTENCE)
+
+    @router.get(
+        "/artifact-sharing",
+        # Internal settings flow — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def get_artifact_sharing(request: Request) -> dict[str, Any]:
+        """
+        Return the caller's external-access settings summary.
+
+        No row means the default: external access on, no share code. The
+        stored code hash and gate key never leave the server.
+
+        :param request: The incoming request, for the caller identity.
+        :returns: ``{"external": <bool>, "share_code_set": <bool>}``.
+        :raises OmnigentError: 401 when authentication is required and absent.
+        """
+        owner = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        record = await asyncio.to_thread(_get_sharing_store().read_sharing, owner)
+        return {
+            "external": record.external if record is not None else True,
+            "share_code_set": record is not None and record.code_hash is not None,
+        }
+
+    @router.put(
+        "/artifact-sharing",
+        # Internal settings flow — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def put_artifact_sharing(
+        request: Request,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Update the caller's external-access switch and share code.
+
+        An absent field keeps its value; ``share_code: null`` clears the
+        code; a string is stripped and must be 4–64 characters. Every
+        successful write regenerates the gate key, so every grant and
+        remembered browser dies with it.
+
+        :param request: The incoming request, for the caller identity.
+        :param body: ``{"external"?: <bool>, "share_code"?: <str | null>}``.
+        :returns: The same shape as the GET.
+        :raises OmnigentError: 400 invalid input, 401 unauthenticated.
+        :raises HTTPException: 429 when the per-owner write rate is exceeded.
+        """
+        owner = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        if not sharing_write_limiter.allow(owner, time.time()):
+            raise HTTPException(
+                status_code=429,
+                detail="Too many sharing settings updates",
+                headers={"Retry-After": "60"},
+            )
+        external = body.get("external")
+        if "external" in body and not isinstance(external, bool):
+            raise OmnigentError(
+                "artifact-sharing 'external' must be a boolean",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        share_code: str | None | KeepShareCode = KEEP_SHARE_CODE
+        if "share_code" in body:
+            raw_code = body["share_code"]
+            if raw_code is None:
+                share_code = None
+            elif isinstance(raw_code, str):
+                stripped = raw_code.strip()
+                if not 4 <= len(stripped) <= 64:
+                    raise OmnigentError(
+                        "artifact-sharing 'share_code' must be 4–64 characters",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                share_code = stripped
+            else:
+                raise OmnigentError(
+                    "artifact-sharing 'share_code' must be a string or null",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        record = await asyncio.to_thread(
+            _get_sharing_store().write_sharing,
+            owner,
+            external=external if isinstance(external, bool) else None,
+            share_code=share_code,
+        )
+        return {
+            "external": record.external,
+            "share_code_set": record.code_hash is not None,
+        }

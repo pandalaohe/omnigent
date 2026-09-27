@@ -27,9 +27,12 @@ _BRIDGE_CONTEXT = b"bridge"
 _MAC_BYTES = 16
 _SESSION_KEY_BYTES = 32
 _PAYLOAD_KEYS = frozenset({"s", "r", "b", "e", "k", "v", "i", "w"})
+# ``x`` carries the panel view's expiry and is present on panel tokens only.
+_PANEL_EXPIRY_KEY = "x"
 # ``conversations.workspace_id`` is a signed 64-bit integer; an id above its
 # range raises in the store lookup before the mac is even verified.
 _WORKSPACE_ID_MAX = 2**63 - 1
+_EXPIRY_MAX = 2**63 - 1
 
 ArtifactVerifyResult = Literal["ok", "revoked", "forged"]
 
@@ -53,6 +56,10 @@ class ArtifactTokenClaims:
     :param key_id: Identifier of the key that signed the token (see
         :func:`key_id`); distinguishes a revoked token (stale key id) from a
         forged one (bad mac under the current key).
+    :param expires_at: Unix seconds after which the token is refused, or
+        ``None``. Panel-view tokens carry it so an open panel can be trusted
+        without the external-access gate; raw-view tokens stay deterministic
+        and never carry one.
     """
 
     session_id: str
@@ -63,6 +70,7 @@ class ArtifactTokenClaims:
     kind: Literal["b", "f"]
     view: Literal["p", "r"]
     key_id: str
+    expires_at: int | None = None
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -90,27 +98,36 @@ def encode_artifact_token(
     entry: str,
     kind: Literal["b", "f"],
     view: Literal["p", "r"],
+    expires_at: int | None = None,
 ) -> str:
     """Encode the capability token for one artifact target.
 
     Wire form ``a1.<payload>.<mac>``: ``payload`` is compact JSON
     base64url-encoded without padding, ``mac`` is the first 16 bytes of
     HMAC-SHA256(session_key, ``a1.`` + payload) base64url without padding.
+    *expires_at* adds the panel-only expiry claim ``x``; a raw-view token
+    must not carry one, because its URL is meant to be deterministic.
 
     :returns: The token, e.g. ``"a1.eyJzIjoi...NiI"``.
+    :raises ValueError: If *expires_at* is set on a raw-view token.
     """
+    if expires_at is not None and view != "p":
+        raise ValueError("only panel-view tokens carry an expiry")
+    payload_fields: dict[str, object] = {
+        "s": session_id,
+        "r": root,
+        "b": 1 if absolute else 0,
+        "e": entry,
+        "k": kind,
+        "v": view,
+        "i": key_id(session_key),
+        "w": workspace_id,
+    }
+    if expires_at is not None:
+        payload_fields[_PANEL_EXPIRY_KEY] = expires_at
     payload = _b64url_encode(
         json.dumps(
-            {
-                "s": session_id,
-                "r": root,
-                "b": 1 if absolute else 0,
-                "e": entry,
-                "k": kind,
-                "v": view,
-                "i": key_id(session_key),
-                "w": workspace_id,
-            },
+            payload_fields,
             separators=(",", ":"),
         ).encode("utf-8")
     )
@@ -128,8 +145,9 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
     """Parse a token's payload without verifying its signature.
 
     Returns ``None`` for any malformed input — wrong prefix, bad base64, bad
-    JSON, missing or mistyped fields, or ``kind`` / ``view`` outside their
-    literal sets — and never raises. Callers pair this with
+    JSON, missing or mistyped fields, ``kind`` / ``view`` outside their
+    literal sets, a panel token without its ``x`` expiry, or a raw-view token
+    carrying one — and never raises. Callers pair this with
     :func:`verify_artifact_token` before trusting the claims.
 
     :param token: The wire token, e.g. ``"a1.eyJzIjoi...NiI"``.
@@ -144,7 +162,8 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
         payload = json.loads(_b64url_decode(parts[1]))
     except (ValueError, TypeError, RecursionError):
         return None
-    if not isinstance(payload, dict) or set(payload) != _PAYLOAD_KEYS:
+    allowed_keys = _PAYLOAD_KEYS | {_PANEL_EXPIRY_KEY}
+    if not isinstance(payload, dict) or not _PAYLOAD_KEYS <= set(payload) <= allowed_keys:
         return None
     session_id = payload["s"]
     root = payload["r"]
@@ -171,6 +190,22 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
         return None
     if kind not in ("b", "f") or view not in ("p", "r"):
         return None
+    # Presence, not truthiness: an absent ``x`` and a present ``null`` are
+    # different wire facts, and only absence means "no expiry claim".
+    if view == "p":
+        if _PANEL_EXPIRY_KEY not in payload:
+            return None
+        expires_at = payload[_PANEL_EXPIRY_KEY]
+        if (
+            isinstance(expires_at, bool)
+            or not isinstance(expires_at, int)
+            or not 0 <= expires_at <= _EXPIRY_MAX
+        ):
+            return None
+    else:
+        if _PANEL_EXPIRY_KEY in payload:
+            return None
+        expires_at = None
     return ArtifactTokenClaims(
         session_id=session_id,
         workspace_id=workspace_id,
@@ -180,6 +215,7 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
         kind=cast(Literal["b", "f"], kind),
         view=cast(Literal["p", "r"], view),
         key_id=kid,
+        expires_at=expires_at,
     )
 
 
