@@ -70,6 +70,8 @@ def _stub_executor_catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 # in a worker silently disappears. Route worker dumps to a file in
 # PYTEST_PROGRESS_LOG_DIR (uploaded as an artifact by integration.yml)
 # so each gw{N}'s stack frames are recoverable post-mortem.
+# The watchdog walks other threads' frames without the GIL and can wedge
+# interpreter exit, so it is armed only when CI collects the dumps.
 _worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
 _log_dir_env = os.environ.get("PYTEST_PROGRESS_LOG_DIR")
 if _log_dir_env:
@@ -78,9 +80,7 @@ if _log_dir_env:
     _faulthandler_file = open(  # noqa: SIM115  -- kept open for the process lifetime
         _log_dir / f"faulthandler-{_worker}.log", "w", buffering=1
     )
-else:
-    _faulthandler_file = sys.stderr
-faulthandler.dump_traceback_later(90, repeat=True, file=_faulthandler_file)
+    faulthandler.dump_traceback_later(90, repeat=True, file=_faulthandler_file)
 
 
 # Diagnostic: dump asyncio.all_tasks() every 60s during async tests.
