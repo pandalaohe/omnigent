@@ -63,6 +63,7 @@ from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.util.session_lifecycle import is_session_closed, title_without_closed_marker
 
 _logger = logging.getLogger(__name__)
+# custom-lint: disable-next=workspace-scoped-cache -- owner lock; a key collision only serializes
 _OWNER_LOCKS: dict[str, asyncio.Lock] = {}
 _UNFINISHED = ("creating", "open", "delivered", "cancel_requested")
 _REPORTABLE = (*_UNFINISHED, "expired")
