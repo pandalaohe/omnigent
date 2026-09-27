@@ -213,11 +213,24 @@ async def launch_library_agent(
     labels[AGENT_TEMPLATE_LABEL_KEY] = agent_id
     # A joint bundle (2+ members) freezes its member snapshot on the session
     # before the synchronous persistence thread, like the interactive
-    # multipart create; a 1-member bundle resolves to no labels.
-    from omnigent.server.routes._sessions.helpers import _member_snapshot_labels
+    # multipart create; a 1-member bundle resolves to no labels. The saved
+    # Agent's member hosts decide each member's host.
+    from omnigent.server.routes._sessions.helpers import (
+        _member_hosts_from_library_agent,
+        _member_snapshot_labels,
+    )
 
     labels.update(
-        await _member_snapshot_labels(spec, host_id=launch.host_id, host_store=host_store)
+        await _member_snapshot_labels(
+            spec,
+            host_id=launch.host_id,
+            host_store=host_store,
+            member_hosts=await _member_hosts_from_library_agent(
+                template_id=agent_id,
+                owner=owner,
+                custom_agents_store=custom_agents_store,
+            ),
+        )
     )
 
     metadata = SessionCreateMetadata(

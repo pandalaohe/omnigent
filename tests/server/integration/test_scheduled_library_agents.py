@@ -46,6 +46,7 @@ pytestmark = pytest.mark.asyncio
 
 _OWNER = "alice@example.com"
 _HOST_ID = "4b653f6031f35d168cc0b37caa1306d1"
+_WORKER_HOST_ID = "8e7d6c5b4a39281706f5e4d3c2b1a09f"
 _VALID_RRULE = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0"
 _TEMPLATE_LABEL = "omnigent:agent-template-id"
 
@@ -360,6 +361,59 @@ async def test_fire_writes_member_snapshot_labels(
         "effort": None,
         "lead": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_fire_member_snapshot_honours_saved_member_hosts(
+    client: httpx.AsyncClient, library_server: _LibraryServer
+) -> None:
+    """A fired joint Agent freezes each member's saved library host."""
+    agent_id = await _create_joint_agent(client)
+    library_server.hosts.upsert_on_connect(_WORKER_HOST_ID, "worker-laptop", _OWNER)
+    patched = await client.patch(
+        f"/v1/custom-agents/{agent_id}",
+        headers=_headers(),
+        json={
+            "version": 1,
+            "members": [
+                {
+                    "name": "library-runner",
+                    "description": None,
+                    "harness": "claude-native",
+                    "model": "lead-model",
+                    "reasoning_effort": None,
+                    "lead": True,
+                },
+                {
+                    "name": "researcher",
+                    "description": None,
+                    "harness": "codex",
+                    "model": "worker-model",
+                    "reasoning_effort": None,
+                    "lead": False,
+                    "host_id": _WORKER_HOST_ID,
+                },
+            ],
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    task_id = await _create_library_task(client, agent_id)
+    dispatched: list[Any] = []
+
+    async def _dispatch(conv: Any, task: Any) -> None:
+        dispatched.append(conv)
+
+    on_fire = build_on_fire(_fire_deps(library_server), launch_dispatch=_dispatch)
+    await on_fire(0, task_id)
+    await _drain()
+
+    assert len(dispatched) == 1
+    session = library_server.conversations.get_conversation(dispatched[0].id)
+    assert session is not None
+    lead = parse_member_entry(session.labels[member_label_key("library-runner")])
+    worker = parse_member_entry(session.labels[member_label_key("researcher")])
+    assert lead is not None and lead["host"] == _HOST_ID
+    assert worker is not None and worker["host"] == _WORKER_HOST_ID
 
 
 async def test_fire_after_library_agent_deleted_records_failed_run(

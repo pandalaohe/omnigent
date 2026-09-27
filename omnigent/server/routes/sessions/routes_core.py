@@ -145,6 +145,7 @@ from omnigent.server.routes._sessions.helpers import (
     _grant_default_public,
     _invalidate_runner_backed_snapshot_state,
     _latest_message_preview,
+    _member_hosts_from_library_agent,
     _member_snapshot_labels,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
@@ -1139,11 +1140,18 @@ def register_core_routes(
         # A joint-agent bundle freezes its member snapshot on the session now,
         # in the async section: the resolver may round-trip to the host catalog
         # for a member's "default" model, which the synchronous persistence
-        # call must not do. A 1-member bundle resolves to no labels.
+        # call must not do. A 1-member bundle resolves to no labels. A create
+        # that names an owned library Agent (the interactive New Chat label)
+        # takes that Agent's saved member hosts.
         member_labels = await _member_snapshot_labels(
             spec,
             host_id=parsed_metadata.host_id,
             host_store=getattr(request.app.state, "host_store", None),
+            member_hosts=await _member_hosts_from_library_agent(
+                template_id=(parsed_metadata.labels or {}).get("omnigent:agent-template-id"),
+                owner=user_id,
+                custom_agents_store=getattr(request.app.state, "custom_agents_store", None),
+            ),
         )
         if member_labels:
             parsed_metadata = parsed_metadata.model_copy(

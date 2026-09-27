@@ -10416,19 +10416,21 @@ async def _member_snapshot_labels(
     *,
     host_id: str | None,
     host_store: HostStore | None,
+    member_hosts: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """
     Resolve one session's member-snapshot labels, or ``{}`` for a 1-member agent.
 
     A bundle whose spec projects two or more members (the lead included)
-    freezes its per-member harness / model / effort at session create, as one
-    ``omnigent.member.<role>`` label per member. The runner reads them to lock
-    a member's dispatch overrides and to refuse work routed to a member that
-    cannot run. The model is the member's own, or — for none / ``"default"`` —
-    the host catalog's ``isDefault`` row for that harness; without a catalog it
-    stays null, never the literal ``"default"``. The session host is the member
-    host until F2a adds per-member hosts. A value that would exceed a label
-    column is a 400, never truncated.
+    freezes its per-member host / harness / model / effort at session create, as
+    one ``omnigent.member.<role>`` label per member. The runner reads them to
+    lock a member's dispatch overrides and to refuse work routed to a member
+    that cannot run. A member's host is its saved ``host_id`` (F2a), else the
+    session host; its availability and catalog ``isDefault`` model resolve
+    against that host. The model is the member's own, or — for none /
+    ``"default"`` — the member host's catalog default row for the harness;
+    without a catalog it stays null, never the literal ``"default"``. A value
+    that would exceed a label column is a 400, never truncated.
 
     Resolution is best-effort: a failed host-store or catalog lookup logs a
     warning and leaves that fact out of the labels, so a transient resolver
@@ -10439,6 +10441,8 @@ async def _member_snapshot_labels(
         session (no liveness, readiness, or catalog resolution then).
     :param host_store: Host registrations, used for liveness and the reported
         per-harness readiness. ``None`` skips availability resolution.
+    :param member_hosts: The launched library Agent's saved ``{role: host_id}``
+        map. A role absent from it (or a blank value) uses the session host.
     :returns: ``{label_key: compact_json_value}``; empty for a 1-member agent.
     :raises OmnigentError: 400 when a member's label key or value would
         overflow its column.
@@ -10448,22 +10452,32 @@ async def _member_snapshot_labels(
     members = project_members(spec)
     if len(members) < 2:
         return {}
-    host: Host | None = None
-    host_lookup_failed = False
-    if host_id is not None and host_store is not None:
+
+    def member_host(member: Mapping[str, Any]) -> str | None:
+        saved = (member_hosts or {}).get(str(member["name"]))
+        return saved if isinstance(saved, str) and saved else host_id
+
+    # One lookup per distinct member host. A failed lookup drops that host's
+    # availability and catalog facts instead of aborting the create.
+    resolved: dict[str, Host | None] = {}
+    lookup_failed: set[str] = set()
+    for candidate in sorted({host for host in map(member_host, members) if host is not None}):
+        if host_store is None:
+            # No store to prove liveness against, same as a hostless create.
+            resolved[candidate] = None
+            continue
         try:
-            host = await asyncio.to_thread(host_store.get_host, host_id)
+            host = await asyncio.to_thread(host_store.get_host, candidate)
         except Exception:  # noqa: BLE001 — a resolver failure must not abort the create
-            host_lookup_failed = True
+            lookup_failed.add(candidate)
             _logger.warning(
                 "member snapshot: host lookup failed for %s; writing labels "
                 "without host availability or catalog defaults",
-                host_id,
+                candidate,
                 exc_info=True,
             )
         else:
-            if host is not None and not host_is_live(host):
-                host = None
+            resolved[candidate] = host if host is not None and host_is_live(host) else None
 
     prepared: list[tuple[str, dict[str, Any], str | None]] = []
     for member in members:
@@ -10475,19 +10489,21 @@ async def _member_snapshot_labels(
         member_model = member.get("model")
         if member_model == "default":
             member_model = None
+        host = member_host(member)
         entry: dict[str, Any] = {
-            "host": host_id,
+            "host": host,
             "harness": harness,
             "model": member_model,
             "effort": member.get("reasoning_effort"),
             "lead": bool(member.get("lead")),
         }
         reason: str | None = None
-        if host_id is not None and not host_lookup_failed:
-            if host is None:
+        if host is not None and host not in lookup_failed:
+            ready = resolved.get(host)
+            if ready is None:
                 reason = MEMBER_UNAVAILABLE_HOST_OFFLINE
             elif isinstance(harness, str) and harness:
-                reported = (host.configured_harnesses or {}).get(harness)
+                reported = (ready.configured_harnesses or {}).get(harness)
                 if reported is not None and reported is not True:
                     reason = (
                         reported
@@ -10496,39 +10512,46 @@ async def _member_snapshot_labels(
                     )
         prepared.append((role, entry, reason))
 
-    # One catalog lookup per needed harness, all in flight together: a create
-    # waits at most one lookup timeout instead of one per harness.
-    catalogs: dict[str, list[dict[str, Any]] | None] = {}
-    if host is not None and host_id is not None:
+    # One catalog lookup per needed (host, harness) pair, all in flight
+    # together: a create waits at most one lookup timeout instead of one per
+    # member.
+    catalogs: dict[tuple[str, str], list[dict[str, Any]] | None] = {}
+    needed = sorted(
+        {
+            (entry["host"], str(entry["harness"]))
+            for _, entry, reason in prepared
+            if reason is None
+            and entry["host"] is not None
+            and isinstance(entry["harness"], str)
+            and entry["harness"]
+        }
+    )
+    if needed:
 
-        async def _fetch_catalog(harness: str) -> list[dict[str, Any]] | None:
+        async def _fetch_catalog(host: str, harness: str) -> list[dict[str, Any]] | None:
             try:
-                return await _host_model_options_via_registry(host_id, harness)
+                return await _host_model_options_via_registry(host, harness)
             except Exception:  # noqa: BLE001 — a resolver failure must not abort the create
                 _logger.warning(
                     "member snapshot: catalog lookup failed for host %s harness "
                     "%s; writing labels without the catalog default",
-                    host_id,
+                    host,
                     harness,
                     exc_info=True,
                 )
                 return None
 
-        needed = sorted(
-            {
-                str(entry["harness"])
-                for _, entry, reason in prepared
-                if reason is None and isinstance(entry["harness"], str) and entry["harness"]
-            }
+        results = await asyncio.gather(
+            *(_fetch_catalog(host, harness) for host, harness in needed)
         )
-        results = await asyncio.gather(*(_fetch_catalog(harness) for harness in needed))
         catalogs = dict(zip(needed, results, strict=True))
 
     labels: dict[str, str] = {}
     for role, entry, reason in prepared:
         harness = entry["harness"]
-        if reason is None and isinstance(harness, str):
-            catalog = catalogs.get(harness)
+        host = entry["host"]
+        if reason is None and host is not None and isinstance(harness, str):
+            catalog = catalogs.get((host, harness))
             if catalog is not None:
                 rows = [row for row in catalog if isinstance(row, Mapping)]
                 model = entry["model"]
@@ -10558,6 +10581,57 @@ async def _member_snapshot_labels(
             )
         labels[key] = value
     return labels
+
+
+async def _member_hosts_from_library_agent(
+    *,
+    template_id: str | None,
+    owner: str | None,
+    custom_agents_store: Any | None,
+) -> dict[str, str]:
+    """
+    Resolve a launched library Agent's saved ``{role: host_id}`` map.
+
+    A session whose ``omnigent:agent-template-id`` (or scheduled launch) names
+    an owned ``ca_`` Agent inherits its members' hosts: a role's saved host
+    decides where that member runs. Unknown and foreign ids — and a server
+    without the library store — resolve to no hosts (every member runs on the
+    session host). Best-effort like the snapshot itself: a store failure logs a
+    warning instead of aborting the create.
+
+    :param template_id: The ``ca_`` template id, or ``None``.
+    :param owner: The creating user, or ``None`` on a single-user server.
+    :param custom_agents_store: Owner-scoped library storage, or ``None``.
+    :returns: ``{role: host_id}`` for members with a saved host; ``{}``
+        otherwise.
+    """
+    if not template_id or not template_id.startswith("ca_") or custom_agents_store is None:
+        return {}
+    from omnigent.server.library_agent_launch import library_agent_owner_id
+
+    try:
+        row = await asyncio.to_thread(
+            custom_agents_store.get, library_agent_owner_id(owner), template_id
+        )
+    except OmnigentError:
+        # A deleted, unknown, or another owner's template is ignored.
+        return {}
+    except Exception:  # noqa: BLE001 — a resolver failure must not abort the create
+        _logger.warning(
+            "member snapshot: library Agent lookup failed for %s; members keep the session host",
+            template_id,
+            exc_info=True,
+        )
+        return {}
+    hosts: dict[str, str] = {}
+    for member in row.get("members") or []:
+        if not isinstance(member, Mapping):
+            continue
+        role = member.get("name")
+        host_id = member.get("host_id")
+        if isinstance(role, str) and role and isinstance(host_id, str) and host_id:
+            hosts[role] = host_id
+    return hosts
 
 
 def _require_cost_control_label_authority(
@@ -12092,6 +12166,7 @@ __all__ = [
     "_mcp_input_required_response",
     "_mcp_ok_response",
     "_mcp_tool_result",
+    "_member_hosts_from_library_agent",
     "_member_model_id",
     "_member_snapshot_labels",
     "_merge_claude_permission_launch_args",

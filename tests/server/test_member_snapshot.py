@@ -29,6 +29,7 @@ from omnigent.member_snapshot import MEMBER_LABEL_PREFIX, parse_member_entry
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import AuthProvider
+from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -100,6 +101,7 @@ class _MemberServer:
     app: FastAPI
     conversations: SqlAlchemyConversationStore
     hosts: HostStore
+    custom: CustomAgentsStore
 
 
 @pytest.fixture()
@@ -121,7 +123,12 @@ def member_server(runtime_init: None, db_uri: str, tmp_path: Path) -> _MemberSer
     # workspace round-trip and runner launch have their own coverage, so a
     # hostless registry skips both.
     app.state.host_registry = None
-    return _MemberServer(app=app, conversations=conversations, hosts=hosts)
+    return _MemberServer(
+        app=app,
+        conversations=conversations,
+        hosts=hosts,
+        custom=CustomAgentsStore(db_uri),
+    )
 
 
 @pytest_asyncio.fixture()
@@ -217,6 +224,76 @@ def _stub_catalog(
         return table.get(harness)
 
     monkeypatch.setattr(helpers, "_host_model_options_via_registry", _fake_options)
+
+
+_MEMBER_HOST = "5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f"
+_TEMPLATE_LABEL = "omnigent:agent-template-id"
+
+
+def _arm_member_host(hosts: HostStore) -> None:
+    hosts.upsert_on_connect(_MEMBER_HOST, "member-worker-laptop", _USER)
+
+
+def _stub_member_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+    table: dict[tuple[str, str], list[dict[str, object]]],
+) -> None:
+    from omnigent.server.routes._sessions import helpers
+
+    async def _fake_options(host_id: str, harness: str) -> list[dict[str, object]] | None:
+        return table.get((host_id, harness))
+
+    monkeypatch.setattr(helpers, "_host_model_options_via_registry", _fake_options)
+
+
+def _create_template(
+    store: CustomAgentsStore,
+    agent_id: str,
+    *,
+    worker_host: str | None,
+    owner: str = _USER,
+) -> None:
+    """A saved joint Agent row whose worker may carry a library-only host."""
+    members: list[dict[str, object]] = [
+        {
+            "name": "custom-reviewer",
+            "description": "Lead reviewer",
+            "harness": "codex",
+            "model": "lead-model",
+            "reasoning_effort": "high",
+            "lead": True,
+        },
+        {
+            "name": "researcher",
+            "description": "Research support",
+            "harness": "claude-sdk",
+            "model": "worker-model",
+            "reasoning_effort": "medium",
+            "lead": False,
+        },
+    ]
+    if worker_host is not None:
+        members[1]["host_id"] = worker_host
+    store.create(
+        owner,
+        {
+            "id": agent_id,
+            "name": "custom-reviewer",
+            "description": "Lead reviewer",
+            "harness": "codex",
+            "model": "lead-model",
+            "bundle_location": f"unused/{agent_id}",
+            "members": members,
+        },
+    )
+
+
+def _template_metadata(agent_id: str) -> dict[str, object]:
+    return {
+        "host_id": _HOST_ID,
+        "workspace": _WORKSPACE,
+        "labels": {_TEMPLATE_LABEL: agent_id},
+    }
 
 
 @pytest.mark.asyncio
@@ -533,3 +610,102 @@ async def test_manual_launch_agent_style_metadata_writes_member_labels(
         "effort": "medium",
         "lead": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_member_host_decides_host_and_catalog_default(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved member host wins over the session host for that member's
+    ``host`` and for its ``"default"`` model resolution."""
+    _arm_host(member_server.hosts)
+    _arm_member_host(member_server.hosts)
+    _stub_member_catalogs(
+        monkeypatch,
+        {
+            (_HOST_ID, "codex"): [{"id": "lead-model", "model": "lead-model", "isDefault": True}],
+            (_MEMBER_HOST, "claude-sdk"): [
+                {"id": "member-host-model", "model": "member-host-model", "isDefault": True}
+            ],
+        },
+    )
+    _create_template(member_server.custom, "ca_joint", worker_host=_MEMBER_HOST)
+
+    entries = await _member_labels_after_create(
+        member_server,
+        joint_bundle(worker_model="default"),
+        metadata=_template_metadata("ca_joint"),
+    )
+
+    assert entries["custom-reviewer"] == {
+        "host": _HOST_ID,
+        "harness": "codex",
+        "model": "lead-model",
+        "effort": "high",
+        "lead": True,
+    }
+    assert entries["researcher"] == {
+        "host": _MEMBER_HOST,
+        "harness": "claude-sdk",
+        "model": "member-host-model",
+        "effort": "medium",
+        "lead": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_offline_member_host_marks_only_its_member(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Availability resolves per member host: an offline worker host leaves the
+    session-host lead untouched."""
+    _arm_host(member_server.hosts)
+    _arm_member_host(member_server.hosts)
+    member_server.hosts.set_offline(_MEMBER_HOST)
+    _stub_member_catalogs(
+        monkeypatch,
+        {(_HOST_ID, "codex"): [{"id": "lead-model", "model": "lead-model", "isDefault": True}]},
+    )
+    _create_template(member_server.custom, "ca_joint", worker_host=_MEMBER_HOST)
+
+    entries = await _member_labels_after_create(
+        member_server,
+        joint_bundle(worker_model="default"),
+        metadata=_template_metadata("ca_joint"),
+    )
+
+    assert "unavailable" not in entries["custom-reviewer"]
+    assert entries["researcher"]["host"] == _MEMBER_HOST
+    assert entries["researcher"]["unavailable"] == "host_offline"
+    # An unavailable host never reaches the catalog: the model stays unresolved.
+    assert entries["researcher"]["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_foreign_and_non_library_template_ids_keep_the_session_host(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only an owned ``ca_`` template contributes member hosts."""
+    _arm_host(member_server.hosts)
+    _arm_member_host(member_server.hosts)
+    _stub_member_catalogs(
+        monkeypatch,
+        {
+            (_HOST_ID, "codex"): [{"id": "lead-model", "model": "lead-model", "isDefault": True}],
+            (_HOST_ID, "claude-sdk"): [
+                {"id": "worker-model", "model": "worker-model", "isDefault": True}
+            ],
+            (_MEMBER_HOST, "claude-sdk"): [
+                {"id": "member-host-model", "model": "member-host-model", "isDefault": True}
+            ],
+        },
+    )
+    _create_template(member_server.custom, "ca_bob", worker_host=_MEMBER_HOST, owner="bob")
+    _create_template(member_server.custom, "ca_plain", worker_host=None)
+
+    for template_id in ("ca_bob", "ca_missing", "ag_session_scoped", "ca_plain"):
+        entries = await _member_labels_after_create(
+            member_server, joint_bundle(), metadata=_template_metadata(template_id)
+        )
+        assert entries["researcher"]["host"] == _HOST_ID, template_id
+        assert entries["custom-reviewer"]["host"] == _HOST_ID, template_id
