@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from typing import Any
 
+from omnigent.stores.comment_store.visitor_comments import comment_rows
 from omnigent.tools.base import Tool, ToolContext
 
 
@@ -89,7 +89,9 @@ class ListCommentsTool(Tool):
         :returns: JSON string with a ``"comments"`` list, each
             entry containing ``id``, ``path``, ``anchor_content``,
             ``start_index``, ``end_index``, ``body``, ``status``,
-            and ``created_by``.
+            and ``created_by``. Visitor comments still in draft are
+            omitted (the owner has not sent them); listed visitor rows
+            additionally carry ``source`` and an untrusted-data ``note``.
         """
         if ctx.conversation_id is None:
             return json.dumps({"error": "no conversation context — cannot scope comment query"})
@@ -111,4 +113,4 @@ class ListCommentsTool(Tool):
         if status_filter is not None:
             comments = [c for c in comments if c.status == status_filter]
 
-        return json.dumps({"comments": [asdict(c) for c in comments]})
+        return json.dumps({"comments": comment_rows(comments)})

@@ -12,6 +12,7 @@ import {
   apiErrorFromResponse,
   approve,
   bindOnlyOnlineRunner,
+  continueArchivedSession,
   createBundledSession,
   createSession,
   createSideChat,
@@ -1626,6 +1627,19 @@ describe("postEvent", () => {
     expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 
+  it("passes the forwarded flag through instead of dropping it", async () => {
+    // The store's delivered result branches on queued+forwarded; a wire
+    // adapter that drops the flag would report a persisted-but-unread
+    // message as delivered.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ queued: true, item_id: "ci_123", forwarded: false }),
+    );
+
+    const out = await postEvent("conv_abc", { type: "message", data: {} });
+
+    expect(out.forwarded).toBe(false);
+  });
+
   it("reads pending_id for a native-terminal message", async () => {
     // Native sessions return a pending-input id instead of an item_id.
     // The id identifies the snapshot's replayed bubble on rebind and is
@@ -1643,6 +1657,27 @@ describe("postEvent", () => {
     });
     expect(out.pendingId).toBe("pending_abc123");
     expect(out.itemId).toBeUndefined();
+  });
+});
+
+describe("continueArchivedSession", () => {
+  it("POSTs the continue route and maps the returned session", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_new",
+        agent_id: "ag_1",
+        status: "idle",
+        created_at: 1,
+        title: "continued",
+      }),
+    );
+
+    const session = await continueArchivedSession("conv old");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv%20old/continue");
+    expect(init.method).toBe("POST");
+    expect(session).toMatchObject({ id: "conv_new", agentId: "ag_1", title: "continued" });
   });
 });
 

@@ -85,6 +85,24 @@ def test_round_trip_preserves_the_panel_expiry() -> None:
     assert claims.expires_at == _EXPIRY
 
 
+@pytest.mark.parametrize("view", ["g", "h"])
+def test_visit_views_round_trip_without_an_expiry(view: str) -> None:
+    """Visitor views are deterministic like ``r``: no ``x`` claim."""
+    token = _token(view=view)
+    claims = decode_artifact_token(token)
+
+    assert claims is not None
+    assert claims.view == view
+    assert claims.expires_at is None
+    assert verify_artifact_token(claims, token, _KEY) == "ok"
+
+
+@pytest.mark.parametrize("view", ["g", "h"])
+def test_visit_views_refuse_an_expiry(view: str) -> None:
+    with pytest.raises(ValueError, match="panel-view"):
+        _token(view=view, expires_at=_EXPIRY)
+
+
 def test_tampered_payload_is_forged() -> None:
     token = _token()
     prefix, _payload, mac = token.split(".")
@@ -171,9 +189,12 @@ _MALFORMED_TOKENS = [
     "a1." + _payload_b64({**_VALID_PAYLOAD, "w": True}) + ".mac",
     "a1." + _payload_b64({**_VALID_PAYLOAD, "w": -1}) + ".mac",
     "a1." + _payload_b64({**_VALID_PAYLOAD, "w": 2**63}) + ".mac",
-    # A panel token must carry its expiry; a raw-view token must not.
+    # A panel token must carry its expiry; a raw-view token must not, and the
+    # visitor views are raw-shaped.
     "a1." + _payload_b64({k: v for k, v in _VALID_PAYLOAD.items() if k != "x"}) + ".mac",
     "a1." + _payload_b64({**_VALID_PAYLOAD, "v": "r"}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "v": "g"}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "v": "h"}) + ".mac",
     # A raw-view token must not carry the key at all, even as null.
     "a1." + _payload_b64({**_VALID_PAYLOAD, "v": "r", "x": None}) + ".mac",
     # ``x`` must be a plain int inside the 64-bit range.

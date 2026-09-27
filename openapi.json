@@ -5958,6 +5958,12 @@
             ],
             "description": "Optional custom instruction prefix; defaults to the standard \"Please address the following file review comments.\" header.",
             "title": "Instruction"
+          },
+          "mark_addressed": {
+            "default": true,
+            "description": "When `True` (the default), each sent comment is marked `addressed`. `False` formats and returns the message without touching comment status, so a caller can mark the comments only after the message actually reached the agent.",
+            "title": "Mark Addressed",
+            "type": "boolean"
           }
         },
         "required": [
@@ -16429,7 +16435,7 @@
     },
     "/v1/sessions/{session_id}/comments": {
       "get": {
-        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** List of serialized comment dicts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
+        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\nVisitor comments still in `draft` are omitted (the owner has not\nsent them to the agent); the owner's read path passes\n`include_visitor_drafts=true` to see them. Every returned visitor\nrow carries `source: \"visitor\"` and an untrusted-data note.\n\n**Returns:** List of serialized comment dicts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
         "operationId": "list_comments_v1_sessions__session_id__comments_get",
         "parameters": [
           {
@@ -16457,6 +16463,17 @@
                 }
               ],
               "title": "Path"
+            }
+          },
+          {
+            "description": "When `True`, include visitor comments that are still drafts.",
+            "in": "query",
+            "name": "include_visitor_drafts",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Visitor Drafts",
+              "type": "boolean"
             }
           }
         ],
@@ -16549,7 +16566,7 @@
     },
     "/v1/sessions/{session_id}/comments/send": {
       "post": {
-        "description": "Mark comments as addressed and format them into an agent message.\n\nFetches each requested comment, marks it `addressed`,\nand formats the full set into a grouped, sorted message string\nsuitable for pasting into the chat composer.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode because\nit transitions comment status from `draft` to `addressed`.\n\n**Parameters**\n\n- `body` \u2014 List of comment IDs to send, with an optional custom instruction prefix.\n\n**Returns:** `{\"formatted_message\": str, \"sent_comment_ids\": list[str]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, or 404 if any requested comment is not found or does not belong to this session.",
+        "description": "Mark comments as addressed and format them into an agent message.\n\nFetches each requested comment, marks it `addressed` (unless\n`mark_addressed` is `False`), and formats the full set into a\ngrouped, sorted message string suitable for pasting into the chat\ncomposer. `mark_addressed: false` exists so a caller can format\nthe message, deliver it, and only then mark the comments.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode because\nit can transition comment status from `draft` to `addressed`.\n\n**Parameters**\n\n- `body` \u2014 List of comment IDs to send, with an optional custom instruction prefix and the mark-addressed switch.\n\n**Returns:** `{\"formatted_message\": str, \"sent_comment_ids\": list[str]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, or 404 if any requested comment is not found or does not belong to this session.",
         "operationId": "send_to_agent_v1_sessions__session_id__comments_send_post",
         "parameters": [
           {
@@ -16605,7 +16622,7 @@
     },
     "/v1/sessions/{session_id}/comments/{comment_id}": {
       "delete": {
-        "description": "Delete a comment.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode, and\nadditionally that the caller is the comment's author \u2014 one\ncollaborator may not delete another user's comment.\n\n**Returns:** `{\"deleted\": true}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, 403 if the caller is not the comment's author, or 404 if the comment is not found or does not belong to this session.",
+        "description": "Delete a comment.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode, and\nadditionally that the caller is the comment's author \u2014 one\ncollaborator may not delete another user's comment. A visitor\ncomment has no account author, so any editor may delete it.\n\n**Returns:** `{\"deleted\": true}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, 403 if the caller is not the comment's author, or 404 if the comment is not found or does not belong to this session.",
         "operationId": "delete_comment_v1_sessions__session_id__comments__comment_id__delete",
         "parameters": [
           {
@@ -19525,6 +19542,50 @@
           }
         },
         "summary": "Switch Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{source_id}/continue": {
+      "post": {
+        "description": "Start a fresh session continuing an archived one.\n\nThe caller needs `LEVEL_EDIT` on the archived session, and an\nunarchived session is refused (409). The new session is top-level\nwith no history: same host, same launch directory (the archived\nsession's worktree when it had one, else its workspace \u2014 validated\nagainst the host exactly like session create), same project, and\nthe same run configuration \u2014 model / reasoning-effort / harness /\ncost-control / sub-agent-routing overrides, `terminal_launch_args`\n(a native session's permission mode lives there), the presentation\nlabels the bound agent's harness stamps (`omnigent.wrapper` and\n`omnigent.ui`, re-derived like create and fork), the run-config\nlabels on an allowlist (claude-native / claude-sdk permission mode,\ncodex-sdk approval mode, the auto-harness pick, the agent-template\nid, the joint-agent member snapshot), and the archived session's\ninference snapshot when it belongs to the caller.\nThe archived session's agent carries over either way: a template\nagent is bound by id, while a session-scoped agent is cloned into a\nfresh session-scoped row from the same bundle. The raw\nsession-scoped id is never bound, because that row belongs to the\narchived session \u2014 switching the new session's agent would delete\nit.\n\nIdempotent: the archived session records\n`omnigent.continued_to=<new id>`, and a repeat call returns that\nsession while it still exists, is not archived and the caller may\nedit it; otherwise a new session is created and the pointer moves.\n\n**Returns:** A `SessionResponse` describing the new session.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the source session (or its agent) does not exist; 403/404 if the caller lacks edit access; 409 if the source is not archived; 400 if the source has no agent binding or its inference snapshot belongs to another user; the create path's workspace error (e.g. a missing directory or offline host) when the workspace cannot be validated.",
+        "operationId": "continue_session_v1_sessions__source_id__continue_post",
+        "parameters": [
+          {
+            "description": "The archived session to continue, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Continue Session",
         "tags": [
           "sessions"
         ]

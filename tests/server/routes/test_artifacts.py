@@ -14,12 +14,13 @@ import asyncio
 import base64
 import contextlib
 import json
+import re
 import threading
 import time
 import urllib.parse
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -45,6 +46,7 @@ from omnigent.runtime import (
 )
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.artifact_links import (
+    bridge_nonce,
     decode_artifact_token,
     encode_artifact_token,
     generate_session_key,
@@ -54,17 +56,22 @@ from omnigent.server.artifact_sharing import (
     KEEP_SHARE_CODE,
     ArtifactSharingStore,
     KeepShareCode,
+    gate_key_id,
+    grant_valid,
     remember_cookie_name,
 )
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes import artifacts as artifacts_module
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
 
 pytestmark = pytest.mark.asyncio
 
-_SESSION_ID = "conv_artifact_session"
+# The real comment store encodes ``conversation_id`` as a 32-char hex uuid,
+# so the fixture session uses that shape.
+_SESSION_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 _HOST_ID = "host_artifact_test"
 _OWNER = "owner@example.com"
 _VIEWER = "viewer@example.com"
@@ -223,6 +230,7 @@ def _build_app(
     auth_provider: AuthProvider | None,
     permission_store: _PermissionStore | None,
     host_registry: HostRegistry | None = None,
+    comment_store: SqlAlchemyCommentStore | None = None,
 ) -> FastAPI:
     """Build the sessions router app with the artifact routes wired."""
     app = FastAPI()
@@ -252,10 +260,12 @@ def _build_app(
             host_registry=host_registry,
             auth_provider=auth_provider,
             permission_store=permission_store,  # type: ignore[arg-type]
+            comment_store=comment_store,
         ),
         prefix="/v1",
     )
     app.state.test_store = store
+    app.state.test_comment_store = comment_store
     app.state.test_host_registry = host_registry
     app.state.test_auth_provider = auth_provider
     app.state.test_permission_store = permission_store
@@ -276,6 +286,7 @@ def app(runner_globals_reset: None, db_uri: str) -> FastAPI:
         auth_provider=auth_provider,
         permission_store=permission_store,
         host_registry=host_registry,
+        comment_store=SqlAlchemyCommentStore(db_uri),
     )
     app.state.test_db_uri = db_uri
     return app
@@ -575,6 +586,38 @@ def _host_file_payload(
     }
 
 
+_VISIT_SHELL = """<!doctype html>
+<html lang="en"><head><meta charset="UTF-8">
+<script type="module" crossorigin src="./assets/visit-abc.js"></script>
+<link rel="modulepreload" crossorigin href="./assets/visit-vendor.js">
+<link rel="stylesheet" crossorigin href="./assets/visit-abc.css">
+</head><body><div id="app"></div></body></html>
+"""
+
+_VISIT_CONFIG_RE = re.compile(
+    r'<script type="application/json" id="omni-visit-config">(.*?)</script>',
+    re.DOTALL,
+)
+
+
+def _write_visit_shell(asset_dir: Path) -> None:
+    """Write a minimal built visit entry into the fake dist."""
+    (asset_dir / "visit.html").write_text(_VISIT_SHELL, encoding="utf-8")
+
+
+def _visit_config(html: str) -> dict[str, Any]:
+    """Extract and parse the served visit config."""
+    match = _VISIT_CONFIG_RE.search(html)
+    assert match is not None, html
+    return json.loads(match.group(1))  # type: ignore[no-any-return]
+
+
+def _comments(app: FastAPI) -> list[Any]:
+    """All comment rows stored for the test session."""
+    store: SqlAlchemyCommentStore = app.state.test_comment_store
+    return store.list_for_conversation(_SESSION_ID)
+
+
 # ── Mint ────────────────────────────────────────────────────────────
 
 
@@ -607,6 +650,45 @@ async def test_mint_non_html_is_a_file_token(client: httpx.AsyncClient) -> None:
 
     assert minted["kind"] == "file"
     assert minted["url"].endswith("/notes.txt")
+
+
+async def test_mint_visit_html_is_a_deterministic_shell_token(
+    client: httpx.AsyncClient,
+) -> None:
+    """A visit mint for an HTML entry is a ``g`` bundle token without expiry."""
+    first = await _mint(client, view="visit")
+    second = await _mint(client, view="visit")
+    claims = decode_artifact_token(_token_from_url(first["url"]))
+
+    assert first["kind"] == "bundle"
+    assert first["expires_at"] is None
+    assert first["url"] == second["url"]
+    assert claims is not None
+    assert claims.view == "g"
+    assert claims.expires_at is None
+
+
+async def test_mint_visit_non_html_falls_back_to_the_raw_view(
+    client: httpx.AsyncClient,
+) -> None:
+    """A visit mint never widens a non-HTML target past the raw view."""
+    minted = await _mint(client, path="notes.txt", view="visit")
+    claims = decode_artifact_token(_token_from_url(minted["url"]))
+
+    assert minted["kind"] == "file"
+    assert claims is not None
+    assert claims.view == "r"
+
+
+async def test_mint_unknown_view_is_rejected(client: httpx.AsyncClient) -> None:
+    """Only ``panel``, ``raw`` and ``visit`` are accepted views."""
+    resp = await client.post(
+        f"/v1/sessions/{_SESSION_ID}/artifacts",
+        json={"path": _ENTRY, "view": "sideways"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == ErrorCode.INVALID_INPUT
 
 
 @pytest.mark.parametrize(
@@ -1368,6 +1450,283 @@ async def test_asset_script_close_is_escaped(
     assert resp.text.count("</script>") == 1
 
 
+# ── Serve: visitor shell (g) and frame (h) ──────────────────────────
+
+
+async def test_visit_shell_rebases_assets_and_stamps_a_nonce(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """The g shell serves visit.html with dist assets, nonce CSP and config."""
+    _write_visit_shell(asset_dir)
+    minted = await _mint(client, view="visit")
+    g_token = _token_from_url(minted["url"])
+
+    resp = await client.get(minted["url"])
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/html")
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["referrer-policy"] == "no-referrer"
+    # Relative URLs would resolve under /v1/artifacts/<g>/ and fetch bundle
+    # files; the dist form is absolute.
+    assert 'src="/assets/visit-abc.js"' in resp.text
+    assert 'href="/assets/visit-vendor.js"' in resp.text
+    assert "./assets/" not in resp.text
+    nonce_match = re.search(r'<script nonce="([^"]+)" type="module"', resp.text)
+    assert nonce_match is not None, resp.text
+    nonce = nonce_match.group(1)
+    assert f'<link nonce="{nonce}" rel="modulepreload"' in resp.text
+    assert resp.headers["content-security-policy"] == (
+        f"default-src 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; frame-src 'self'; form-action 'none'; "
+        "frame-ancestors 'none'; base-uri 'none'"
+    )
+    config = _visit_config(resp.text)
+    assert config["token"] == g_token
+    assert config["grant"] is None
+    assert config["path"] == "index.html"
+    assert config["commentsEnabled"] is True
+    key = session_key_bytes(_conv(app).labels[ARTIFACT_LINK_KEY_LABEL])
+    h_token = config["frameUrl"].split("/")[3]
+    h_claims = decode_artifact_token(h_token)
+    assert h_claims is not None
+    assert h_claims.view == "h"
+    assert h_claims.entry == "index.html"
+    assert config["frameUrl"] == f"/v1/artifacts/{h_token}/index.html"
+    assert config["nonce"] == bridge_nonce(key, h_token)
+
+
+async def test_visit_shell_config_json_is_html_escaped(
+    client: httpx.AsyncClient,
+    asset_dir: Path,
+) -> None:
+    """A crafted path cannot close the config script or break out of it."""
+    _write_visit_shell(asset_dir)
+    minted = await _mint(client, view="visit")
+    prefix = minted["url"].rsplit("/", 1)[0]
+
+    resp = await client.get(f"{prefix}/a%3Cb.html")
+
+    assert resp.status_code == 200, resp.text
+    assert '"path":"a\\u003cb.html"' in resp.text
+    assert "<b.html" not in resp.text
+
+
+async def test_visit_shell_rebases_for_the_configured_base_path(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """Assets and the frame URL carry the deployment base path."""
+    _write_visit_shell(asset_dir)
+    app.state.base_path = "/proxy/6767"
+    minted = await _mint(client, view="visit")
+
+    resp = await client.get(minted["url"])
+
+    assert 'src="/proxy/6767/assets/visit-abc.js"' in resp.text
+    # The base-path script the index rewrite injects is executable, so the
+    # stamping must cover it too or the shell cannot learn its prefix.
+    assert re.search(r'<script nonce="[^"]+">window\.__OMNIGENT_BASE_PATH__', resp.text)
+    config = _visit_config(resp.text)
+    assert config["frameUrl"].startswith("/proxy/6767/v1/artifacts/")
+
+
+async def test_visit_shell_gated_carries_grants_for_g_and_h(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """A share-code gate yields a grant for the shell and one for the frame.
+
+    The grants must bind the gate key the unlock actually passed; the frame
+    grant travels on the h URL, the shell grant in the config.
+    """
+    _write_visit_shell(asset_dir)
+    _set_sharing(app, share_code="open-sesame")
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+    g_token = _token_from_url(minted["url"])
+
+    unlock = await client.post(minted["url"], data={"code": "open-sesame"})
+    resp = await client.get(unlock.headers["location"])
+
+    assert unlock.status_code == 303
+    assert resp.status_code == 200, resp.text
+    config = _visit_config(resp.text)
+    assert config["token"] == g_token
+    record = _sharing_store(app).read_sharing(_OWNER)
+    assert record is not None
+    key = session_key_bytes(_conv(app).labels[ARTIFACT_LINK_KEY_LABEL])
+    identifier = gate_key_id(record.gate_key)
+    assert config["grant"] is not None
+    assert grant_valid(key, g_token, config["grant"], identifier, now_epoch())
+    h_segment = config["frameUrl"].split("/")[3]
+    h_token, separator, h_grant = h_segment.partition("~")
+    assert separator and h_grant
+    assert grant_valid(key, h_token, h_grant, identifier, now_epoch())
+
+
+async def test_visit_shell_absent_dist_entry_is_unavailable(
+    client: httpx.AsyncClient,
+    asset_dir: Path,
+) -> None:
+    """No built visit.html answers the g request with a clear 503 page."""
+    assert not (asset_dir / "visit.html").exists()
+    minted = await _mint(client, view="visit")
+
+    resp = await client.get(minted["url"])
+
+    assert resp.status_code == 503
+    assert "visitor page is not available" in resp.text
+    assert resp.headers["content-type"].startswith("text/html")
+
+
+async def test_visit_shell_gated_request_meets_the_form(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """A bare g URL under a share-code gate gets the form, never the shell."""
+    _write_visit_shell(asset_dir)
+    _set_sharing(app, share_code="open-sesame")
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+
+    resp = await client.get(minted["url"])
+
+    assert resp.status_code == 401
+    assert '<form method="post">' in resp.text
+
+
+async def test_visit_shell_archived_is_gone(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """An archived session's shell is a 410 page."""
+    _write_visit_shell(asset_dir)
+    minted = await _mint(client, view="visit")
+    _conv(app).archived = True
+
+    resp = await client.get(minted["url"])
+
+    assert resp.status_code == 410
+
+
+@pytest.mark.parametrize("view", ["g", "h"])
+async def test_gate_closed_visitor_views_meet_the_form(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+    view: Literal["g", "h"],
+) -> None:
+    """A bare visitor-view URL under a share-code gate gets the form."""
+    _write_visit_shell(asset_dir)
+    _set_sharing(app, share_code="open-sesame")
+    await _mint(client)  # materialize the session key for the crafted token
+    app.state.test_auth_provider.user_id = None
+
+    resp = await client.get(_raw_token_url(app, view=view))
+
+    assert resp.status_code == 401
+    assert '<form method="post">' in resp.text
+
+
+async def test_share_code_change_cuts_an_h_frame(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """A code change voids the h frame's grant; the frame meets the form."""
+    (asset_dir / "omni-html-bridge.js").write_text("bridge();", encoding="utf-8")
+    _write_visit_shell(asset_dir)
+    _set_sharing(app, share_code="old-code")
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+    unlock = await client.post(minted["url"], data={"code": "old-code"})
+    shell = await client.get(unlock.headers["location"])
+    frame_url = _visit_config(shell.text)["frameUrl"]
+    runner = _stub_runner_app(b"<html><body>x</body></html>", content_type="text/html")
+
+    async with _use_runner(runner):
+        before = await client.get(frame_url)
+    _set_sharing(app, share_code="new-code")
+    after = await client.get(frame_url)
+
+    assert unlock.status_code == 303
+    assert before.status_code == 200, before.text
+    assert after.status_code == 401
+    assert '<form method="post">' in after.text
+
+
+async def test_g_view_non_html_serves_bytes(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """A g request for a non-HTML path stays raw bytes, not the shell."""
+    _write_visit_shell(asset_dir)
+    await _mint(client)  # materialize the session key for the crafted token
+    url = _raw_token_url(app, entry="notes.txt", view="g")
+    runner = _stub_runner_app(b"plain", content_type="text/plain")
+
+    async with _use_runner(runner):
+        resp = await client.get(url)
+
+    assert resp.status_code == 200
+    assert resp.content == b"plain"
+    assert "omni-visit-config" not in resp.text
+
+
+async def test_h_view_html_injects_the_bridge_with_its_own_nonce(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """The h frame injects the bridge under the h token's nonce, as p does."""
+    asset = "window.__omniBridge = 1;\n"
+    (asset_dir / "omni-html-bridge.js").write_text(asset, encoding="utf-8")
+    await _mint(client)
+    url = _raw_token_url(app, view="h")
+    h_token = url.split("/")[3]
+    body = b"<html><body><h1>hi</h1></body></html>"
+    runner = _stub_runner_app(body, content_type="text/html")
+
+    async with _use_runner(runner):
+        resp = await client.get(url)
+
+    key = session_key_bytes(_conv(app).labels[ARTIFACT_LINK_KEY_LABEL])
+    expected = f'<script data-omni-nonce="{bridge_nonce(key, h_token)}">{asset}</script>'
+    assert resp.status_code == 200
+    assert expected in resp.text
+    assert "omni-visit-config" not in resp.text
+
+
+async def test_unlock_for_g_issues_a_grant_that_serves_the_shell(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """The unlock POST for a g token 303s onto a grant; the shell follows."""
+    _write_visit_shell(asset_dir)
+    _set_sharing(app, share_code="open-sesame")
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+
+    unlock = await client.post(minted["url"], data={"code": "open-sesame"})
+    served = await client.get(unlock.headers["location"])
+
+    assert unlock.status_code == 303
+    assert "~" in unlock.headers["location"]
+    assert served.status_code == 200
+    assert "omni-visit-config" in served.text
+
+
 # ── Open ────────────────────────────────────────────────────────────
 
 
@@ -1465,13 +1824,24 @@ def _set_sharing(
     owner: str = _OWNER,
     external: bool | None = None,
     share_code: str | None | KeepShareCode = KEEP_SHARE_CODE,
+    allow_comments: bool | None = None,
 ) -> None:
     """Write an owner's sharing record through the real store."""
-    _sharing_store(app).write_sharing(owner, external=external, share_code=share_code)
+    _sharing_store(app).write_sharing(
+        owner,
+        external=external,
+        share_code=share_code,
+        allow_comments=allow_comments,
+    )
 
 
-def _raw_token_url(app: FastAPI, *, entry: str = "reports/index.html") -> str:
-    """Craft a raw-view token for *entry* without going through the mint."""
+def _raw_token_url(
+    app: FastAPI,
+    *,
+    entry: str = "reports/index.html",
+    view: Literal["r", "g", "h"] = "r",
+) -> str:
+    """Craft a token for *entry* without going through the mint."""
     key = session_key_bytes(_conv(app).labels[ARTIFACT_LINK_KEY_LABEL])
     token = encode_artifact_token(
         key,
@@ -1481,28 +1851,36 @@ def _raw_token_url(app: FastAPI, *, entry: str = "reports/index.html") -> str:
         absolute=False,
         entry=entry.rsplit("/", 1)[-1],
         kind="b" if entry.endswith((".html", ".htm")) else "f",
-        view="r",
+        view=view,
     )
     return f"/v1/artifacts/{token}/{urllib.parse.quote(entry.rsplit('/', 1)[-1])}"
 
 
 async def test_artifact_sharing_get_defaults_to_open(client: httpx.AsyncClient) -> None:
-    """No row means external on and no code."""
+    """No row means external on, no code and visitor comments on."""
     resp = await client.get("/v1/artifact-sharing")
 
     assert resp.status_code == 200
-    assert resp.json() == {"external": True, "share_code_set": False}
+    assert resp.json() == {
+        "external": True,
+        "share_code_set": False,
+        "allow_comments": True,
+    }
 
 
 async def test_artifact_sharing_put_round_trip(client: httpx.AsyncClient) -> None:
     """A PUT merges the fields it carries and the GET reflects them."""
     put = await client.put(
         "/v1/artifact-sharing",
-        json={"external": False, "share_code": "open-sesame"},
+        json={"external": False, "share_code": "open-sesame", "allow_comments": False},
     )
 
     assert put.status_code == 200
-    assert put.json() == {"external": False, "share_code_set": True}
+    assert put.json() == {
+        "external": False,
+        "share_code_set": True,
+        "allow_comments": False,
+    }
     assert (await client.get("/v1/artifact-sharing")).json() == put.json()
 
 
@@ -1514,7 +1892,39 @@ async def test_artifact_sharing_put_absent_field_keeps_its_value(
 
     put = await client.put("/v1/artifact-sharing", json={"external": False})
 
-    assert put.json() == {"external": False, "share_code_set": True}
+    assert put.json() == {
+        "external": False,
+        "share_code_set": True,
+        "allow_comments": True,
+    }
+
+
+async def test_artifact_sharing_allow_comments_only_write_keeps_the_gate_key(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """Flipping visitor comments does not sign open visitors out."""
+    await client.put("/v1/artifact-sharing", json={"share_code": "open-sesame"})
+    before = _sharing_store(app).read_sharing(_OWNER)
+    assert before is not None
+
+    put = await client.put("/v1/artifact-sharing", json={"allow_comments": False})
+
+    after = _sharing_store(app).read_sharing(_OWNER)
+    assert put.json()["allow_comments"] is False
+    assert after is not None
+    assert after.gate_key == before.gate_key
+    assert after.allow_comments is False
+
+
+async def test_artifact_sharing_put_rejects_a_non_bool_allow_comments(
+    client: httpx.AsyncClient,
+) -> None:
+    """``allow_comments`` must be a boolean when present."""
+    resp = await client.put("/v1/artifact-sharing", json={"allow_comments": "yes"})
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == ErrorCode.INVALID_INPUT
 
 
 @pytest.mark.parametrize("code", ["abc", "x" * 65])
@@ -1555,7 +1965,11 @@ async def test_artifact_sharing_put_null_clears_the_code(client: httpx.AsyncClie
 
     put = await client.put("/v1/artifact-sharing", json={"share_code": None})
 
-    assert put.json() == {"external": False, "share_code_set": False}
+    assert put.json() == {
+        "external": False,
+        "share_code_set": False,
+        "allow_comments": True,
+    }
 
 
 async def test_artifact_sharing_responses_never_carry_the_secrets(
@@ -1573,7 +1987,7 @@ async def test_artifact_sharing_responses_never_carry_the_secrets(
     assert record is not None
     assert record.code_hash is not None
     for response in (put, get):
-        assert set(response.json()) == {"external", "share_code_set"}
+        assert set(response.json()) == {"external", "share_code_set", "allow_comments"}
         assert record.gate_key not in response.text
         assert record.code_hash not in response.text
 
@@ -2135,6 +2549,393 @@ async def test_gate_concurrent_unlocks_reserve_and_release_the_budget(
 
 
 # ── Gate: cookie is not a login ─────────────────────────────────────
+
+
+# ── Visitor comments POST ───────────────────────────────────────────
+
+
+async def _post_visitor_comment(
+    client: httpx.AsyncClient,
+    token: str,
+    *,
+    path: str = "index.html",
+    body: str = "Fix this",
+    grant: str | None = None,
+    name: str | None = "Alice",
+    anchor_content: str | None = None,
+    start_index: int = 0,
+    end_index: int = 0,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    """POST one visitor comment through the real route."""
+    payload: dict[str, Any] = {
+        "token": token,
+        "path": path,
+        "body": body,
+        "start_index": start_index,
+        "end_index": end_index,
+    }
+    if grant is not None:
+        payload["grant"] = grant
+    if name is not None:
+        payload["name"] = name
+    if anchor_content is not None:
+        payload["anchor_content"] = anchor_content
+    return await client.post("/v1/artifact-comments", json=payload, headers=headers)
+
+
+def _grant_from_url(url: str) -> str:
+    """Extract the grant suffix from a ``<token>~<grant>`` artifact URL."""
+    _bare, separator, grant = url.split("/")[3].partition("~")
+    assert separator and grant
+    return grant
+
+
+async def test_visitor_comment_open_gate_stores_a_visitor_row(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """An open gate admits a grant-less visitor comment on the joined path."""
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+
+    resp = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        body="Please rewrite this",
+        anchor_content="old text",
+        start_index=3,
+        end_index=11,
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json() == {"ok": True}
+    rows = _comments(app)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.conversation_id == _SESSION_ID
+    assert row.path == "reports/index.html"
+    assert row.body == "Please rewrite this"
+    assert row.anchor_content == "old text"
+    assert row.start_index == 3
+    assert row.end_index == 11
+    assert row.status == "draft"
+    assert row.created_by == "visitor:Alice"
+
+
+async def test_visitor_comment_nested_root_path_is_joined(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """The stored path is the bundle root joined with the requested page."""
+    minted = await _mint(client, path="reports/page2.html", view="visit")
+
+    resp = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        path="page2.html",
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert _comments(app)[0].path == "reports/page2.html"
+
+
+async def test_visitor_comment_absolute_root_path_keeps_the_leading_slash(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    unconfined_browse: None,
+) -> None:
+    """An absolute link stores the same host path its serve route would."""
+    minted = await _mint(client, path="/opt/reports/index.html", base="host", view="visit")
+
+    resp = await _post_visitor_comment(client, _token_from_url(minted["url"]))
+
+    assert resp.status_code == 201, resp.text
+    assert _comments(app)[0].path == "/opt/reports/index.html"
+
+
+async def test_visitor_comment_gated_accepts_a_valid_grant(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A share-code link admits a comment carrying its unlock grant."""
+    _set_sharing(app, share_code="open-sesame")
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+    unlock = await client.post(minted["url"], data={"code": "open-sesame"})
+
+    resp = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        grant=_grant_from_url(unlock.headers["location"]),
+    )
+
+    assert unlock.status_code == 303
+    assert resp.status_code == 201, resp.text
+    assert len(_comments(app)) == 1
+
+
+async def test_visitor_comment_gated_without_a_grant_reloads(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A share-code link refuses a grant-less comment with 403 reload."""
+    _set_sharing(app, share_code="open-sesame")
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+
+    resp = await _post_visitor_comment(client, _token_from_url(minted["url"]))
+
+    assert resp.status_code == 403
+    assert resp.json() == {"reason": "reload"}
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_stale_grant_after_a_code_change_reloads(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A new share code rotates the gate key and voids the old grant."""
+    _set_sharing(app, share_code="old-code")
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+    unlock = await client.post(minted["url"], data={"code": "old-code"})
+    grant = _grant_from_url(unlock.headers["location"])
+
+    _set_sharing(app, share_code="new-code")
+    resp = await _post_visitor_comment(client, _token_from_url(minted["url"]), grant=grant)
+
+    assert resp.status_code == 403
+    assert resp.json() == {"reason": "reload"}
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_external_off_reloads(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A switched-off gate refuses the comment and points at a reload."""
+    _set_sharing(app, external=False)
+    minted = await _mint(client, view="visit")
+    app.state.test_auth_provider.user_id = None
+
+    resp = await _post_visitor_comment(client, _token_from_url(minted["url"]))
+
+    assert resp.status_code == 403
+    assert resp.json() == {"reason": "reload"}
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_allow_comments_off_is_disabled(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """The owner's comments switch refuses with the disabled reason."""
+    _set_sharing(app, allow_comments=False)
+    minted = await _mint(client, view="visit")
+
+    resp = await _post_visitor_comment(client, _token_from_url(minted["url"]))
+
+    assert resp.status_code == 403
+    assert resp.json() == {"reason": "disabled"}
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_archived_session_is_gone(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """An archived session answers 410 and stores nothing."""
+    minted = await _mint(client, view="visit")
+    _conv(app).archived = True
+
+    resp = await _post_visitor_comment(client, _token_from_url(minted["url"]))
+
+    assert resp.status_code == 410
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_revoked_link_is_gone(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """Revoking the session key kills the token with every other link."""
+    minted = await _mint(client, view="visit")
+    revoke = await client.post(f"/v1/sessions/{_SESSION_ID}/artifacts/revoke")
+
+    resp = await _post_visitor_comment(client, _token_from_url(minted["url"]))
+
+    assert revoke.status_code == 204
+    assert resp.status_code == 410
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_cross_origin_is_refused(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With an allowlist configured, an untrusted Origin is a 403."""
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "https://app.example.com")
+    minted = await _mint(client, view="visit")
+
+    resp = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        headers={"Origin": "https://evil.example"},
+    )
+
+    assert resp.status_code == 403
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_requires_json_content_type(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """The shared JSON guard refuses a non-JSON body before it is parsed."""
+    minted = await _mint(client, view="visit")
+
+    resp = await client.post(
+        "/v1/artifact-comments",
+        content=json.dumps({"token": _token_from_url(minted["url"])}),
+        headers={"Content-Type": "text/plain"},
+    )
+
+    assert resp.status_code == 415
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_window_is_per_link(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """The 21st comment on one link is 429 while another link still posts."""
+    first = await _mint(client, view="visit")
+    second = await _mint(client, path="reports/page2.html", view="visit")
+    first_token = _token_from_url(first["url"])
+    second_token = _token_from_url(second["url"])
+
+    for _ in range(20):
+        assert (await _post_visitor_comment(client, first_token)).status_code == 201
+
+    throttled = await _post_visitor_comment(client, first_token)
+    other = await _post_visitor_comment(client, second_token, path="page2.html")
+
+    assert throttled.status_code == 429
+    assert throttled.headers["retry-after"] == "600"
+    assert other.status_code == 201
+    assert len(_comments(app)) == 21
+
+
+async def test_visitor_comment_oversized_body_is_rejected(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A body past the cap is refused whole, never truncated into a row."""
+    minted = await _mint(client, view="visit")
+
+    resp = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        body="x" * 4001,
+    )
+
+    assert resp.status_code in (413, 422)
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_path_outside_the_bundle_is_not_found(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A traversal path never reaches the comment store."""
+    minted = await _mint(client, view="visit")
+
+    resp = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        path="../secret.html",
+    )
+
+    assert resp.status_code == 404
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_non_html_path_is_not_found(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """Comments belong to HTML pages; a bundle's other bytes stay unserved."""
+    minted = await _mint(client, view="visit")
+
+    resp = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        path="notes.txt",
+    )
+
+    assert resp.status_code == 404
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_frame_token_is_not_found(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """Only the shell's ``g`` token is a comment authority, never ``h``."""
+    await _mint(client)
+    h_token = _raw_token_url(app, view="h").split("/")[3]
+
+    resp = await _post_visitor_comment(client, h_token)
+
+    assert resp.status_code == 404
+    assert _comments(app) == []
+
+
+async def test_visit_shell_without_a_comment_store_disables_comments(
+    runner_globals_reset: None,
+    db_uri: str,
+    asset_dir: Path,
+) -> None:
+    """A server without a comment store serves the shell but no comment route."""
+    del runner_globals_reset
+    _write_visit_shell(asset_dir)
+    store = _ConversationStore({_SESSION_ID: _conversation()}, storage_location=db_uri)
+    permission_store = _PermissionStore()
+    permission_store.grant(_OWNER, _SESSION_ID, LEVEL_OWNER)
+    app = _build_app(
+        store,
+        auth_provider=_FixedAuthProvider(),
+        permission_store=permission_store,
+        comment_store=None,
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
+        minted = await _mint(client, view="visit")
+        shell = await client.get(minted["url"])
+        resp = await _post_visitor_comment(client, _token_from_url(minted["url"]))
+
+    assert shell.status_code == 200
+    assert _visit_config(shell.text)["commentsEnabled"] is False
+    assert resp.status_code == 404
+
+
+async def test_visit_shell_allow_comments_off_disables_the_affordance(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """The owner's switch turns the shell's comment affordance off."""
+    _write_visit_shell(asset_dir)
+    _set_sharing(app, allow_comments=False)
+    minted = await _mint(client, view="visit")
+
+    resp = await client.get(minted["url"])
+
+    assert resp.status_code == 200
+    assert _visit_config(resp.text)["commentsEnabled"] is False
 
 
 async def test_gate_remember_cookie_is_not_an_api_identity(db_uri: str) -> None:

@@ -8,6 +8,10 @@ import pytest_asyncio
 from omnigent.db.utils import generate_agent_id
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.comment_store.visitor_comments import (
+    VISITOR_COMMENT_NOTE,
+    visitor_author,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -117,6 +121,77 @@ async def test_list_comments_filter_by_path(client: httpx.AsyncClient, session_i
     assert paths == {"a.py"}
 
 
+async def test_list_comments_hides_visitor_drafts_and_marks_visitor_rows(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """Visitor drafts stay hidden; listed visitor rows carry the untrusted fields.
+
+    A visitor comment that has not been sent to the agent is feedback the
+    owner never vouched for, so the agent-facing listing must omit it. Once
+    addressed (sent), it must still be visibly marked as untrusted, while
+    owner rows stay byte-identical to today.
+    """
+    store = SqlAlchemyCommentStore(db_uri)
+    owner = store.add(session_id, "src/App.tsx", "owner note", 0, 5)
+    visitor_draft = store.add(
+        session_id,
+        "src/App.tsx",
+        "unsent visitor note",
+        10,
+        15,
+        created_by=visitor_author("Alice"),
+    )
+    visitor_sent = store.add(
+        session_id,
+        "src/App.tsx",
+        "sent visitor note",
+        20,
+        25,
+        created_by=visitor_author(""),
+    )
+    store.update_comment(visitor_sent.id, session_id, status="addressed")
+
+    resp = await client.get(f"/v1/sessions/{session_id}/comments")
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()}
+
+    assert visitor_draft.id not in rows, "Unsent visitor feedback must be hidden from the listing"
+    assert set(rows) == {owner.id, visitor_sent.id}
+
+    # Non-visitor rows must not gain the new fields.
+    assert "source" not in rows[owner.id]
+    assert "note" not in rows[owner.id]
+
+    marked = rows[visitor_sent.id]
+    assert marked["source"] == "visitor"
+    assert marked["note"] == VISITOR_COMMENT_NOTE
+
+
+async def test_list_comments_include_visitor_drafts(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """``include_visitor_drafts`` returns drafts, still marked untrusted."""
+    store = SqlAlchemyCommentStore(db_uri)
+    visitor_draft = store.add(
+        session_id,
+        "src/App.tsx",
+        "unsent visitor note",
+        10,
+        15,
+        created_by=visitor_author("Alice"),
+    )
+
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/comments",
+        params={"include_visitor_drafts": "1"},
+    )
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()}
+    assert visitor_draft.id in rows
+    assert rows[visitor_draft.id]["source"] == "visitor"
+    assert rows[visitor_draft.id]["note"] == VISITOR_COMMENT_NOTE
+
+
 # ── PATCH /sessions/{id}/comments/{comment_id} ───────────────────────
 
 
@@ -183,6 +258,32 @@ async def test_send_comments(client: httpx.AsyncClient, session_id: str) -> None
     assert cid in body["sent_comment_ids"]
     assert "formatted_message" in body
     assert "review comments" in body["formatted_message"].lower()
+
+
+async def test_send_comments_mark_addressed_false_leaves_status(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """``mark_addressed: false`` formats the message but marks nothing.
+
+    A caller that delivers the formatted message itself (e.g. the web app
+    pinning a send to a session) marks the comments afterwards, so a failed
+    delivery must not silently consume them.
+    """
+    add_resp = await client.post(f"/v1/sessions/{session_id}/comments", json=_comment_payload())
+    cid = add_resp.json()["id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/comments/send",
+        json={"comment_ids": [cid], "mark_addressed": False},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sent_comment_ids"] == [cid]
+    assert "Fix the import" in body["formatted_message"]
+
+    list_resp = await client.get(f"/v1/sessions/{session_id}/comments")
+    statuses = {c["id"]: c["status"] for c in list_resp.json()}
+    assert statuses[cid] == "draft", "mark_addressed=false must leave the comment unmarked"
 
 
 async def test_send_comments_not_found(client: httpx.AsyncClient, session_id: str) -> None:

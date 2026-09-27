@@ -9,9 +9,12 @@
 import { useEffect, useState } from "react";
 import { withBasePath } from "@/lib/basePath";
 import { authenticatedFetch } from "@/lib/identity";
+import { stripInjectedScripts } from "@/lib/stripInjectedScripts";
 import { browseLocationBase } from "@/hooks/useWorkspaceChangedFiles";
 
-export type ArtifactView = "panel" | "raw";
+/** `visit` serves the commentable visitor shell for HTML entries (the
+ *  server falls back to raw bytes for every other file). */
+export type ArtifactView = "panel" | "raw" | "visit";
 
 /** Mint response of `POST /v1/sessions/{sid}/artifacts`. */
 export interface MintedArtifactLink {
@@ -59,19 +62,6 @@ export async function mintArtifactLink(
     ...link,
     expires_at: typeof link.expires_at === "number" ? link.expires_at : null,
   };
-}
-
-/**
- * Drop the bridge `<script data-omni-nonce="…">…</script>` tags the server
- * inlines into panel-view HTML, so comment offsets match the file's own bytes.
- * The asset escapes its own `</script`, so the first literal close ends a tag.
- */
-export function stripInjectedScripts(html: string, nonce: string): string {
-  const escapedNonce = nonce.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return html.replace(
-    new RegExp(`<script data-omni-nonce="${escapedNonce}">[\\s\\S]*?</script>`, "g"),
-    "",
-  );
 }
 
 /** GET one panel-view artifact file's stripped source; throws on non-2xx. */

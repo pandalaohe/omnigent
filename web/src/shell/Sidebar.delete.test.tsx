@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import type * as UseCommentsModule from "@/hooks/useComments";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the optimistic delete-session flow in the sidebar. The
 // contract: clicking "Delete" in the confirm dialog fires the mutation,
@@ -63,6 +64,15 @@ vi.mock("@/hooks/useConversations", () => ({
 // Heavy sibling widgets in the sidebar pull their own hooks/providers;
 // stub them so this test stays scoped to the conversation row.
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+
+// The delete confirmation reads the session's comments; the count line is
+// covered in HeaderConversationMenu.test.tsx, so this file only needs the
+// query to not fire a real fetch. Keep the module's other exports
+// (useCommentInbox shares them through the provider).
+vi.mock("@/hooks/useComments", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseCommentsModule>();
+  return { ...actual, useComments: () => ({ data: [] }) };
+});
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";

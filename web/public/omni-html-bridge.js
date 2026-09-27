@@ -26,6 +26,9 @@
   (document.head || document.documentElement).appendChild(style);
 
   var port = null;
+  // The visitor shell's init marks visit mode: link clicks must keep the shell
+  // in place, unlike the panel's own link routing.
+  var VISIT = false;
   var comments = []; // [{ id, anchor_content, occ }]
   var active = null; // { anchor_content, occ } | null
   var activeRanges = []; // ranges matching the active comment (for scroll-into-view)
@@ -322,6 +325,9 @@
   // A plain click on an http(s) link outside this artifact's
   // `/v1/artifacts/<token>/` prefix (same scheme and host) opens in a new tab;
   // in-bundle links, mailto:, fragments and non-artifact pages stay native.
+  // In visit mode a cross-origin link also opens in a new tab (the shell's CSP
+  // frames only its own origin), and a same-origin link targeting `_top` /
+  // `_parent` navigates the frame itself instead of the shell.
   function onDocumentClick(e) {
     if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.defaultPrevented) {
       return;
@@ -341,15 +347,25 @@
       return;
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") return;
-    if (
-      url.protocol === location.protocol &&
-      url.host === location.host &&
-      url.pathname.indexOf(m[1]) === 0
-    ) {
+    var sameOrigin = url.protocol === location.protocol && url.host === location.host;
+    if (VISIT) {
+      var linkTarget = (anchor.getAttribute("target") || "").toLowerCase();
+      if (sameOrigin && (linkTarget === "_top" || linkTarget === "_parent")) {
+        e.preventDefault();
+        window.location.assign(url.href);
+        return;
+      }
+      if (!sameOrigin) {
+        e.preventDefault();
+        window.open(url.href, "_blank", "noopener");
+        return;
+      }
+    }
+    if (sameOrigin && url.pathname.indexOf(m[1]) === 0) {
       return;
     }
     e.preventDefault();
-    window.open(url.href, "_blank", "noopener,noreferrer");
+    window.open(url.href, "_blank", VISIT ? "noopener" : "noopener,noreferrer");
   }
 
   // Also react to programmatic / keyboard selection (mouseup alone misses
@@ -366,6 +382,7 @@
     var d = e.data;
     if (!d || d.source !== SRC || d.nonce !== NONCE) return;
     if (d.type === T.init && e.ports && e.ports[0]) {
+      VISIT = d.visit === true;
       port = e.ports[0];
       port.onmessage = function (ev) {
         var m = ev.data;

@@ -119,6 +119,23 @@ def test_write_sharing_is_per_owner(db_uri: str) -> None:
     assert store.read_sharing("bob") is None
 
 
+def test_allow_comments_only_write_keeps_the_gate_key(db_uri: str) -> None:
+    """The visitor-comments switch must not sign open visitors out."""
+    store = ArtifactSharingStore(db_uri)
+
+    first = store.write_sharing("alice", external=False, share_code="open-sesame")
+    second = store.write_sharing("alice", allow_comments=False)
+
+    assert second.gate_key == first.gate_key
+    assert second.allow_comments is False
+    assert store.read_sharing("alice") == second
+
+    # Any other field still rotates the key, as before.
+    third = store.write_sharing("alice", external=True)
+
+    assert third.gate_key != second.gate_key
+
+
 def test_write_sharing_seeds_the_row_before_the_locked_read(db_uri: str) -> None:
     """Disjoint first writes merge because the locked read finds a seeded row.
 
@@ -189,6 +206,7 @@ def test_write_sharing_raises_when_the_update_matches_no_row(
         json.dumps({"external": "yes", "gate_key": "k"}),
         json.dumps({"external": True, "gate_key": ""}),
         json.dumps({"external": True, "gate_key": "k", "code_hash": 7}),
+        json.dumps({"external": True, "gate_key": "k", "allow_comments": "yes"}),
         json.dumps([1, 2]),
     ],
 )
@@ -207,6 +225,26 @@ def test_malformed_row_reads_as_no_row(db_uri: str, value: str) -> None:
         )
 
     assert ArtifactSharingStore(db_uri).read_sharing("alice") is None
+
+
+def test_row_without_allow_comments_reads_true(db_uri: str) -> None:
+    """A row written before the field existed keeps the documented default."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_named_managed_session_maker(engine, query_name_prefix="test.artifact_sharing")
+    with maker("insert_legacy_sharing_row") as session:
+        session.add(
+            SqlPreference(
+                workspace_id=current_workspace_id(),
+                user_id="alice",
+                key=ARTIFACT_SHARING_PREFERENCE_KEY,
+                value=json.dumps({"external": True, "code_hash": None, "gate_key": "k"}),
+            )
+        )
+
+    record = ArtifactSharingStore(db_uri).read_sharing("alice")
+
+    assert record is not None
+    assert record.allow_comments is True
 
 
 def test_gate_key_id_is_eight_hex_of_the_key_hash() -> None:
@@ -370,4 +408,4 @@ async def test_no_api_response_carries_the_hash_or_gate_key(
     for response in (put, get, me, preferences_put):
         assert record.gate_key not in response.text
         assert record.code_hash not in response.text
-    assert set(get.json()) == {"external", "share_code_set"}
+    assert set(get.json()) == {"external", "share_code_set", "allow_comments"}

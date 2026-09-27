@@ -296,6 +296,35 @@ describe("CommentsPanel author-only edit/delete gating", () => {
     expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
   });
+
+  it("shows the visitor label on a visitor comment", () => {
+    renderGated({
+      canEdit: true,
+      comments: [makeAuthoredComment("c1", "visitor:Alice")],
+    });
+    expect(screen.getByText("Visitor · Alice")).toBeInTheDocument();
+  });
+
+  it("lets an editor delete a visitor comment but never edit it", () => {
+    // The server exempts visitor comments from the DELETE author check while
+    // body edits stay author-only; the panel mirrors both.
+    mockGetCurrentAuthorId.mockReturnValue("bob@example.com");
+    renderGated({
+      canEdit: true,
+      comments: [makeAuthoredComment("c1", "visitor:Alice")],
+    });
+    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  it("hides visitor delete from a read-only viewer", () => {
+    renderGated({
+      canEdit: false,
+      comments: [makeAuthoredComment("c1", "visitor:Alice")],
+    });
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
 });
 
 // ── Show more / less (long comment bodies) ──────────────────────────────────

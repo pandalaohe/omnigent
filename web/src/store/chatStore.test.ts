@@ -3705,6 +3705,61 @@ describe("chatStore — send (first-send ordering)", () => {
   });
 });
 
+// The resolved value is the "did the agent actually get it" signal the
+// comments-send hook and the archived banner branch on. A call that only
+// persisted the message (no runner), was policy-denied, or failed outright
+// must resolve false.
+describe("chatStore — send delivery result", () => {
+  function seedExistingSession(): void {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      pendingUserMessages: [],
+    });
+  }
+
+  function mockEventsResponse(body: unknown, status = 200): void {
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(body, status === 200 ? undefined : { ok: false, status });
+      }
+      return defaultFetchHandler(input, init);
+    });
+  }
+
+  it("resolves true when the server accepts and forwards the message", async () => {
+    seedExistingSession();
+    mockEventsResponse({ queued: true, item_id: "ci_mock" });
+
+    await expect(useChatStore.getState().send("hi", "agent_xyz")).resolves.toBe(true);
+  });
+
+  it("resolves false when the message was persisted without a runner", async () => {
+    // {queued: true, forwarded: false}: a native-terminal message the server
+    // stored because no runner was reachable. The agent never reads it.
+    seedExistingSession();
+    mockEventsResponse({ queued: true, item_id: "ci_mock", forwarded: false });
+
+    await expect(useChatStore.getState().send("hi", "agent_xyz")).resolves.toBe(false);
+  });
+
+  it("resolves false when a policy denies the message", async () => {
+    seedExistingSession();
+    mockEventsResponse({ queued: false, denied: true });
+
+    await expect(useChatStore.getState().send("hi", "agent_xyz")).resolves.toBe(false);
+  });
+
+  it("resolves false when postEvent fails", async () => {
+    seedExistingSession();
+    mockEventsResponse({ error: { code: "internal_error", message: "boom on the server" } }, 500);
+
+    await expect(useChatStore.getState().send("hi", "agent_xyz")).resolves.toBe(false);
+  });
+});
+
 describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
   // Drives the navigate-first flow directly (NewChatDialog owns createSession;
   // these exercise the store side): begin a client-only conversation, then
@@ -4207,6 +4262,18 @@ describe("chatStore — first message during native model startup", () => {
         }),
       },
     ]);
+  });
+
+  it("resolves a pre-model send false when it is cancelled before dispatch", async () => {
+    // The early return paths (cancelled draft, lost model-selection wait)
+    // resolve false: nothing was posted, so nothing can be marked delivered.
+    begin();
+    await settle();
+    const sending = useChatStore.getState().send("cancelled before dispatch", "agent_xyz");
+    await settle();
+    useChatStore.getState().stop();
+
+    await expect(sending).resolves.toBe(false);
   });
 
   it("does not wait for Codex's first-turn model report or own its subsequent sends locally", async () => {

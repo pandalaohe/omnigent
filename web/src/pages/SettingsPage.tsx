@@ -46,6 +46,8 @@ import {
 } from "react";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
+import { useComments } from "@/hooks/useComments";
+import { bulkCommentsDeleteLine, unhandledCommentsDeleteLine } from "@/lib/comments";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
@@ -3284,6 +3286,12 @@ function ArchivedBulkActionBar({
 
   const count = selectedIds.size;
   const deletableSelected = ownedSelected.filter((conversation) => !isArchiveLocked(conversation));
+  const deleteCommentsLine = bulkCommentsDeleteLine(
+    deletableSelected.reduce(
+      (total, conversation) => total + (conversation.comments_count ?? 0),
+      0,
+    ),
+  );
   const unlock = ownedSelected.length > 0 && ownedSelected.every(isArchiveLocked);
   const isBusy = bulkArchive.isPending || bulkLock.isPending || bulkDelete.isPending;
   const [confirmAction, setConfirmAction] = useState<"lock" | "unarchive" | "delete" | null>(null);
@@ -3401,6 +3409,9 @@ function ArchivedBulkActionBar({
                     : "Protects the selected sessions from deletion."}
             </DialogDescription>
           </DialogHeader>
+          {confirmAction === "delete" && deleteCommentsLine !== null && (
+            <p className="text-sm text-muted-foreground">{deleteCommentsLine}</p>
+          )}
           <DialogFooter>
             <Button
               type="button"
@@ -3456,6 +3467,10 @@ function ArchivedRow({
   const archiveLock = useArchiveLockConversation();
   const del = useStopAndDeleteConversation();
   const [deleteOpen, setDeleteOpen] = useState(false);
+  // Unhandled comments die with the session; fetch them when the delete
+  // confirmation opens so the dialog can name the count.
+  const { data: deleteComments } = useComments(deleteOpen ? conversation.id : undefined);
+  const deleteCommentsLine = unhandledCommentsDeleteLine(deleteComments ?? []);
   const label = conversationDisplayLabel(conversation);
   const locked = isArchiveLocked(conversation);
   const busy = archive.isPending || archiveLock.isPending || del.isPending;
@@ -3638,6 +3653,9 @@ function ArchivedRow({
               removed. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
+          {deleteCommentsLine !== null && (
+            <p className="text-sm text-muted-foreground">{deleteCommentsLine}</p>
+          )}
           <DialogFooter>
             <Button variant="ghost" onClick={() => setDeleteOpen(false)} disabled={del.isPending}>
               Cancel

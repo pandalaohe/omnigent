@@ -7,6 +7,7 @@ Comments can be sent to the agent as a formatted message via the
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
@@ -25,11 +26,21 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._errors import session_not_found
 from omnigent.stores import ConversationStore
 from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.comment_store.visitor_comments import (
+    VISITOR_FEEDBACK_HEADER,
+    comment_rows,
+    is_visitor_author,
+    visitor_author_label,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 
-def _format_message(comments: list[Comment]) -> str:
-    """Format a list of comments into a human-readable message for the agent.
+def _comment_sections(
+    comments: list[Comment],
+    *,
+    bullet_label: Callable[[Comment], str] | None = None,
+) -> list[str]:
+    """Render the ``File:`` sections for *comments*.
 
     Groups comments by file path (alphabetical) and sorts within each group
     by ``start_index`` ascending. Each bullet shows the anchor_content
@@ -37,21 +48,52 @@ def _format_message(comments: list[Comment]) -> str:
     agent can locate the relevant section without needing pre-computed line
     numbers.
 
-    :param comments: The comments to format.
-    :returns: A multi-line string suitable for posting to the agent.
+    :param comments: The comments to render.
+    :param bullet_label: Optional label prefixed to each bullet, used to
+        attribute visitor comments to their author.
+    :returns: The section lines, or an empty list when there are no comments.
     """
     by_path: dict[str, list[Comment]] = {}
     for c in comments:
         by_path.setdefault(c.path, []).append(c)
 
-    lines = ["Please address the following review comments."]
+    lines: list[str] = []
     for path in sorted(by_path):
         lines.append("")
         lines.append(f"File: {path}")
         for c in sorted(by_path[path], key=lambda c: c.start_index):
             anchor = f'"{c.anchor_content.strip()}" ' if c.anchor_content else ""
-            lines.append(f"• {anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
+            label = f"{bullet_label(c)}: " if bullet_label is not None else ""
+            lines.append(f"• {label}{anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
 
+    return lines
+
+
+def _format_message(comments: list[Comment]) -> str:
+    """Format a list of comments into a human-readable message for the agent.
+
+    The owner's comments keep the standard listing. Visitor comments are
+    appended in their own untrusted-feedback section, each bullet prefixed
+    with the visitor label, so a comment relayed from a shared link is
+    never presented as an instruction from the user.
+
+    :param comments: The comments to format.
+    :returns: A multi-line string suitable for posting to the agent.
+    """
+    owner_comments = [c for c in comments if not is_visitor_author(c.created_by)]
+    visitor_comments = [c for c in comments if is_visitor_author(c.created_by)]
+
+    lines = ["Please address the following review comments."]
+    lines.extend(_comment_sections(owner_comments))
+    if visitor_comments:
+        lines.append("")
+        lines.append(VISITOR_FEEDBACK_HEADER)
+        lines.extend(
+            _comment_sections(
+                visitor_comments,
+                bullet_label=lambda c: visitor_author_label(c.created_by or ""),
+            )
+        )
     return "\n".join(lines)
 
 
@@ -111,10 +153,15 @@ class SendCommentsRequest(BaseModel):
     :param instruction: Optional custom instruction prefix; defaults
         to the standard "Please address the following file review
         comments." header.
+    :param mark_addressed: When ``True`` (the default), each sent comment
+        is marked ``addressed``. ``False`` formats and returns the message
+        without touching comment status, so a caller can mark the comments
+        only after the message actually reached the agent.
     """
 
     comment_ids: list[str]
     instruction: str | None = None
+    mark_addressed: bool = True
 
 
 # ── Router factory ─────────────────────────────────────────────────────────────
@@ -169,7 +216,11 @@ def create_comments_router(
                 raise session_not_found()
 
     async def _require_comment_author(
-        user_id: str | None, comment_id: str, session_id: str
+        user_id: str | None,
+        comment_id: str,
+        session_id: str,
+        *,
+        visitor_deletable: bool = False,
     ) -> None:
         """Enforce that the caller authored the comment they are mutating.
 
@@ -179,6 +230,11 @@ def create_comments_router(
         collaborator with edit access can still mark *anyone's* comment
         addressed (a shared review-workflow action), but cannot rewrite or
         delete another user's comment.
+
+        Visitor comments (written through a share link, so they have no
+        account author) are the exception to deletion: *visitor_deletable*
+        lets an editor remove them, while body edits stay author-only
+        because the delete path is the only caller that passes it.
 
         Comments with no recorded author (``created_by is None`` — legacy
         comments created before per-user attribution, or single-user mode)
@@ -193,12 +249,16 @@ def create_comments_router(
         :param user_id: The authenticated caller, e.g. ``"bob@example.com"``.
         :param comment_id: The comment being mutated, e.g. ``"a1b2c3d4-..."``.
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
+        :param visitor_deletable: When ``True``, a visitor-authored comment
+            passes without an author match (DELETE only).
         :raises OmnigentError: 404 if the comment is not found in this
             session; 403 if the caller is not the comment's author.
         """
         comment = await asyncio.to_thread(store.get, comment_id, session_id)
         if comment is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+        if visitor_deletable and is_visitor_author(comment.created_by):
+            return
         if comment.created_by is not None and comment.created_by != user_id:
             raise OmnigentError(
                 "Only the comment author can edit or delete this comment",
@@ -245,22 +305,30 @@ def create_comments_router(
         request: Request,
         session_id: str,
         path: str | None = None,
+        include_visitor_drafts: bool = False,
     ) -> list[dict[str, Any]]:
         """List comments for a session, optionally filtered by file.
 
         Requires ``LEVEL_READ`` on the session in multi-user mode.
 
+        Visitor comments still in ``draft`` are omitted (the owner has not
+        sent them to the agent); the owner's read path passes
+        ``include_visitor_drafts=true`` to see them. Every returned visitor
+        row carries ``source: "visitor"`` and an untrusted-data note.
+
         :param request: The incoming request, used to extract the user identity.
         :param session_id: The session to query, e.g. ``"conv_abc123"``.
         :param path: When provided, only return comments for this file,
             e.g. ``"src/App.tsx"``.
+        :param include_visitor_drafts: When ``True``, include visitor
+            comments that are still drafts.
         :returns: List of serialized comment dicts.
         :raises OmnigentError: 401/403/404 if the user lacks read permission.
         """
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_READ)
         comments = store.list_for_conversation(session_id, path=path)
-        return [asdict(c) for c in comments]
+        return comment_rows(comments, include_visitor_drafts=include_visitor_drafts)
 
     @router.patch("/sessions/{session_id}/comments/{comment_id}")
     async def update_comment(
@@ -321,7 +389,8 @@ def create_comments_router(
 
         Requires ``LEVEL_EDIT`` on the session in multi-user mode, and
         additionally that the caller is the comment's author — one
-        collaborator may not delete another user's comment.
+        collaborator may not delete another user's comment. A visitor
+        comment has no account author, so any editor may delete it.
 
         :param request: The incoming request, used to extract the user identity.
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
@@ -334,7 +403,7 @@ def create_comments_router(
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_EDIT)
         if permission_store is not None:
-            await _require_comment_author(user_id, comment_id, session_id)
+            await _require_comment_author(user_id, comment_id, session_id, visitor_deletable=True)
         deleted = store.delete(comment_id, session_id)
         if deleted is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
@@ -348,17 +417,19 @@ def create_comments_router(
     ) -> dict[str, Any]:
         """Mark comments as addressed and format them into an agent message.
 
-        Fetches each requested comment, marks it ``addressed``,
-        and formats the full set into a grouped, sorted message string
-        suitable for pasting into the chat composer.
+        Fetches each requested comment, marks it ``addressed`` (unless
+        ``mark_addressed`` is ``False``), and formats the full set into a
+        grouped, sorted message string suitable for pasting into the chat
+        composer. ``mark_addressed: false`` exists so a caller can format
+        the message, deliver it, and only then mark the comments.
 
         Requires ``LEVEL_EDIT`` on the session in multi-user mode because
-        it transitions comment status from ``draft`` to ``addressed``.
+        it can transition comment status from ``draft`` to ``addressed``.
 
         :param request: The incoming request, used to extract the user identity.
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
         :param body: List of comment IDs to send, with an optional
-            custom instruction prefix.
+            custom instruction prefix and the mark-addressed switch.
         :returns: ``{"formatted_message": str, "sent_comment_ids": list[str]}``.
         :raises OmnigentError: 401/403/404 if the user lacks edit permission,
             or 404 if any requested comment is not found or does not belong to
@@ -367,10 +438,10 @@ def create_comments_router(
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_EDIT)
 
-        # Fetch + mark-addressed for every requested comment runs N sync
-        # DB gets + N sync updates. Do the whole batch in one worker-thread
-        # hop so it never blocks the single-worker event loop (and can't
-        # serialize concurrent requests behind it).
+        # Fetch (and, unless disabled, mark-addressed for) every requested
+        # comment runs N sync DB gets + up to N sync updates. Do the whole
+        # batch in one worker-thread hop so it never blocks the single-worker
+        # event loop (and can't serialize concurrent requests behind it).
         def _fetch_and_mark() -> list[Comment]:
             """Resolve every comment id, then mark each addressed."""
             fetched: list[Comment] = []
@@ -379,8 +450,9 @@ def create_comments_router(
                 if comment is None:
                     raise OmnigentError(f"Comment not found: {cid}", code=ErrorCode.NOT_FOUND)
                 fetched.append(comment)
-            for comment in fetched:
-                store.update_comment(comment.id, session_id, status="addressed")
+            if body.mark_addressed:
+                for comment in fetched:
+                    store.update_comment(comment.id, session_id, status="addressed")
             return fetched
 
         to_send = await asyncio.to_thread(_fetch_and_mark)

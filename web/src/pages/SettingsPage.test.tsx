@@ -9,6 +9,7 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import type * as UseCommentsModule from "@/hooks/useComments";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
 import * as host from "@/lib/host";
@@ -162,6 +163,12 @@ vi.mock("@/hooks/useConversations", async () => {
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: mocks.hosts }),
 }));
+// The archived delete dialogs read the session's comments; these fixtures
+// hold none, so the count line stays out of the dialogs under test.
+vi.mock("@/hooks/useComments", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseCommentsModule>();
+  return { ...actual, useComments: () => ({ data: [] }) };
+});
 vi.mock("@/components/archive/ArchiveTranscriptViewer", () => ({
   ArchiveTranscriptViewer: ({ conversation }: { conversation: Conversation | null }) => (
     <div data-testid="archive-transcript" tabIndex={0}>

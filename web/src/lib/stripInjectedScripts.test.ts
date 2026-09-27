@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { stripInjectedScripts } from "./useArtifactLink";
+import { stripInjectedScripts } from "./stripInjectedScripts";
 
 describe("stripInjectedScripts", () => {
   const nonce = "abc123";

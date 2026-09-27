@@ -41,6 +41,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.member_snapshot import MEMBER_LABEL_PREFIX
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -176,6 +177,7 @@ from omnigent.server.routes._sessions.helpers import (
     _set_read_state,
     _surface_model_change_forward_failure,
     _title_content_from_item,
+    _validate_session_workspace,
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
@@ -232,6 +234,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_LOCK_LABEL_KEY,
+    CONTINUED_TO_LABEL_KEY,
     DELETION_CLAIM_STALE_AFTER_S,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
@@ -4127,6 +4130,268 @@ def register_core_routes(
             permission_level=level,
             last_task_error=None,
             agent_name=base_agent.name,
+        )
+
+    # ── POST /sessions/{source_id}/continue ─────────────────────
+
+    @router.post(
+        "/sessions/{source_id}/continue",
+        status_code=201,
+        # response_model=None keeps FastAPI from re-validating/serializing
+        # the handler's SessionResponse; responses= still advertises the
+        # body schema to docs/SDK tooling.
+        response_model=None,
+        responses={201: {"model": SessionResponse}},
+    )
+    async def continue_session(
+        request: Request,
+        source_id: str,
+    ) -> SessionResponse:
+        """
+        Start a fresh session continuing an archived one.
+
+        The caller needs ``LEVEL_EDIT`` on the archived session, and an
+        unarchived session is refused (409). The new session is top-level
+        with no history: same host, same launch directory (the archived
+        session's worktree when it had one, else its workspace — validated
+        against the host exactly like session create), same project, and
+        the same run configuration — model / reasoning-effort / harness /
+        cost-control / sub-agent-routing overrides, ``terminal_launch_args``
+        (a native session's permission mode lives there), the presentation
+        labels the bound agent's harness stamps (``omnigent.wrapper`` and
+        ``omnigent.ui``, re-derived like create and fork), the run-config
+        labels on an allowlist (claude-native / claude-sdk permission mode,
+        codex-sdk approval mode, the auto-harness pick, the agent-template
+        id, the joint-agent member snapshot), and the archived session's
+        inference snapshot when it belongs to the caller.
+        The archived session's agent carries over either way: a template
+        agent is bound by id, while a session-scoped agent is cloned into a
+        fresh session-scoped row from the same bundle. The raw
+        session-scoped id is never bound, because that row belongs to the
+        archived session — switching the new session's agent would delete
+        it.
+
+        Idempotent: the archived session records
+        ``omnigent.continued_to=<new id>``, and a repeat call returns that
+        session while it still exists, is not archived and the caller may
+        edit it; otherwise a new session is created and the pointer moves.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param source_id: The archived session to continue, e.g.
+            ``"conv_abc123"``.
+        :returns: A :class:`SessionResponse` describing the new session.
+        :raises OmnigentError: 404 if the source session (or its agent)
+            does not exist; 403/404 if the caller lacks edit access;
+            409 if the source is not archived; 400 if the source has no
+            agent binding or its inference snapshot belongs to another
+            user; the create path's workspace error (e.g. a missing
+            directory or offline host) when the workspace cannot be
+            validated.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, source_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        source = access.conversation
+        if source is None:
+            source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+            if source is None:
+                raise OmnigentError(
+                    f"Session not found: {source_id!r}",
+                    code=ErrorCode.NOT_FOUND,
+                )
+        if not source.archived:
+            raise OmnigentError(
+                "Only an archived session can be continued.",
+                code=ErrorCode.CONFLICT,
+            )
+        if source.agent_id is None:
+            raise OmnigentError(
+                "Source session has no agent binding — cannot continue.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        # A repeat call returns the pointed-to session only while it
+        # exists, is unarchived, and the caller may edit it: the pointer
+        # is a hint, not a grant, so a refusal mints a fresh successor.
+        continued_to = source.labels.get(CONTINUED_TO_LABEL_KEY)
+        if continued_to:
+            existing = await asyncio.to_thread(conversation_store.get_conversation, continued_to)
+            if existing is not None and not existing.archived:
+                try:
+                    reuse = await _require_access_and_level(
+                        user_id, existing.id, LEVEL_EDIT, permission_store, conversation_store
+                    )
+                except OmnigentError:
+                    reuse = None
+                if reuse is not None:
+                    return await _get_session_snapshot(
+                        conversation_store,
+                        existing.id,
+                        reuse.level,
+                        agent_store=agent_store,
+                        agent_cache=agent_cache,
+                        conversation=existing,
+                        liveness_lookup=liveness_lookup,
+                        include_items=False,
+                        request=request,
+                        allow_host_fill=False,
+                    )
+
+        source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
+        if source_agent is None:
+            raise OmnigentError(
+                f"Source agent not found: {source.agent_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            )
+
+        # A saved inference configuration names the user whose provider
+        # credentials it carries, so only that user may continue with it —
+        # the same rule and error as fork.
+        if source.inference_snapshot is not None:
+            from omnigent.server.auth import RESERVED_USER_LOCAL
+
+            if source.inference_snapshot["owner_id"] != (user_id or RESERVED_USER_LOCAL):
+                raise OmnigentError(
+                    "This session's inference configuration belongs to another user. "
+                    "Start a new session to use your own provider connection.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+        # Only run-config labels carry over: the permission / approval modes,
+        # the auto-harness pick, the template id and the member snapshot.
+        # Instance-scoped, archive, pin, artifact-key, continued_to,
+        # codex-bypass, fork-source and side-chat labels stay behind, so a
+        # continuation never re-arms a bypass and owns none of the archived
+        # session's secret or placement state.
+        from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+        continued_labels = {
+            key: value
+            for key, value in source.labels.items()
+            if key
+            in (
+                _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+                CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+                CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+                AUTO_HARNESS_LABEL_KEY,
+                "omnigent:agent-template-id",
+            )
+            or key.startswith(MEMBER_LABEL_PREFIX)
+        }
+        # The successor binds the source's agent or a clone from the same
+        # bundle, so the source agent's harness decides the Web UI mode. A
+        # missing wrapper/ui pair renders a native continuation as plain chat
+        # (no permission-mode control) and misroutes every server branch
+        # keyed on the wrapper label; updated last so it wins over anything
+        # copied for the same key.
+        continued_labels.update(
+            await asyncio.to_thread(_presentation_labels_for_agent, source_agent)
+        )
+
+        # The archived session's working tree wins over its launch
+        # directory, so the continuation edits the same checkout. A
+        # host-bound workspace goes through the same validator session
+        # create uses, so a missing directory or offline host fails with
+        # the create path's error instead of landing a dead session.
+        workspace = source.worktree or source.workspace
+        if source.host_id is not None:
+            workspace = await _validate_session_workspace(
+                user_id=user_id,
+                host_id=source.host_id,
+                workspace=workspace,
+                agent=source_agent,
+                agent_cache=agent_cache,
+                request=request,
+            )
+
+        if source_agent.session_id is None:
+            # Template/shared agent: safe to bind the same row directly.
+            conv = await asyncio.to_thread(
+                conversation_store.create_conversation,
+                agent_id=source_agent.id,
+                host_id=source.host_id,
+                workspace=workspace,
+                project_id=source.project_id,
+                model_override=source.model_override,
+                reasoning_effort=source.reasoning_effort,
+                harness_override=source.harness_override,
+                cost_control_mode_override=source.cost_control_mode_override,
+                subagent_routing_override=source.subagent_routing_override,
+                terminal_launch_args=source.terminal_launch_args,
+                inference_snapshot=source.inference_snapshot,
+                labels=continued_labels or None,
+            )
+        else:
+            # Session-scoped agent: clone a fresh row from the same bundle
+            # (same name/description), the way fork clones — never bind the
+            # raw id, which the archived session owns.
+            created = await asyncio.to_thread(
+                conversation_store.create_session_with_agent,
+                agent_id=generate_agent_id(),
+                agent_name=source_agent.name,
+                agent_bundle_location=source_agent.bundle_location,
+                agent_description=source_agent.description,
+                host_id=source.host_id,
+                workspace=workspace,
+                project_id=source.project_id,
+                model_override=source.model_override,
+                reasoning_effort=source.reasoning_effort,
+                terminal_launch_args=source.terminal_launch_args,
+                inference_snapshot=source.inference_snapshot,
+                labels=continued_labels or None,
+                created_by=user_id,
+            )
+            conv = created.conversation
+            # create_session_with_agent takes no run-config overrides, so
+            # apply them via update_conversation.
+            if (
+                source.harness_override is not None
+                or source.cost_control_mode_override is not None
+                or source.subagent_routing_override is not None
+            ):
+                updated = await asyncio.to_thread(
+                    conversation_store.update_conversation,
+                    conv.id,
+                    harness_override=source.harness_override,
+                    cost_control_mode_override=source.cost_control_mode_override,
+                    subagent_routing_override=source.subagent_routing_override,
+                )
+                if updated is not None:
+                    conv = updated
+
+        if permission_store is not None and user_id is not None:
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+            await asyncio.to_thread(permission_store.grant, user_id, conv.id, LEVEL_OWNER)
+        _announce_session_added(user_id, conv.id)
+        await _grant_default_public(
+            request.app.state,
+            permission_store,
+            conv.id,
+            managed=False,
+            workspace=conv.workspace,
+            host_id=source.host_id,
+        )
+        # Record the pointer only after the new session exists, so a failed
+        # create never leaves the archived session claiming a live successor.
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            source_id,
+            {CONTINUED_TO_LABEL_KEY: conv.id},
+        )
+
+        level = await _get_permission_level(user_id, conv.id, permission_store)
+        return await _get_session_snapshot(
+            conversation_store,
+            conv.id,
+            level,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            conversation=conv,
+            liveness_lookup=liveness_lookup,
+            include_items=False,
+            request=request,
+            allow_host_fill=False,
         )
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────

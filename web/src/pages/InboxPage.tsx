@@ -48,6 +48,7 @@ import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { useSidebarData } from "@/hooks/useSidebarData";
+import { commentAuthorLabel } from "@/lib/comments";
 import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
@@ -349,9 +350,10 @@ export function InboxPage() {
         })}
         {commentInbox.items.map((item) => {
           const comment = item.comment;
-          // Single-user mode stores no author; mirror CommentsPanel's
-          // "You" fallback (the only human in that mode is the viewer).
-          const author = comment.created_by ?? "You";
+          // Single-user mode stores no author; the helper keeps the same
+          // "You" fallback (the only human in that mode is the viewer) and
+          // labels visitor comments.
+          const author = commentAuthorLabel(comment.created_by);
           const sessionTitle = conversationDisplayLabel(item.row);
           return (
             <div

@@ -2,9 +2,11 @@
 
 An artifact link is governed by the *owner's* sharing record — one
 ``preferences`` row (key :data:`ARTIFACT_SHARING_PREFERENCE_KEY`) holding an
-"external access" switch and an optional share-code hash. Every settings write
-regenerates a gate key, so a change invalidates every grant and every
-remembered browser the record signed.
+"external access" switch, an optional share-code hash and a visitor-comments
+switch. A settings write regenerates a gate key, so a change invalidates every
+grant and every remembered browser the record signed; an
+``allow_comments``-only write keeps the key, so that switch does not sign
+visitors out.
 
 This module owns the record store plus the two credentials layered on the
 artifact token: the URL-path grant (``<token>~<grant>``) that lets a page's
@@ -66,14 +68,18 @@ class SharingRecord:
         the owner's links once they pass the gate.
     :param code_hash: argon2id hash of the share code, or ``None`` when no
         code is set. Never returned to a client.
-    :param gate_key: Random secret regenerated on every write; signs grants
-        and remember cookies, so a settings change invalidates all of them.
-        Never returned to a client.
+    :param gate_key: Random secret regenerated on a settings write; signs
+        grants and remember cookies, so a settings change invalidates all of
+        them. An ``allow_comments``-only write keeps the stored key, so the
+        switch does not sign visitors out. Never returned to a client.
+    :param allow_comments: Whether visitors holding a link may leave comments
+        on the shared page. Defaults to ``True`` when absent.
     """
 
     external: bool
     code_hash: str | None
     gate_key: str
+    allow_comments: bool = True
 
 
 class KeepShareCode:
@@ -104,11 +110,21 @@ def _decode_record(raw: bytes | str | memoryview | None) -> SharingRecord | None
     external = decoded.get("external")
     code_hash = decoded.get("code_hash")
     gate_key = decoded.get("gate_key")
+    # Absent means the documented default: visitor comments on. A row written
+    # before the field existed must keep that default, not fail closed.
+    allow_comments = decoded.get("allow_comments", True)
     if not isinstance(external, bool) or not isinstance(gate_key, str) or not gate_key:
         return None
     if code_hash is not None and not isinstance(code_hash, str):
         return None
-    return SharingRecord(external=external, code_hash=code_hash, gate_key=gate_key)
+    if not isinstance(allow_comments, bool):
+        return None
+    return SharingRecord(
+        external=external,
+        code_hash=code_hash,
+        gate_key=gate_key,
+        allow_comments=allow_comments,
+    )
 
 
 def _encode_record(record: SharingRecord) -> str:
@@ -118,6 +134,7 @@ def _encode_record(record: SharingRecord) -> str:
             "external": record.external,
             "code_hash": record.code_hash,
             "gate_key": record.gate_key,
+            "allow_comments": record.allow_comments,
         },
         separators=(",", ":"),
     )
@@ -246,6 +263,7 @@ class ArtifactSharingStore:
         *,
         external: bool | None = None,
         share_code: str | None | KeepShareCode = KEEP_SHARE_CODE,
+        allow_comments: bool | None = None,
     ) -> SharingRecord:
         """Merge an update into *owner*'s record and return the new state.
 
@@ -257,12 +275,16 @@ class ArtifactSharingStore:
         writes would each merge against the defaults and the later update
         would replace the other's field. ``share_code=None`` clears the code;
         a string replaces it (hashed here). Every successful write
-        regenerates the gate key.
+        regenerates the gate key, except one that carries only
+        *allow_comments*: keeping the key on that switch is what stops
+        flipping visitor comments from signing every open visitor out.
 
         :param owner: User id whose record is written.
         :param external: New switch value, or ``None`` to keep the current one.
         :param share_code: New plaintext code, ``None`` to clear, or
             :data:`KEEP_SHARE_CODE` to keep.
+        :param allow_comments: New visitor-comments switch, or ``None`` to
+            keep the current one (``True`` on a first write).
         :returns: The persisted record.
         :raises RuntimeError: When the seeded row is not the one updated — an
             owner the column cannot store (MySQL truncation) — so callers
@@ -290,12 +312,25 @@ class ArtifactSharingStore:
             else:
                 # KEEP_SHARE_CODE: the stored hash survives this write.
                 code_hash = current.code_hash if current is not None else None
+            # Only an allow_comments-only write on an existing row keeps the
+            # gate key; every other write rotates it.
+            gate_key = generate_gate_key()
+            if (
+                current is not None
+                and external is None
+                and isinstance(share_code, KeepShareCode)
+                and allow_comments is not None
+            ):
+                gate_key = current.gate_key
             record = SharingRecord(
                 external=(current.external if current is not None else True)
                 if external is None
                 else external,
                 code_hash=code_hash,
-                gate_key=generate_gate_key(),
+                gate_key=gate_key,
+                allow_comments=(current.allow_comments if current is not None else True)
+                if allow_comments is None
+                else allow_comments,
             )
             result = cast(
                 "CursorResult[tuple[object]]",
