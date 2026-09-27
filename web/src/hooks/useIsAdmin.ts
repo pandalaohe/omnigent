@@ -23,9 +23,14 @@ export function useIsAdmin(): boolean {
       return getCurrentIsAdmin();
     },
     staleTime: 30_000,
-    // Seed from the already-resolved cache so first paint is correct when
-    // identity resolved during boot (the common case).
-    initialData: getCurrentIsAdmin,
+    // Placeholder, not initialData: the app mounts before GET /v1/me
+    // resolves, and a seeded initialData value is stamped fresh for
+    // `staleTime`, so the queryFn would never run on that first load and
+    // the admin group would stay hidden until some later invalidation.
+    // A placeholder is uncached and does not count as fresh, so the
+    // query still fetches on mount, while first paint stays correct when
+    // identity already resolved during boot (the common case).
+    placeholderData: getCurrentIsAdmin,
   });
-  return data;
+  return data ?? false;
 }
