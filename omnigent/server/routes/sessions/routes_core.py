@@ -4157,10 +4157,13 @@ def register_core_routes(
         against the host exactly like session create), same project, and
         the same run configuration — model / reasoning-effort / harness /
         cost-control / sub-agent-routing overrides, ``terminal_launch_args``
-        (a native session's permission mode lives there), the run-config
-        labels on an allowlist (claude-native permission mode, the
-        agent-template id, the joint-agent member snapshot), and the
-        archived session's inference snapshot when it belongs to the caller.
+        (a native session's permission mode lives there), the presentation
+        labels the bound agent's harness stamps (``omnigent.wrapper`` and
+        ``omnigent.ui``, re-derived like create and fork), the run-config
+        labels on an allowlist (claude-native / claude-sdk permission mode,
+        codex-sdk approval mode, the auto-harness pick, the agent-template
+        id, the joint-agent member snapshot), and the archived session's
+        inference snapshot when it belongs to the caller.
         The archived session's agent carries over either way: a template
         agent is bound by id, while a session-scoped agent is cloned into a
         fresh session-scoped row from the same bundle. The raw
@@ -4255,18 +4258,36 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
 
-        # Only run-config labels carry over: the permission mode, the
-        # template id and the member snapshot. Instance-scoped, archive, pin,
-        # artifact-key, continued_to, codex-bypass, fork-source and side-chat
-        # labels stay behind, so a continuation never re-arms a bypass and
-        # owns none of the archived session's secret or placement state.
+        # Only run-config labels carry over: the permission / approval modes,
+        # the auto-harness pick, the template id and the member snapshot.
+        # Instance-scoped, archive, pin, artifact-key, continued_to,
+        # codex-bypass, fork-source and side-chat labels stay behind, so a
+        # continuation never re-arms a bypass and owns none of the archived
+        # session's secret or placement state.
+        from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
         continued_labels = {
             key: value
             for key, value in source.labels.items()
-            if key == _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
-            or key == "omnigent:agent-template-id"
+            if key
+            in (
+                _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+                CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+                CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+                AUTO_HARNESS_LABEL_KEY,
+                "omnigent:agent-template-id",
+            )
             or key.startswith(MEMBER_LABEL_PREFIX)
         }
+        # The successor binds the source's agent or a clone from the same
+        # bundle, so the source agent's harness decides the Web UI mode. A
+        # missing wrapper/ui pair renders a native continuation as plain chat
+        # (no permission-mode control) and misroutes every server branch
+        # keyed on the wrapper label; updated last so it wins over anything
+        # copied for the same key.
+        continued_labels.update(
+            await asyncio.to_thread(_presentation_labels_for_agent, source_agent)
+        )
 
         # The archived session's working tree wins over its launch
         # directory, so the continuation edits the same checkout. A

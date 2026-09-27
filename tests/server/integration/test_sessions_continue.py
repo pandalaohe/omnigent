@@ -19,9 +19,20 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent._wrapper_labels import (
+    CLAUDE_NATIVE_WRAPPER_VALUE,
+    UI_MODE_LABEL_KEY,
+    UI_MODE_TERMINAL_VALUE,
+    WRAPPER_LABEL_KEY,
+)
 from omnigent.db.utils import generate_agent_id
 from omnigent.member_snapshot import member_label_key
+from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.sdk_permission_modes import (
+    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
+    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+)
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
@@ -325,6 +336,9 @@ async def test_continue_copies_run_configuration_and_allowlisted_labels(
         inference_snapshot=dict(_SNAPSHOT_LOCAL),
         labels={
             _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY: "acceptEdits",
+            CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY: "acceptEdits",
+            CODEX_SDK_APPROVAL_MODE_LABEL_KEY: "never",
+            AUTO_HARNESS_LABEL_KEY: "1",
             "omnigent:agent-template-id": template_id,
             member_label_key("researcher"): '{"lead": false}',
             CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1",
@@ -345,9 +359,45 @@ async def test_continue_copies_run_configuration_and_allowlisted_labels(
     assert continued.inference_snapshot == _SNAPSHOT_LOCAL
     assert continued.labels == {
         _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY: "acceptEdits",
+        CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY: "acceptEdits",
+        CODEX_SDK_APPROVAL_MODE_LABEL_KEY: "never",
+        AUTO_HARNESS_LABEL_KEY: "1",
         "omnigent:agent-template-id": template_id,
         member_label_key("researcher"): '{"lead": false}',
     }, "Only the allowlisted run-config labels may carry over"
+
+
+async def test_continue_derives_presentation_labels_from_native_agent(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A native agent's continuation carries its terminal-first labels.
+
+    Create and fork stamp ``omnigent.wrapper`` / ``omnigent.ui`` from the
+    bound agent's harness; the Web UI gates terminal-first mode (and the
+    permission-mode control) on them, so a continuation that copied only
+    allowlisted labels would come up as plain chat.
+    """
+    agent = await create_test_agent(
+        client,
+        name="continue-native",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    await _archive(client, agent["_session_id"])
+
+    resp = await _continue(client, agent["_session_id"])
+    assert resp.status_code == 201, resp.text
+    continued = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["id"])
+    assert continued is not None
+
+    assert continued.labels.get(WRAPPER_LABEL_KEY) == CLAUDE_NATIVE_WRAPPER_VALUE, (
+        "A native agent's continuation must carry the wrapper label create and "
+        f"fork stamp; got {continued.labels!r}"
+    )
+    assert continued.labels.get(UI_MODE_LABEL_KEY) == UI_MODE_TERMINAL_VALUE, (
+        "Without omnigent.ui == 'terminal' the Web UI treats the continuation "
+        f"as non-native (no permission-mode control); got {continued.labels!r}"
+    )
 
 
 async def test_continue_uses_only_the_callers_inference_snapshot(
