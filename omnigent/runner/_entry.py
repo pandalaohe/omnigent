@@ -1544,6 +1544,7 @@ def create_app(
             run_subagent_launch_reaper(
                 mark_terminal=app.state.mark_subagent_terminal_and_wake,
                 reconcile_pending=app.state.reconcile_pending_subagent_results,
+                check_remote_members=app.state.check_remote_member_liveness,
             ),
             name="runner-subagent-launch-reaper",
         )

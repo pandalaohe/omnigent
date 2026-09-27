@@ -510,6 +510,11 @@ _SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
 _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
 # Interval for the background sweep in the runner entrypoint.
 SUBAGENT_LAUNCH_REAP_INTERVAL_S = 30.0
+# How long a remote member's dispatch may run without a result before its
+# child session is checked for a silent end; see
+# :func:`check_remote_member_liveness`.
+_REMOTE_MEMBER_CHECK_S_ENV = "OMNIGENT_REMOTE_MEMBER_CHECK_S"
+_DEFAULT_REMOTE_MEMBER_CHECK_S = 600.0
 
 
 def resolve_subagent_launch_timeout_s() -> float:
@@ -538,6 +543,33 @@ def resolve_subagent_launch_timeout_s() -> float:
             _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S,
         )
         return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    return value
+
+
+def resolve_remote_member_check_s() -> float:
+    """
+    Resolve the interval between remote-member liveness checks in seconds.
+
+    Values ``<= 0`` disable the check. A non-numeric or non-finite override
+    is rejected with a warning and falls back to the default.
+
+    :returns: The interval in seconds, e.g. ``600.0``.
+    """
+    raw = os.environ.get(_REMOTE_MEMBER_CHECK_S_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_REMOTE_MEMBER_CHECK_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is None or not math.isfinite(value):
+        _logger.warning(
+            "Invalid %s=%r; using default %ss",
+            _REMOTE_MEMBER_CHECK_S_ENV,
+            raw,
+            _DEFAULT_REMOTE_MEMBER_CHECK_S,
+        )
+        return _DEFAULT_REMOTE_MEMBER_CHECK_S
     return value
 
 
@@ -1760,6 +1792,12 @@ class _SubagentWorkEntry:
     :param remote: Whether the child runs on another host (cross-host
         member). Its ``running``/terminal status edges are emitted on the
         child's own runner and never reach this one.
+    :param host_id: Host running the child when ``remote``, e.g.
+        ``"host_a1b2c3"``; ``None`` for a same-host child.
+    :param started_monotonic: Runner-local monotonic instant this dispatch
+        was registered, used by the remote-member liveness interval.
+    :param last_remote_check_monotonic: Runner-local monotonic instant of the
+        last remote-member liveness check, or ``None`` until first checked.
     """
 
     parent_session_id: str
@@ -1775,6 +1813,9 @@ class _SubagentWorkEntry:
     completed_at: float | None = None
     delivered: bool = False
     remote: bool = False
+    host_id: str | None = None
+    started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
+    last_remote_check_monotonic: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2052,6 +2093,7 @@ def register_subagent_work(
     created_by: str | None = None,
     work_id: str | None = None,
     remote: bool = False,
+    host_id: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -2073,6 +2115,8 @@ def register_subagent_work(
         e.g. ``"subagent_a1b2c3d4e5f6"``; ``None`` mints a new one.
     :param remote: Whether the child runs on another host; see
         :attr:`_SubagentWorkEntry.remote`.
+    :param host_id: Host running the child when ``remote``, e.g.
+        ``"host_a1b2c3"``; see :attr:`_SubagentWorkEntry.host_id`.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -2092,6 +2136,7 @@ def register_subagent_work(
         wrapper_label=wrapper_label,
         created_by=created_by,
         remote=remote,
+        host_id=host_id,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
@@ -2619,11 +2664,122 @@ def reap_stalled_subagent_launches(
     return reaped
 
 
+# Child session statuses that still owe this runner a result.
+_REMOTE_MEMBER_LIVE_STATUSES = frozenset({"running", "waiting"})
+
+
+def _remote_member_failure_notice(entry: _SubagentWorkEntry) -> str:
+    """
+    Build the failure notice for a remote member that ended silently.
+
+    :param entry: Remote work entry whose child session ended without a report.
+    :returns: Message naming the member role, host, and child session.
+    """
+    return (
+        f"member {entry.agent} on host {entry.host_id or 'unknown'} ended "
+        f"without reporting a result; its session is {entry.child_session_id}"
+    )
+
+
+async def check_remote_member_liveness(
+    *,
+    server_client: httpx.AsyncClient,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
+    interval_s: float | None = None,
+    now: float | None = None,
+) -> list[_SubagentWorkEntry]:
+    """
+    Fail remote work whose child session ended without reporting a result.
+
+    A remote member's terminal report is posted once by its own host's runner
+    and may be lost; this runner then has no local edge and would await it
+    forever. On a slow interval, each started ``remote`` entry's child session
+    row is read from the server (items and usage excluded). Gone, or no longer
+    running/waiting, means the member ended silently, and its failure is
+    delivered to the lead through the same terminal path the launch reaper
+    uses. The child's transcript and output are never read or delivered here.
+    A failed server read leaves the entry for the next sweep. Same-host
+    entries are never checked.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param mark_terminal: Terminal-delivery callback; defaults to the
+        inbox-only :func:`mark_subagent_work_terminal`.
+    :param interval_s: Interval override for tests; defaults to
+        :func:`resolve_remote_member_check_s`.
+    :param now: Monotonic clock override for tests.
+    :returns: The entries failed by this sweep.
+    """
+    interval = resolve_remote_member_check_s() if interval_s is None else interval_s
+    if interval <= 0:
+        return []
+    deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
+    current = time.monotonic() if now is None else now
+    failed: list[_SubagentWorkEntry] = []
+    for entry in list(_subagent_work_by_child.values()):
+        if not entry.remote or entry.status in _SUBAGENT_TERMINAL_STATUSES:
+            continue
+        if current - entry.started_monotonic < interval:
+            continue
+        last_check = entry.last_remote_check_monotonic
+        if last_check is not None and current - last_check < interval:
+            continue
+        try:
+            resp = await server_client.get(
+                f"/v1/sessions/{entry.child_session_id}",
+                params=_SESSION_METADATA_PARAMS,
+                timeout=10.0,
+            )
+        except (httpx.HTTPError, asyncio.TimeoutError, RuntimeError):
+            _logger.warning(
+                "Remote-member liveness read failed for %s; skipping this sweep",
+                entry.child_session_id,
+                exc_info=True,
+                extra={"session_id": entry.child_session_id},
+            )
+            continue
+        if resp.status_code == 404:
+            live = False
+        elif resp.status_code == 200:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            if not isinstance(body, dict) or not isinstance(body.get("status"), str):
+                continue
+            live = body["status"] in _REMOTE_MEMBER_LIVE_STATUSES
+        else:
+            _logger.warning(
+                "Remote-member liveness read for %s answered %s; skipping this sweep",
+                entry.child_session_id,
+                resp.status_code,
+                extra={"session_id": entry.child_session_id},
+            )
+            continue
+        entry.last_remote_check_monotonic = current
+        if live:
+            continue
+        _logger.warning(
+            "Remote member %s on host %s ended without reporting a result (child=%s)",
+            entry.agent,
+            entry.host_id,
+            entry.child_session_id,
+            extra={"session_id": entry.child_session_id},
+        )
+        deliver(
+            entry.child_session_id,
+            status="failed",
+            output=_remote_member_failure_notice(entry),
+        )
+        failed.append(entry)
+    return failed
+
+
 async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
+    check_remote_members: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Periodically sweep for sub-agent dispatches wedged in ``launching``.
@@ -2636,6 +2792,8 @@ async def run_subagent_launch_reaper(
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
     :param reconcile_pending: Refresh recovered work awaiting remote completion.
+    :param check_remote_members: Slow liveness check for remote members that
+        ended without reporting a result.
     :returns: None.
     """
     while True:
@@ -2644,6 +2802,8 @@ async def run_subagent_launch_reaper(
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
             if reconcile_pending is not None:
                 await reconcile_pending()
+            if check_remote_members is not None:
+                await check_remote_members()
         except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
@@ -9388,6 +9548,15 @@ def create_runner_app(
     # Seam for the entrypoint's launch reaper (and tests): terminal delivery
     # that also schedules the parent wake POST, not just the inbox insert.
     app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
+
+    async def _check_remote_member_liveness() -> None:
+        """Run the slow remote-member liveness sweep for the entrypoint."""
+        await check_remote_member_liveness(
+            server_client=server_client,
+            mark_terminal=_mark_subagent_terminal_and_wake,
+        )
+
+    app.state.check_remote_member_liveness = _check_remote_member_liveness
 
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,

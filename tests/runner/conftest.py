@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +121,47 @@ def _ensure_subprocess_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     existing = os.environ.get("PYTHONPATH", "")
     new_path = f"{_PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(_PROJECT_ROOT)
     monkeypatch.setenv("PYTHONPATH", new_path)
+
+
+@pytest.fixture
+def _clean_subagent_registry() -> Iterator[None]:
+    """Snapshot and restore the process-wide sub-agent / inbox maps.
+
+    The sub-agent work registry and inbox queues live in module-level dicts on
+    ``omnigent.runner.app`` that otherwise leak across tests. Clear them before
+    the test and restore the originals after.
+    """
+    from omnigent.runner import app as runner_app
+
+    saved = (
+        dict(runner_app._subagent_work_by_child),
+        {k: set(v) for k, v in runner_app._subagent_work_by_parent.items()},
+        dict(runner_app._session_inboxes_ref),
+        set(runner_app._drained_delivered_subagent_children),
+        set(runner_app._subagent_recovery_done),
+        dict(runner_app._subagent_recovery_locks),
+    )
+    runner_app._subagent_work_by_child.clear()
+    runner_app._subagent_work_by_parent.clear()
+    runner_app._session_inboxes_ref.clear()
+    runner_app._drained_delivered_subagent_children.clear()
+    runner_app._subagent_recovery_done.clear()
+    runner_app._subagent_recovery_locks.clear()
+    try:
+        yield
+    finally:
+        runner_app._subagent_work_by_child.clear()
+        runner_app._subagent_work_by_child.update(saved[0])
+        runner_app._subagent_work_by_parent.clear()
+        runner_app._subagent_work_by_parent.update(saved[1])
+        runner_app._session_inboxes_ref.clear()
+        runner_app._session_inboxes_ref.update(saved[2])
+        runner_app._drained_delivered_subagent_children.clear()
+        runner_app._drained_delivered_subagent_children.update(saved[3])
+        runner_app._subagent_recovery_done.clear()
+        runner_app._subagent_recovery_done.update(saved[4])
+        runner_app._subagent_recovery_locks.clear()
+        runner_app._subagent_recovery_locks.update(saved[5])
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:

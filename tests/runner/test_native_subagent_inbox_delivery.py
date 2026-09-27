@@ -17,7 +17,6 @@ delivery still can't be confirmed on this runner.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -40,45 +39,6 @@ from tests.runner.helpers import NullServerClient
 
 PARENT_SESSION_ID = "conv_parent_orchestrator"
 CHILD_SESSION_ID = "conv_child_reviewer"
-
-
-@pytest.fixture
-def _clean_subagent_registry() -> Iterator[None]:
-    """Snapshot and restore the process-wide sub-agent / inbox maps.
-
-    The sub-agent work registry and inbox queues live in module-level dicts on
-    ``omnigent.runner.app`` that otherwise leak across tests. Clear them before
-    the test and restore the originals after.
-    """
-    saved = (
-        dict(runner_app._subagent_work_by_child),
-        {k: set(v) for k, v in runner_app._subagent_work_by_parent.items()},
-        dict(runner_app._session_inboxes_ref),
-        set(runner_app._drained_delivered_subagent_children),
-        set(runner_app._subagent_recovery_done),
-        dict(runner_app._subagent_recovery_locks),
-    )
-    runner_app._subagent_work_by_child.clear()
-    runner_app._subagent_work_by_parent.clear()
-    runner_app._session_inboxes_ref.clear()
-    runner_app._drained_delivered_subagent_children.clear()
-    runner_app._subagent_recovery_done.clear()
-    runner_app._subagent_recovery_locks.clear()
-    try:
-        yield
-    finally:
-        runner_app._subagent_work_by_child.clear()
-        runner_app._subagent_work_by_child.update(saved[0])
-        runner_app._subagent_work_by_parent.clear()
-        runner_app._subagent_work_by_parent.update(saved[1])
-        runner_app._session_inboxes_ref.clear()
-        runner_app._session_inboxes_ref.update(saved[2])
-        runner_app._drained_delivered_subagent_children.clear()
-        runner_app._drained_delivered_subagent_children.update(saved[3])
-        runner_app._subagent_recovery_done.clear()
-        runner_app._subagent_recovery_done.update(saved[4])
-        runner_app._subagent_recovery_locks.clear()
-        runner_app._subagent_recovery_locks.update(saved[5])
 
 
 class _SnapshotServerClient(NullServerClient):

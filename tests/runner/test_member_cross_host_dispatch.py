@@ -328,6 +328,7 @@ async def test_continuation_to_an_existing_remote_child_is_marked_started(
         entry = calls["work_entry"]
         assert entry is not None and entry.status == "running"
         assert entry.remote is True
+        assert entry.host_id == _MEMBER_HOST
         assert (
             runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
             == []
@@ -432,6 +433,7 @@ async def test_by_id_continuation_of_a_remote_child_is_marked_started(
         entry = runner_app.get_subagent_work(child_id)
         assert entry is not None and entry.status == "running"
         assert entry.remote is True
+        assert entry.host_id == _MEMBER_HOST
         assert (
             runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
             == []
@@ -439,3 +441,335 @@ async def test_by_id_continuation_of_a_remote_child_is_marked_started(
     finally:
         runner_app.unregister_subagent_work(child_id)
         runner_app._session_inboxes_ref.pop("conv_member_cross_host", None)
+
+
+class _LivenessServerClient:
+    """Child-session reads for the remote-member liveness check."""
+
+    def __init__(
+        self,
+        *,
+        status: str | None = "running",
+        missing: bool = False,
+        fail: bool = False,
+        server_error: bool = False,
+    ) -> None:
+        """
+        Configure the child read's answer.
+
+        :param status: ``status`` on the child session row for a 200.
+        :param missing: Answer 404 (session gone).
+        :param fail: Raise a transport error.
+        :param server_error: Answer 503.
+        """
+        self._status = status
+        self._missing = missing
+        self._fail = fail
+        self._server_error = server_error
+        self.reads: list[tuple[str, dict[str, Any]]] = []
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        """Record the read, then answer from the configured shape."""
+        self.reads.append((url, dict(kwargs.get("params") or {})))
+        if self._fail:
+            raise httpx.ConnectError("server unreachable")
+        if self._missing:
+            return httpx.Response(404, json={"error": "session not found"})
+        if self._server_error:
+            return httpx.Response(503, json={"error": "runner unavailable"})
+        return httpx.Response(200, json={"id": _CHILD_ID, "status": self._status})
+
+
+def _register_remote_work(
+    *,
+    child_id: str = _CHILD_ID,
+    remote: bool = True,
+    host_id: str | None = _MEMBER_HOST,
+) -> Any:
+    """Register one started work entry directly in the runner registry."""
+    from omnigent.runner import app as runner_app
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id="conv_member_cross_host",
+        child_session_id=child_id,
+        agent="worker",
+        title="task",
+        remote=remote,
+        host_id=host_id,
+    )
+    runner_app.mark_subagent_work_started(child_id)
+    return entry
+
+
+_LIVENESS_READ_PARAMS = {
+    "include_items": "false",
+    "include_usage": "false",
+    "include_liveness": "false",
+}
+
+
+@pytest.mark.asyncio
+async def test_remote_member_liveness_fails_a_child_that_ended_silently(
+    _clean_subagent_registry: None,
+) -> None:
+    """An idle remote child past the interval yields one failure notice.
+
+    The notice names the member role, host, and child session, and the sweep
+    reads only the session row — never the child's transcript or output.
+    """
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_member_cross_host"] = inbox
+    server_client = _LivenessServerClient(status="idle")
+
+    failed = await runner_app.check_remote_member_liveness(
+        server_client=server_client,  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 601.0,
+    )
+
+    assert failed == [entry]
+    assert entry.status == "failed"
+    assert server_client.reads == [(f"/v1/sessions/{_CHILD_ID}", _LIVENESS_READ_PARAMS)]
+    payload = inbox.get_nowait()
+    assert payload["status"] == "failed"
+    assert payload["work_id"] == entry.work_id
+    assert payload["output"] == (
+        "member worker on host host_member ended without reporting a result; "
+        "its session is conv_child_remote"
+    )
+
+    # The entry is terminal now: a later sweep neither reads nor delivers again.
+    later = _LivenessServerClient(status="idle")
+    assert (
+        await runner_app.check_remote_member_liveness(
+            server_client=later,  # type: ignore[arg-type]
+            interval_s=600.0,
+            now=entry.started_monotonic + 1202.0,
+        )
+        == []
+    )
+    assert later.reads == []
+    assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_remote_member_liveness_fails_a_gone_child(
+    _clean_subagent_registry: None,
+) -> None:
+    """A child session the server no longer has is a silent end too."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_member_cross_host"] = inbox
+
+    failed = await runner_app.check_remote_member_liveness(
+        server_client=_LivenessServerClient(missing=True),  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 601.0,
+    )
+
+    assert failed == [entry]
+    payload = inbox.get_nowait()
+    assert payload["output"] == (
+        "member worker on host host_member ended without reporting a result; "
+        "its session is conv_child_remote"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_member_liveness_leaves_a_live_child_alone(
+    _clean_subagent_registry: None,
+) -> None:
+    """A child still running or waiting is left for the next interval."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_member_cross_host"] = inbox
+
+    for status in ("running", "waiting"):
+        server_client = _LivenessServerClient(status=status)
+        failed = await runner_app.check_remote_member_liveness(
+            server_client=server_client,  # type: ignore[arg-type]
+            interval_s=600.0,
+            now=entry.started_monotonic + 601.0,
+        )
+        assert failed == []
+        assert entry.status == "running"
+        assert inbox.empty()
+
+    # A check inside the next interval does not read the session again.
+    quiet = _LivenessServerClient(status="waiting")
+    await runner_app.check_remote_member_liveness(
+        server_client=quiet,  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 1200.0,
+    )
+    assert quiet.reads == []
+
+
+@pytest.mark.asyncio
+async def test_remote_member_liveness_waits_for_the_interval(
+    _clean_subagent_registry: None,
+) -> None:
+    """A remote entry younger than the interval is not even read."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    server_client = _LivenessServerClient(status="idle")
+
+    failed = await runner_app.check_remote_member_liveness(
+        server_client=server_client,  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 599.0,
+    )
+
+    assert failed == []
+    assert server_client.reads == []
+
+
+@pytest.mark.asyncio
+async def test_same_host_work_is_never_liveness_checked(
+    _clean_subagent_registry: None,
+) -> None:
+    """Only remote entries are checked; a same-host entry keeps its local edge."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work(remote=False, host_id=None)
+    server_client = _LivenessServerClient(status="idle")
+
+    failed = await runner_app.check_remote_member_liveness(
+        server_client=server_client,  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 10_000.0,
+    )
+
+    assert failed == []
+    assert server_client.reads == []
+    assert entry.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_remote_member_liveness_skips_a_failed_server_read(
+    _clean_subagent_registry: None,
+) -> None:
+    """A failed server read is skipped, and the next sweep retries it."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_member_cross_host"] = inbox
+
+    for failed_client in (
+        _LivenessServerClient(fail=True),
+        _LivenessServerClient(server_error=True),
+    ):
+        failed = await runner_app.check_remote_member_liveness(
+            server_client=failed_client,  # type: ignore[arg-type]
+            interval_s=600.0,
+            now=entry.started_monotonic + 601.0,
+        )
+        assert failed == []
+        assert entry.status == "running"
+        assert inbox.empty()
+        assert len(failed_client.reads) == 1
+
+    # A failed read does not consume the interval: the next sweep reads again
+    # and, this time, reports the silent end.
+    retry = _LivenessServerClient(status="idle")
+    failed = await runner_app.check_remote_member_liveness(
+        server_client=retry,  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 602.0,
+    )
+    assert failed == [entry]
+    assert len(retry.reads) == 1
+    assert inbox.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_late_terminal_report_after_the_notice_is_not_redelivered(
+    _clean_subagent_registry: None,
+) -> None:
+    """A child's late terminal edge cannot deliver a second notice."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_member_cross_host"] = inbox
+    await runner_app.check_remote_member_liveness(
+        server_client=_LivenessServerClient(status="idle"),  # type: ignore[arg-type]
+        interval_s=600.0,
+        now=entry.started_monotonic + 601.0,
+    )
+    inbox.get_nowait()
+
+    ack = runner_app.mark_subagent_work_terminal(
+        _CHILD_ID, status="completed", output="late result"
+    )
+
+    assert ack.delivered and not ack.delivered_now
+    assert inbox.empty()
+
+
+def test_remote_member_check_s_reads_the_env_with_a_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check interval comes from the env, falling back to 600 on bad values."""
+    from omnigent.runner import app as runner_app
+
+    monkeypatch.delenv("OMNIGENT_REMOTE_MEMBER_CHECK_S", raising=False)
+    assert runner_app.resolve_remote_member_check_s() == 600.0
+    monkeypatch.setenv("OMNIGENT_REMOTE_MEMBER_CHECK_S", "45.5")
+    assert runner_app.resolve_remote_member_check_s() == 45.5
+    for bad in ("not-a-number", "nan", "inf", ""):
+        monkeypatch.setenv("OMNIGENT_REMOTE_MEMBER_CHECK_S", bad)
+        assert runner_app.resolve_remote_member_check_s() == 600.0, bad
+
+
+@pytest.mark.asyncio
+async def test_remote_member_check_interval_zero_disables_the_sweep(
+    _clean_subagent_registry: None,
+) -> None:
+    """``0`` disables the slow check, like the launch-timeout budget."""
+    from omnigent.runner import app as runner_app
+
+    entry = _register_remote_work()
+    server_client = _LivenessServerClient(status="idle")
+
+    failed = await runner_app.check_remote_member_liveness(
+        server_client=server_client,  # type: ignore[arg-type]
+        interval_s=0.0,
+        now=entry.started_monotonic + 10_000.0,
+    )
+
+    assert failed == []
+    assert server_client.reads == []
+
+
+@pytest.mark.asyncio
+async def test_launch_reaper_runs_the_remote_member_check() -> None:
+    """The sweep loop invokes the remote-member check each round."""
+    from omnigent.runner import app as runner_app
+
+    checked = asyncio.Event()
+    calls: list[str] = []
+
+    async def _check() -> None:
+        calls.append("check")
+        checked.set()
+
+    sweep = asyncio.create_task(
+        runner_app.run_subagent_launch_reaper(interval_s=0.001, check_remote_members=_check)
+    )
+    try:
+        await asyncio.wait_for(checked.wait(), timeout=5)
+    finally:
+        sweep.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweep
+    assert calls[0] == "check"

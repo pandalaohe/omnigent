@@ -1692,6 +1692,7 @@ async def _send_to_in_flight_child(
     wrapper_label: str | None,
     created_by: str | None = None,
     remote: bool = False,
+    host_id: str | None = None,
 ) -> str:
     """Steer a message into a sub-agent whose turn is already in flight.
 
@@ -1744,6 +1745,8 @@ async def _send_to_in_flight_child(
     :param created_by: Human actor that sent the nudge, if known.
     :param remote: Whether the child runs on another host (its completion
         then reaches this runner only through the server).
+    :param host_id: Host running the child when ``remote``, e.g.
+        ``"host_a1b2c3"``.
     :returns: A JSON handle on success; a descriptive error string otherwise.
     """
     from omnigent.runner import app as _runner_app
@@ -1797,6 +1800,7 @@ async def _send_to_in_flight_child(
                 created_by=created_by,
                 work_id=work_id,
                 remote=remote,
+                host_id=host_id,
             )
             fresh.status = "running"
             # Best-effort dispatch-id stamp for restart recovery only; the
@@ -3239,6 +3243,7 @@ async def _execute_subagent_tool(
                 wrapper_label=child_wrapper_label,
                 created_by=dispatch_created_by,
                 remote=remote_child,
+                host_id=remote_host,
             )
     else:
         _auto_ordinal = False
@@ -3666,6 +3671,7 @@ async def _execute_subagent_tool(
         created_by=dispatch_created_by,
         work_id=work_id,
         remote=remote_child,
+        host_id=remote_host,
     )
     if remote_child_bound:
         # A new remote child's ``running`` edge is emitted on its own host's
@@ -4349,8 +4355,9 @@ async def _send_to_existing_session(
     # A direct child may itself be a cross-host member; its status edges are
     # owned by its own host's runner, so a continuation there needs the same
     # start acknowledgment as a named dispatch.
+    child_host = _optional_string(snap_data.get("host_id"))
     remote_child = await _child_on_another_host(
-        _optional_string(snap_data.get("host_id")),
+        child_host,
         server_client=server_client,
         conversation_id=conversation_id,
     )
@@ -4382,6 +4389,7 @@ async def _send_to_existing_session(
             wrapper_label=_session_wrapper_label(snap_data),
             created_by=created_by,
             remote=remote_child,
+            host_id=child_host if remote_child else None,
         )
     work_id = _runner_app.new_subagent_work_id()
     stamp_error = await _patch_subagent_label(
@@ -4405,6 +4413,7 @@ async def _send_to_existing_session(
         created_by=created_by,
         work_id=work_id,
         remote=remote_child,
+        host_id=child_host if remote_child else None,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
