@@ -131,8 +131,13 @@ export function AgentsSettings() {
   const harnessLabels = useBrainHarnessLabels();
   // Harness-backed built-ins are flat executor specs, not editable member
   // Agents — the same Harnesses/Agents split NewChatDialog draws.
-  const builtinAgents = (available.data ?? []).filter(
-    (agent) => agent.builtin === true && !isNativeCodingAgent(agent) && !isAcpHarnessAgent(agent),
+  const builtinAgents = useMemo(
+    () =>
+      (available.data ?? []).filter(
+        (agent) =>
+          agent.builtin === true && !isNativeCodingAgent(agent) && !isAcpHarnessAgent(agent),
+      ),
+    [available.data],
   );
   // Pins address rows the way the picker does: a built-in by its /v1/agents
   // id, a saved Agent by its `ca_` id via customAgentForPicker. Toggling
@@ -145,7 +150,7 @@ export function AgentsSettings() {
     !available.error &&
     catalog.data !== undefined &&
     !catalog.error;
-  const customAgentRows = catalog.data ?? [];
+  const customAgentRows = useMemo(() => catalog.data ?? [], [catalog.data]);
   const pinCandidates = useMemo(
     () => [...builtinAgents, ...customAgentRows.map(customAgentForPicker)],
     [builtinAgents, customAgentRows],
