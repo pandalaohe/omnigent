@@ -514,6 +514,16 @@ def _upsert_labels(
     )
 
 
+def _reject_artifact_key_collision(requested_key: str, stored_key: str) -> None:
+    # MySQL's utf8mb4_0900_ai_ci collation matches case, accent and U+FEFF
+    # variants as equal, so a variant key can select the canonical row and
+    # overwrite the session's signing secret.
+    if stored_key == requested_key:
+        return
+    if stored_key == ARTIFACT_LINK_KEY_LABEL or requested_key == ARTIFACT_LINK_KEY_LABEL:
+        raise ValueError(f"label key {requested_key!r} collides with stored key {stored_key!r}")
+
+
 def _upsert_prepared_labels(
     session: Session,
     conversation_id: str,
@@ -547,6 +557,7 @@ def _upsert_prepared_labels(
         if existing is None:
             session.add(SqlConversationLabel(**row))
         else:
+            _reject_artifact_key_collision(row["key"], existing.key)
             # mypy sees existing.{value,updated_at} as the
             # Mapped[...] descriptor types; at runtime these
             # are plain attributes that accept the target
@@ -1672,11 +1683,12 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         def write(session: Session) -> str:
             dialect = session.bind.dialect.name if session.bind is not None else ""
-            stored_query = select(SqlConversationLabel.value).where(
+            conditions = (
                 SqlConversationLabel.workspace_id == workspace_id,
                 SqlConversationLabel.conversation_id == conversation_id,
                 SqlConversationLabel.key == key,
             )
+            stored_query = select(SqlConversationLabel.value).where(*conditions)
             if dialect == "sqlite" or is_postgresql_family(dialect):
                 if dialect == "sqlite":
                     from sqlalchemy.dialects.sqlite import insert as guarded_insert
@@ -1690,17 +1702,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                         index_elements=["workspace_id", "conversation_id", "key"]
                     )
                 )
-            else:
-                # Generic dialects (MySQL reachable): the insert is the race
-                # arbiter; its SAVEPOINT isolates the loser's duplicate-key
-                # error, and the locking read sees the winner under any snapshot.
-                try:
-                    with session.begin_nested():
-                        session.add(SqlConversationLabel(**row))
-                except IntegrityError:
-                    pass
-                stored_query = stored_query.with_for_update()
-            return session.execute(stored_query).scalar_one()
+                return session.execute(stored_query).scalar_one()
+            # Generic dialects (MySQL reachable): the insert is the race
+            # arbiter; its SAVEPOINT isolates the loser's duplicate-key
+            # error, and the locking read sees the winner under any snapshot.
+            try:
+                with session.begin_nested():
+                    session.add(SqlConversationLabel(**row))
+            except IntegrityError:
+                pass
+            stored_key, stored_value = session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value)
+                .where(*conditions)
+                .with_for_update()
+            ).one()
+            _reject_artifact_key_collision(key, stored_key)
+            return stored_value
 
         return run_write_transaction(
             self._conv_session_immediate,

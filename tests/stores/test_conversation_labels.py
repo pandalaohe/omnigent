@@ -11,11 +11,18 @@ tests land in Phase 3+.
 
 from __future__ import annotations
 
+import contextlib
+from pathlib import Path
+
 import pytest
 
 from omnigent.entities import (
     MessageData,
     NewConversationItem,
+)
+from omnigent.server.artifact_links import (
+    get_or_create_artifact_key,
+    read_artifact_key,
 )
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
@@ -187,6 +194,99 @@ def test_is_artifact_link_key_matches_collation_variants(key: str, expected: boo
     as the same key, so the reserved-key predicate must match them too; an
     exact string compare would let a variant overwrite the stored secret row."""
     assert is_artifact_link_key(key) is expected
+
+
+# ── Collation-equivalent artifact key rows ─────────────
+
+
+def test_artifact_key_survives_a_collation_variant_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A variant spelling of the reserved key must not replace the secret.
+
+    MySQL's key collation matches case, accents and U+FEFF, so on generic
+    dialects the variant selects the canonical row and the upsert would
+    overwrite the signing key; on deterministic collations it lands as its own
+    row. Either way the canonical value the minted links were signed with
+    must survive.
+    """
+    conv = conversation_store.create_conversation()
+    original = get_or_create_artifact_key(conversation_store, conv.id)
+
+    variant = "\ufeff" + ARTIFACT_LINK_KEY_LABEL
+    with contextlib.suppress(ValueError):
+        conversation_store.set_labels(conv.id, {variant: "attacker"})
+
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert read_artifact_key(got.labels) == original
+
+
+def test_collation_variant_seed_never_becomes_the_signing_key(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A variant row seeded before the first mint must not be adopted.
+
+    Generic dialects collide the canonical insert with the variant row, and
+    the locked read-back would otherwise return the seeded value as the
+    session's signing secret.
+    """
+    conv = conversation_store.create_conversation()
+    seeded = "seeded-variant-value"
+    conversation_store.set_labels(conv.id, {"\ufeff" + ARTIFACT_LINK_KEY_LABEL: seeded})
+
+    key: bytes | None = None
+    with contextlib.suppress(ValueError):
+        key = get_or_create_artifact_key(conversation_store, conv.id)
+
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    if key is None:
+        # Refused: the variant row is all that exists, so nothing can sign.
+        assert read_artifact_key(got.labels) is None
+    else:
+        assert read_artifact_key(got.labels) == key
+        assert got.labels[ARTIFACT_LINK_KEY_LABEL] != seeded
+
+
+def test_generic_branch_refuses_nocase_collision_on_sqlite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local reproduction of the generic-dialect collision on NOCASE SQLite.
+
+    SQLite's default BINARY collation compares deterministically, so the
+    ``conversation_labels`` table is rebuilt with ``COLLATE NOCASE`` and the
+    dialect check is routed past the SQLite branch; the variant write must be
+    refused in both the upsert and the insert-if-absent read-back.
+    """
+    from sqlalchemy import text
+
+    store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'nocase.db'}")
+    with store._session("test_setup") as session:
+        ddl = session.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='table' AND name='conversation_labels'")
+        ).scalar_one()
+        session.execute(text("DROP TABLE conversation_labels"))
+        session.execute(
+            text(ddl.replace('"key" VARCHAR(128)', '"key" VARCHAR(128) COLLATE NOCASE'))
+        )
+    monkeypatch.setattr(store._conv_engine.dialect, "name", "mysql")
+
+    upper = ARTIFACT_LINK_KEY_LABEL.upper()
+
+    conv = store.create_conversation()
+    store.set_labels(conv.id, {ARTIFACT_LINK_KEY_LABEL: "canonical-value"})
+    with pytest.raises(ValueError):
+        store.set_labels(conv.id, {upper: "attacker"})
+    got = store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels[ARTIFACT_LINK_KEY_LABEL] == "canonical-value"
+
+    seeded = store.create_conversation()
+    store.set_labels(seeded.id, {upper: "seeded-value"})
+    with pytest.raises(ValueError):
+        get_or_create_artifact_key(store, seeded.id)
 
 
 # ── Survival across conversation_items churn ───────────
