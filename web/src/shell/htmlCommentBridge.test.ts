@@ -364,9 +364,10 @@ describe("omni-html-bridge.js runtime", () => {
     return win;
   }
 
-  function clickAnchor(win: BridgeWindow, href: string): MouseEvent {
+  function clickAnchor(win: BridgeWindow, href: string, target?: string): MouseEvent {
     const anchor = win.document.createElement("a");
     anchor.href = href;
+    if (target) anchor.setAttribute("target", target);
     win.document.body.appendChild(anchor);
     const ev = new win.MouseEvent("click", { bubbles: true, cancelable: true });
     anchor.dispatchEvent(ev);
@@ -486,5 +487,78 @@ describe("omni-html-bridge.js runtime", () => {
       "noopener,noreferrer",
     );
     expect(insecure.defaultPrevented).toBe(true);
+  });
+
+  /** Adopt a port with an init carrying *visit*, and await the bridge's ready. */
+  async function initBridge(win: BridgeWindow, visit: boolean | undefined) {
+    const channel = new MessageChannel();
+    const ready = new Promise<void>((resolve) => {
+      channel.port2.onmessage = () => resolve();
+    });
+    win.dispatchEvent(
+      new win.MessageEvent("message", {
+        data: {
+          source: BRIDGE_SOURCE,
+          nonce: NONCE,
+          type: BRIDGE_MSG.init,
+          ...(visit === undefined ? {} : { visit }),
+        },
+        ports: [channel.port1],
+      }),
+    );
+    await ready;
+    return channel;
+  }
+
+  it("leaves panel-mode link handling unchanged when the init carries no visit flag", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = await initBridge(win, undefined);
+
+    const open = stubOpen(win);
+    const top = clickAnchor(win, "page2.html", "_top");
+    expect(top.defaultPrevented).toBe(false);
+    expect(open).not.toHaveBeenCalled();
+    // The panel's own preview keeps the native frame navigation.
+    expect(win.location.href).toBe(BUNDLE_URL);
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("visit mode opens cross-origin links in a new tab and keeps _top/_parent same-origin links in the frame", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = await initBridge(win, true);
+
+    const open = stubOpen(win);
+
+    // Visit mode routes cross-origin links out with a plain noopener tab.
+    const external = clickAnchor(win, "https://example.com/x");
+    expect(open).toHaveBeenCalledWith("https://example.com/x", "_blank", "noopener");
+    expect(external.defaultPrevented).toBe(true);
+
+    // Same origin targeting the top window: the frame follows the link itself
+    // so the shell is never navigated away. jsdom runs the same-document
+    // navigation, making the frame's new URL observable.
+    open.mockClear();
+    const top = clickAnchor(win, "#section", "_top");
+    expect(top.defaultPrevented).toBe(true);
+    expect(open).not.toHaveBeenCalled();
+    expect(win.location.href).toBe(`${BUNDLE_URL}#section`);
+
+    const parent = clickAnchor(win, "#other", "_parent");
+    expect(parent.defaultPrevented).toBe(true);
+    expect(win.location.href).toBe(`${BUNDLE_URL}#other`);
+
+    // Same-origin links outside the bundle still leave the sandbox via a tab.
+    const outside = clickAnchor(win, "/omni/elsewhere");
+    expect(open).toHaveBeenCalledWith(`${ORIGIN}/omni/elsewhere`, "_blank", "noopener");
+    expect(outside.defaultPrevented).toBe(true);
+
+    // An in-bundle link without a top target keeps the native frame navigation.
+    const sibling = clickAnchor(win, "page2.html");
+    expect(sibling.defaultPrevented).toBe(false);
+
+    channel.port1.close();
+    channel.port2.close();
   });
 });

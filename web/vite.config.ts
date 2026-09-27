@@ -281,6 +281,14 @@ export default defineConfig(({ command }) => ({
     outDir: path.resolve(__dirname, "../omnigent/server/static/web-ui"),
     emptyOutDir: true,
     rollupOptions: {
+      // Two entries: the SPA (`index.html`) and the visitor shell
+      // (`visit.html`) the server serves for a `g` artifact link. The shell is
+      // a leaf bundle — it must not pull in the app shell (stores, router,
+      // query client); keep its imports to src/visit and src/lib leaves.
+      input: {
+        index: path.resolve(__dirname, "index.html"),
+        visit: path.resolve(__dirname, "visit.html"),
+      },
       output: {
         manualChunks: (id: string) => streamdownManualChunk(id) ?? shikiManualChunk(id),
       },
