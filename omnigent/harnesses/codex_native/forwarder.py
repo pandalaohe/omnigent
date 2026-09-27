@@ -200,6 +200,14 @@ _EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
 _EXTERNAL_GOAL_STATE_TYPE = "external_goal_state"
 _CODEX_GOAL_UPDATED_METHOD = "thread/goal/updated"
 _CODEX_GOAL_CLEARED_METHOD = "thread/goal/cleared"
+# Codex ``hook/completed`` carries one native lifecycle-hook run; its
+# ``run.entries`` can include warning/error diagnostics worth surfacing.
+# Model-directed context/feedback/stop entries are not UI diagnostics.
+_CODEX_HOOK_COMPLETED_METHOD = "hook/completed"
+_CODEX_HOOK_NOTICE_KINDS: dict[str, tuple[str, str]] = {
+    "warning": ("codex_hook_warning", "info"),
+    "error": ("codex_hook_error", "error"),
+}
 # Codex AgentControl child-spawn event fields.
 _CODEX_COLLAB_AGENT_ITEM_TYPE = "collabAgentToolCall"
 _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
@@ -3481,6 +3489,9 @@ async def _handle_event(
     )
     if route_session_id is None:
         return
+    if method == _CODEX_HOOK_COMPLETED_METHOD:
+        await _handle_hook_completed(client, route_session_id, params)
+        return
     if is_child and forwarder_state is not None:
         child_thread = _thread_id_from_params(params)
         observed_status = None
@@ -3630,6 +3641,75 @@ async def _handle_event(
             forwarder_state=forwarder_state,
             bridge_dir=bridge_dir,
             async_questions_live=not is_child and not is_replay,
+        )
+
+
+async def _handle_hook_completed(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+) -> None:
+    """
+    Mirror native Codex hook warnings and errors as harness error items.
+
+    ``hook/completed`` carries one run's entries; only ``warning`` and
+    ``error`` entries with non-blank text carry a user-visible diagnostic,
+    surfaced as ``error`` items (harness metadata, not transcript
+    messages). Model-directed context/feedback/stop entries stay with
+    Codex. An entry's position in ``run.entries``
+    keys its item, so a replayed notification derives the same
+    idempotency keys; the thread id in the key keeps identical run ids on
+    different threads apart.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex ``hook/completed`` params, e.g.
+        ``{"threadId": "thread_abc", "run": {"id": "run_abc",
+        "entries": [{"kind": "warning", "text": "..."}]}}``.
+    :returns: None.
+    """
+    run = params.get("run")
+    if not isinstance(run, dict):
+        return
+    thread_id = _thread_id_from_params(params)
+    run_id = run.get("id")
+    if (
+        not isinstance(thread_id, str)
+        or not thread_id.strip()
+        or not isinstance(run_id, str)
+        or not run_id.strip()
+    ):
+        _logger.info("Codex forwarder ignored hook notification without thread/run id")
+        return
+    entries = run.get("entries")
+    if not isinstance(entries, list):
+        return
+    response_id = _response_id(_params_with_turn_id(params, run_id))
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("kind")
+        if not isinstance(kind, str):
+            continue
+        notice = _CODEX_HOOK_NOTICE_KINDS.get(kind)
+        if notice is None:
+            continue
+        text = entry.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        code, level = notice
+        await _post_external_item(
+            client,
+            session_id,
+            item_type="error",
+            item_data={
+                "source": "harness",
+                "code": code,
+                "level": level,
+                "message": text,
+            },
+            response_id=response_id,
+            source_id=f"codex-hook:{thread_id}:{run_id}:{index}",
         )
 
 
