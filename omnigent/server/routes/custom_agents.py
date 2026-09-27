@@ -222,6 +222,23 @@ def create_custom_agents_router(
             hosts[str(projected_lead["name"])] = stored_lead["host_id"]
         return hosts
 
+    def requested_member_hosts(
+        stored: list[dict[str, Any]] | None, requested: list[dict[str, Any]]
+    ) -> dict[str, str | None]:
+        """Recover ``{role: host_id}`` from a members PATCH roster.
+
+        A member that omits ``host_id`` — a client from before the field
+        existed — keeps the stored host for that role; an explicit ``null``
+        clears it.
+        """
+        hosts: dict[str, str | None] = {}
+        stored_hosts = hosts_by_role(stored)
+        for member in requested:
+            name = member.get("name")
+            if isinstance(name, str):
+                hosts[name] = member["host_id"] if "host_id" in member else stored_hosts.get(name)
+        return hosts
+
     async def validate_member_hosts(user_id: str | None, host_ids: set[str]) -> None:
         """Refuse a host id the owner cannot use; an offline host is accepted."""
         for host_id in sorted(host_ids):
@@ -467,8 +484,10 @@ def create_custom_agents_router(
             projected = project_members(spec)
             if request_members is not None:
                 # A members PATCH is a full roster replacement: each request
-                # member's host (or its absence) is authoritative.
-                member_hosts = hosts_by_role(request_members)
+                # member's host is authoritative, except that an omitted
+                # field falls back to the stored host (an explicit null
+                # clears it).
+                member_hosts = requested_member_hosts(row["members"], request_members)
             else:
                 # A scalar PATCH rebuilds the column from the bundle, which
                 # never carries hosts, so carry the stored ones over by role.

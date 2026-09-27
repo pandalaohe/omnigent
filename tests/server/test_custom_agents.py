@@ -620,6 +620,55 @@ async def test_patch_members_clears_a_host_cleared_to_session_host(
 
 
 @pytest.mark.asyncio
+async def test_patch_members_omitted_host_id_keeps_the_stored_host(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """A roster member without the field (a pre-F2a client) keeps the stored
+    host for that role; an explicit null still clears."""
+    hosts = HostStore(db_uri)
+    _arm_hosts(hosts, _LEAD_HOST, _WORKER_HOST)
+    app, _artifacts, _agents, _conversations, _permissions = make_app(
+        db_uri, tmp_path, host_store=hosts
+    )
+    headers = {"x-test-user": "alice"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        agent_id = await _create_joint(client, headers)
+        hosted = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": _hosted_roster(), "version": 1},
+        )
+        assert hosted.status_code == 200, hosted.text
+        omitted = [
+            {key: value for key, value in member.items() if key != "host_id"}
+            for member in _hosted_roster()
+        ]
+        kept = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={"members": omitted, "version": 2},
+        )
+        assert kept.status_code == 200, kept.text
+        cleared = await client.patch(
+            f"/v1/custom-agents/{agent_id}",
+            headers=headers,
+            json={
+                "members": [{**member, "host_id": None} for member in omitted],
+                "version": 3,
+            },
+        )
+
+    assert [(member["name"], member["host_id"]) for member in kept.json()["members"]] == [
+        ("custom-reviewer", _LEAD_HOST),
+        ("researcher", _WORKER_HOST),
+    ]
+    assert cleared.status_code == 200, cleared.text
+    assert all("host_id" not in member for member in cleared.json()["members"])
+
+
+@pytest.mark.asyncio
 async def test_patch_members_unknown_host_is_a_400(
     db_uri: str, tmp_path: Path, runtime_init: None
 ) -> None:
