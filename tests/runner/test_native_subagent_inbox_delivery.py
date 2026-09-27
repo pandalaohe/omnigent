@@ -139,6 +139,9 @@ def _child_summary(**overrides: Any) -> dict[str, Any]:
     """
     Build a terminal child-session summary as the sessions API returns it.
 
+    The default labels pair the undrained dispatch id with the terminal the
+    server recorded for that same dispatch (its ``terminal_dispatch_id``).
+
     :param overrides: Field overrides, e.g. ``current_task_status="failed"``.
     :returns: Child summary carrying an undrained dispatch id by default.
     """
@@ -147,7 +150,10 @@ def _child_summary(**overrides: Any) -> dict[str, Any]:
         "tool": "reviewer",
         "session_name": "review",
         "current_task_status": "completed",
-        "labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID},
+        "labels": {
+            runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID,
+            runner_app.SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY: DISPATCH_ID,
+        },
     }
     summary.update(overrides)
     return summary
@@ -708,6 +714,7 @@ async def test_runner_restart_replays_continued_turn_with_stale_receipt(
     labels = {
         runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_turn2",
         runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_turn1",
+        runner_app.SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY: "subagent_turn2",
     }
     app = create_runner_app(
         server_client=_RecoveryServerClient([_child_summary(labels=labels)]),  # type: ignore[arg-type]
@@ -1426,6 +1433,168 @@ async def test_started_remote_work_is_reconciled_once_from_the_server_row(
     )
     assert late.delivered and not late.delivered_now
     assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_ignores_a_previous_turns_terminal_as_the_new_dispatch(
+    _clean_subagent_registry: None,
+) -> None:
+    """A continued dispatch must not be completed from the previous turn's row.
+
+    While dispatch B's message is being sent, the server row still carries turn
+    A's terminal. Reconciliation may rebuild only terminal evidence the server
+    paired with B — a started entry plus the stale row must deliver nothing,
+    and B's own terminal must deliver exactly once with B's output.
+    """
+    child = _child_summary(
+        labels={
+            runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_turn2",
+            runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_turn1",
+            runner_app.SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY: "subagent_turn1",
+        }
+    )
+    server_client = _RecoveryServerClient([child])
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        work_id="subagent_turn2",
+        remote=True,
+    )
+    # B registered but its message POST has not been accepted yet: the launch
+    # entry is not eligible for server-row reconciliation at all.
+    await app.state.reconcile_pending_subagent_results()
+    assert inbox.empty()
+    assert entry.status == "launching"
+
+    # B's message POST succeeded, and the server row still shows turn 1's
+    # terminal attributed to turn 1's dispatch.
+    runner_app.mark_subagent_work_started(CHILD_SESSION_ID)
+    await app.state.reconcile_pending_subagent_results()
+    assert inbox.empty(), "turn 1's terminal must not complete dispatch 2"
+    assert entry.status == "running"
+
+    # Turn 2's terminal: the server pairs the row with dispatch 2.
+    child["labels"] = {
+        runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_turn2",
+        runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_turn1",
+        runner_app.SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY: "subagent_turn2",
+    }
+    await app.state.reconcile_pending_subagent_results()
+    assert inbox.qsize() == 1
+    payload = inbox.get_nowait()
+    assert payload["work_id"] == "subagent_turn2"
+    assert payload["status"] == "completed"
+    assert payload["output"] == "review complete: LGTM"
+
+    await app.state.reconcile_pending_subagent_results()
+    assert inbox.empty(), "a reconciled dispatch delivers exactly once"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_rebuilds_a_current_turn_answer_when_the_report_was_lost(
+    _clean_subagent_registry: None,
+) -> None:
+    """A lost report is recovered when the transcript proves the current turn.
+
+    The durable terminal still names the previous dispatch, but the child's own
+    turn ran and its assistant answer sits above the user message that started
+    it, so the lead must not wait forever on the missing report.
+    """
+    child = _child_summary(
+        labels={
+            runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID,
+            runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_turn0",
+            runner_app.SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY: "subagent_turn0",
+        }
+    )
+    server_client = _RecoveryServerClient(
+        [child],
+        child_items=[
+            _CHILD_RESULT_ITEM,
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "review"}],
+            },
+        ],
+    )
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+
+    runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        work_id=DISPATCH_ID,
+        remote=True,
+    )
+    runner_app.mark_subagent_work_started(CHILD_SESSION_ID)
+
+    await app.state.reconcile_pending_subagent_results()
+
+    payload = inbox.get_nowait()
+    assert payload["work_id"] == DISPATCH_ID
+    assert payload["status"] == "completed"
+    assert payload["output"] == "review complete: LGTM"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_skips_an_unattributed_terminal_and_failure(
+    _clean_subagent_registry: None,
+) -> None:
+    """A stale terminal with no dispatch pairing is not rebuilt.
+
+    Turn A's answer has no user turn below it in the transcript (the shape a
+    previous turn's row has before dispatch B's message lands), and a stored
+    failure carries no transcript proof at all, so neither may complete B.
+    """
+    completed = _child_summary(
+        labels={
+            runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID,
+            runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_turn0",
+            runner_app.SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY: "subagent_turn0",
+        }
+    )
+    server_client = _RecoveryServerClient(
+        [completed],
+        child_items=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "turn 0 answer"}],
+            }
+        ],
+    )
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        work_id=DISPATCH_ID,
+        remote=True,
+    )
+    runner_app.mark_subagent_work_started(CHILD_SESSION_ID)
+
+    await app.state.reconcile_pending_subagent_results()
+    assert inbox.empty(), "an orphan assistant answer must not complete the dispatch"
+
+    completed.update(
+        current_task_status="failed",
+        last_task_error={"code": "required_terminal_exited", "message": "pane died"},
+    )
+    await app.state.reconcile_pending_subagent_results()
+    assert inbox.empty(), "a failure from an earlier dispatch must not complete the dispatch"
 
 
 @pytest.mark.asyncio

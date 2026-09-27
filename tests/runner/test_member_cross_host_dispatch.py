@@ -59,6 +59,7 @@ async def _dispatch(
     child_runner_id: str | None = "runner_member",
     existing_child: dict[str, Any] | None = None,
     keep_work: bool = False,
+    events_status: int = 202,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     """
     Drive one named ``sys_session_send`` against a remote-member mock server.
@@ -67,6 +68,7 @@ async def _dispatch(
         the send continues that child instead of creating one.
     :param keep_work: Leave the registered work entry in the registry (the
         caller cleans up) so it can be handed to the launch reaper.
+    :param events_status: Status the child message POST answers with.
     :returns: ``(tool_output, create_bodies, calls)`` where *calls* counts the
         host / worktree lookups and captures the final work entry.
     """
@@ -136,7 +138,7 @@ async def _dispatch(
                 payload["runner_id"] = child_runner_id
             return httpx.Response(201, json=payload)
         if request.method == "POST" and path == f"/v1/sessions/{_CHILD_ID}/events":
-            return httpx.Response(202, json={"queued": True})
+            return httpx.Response(events_status, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -334,6 +336,36 @@ async def test_continuation_to_an_existing_remote_child_is_marked_started(
     finally:
         runner_app.unregister_subagent_work(_CHILD_ID)
         runner_app._session_inboxes_ref.pop("conv_member_cross_host", None)
+
+
+@pytest.mark.asyncio
+async def test_continuation_is_marked_started_only_after_its_message_lands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continuation whose message POST fails never becomes started work.
+
+    Before the POST the server row still carries the previous turn's terminal,
+    so marking the dispatch started early would let the reconciliation backstop
+    read that terminal as this dispatch's result.
+    """
+    from omnigent.runner import app as runner_app
+
+    started: list[str] = []
+    monkeypatch.setattr(
+        runner_app, "mark_subagent_work_started", lambda cid: started.append(cid) or None
+    )
+
+    output, bodies, calls = await _dispatch(
+        monkeypatch,
+        labels=_member_labels(),
+        existing_child=_existing_child(),
+        events_status=500,
+    )
+
+    assert output.startswith("Error:")
+    assert bodies == [], "a continuation must not create a child"
+    assert started == [], "a failed POST must not mark the remote work started"
+    assert calls["work_status"] is None, "the failed dispatch leaves no work entry"
 
 
 @pytest.mark.asyncio

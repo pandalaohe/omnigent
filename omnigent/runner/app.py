@@ -553,6 +553,10 @@ _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
 SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
+# The dispatch id the server paired with the child row's durable terminal
+# status, so reconciliation can tell the current dispatch's terminal from a
+# previous turn's session-level terminal.
+SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.terminal_dispatch_id"
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
 # wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
@@ -2310,24 +2314,31 @@ async def _list_child_sessions(
         params["after"] = page["last_id"]
 
 
-async def _fetch_latest_assistant_text(
+async def _fetch_latest_assistant_turn(
     server_client: httpx.AsyncClient, session_id: str
-) -> str | None:
+) -> tuple[str | None, bool]:
     """
-    Return the newest assistant message text from the latest turn.
+    Return the newest assistant message text and whether it answers a turn.
+
+    Reading newest first stops at the first non-meta user message or tool item:
+    crossing that boundary would reuse an assistant answer from an older turn.
+    Meta messages do not start a turn and are skipped. The scan continues past
+    the newest assistant message to find the user message that started its
+    turn; a transcript that ends first (or whose newest turn is a bare user /
+    tool item) proves no turn produced the answer, so it cannot be delivered
+    as the current dispatch's result.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param session_id: Session to read, e.g. ``"conv_child456"``.
-    Reading newest first stops at the first non-meta user message or tool item:
-    crossing that boundary would reuse an assistant answer from an older turn.
-    Meta messages do not start a turn and are skipped.
-
-    :returns: Joined text blocks of the latest turn's newest assistant message
-        (empty when that message carries no text, matching live delivery), or
-        ``None`` when the latest turn has no assistant message.
+    :returns: ``(output, answers_a_turn)`` where *output* is the joined text
+        blocks of the newest assistant message (empty when it carries no text,
+        matching live delivery; ``None`` when the latest turn has no assistant
+        message) and *answers_a_turn* is ``True`` only when the user message
+        that started the assistant message's turn is present in the transcript.
     :raises _SubagentRecoveryReadError: When a page read fails.
     """
     params: dict[str, str] = {"limit": "100", "order": "desc"}
+    output: str | None = None
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
@@ -2336,18 +2347,20 @@ async def _fetch_latest_assistant_text(
                 continue
             if item_type == "message":
                 if item.get("role") == "assistant":
-                    return "\n".join(
-                        block["text"]
-                        for block in item.get("content", [])
-                        if block.get("type") in {"output_text", "text"} and block.get("text")
-                    )
+                    if output is None:
+                        output = "\n".join(
+                            block["text"]
+                            for block in item.get("content", [])
+                            if block.get("type") in {"output_text", "text"} and block.get("text")
+                        )
+                    continue
                 if item.get("role") == "user":
-                    return None
+                    return (output, output is not None)
                 continue
-            if item_type in {"function_call", "function_call_output"}:
-                return None
+            if item_type in {"function_call", "function_call_output"} and output is None:
+                return (None, False)
         if not page.get("has_more") or not page.get("last_id"):
-            return None
+            return (output, False)
         params["after"] = page["last_id"]
 
 
@@ -2381,7 +2394,13 @@ async def _recover_subagent_results_from_server(
     result is rebuilt from the child transcript and queued again under the
     same dispatch id, letting the eventual drain close the loop. This scan
     also reconstructs a started cross-host child's result, whose terminal
-    edge its own runner owns and may have failed to report.
+    edge its own runner owns and may have failed to report. Only terminal
+    evidence that belongs to the current dispatch is rebuilt: either the
+    server paired the durable terminal with that dispatch id, or the
+    transcript shows the dispatch's own turn produced an assistant answer.
+    The child row's session-level terminal alone is not enough — while a
+    continuation's message is being dispatched it still carries the previous
+    turn's terminal.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param parent_id: Parent session whose inbox was recreated, e.g.
@@ -2409,16 +2428,28 @@ async def _recover_subagent_results_from_server(
         ) or child_id in _drained_delivered_subagent_children:
             continue
         labels = child.get("labels")
-        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+        labels_map = labels if isinstance(labels, dict) else {}
+        dispatch_id = undelivered_subagent_dispatch_id(labels_map)
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
+        # The durable terminal must belong to this dispatch: the server pairs
+        # it with the dispatch id stamped when the turn was sent. A terminal
+        # stamped for an earlier dispatch is not this dispatch's result — for a
+        # success-shaped status the transcript can still prove the current turn
+        # produced its answer (a lost remote report leaves the previous
+        # terminal in place), while a stored failure carries no such proof.
+        attributed = labels_map.get(SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY) == dispatch_id
         output: str | None = None
         if status == "failed":
-            error = child.get("last_task_error")
-            message = error.get("message") if isinstance(error, dict) else None
-            output = message if isinstance(message, str) else None
+            if not interrupted:
+                if not attributed:
+                    continue
+                message = error.get("message") if isinstance(error, dict) else None
+                output = message if isinstance(message, str) else None
         elif not interrupted:
-            output = await _fetch_latest_assistant_text(server_client, child_id)
+            output, answers_a_turn = await _fetch_latest_assistant_turn(server_client, child_id)
+            if not attributed and not answers_a_turn:
+                continue
             if output is None and status == "stopped":
                 output = "Sub-agent stopped before producing a reliable final result."
             elif output is None and status == "killed":

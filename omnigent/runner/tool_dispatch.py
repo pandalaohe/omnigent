@@ -3667,12 +3667,11 @@ async def _execute_subagent_tool(
         work_id=work_id,
         remote=remote_child,
     )
-    if remote_child_bound or (existing is not None and remote_child):
-        # A remote child's ``running`` edge is emitted on its own host's runner
-        # and never reaches this launch entry: a new child's create host
-        # binding is the start proof this runner has, and a continued child
-        # already has a live runner there. Either way the 180 s launch reaper
-        # must not fail a child that is already working.
+    if remote_child_bound:
+        # A new remote child's ``running`` edge is emitted on its own host's
+        # runner and never reaches this launch entry: the create host binding
+        # is the start proof this runner has, so the 180 s launch reaper must
+        # not fail a child that is already working.
         _runner_app.mark_subagent_work_started(child_session_id)
     # Meet the member obligation here, at registration — before the awaited
     # file copy / first-message POST — so a child whose terminal status lands
@@ -3760,6 +3759,14 @@ async def _execute_subagent_tool(
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error
+
+    if existing is not None and remote_child:
+        # A continued remote child's next turn runs on its own host; this
+        # runner only has the start proof once the message that starts it was
+        # accepted. Before the POST the server row still carries the previous
+        # turn's terminal, which the backstop must never read as this
+        # dispatch's result.
+        _runner_app.mark_subagent_work_started(child_session_id)
 
     # Return the structured handle mirrored from ``spawn.py``. The debug panel
     # parses this to discover child sessions in the sidebar.
@@ -4401,11 +4408,6 @@ async def _send_to_existing_session(
         work_id=work_id,
         remote=remote_child,
     )
-    if remote_child:
-        # The continued turn's running edge stays on the child's host; the
-        # child's existing runtime there is the start proof this runner has, so
-        # the launch reaper must not fail it.
-        _runner_app.mark_subagent_work_started(target_session_id)
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
@@ -4430,6 +4432,14 @@ async def _send_to_existing_session(
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
+
+    if remote_child:
+        # The continued turn's running edge stays on the child's host; this
+        # runner only has the start proof once the message that starts it was
+        # accepted. Before the POST the server row still carries the previous
+        # turn's terminal, which the backstop must never read as this
+        # dispatch's result.
+        _runner_app.mark_subagent_work_started(target_session_id)
 
     return json.dumps(
         {
