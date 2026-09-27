@@ -8326,7 +8326,9 @@ def create_runner_app(
                 resp.raise_for_status()
                 return True
             except (httpx.HTTPError, RuntimeError, asyncio.TimeoutError) as exc:
-                retryable = isinstance(exc, asyncio.TimeoutError) or _wake_post_is_retryable(exc)
+                retryable = isinstance(exc, asyncio.TimeoutError) or (
+                    isinstance(exc, httpx.HTTPError) and _wake_post_is_retryable(exc)
+                )
                 if attempt >= _WAKE_POST_MAX_ATTEMPTS or not retryable:
                     _logger.error(
                         "Member notice undelivered after %d attempt(s): "
