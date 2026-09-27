@@ -814,7 +814,6 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "bridge_dir": bridge_dir,
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
-            "owned_app_server": app_server,
             "client": retained_client if retain_subscription else None,
             "owned_app_server": app_server,
         }
