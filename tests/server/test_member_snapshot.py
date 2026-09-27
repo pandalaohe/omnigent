@@ -682,6 +682,71 @@ async def test_offline_member_host_marks_only_its_member(
 
 
 @pytest.mark.asyncio
+async def test_failed_member_host_lookup_contributes_no_catalog_facts(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising ``get_host`` for the member host skips it entirely: no catalog
+    call, no availability, no catalog default — and its host id still freezes."""
+    from omnigent.server.routes._sessions import helpers
+
+    _arm_host(member_server.hosts)
+    _arm_member_host(member_server.hosts)
+    _create_template(member_server.custom, "ca_joint", worker_host=_MEMBER_HOST)
+
+    calls: list[tuple[str, str]] = []
+
+    async def _spy_options(host_id: str, harness: str) -> list[dict[str, object]] | None:
+        calls.append((host_id, harness))
+        return {
+            (_HOST_ID, "codex"): [{"id": "lead-model", "model": "lead-model"}],
+            (_MEMBER_HOST, "claude-sdk"): [
+                {"id": "member-host-model", "model": "member-host-model", "isDefault": True}
+            ],
+        }.get((host_id, harness))
+
+    monkeypatch.setattr(helpers, "_host_model_options_via_registry", _spy_options)
+
+    original_get_host = member_server.hosts.get_host
+
+    def _broken_member_lookup(host_id: str):
+        if host_id == _MEMBER_HOST:
+            raise RuntimeError("member host lookup down")
+        return original_get_host(host_id)
+
+    monkeypatch.setattr(member_server.hosts, "get_host", _broken_member_lookup)
+
+    # A "default" model stays null: the failed host's catalog default must not
+    # leak into the snapshot.
+    default_entries = await _member_labels_after_create(
+        member_server,
+        joint_bundle(worker_model="default"),
+        metadata=_template_metadata("ca_joint"),
+    )
+    assert calls == [(_HOST_ID, "codex")]
+    assert default_entries["researcher"] == {
+        "host": _MEMBER_HOST,
+        "harness": "claude-sdk",
+        "model": None,
+        "effort": "medium",
+        "lead": False,
+    }
+
+    # An explicit model is kept as saved — never model_missing.
+    calls.clear()
+    entries = await _member_labels_after_create(
+        member_server, joint_bundle(), metadata=_template_metadata("ca_joint")
+    )
+    assert calls == [(_HOST_ID, "codex")]
+    assert entries["researcher"] == {
+        "host": _MEMBER_HOST,
+        "harness": "claude-sdk",
+        "model": "worker-model",
+        "effort": "medium",
+        "lead": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_unknown_foreign_and_non_library_template_ids_keep_the_session_host(
     member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

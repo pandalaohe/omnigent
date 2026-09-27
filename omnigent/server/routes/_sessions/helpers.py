@@ -10514,7 +10514,8 @@ async def _member_snapshot_labels(
 
     # One catalog lookup per needed (host, harness) pair, all in flight
     # together: a create waits at most one lookup timeout instead of one per
-    # member.
+    # member. A host whose lookup failed is never consulted: a transient
+    # failure must not turn into a frozen catalog default or model_missing.
     catalogs: dict[tuple[str, str], list[dict[str, Any]] | None] = {}
     needed = sorted(
         {
@@ -10522,6 +10523,7 @@ async def _member_snapshot_labels(
             for _, entry, reason in prepared
             if reason is None
             and entry["host"] is not None
+            and entry["host"] not in lookup_failed
             and isinstance(entry["harness"], str)
             and entry["harness"]
         }
