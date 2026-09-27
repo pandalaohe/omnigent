@@ -54,6 +54,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.member_snapshot import member_entries_from_labels
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -2656,6 +2657,66 @@ def _subagent_launching_message(agent: str, title: object, task_id: str) -> str:
     )
 
 
+def _member_harness_name(harness: object) -> str | None:
+    """Canonicalize a member snapshot / override harness spelling for comparison."""
+    if not isinstance(harness, str) or not harness:
+        return None
+    return canonicalize_harness(harness) or harness
+
+
+def _member_dispatch_lock_error(
+    role: str,
+    member: _JsonObject,
+    *,
+    model: str | None,
+    reasoning_effort: str | None,
+    harness_override: str | None,
+) -> str | None:
+    """
+    Return the tool error locking *role* to its session member snapshot.
+
+    The session froze the member's harness / model / effort at create, so an
+    explicit per-dispatch value that differs is rejected instead of silently
+    changing the member, and a member the server marked unavailable refuses
+    the dispatch outright. Explicit values equal to the snapshot pass through
+    to the normal creation path.
+
+    :param role: The named sub-agent role, e.g. ``"researcher"``.
+    :param member: The role's parsed snapshot entry.
+    :param model: Explicit ``args.model`` from the dispatch, or ``None``.
+    :param reasoning_effort: Explicit ``args.reasoning_effort``, or ``None``.
+    :param harness_override: Explicit ``args.harness`` (raw), or ``None``.
+    :returns: An error string when the member is unavailable or an explicit
+        argument differs; ``None`` when the dispatch may proceed.
+    """
+    unavailable = member.get("unavailable")
+    if isinstance(unavailable, str) and unavailable:
+        return (
+            f"Error: member {role!r} is unavailable for this session "
+            f"({unavailable}); work cannot be routed to it"
+        )
+    checks: tuple[tuple[str, str | None, object], ...] = (
+        ("harness", harness_override, member.get("harness")),
+        ("model", model, member.get("model")),
+        ("reasoning_effort", reasoning_effort, member.get("effort")),
+    )
+    for field, requested, locked in checks:
+        if requested is None:
+            continue
+        if field == "harness":
+            matches = _member_harness_name(requested) == _member_harness_name(locked)
+        else:
+            matches = requested == locked
+        if matches:
+            continue
+        display = locked if isinstance(locked, str) and locked else "default"
+        return (
+            f"Error: member {role!r} is locked to {display!r} for this session; "
+            f"sys_session_send '{field}' cannot change it"
+        )
+    return None
+
+
 async def _execute_subagent_tool(
     args: _JsonObject,
     *,
@@ -2821,6 +2882,28 @@ async def _execute_subagent_tool(
     # Verify the sub-agent exists in the parent spec.
     if not _has_subagent(sub_agent_name, agent_spec):
         return f"Error: sub-agent {sub_agent_name!r} not found in agent spec"
+
+    # Joint-agent session member snapshot: the session froze each member's
+    # harness / model / effort at create and may have marked a member
+    # unavailable. Enforce it before any harness / readiness / model handling;
+    # a session without member labels, or a role with no snapshot entry,
+    # behaves exactly as before.
+    member_entry: _JsonObject | None = None
+    session_labels = await _runner_app._fetch_current_session_labels(
+        server_client, conversation_id
+    )
+    if session_labels:
+        member_entry = member_entries_from_labels(session_labels).get(str(sub_agent_name))
+    if member_entry is not None:
+        lock_error = _member_dispatch_lock_error(
+            str(sub_agent_name),
+            member_entry,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            harness_override=harness_override,
+        )
+        if lock_error is not None:
+            return lock_error
 
     dispatch_created_by = await _session_turn_actor(
         server_client=server_client,
@@ -3071,31 +3154,55 @@ async def _execute_subagent_tool(
                 harness=child_harness,
             )
         else:
-            # No explicit per-dispatch model: inherit the parent session's
-            # selection so the user's chosen model governs the whole session
-            # tree. Best-effort — skipped when the sub-agent spec pins its
-            # own model, the harness has no override plumbing, or the parent
-            # model's family cannot run on the child harness.
-            inherited = await _inherited_parent_model(
-                server_client=server_client,
-                conversation_id=conversation_id,
-                sub_agent_name=str(sub_agent_name),
-                agent_spec=agent_spec,
-                child_harness=child_harness,
+            # No explicit per-dispatch model. A snapshot member runs the
+            # session's frozen model — parent inheritance never applies to it;
+            # otherwise inherit the parent session's selection so the user's
+            # chosen model governs the whole session tree. Best-effort — skipped
+            # when the sub-agent spec pins its own model, the harness has no
+            # override plumbing, or the parent model's family cannot run on the
+            # child harness.
+            snapshot_model = (
+                member_entry.get("model")
+                if member_entry is not None
+                and isinstance(member_entry.get("model"), str)
+                and member_entry.get("model")
+                else None
             )
-            if inherited is not None:
-                create_body["model_override"] = _normalize_subagent_model(
-                    inherited,
+            if snapshot_model is not None:
+                if harness_supports_model_override(child_harness):
+                    create_body["model_override"] = _normalize_subagent_model(
+                        snapshot_model,
+                        sub_agent_name=str(sub_agent_name),
+                        agent_spec=agent_spec,
+                        harness=child_harness,
+                    )
+            elif member_entry is None:
+                inherited = await _inherited_parent_model(
+                    server_client=server_client,
+                    conversation_id=conversation_id,
                     sub_agent_name=str(sub_agent_name),
                     agent_spec=agent_spec,
-                    harness=child_harness,
+                    child_harness=child_harness,
                 )
+                if inherited is not None:
+                    create_body["model_override"] = _normalize_subagent_model(
+                        inherited,
+                        sub_agent_name=str(sub_agent_name),
+                        agent_spec=agent_spec,
+                        harness=child_harness,
+                    )
         # A dispatch that names no effort inherits the sub-agent spec's
         # ``executor.reasoning_effort``, so a worker's default is declared
         # once in its config instead of depending on the orchestrator
-        # remembering to pass it on every dispatch.
+        # remembering to pass it on every dispatch. A snapshot member's
+        # effort is the session's frozen value instead.
         effective_effort = reasoning_effort
         effort_source = "sys_session_send"
+        if effective_effort is None and member_entry is not None:
+            snapshot_effort = member_entry.get("effort")
+            if isinstance(snapshot_effort, str) and snapshot_effort:
+                effective_effort = snapshot_effort
+                effort_source = f"member {sub_agent_name!r} snapshot"
         if effective_effort is None:
             sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
             # ``getattr``: sub-specs also arrive as structural stubs that

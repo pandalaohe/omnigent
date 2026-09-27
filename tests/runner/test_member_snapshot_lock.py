@@ -1,0 +1,377 @@
+"""Runner-side member snapshot lock for joint-agent dispatches (SCC06 F1a).
+
+A session that froze a member snapshot (``omnigent.member.<role>`` labels)
+locks the member's harness / model / effort: an explicit ``sys_session_send``
+value that differs is rejected, a member the server marked unavailable
+refuses the dispatch, and a dispatch naming none of them runs the snapshot's
+model / effort instead of parent inheritance. Sessions without member labels
+behave exactly as before.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+import pytest
+
+from omnigent.member_snapshot import encode_member_entry, member_label_key
+
+_MEMBER_MODEL = "databricks-claude-haiku-4-5"
+_PARENT_MODEL = "databricks-claude-sonnet-4-6"
+
+
+def _spec_with_worker(
+    harness: str,
+    *,
+    worker_model: str | None = None,
+    worker_effort: str | None = None,
+    allowed_harnesses: list[str] | None = None,
+) -> SimpleNamespace:
+    """
+    Build a parent-spec stub declaring one ``worker`` sub-agent.
+
+    :param harness: The sub-agent's declared harness, e.g. ``"claude-sdk"``.
+    :param worker_model: Optional ``executor.model`` pin on the worker spec.
+    :param worker_effort: Optional ``executor.reasoning_effort`` pin.
+    :param allowed_harnesses: Optional ``executor.config.allowed_harnesses``
+        allowlist for a per-dispatch harness override.
+    :returns: A structural parent-spec stub for ``execute_tool``.
+    """
+    config: dict[str, object] = {"harness": harness}
+    if allowed_harnesses is not None:
+        config["allowed_harnesses"] = allowed_harnesses
+    executor = SimpleNamespace(type="omnigent", config=config)
+    if worker_model is not None:
+        executor.model = worker_model
+    if worker_effort is not None:
+        executor.reasoning_effort = worker_effort
+    return SimpleNamespace(sub_agents=[SimpleNamespace(name="worker", executor=executor)])
+
+
+def _stub_worker_launchable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a native-harness dispatch pass preflight in a CLI-less test env."""
+    from omnigent.onboarding import harness_install
+
+    monkeypatch.setattr(harness_install, "missing_harness_cli", lambda _harness: None)
+
+
+def _member_labels(role: str = "worker", **entry: object) -> dict[str, str]:
+    """One member snapshot label for *role* with sensible overrides."""
+    payload: dict[str, object] = {
+        "host": None,
+        "harness": "claude-sdk",
+        "model": _MEMBER_MODEL,
+        "effort": "high",
+        "lead": False,
+    }
+    payload.update(entry)
+    return {member_label_key(role): encode_member_entry(payload)}
+
+
+async def _dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agent_spec: Any,
+    conv_id: str,
+    labels: dict[str, str] | None = None,
+    parent_snapshot: dict[str, Any] | None = None,
+    dispatch_args: dict[str, Any] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Drive one named ``sys_session_send`` and capture the child create bodies.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param agent_spec: The parent spec under test.
+    :param conv_id: Unique parent conversation id per test.
+    :param labels: Session labels the server reports, or ``None`` for a 404
+        (a session with no snapshot at all).
+    :param parent_snapshot: JSON the mock server returns for
+        ``GET /v1/sessions/{conv_id}``; ``None`` serves a 404.
+    :param dispatch_args: Extra ``args``-object fields (model / effort /
+        harness) for the dispatch.
+    :returns: ``(tool_output, create_bodies)``.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve labels, the parent snapshot, child lookup, create, and events."""
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv_id}/labels":
+            if labels is None:
+                return httpx.Response(404, json={"error": "not found"})
+            return httpx.Response(200, json={"labels": labels})
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv_id}":
+            if parent_snapshot is None:
+                return httpx.Response(404, json={"error": "not found"})
+            return httpx.Response(200, json=parent_snapshot)
+        if (
+            request.method == "GET"
+            and request.url.path == f"/v1/sessions/{conv_id}/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_member"})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_child_member/events"
+        ):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    args: dict[str, Any] = {"input": "do the task"}
+    args.update(dispatch_args or {})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"agent": "worker", "title": "task", "args": args}),
+                server_client=server_client,
+                conversation_id=conv_id,
+                agent_spec=agent_spec,
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_member")
+            runner_app._session_inboxes_ref.pop(conv_id, None)
+    return output, create_bodies
+
+
+@pytest.mark.asyncio
+async def test_explicit_model_mismatch_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dispatch model differing from the snapshot is rejected, nothing created."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_model_lock",
+        labels=_member_labels(),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+
+    assert output.startswith("Error:")
+    assert "'worker' is locked to" in output
+    assert _MEMBER_MODEL in output
+    assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_effort_mismatch_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dispatch effort differing from the snapshot is rejected."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_effort_lock",
+        labels=_member_labels(),
+        dispatch_args={"reasoning_effort": "low"},
+    )
+
+    assert output.startswith("Error:")
+    assert "'worker' is locked to 'high'" in output
+    assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_harness_mismatch_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dispatch harness differing from the snapshot is rejected."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("codex-native"),
+        conv_id="conv_member_harness_lock",
+        labels=_member_labels(),
+        dispatch_args={"harness": "codex-native"},
+    )
+
+    assert output.startswith("Error:")
+    assert "'worker' is locked to 'claude-sdk'" in output
+    assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_matching_explicit_values_are_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit values equal to the snapshot pass through to creation."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk", allowed_harnesses=["claude-sdk"]),
+        conv_id="conv_member_matching",
+        labels=_member_labels(),
+        parent_snapshot={
+            "id": "conv_member_matching",
+            "agent_id": "ag_parent",
+            "harness": "claude-sdk",
+            "model_override": _PARENT_MODEL,
+            "llm_model": None,
+        },
+        dispatch_args={
+            "model": _MEMBER_MODEL,
+            "reasoning_effort": "high",
+            "harness": "claude-sdk",
+        },
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert len(bodies) == 1
+    assert bodies[0]["model_override"] == _MEMBER_MODEL
+    assert bodies[0]["reasoning_effort"] == "high"
+    assert bodies[0]["harness_override"] == "claude-sdk"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_model_and_effort_apply_instead_of_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No explicit value: the frozen model / effort win over the parent's model."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk", worker_effort="low"),
+        conv_id="conv_member_snapshot_wins",
+        labels=_member_labels(),
+        parent_snapshot={
+            "id": "conv_member_snapshot_wins",
+            "agent_id": "ag_parent",
+            "harness": "claude-sdk",
+            "model_override": _PARENT_MODEL,
+            "llm_model": None,
+        },
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert bodies[0]["model_override"] == _MEMBER_MODEL
+    assert bodies[0]["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_null_snapshot_model_skips_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member frozen to no model override never inherits the parent's."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_null_model",
+        labels=_member_labels(model=None),
+        parent_snapshot={
+            "id": "conv_member_null_model",
+            "agent_id": "ag_parent",
+            "harness": "claude-sdk",
+            "model_override": _PARENT_MODEL,
+            "llm_model": None,
+        },
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_null_snapshot_model_rejects_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member frozen to no model refuses an explicit dispatch model."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_null_model_explicit",
+        labels=_member_labels(model=None),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+
+    assert output.startswith("Error:")
+    assert "locked to 'default'" in output
+    assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_member_refuses_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unavailable snapshot member returns the reason and creates nothing."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_unavailable",
+        labels=_member_labels(unavailable="host_offline"),
+    )
+
+    assert output.startswith("Error:")
+    assert "worker" in output
+    assert "host_offline" in output
+    assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_session_without_member_labels_still_inherits_parent_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unrelated labels leave today's parent-model inheritance in place."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_no_snapshot",
+        labels={"unrelated": "1"},
+        parent_snapshot={
+            "id": "conv_member_no_snapshot",
+            "agent_id": "ag_parent",
+            "harness": "claude-sdk",
+            "model_override": _PARENT_MODEL,
+            "llm_model": None,
+        },
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert bodies[0]["model_override"] == _PARENT_MODEL
+
+
+@pytest.mark.asyncio
+async def test_malformed_member_label_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A corrupt member label behaves like no snapshot entry, not a crash."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_malformed",
+        labels={member_label_key("worker"): "{not json"},
+        parent_snapshot={
+            "id": "conv_member_malformed",
+            "agent_id": "ag_parent",
+            "harness": "claude-sdk",
+            "model_override": _PARENT_MODEL,
+            "llm_model": None,
+        },
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert bodies[0]["model_override"] == _PARENT_MODEL
