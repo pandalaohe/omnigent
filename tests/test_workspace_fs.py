@@ -102,6 +102,40 @@ def test_read_binary_file_returns_base64(tmp_path: Path) -> None:
     assert result["encoding"] == "base64"
 
 
+def test_read_raw_returns_text_past_default_line_cap(tmp_path: Path) -> None:
+    """``raw=True`` returns a whole text file, not the default 2000-line cap.
+
+    A bundle response must carry the file as written; the line cap would
+    silently cut an HTML page off mid-document.
+    """
+    lines = [f"line {i}\n" for i in range(2501)]
+    (tmp_path / "long.txt").write_text("".join(lines))
+    reader = WorkspaceReader(tmp_path)
+
+    capped = reader.list_or_read("long.txt")
+    assert capped["truncated"] is True
+
+    whole = reader.list_or_read("long.txt", raw=True)
+    assert whole["truncated"] is False
+    assert whole["content"] == "".join(lines)
+
+
+def test_read_raw_keeps_byte_cap(tmp_path: Path, monkeypatch) -> None:
+    """``raw`` lifts only the line cap; the byte cap still flags truncation.
+
+    The byte cap is the anti-OOM bound: dropping it because a bundle token
+    asked for the whole file would let one request read a huge file.
+    """
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 8)
+    (tmp_path / "big.txt").write_text("0123456789abcdef")  # 16 bytes > cap 8
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("big.txt", raw=True)
+
+    assert result["truncated"] is True
+    assert result["content"] == "01234567"
+
+
 def test_read_missing_file_raises_not_found(tmp_path: Path) -> None:
     """A missing path raises a 404 ``WorkspaceReaderError``.
 
@@ -227,6 +261,65 @@ def test_symlink_escaping_root_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(WorkspaceReaderError) as excinfo:
         reader.list_or_read("link.txt")
     assert excinfo.value.status == 400
+
+
+def test_read_with_within_refuses_symlink_escape(tmp_path: Path) -> None:
+    """A symlinked directory inside the bundle pointing outside it is refused.
+
+    ``bundle/shared -> ../private`` resolves to a sibling directory that is
+    still inside the workspace, so workspace confinement alone admits it;
+    only the bundle containment check keeps the token from reading it.
+    """
+    bundle = tmp_path / "bundle"
+    private = tmp_path / "private"
+    bundle.mkdir()
+    private.mkdir()
+    (bundle / "notes.txt").write_text("inside")
+    (private / "notes.txt").write_text("outside")
+    (bundle / "shared").symlink_to(private, target_is_directory=True)
+    reader = WorkspaceReader(tmp_path)
+
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.list_or_read("bundle/shared/notes.txt", within="bundle")
+    assert excinfo.value.status == 404
+
+
+def test_read_with_within_refuses_dot_directory_and_listing(tmp_path: Path) -> None:
+    """A resolved dot component is refused, and so is a directory target.
+
+    A bundle token addresses files, never a listing: a listing response has
+    no bytes to confine and would leak the names the boundary hides.
+    """
+    hidden = tmp_path / "bundle" / ".hidden"
+    hidden.mkdir(parents=True)
+    (hidden / "notes.txt").write_text("secret")
+    reader = WorkspaceReader(tmp_path)
+
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.list_or_read("bundle/.hidden/notes.txt", within="bundle")
+    assert excinfo.value.status == 404
+
+    with pytest.raises(WorkspaceReaderError) as dir_excinfo:
+        reader.list_or_read("bundle", within="bundle")
+    assert dir_excinfo.value.status == 404
+
+
+def test_read_with_within_confirms_enforcement(tmp_path: Path) -> None:
+    """A successful confined read says so, so the server can refuse silence.
+
+    The server treats a payload without ``within_enforced`` as an old host
+    and fails closed; a default (unconfined) read must not carry the field.
+    """
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "notes.txt").write_text("inside")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("bundle/notes.txt", within="bundle")
+
+    assert result["content"] == "inside"
+    assert result["within_enforced"] is True
+    assert "within_enforced" not in reader.list_or_read("bundle/notes.txt")
 
 
 # ── search ────────────────────────────────────────────────────────────

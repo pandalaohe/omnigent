@@ -40,6 +40,7 @@ from collections import deque
 from pathlib import Path
 from typing import TypeAlias, cast
 
+from omnigent.artifact_paths import resolved_within
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
@@ -134,6 +135,8 @@ class WorkspaceReader:
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        raw: bool = False,
+        within: str | None = None,
     ) -> _WorkspacePayload:
         """List a directory or read a file, mirroring ``_fs_list_or_read``.
 
@@ -142,13 +145,30 @@ class WorkspaceReader:
         :param after: Forward-pagination cursor entry id.
         :param before: Backward-pagination cursor entry id.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :param raw: Return a file whole, without the line cap; the byte cap
+            and ``truncated`` flag stay as they are. Ignored for a listing.
+        :param within: Bundle root (relative to the workspace, ``""`` for the
+            workspace root) the file must resolve strictly inside, passing
+            the bundle name rules; anything else is a 404. A directory
+            cannot be confined and is refused.
         :returns: A directory-listing dict or a file-content dict.
         :raises WorkspaceReaderError: On invalid path or missing file.
         """
         resolved = self._resolve(path)
         if resolved.is_dir():
+            if within is not None:
+                # A listing would leak names the bundle boundary hides; a
+                # bundle token never asks for one.
+                raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
             return self._list_dir(path, resolved, limit, after, before, order)
-        return self._read_file(path, resolved)
+        if within is not None:
+            root = self._resolve(within)
+            if not resolved_within(resolved, root):
+                raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
+        payload = self._read_file(path, resolved, limit=None if raw else _DEFAULT_READ_LIMIT)
+        if within is not None:
+            payload["within_enforced"] = True
+        return payload
 
     def _list_dir(
         self,

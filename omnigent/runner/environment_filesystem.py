@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec
 
+from omnigent.artifact_paths import resolved_within
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
     DirectoryNotEmpty,
@@ -1289,7 +1290,9 @@ print(json.dumps({'r': results, 't': truncated}))
             modified_at=info["m"],
         )
 
-    async def open_download(self, path: str) -> tuple[BinaryIO, Path, int]:
+    async def open_download(
+        self, path: str, *, within: str | None = None
+    ) -> tuple[BinaryIO, Path, int]:
         """Open *path* for a raw download, bound to what the sandbox can read.
 
         The bytes are served from this process, since the helper's
@@ -1304,13 +1307,21 @@ print(json.dumps({'r': results, 't': truncated}))
 
         :param path: Relative path within the environment, or an absolute
             path elsewhere on the filesystem.
+        :param within: Bundle root the resolved path must fall strictly
+            inside, resolved like *path* (``""`` = the environment root);
+            refused otherwise. Enforced on the realpath, so a symlink
+            inside the bundle cannot aim outside it.
         :returns: The open file at byte 0, its resolved path, and its size.
         :raises InvalidPath: If the path names a directory.
         :raises FilesystemPathNotFound: If the path is missing, not a
-            regular file, or hidden from the helper.
+            regular file, or hidden from the helper, or outside *within*.
         :raises PathUnreachable: If an absolute path is out of reach.
         """
         resolved = self._resolve(path)
+        if within is not None:
+            root = self._resolve(within)
+            if not resolved_within(resolved, root):
+                raise FilesystemPathNotFound(f"Path {path!r} not found")
         if resolved.is_dir():
             raise InvalidPath(f"Path {path!r} is a directory")
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
