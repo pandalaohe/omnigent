@@ -4102,7 +4102,9 @@ describe("NewChatLandingScreen", () => {
     }
     fireEvent.blur(picker);
     const productIcon = screen.getByTestId("new-chat-landing-agent-icon").querySelector("img");
-    expect(screen.getByTestId("new-chat-landing-agent-icon")).toHaveClass("size-4");
+    const productIconSlot = screen.getByTestId("new-chat-landing-agent-icon");
+    expect(productIconSlot).toHaveClass("h-4");
+    expect(productIconSlot).not.toHaveClass("size-4");
     expect(productIcon).toHaveClass("size-4", "-translate-y-[0.5px]");
     const productIconSource = decodeURIComponent(productIcon?.getAttribute("src") ?? "");
     expect(productIconSource).toContain("<title>Claude Code</title>");

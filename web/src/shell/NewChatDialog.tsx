@@ -1947,7 +1947,7 @@ export function AgentHarnessPicker({
     </span>
   ) : visibleCachedPreview ? (
     <span
-      className="flex size-4 shrink-0 items-center justify-center"
+      className="flex h-4 shrink-0 items-center justify-center"
       data-testid="new-chat-landing-agent-icon"
     >
       {visibleCachedPreview.smartRouting ? (
@@ -7394,7 +7394,7 @@ export function NewChatLandingScreen() {
                         triggerIcon={
                           selectedAgent ? (
                             <span
-                              className="flex size-4 shrink-0 items-center justify-center"
+                              className="flex h-4 shrink-0 items-center justify-center"
                               data-testid="new-chat-landing-agent-icon"
                             >
                               {smartRoutingHarnessSelected ? (
