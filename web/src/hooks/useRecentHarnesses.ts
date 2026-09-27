@@ -13,12 +13,12 @@
 import { useCallback, useSyncExternalStore } from "react";
 
 /** Native / ACP harness ids (e.g. `pi-native`). */
-export const RECENT_HARNESSES_KEY = "omnigent:recent-harnesses";
+const RECENT_HARNESSES_KEY = "omnigent:recent-harnesses";
 /** Standalone SDK product harness ids (`claude-sdk`, `codex`). */
 export const RECENT_SDK_KEY = "omnigent:recent-sdk";
 /** Composed built-in / saved (`ca_`) Agent ids. */
 export const RECENT_AGENTS_KEY = "omnigent:recent-agents";
-export const MAX_RECENT_IDS = 4;
+const MAX_RECENT_IDS = 4;
 const emptySnapshot: string[] = [];
 
 interface RecentStore {
@@ -70,7 +70,7 @@ function writeAll(storageKey: string, list: string[]): void {
   }
 }
 
-export interface RecentIds {
+interface RecentIds {
   /** Most-recent-first ids the user has launched. */
   recentIds: string[];
   /**

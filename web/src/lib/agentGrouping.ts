@@ -40,7 +40,7 @@ export function isSdkAgent(agent: Pick<AvailableAgent, "name" | "harness">): boo
 }
 
 /** The vendor product mark an SDK harness runs, keyed by harness spelling. */
-export const SDK_HARNESS_ICON_KINDS: ReadonlyMap<string, "claude" | "codex"> = new Map([
+const SDK_HARNESS_ICON_KINDS: ReadonlyMap<string, "claude" | "codex"> = new Map([
   ["claude-sdk", "claude"],
   ["codex", "codex"],
 ]);

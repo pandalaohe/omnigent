@@ -40,7 +40,7 @@ const COMPOSER_HARNESS_ICONS: Record<
   },
 };
 
-export type ComposerAgentIconAgent = Pick<AvailableAgent, "name" | "harness"> & {
+type ComposerAgentIconAgent = Pick<AvailableAgent, "name" | "harness"> & {
   /** The row's Agent id, when known: a user badge on this id takes the badge
    *  slot, so the SDK mark yields to it. */
   id?: string;
