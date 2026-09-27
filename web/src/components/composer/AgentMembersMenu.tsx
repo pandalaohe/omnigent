@@ -17,15 +17,17 @@ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 const NO_CHILD_SESSIONS: readonly ChildSessionInfo[] = [];
 
 /**
- * A member's settled child session, matched by sub-agent name: the server
+ * A member's settled child session, matched by sub-agent name only: the server
  * titles a child ``"{sub_agent_name}:{session_name}"``, so the summary's
- * ``tool`` is the role this member dispatched under.
+ * ``tool`` is the role this member dispatched under. The instance
+ * ``session_name`` can itself read as a role (``executor:reviewer``), so
+ * matching on it would hand another role's child to this member.
  */
 export function childSessionForRole(
   children: readonly ChildSessionInfo[],
   role: string,
 ): ChildSessionInfo | undefined {
-  return children.find((child) => child.tool === role || child.session_name === role);
+  return children.find((child) => child.tool === role);
 }
 
 function memberConfigLine(member: SessionMember): string {

@@ -110,16 +110,21 @@ describe("AgentMembersMenu", () => {
     expect(screen.queryByTestId("agent-member-open-architect")).toBeNull();
   });
 
-  it("matches a child by session name when the tool label differs", () => {
+  it("does not hand role reviewer the executor:reviewer child's Open", () => {
+    // WHY: matching the instance name too would pick this child for role
+    // "reviewer" even though it was dispatched under "executor".
     renderInMenu(
       <AgentMembersMenu
         members={MEMBERS}
-        childSessions={[child({ id: "conv_by_name", tool: null, session_name: "reviewer" })]}
+        childSessions={[
+          child({ id: "conv_exec_reviewer", tool: "executor", session_name: "reviewer" }),
+        ]}
       />,
     );
-    expect(screen.getByTestId("agent-member-open-reviewer")).toHaveAttribute(
+    expect(screen.queryByTestId("agent-member-open-reviewer")).toBeNull();
+    expect(screen.getByTestId("agent-member-open-executor")).toHaveAttribute(
       "href",
-      "/c/conv_by_name",
+      "/c/conv_exec_reviewer",
     );
   });
 
