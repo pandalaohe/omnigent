@@ -10800,6 +10800,31 @@ async def _create_session_from_existing_agent(
             ]
             await asyncio.to_thread(conversation_store.append, conv.id, new_items)
         else:
+            # Initialize before dispatching the kickoff: a native session's
+            # terminal launches from the first dispatch, so without this the
+            # terminal is built before the init envelope that carries the global
+            # instructions, the worktree startup line, and the feature flags
+            # reaches the runner.
+            try:
+                native_terminal_ready = await _ensure_runner_session_initialized(
+                    conv.id,
+                    conv,
+                    runner_client,
+                    conversation_store,
+                    initializer=getattr(request.app.state, "runner_session_initializer", None),
+                    suppress_recovery_turn=True,
+                )
+            except Exception:  # noqa: BLE001
+                # Best effort: a create must not fail because the runner did
+                # not finish its handshake — dispatch continues unready.
+                _logger.warning(
+                    "Session-init handshake failed for new session %s; "
+                    "dispatching the initial items without a ready native terminal",
+                    conv.id,
+                    exc_info=True,
+                    extra={"session_id": conv.id},
+                )
+                native_terminal_ready = False
             await _ensure_runner_relay_ready(
                 conv.id,
                 conv.runner_id,
@@ -10826,6 +10851,7 @@ async def _create_session_from_existing_agent(
                     artifact_store=artifact_store,
                     created_by=_attribution_user(user_id),
                     runner_router=runner_router,
+                    native_terminal_ready=native_terminal_ready,
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
                 )
