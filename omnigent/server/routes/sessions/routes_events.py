@@ -141,11 +141,9 @@ from omnigent.server.routes._sessions.common import (
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
-    _SUBAGENT_DISPATCH_ID_LABEL_KEY,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _SUBAGENT_STATUS_GENERATION_LABEL_KEY,
     _SUBAGENT_STATUS_TYPE,
-    _SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY,
     _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
@@ -1702,19 +1700,10 @@ def register_events_routes(
                             conversation_store,
                         )
                 if stop_conv is not None and stop_conv.kind == "sub_agent":
-                    stop_dispatch_id = stop_conv.labels.get(_SUBAGENT_DISPATCH_ID_LABEL_KEY)
                     await asyncio.to_thread(
                         conversation_store.set_labels,
                         session_id,
-                        {
-                            _SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "stopped",
-                            # Same dispatch attribution as the terminal-status
-                            # handler: the parent runner must not read this stop
-                            # as some later dispatch's result.
-                            _SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY: (
-                                stop_dispatch_id if isinstance(stop_dispatch_id, str) else ""
-                            ),
-                        },
+                        {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "stopped"},
                     )
                 # Only claim idle when the runner is confirmed gone: a fresh
                 # stamp may still be executing on another replica or be
@@ -2298,18 +2287,6 @@ def register_events_routes(
                     durable_terminal_status = ""
                 if durable_terminal_status in ("", "completed", "failed", "stopped", "killed"):
                     label_updates = {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: durable_terminal_status}
-                    # Attribute the terminal to the dispatch that produced it.
-                    # The parent runner's reconciliation rebuilds a lost remote
-                    # result from these labels; the next dispatch stamps a new
-                    # dispatch id before its turn runs, so without the pairing
-                    # the previous turn's terminal would read as the newer
-                    # dispatch's result.
-                    dispatch_id = conv.labels.get(_SUBAGENT_DISPATCH_ID_LABEL_KEY)
-                    label_updates[_SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY] = (
-                        dispatch_id
-                        if durable_terminal_status and isinstance(dispatch_id, str)
-                        else ""
-                    )
                     is_native_claude_child = (
                         conv.labels.get("omnigent.wrapper") == "claude-code-native-ui-subagent"
                     )

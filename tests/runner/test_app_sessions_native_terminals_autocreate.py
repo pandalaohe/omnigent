@@ -3581,10 +3581,7 @@ class _DeletingCodexRecoveryServerClient:
             "tool": "reviewer",
             "session_name": child_id,
             "current_task_status": "completed",
-            "labels": {
-                runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: dispatch_id,
-                runner_app.SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY: dispatch_id,
-            },
+            "labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: dispatch_id},
         }
 
     @staticmethod

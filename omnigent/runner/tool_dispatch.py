@@ -2814,7 +2814,7 @@ async def _child_on_another_host(
     (named sends know a member's host from the frozen snapshot instead). A
     child with no recorded host is local by definition; an unreadable caller
     session counts as another host, mirroring ``_member_remote_host``, so the
-    reconciliation backstop is armed rather than skipped on a lookup hiccup.
+    dispatch is tracked as remote rather than treated as local on a hiccup.
 
     :param child_host: The child session's ``host_id``, or ``None``.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -3153,9 +3153,9 @@ async def _execute_subagent_tool(
     # F2b: a snapshot member saved on another host runs THERE, whether this
     # dispatch creates its child or continues an idle one. The target host
     # re-checks readiness at create (the snapshot's ``unavailable`` covers
-    # create-time facts) and supplies the worktree; either way the child's
-    # status edges stay on its own host's runner, so this runner needs the
-    # fact to mark the work started and to arm the server-row backstop.
+    # create-time facts) and supplies the worktree; the child's status edges
+    # stay on its own host's runner, so this runner needs the fact to mark
+    # the work started.
     remote_host = await _member_remote_host(
         member_entry,
         server_client=server_client,
@@ -3761,11 +3761,9 @@ async def _execute_subagent_tool(
         return error
 
     if existing is not None and remote_child:
-        # A continued remote child's next turn runs on its own host; this
-        # runner only has the start proof once the message that starts it was
-        # accepted. Before the POST the server row still carries the previous
-        # turn's terminal, which the backstop must never read as this
-        # dispatch's result.
+        # A continued remote child's next turn runs on its own host; the start
+        # proof this runner has is the accepted message POST, so marking the
+        # work started before it would treat an unsent dispatch as running.
         _runner_app.mark_subagent_work_started(child_session_id)
 
     # Return the structured handle mirrored from ``spawn.py``. The debug panel
@@ -4350,7 +4348,7 @@ async def _send_to_existing_session(
     instance_title = parsed.title if parsed.title is not None else (display_title or "")
     # A direct child may itself be a cross-host member; its status edges are
     # owned by its own host's runner, so a continuation there needs the same
-    # start acknowledgment and server-row backstop as a named dispatch.
+    # start acknowledgment as a named dispatch.
     remote_child = await _child_on_another_host(
         _optional_string(snap_data.get("host_id")),
         server_client=server_client,
@@ -4434,11 +4432,9 @@ async def _send_to_existing_session(
         )
 
     if remote_child:
-        # The continued turn's running edge stays on the child's host; this
-        # runner only has the start proof once the message that starts it was
-        # accepted. Before the POST the server row still carries the previous
-        # turn's terminal, which the backstop must never read as this
-        # dispatch's result.
+        # The continued turn's running edge stays on the child's host; the
+        # start proof this runner has is the accepted message POST, so marking
+        # the work started before it would treat an unsent dispatch as running.
         _runner_app.mark_subagent_work_started(target_session_id)
 
     return json.dumps(

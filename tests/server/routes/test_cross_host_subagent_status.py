@@ -137,37 +137,6 @@ async def test_cross_host_terminal_status_is_delivered_through_the_parent_runner
 
 
 @pytest.mark.asyncio
-async def test_terminal_status_stamps_the_dispatch_that_produced_it(
-    cross_host_route: _CrossHostRoute,
-) -> None:
-    """The durable terminal carries the dispatch current when the edge landed.
-
-    The parent runner's reconciliation reads these labels; a terminal that
-    names the previous dispatch must not be rebuilt as a newer dispatch's
-    result, and a running edge clears both.
-    """
-    route = cross_host_route
-    route.store.set_labels(route.child_id, {"omnigent.subagent.dispatch_id": "subagent_turn1"})
-    assert (await _post_status(route, "idle")).status_code == 202
-    labels = route.store.get_conversation(route.child_id).labels
-    assert labels["omnigent.subagent.terminal_status"] == "completed"
-    assert labels["omnigent.subagent.terminal_dispatch_id"] == "subagent_turn1"
-
-    # The next dispatch stamps a new dispatch id before its turn runs; its own
-    # terminal must not keep the previous attribution.
-    route.store.set_labels(route.child_id, {"omnigent.subagent.dispatch_id": "subagent_turn2"})
-    assert (await _post_status(route, "failed")).status_code == 202
-    labels = route.store.get_conversation(route.child_id).labels
-    assert labels["omnigent.subagent.terminal_status"] == "failed"
-    assert labels["omnigent.subagent.terminal_dispatch_id"] == "subagent_turn2"
-
-    assert (await _post_status(route, "running")).status_code == 202
-    labels = route.store.get_conversation(route.child_id).labels
-    assert labels["omnigent.subagent.terminal_status"] == ""
-    assert labels["omnigent.subagent.terminal_dispatch_id"] == ""
-
-
-@pytest.mark.asyncio
 async def test_non_terminal_cross_host_status_forwards_only_to_the_child_runner(
     cross_host_route: _CrossHostRoute,
 ) -> None:

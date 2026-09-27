@@ -553,10 +553,6 @@ _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
 SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
-# The dispatch id the server paired with the child row's durable terminal
-# status, so reconciliation can tell the current dispatch's terminal from a
-# previous turn's session-level terminal.
-SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.terminal_dispatch_id"
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
 # wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
@@ -1762,10 +1758,8 @@ class _SubagentWorkEntry:
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
     :param remote: Whether the child runs on another host (cross-host
-        member). Its ``running``/terminal edges are emitted by the
-        child's own runner, so this runner only learns of completion
-        from the server — making the entry eligible for the server
-        reconciliation backstop even while non-terminal.
+        member). Its ``running``/terminal status edges are emitted on the
+        child's own runner and never reach this one.
     """
 
     parent_session_id: str
@@ -2314,31 +2308,24 @@ async def _list_child_sessions(
         params["after"] = page["last_id"]
 
 
-async def _fetch_latest_assistant_turn(
+async def _fetch_latest_assistant_text(
     server_client: httpx.AsyncClient, session_id: str
-) -> tuple[str | None, bool]:
+) -> str | None:
     """
-    Return the newest assistant message text and whether it answers a turn.
-
-    Reading newest first stops at the first non-meta user message or tool item:
-    crossing that boundary would reuse an assistant answer from an older turn.
-    Meta messages do not start a turn and are skipped. The scan continues past
-    the newest assistant message to find the user message that started its
-    turn; a transcript that ends first (or whose newest turn is a bare user /
-    tool item) proves no turn produced the answer, so it cannot be delivered
-    as the current dispatch's result.
+    Return the newest assistant message text from the latest turn.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param session_id: Session to read, e.g. ``"conv_child456"``.
-    :returns: ``(output, answers_a_turn)`` where *output* is the joined text
-        blocks of the newest assistant message (empty when it carries no text,
-        matching live delivery; ``None`` when the latest turn has no assistant
-        message) and *answers_a_turn* is ``True`` only when the user message
-        that started the assistant message's turn is present in the transcript.
+    Reading newest first stops at the first non-meta user message or tool item:
+    crossing that boundary would reuse an assistant answer from an older turn.
+    Meta messages do not start a turn and are skipped.
+
+    :returns: Joined text blocks of the latest turn's newest assistant message
+        (empty when that message carries no text, matching live delivery), or
+        ``None`` when the latest turn has no assistant message.
     :raises _SubagentRecoveryReadError: When a page read fails.
     """
     params: dict[str, str] = {"limit": "100", "order": "desc"}
-    output: str | None = None
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
@@ -2347,36 +2334,19 @@ async def _fetch_latest_assistant_turn(
                 continue
             if item_type == "message":
                 if item.get("role") == "assistant":
-                    if output is None:
-                        output = "\n".join(
-                            block["text"]
-                            for block in item.get("content", [])
-                            if block.get("type") in {"output_text", "text"} and block.get("text")
-                        )
-                    continue
+                    return "\n".join(
+                        block["text"]
+                        for block in item.get("content", [])
+                        if block.get("type") in {"output_text", "text"} and block.get("text")
+                    )
                 if item.get("role") == "user":
-                    return (output, output is not None)
+                    return None
                 continue
-            if item_type in {"function_call", "function_call_output"} and output is None:
-                return (None, False)
+            if item_type in {"function_call", "function_call_output"}:
+                return None
         if not page.get("has_more") or not page.get("last_id"):
-            return (output, False)
+            return None
         params["after"] = page["last_id"]
-
-
-def _subagent_result_awaits_server(entry: _SubagentWorkEntry) -> bool:
-    """Whether the server row is a live delivery source for this entry.
-
-    ``waiting`` entries await a completion that already happened elsewhere. A
-    ``running`` entry whose child runs on another host never receives the
-    child's own terminal edge on this runner (the child's runner owns it), so
-    the server row is the backstop when that report is lost; a same-host
-    ``running`` entry keeps today's local-edge delivery.
-
-    :param entry: Work entry to classify.
-    :returns: ``True`` when reconciliation may rebuild its result.
-    """
-    return entry.status == "waiting" or (entry.status == "running" and entry.remote)
 
 
 async def _recover_subagent_results_from_server(
@@ -2392,15 +2362,7 @@ async def _recover_subagent_results_from_server(
     parent's ``sys_read_inbox`` drain writes that id back as the delivered
     id. A terminal child whose two ids differ was never drained, so its
     result is rebuilt from the child transcript and queued again under the
-    same dispatch id, letting the eventual drain close the loop. This scan
-    also reconstructs a started cross-host child's result, whose terminal
-    edge its own runner owns and may have failed to report. Only terminal
-    evidence that belongs to the current dispatch is rebuilt: either the
-    server paired the durable terminal with that dispatch id, or the
-    transcript shows the dispatch's own turn produced an assistant answer.
-    The child row's session-level terminal alone is not enough — while a
-    continuation's message is being dispatched it still carries the previous
-    turn's terminal.
+    same dispatch id, letting the eventual drain close the loop.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param parent_id: Parent session whose inbox was recreated, e.g.
@@ -2423,42 +2385,29 @@ async def _recover_subagent_results_from_server(
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
         existing = get_subagent_work(child_id)
-        if (
-            existing is not None and not _subagent_result_awaits_server(existing)
-        ) or child_id in _drained_delivered_subagent_children:
+        if (existing is not None and existing.status != "waiting") or (
+            child_id in _drained_delivered_subagent_children
+        ):
             continue
         labels = child.get("labels")
-        labels_map = labels if isinstance(labels, dict) else {}
-        dispatch_id = undelivered_subagent_dispatch_id(labels_map)
+        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
-        # The durable terminal must belong to this dispatch: the server pairs
-        # it with the dispatch id stamped when the turn was sent. A terminal
-        # stamped for an earlier dispatch is not this dispatch's result — for a
-        # success-shaped status the transcript can still prove the current turn
-        # produced its answer (a lost remote report leaves the previous
-        # terminal in place), while a stored failure carries no such proof.
-        attributed = labels_map.get(SUBAGENT_TERMINAL_DISPATCH_ID_LABEL_KEY) == dispatch_id
         output: str | None = None
         if status == "failed":
-            if not interrupted:
-                if not attributed:
-                    continue
-                message = error.get("message") if isinstance(error, dict) else None
-                output = message if isinstance(message, str) else None
+            error = child.get("last_task_error")
+            message = error.get("message") if isinstance(error, dict) else None
+            output = message if isinstance(message, str) else None
         elif not interrupted:
-            output, answers_a_turn = await _fetch_latest_assistant_turn(server_client, child_id)
-            if not attributed and not answers_a_turn:
-                continue
+            output = await _fetch_latest_assistant_text(server_client, child_id)
             if output is None and status == "stopped":
                 output = "Sub-agent stopped before producing a reliable final result."
             elif output is None and status == "killed":
                 output = "Sub-agent was killed before producing a reliable final result."
         # A forwarded completion or newer dispatch may arrive during the history read.
-        latest = get_subagent_work(child_id)
         if (
-            latest is not existing
-            or (existing is not None and not _subagent_result_awaits_server(existing))
+            get_subagent_work(child_id) is not existing
+            or (existing is not None and existing.status != "waiting")
             or child_id in _drained_delivered_subagent_children
         ):
             continue
@@ -6495,21 +6444,14 @@ def create_runner_app(
     app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
 
     async def _reconcile_pending_subagent_results() -> None:
-        """Refresh work whose result can only come from the server row.
-
-        Covers ``waiting`` entries and started cross-host work: a remote
-        child's terminal edge is emitted on its own host's runner, so this
-        runner's only proof of completion is the server's child row.
-        """
+        """Refresh only recovered work with no local execution or completion edge."""
         parents = {
             entry.parent_session_id
             for entry in list(_subagent_work_by_child.values())
-            if _subagent_result_awaits_server(entry)
+            if entry.status == "waiting"
         }
         for parent_id in parents:
-            if not any(
-                _subagent_result_awaits_server(entry) for entry in list_subagent_work(parent_id)
-            ):
+            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
                 continue
             _subagent_recovery_done.discard(parent_id)
             await _recover_undrained_subagent_results(parent_id)
@@ -9382,13 +9324,8 @@ def create_runner_app(
         delivery has no parent inbox to reach; posting the edge to the server
         routes it through the parent-runner forward. The same report recovers a
         local child whose work entry a restart wiped, one polling interval
-        sooner than the reconciliation backstop.
-
-        Deliberately single-shot: the report carries no dispatch id, so a retry
-        that lands after the parent started the child's next dispatch would be
-        applied to that newer entry. A failed report is recovered by the parent
-        runner's reconciliation, which rebuilds only terminal evidence the
-        server paired with the dispatch (or the dispatch's own transcript turn).
+        sooner than the reconciliation backstop. Single-shot: the report carries
+        no dispatch id, so a late retry could complete the child's next entry.
 
         :param child_session_id: The sub-agent child session id.
         :param status: Server-vocabulary status, e.g. ``"completed"``.
@@ -9403,10 +9340,9 @@ def create_runner_app(
                 status=status,
                 output=output,
             )
-        except Exception:  # noqa: BLE001 — the parent runner's reconciliation is the backstop
+        except Exception:  # noqa: BLE001 — the polling backstop re-delivers
             _logger.warning(
-                "Failed to report an untracked sub-agent terminal status for %s; "
-                "the parent runner's reconciliation remains the backstop",
+                "Failed to report an untracked sub-agent terminal status for %s",
                 child_session_id,
                 exc_info=True,
                 extra={"session_id": child_session_id},
