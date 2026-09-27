@@ -12,6 +12,7 @@ import {
 } from "@/lib/agentBadgePreferences";
 import {
   isAcpHarnessAgent,
+  isSdkAgent,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
@@ -161,9 +162,15 @@ export function AgentsSettings() {
     catalog.data !== undefined &&
     !catalog.error;
   const customAgentRows = useMemo(() => catalog.data ?? [], [catalog.data]);
+  // SDK product built-ins live in New Chat's own SDK section and are not pin
+  // candidates there, so Settings must not offer or count those pins either.
+  const pinnableBuiltinAgents = useMemo(
+    () => memberBuiltinAgents.filter((agent) => !isSdkAgent(agent)),
+    [memberBuiltinAgents],
+  );
   const pinCandidates = useMemo(
-    () => [...memberBuiltinAgents, ...customAgentRows.map(customAgentForPicker)],
-    [memberBuiltinAgents, customAgentRows],
+    () => [...pinnableBuiltinAgents, ...customAgentRows.map(customAgentForPicker)],
+    [pinnableBuiltinAgents, customAgentRows],
   );
   const pinnedIds = useMemo(
     () => resolvePinnedAgentIds(storedPinnedIds, pinCandidates),
@@ -272,7 +279,7 @@ export function AgentsSettings() {
                   </div>
                 )}
               </div>
-              {memberControls && (
+              {memberControls && !isSdkAgent(agent) && (
                 <PinToggle
                   agentId={agent.id}
                   name={agent.display_name}

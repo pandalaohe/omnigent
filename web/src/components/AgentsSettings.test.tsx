@@ -486,6 +486,22 @@ describe("AgentsSettings", () => {
     );
   });
 
+  it("leaves SDK product built-ins out of the pin candidates", () => {
+    localStorage.setItem(
+      "omnigent:agent-pins",
+      JSON.stringify({
+        ids: ["ag_builtin_codex_sdk", "ag_builtin_polly", "ag_builtin_debby"],
+      }),
+    );
+    renderSettings();
+
+    // The SDK row has no pin control...
+    expect(screen.queryByRole("button", { name: "Pin Codex SDK" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Unpin Codex SDK" })).not.toBeInTheDocument();
+    // ...and its stale pin does not consume one of the three slots.
+    expect(screen.getByRole("button", { name: "Pin Reviewer" })).toBeEnabled();
+  });
+
   it("disables the pin button of unpinned rows at the cap", () => {
     mocks.catalog = [custom, { ...custom, id: "ca_second", name: "Second" }];
     renderSettings();
