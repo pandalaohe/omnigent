@@ -14,7 +14,10 @@ This migration copies every non-NULL envelope into the settings rows so the
 row store reads exist; the column itself is deliberately left untouched (a
 rollback to an image without the row store still finds it). A user whose
 ``settings.version`` row already exists is skipped, so re-running is
-idempotent and never overwrites rows a client wrote.
+idempotent and never overwrites rows a client wrote. A batch that keeps
+failing after three attempts fails the migration instead of stamping the
+revision, so no user is left without rows; the retry that follows a fix
+resumes from the users still missing a ``settings.version`` row.
 
 Only a version-1 envelope with an object ``settings`` moves. Unknown
 namespace keys are dropped; an undecodable or malformed envelope is skipped
@@ -124,12 +127,12 @@ def _copy_with_retries(
             if attempt == 2:
                 _logger.warning(
                     "Could not %s user preference rows after 3 attempts; "
-                    "the affected users keep their pre-move envelopes",
+                    "failing the migration so these users keep their pre-move envelopes",
                     operation,
                     exc_info=True,
                 )
-            else:
-                time.sleep(0.1 * (2**attempt))
+                raise
+            time.sleep(0.1 * (2**attempt))
 
 
 def _load_batch(

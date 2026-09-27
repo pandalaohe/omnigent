@@ -326,6 +326,33 @@ def test_preferences_move_skips_an_oversized_namespace(
     engine.dispose()
 
 
+def test_preferences_move_fails_when_a_batch_cannot_land(tmp_path: Path) -> None:
+    """A batch that keeps failing fails the migration instead of stamping it."""
+    uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-fails.db")
+    _seed_user(engine, "alice", encode('{"settings":{"context_indicator":"compact"},"version":1}'))
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO preferences (workspace_id, user_id, key, value) "
+                "VALUES (0, 'alice', 'settings.context_indicator', :value)"
+            ),
+            {"value": encode('"wide"')},
+        )
+    engine.dispose()
+
+    # The batch's second insert collides with the existing row, so every
+    # attempt fails and the retry loop must surface the error.
+    with pytest.raises(sa.exc.IntegrityError):
+        command.upgrade(config, "head")
+
+    engine = sa.create_engine(uri)
+    with engine.connect() as connection:
+        version = connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+    assert version == _PRE_MOVE_REVISION
+    assert _settings_rows(engine, "alice") == {"context_indicator": '"wide"'}
+    engine.dispose()
+
+
 def test_preferences_move_downgrade_removes_only_settings_rows(tmp_path: Path) -> None:
     """Downgrade deletes settings.* and leaves users.preferences in place."""
     uri, config, engine = _upgrade_to_pre_move(tmp_path, "move-downgrade.db")
