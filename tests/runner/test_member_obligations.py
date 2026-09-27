@@ -224,6 +224,11 @@ async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) ->
         await asyncio.sleep(0.01)
 
 
+async def _wait_for_turn_end(app: Any) -> None:
+    """Wait until no turn is active for the parent session."""
+    await _wait_until(lambda: not app.state.active_turns.get(PARENT))
+
+
 def _events_of_type(server: _MemberServerClient, event_type: str) -> list[dict[str, Any]]:
     """Every recorded POST body of *event_type* (in order)."""
     return [
@@ -240,19 +245,21 @@ def _notices(server: _MemberServerClient) -> list[dict[str, Any]]:
 
 @pytest.fixture(autouse=True)
 def _clean_member_obligations() -> Iterator[None]:
-    """Keep the module-level obligation, member, and history state per-test."""
+    """Keep the module-level obligation, member, turn-stamp, and history state per-test."""
     saved = {
-        session: dict(obligations)
+        session: list(obligations)
         for session, obligations in runner_app._member_obligations.items()
     }
     saved_members = {
         session: dict(entries) for session, entries in runner_app._session_member_entries.items()
     }
+    saved_stamps = dict(runner_app._member_turn_stamps)
     saved_histories = {
         session: list(items) for session, items in runner_app._session_histories_ref.items()
     }
     runner_app._member_obligations.clear()
     runner_app._session_member_entries.clear()
+    runner_app._member_turn_stamps.clear()
     runner_app._session_histories_ref.clear()
     try:
         yield
@@ -261,6 +268,8 @@ def _clean_member_obligations() -> Iterator[None]:
         runner_app._member_obligations.update(saved)
         runner_app._session_member_entries.clear()
         runner_app._session_member_entries.update(saved_members)
+        runner_app._member_turn_stamps.clear()
+        runner_app._member_turn_stamps.update(saved_stamps)
         runner_app._session_histories_ref.clear()
         runner_app._session_histories_ref.update(saved_histories)
 
@@ -312,8 +321,8 @@ async def test_note_prepended_for_named_non_lead_role() -> None:
     assert "sys_session_send" in note
     assert user_text == "@executor build the parser please"
     obligations = runner_app.list_member_obligations(PARENT)
-    assert list(obligations) == ["executor"]
-    assert obligations["executor"].child_session_id is None
+    assert [obligation.role for obligation in obligations] == ["executor"]
+    assert obligations[0].child_session_id is None
 
 
 @pytest.mark.asyncio
@@ -328,7 +337,7 @@ async def test_naming_the_lead_adds_no_note() -> None:
         await _wait_until(lambda: bool(harness.posted_bodies))
 
     assert _ordered_user_texts(harness.posted_bodies[0]) == [f"@{LEAD_ROLE} do it yourself"]
-    assert runner_app.list_member_obligations(PARENT) == {}
+    assert runner_app.list_member_obligations(PARENT) == []
 
 
 @pytest.mark.asyncio
@@ -343,7 +352,7 @@ async def test_message_without_mentions_is_untouched() -> None:
         await _wait_until(lambda: bool(harness.posted_bodies))
 
     assert _ordered_user_texts(harness.posted_bodies[0]) == ["just do the thing"]
-    assert runner_app.list_member_obligations(PARENT) == {}
+    assert runner_app.list_member_obligations(PARENT) == []
 
 
 @pytest.mark.asyncio
@@ -361,7 +370,7 @@ async def test_session_without_members_is_untouched() -> None:
         await _wait_until(lambda: bool(harness.posted_bodies))
 
     assert _ordered_user_texts(harness.posted_bodies[0]) == ["@executor build it"]
-    assert runner_app.list_member_obligations(PARENT) == {}
+    assert runner_app.list_member_obligations(PARENT) == []
 
 
 @pytest.mark.asyncio
@@ -375,9 +384,10 @@ async def test_unavailable_named_role_gets_immediate_notice_not_note() -> None:
         response = await _post_message(client, "[executor] build it")
         assert response.status_code == 202
         await _wait_until(lambda: bool(harness.posted_bodies))
+        await _wait_until(lambda: bool(_notices(server)))
 
     assert _ordered_user_texts(harness.posted_bodies[0]) == ["[executor] build it"]
-    assert runner_app.list_member_obligations(PARENT) == {}
+    assert runner_app.list_member_obligations(PARENT) == []
     assert _notices(server) == [
         {
             "type": "external_conversation_item",
@@ -392,6 +402,89 @@ async def test_unavailable_named_role_gets_immediate_notice_not_note() -> None:
             },
         }
     ]
+
+
+# --------------------------------------------------------------------------
+# Buffered and repeated requests (finding: routing must cover every request)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_buffered_request_is_routed_when_its_turn_starts() -> None:
+    """A message buffered behind a running turn gets its note when it starts."""
+    gate = asyncio.Event()
+    harness = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ],
+        gate,
+    )
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server, harness_client=harness)
+
+    async with _runner_client(app) as client:
+        await _seed_session(
+            client, labels=_member_labels(roles=(LEAD_ROLE, WORKER_ROLE, "reviewer"))
+        )
+        assert (await _post_message(client, "@executor first task")).status_code == 202
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+        assert (await _post_message(client, "@reviewer check it")).status_code == 202
+        gate.set()
+        await _wait_until(lambda: len(harness.posted_bodies) >= 2)
+
+    texts = _ordered_user_texts(harness.posted_bodies[1])
+    assert texts[-1] == "@reviewer check it"
+    assert any("'reviewer'" in text and "sys_session_send" in text for text in texts)
+    roles = [obligation.role for obligation in runner_app.list_member_obligations(PARENT)]
+    assert roles == ["executor", "reviewer"]
+
+
+@pytest.mark.asyncio
+async def test_second_request_naming_a_busy_role_gets_its_own_obligation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request naming a member already running opens a fresh obligation + note."""
+    server = _MemberServerClient()
+    app, _pm, harness = _build_app(server)
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        await _post_message(client, "@executor first task")
+        await _wait_for_turn_end(app)
+
+    output, _create_bodies = await _run_named_dispatch(monkeypatch, create_status=201)
+    assert json.loads(output)["status"] == "launching"
+    records = runner_app.list_member_obligations(PARENT)
+    assert [obligation.child_session_id for obligation in records] == [WORKER_CHILD]
+
+    async with _runner_client(app) as client:
+        await _post_message(client, "@executor second task")
+        await _wait_until(lambda: len(harness.posted_bodies) >= 2)
+
+    texts = _ordered_user_texts(harness.posted_bodies[1])
+    assert texts[-1] == "@executor second task"
+    assert any("'executor'" in text and "second task" in text for text in texts)
+    records = runner_app.list_member_obligations(PARENT)
+    assert [obligation.role for obligation in records] == ["executor", "executor"]
+    assert records[0].child_session_id == WORKER_CHILD
+    assert records[1].child_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_system_post_is_not_parsed_for_mentions() -> None:
+    """The runner's own ``[System: …]`` wake posts never route mentions."""
+    server = _MemberServerClient()
+    app, _pm, harness = _build_app(server)
+    wake = "[System: sub-agent finished] @executor look at its result"
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        await _post_message(client, wake)
+        await _wait_until(lambda: bool(harness.posted_bodies))
+
+    assert _ordered_user_texts(harness.posted_bodies[0]) == [wake]
+    assert runner_app.list_member_obligations(PARENT) == []
 
 
 # --------------------------------------------------------------------------
@@ -478,14 +571,14 @@ async def _run_named_dispatch(
 @pytest.mark.asyncio
 async def test_child_create_meets_the_obligation(monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful named dispatch records the child id on the obligation."""
-    runner_app.record_member_obligation(PARENT, WORKER_ROLE)
+    runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
 
     output, create_bodies = await _run_named_dispatch(monkeypatch, create_status=201)
 
     payload = json.loads(output)
     assert payload["status"] == "launching", output
     assert len(create_bodies) == 1
-    obligation = runner_app.list_member_obligations(PARENT)[WORKER_ROLE]
+    obligation = runner_app.list_member_obligations(PARENT)[0]
     assert obligation.child_session_id == WORKER_CHILD
     assert obligation.failure_reason is None
 
@@ -493,26 +586,26 @@ async def test_child_create_meets_the_obligation(monkeypatch: pytest.MonkeyPatch
 @pytest.mark.asyncio
 async def test_failed_child_create_records_the_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     """A dispatch that errors records why, for the turn-end notice to quote."""
-    runner_app.record_member_obligation(PARENT, WORKER_ROLE)
+    runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
 
     output, create_bodies = await _run_named_dispatch(monkeypatch, create_status=500)
 
     assert output.startswith("Error:")
     assert create_bodies
-    obligation = runner_app.list_member_obligations(PARENT)[WORKER_ROLE]
+    obligation = runner_app.list_member_obligations(PARENT)[0]
     assert obligation.child_session_id is None
     assert obligation.failure_reason is not None
     assert "failed to create child session" in obligation.failure_reason
 
 
 # --------------------------------------------------------------------------
-# Turn end: one follow-up, then a visible notice
+# Turn end: one follow-up (tied to its turn), then a visible notice
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_unmet_role_gets_exactly_one_follow_up_then_a_notice() -> None:
-    """Unmet at turn end → one follow-up; still unmet → one notice, dropped."""
+    """Unmet at turn end → one follow-up; that follow-up turn ends → one notice."""
     server = _MemberServerClient()
     app, _pm, _harness = _build_app(server)
 
@@ -526,20 +619,43 @@ async def test_unmet_role_gets_exactly_one_follow_up_then_a_notice() -> None:
         follow_up_text = follow_ups[0]["data"]["content"][0]["text"]
         assert "executor" in follow_up_text
         assert "sys_session_send" in follow_up_text
-        assert runner_app.list_member_obligations(PARENT)["executor"].followed_up is True
+        assert runner_app.list_member_obligations(PARENT)[0].follow_up_sent is True
 
-        # The follow-up turn ends still unmet → one visible notice, obligation gone.
-        await _post_message(client, "carry on")
+        # The server hands the follow-up back to the runner, which starts the
+        # follow-up turn; its end settles the still-unmet request.
+        await _post_message(client, follow_up_text)
         await _wait_until(lambda: bool(_notices(server)))
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
 
     notices = _notices(server)
     assert len(notices) == 1
     item_data = notices[0]["data"]["item_data"]
     assert item_data["message"] == "executor did not run: not dispatched after the follow-up"
     assert item_data["level"] == "info"
-    assert runner_app.list_member_obligations(PARENT) == {}
     # Never a second follow-up.
     assert len(_events_of_type(server, "message")) == 1
+
+
+@pytest.mark.asyncio
+async def test_unrelated_turn_end_does_not_consume_the_follow_up() -> None:
+    """An unrelated turn end (wake turn, extra idle edge) exhausts nothing."""
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server)
+
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        await _post_message(client, "[executor] build the parser")
+        await _wait_until(lambda: bool(_events_of_type(server, "message")))
+
+        await _post_message(client, "an unrelated follow-on message")
+        await _wait_for_turn_end(app)
+        await asyncio.sleep(0.05)
+
+    assert _notices(server) == []
+    records = runner_app.list_member_obligations(PARENT)
+    assert len(records) == 1
+    assert records[0].follow_up_sent is True
+    assert records[0].follow_up_turn is None
 
 
 @pytest.mark.asyncio
@@ -570,7 +686,7 @@ async def test_failed_dispatch_notices_at_turn_end_without_a_follow_up() -> None
     assert _notices(server)[0]["data"]["item_data"]["message"] == (
         "executor did not run: failed to create child session: 500 boom"
     )
-    assert runner_app.list_member_obligations(PARENT) == {}
+    assert runner_app.list_member_obligations(PARENT) == []
 
 
 @pytest.mark.asyncio
@@ -582,7 +698,7 @@ async def test_child_failure_posts_the_notice_and_closes(
     app, _pm, _harness = _build_app(server)
 
     async with _runner_client(app) as client:
-        runner_app.record_member_obligation(PARENT, WORKER_ROLE)
+        runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
         runner_app.mark_member_obligation_met(PARENT, WORKER_ROLE, WORKER_CHILD)
         runner_app._session_inboxes_ref[PARENT] = asyncio.Queue()
         runner_app.register_subagent_work(
@@ -601,8 +717,8 @@ async def test_child_failure_posts_the_notice_and_closes(
         )
         assert response.status_code in (200, 204)
         await _wait_until(lambda: bool(_notices(server)))
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
 
-    assert runner_app.list_member_obligations(PARENT) == {}
     assert _notices(server)[0]["data"]["item_data"]["message"] == (
         "executor did not run: Error: sub-agent blew up"
     )
@@ -617,7 +733,7 @@ async def test_child_completion_closes_without_a_notice(
     app, _pm, _harness = _build_app(server)
 
     async with _runner_client(app) as client:
-        runner_app.record_member_obligation(PARENT, WORKER_ROLE)
+        runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
         runner_app.mark_member_obligation_met(PARENT, WORKER_ROLE, WORKER_CHILD)
         runner_app._session_inboxes_ref[PARENT] = asyncio.Queue()
         runner_app.register_subagent_work(
@@ -634,7 +750,7 @@ async def test_child_completion_closes_without_a_notice(
                 "data": {"status": "completed", "output": "all done"},
             },
         )
-        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == {})
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [])
         await asyncio.sleep(0.05)
 
     assert _notices(server) == []

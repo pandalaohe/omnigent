@@ -2740,7 +2740,10 @@ def _note_member_obligation_outcome(
     role = args.get("agent")
     if not isinstance(role, str) or not role:
         return
-    if role not in _runner_app.list_member_obligations(conversation_id):
+    if not any(
+        obligation.role == role
+        for obligation in _runner_app.list_member_obligations(conversation_id)
+    ):
         return
     if output.startswith("Error:"):
         reason = output.splitlines()[0].removeprefix("Error:").strip() or "dispatch failed"
