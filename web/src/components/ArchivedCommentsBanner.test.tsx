@@ -179,6 +179,11 @@ describe("ArchivedCommentsBanner", () => {
     await waitFor(() => expect(mocks.send).toHaveBeenCalled());
     // The send failed, so the comments stay unhandled — the prompt is
     // restored to the new session's composer by the store.
+    await waitFor(() =>
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        "The message didn't reach the agent; the comments stay unhandled.",
+      ),
+    );
     expect(
       mocks.fetch.mock.calls.filter(
         ([, opts]) => (opts as RequestInit | undefined)?.method === "PATCH",

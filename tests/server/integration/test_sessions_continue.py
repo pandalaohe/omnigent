@@ -519,6 +519,53 @@ async def test_continue_requires_edit_access(
     )
 
 
+async def test_continue_reuse_requires_edit_access_to_successor(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The ``continued_to`` pointer never grants access to the successor.
+
+    Alice continues the archived source first, so the pointer names her
+    private successor. Bob, an editor of the source with no grant on that
+    successor, must not receive it: the route mints him his own session
+    and moves the pointer there.
+    """
+    agent = await create_test_agent(auth_client, name="continue-reuse-auth", user=ALICE)
+    session_id = agent["_session_id"]
+    alice = {"X-Forwarded-Email": ALICE}
+    bob = {"X-Forwarded-Email": BOB}
+
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user(BOB)
+    perm_store.grant(BOB, session_id, LEVEL_EDIT)
+
+    archive = await auth_client.patch(
+        f"/v1/sessions/{session_id}", json={"archived": True}, headers=alice
+    )
+    assert archive.status_code == 200, archive.text
+
+    alices = await _continue(auth_client, session_id, headers=alice)
+    assert alices.status_code == 201, alices.text
+
+    bobs = await _continue(auth_client, session_id, headers=bob)
+    assert bobs.status_code == 201, bobs.text
+    assert bobs.json()["id"] != alices.json()["id"], (
+        "Bob must never receive Alice's private successor"
+    )
+
+    source_row = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert source_row is not None
+    assert source_row.labels["omnigent.continued_to"] == bobs.json()["id"], (
+        "The pointer must move to the session Bob's call created"
+    )
+
+    bobs_again = await _continue(auth_client, session_id, headers=bob)
+    assert bobs_again.status_code == 201, bobs_again.text
+    assert bobs_again.json()["id"] == bobs.json()["id"], (
+        "Bob's own successor is reusable: the pointer now names a session he can edit"
+    )
+
+
 async def test_continue_missing_session_returns_404(
     auth_client: httpx.AsyncClient,
 ) -> None:

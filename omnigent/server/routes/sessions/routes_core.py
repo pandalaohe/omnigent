@@ -4170,7 +4170,8 @@ def register_core_routes(
 
         Idempotent: the archived session records
         ``omnigent.continued_to=<new id>``, and a repeat call returns that
-        session while it still exists and is not archived.
+        session while it still exists, is not archived and the caller may
+        edit it; otherwise a new session is created and the pointer moves.
 
         :param request: The incoming FastAPI request (for auth).
         :param source_id: The archived session to continue, e.g.
@@ -4207,26 +4208,32 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-        # A repeat call returns the session this archived one already
-        # continued into, while that session still exists and is not itself
-        # archived (an archived successor is stale, so a new one is minted).
+        # A repeat call returns the pointed-to session only while it
+        # exists, is unarchived, and the caller may edit it: the pointer
+        # is a hint, not a grant, so a refusal mints a fresh successor.
         continued_to = source.labels.get(CONTINUED_TO_LABEL_KEY)
         if continued_to:
             existing = await asyncio.to_thread(conversation_store.get_conversation, continued_to)
             if existing is not None and not existing.archived:
-                level = await _get_permission_level(user_id, existing.id, permission_store)
-                return await _get_session_snapshot(
-                    conversation_store,
-                    existing.id,
-                    level,
-                    agent_store=agent_store,
-                    agent_cache=agent_cache,
-                    conversation=existing,
-                    liveness_lookup=liveness_lookup,
-                    include_items=False,
-                    request=request,
-                    allow_host_fill=False,
-                )
+                try:
+                    reuse = await _require_access_and_level(
+                        user_id, existing.id, LEVEL_EDIT, permission_store, conversation_store
+                    )
+                except OmnigentError:
+                    reuse = None
+                if reuse is not None:
+                    return await _get_session_snapshot(
+                        conversation_store,
+                        existing.id,
+                        reuse.level,
+                        agent_store=agent_store,
+                        agent_cache=agent_cache,
+                        conversation=existing,
+                        liveness_lookup=liveness_lookup,
+                        include_items=False,
+                        request=request,
+                        allow_host_fill=False,
+                    )
 
         source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
         if source_agent is None:

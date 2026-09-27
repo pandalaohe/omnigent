@@ -112,7 +112,10 @@ export function ArchivedCommentsBanner({
       const delivered = await useChatStore
         .getState()
         .send(prompt, agentId, [], { pinnedConversationId: session.id });
-      if (!delivered) return;
+      if (!delivered) {
+        toast.error("The message didn't reach the agent; the comments stay unhandled.");
+        return;
+      }
       await markAddressed(sessionId, sentCommentIds);
       await queryClient.invalidateQueries({ queryKey: ["comments", sessionId] });
     } catch {

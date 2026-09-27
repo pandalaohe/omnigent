@@ -178,6 +178,23 @@ describe("visitor shell handshake", () => {
   });
 });
 
+describe("visitor shell visibility", () => {
+  it("keeps the form actually hidden until it is opened", async () => {
+    mount();
+    const { postMessage } = loadFrame();
+    await sendFromFrame(postMessage, { type: BRIDGE_MSG.ready, pathname: FRAME_URL });
+
+    const form = get<HTMLFormElement>("omni-visit-form");
+    expect(form.hidden).toBe(true);
+    // The shell's own `display: flex` must not override the hidden attribute.
+    expect(getComputedStyle(form).display).toBe("none");
+
+    get<HTMLButtonElement>("omni-visit-comment").click();
+    expect(form.hidden).toBe(false);
+    expect(getComputedStyle(form).display).not.toBe("none");
+  });
+});
+
 describe("visitor shell comments", () => {
   it("maps a selection to source offsets and posts the anchor with the comment", async () => {
     const fetchMock = mockFetch((url) => {

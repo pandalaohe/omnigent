@@ -75,6 +75,8 @@ function element<K extends keyof HTMLElementTagNameMap>(
 
 const STYLE = `
 html, body { margin: 0; height: 100%; }
+/* The form's own display rule would otherwise beat the UA [hidden] rule. */
+[hidden] { display: none !important; }
 #omni-visit-frame { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; }
 #omni-visit-status, #omni-visit-unavailable {
   position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 10;
