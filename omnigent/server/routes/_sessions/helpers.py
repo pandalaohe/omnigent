@@ -10607,36 +10607,42 @@ async def _notify_runner_of_bundled_child(
     session_id: str,
     agent_id: str,
     runner_router: RunnerRouter | None,
+    *,
+    init_body: dict[str, Any] | None = None,
 ) -> None:
     """
     Notify the inherited runner that a bundled child session exists.
 
     Lets the runner initialize per-session state (inbox queue,
     agent-id cache) before the first forwarded event, mirroring the
-    JSON create path's post-create notify. Failures are logged and
-    swallowed — the notify is additive and must not fail the create.
+    JSON create path's post-create notify. Pass *init_body* — the full
+    session-init envelope — so the runner also stores the global
+    instructions and the rest of the session state; without it the
+    legacy id-only body is sent. Failures are logged and swallowed —
+    the notify is additive and must not fail the create.
 
     :param session_id: The new child session id, e.g. ``"conv_abc123"``.
     :param agent_id: The child's session-scoped agent id,
         e.g. ``"ag_abc123"``.
     :param runner_router: Router used to resolve the bound runner's
         client; ``None`` falls back to the in-process runner.
+    :param init_body: Full session-init payload to POST, or ``None``
+        for the legacy id-only body.
     :returns: None.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
+    if init_body is None:
+        init_body = {
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "sub_agent_name": None,
+        }
     try:
-        # Bundled children keep the legacy id-only body: bundle creation plumbs
-        # no harness/model override for a session-init envelope to seed. The
-        # create and rebind notifies send the full envelope instead.
         await runner_client.post(
             "/v1/sessions",
-            json={
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "sub_agent_name": None,
-            },
+            json=init_body,
             timeout=10.0,
         )
     except (httpx.HTTPError, ConnectionError):

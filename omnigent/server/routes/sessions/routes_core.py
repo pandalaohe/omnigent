@@ -114,6 +114,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _RUNNER_SESSION_INIT_TIMEOUT_S,
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _logger,
     _managed_launch_tasks,
@@ -189,6 +190,9 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_archive_unfence,
     _validate_session_model_selection,
     ensure_runner_connected,
+)
+from omnigent.server.runner_session_init import (
+    runner_archive_states_for_conversation,
 )
 from omnigent.server.schemas import (
     ArchivedSessionFacetsResponse,
@@ -818,15 +822,51 @@ def register_core_routes(
             # current session state; older runners ignore the extra key.
             # ``initial_items`` are already persisted and forwarded by now, so
             # suppress the runner's recovery turn or they run twice.
-            init_body = await _session_init_notify_body(conv, request, suppress_recovery_turn=True)
-            try:
-                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
-            except (httpx.HTTPError, ConnectionError):
-                _logger.warning(
-                    "Failed to notify runner about session %s",
-                    resp.id,
-                    exc_info=True,
+            #
+            # Deliver through the app's ``RunnerSessionInitializer`` when
+            # present: a child with ``initial_items`` already ran the handshake
+            # before its kickoff dispatch, so a completed init for the same key
+            # is reused (no second POST) and a failed one is retried. The
+            # initializer needs a bound runner id for its memo key; without
+            # one, keep the direct POST. Any initializer failure falls through
+            # to the direct path, whose envelope-build failure still degrades
+            # to the id-only body so the runner is always notified.
+            initializer = getattr(request.app.state, "runner_session_initializer", None)
+            initialized = False
+            if initializer is not None and conv.runner_id is not None:
+                try:
+                    archive_states = await runner_archive_states_for_conversation(
+                        conv, conversation_store
+                    )
+                    await initializer.initialize(
+                        conv,
+                        _rc,
+                        timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+                        suppress_recovery_turn=True,
+                        archive_states=archive_states,
+                    )
+                    initialized = True
+                except Exception:
+                    # Additive notify: a failed handshake must not fail the
+                    # create, matching the direct path below.
+                    _logger.warning(
+                        "Runner session initialization failed for session %s; "
+                        "falling back to the direct notify",
+                        resp.id,
+                        exc_info=True,
+                    )
+            if not initialized:
+                init_body = await _session_init_notify_body(
+                    conv, request, suppress_recovery_turn=True
                 )
+                try:
+                    await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
+                except (httpx.HTTPError, ConnectionError):
+                    _logger.warning(
+                        "Failed to notify runner about session %s",
+                        resp.id,
+                        exc_info=True,
+                    )
         # Grant the creator ownership BEFORE any host launch so the
         # launch's session-ownership check (shared with
         # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
@@ -1105,10 +1145,22 @@ def register_core_routes(
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
         if inherited_runner_id is not None:
+            # Full session-init envelope, not the legacy id-only body, so the
+            # runner stores the global instructions and the rest of the
+            # session state the child's terminal launch reads.
+            child_conv = await asyncio.to_thread(
+                conversation_store.get_conversation, result.session_id
+            )
+            notify_body = (
+                await _session_init_notify_body(child_conv, request)
+                if child_conv is not None
+                else None
+            )
             await _notify_runner_of_bundled_child(
                 result.session_id,
                 result.agent_id,
                 runner_router,
+                init_body=notify_body,
             )
         # Grant the creator ownership BEFORE scheduling the managed
         # launch, mirroring the JSON path: a managed-guard failure

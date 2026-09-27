@@ -2111,6 +2111,68 @@ async def test_multipart_create_with_parent_links_child(
     assert child_id in listed_ids
 
 
+async def test_multipart_child_init_notify_carries_global_instructions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bundled child's runner notify carries the full session-init envelope.
+
+    A config-path child inherits the parent's runner, and the legacy id-only
+    notify left the runner without the global instructions text — its terminal
+    launch then missed them.
+    """
+    from omnigent.runtime import _globals
+    from omnigent.stores.global_instructions_store.sqlalchemy_store import (
+        SqlAlchemyGlobalInstructionsStore,
+    )
+
+    parent = await _create_parent_session(client, agent_name="bundle-init-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    assert conv_store.set_runner_id(parent["id"], "runner-bundled-init")
+
+    global_text = "always run the focused test [bundle-init-marker]"
+    store = SqlAlchemyGlobalInstructionsStore(db_uri)
+    store.save(global_text, created_by=None)
+    monkeypatch.setattr(_globals, "_global_instructions_store", store)
+
+    posts: list[tuple[str, Any]] = []
+
+    class _RecordingRunner:
+        async def post(self, path: str, *, json: Any = None, **kwargs: Any) -> httpx.Response:
+            posts.append((path, json))
+            return httpx.Response(
+                200,
+                json={},
+                request=httpx.Request("POST", f"http://runner{path}"),
+            )
+
+    runner = _RecordingRunner()
+
+    async def _resolve_bound_runner(*args: Any, **kwargs: Any) -> _RecordingRunner:
+        return runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _resolve_bound_runner)
+
+    child_bundle = build_agent_bundle(name="bundle-init-child")
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"parent_session_id": parent["id"]})},
+        files={"bundle": ("agent.tar.gz", child_bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201, resp.text
+    child_id = resp.json()["session_id"]
+
+    init_bodies = [
+        body
+        for path, body in posts
+        if path == "/v1/sessions" and isinstance(body, dict) and body.get("session_id") == child_id
+    ]
+    assert len(init_bodies) == 1, posts
+    snapshot = init_bodies[0]["session_init"]["snapshot"]
+    assert snapshot["global_instructions"] == global_text, init_bodies[0]
+
+
 @pytest.mark.parametrize(
     "harness,config,expected_args",
     [
