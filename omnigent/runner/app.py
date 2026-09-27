@@ -1915,19 +1915,32 @@ def mark_member_obligation_met(session_id: str, role: str, child_session_id: str
 
 
 def mark_member_obligation_failed(
-    session_id: str, role: str, reason: str, *, force: bool = False
+    session_id: str,
+    role: str,
+    reason: str,
+    *,
+    force: bool = False,
+    child_session_id: str | None = None,
 ) -> bool:
     """Record a failed dispatch (or teardown) for *role*'s obligations.
 
     Unless *force* is set, an obligation already met by a launched child is
     left alone — only a post-registration teardown knows that child is gone
-    and must turn the obligation back into a failure.
+    and must turn the obligation back into a failure. A forced failure that
+    names the *child_session_id* it tore down touches only the records attached
+    to that child, so a sibling request still running never loses its dispatch.
     """
     failed = False
     for obligation in list_member_obligations(session_id):
         if obligation.role != role:
             continue
         if obligation.child_session_id is not None and not force:
+            continue
+        if (
+            force
+            and child_session_id is not None
+            and (obligation.child_session_id != child_session_id)
+        ):
             continue
         obligation.child_session_id = None
         obligation.failure_reason = reason

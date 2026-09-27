@@ -2723,15 +2723,17 @@ def _note_member_dispatch_failure(
     error: str,
     *,
     force: bool = False,
+    child_session_id: str | None = None,
 ) -> None:
     """Record a dispatch failure against the turn's member obligations.
 
     A ``sys_session_send`` naming a role the user addressed meets that role's
     obligation at child registration (inside ``_execute_subagent_tool``), so
     this only records failures: a dispatch that errored before registration,
-    or a post-registration teardown (*force*) whose spawned child is gone. The
-    turn-end handling quotes the first error line. A role with no obligation
-    (or a by-id send) is left alone.
+    or a post-registration teardown (*force*, scoped to the *child_session_id*
+    that was torn down) whose spawned child is gone. The turn-end handling
+    quotes the first error line. A role with no obligation (or a by-id send)
+    is left alone.
     """
     from omnigent.runner import app as _runner_app
 
@@ -2743,7 +2745,9 @@ def _note_member_dispatch_failure(
     ):
         return
     reason = error.splitlines()[0].removeprefix("Error:").strip() or "dispatch failed"
-    _runner_app.mark_member_obligation_failed(conversation_id, role, reason, force=force)
+    _runner_app.mark_member_obligation_failed(
+        conversation_id, role, reason, force=force, child_session_id=child_session_id
+    )
 
 
 async def _execute_subagent_tool(
@@ -3463,7 +3467,11 @@ async def _execute_subagent_tool(
             created_child=created_child,
         )
         _note_member_dispatch_failure(
-            conversation_id, sub_agent_name, copy_result.error, force=True
+            conversation_id,
+            sub_agent_name,
+            copy_result.error,
+            force=True,
+            child_session_id=child_session_id,
         )
         if teardown_warning is not None:
             return f"{copy_result.error}\n{teardown_warning}"
@@ -3488,7 +3496,9 @@ async def _execute_subagent_tool(
             created_child=created_child,
         )
         error = f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
-        _note_member_dispatch_failure(conversation_id, sub_agent_name, error, force=True)
+        _note_member_dispatch_failure(
+            conversation_id, sub_agent_name, error, force=True, child_session_id=child_session_id
+        )
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error
@@ -3501,7 +3511,9 @@ async def _execute_subagent_tool(
         error = (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
-        _note_member_dispatch_failure(conversation_id, sub_agent_name, error, force=True)
+        _note_member_dispatch_failure(
+            conversation_id, sub_agent_name, error, force=True, child_session_id=child_session_id
+        )
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error

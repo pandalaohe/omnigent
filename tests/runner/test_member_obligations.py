@@ -702,6 +702,8 @@ async def _run_named_dispatch(
     *,
     create_status: int,
     during_child_post: Callable[[], None] | None = None,
+    child_id: str = WORKER_CHILD,
+    child_post_status: int = 202,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Drive one named ``sys_session_send`` against a mock server.
 
@@ -710,6 +712,8 @@ async def _run_named_dispatch(
     :param during_child_post: Hook fired inside the child-message POST, i.e.
         the registration window between the child registration and the tool's
         return.
+    :param child_id: Id the create POST mints for the child.
+    :param child_post_status: Status the child-message POST answers.
     :returns: ``(tool_output, create_bodies)``.
     """
     from types import SimpleNamespace
@@ -753,10 +757,12 @@ async def _run_named_dispatch(
             create_bodies.append(json.loads(request.content))
             if create_status >= 400:
                 return httpx.Response(create_status, json={"error": "boom"})
-            return httpx.Response(201, json={"id": WORKER_CHILD})
-        if request.method == "POST" and request.url.path == f"/v1/sessions/{WORKER_CHILD}/events":
+            return httpx.Response(201, json={"id": child_id})
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
             if during_child_post is not None:
                 during_child_post()
+            if child_post_status >= 400:
+                return httpx.Response(child_post_status, json={"error": "child post failed"})
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -774,7 +780,7 @@ async def _run_named_dispatch(
                 session_inbox=session_inbox,
             )
         finally:
-            runner_app.unregister_subagent_work(WORKER_CHILD)
+            runner_app.unregister_subagent_work(child_id)
             runner_app._session_inboxes_ref.pop(PARENT, None)
     return output, create_bodies
 
@@ -837,6 +843,45 @@ async def test_terminal_during_registration_window_settles_the_obligation(
     assert _notices(server)[0]["data"]["item_data"]["message"] == (
         "executor did not run: fast failure"
     )
+
+
+@pytest.mark.asyncio
+async def test_child_teardown_fails_only_its_own_obligations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B's failed message POST fails B's record; A's running child stays attached."""
+    first = runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
+    output_a, _create_bodies = await _run_named_dispatch(monkeypatch, create_status=201)
+    assert json.loads(output_a)["status"] == "launching"
+    assert first.child_session_id == WORKER_CHILD
+
+    second = runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=2)
+    output_b, _create_bodies = await _run_named_dispatch(
+        monkeypatch,
+        create_status=201,
+        child_id="conv_member_child_b",
+        child_post_status=500,
+    )
+    assert output_b.startswith("Error:")
+
+    assert first.child_session_id == WORKER_CHILD
+    assert first.failure_reason is None
+    assert second.child_session_id is None
+    assert second.failure_reason is not None
+    assert "failed to send message" in second.failure_reason
+
+    # The next turn end quotes only B's failure: one notice, A untouched.
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server)
+    async with _runner_client(app) as client:
+        await _seed_session(client, labels=_member_labels())
+        await _post_message(client, "status?")
+        await _wait_until(lambda: bool(_notices(server)))
+        await _wait_until(lambda: runner_app.list_member_obligations(PARENT) == [first])
+
+    assert [notice["data"]["item_data"]["message"] for notice in _notices(server)] == [
+        f"executor did not run: {second.failure_reason}"
+    ]
 
 
 # --------------------------------------------------------------------------
