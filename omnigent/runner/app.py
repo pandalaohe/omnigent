@@ -493,6 +493,17 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "stopped", "killed"})
+# Runner-local terminal statuses mapped to the server's
+# ``external_session_status`` vocabulary, used to report a terminal edge for a
+# sub-agent whose work is not tracked on this runner (a cross-host child, or a
+# child whose work registry entry was wiped by a restart).
+_SUBAGENT_REPORTED_TERMINAL_STATUS: dict[str, str] = {
+    "completed": "completed",
+    "failed": "failed",
+    "cancelled": "stopped",
+    "stopped": "stopped",
+    "killed": "killed",
+}
 # Bound how long a sub-agent dispatch can wait for a start acknowledgment.
 # A timeout reports uncertain launch status, not proof that the process is dead.
 _SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
@@ -9296,6 +9307,55 @@ def create_runner_app(
         _retry_task.add_done_callback(_clear_retry_refs)
         _background_tasks.add(_retry_task)
 
+    async def _post_untracked_subagent_terminal(
+        child_session_id: str, *, status: str, output: str | None
+    ) -> None:
+        """Report a terminal edge for a sub-agent whose work is not tracked here.
+
+        A cross-host child's runner is not the parent's runner, so local
+        delivery has no parent inbox to reach; posting the edge to the server
+        routes it through the parent-runner forward. The same report recovers a
+        local child whose work entry a restart wiped, one polling interval
+        sooner than the reconciliation backstop.
+
+        :param child_session_id: The sub-agent child session id.
+        :param status: Server-vocabulary status, e.g. ``"completed"``.
+        :param output: The child's terminal output text, or ``None``.
+        """
+        from omnigent.native._native_post_delivery import post_external_session_status
+
+        try:
+            await post_external_session_status(
+                server_client,
+                session_id=child_session_id,
+                status=status,
+                output=output,
+            )
+        except Exception:  # noqa: BLE001 — the polling backstop re-delivers
+            _logger.warning(
+                "Failed to report an untracked sub-agent terminal status for %s",
+                child_session_id,
+                exc_info=True,
+                extra={"session_id": child_session_id},
+            )
+
+    def _post_untracked_subagent_terminal_soon(
+        child_session_id: str, *, status: str, output: str | None
+    ) -> None:
+        """Schedule :func:`_post_untracked_subagent_terminal` on the loop."""
+        reported = _SUBAGENT_REPORTED_TERMINAL_STATUS.get(status)
+        if reported is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            _post_untracked_subagent_terminal(child_session_id, status=reported, output=output)
+        )
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
     def _mark_subagent_terminal_and_wake(
         child_session_id: str, *, status: str, output: str | None
     ) -> _SubagentDeliveryAck:
@@ -9304,6 +9364,16 @@ def create_runner_app(
             _schedule_subagent_wake(ack.entry)
         if ack.entry is not None and ack.delivered:
             _settle_member_obligation_for_child(ack.entry)
+        elif (
+            not ack.delivered
+            and ack.entry is None
+            and child_session_id in _session_sub_agent_names
+        ):
+            # This session is a sub-agent this runner serves, but its work
+            # lives on the parent's runner (cross-host) or was lost (restart):
+            # hand the terminal edge back to the server, whose sub-agent path
+            # forwards it to the parent runner that owns the inbox.
+            _post_untracked_subagent_terminal_soon(child_session_id, status=status, output=output)
         return ack
 
     # Seam for the entrypoint's launch reaper (and tests): terminal delivery
@@ -11415,6 +11485,12 @@ def create_runner_app(
                     # A native lead's turn end is the forwarder's idle edge, the
                     # counterpart of _on_proxy_stream_end for non-native leads.
                     _handle_member_turn_end(conversation_id)
+            if isinstance(data, dict) and data.get("cross_host") is True:
+                # A cross-host child's terminal edge is delivered through the
+                # PARENT's runner; this runner gets it as a mirror only, for
+                # the pane / exit bookkeeping above. Attempting local delivery
+                # would register work whose parent inbox never exists here.
+                return Response(status_code=204)
             if status in ("idle", "completed", "failed", "stopped", "killed"):
                 if await _is_mirrored_claude_agent_tool_child(conversation_id):
                     # Claude Code hands a mirrored Agent-tool sub-agent's result

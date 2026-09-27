@@ -1185,3 +1185,119 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
     assert late.delivered and not late.delivered_now
     assert inbox.empty()
     assert child["runner_id"] == "other-live-runner"
+
+
+@pytest.mark.asyncio
+async def test_cross_host_mirror_terminal_status_is_acked_without_local_delivery(
+    _clean_subagent_registry: None,
+) -> None:
+    """The child runner's mirror edge must not register undeliverable work.
+
+    A cross-host child's terminal edge reaches its own runner (host B) marked
+    ``cross_host``: the PARENT's runner owns delivery into the parent inbox.
+    The mirror must update the pane state only — attempting local delivery
+    would register a work entry whose parent never runs here and 503.
+    """
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    server_client = _SnapshotServerClient(
+        _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        _parent_snapshot(parent_session_id=None),
+    )
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "done", "cross_host": True},
+            },
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert runner_app.get_subagent_work(CHILD_SESSION_ID) is None
+    assert runner_app._session_inboxes_ref.get(PARENT_SESSION_ID) is None
+    # The mirror still feeds this runner's own pane / exit bookkeeping.
+    assert app.state.native_pane_status[CHILD_SESSION_ID] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_untracked_sub_agent_terminal_reports_to_the_server(
+    _clean_subagent_registry: None,
+) -> None:
+    """A child this runner serves but does not track reports its terminal upstream.
+
+    A cross-host child's runner never holds the parent's work entry, so a
+    terminal edge has nowhere to deliver locally. The runner must hand it back
+    to the server, whose sub-agent path forwards it to the parent's runner;
+    a tracked child keeps the local path and reports nothing.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    server_client = _SnapshotServerClient(
+        _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        _parent_snapshot(parent_session_id=None),
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        init = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": CHILD_SESSION_ID,
+                "agent_id": "ag_reviewer",
+                "sub_agent_name": "reviewer",
+            },
+        )
+        assert init.status_code == 201, init.text
+        app.state.mark_subagent_terminal_and_wake(
+            CHILD_SESSION_ID, status="completed", output="review complete: LGTM"
+        )
+        reports: list[dict[str, Any]] = []
+        for _ in range(200):
+            reports = [
+                kwargs.get("json")
+                for url, kwargs in server_client.posts
+                if url.rstrip("/").endswith(f"/v1/sessions/{CHILD_SESSION_ID}/events")
+            ]
+            if reports:
+                break
+            await asyncio.sleep(0.01)
+
+        assert reports, (
+            "an untracked sub-agent's terminal edge never reached the server; the "
+            "parent runner can never deliver the result"
+        )
+        event = reports[-1]
+        assert event["type"] == "external_session_status"
+        assert event["data"]["status"] == "completed"
+        assert event["data"]["output"] == "review complete: LGTM"
+        assert runner_app._session_inboxes_ref.get(PARENT_SESSION_ID) is None
+
+        # A tracked child keeps the local delivery path and reports nothing.
+        runner_app.register_subagent_work(
+            parent_session_id=PARENT_SESSION_ID,
+            child_session_id=CHILD_SESSION_ID,
+            agent="reviewer",
+            title="review",
+        )
+        before = len(server_client.posts)
+        app.state.mark_subagent_terminal_and_wake(
+            CHILD_SESSION_ID, status="completed", output="second"
+        )
+        await asyncio.sleep(0.05)
+        assert len(server_client.posts) == before

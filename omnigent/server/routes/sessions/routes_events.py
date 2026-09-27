@@ -141,6 +141,7 @@ from omnigent.server.routes._sessions.common import (
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
+    _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _SUBAGENT_STATUS_GENERATION_LABEL_KEY,
     _SUBAGENT_STATUS_TYPE,
     _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
@@ -209,6 +210,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_filesystem_attachment_harness,
     _resolve_harness,
     _response_agent_name_from_store,
+    _RunnerForwardResult,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
@@ -780,6 +782,78 @@ async def _retry_session_single_flight(
                 lambda completed_task: _evict_retry_recovery_task(session_id, completed_task)
             )
     return await asyncio.shield(task)
+
+
+async def _cross_host_subagent_parent(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+) -> Conversation | None:
+    """
+    Return the parent when *conv* is a sub-agent running on another host.
+
+    A cross-host member child (SCC06 F2b) runs on its own host's runner, so
+    its terminal status cannot be delivered into the parent inbox the way a
+    co-located child's is; the parent's runner owns that inbox. ``None`` for a
+    top-level session, a hostless child, or a child on its parent's host.
+
+    :param conv: The child conversation the status edge belongs to.
+    :param conversation_store: Store used to read the parent row.
+    :returns: The parent conversation when the child is cross-host, else
+        ``None``.
+    """
+    parent_id = conv.parent_conversation_id
+    if conv.kind != "sub_agent" or conv.host_id is None or parent_id is None:
+        return None
+    parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+    if parent is None or parent.host_id == conv.host_id:
+        return None
+    return parent
+
+
+async def _forward_subagent_terminal_to_parent_runner(
+    child_conv: Conversation,
+    parent_conv: Conversation,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: Any,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """
+    POST a cross-host child's terminal status to the PARENT's runner.
+
+    The event keeps the child id, so the parent runner's
+    ``external_session_status`` handler rebuilds the work entry from the
+    server and enqueues the result in the parent inbox — the same delivery a
+    co-located child gets from its shared runner.
+
+    :param child_conv: The cross-host child whose terminal edge to deliver.
+    :param parent_conv: The child's parent, whose runner owns the inbox.
+    :param runner_router: Router used to resolve the parent's runner client.
+    :param tunnel_registry: Runner-tunnel registry used to await the parent
+        runner's (re)connect, or ``None`` in test setups.
+    :param forward_body: The ``external_session_status`` event body.
+    :returns: The parent runner's HTTP result, or ``None`` when no live parent
+        runner could be resolved.
+    """
+    if parent_conv.runner_id is None:
+        return None
+    client = await _wait_for_runner_client(
+        parent_conv.id,
+        runner_router,
+        tunnel_registry,
+        runner_id=parent_conv.runner_id,
+        timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
+    )
+    if client is None:
+        return None
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{child_conv.id}/events",
+            json=forward_body,
+            timeout=5.0,
+        )
+    except (httpx.HTTPError, ConnectionError):
+        return None
+    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
 
 
 def register_events_routes(
@@ -2324,10 +2398,24 @@ def register_events_routes(
                 )
             forward_body = body.model_dump()
             forward_body["data"] = data
+            # A cross-host member child's own runner has no parent inbox: the
+            # terminal edge it gets is a mirror for its pane / exit bookkeeping
+            # (marked so it does not attempt undeliverable work), while the
+            # PARENT's runner owns delivery into the parent inbox.
+            cross_host_parent = (
+                await _cross_host_subagent_parent(conv, conversation_store)
+                if status in {"idle", "completed", "failed", "stopped", "killed"}
+                else None
+            )
+            child_forward_body = (
+                {**forward_body, "data": {**data, "cross_host": True}}
+                if cross_host_parent is not None
+                else forward_body
+            )
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
-                forward_body,
+                child_forward_body,
             )
             if (
                 conv.kind == "sub_agent"
@@ -2340,7 +2428,17 @@ def register_events_routes(
                 # collab threads live in the app-server thread tree, and a
                 # devin sub-agent is a reconstructed chain of the parent
                 # session, never an omnigent-dispatched runner sub-agent.
-                if runner_result is None:
+                if cross_host_parent is not None:
+                    # The delivery contract is the parent-runner forward; the
+                    # mirror to the child's runner above is best-effort.
+                    runner_result = await _forward_subagent_terminal_to_parent_runner(
+                        conv,
+                        cross_host_parent,
+                        runner_router,
+                        getattr(request.app.state, "tunnel_registry", None),
+                        forward_body,
+                    )
+                elif runner_result is None:
                     # The child's pinned runner_id is stale — its runner was
                     # relaunched under a new id and only the parent was
                     # rebound, so the child points at a dead runner forever and

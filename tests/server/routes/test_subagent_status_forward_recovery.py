@@ -171,6 +171,60 @@ async def test_recover_no_parent_returns_none(
     assert _patch_forward_and_wait["forwarded_with"] == []
 
 
+async def test_cross_host_child_is_not_healed_to_the_parent_runner(
+    _patch_forward_and_wait: dict[str, Any],
+) -> None:
+    """
+    A child on another host keeps its own runner; the parent's cannot serve it.
+
+    SCC06 F2b: a cross-host member child runs on its host's runner, so
+    repointing it at the parent's runner would move it to the wrong host.
+    Recovery must decline (the caller then fails the forward rather than
+    misroute it).
+    """
+    child = _conv("conv_child", runner_id="runner_member", parent_id="conv_parent")
+    child.host_id = "22" * 16
+    parent = _conv("conv_parent", runner_id="runner_lead")
+    parent.host_id = "11" * 16
+    store = _FakeStore(parent)
+
+    result = await _recover_subagent_status_forward_via_parent(
+        child,
+        runner_router=None,
+        tunnel_registry=object(),
+        conversation_store=store,  # type: ignore[arg-type]
+        forward_body={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert result is None
+    assert store.rebinds == []
+    assert _patch_forward_and_wait["waited_for"] == []
+    assert _patch_forward_and_wait["forwarded_with"] == []
+
+
+async def test_same_host_child_still_heals_to_the_parent_runner(
+    _patch_forward_and_wait: dict[str, Any],
+) -> None:
+    """A co-located child (equal hosts) keeps today's heal behaviour."""
+    child = _conv("conv_child", runner_id="runner_old", parent_id="conv_parent")
+    child.host_id = "11" * 16
+    parent = _conv("conv_parent", runner_id="runner_new")
+    parent.host_id = "11" * 16
+    store = _FakeStore(parent)
+
+    result = await _recover_subagent_status_forward_via_parent(
+        child,
+        runner_router=None,
+        tunnel_registry=object(),
+        conversation_store=store,  # type: ignore[arg-type]
+        forward_body={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert result is not None and result.status_code == 202
+    assert store.rebinds == [("conv_child", "runner_new")]
+    assert _patch_forward_and_wait["forwarded_with"] == ["conv_child"]
+
+
 async def test_recover_same_runner_skips_rebind_but_retries(
     _patch_forward_and_wait: dict[str, Any],
 ) -> None:

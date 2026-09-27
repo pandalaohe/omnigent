@@ -3762,6 +3762,18 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
+    # A cross-host member child (SCC06 F2b) runs on its OWN host's runner, so
+    # the parent's runner is not a valid place to heal it to; leave the binding
+    # alone and let the caller fail the forward instead of misrouting it.
+    parent_id = child_conv.parent_conversation_id
+    if (
+        getattr(child_conv, "host_id", None) is not None
+        and parent_id is not None
+        and parent_id != child_conv.id
+    ):
+        parent_conv = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+        if parent_conv is not None and parent_conv.host_id != child_conv.host_id:
+            return None
     # Walk the ancestor chain (immediate parent first, then root) to find a
     # live runner.  A single hop covers the common case; two hops cover nested
     # sub-agents where the immediate parent's runner is also stale but the root
