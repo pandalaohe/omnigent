@@ -1235,6 +1235,27 @@ describe("late direct-attach advert", () => {
   });
 });
 
+describe("attach unmount", () => {
+  it("unmount disposes the attached terminal session", async () => {
+    const view = render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const session = terminalSessionMock.instances[0];
+
+    view.unmount();
+
+    expect(session.dispose).toHaveBeenCalled();
+  });
+
+  it("unmount before the deferred attach runs opens no session", async () => {
+    const view = render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+
+    view.unmount();
+    await act(async () => {});
+
+    expect(terminalSessionMock.instances).toHaveLength(0);
+  });
+});
+
 describe("closed bridge overlay", () => {
   it("renders a resume button beside the closed message and invokes the callback", async () => {
     const onResume = vi.fn().mockResolvedValue(undefined);

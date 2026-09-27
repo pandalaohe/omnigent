@@ -1,12 +1,9 @@
 // xterm.js view bridged to an agent's tmux session over a WebSocket.
 //
 // The xterm + WebSocket lifecycle lives in `TerminalSession` (plain
-// JS, outside React). This component is a thin shell: a callback ref
-// constructs the session when its container node attaches and
-// returns a cleanup that disposes the session when the node detaches
-// (or any of the addressing inputs change). React 19 calls the
-// returned cleanup directly — no `useEffect` + `useRef` dance, no
-// guard against a missing `ref.current`.
+// JS, outside React); this component is a thin shell around a
+// callback ref that constructs the session when its container node
+// attaches.
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -522,7 +519,16 @@ export function TerminalView({
 
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
-      if (node === null) return;
+      // React 18 ignores the cleanup this callback returns and calls the
+      // ref with null on unmount instead, so the attach is retired here.
+      if (node === null) {
+        attachGenerationRef.current += 1;
+        upgradeCtlRef.current?.abort();
+        disposeActiveSession();
+        terminalNodeRef.current = null;
+        onStateChangeRef.current?.(null);
+        return;
+      }
       terminalNodeRef.current = node;
       // React re-runs a ref callback for the *same* node whenever the
       // callback's identity changes — here, when the runner's
