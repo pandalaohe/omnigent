@@ -359,39 +359,3 @@ def test_agent_owner_legacy_null_is_admin_only(
     perm_store.ensure_user(BOB)
     perm_store.set_admin(BOB, True)
     require_agent_owner(BOB, agent, perm_store)
-
-
-# ── Visitor author marker ───────────────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("Alice", "visitor:Alice"),
-        ("  Alice  ", "visitor:Alice"),
-        ("Ali\nce", "visitor:Ali" + "ce"),
-        ("bob:builder", "visitor:bobbuilder"),
-        ("", "visitor:"),
-        (None, "visitor:"),
-        ("x" * 60, "visitor:" + "x" * 40),
-    ],
-)
-def test_visitor_author_cleans_the_submitted_name(name: str | None, expected: str) -> None:
-    """Control characters and ``:`` cannot survive into the author marker."""
-    assert _auth_helpers.visitor_author(name) == expected
-
-
-@pytest.mark.parametrize(
-    ("created_by", "expected"),
-    [
-        ("visitor:Alice", True),
-        ("visitor:", True),
-        ("alice@example.com", False),
-        (None, False),
-    ],
-)
-def test_is_visitor_author_matches_only_the_marker_family(
-    created_by: str | None, expected: bool
-) -> None:
-    """Account ids never carry the marker; the marker always does."""
-    assert _auth_helpers.is_visitor_author(created_by) is expected

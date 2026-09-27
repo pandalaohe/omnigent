@@ -195,6 +195,11 @@ def pinned_label_key(user_id: str | None) -> str:
 # match that fallback's unit.
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
+# New-session id an archived session was continued into (``POST
+# /v1/sessions/{sid}/continue``). The archived row keeps the pointer so a
+# repeat continue returns the same session instead of minting another one.
+CONTINUED_TO_LABEL_KEY = "omnigent.continued_to"
+
 # Per-session secret keying artifact-link tokens; server-internal (never
 # client-settable, never shown to viewers). Deleting or rotating it revokes
 # every link of the session.

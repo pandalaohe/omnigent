@@ -10,6 +10,7 @@ import pytest
 
 from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.comment_store.visitor_comments import VISITOR_COMMENT_NOTE
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 
@@ -455,6 +456,43 @@ def test_filter_by_path_and_status(
         f"Expected only {target.id!r} (app.py + draft), got {ids!r}. "
         "Combined path+status filter is broken."
     )
+
+
+def test_visitor_drafts_hidden_and_sent_rows_marked(
+    tool: ListCommentsTool,
+    store: _InMemoryCommentStore,
+) -> None:
+    """
+    Visitor comments the owner never sent stay hidden; sent ones are marked.
+
+    A visitor comment is feedback the owner has not vouched for until it is
+    sent to the agent, so the tool must not surface it as an open item.
+    Once addressed (sent), the row must carry the untrusted source/note
+    fields, while owner rows stay unchanged.
+    """
+    owner = store.add("conv-123", "app.py", "Owner note", 0, 10)
+    visitor_draft = store.add(
+        "conv-123", "app.py", "Unsent visitor note", 20, 30, created_by="visitor:Alice"
+    )
+    visitor_sent = store.add(
+        "conv-123", "app.py", "Sent visitor note", 40, 50, created_by="visitor:"
+    )
+    store.update_comment(visitor_sent.id, "conv-123", status="addressed")
+
+    result = _invoke(tool, {})
+    rows = {c["id"]: c for c in result["comments"]}
+    assert visitor_draft.id not in rows, (
+        f"Unsent visitor comment {visitor_draft.id!r} must not be listed"
+    )
+    assert set(rows) == {owner.id, visitor_sent.id}
+    assert "source" not in rows[owner.id], "Owner rows must not gain visitor fields"
+    assert "note" not in rows[owner.id]
+    assert rows[visitor_sent.id]["source"] == "visitor"
+    assert rows[visitor_sent.id]["note"] == VISITOR_COMMENT_NOTE
+
+    # The draft-status filter must not re-introduce the hidden visitor draft.
+    drafts = _invoke(tool, {"status": "draft"})
+    assert visitor_draft.id not in {c["id"] for c in drafts["comments"]}
 
 
 def test_comment_fields_are_complete(

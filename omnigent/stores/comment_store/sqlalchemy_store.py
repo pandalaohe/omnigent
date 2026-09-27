@@ -16,7 +16,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Comment, CommentsFingerprint
-from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.comment_store import COMMENT_STATUS_DRAFT, CommentStore
 
 
 def _to_entity(row: SqlComment) -> Comment:
@@ -102,7 +102,7 @@ class SqlAlchemyCommentStore(CommentStore):
                 start_index=start_index,
                 end_index=end_index,
                 body=body,
-                status=encode_comment_status("draft"),
+                status=encode_comment_status(COMMENT_STATUS_DRAFT),
                 created_at=created_us // 1_000_000,
                 updated_at=created_us,
                 anchor_content=anchor_content,

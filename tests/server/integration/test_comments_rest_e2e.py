@@ -34,6 +34,7 @@ from omnigent.server.auth import LEVEL_EDIT
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.comment_store.visitor_comments import visitor_author
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -225,6 +226,57 @@ async def test_delete_nonexistent_comment_returns_404(
         headers=headers,
     )
     assert resp.status_code == 404
+
+
+async def test_editor_deletes_visitor_comment_but_cannot_rewrite_it(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A visitor comment is deletable by any editor; its body stays author-only.
+
+    A visitor comment has no account author, so the author check cannot
+    apply to deletion — an editor cleaning up the owner's inbox must be
+    able to remove it. Rewriting the visitor's words stays forbidden, and
+    marking it addressed stays open to editors as for any comment.
+    """
+    session_id = _seed_session(db_uri)
+    headers = {"X-Forwarded-Email": ALICE}
+    visitor = SqlAlchemyCommentStore(db_uri).add(
+        session_id,
+        "src/foo.py",
+        "feedback left through a shared link",
+        0,
+        5,
+        created_by=visitor_author("Mallory"),
+    )
+
+    rewrite = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{visitor.id}",
+        json={"body": "rewritten by the owner"},
+        headers=headers,
+    )
+    assert rewrite.status_code == 403, (
+        f"Editing a visitor comment's body must stay refused, got "
+        f"{rewrite.status_code}: {rewrite.text}"
+    )
+
+    status = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{visitor.id}",
+        json={"status": "addressed"},
+        headers=headers,
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["status"] == "addressed"
+
+    deleted = await auth_client.delete(
+        f"/v1/sessions/{session_id}/comments/{visitor.id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 200, (
+        f"An editor must be able to delete a visitor comment, got "
+        f"{deleted.status_code}: {deleted.text}"
+    )
+    assert deleted.json()["deleted"] is True
 
 
 async def test_comment_on_nonexistent_session_returns_404(

@@ -86,9 +86,6 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
-from omnigent.server.routes._auth_helpers import (
-    visitor_author as _visitor_author,
-)
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._gzip_route import skip_gzip
 from omnigent.server.routes._oauth import RATE_LIMITER_MAX_KEYS, SlidingWindowRateLimiter
@@ -97,6 +94,9 @@ from omnigent.server.routes.sessions.routes_resources import _RunnerStreamRespon
 from omnigent.server.schemas import ArtifactOpenRequestEvent
 from omnigent.stores import ConversationStore
 from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.comment_store.visitor_comments import (
+    visitor_author as _visitor_author,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 logger = logging.getLogger(__name__)

@@ -4,6 +4,11 @@ from abc import ABC, abstractmethod
 
 from omnigent.entities import Comment, CommentsFingerprint
 
+# Status of a comment that has not been sent to the agent yet. Mirrors the
+# ``"draft"`` key of :data:`omnigent.db.enum_codecs.COMMENT_STATUS`, the
+# vocabulary the SQL store encodes.
+COMMENT_STATUS_DRAFT = "draft"
+
 
 class CommentStore(ABC):
     """Abstract base for file comment persistence.
