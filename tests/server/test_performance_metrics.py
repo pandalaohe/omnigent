@@ -23,6 +23,7 @@ from omnigent.server.performance_metrics import (
     ServerPerformanceMetrics,
     SystemLoadAverage,
     publish_server_metrics_periodically,
+    redact_artifact_token,
     set_request_duration_for_access_log,
     set_request_id_for_access_log,
     set_request_session_id_for_access_log,
@@ -394,6 +395,57 @@ def test_request_duration_access_formatter_appends_individual_duration() -> None
         )
     finally:
         set_request_duration_for_access_log(None)
+
+
+def test_request_duration_access_formatter_redacts_artifact_token() -> None:
+    """
+    The artifact capability token never reaches the access log.
+
+    The token in an artifact URL is the credential; a logged copy could be
+    replayed, so the access formatter must replace that path segment.
+    """
+    formatter = RequestDurationAccessFormatter(
+        fmt='%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+        use_colors=False,
+    )
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(
+            "10.0.0.1:0",
+            "GET",
+            "/v1/artifacts/a1.x.y/index.html",
+            "1.1",
+            200,
+        ),
+        exc_info=None,
+    )
+
+    try:
+        output = formatter.format(record)
+    finally:
+        set_request_duration_for_access_log(None)
+
+    assert "/v1/artifacts/<redacted>/index.html" in output
+    assert "a1.x.y" not in output
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/omni/v1/artifacts/a1.x.y/index.html",
+        "/v1/artifacts/a1.x.y/index.html?cachebust=1",
+    ],
+)
+def test_redact_artifact_token_handles_prefix_and_query(text: str) -> None:
+    """Redaction works under a base-path prefix and before a query string."""
+    redacted = redact_artifact_token(text)
+
+    assert "a1.x.y" not in redacted
+    assert "/v1/artifacts/<redacted>/index.html" in redacted
 
 
 def test_request_duration_access_formatter_colors_standard_level_name() -> None:

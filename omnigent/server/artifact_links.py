@@ -1,7 +1,7 @@
 """Artifact-link token and per-session key primitives.
 
-Artifact capability URLs carry a signed descriptor (session, root, entry,
-kind, view) keyed by a random per-session secret stored in the
+Artifact capability URLs carry a signed descriptor (session, workspace,
+root, entry, kind, view) keyed by a random per-session secret stored in the
 server-reserved :data:`ARTIFACT_LINK_KEY_LABEL` conversation label. This
 module owns the wire format and the key lifecycle; the HTTP routes and the
 serve path consume it.
@@ -26,7 +26,10 @@ _TOKEN_PREFIX = "a1"
 _BRIDGE_CONTEXT = b"bridge"
 _MAC_BYTES = 16
 _SESSION_KEY_BYTES = 32
-_PAYLOAD_KEYS = frozenset({"s", "r", "b", "e", "k", "v", "i"})
+_PAYLOAD_KEYS = frozenset({"s", "r", "b", "e", "k", "v", "i", "w"})
+# ``conversations.workspace_id`` is a signed 64-bit integer; an id above its
+# range raises in the store lookup before the mac is even verified.
+_WORKSPACE_ID_MAX = 2**63 - 1
 
 ArtifactVerifyResult = Literal["ok", "revoked", "forged"]
 
@@ -36,6 +39,8 @@ class ArtifactTokenClaims:
     """Descriptor carried by an artifact capability URL.
 
     :param session_id: Session the link belongs to, e.g. ``"conv_abc123"``.
+    :param workspace_id: Workspace the link was minted in; the credential-free
+        serve route rebinds it around every store / reader lookup.
     :param root: Bundle root — workspace-relative (posix, ``""`` = workspace
         root) when ``absolute`` is ``False``, absolute host path otherwise.
     :param absolute: ``True`` when ``root`` is an absolute host path (the
@@ -51,6 +56,7 @@ class ArtifactTokenClaims:
     """
 
     session_id: str
+    workspace_id: int
     root: str
     absolute: bool
     entry: str
@@ -78,6 +84,7 @@ def encode_artifact_token(
     session_key: bytes,
     *,
     session_id: str,
+    workspace_id: int,
     root: str,
     absolute: bool,
     entry: str,
@@ -102,6 +109,7 @@ def encode_artifact_token(
                 "k": kind,
                 "v": view,
                 "i": key_id(session_key),
+                "w": workspace_id,
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -145,6 +153,7 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
     kind = payload["k"]
     view = payload["v"]
     kid = payload["i"]
+    workspace_id = payload["w"]
     if not isinstance(session_id, str) or not isinstance(root, str) or not isinstance(entry, str):
         return None
     if not isinstance(kid, str):
@@ -152,10 +161,19 @@ def decode_artifact_token(token: str) -> ArtifactTokenClaims | None:
     # bool is an int subclass; only the wire's 0 / 1 are valid.
     if isinstance(absolute, bool) or absolute not in (0, 1):
         return None
+    # Workspace ids are non-negative ints within the column's range; a bool
+    # would silently compare as 0 / 1 and aim the lookup at the wrong workspace.
+    if (
+        isinstance(workspace_id, bool)
+        or not isinstance(workspace_id, int)
+        or not 0 <= workspace_id <= _WORKSPACE_ID_MAX
+    ):
+        return None
     if kind not in ("b", "f") or view not in ("p", "r"):
         return None
     return ArtifactTokenClaims(
         session_id=session_id,
+        workspace_id=workspace_id,
         root=root,
         absolute=bool(absolute),
         entry=entry,

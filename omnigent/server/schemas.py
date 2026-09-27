@@ -4319,6 +4319,29 @@ class BrowserActionRequestEvent(_SSEEventBase):
     args: dict[str, Any]
 
 
+class ArtifactOpenRequestEvent(_SSEEventBase):
+    """
+    Request that the web UI open a workspace file in the preview panel.
+
+    Emitted by the server ``POST /v1/sessions/{id}/artifacts/open`` route
+    when the runner-side ``open_in_panel`` tool asks the web client to show
+    a file. The event fans out on the session stream to every subscribed
+    client; each client mints its own artifact link for ``path`` with its
+    own authorization, so the event carries no URL and grants no file
+    access by itself.
+
+    :param type: Always ``"artifact.open_request"``.
+    :param path: Workspace-relative path, or an absolute host path with a
+        leading slash, e.g. ``"reports/index.html"``.
+    :param base: Which root ``path`` is relative to — ``"workspace"`` for a
+        session-workspace path, ``"host"`` for an absolute host path.
+    """
+
+    type: Literal["artifact.open_request"]
+    path: str
+    base: Literal["workspace", "host"]
+
+
 class ElicitationResolvedEvent(_SSEEventBase):
     """
     Signal that a previously-published elicitation is no longer
@@ -4918,6 +4941,8 @@ ServerStreamEvent = Annotated[
     | ElicitationResolvedEvent
     # ── Transient (SSE-only) — embedded-browser action request ─
     | BrowserActionRequestEvent
+    # ── Transient (SSE-only) — artifact open request ───────────
+    | ArtifactOpenRequestEvent
     # ── Transient (SSE-only) — native policy DENY signal ───────
     | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────

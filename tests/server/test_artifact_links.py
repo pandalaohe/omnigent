@@ -25,6 +25,7 @@ _ROTATED_KEY = b"\x22" * 32
 def _token(key: bytes = _KEY, **overrides: object) -> str:
     fields: dict[str, object] = {
         "session_id": "conv_abc123",
+        "workspace_id": 0,
         "root": "reports",
         "absolute": False,
         "entry": "index.html",
@@ -45,6 +46,7 @@ def _payload_segment(claims: ArtifactTokenClaims, **overrides: object) -> str:
         "k": claims.kind,
         "v": claims.view,
         "i": claims.key_id,
+        "w": claims.workspace_id,
     }
     fields.update(overrides)
     raw = json.dumps(fields, separators=(",", ":")).encode("utf-8")
@@ -52,12 +54,13 @@ def _payload_segment(claims: ArtifactTokenClaims, **overrides: object) -> str:
 
 
 def test_round_trip_preserves_every_claim() -> None:
-    token = _token(absolute=True, entry="deep/page.html", kind="f", view="r")
+    token = _token(workspace_id=7, absolute=True, entry="deep/page.html", kind="f", view="r")
     claims = decode_artifact_token(token)
 
     assert claims is not None
     assert claims == ArtifactTokenClaims(
         session_id="conv_abc123",
+        workspace_id=7,
         root="reports",
         absolute=True,
         entry="deep/page.html",
@@ -124,6 +127,7 @@ _VALID_PAYLOAD: dict[str, object] = {
     "k": "b",
     "v": "p",
     "i": "0123abcd",
+    "w": 0,
 }
 
 _MALFORMED_TOKENS = [
@@ -147,6 +151,11 @@ _MALFORMED_TOKENS = [
     "a1." + _payload_b64({**_VALID_PAYLOAD, "e": 42}) + ".mac",
     "a1." + _payload_b64({**_VALID_PAYLOAD, "k": "z"}) + ".mac",
     "a1." + _payload_b64({**_VALID_PAYLOAD, "v": "z"}) + ".mac",
+    "a1." + _payload_b64({k: v for k, v in _VALID_PAYLOAD.items() if k != "w"}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "w": "0"}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "w": True}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "w": -1}) + ".mac",
+    "a1." + _payload_b64({**_VALID_PAYLOAD, "w": 2**63}) + ".mac",
 ]
 
 

@@ -125,6 +125,11 @@ class _RunnerStreamResponse(StreamingResponse):
         super().__init__(upstream.aiter_raw(), headers=headers)
         self._upstream = upstream
 
+    @property
+    def upstream(self) -> httpx.Response:
+        """The runner response this wrapper streams and closes."""
+        return self._upstream
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
             await super().__call__(scope, receive, send)
@@ -436,6 +441,9 @@ def register_resources_routes(
                     "content-disposition",
                     "cache-control",
                     "x-content-type-options",
+                    # Present only when the caller sent ``within``; the artifact
+                    # serve route reads it back to confirm bundle containment.
+                    "x-omnigent-within",
                 )
                 if name in resp.headers
             }
@@ -3069,3 +3077,21 @@ def register_resources_routes(
     # sibling (e.g. `.../environments/{id}/shell`), which is how they behaved
     # when they were registered inline on `router`.
     router.include_router(file_read_router)
+
+    # Artifact capability URLs (mint/revoke/open plus the public serve and
+    # preflight routes). Registered from here so the mint and open paths reuse
+    # this function's authorization closures instead of re-deriving them.
+    from omnigent.server.routes.artifacts import register_artifact_routes
+
+    register_artifact_routes(
+        router,
+        conversation_store=conversation_store,
+        host_registry=host_registry,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+        _authorize_browse_read=_authorize_browse_read,
+        _authorize_absolute_browse=_authorize_absolute_browse,
+        _stream_download_from_runner=_stream_download_from_runner,
+        _read_workspace_via_host=_read_workspace_via_host,
+        _runner_path_segment=_runner_path_segment,
+    )

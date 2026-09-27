@@ -198,6 +198,51 @@
         "title": "ArchivedSessionFacetsResponse",
         "type": "object"
       },
+      "ArtifactOpenRequestEvent": {
+        "description": "Request that the web UI open a workspace file in the preview panel.\n\nEmitted by the server `POST /v1/sessions/{id}/artifacts/open` route\nwhen the runner-side `open_in_panel` tool asks the web client to show\na file. The event fans out on the session stream to every subscribed\nclient; each client mints its own artifact link for `path` with its\nown authorization, so the event carries no URL and grants no file\naccess by itself.",
+        "properties": {
+          "base": {
+            "description": "Which root `path` is relative to \u2014 `\"workspace\"` for a session-workspace path, `\"host\"` for an absolute host path.",
+            "enum": [
+              "workspace",
+              "host"
+            ],
+            "title": "Base",
+            "type": "string"
+          },
+          "path": {
+            "description": "Workspace-relative path, or an absolute host path with a leading slash, e.g. `\"reports/index.html\"`.",
+            "title": "Path",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "artifact.open_request",
+            "description": "Always `\"artifact.open_request\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "path",
+          "base"
+        ],
+        "title": "ArtifactOpenRequestEvent",
+        "type": "object"
+      },
       "AssignmentCreateRequest": {
         "additionalProperties": false,
         "description": "Body for `POST /v1/assignments`.",
@@ -5967,6 +6012,7 @@
       "ServerStreamEvent": {
         "discriminator": {
           "mapping": {
+            "artifact.open_request": "#/components/schemas/ArtifactOpenRequestEvent",
             "browser.action_request": "#/components/schemas/BrowserActionRequestEvent",
             "response.cancelled": "#/components/schemas/CancelledEvent",
             "response.client_task.cancel": "#/components/schemas/ClientTaskCancelEvent",
@@ -6136,6 +6182,9 @@
           },
           {
             "$ref": "#/components/schemas/BrowserActionRequestEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ArtifactOpenRequestEvent"
           },
           {
             "$ref": "#/components/schemas/PolicyDeniedEvent"

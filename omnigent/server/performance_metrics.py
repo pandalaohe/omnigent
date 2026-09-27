@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import logging
 import os
+import re
 import sys
 import time
 
@@ -189,6 +190,26 @@ class MeterLike(Protocol):
         ...
 
 
+# Artifact capability URLs carry their credential in the path; the token
+# must never reach a log line. Matched on the path segment whether or not a
+# base-path prefix precedes ``/v1``, and stopped before a query string.
+_ARTIFACT_TOKEN_RE = re.compile(r"(/v1/artifacts/)[^/\s?\"]+")
+
+
+def redact_artifact_token(text: str) -> str:
+    """
+    Replace the token segment of every artifact URL in *text*.
+
+    Used by the access formatter and by the app-level logs that write a
+    request path, so a leaked capability URL cannot be replayed from logs.
+
+    :param text: A log message or path string, e.g.
+        ``'GET /v1/artifacts/a1.x.y/index.html HTTP/1.1'``.
+    :returns: *text* with the token replaced by ``<redacted>``.
+    """
+    return _ARTIFACT_TOKEN_RE.sub(r"\1<redacted>", text)
+
+
 def _sanitize_access_log_value(value: str) -> str:
     """
     Make a client-controlled string safe to embed in an access-log line.
@@ -242,7 +263,7 @@ class RequestDurationAccessFormatter(AccessFormatter):
             logger.
         :returns: Enriched access message.
         """
-        message = super().formatMessage(record)
+        message = redact_artifact_token(super().formatMessage(record))
         parts: list[str] = [message]
         try:
             duration_seconds = _REQUEST_DURATION_CONTEXT.get()
