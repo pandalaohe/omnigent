@@ -8528,11 +8528,11 @@ def create_runner_app(
         entries = _session_member_entries.get(session_id) or {}
         if len(entries) < 2:
             return None
-        if injected:
-            turn = _member_turn_stamps.get(session_id)
-            if turn is None:
-                return None
-        else:
+        # A body injected into the turn already running binds to that turn's
+        # stamp; a running turn that never routed (recovery, /compact) is
+        # stamped here so its own end can still settle the request.
+        turn = _member_turn_stamps.get(session_id) if injected else None
+        if turn is None:
             turn = advance_member_turn(session_id)
         lead_roles = {role for role, entry in entries.items() if entry.get("lead") is True}
         note_lines: list[str] = []
