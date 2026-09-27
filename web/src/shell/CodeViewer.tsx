@@ -438,6 +438,12 @@ export interface CodeViewerProps {
    * itself can't anchor text-selection comments).
    */
   onRequestEditMode?: () => void;
+  /**
+   * Lifts the page currently displayed inside the HTML preview frame, so the
+   * parent can read/write comments under that page's path (null once the
+   * preview surface goes away).
+   */
+  onFrameChange?: (frame: { path: string; source: string } | null) => void;
 }
 
 export function CodeViewer({
@@ -460,6 +466,7 @@ export function CodeViewer({
   tocOpen = false,
   onTocToggle,
   onRequestEditMode,
+  onFrameChange,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -843,11 +850,13 @@ export function CodeViewer({
     return (
       <HtmlCommentViewer
         conversationId={conversationId}
+        path={path}
         content={content}
         truncated={truncated}
         comments={previewComments}
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
+        onFrameChange={onFrameChange}
       />
     );
   }

@@ -409,7 +409,12 @@ function FileViewerBody({
     currentNavIdx >= 0 && currentNavIdx < navigableFiles.length - 1
       ? navigableFiles[currentNavIdx + 1]
       : null;
-  const commentsQuery = useComments(conversationId, path);
+  // The page the HTML preview frame currently displays. Comments follow it —
+  // an in-frame navigation shows a sibling bundle file, which has its own
+  // comment thread — and fall back to the opened file when no frame is up.
+  const [frame, setFrame] = useState<{ path: string; source: string } | null>(null);
+  const commentPath = frame?.path ?? path;
+  const commentsQuery = useComments(conversationId, commentPath);
   const addComment = useAddComment(conversationId);
   const updateComment = useUpdateComment(conversationId);
   const deleteComment = useDeleteComment(conversationId);
@@ -457,10 +462,16 @@ function FileViewerBody({
   // Reset selection state whenever the file changes.
   useEffect(() => {
     setActiveSelection(null);
+    setFrame(null);
     handleDirtyChange(false);
     setSaveStatus("idle");
     setTocOpen(false);
   }, [path, handleDirtyChange]);
+  // A selection belongs to one page; the preview frame reporting a different
+  // page (in-frame navigation) invalidates it.
+  useEffect(() => {
+    setActiveSelection(null);
+  }, [commentPath]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
   // When navigating via < > arrows (path changes while already open), the
@@ -567,8 +578,8 @@ function FileViewerBody({
   const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const { open: openComments, addressed: addressedComments } = useMemo(
-    () => classifyAndRemapComments(allComments, fileContent),
-    [allComments, fileContent],
+    () => classifyAndRemapComments(allComments, frame?.source ?? fileContent),
+    [allComments, frame?.source, fileContent],
   );
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
@@ -1649,6 +1660,7 @@ function FileViewerBody({
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+              onFrameChange={setFrame}
             />
           )}
         </div>
@@ -1663,7 +1675,7 @@ function FileViewerBody({
               if (activeSelection == null) return;
               addComment.mutate(
                 {
-                  path,
+                  path: commentPath,
                   start_index: activeSelection.start_index,
                   end_index: activeSelection.end_index,
                   body,

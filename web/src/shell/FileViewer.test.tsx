@@ -15,7 +15,7 @@
 //      comments panel is open — never from merely opening the file.
 
 import { useMemo } from "react";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +23,7 @@ import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
 
 const codeViewerRenders = vi.hoisted(() => vi.fn());
+const addCommentMutate = vi.hoisted(() => vi.fn());
 
 // ── Mock heavy child components ───────────────────────────────────────────────
 
@@ -37,12 +38,20 @@ vi.mock("./CodeViewer", () => ({
     viewMode,
     searchOpen,
     onDirtyChange,
+    onSetActiveSelection,
+    onFrameChange,
   }: {
     path: string;
     position?: { line: number };
     viewMode: string;
     searchOpen?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
+    onSetActiveSelection?: (sel: {
+      start_index: number;
+      end_index: number;
+      anchor_content: string;
+    }) => void;
+    onFrameChange?: (frame: { path: string; source: string } | null) => void;
   }) => {
     codeViewerRenders({ path, position });
     return (
@@ -52,6 +61,20 @@ vi.mock("./CodeViewer", () => ({
         data-search-open={String(!!searchOpen)}
       >
         <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
+        <button
+          type="button"
+          aria-label="report frame"
+          onClick={() =>
+            onFrameChange?.({ path: "linked/page2.html", source: "<html>page two</html>" })
+          }
+        />
+        <button
+          type="button"
+          aria-label="select text"
+          onClick={() =>
+            onSetActiveSelection?.({ start_index: 0, end_index: 4, anchor_content: "page" })
+          }
+        />
         {viewMode === "editor" && (
           <textarea aria-label="Draft text" onChange={() => onDirtyChange?.(true)} />
         )}
@@ -67,6 +90,7 @@ vi.mock("./CommentsPanel", () => ({
   CommentsPanel: ({
     onClickComment,
     onAddressAll,
+    onAddComment,
     comments,
     addressedComments,
     activeSelection,
@@ -74,6 +98,7 @@ vi.mock("./CommentsPanel", () => ({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
     onAddressAll?: () => void;
+    onAddComment?: (body: string) => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     comments?: any[];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -89,6 +114,7 @@ vi.mock("./CommentsPanel", () => ({
           onClick={() => onClickComment?.(c)}
         />
       ))}
+      <button type="button" aria-label="add comment" onClick={() => onAddComment?.("body text")} />
       <button type="button" aria-label="address all comments" onClick={onAddressAll} />
     </div>
   ),
@@ -126,7 +152,7 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
 
 vi.mock("@/hooks/useComments", () => ({
   useComments: vi.fn(),
-  useAddComment: vi.fn(() => ({ mutate: vi.fn() })),
+  useAddComment: vi.fn(() => ({ mutate: addCommentMutate })),
   useUpdateComment: vi.fn(() => ({ mutate: vi.fn() })),
   useDeleteComment: vi.fn(() => ({ mutate: vi.fn() })),
 }));
@@ -2094,4 +2120,33 @@ describe("file position navigation", () => {
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
     },
   );
+});
+
+describe("FileViewer comments follow the preview frame", () => {
+  it("queries and posts comments under the page the frame reports", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, path: "file1.py" });
+
+    // No frame yet: comments belong to the opened file.
+    expect(useCommentsMock).toHaveBeenLastCalledWith("conv_1", "file1.py");
+
+    // In-frame navigation reports the linked page; comments follow it.
+    fireEvent.click(screen.getByRole("button", { name: "report frame" }));
+    await waitFor(() =>
+      expect(useCommentsMock).toHaveBeenLastCalledWith("conv_1", "linked/page2.html"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "select text" }));
+    fireEvent.click(screen.getByRole("button", { name: "add comment" }));
+
+    expect(addCommentMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: "linked/page2.html",
+        start_index: 0,
+        end_index: 4,
+        body: "body text",
+      }),
+      expect.anything(),
+    );
+  });
 });
