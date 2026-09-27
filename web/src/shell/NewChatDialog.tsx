@@ -352,6 +352,8 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { AgentBadge } from "@/components/AgentBadge";
+import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
+import { agentBadgeFor } from "@/lib/agentBadgePreferences";
 import {
   AGENT_TEMPLATE_LABEL,
   customAgentBundle,
@@ -1540,6 +1542,13 @@ export function AgentHarnessPicker({
   const { recentHarnesses } = useRecentHarnesses();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
+  // The badge is the Agent's optional visual identity; Smart Routing has no
+  // single agent, hence the null. Resolved before the early return so the
+  // trigger can skip its wrapper entirely when no badge is configured.
+  const triggerBadge = agentBadgeFor(
+    useAgentBadgePreferences(),
+    autoHarnessActive ? null : effectiveAgentId,
+  );
   const triggerSdk = triggerDetails.find((detail) => detail.label === "SDK");
   const triggerModel = triggerDetails.find((detail) => detail.label === "Model");
   const triggerEffort = triggerDetails.find(
@@ -1841,6 +1850,33 @@ export function AgentHarnessPicker({
     triggerTooltip || null
   );
 
+  // Without a badge the trigger icon must stay exactly upstream's expression
+  // (disabled → nothing, else warning / cached-preview glyph / caller icon)
+  // with no wrapper element: an empty wrapper makes ComposerHarnessTrigger
+  // treat the trigger as icon-bearing and hide the label when the composer row
+  // collapses.
+  const triggerIconContent = selectedUnavailable ? (
+    <span
+      className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
+      data-testid="new-chat-landing-agent-warning"
+    >
+      <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+    </span>
+  ) : visibleCachedPreview ? (
+    <span
+      className="flex size-4 shrink-0 items-center justify-center"
+      data-testid="new-chat-landing-agent-icon"
+    >
+      {visibleCachedPreview.smartRouting ? (
+        <WandSparklesIcon className="size-4" aria-hidden="true" />
+      ) : (
+        <ComposerAgentIcon agent={visibleCachedPreview.agent} />
+      )}
+    </span>
+  ) : (
+    triggerIcon
+  );
+
   if (previewOnly && cachedPreview === null) {
     return (
       <NewChatPickerLoading
@@ -1879,34 +1915,13 @@ export function AgentHarnessPicker({
             ? (visibleCachedPreview?.effort ?? triggerSecondaryText)
             : undefined,
         icon:
-          disabledLabel !== undefined ? undefined : (
-            // The badge is the Agent's optional visual identity; it renders
-            // nothing until the user configures one, so the default trigger is
-            // unchanged. Smart Routing has no single agent, hence the null.
+          disabledLabel !== undefined ? undefined : triggerBadge ? (
             <span className="flex items-center gap-1">
               <AgentBadge agentId={autoHarnessActive ? null : effectiveAgentId} />
-              {selectedUnavailable ? (
-                <span
-                  className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
-                  data-testid="new-chat-landing-agent-warning"
-                >
-                  <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
-                </span>
-              ) : visibleCachedPreview ? (
-                <span
-                  className="flex size-4 shrink-0 items-center justify-center"
-                  data-testid="new-chat-landing-agent-icon"
-                >
-                  {visibleCachedPreview.smartRouting ? (
-                    <WandSparklesIcon className="size-4" aria-hidden="true" />
-                  ) : (
-                    <ComposerAgentIcon agent={visibleCachedPreview.agent} />
-                  )}
-                </span>
-              ) : (
-                triggerIcon
-              )}
+              {triggerIconContent}
             </span>
+          ) : (
+            triggerIconContent
           ),
         className: cn(
           triggerClassName,

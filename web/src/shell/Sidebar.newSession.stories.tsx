@@ -3,6 +3,7 @@ import { onlineManager } from "@tanstack/react-query";
 import { expect, userEvent, within } from "storybook/test";
 
 import type { Conversation } from "@/hooks/useConversations";
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
@@ -20,7 +21,7 @@ const sessions: Conversation[] = [
     created_at: 1_780_000_000,
     updated_at: 1_780_000_200,
     labels: { omni_project: "Alpha" },
-    permission_level: 3,
+    permission_level: 4,
   },
   {
     id: "session-unfiled",
@@ -31,7 +32,7 @@ const sessions: Conversation[] = [
     created_at: 1_780_000_000,
     updated_at: 1_780_000_100,
     labels: {},
-    permission_level: 3,
+    permission_level: 4,
   },
 ];
 
@@ -71,11 +72,10 @@ const meta = {
             ],
             pageParams: [undefined],
           };
-          for (const includeArchived of [true, false]) {
-            client.setQueryData(["conversations", "", includeArchived], data);
-            for (const visibility of ["mine", "shared", "archived"]) {
-              client.setQueryData(["conversations", "", includeArchived, null, visibility], data);
-            }
+          // The sidebar reads sessions through the scoped Mine/Shared caches
+          // (useScopeCache), always with archived rows excluded.
+          for (const visibility of ["mine", "shared"]) {
+            client.setQueryData(["conversations", "", false, null, visibility], data);
           }
           client.setQueryData(["pinned-conversations"], {
             conversations: [],
@@ -89,15 +89,16 @@ const meta = {
             ...data,
             pages: [{ ...data.pages[0], data: [] }],
           });
-          client.setQueryData(["hosts", { includeSandbox: false }], []);
           client.setQueryData(["hosts", { includeSandbox: true }], []);
         }}
       >
         <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, single_user: true }}>
           <ExtensionCatalogProvider extensions={[]}>
-            <div className="app-shell fixed inset-0 overflow-hidden bg-background">
-              <Story />
-            </div>
+            <SidebarDataProvider>
+              <div className="app-shell relative h-[640px] w-[720px] overflow-hidden bg-background">
+                <Story />
+              </div>
+            </SidebarDataProvider>
           </ExtensionCatalogProvider>
         </CapabilitiesProvider>
       </StoryQueryRouter>

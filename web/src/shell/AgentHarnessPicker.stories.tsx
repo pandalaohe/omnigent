@@ -159,6 +159,14 @@ export const ReadyOnHost: Story = {
   play: async ({ canvasElement }) => openPicker(canvasElement),
 };
 
+export const Configured: Story = {
+  args: {
+    triggerDetails: [{ label: "Model", value: "Opus 4.6" }],
+    selectedConfigContent: <span>Model configuration</span>,
+  },
+  play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
 export const NeedsSetupBadges: Story = {
   args: {
     host: {

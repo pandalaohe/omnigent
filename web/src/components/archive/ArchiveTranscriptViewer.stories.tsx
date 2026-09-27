@@ -95,14 +95,12 @@ const meta = {
           });
         }}
       >
-        <div className="fixed inset-0 flex items-center justify-center overflow-hidden bg-background">
-          <div
-            data-testid="archive-reader-story-frame"
-            className="flex h-full max-h-[700px] max-w-full overflow-hidden border bg-background"
-            style={{ width: context.parameters.readerWidth ?? 390 }}
-          >
-            <Story />
-          </div>
+        <div
+          data-testid="archive-reader-story-frame"
+          className="flex h-[700px] max-w-full overflow-hidden border bg-background"
+          style={{ width: context.parameters.readerWidth ?? 390 }}
+        >
+          <Story />
         </div>
       </StoryQueryRouter>
     ),

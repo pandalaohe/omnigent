@@ -58,6 +58,7 @@ import {
 } from "./NewChatDialog";
 import { useSandboxModelOptions, type SandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
@@ -4047,6 +4048,16 @@ describe("NewChatLandingScreen", () => {
       expect(picker).toHaveTextContent("Preferred team model");
     },
   );
+
+  it("leaves the trigger icon unwrapped when no badge is configured", () => {
+    // No badge and no trigger icon: an empty wrapper would make
+    // ComposerHarnessTrigger hide the label when the composer row collapses.
+    mockAgents([]);
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-agent-config-value")).not.toHaveClass(
+      COMPOSER_COLLAPSED_LABEL_CLASS,
+    );
+  });
 
   it("renders structured model and effort details in the harness picker", async () => {
     mockClaudeModels([
