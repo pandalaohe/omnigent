@@ -24,6 +24,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.member_snapshot import member_label_key, parse_member_entry
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
@@ -59,6 +60,27 @@ executor:
     harness: {harness}
 """
     entries = {"config.yaml": config.encode(), "prompts/custom.md": b"do the thing"}
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as archive:
+        for entry, data in entries.items():
+            info = tarfile.TarInfo(entry)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return out.getvalue()
+
+
+def _joint_bundle() -> bytes:
+    """A 2-member saved Agent: a claude-native lead plus a codex worker."""
+    entries = {
+        "config.yaml": b"""spec_version: 1
+name: library-runner
+executor: {type: omnigent, model: lead-model, config: {harness: claude-native}}
+""",
+        "agents/researcher/config.yaml": b"""spec_version: 1
+name: researcher
+executor: {type: omnigent, model: worker-model, config: {harness: codex}}
+""",
+    }
     out = io.BytesIO()
     with tarfile.open(fileobj=out, mode="w:gz") as archive:
         for entry, data in entries.items():
@@ -147,6 +169,16 @@ async def _create_agent(client: httpx.AsyncClient, *, harness: str = "claude-nat
         "/v1/custom-agents",
         headers=_headers(),
         files={"bundle": ("agent.tar.gz", _bundle(harness=harness))},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+async def _create_joint_agent(client: httpx.AsyncClient) -> str:
+    response = await client.post(
+        "/v1/custom-agents",
+        headers=_headers(),
+        files={"bundle": ("agent.tar.gz", _joint_bundle())},
     )
     assert response.status_code == 201, response.text
     return response.json()["id"]
@@ -287,6 +319,47 @@ async def test_fire_launches_session_scoped_agent_from_saved_bundle(
 
     runs, _ = library_server.tasks.list_runs(task_id)
     assert [run.status for run in runs] == ["running"]
+
+
+async def test_fire_writes_member_snapshot_labels(
+    client: httpx.AsyncClient, library_server: _LibraryServer
+) -> None:
+    """A 2-member saved Agent's fire freezes the member snapshot on the session.
+
+    The scheduled launch path writes the same ``omnigent.member.<role>``
+    labels the interactive multipart create does, so the runner's member lock
+    works for fired sessions too.
+    """
+    agent_id = await _create_joint_agent(client)
+    task_id = await _create_library_task(client, agent_id)
+    dispatched: list[Any] = []
+
+    async def _dispatch(conv: Any, task: Any) -> None:
+        dispatched.append(conv)
+
+    on_fire = build_on_fire(_fire_deps(library_server), launch_dispatch=_dispatch)
+    await on_fire(0, task_id)
+    await _drain()
+
+    assert len(dispatched) == 1
+    session = library_server.conversations.get_conversation(dispatched[0].id)
+    assert session is not None
+    lead = parse_member_entry(session.labels[member_label_key("library-runner")])
+    worker = parse_member_entry(session.labels[member_label_key("researcher")])
+    assert lead == {
+        "host": _HOST_ID,
+        "harness": "claude-native",
+        "model": "lead-model",
+        "effort": None,
+        "lead": True,
+    }
+    assert worker == {
+        "host": _HOST_ID,
+        "harness": "codex",
+        "model": "worker-model",
+        "effort": None,
+        "lead": False,
+    }
 
 
 async def test_fire_after_library_agent_deleted_records_failed_run(

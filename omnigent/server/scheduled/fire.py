@@ -860,6 +860,7 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
         custom_agents_store=custom_agents_store,
         artifact_store=deps.artifact_store,
         conversation_store=deps.conversation_store,
+        host_store=deps.host_store,
         owner=task.user_id,
         agent_id=task.agent_id,
         launch=LibraryAgentLaunch(

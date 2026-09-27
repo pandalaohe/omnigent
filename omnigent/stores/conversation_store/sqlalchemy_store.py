@@ -93,6 +93,7 @@ from omnigent.entities import (
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
+from omnigent.member_snapshot import MEMBER_LABEL_PREFIX
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
@@ -6424,7 +6425,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             row.updated_at = now
 
             existing = _fetch_labels(ap_sess, conversation_id)
-            present_drop = [key for key in drop_keys if key in existing]
+            # The member snapshot is the switched-away agent's roster, so every
+            # ``omnigent.member.*`` key drops with the keyed instance-scoped
+            # labels; the new agent's own session create writes a fresh one.
+            present_drop = [
+                key for key in existing if key in drop_keys or key.startswith(MEMBER_LABEL_PREFIX)
+            ]
             if present_drop:
                 ap_sess.execute(
                     delete(SqlConversationLabel).where(

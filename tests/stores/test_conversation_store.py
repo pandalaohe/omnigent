@@ -6078,6 +6078,9 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
             "omnigent.goal_state": "active",
             "omnigent.last_provider_usage_limits": '{"source":"claude"}',
             "omnigent:agent-template-id": "ca_old",
+            # The joint-agent member snapshot belongs to the switched-away
+            # agent; a prefix drop must clear every role key.
+            "omnigent.member.researcher": '{"lead":false}',
             "unrelated": "preserved",
             # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
             # switch (a new agent/harness context) drops it rather than
@@ -6137,6 +6140,9 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     # index would otherwise be violated by leaving both).
     assert updated.agent_id == "9d2c8d5e342b7da390dc38351c49fb72"
     assert "omnigent:agent-template-id" not in updated.labels
+    assert "omnigent.member.researcher" not in updated.labels, (
+        "the member snapshot belongs to the switched-away agent"
+    )
     assert updated.labels["unrelated"] == "preserved"
     assert agent_store.get("af75a9579488e3520ba6842699e43323") is None, (
         "old session-scoped agent must be deleted on switch"

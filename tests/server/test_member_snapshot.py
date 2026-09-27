@@ -1,0 +1,420 @@
+"""Member snapshot labels at session create (SCC06 F1a, custom line).
+
+A bundle whose spec projects 2+ members freezes each member as one
+``omnigent.member.<role>`` label: the effective host / harness / model /
+effort, the lead flag, and an availability reason when the member cannot
+run. A 1-member bundle gets no member labels; a client seed is refused; an
+over-cap key or value is a 400, never truncated. The scheduled
+``launch_library_agent`` path is covered in
+``tests/server/integration/test_scheduled_library_agents.py``.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import tarfile
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
+
+import httpx
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from starlette.requests import HTTPConnection
+
+from omnigent.member_snapshot import MEMBER_LABEL_PREFIX, parse_member_entry
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
+from omnigent.server.auth import AuthProvider
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+_HOST_ID = "7a2b1c9dfe310a4bb2cc56d1a0e47b3c"
+_WORKSPACE = "/repo"
+_USER = "alice"
+
+
+class HeaderAuth(AuthProvider):
+    def get_user_id(self, request: HTTPConnection) -> str | None:
+        return request.headers.get("x-test-user")
+
+
+def _bundle(*, lead: str, worker: str | None) -> bytes:
+    """One ``config.yaml`` plus an optional ``researcher`` sub-agent."""
+    entries = {"config.yaml": lead.encode()}
+    if worker is not None:
+        entries["agents/researcher/config.yaml"] = worker.encode()
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as archive:
+        for name, data in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return out.getvalue()
+
+
+def joint_bundle(
+    *,
+    lead_model: str = "lead-model",
+    lead_harness: str = "codex",
+    worker_model: str = "worker-model",
+    worker_harness: str = "claude-sdk",
+    worker_effort: str = "medium",
+    worker_name: str = "researcher",
+) -> bytes:
+    return _bundle(
+        lead=f"""spec_version: 1
+name: custom-reviewer
+description: Lead reviewer
+executor: {{type: omnigent, model: {lead_model}, reasoning_effort: high,
+  config: {{harness: {lead_harness}}}}}
+""",
+        worker=f"""spec_version: 1
+name: {worker_name}
+description: Research support
+executor: {{type: omnigent, model: {worker_model}, reasoning_effort: {worker_effort},
+  config: {{harness: {worker_harness}}}}}
+""",
+    )
+
+
+def single_bundle() -> bytes:
+    return _bundle(
+        lead="""spec_version: 1
+name: solo
+executor: {type: omnigent, model: lead-model, config: {harness: codex}}
+""",
+        worker=None,
+    )
+
+
+@dataclass
+class _MemberServer:
+    app: FastAPI
+    conversations: SqlAlchemyConversationStore
+    hosts: HostStore
+
+
+@pytest.fixture()
+def member_server(runtime_init: None, db_uri: str, tmp_path: Path) -> _MemberServer:
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    conversations = SqlAlchemyConversationStore(db_uri)
+    hosts = HostStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversations,
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=HeaderAuth(),
+        host_store=hosts,
+    )
+    # The snapshot resolution is this file's subject; the multipart host
+    # workspace round-trip and runner launch have their own coverage, so a
+    # hostless registry skips both.
+    app.state.host_registry = None
+    return _MemberServer(app=app, conversations=conversations, hosts=hosts)
+
+
+@pytest_asyncio.fixture()
+async def client(member_server: _MemberServer) -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=member_server.app), base_url="http://test"
+    ) as http:
+        yield http
+
+
+@pytest.fixture(autouse=True)
+def _stub_workspace_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Echo the requested workspace instead of the host.stat round-trip."""
+    from omnigent.server.routes import _session_create_validation as validation
+
+    async def _validate(**kwargs: object) -> str:
+        workspace = kwargs["workspace"]
+        assert isinstance(workspace, str)
+        return workspace
+
+    monkeypatch.setattr(validation, "validate_uploaded_bundle_host_workspace", _validate)
+
+
+def _arm_host(hosts: HostStore, *, configured_harnesses: dict[str, object] | None = None) -> None:
+    hosts.upsert_on_connect(
+        _HOST_ID,
+        "member-laptop",
+        _USER,
+        configured_harnesses=configured_harnesses,  # type: ignore[arg-type]
+    )
+
+
+async def _create(
+    client: httpx.AsyncClient,
+    bundle_bytes: bytes,
+    *,
+    metadata: dict[str, object] | None = None,
+    expect: int = 201,
+) -> httpx.Response:
+    body = metadata if metadata is not None else {"host_id": _HOST_ID, "workspace": _WORKSPACE}
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(body)},
+        files={"bundle": ("agent.tar.gz", bundle_bytes, "application/gzip")},
+        headers={"x-test-user": _USER},
+    )
+    assert response.status_code == expect, response.text
+    return response
+
+
+async def _member_labels_after_create(
+    member_server: _MemberServer,
+    bundle_bytes: bytes,
+    *,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, dict[str, object]]:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=member_server.app), base_url="http://test"
+    ) as client:
+        response = await _create(client, bundle_bytes, metadata=metadata)
+    conversation = member_server.conversations.get_conversation(response.json()["session_id"])
+    assert conversation is not None
+    entries: dict[str, dict[str, object]] = {}
+    for key, value in conversation.labels.items():
+        if not key.startswith(MEMBER_LABEL_PREFIX):
+            continue
+        parsed = parse_member_entry(value)
+        assert parsed is not None
+        entries[key[len(MEMBER_LABEL_PREFIX) :]] = parsed
+    return entries
+
+
+_CATALOGS: dict[str, list[dict[str, object]]] = {
+    "codex": [{"id": "lead-model", "model": "lead-model", "isDefault": True}],
+    "claude-sdk": [
+        {"id": "worker-model", "model": "worker-model", "isDefault": False},
+        {"id": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "isDefault": False},
+        {"id": "claude-opus-4-8", "model": "claude-opus-4-8", "isDefault": True},
+    ],
+}
+
+
+def _stub_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    catalogs: dict[str, list[dict[str, object]]] | None = None,
+) -> None:
+    from omnigent.server.routes._sessions import helpers
+
+    table = _CATALOGS if catalogs is None else catalogs
+
+    async def _fake_options(host_id: str, harness: str) -> list[dict[str, object]] | None:
+        assert host_id == _HOST_ID
+        return table.get(harness)
+
+    monkeypatch.setattr(helpers, "_host_model_options_via_registry", _fake_options)
+
+
+@pytest.mark.asyncio
+async def test_multipart_create_writes_one_label_per_member(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 2-member bundle freezes the lead and the worker under their roles."""
+    _arm_host(member_server.hosts)
+    _stub_catalog(monkeypatch)
+
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert entries == {
+        "custom-reviewer": {
+            "host": _HOST_ID,
+            "harness": "codex",
+            "model": "lead-model",
+            "effort": "high",
+            "lead": True,
+        },
+        "researcher": {
+            "host": _HOST_ID,
+            "harness": "claude-sdk",
+            "model": "worker-model",
+            "effort": "medium",
+            "lead": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_one_member_bundle_writes_no_member_labels(
+    member_server: _MemberServer,
+) -> None:
+    """A 1-member Agent keeps its harness controls: no member snapshot at all."""
+    _arm_host(member_server.hosts)
+
+    entries = await _member_labels_after_create(member_server, single_bundle())
+
+    assert entries == {}
+
+
+@pytest.mark.asyncio
+async def test_default_model_resolves_to_host_catalog_is_default(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A member model of ``default`` freezes the catalog's ``isDefault`` row."""
+    _arm_host(member_server.hosts)
+    _stub_catalog(monkeypatch)
+
+    entries = await _member_labels_after_create(
+        member_server, joint_bundle(worker_model="default")
+    )
+
+    assert entries["researcher"]["model"] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_missing_default_row_keeps_model_null(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A catalog with no ``isDefault`` row leaves a ``default`` member null."""
+    _arm_host(member_server.hosts)
+    _stub_catalog(
+        monkeypatch,
+        {
+            "codex": [{"id": "lead-model", "model": "lead-model"}],
+            "claude-sdk": [{"id": "claude-sonnet-4-6", "model": "claude-sonnet-4-6"}],
+        },
+    )
+
+    entries = await _member_labels_after_create(
+        member_server, joint_bundle(worker_model="default")
+    )
+
+    assert entries["researcher"]["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_offline_host_marks_every_member_host_offline(
+    member_server: _MemberServer,
+) -> None:
+    _arm_host(member_server.hosts)
+    member_server.hosts.set_offline(_HOST_ID)
+
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert entries["custom-reviewer"]["unavailable"] == "host_offline"
+    assert entries["researcher"]["unavailable"] == "host_offline"
+
+
+@pytest.mark.asyncio
+async def test_unknown_host_marks_members_host_offline(
+    member_server: _MemberServer,
+) -> None:
+    """A host row that was never registered counts as not live."""
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert entries["researcher"]["unavailable"] == "host_offline"
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_harness_maps_false_to_reason_code(
+    member_server: _MemberServer,
+) -> None:
+    """``False`` readiness becomes ``harness_not_configured``; a reported string
+    reason is stored as-is."""
+    _arm_host(
+        member_server.hosts,
+        configured_harnesses={"codex": False, "claude-sdk": "binary-missing"},
+    )
+
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert entries["custom-reviewer"]["unavailable"] == "harness_not_configured"
+    assert entries["researcher"]["unavailable"] == "binary-missing"
+
+
+@pytest.mark.asyncio
+async def test_unreported_harness_is_not_unavailable(
+    member_server: _MemberServer,
+) -> None:
+    """A harness the host's readiness map omits stays unknown, not blocked."""
+    _arm_host(member_server.hosts, configured_harnesses={"codex": True})
+
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert "unavailable" not in entries["researcher"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_model_missing_from_catalog_is_unavailable(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm_host(member_server.hosts)
+    _stub_catalog(
+        monkeypatch,
+        {
+            "codex": [{"id": "lead-model", "model": "lead-model"}],
+            "claude-sdk": [{"id": "claude-sonnet-4-6", "model": "claude-sonnet-4-6"}],
+        },
+    )
+
+    entries = await _member_labels_after_create(member_server, joint_bundle())
+
+    assert entries["researcher"]["unavailable"] == "model_missing"
+
+
+@pytest.mark.asyncio
+async def test_member_label_key_over_cap_is_a_400(client: httpx.AsyncClient) -> None:
+    """A role whose label key exceeds 128 chars is rejected, never truncated."""
+    role = "r" * 113
+    response = await _create(client, joint_bundle(worker_name=role), expect=400)
+
+    assert response.json()["error"]["code"] == "invalid_input"
+    assert role[:20] in response.text
+
+
+@pytest.mark.asyncio
+async def test_member_label_value_over_cap_is_a_400(client: httpx.AsyncClient) -> None:
+    """A member value over the 256-char label cap is a 400 naming the role."""
+    response = await _create(client, joint_bundle(worker_model="m" * 240), expect=400)
+
+    body = response.json()
+    assert body["error"]["code"] == "invalid_input"
+    assert "researcher" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_client_seeded_member_label_is_rejected(
+    client: httpx.AsyncClient,
+) -> None:
+    """The ``omnigent.member.*`` namespace is server-reserved on create."""
+    response = await _create(
+        client,
+        joint_bundle(),
+        metadata={
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"omnigent.member.researcher": "{}"},
+        },
+        expect=400,
+    )
+
+    assert response.json()["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_manual_launch_agent_style_metadata_writes_member_labels(
+    member_server: _MemberServer,
+) -> None:
+    """A hostless create (the interactive shape without a host chip) stores the
+    snapshot with a null host and no availability resolution."""
+    entries = await _member_labels_after_create(member_server, joint_bundle(), metadata={})
+
+    assert entries["researcher"] == {
+        "host": None,
+        "harness": "claude-sdk",
+        "model": "worker-model",
+        "effort": "medium",
+        "lead": False,
+    }

@@ -145,6 +145,7 @@ from omnigent.server.routes._sessions.helpers import (
     _grant_default_public,
     _invalidate_runner_backed_snapshot_state,
     _latest_message_preview,
+    _member_snapshot_labels,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _notify_runner_of_bundled_child,
@@ -1135,6 +1136,19 @@ def register_core_routes(
             user_id,
             conversation_store,
         )
+        # A joint-agent bundle freezes its member snapshot on the session now,
+        # in the async section: the resolver may round-trip to the host catalog
+        # for a member's "default" model, which the synchronous persistence
+        # call must not do. A 1-member bundle resolves to no labels.
+        member_labels = await _member_snapshot_labels(
+            spec,
+            host_id=parsed_metadata.host_id,
+            host_store=getattr(request.app.state, "host_store", None),
+        )
+        if member_labels:
+            parsed_metadata = parsed_metadata.model_copy(
+                update={"labels": {**parsed_metadata.labels, **member_labels}}
+            )
         with creation_stage("create_persistence_ms"):
             result = await asyncio.to_thread(
                 _create_session_from_bundle,

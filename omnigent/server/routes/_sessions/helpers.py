@@ -65,6 +65,16 @@ from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.member_snapshot import (
+    MEMBER_LABEL_KEY_MAX_CHARS,
+    MEMBER_LABEL_PREFIX,
+    MEMBER_LABEL_VALUE_MAX_CHARS,
+    MEMBER_UNAVAILABLE_HARNESS_NOT_CONFIGURED,
+    MEMBER_UNAVAILABLE_HOST_OFFLINE,
+    MEMBER_UNAVAILABLE_MODEL_MISSING,
+    encode_member_entry,
+    member_label_key,
+)
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -298,7 +308,7 @@ from omnigent.stores.conversation_store import (
     is_artifact_link_key,
 )
 from omnigent.stores.file_store import FileStore
-from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
@@ -10311,6 +10321,15 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {handoff_key!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    # The member snapshot freezes a joint session's members at create. A client
+    # seed would forge which harness / model / effort a member is locked to,
+    # and which members count as unavailable.
+    member_key = next((key for key in labels if key.startswith(MEMBER_LABEL_PREFIX)), None)
+    if member_key is not None:
+        raise OmnigentError(
+            f"label {member_key!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
@@ -10381,6 +10400,119 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {ARTIFACT_LINK_KEY_LABEL!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+
+
+def _member_model_id(row: Mapping[str, Any]) -> str | None:
+    """Return the launchable model id of one raw host-catalog row."""
+    for key in ("model", "id"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+async def _member_snapshot_labels(
+    spec: AgentSpec,
+    *,
+    host_id: str | None,
+    host_store: HostStore | None,
+) -> dict[str, str]:
+    """
+    Resolve one session's member-snapshot labels, or ``{}`` for a 1-member agent.
+
+    A bundle whose spec projects two or more members (the lead included)
+    freezes its per-member harness / model / effort at session create, as one
+    ``omnigent.member.<role>`` label per member. The runner reads them to lock
+    a member's dispatch overrides and to refuse work routed to a member that
+    cannot run. The model is the member's own, or — for none / ``"default"`` —
+    the host catalog's ``isDefault`` row for that harness; without a catalog it
+    stays null. The session host is the member host until F2a adds per-member
+    hosts. A value that would exceed a label column is a 400, never truncated.
+
+    :param spec: The uploaded bundle's validated spec.
+    :param host_id: The session's target host, or ``None`` for a hostless
+        session (no liveness, readiness, or catalog resolution then).
+    :param host_store: Host registrations, used for liveness and the reported
+        per-harness readiness. ``None`` skips availability resolution.
+    :returns: ``{label_key: compact_json_value}``; empty for a 1-member agent.
+    :raises OmnigentError: 400 when a member's label key or value would
+        overflow its column.
+    """
+    from omnigent.server.custom_agent_bundles import project_members
+
+    members = project_members(spec)
+    if len(members) < 2:
+        return {}
+    host = (
+        await asyncio.to_thread(host_store.get_host, host_id)
+        if host_id is not None and host_store is not None
+        else None
+    )
+    if host is not None and not host_is_live(host):
+        host = None
+    catalogs: dict[str, list[dict[str, Any]] | None] = {}
+    labels: dict[str, str] = {}
+    for member in members:
+        role = str(member["name"])
+        harness = member.get("harness")
+        entry: dict[str, Any] = {
+            "host": host_id,
+            "harness": harness,
+            "model": member.get("model"),
+            "effort": member.get("reasoning_effort"),
+            "lead": bool(member.get("lead")),
+        }
+        reason: str | None = None
+        if host_id is not None:
+            if host is None:
+                reason = MEMBER_UNAVAILABLE_HOST_OFFLINE
+            elif isinstance(harness, str) and harness:
+                reported = (host.configured_harnesses or {}).get(harness)
+                if reported is not None and reported is not True:
+                    reason = (
+                        reported
+                        if isinstance(reported, str) and reported
+                        else MEMBER_UNAVAILABLE_HARNESS_NOT_CONFIGURED
+                    )
+        model = entry["model"]
+        if (
+            reason is None
+            and host is not None
+            and host_id is not None
+            and isinstance(harness, str)
+            and harness
+        ):
+            if harness not in catalogs:
+                catalogs[harness] = await _host_model_options_via_registry(host_id, harness)
+            catalog = catalogs[harness]
+            if catalog is not None:
+                rows = [row for row in catalog if isinstance(row, Mapping)]
+                if model is None or model == "default":
+                    default_row = next((row for row in rows if row.get("isDefault") is True), None)
+                    entry["model"] = (
+                        _member_model_id(default_row) if default_row is not None else None
+                    )
+                elif model not in {_member_model_id(row) for row in rows}:
+                    reason = MEMBER_UNAVAILABLE_MODEL_MISSING
+        if reason is not None:
+            entry["unavailable"] = reason
+        key = member_label_key(role)
+        if len(key) > MEMBER_LABEL_KEY_MAX_CHARS:
+            raise OmnigentError(
+                f"member role {role!r} makes label key {key!r} longer than "
+                f"{MEMBER_LABEL_KEY_MAX_CHARS} characters; shorten the role",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        value = encode_member_entry(entry)
+        if len(value) > MEMBER_LABEL_VALUE_MAX_CHARS:
+            raise OmnigentError(
+                f"member {role!r}'s snapshot label value is {len(value)} characters, "
+                f"over the {MEMBER_LABEL_VALUE_MAX_CHARS}-character cap; "
+                "shorten the member's harness or model",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        labels[key] = value
+    return labels
 
 
 def _require_cost_control_label_authority(
@@ -11915,6 +12047,8 @@ __all__ = [
     "_mcp_input_required_response",
     "_mcp_ok_response",
     "_mcp_tool_result",
+    "_member_model_id",
+    "_member_snapshot_labels",
     "_merge_claude_permission_launch_args",
     "_merge_pending_file_blocks",
     "_message_text",

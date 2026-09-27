@@ -158,6 +158,7 @@ async def launch_library_agent(
     custom_agents_store: CustomAgentsStore,
     artifact_store: Any,
     conversation_store: Any,
+    host_store: Any | None = None,
     owner: str | None,
     agent_id: str,
     launch: LibraryAgentLaunch,
@@ -171,6 +172,9 @@ async def launch_library_agent(
     :param custom_agents_store: Owner-scoped library storage.
     :param artifact_store: Store holding the row's bundle bytes.
     :param conversation_store: Store owning the session+agent insert.
+    :param host_store: Host registrations, used to resolve a joint bundle's
+        member snapshot (liveness, readiness, catalog default). ``None``
+        resolves no member labels.
     :param owner: Task/request owner; ``None`` maps to the local identity.
     :param agent_id: The owned ``ca_`` id to launch.
     :param launch: Per-session values (title, host/workspace, overrides).
@@ -207,6 +211,14 @@ async def launch_library_agent(
     ):
         labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = permission_mode
     labels[AGENT_TEMPLATE_LABEL_KEY] = agent_id
+    # A joint bundle (2+ members) freezes its member snapshot on the session
+    # before the synchronous persistence thread, like the interactive
+    # multipart create; a 1-member bundle resolves to no labels.
+    from omnigent.server.routes._sessions.helpers import _member_snapshot_labels
+
+    labels.update(
+        await _member_snapshot_labels(spec, host_id=launch.host_id, host_store=host_store)
+    )
 
     metadata = SessionCreateMetadata(
         title=launch.title,
