@@ -553,6 +553,7 @@ def _upsert_prepared_labels(
         existing = session.get(
             SqlConversationLabel,
             (current_workspace_id(), row["conversation_id"], row["key"]),
+            with_for_update=True,
         )
         if existing is None:
             session.add(SqlConversationLabel(**row))
