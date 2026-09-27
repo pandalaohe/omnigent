@@ -11,9 +11,7 @@ import type { ParsedPeerMessage } from "@/lib/peerMessage";
 const TITLE_TRUNCATE_LENGTH = 48;
 
 function truncateTitle(title: string): string {
-  return title.length > TITLE_TRUNCATE_LENGTH
-    ? `${title.slice(0, TITLE_TRUNCATE_LENGTH)}…`
-    : title;
+  return title.length > TITLE_TRUNCATE_LENGTH ? `${title.slice(0, TITLE_TRUNCATE_LENGTH)}…` : title;
 }
 
 interface PeerMessageViewProps {
@@ -39,10 +37,7 @@ export function PeerMessageView({ message }: PeerMessageViewProps) {
       className="max-w-[640px]"
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
-        <span
-          title={message.senderId}
-          className="mb-1 mr-1 text-sm text-muted-foreground"
-        >
+        <span title={message.senderId} className="mb-1 mr-1 text-sm text-muted-foreground">
           {label}
         </span>
         <MessageContent>

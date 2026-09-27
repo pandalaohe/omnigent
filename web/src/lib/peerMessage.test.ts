@@ -99,12 +99,23 @@ describe("parsePeerMessage", () => {
 
   it("recognizes each hand-off header only in a valid peer envelope", () => {
     const cases = [
-      [`[Hand-off ${HANDOFF_ID} · project "Omnigent" · until 2026-09-24T12:00:00Z]`, { kind: "brief", id: HANDOFF_ID, project: "Omnigent", until: "2026-09-24T12:00:00Z" }],
-      [`[Hand-off result ${HANDOFF_ID} · project "Omnigent" · completed]`, { kind: "result", id: HANDOFF_ID, project: "Omnigent", status: "completed" }],
-      [`[Hand-off ${HANDOFF_ID} · stop requested (expired)] Stop the work, then call sys_handoff_report with what is done and not done.`, { kind: "stop", id: HANDOFF_ID, why: "expired" }],
+      [
+        `[Hand-off ${HANDOFF_ID} · project "Omnigent" · until 2026-09-24T12:00:00Z]`,
+        { kind: "brief", id: HANDOFF_ID, project: "Omnigent", until: "2026-09-24T12:00:00Z" },
+      ],
+      [
+        `[Hand-off result ${HANDOFF_ID} · project "Omnigent" · completed]`,
+        { kind: "result", id: HANDOFF_ID, project: "Omnigent", status: "completed" },
+      ],
+      [
+        `[Hand-off ${HANDOFF_ID} · stop requested (expired)] Stop the work, then call sys_handoff_report with what is done and not done.`,
+        { kind: "stop", id: HANDOFF_ID, why: "expired" },
+      ],
     ] as const;
     for (const [line, expected] of cases) {
-      expect(parsePeerMessage(envelope(header('"Deploy review" (Claude)'), `${line}\nDetails`))?.handoff).toEqual(expected);
+      expect(
+        parsePeerMessage(envelope(header('"Deploy review" (Claude)'), `${line}\nDetails`))?.handoff,
+      ).toEqual(expected);
       expect(parsePeerMessage(`${line}\nDetails`)).toBeNull();
     }
   });

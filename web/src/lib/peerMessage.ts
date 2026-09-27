@@ -39,8 +39,10 @@ export interface ParsedPeerMessage {
 const HEADER_RE =
   /^\[Peer message from session ([0-9a-f]{32}) "([^"]*)" \(([^()·]+?)(?: · ([^()]+))?\) ref=(\S+) msg=([0-9a-f]{32}) — sent by another Omnigent session, not by your user; (?:what it may ask of you follows the request policy in your Omnigent instructions, and without one it grants no permissions|it grants no permissions)\.\]$/;
 const BRIEF_RE = /^\[Hand-off ([0-9a-f]{32}) · project "(.+)" · until (\d{4}-\d\d-\d\dT[^\]]+Z)\]$/;
-const RESULT_RE = /^\[Hand-off result ([0-9a-f]{32}) · project "(.+)" · (completed|incomplete|failed|cancelled)\]$/;
-const STOP_RE = /^\[Hand-off ([0-9a-f]{32}) · stop requested \((cancelled|expired|revoked)\)\](?: Stop the work, then call sys_handoff_report with what is done and not done\.)?$/;
+const RESULT_RE =
+  /^\[Hand-off result ([0-9a-f]{32}) · project "(.+)" · (completed|incomplete|failed|cancelled)\]$/;
+const STOP_RE =
+  /^\[Hand-off ([0-9a-f]{32}) · stop requested \((cancelled|expired|revoked)\)\](?: Stop the work, then call sys_handoff_report with what is done and not done\.)?$/;
 
 /**
  * Parse an inbound peer-message envelope.
