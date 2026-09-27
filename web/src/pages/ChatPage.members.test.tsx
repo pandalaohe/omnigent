@@ -14,8 +14,17 @@ import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
-// The "@" menu's file source: one file at the workspace root, enough to prove
-// file rows still render beside a Members section.
+// The "@" menu's file source: the workspace root holds a "src" folder (enough
+// to prove file rows still render beside a Members section), and drilling into
+// it lists one nested file. Mutable hoisted state lets a test flip the nested
+// listing to "still loading" without re-mocking the module.
+const ws = vi.hoisted(() => ({
+  srcEntries: [] as unknown[],
+  srcLoading: false,
+}));
+const SRC_ENTRIES: WorkspaceFile[] = [
+  { path: "src/server.ts", name: "server.ts", type: "file", bytes: 10, modified_at: null },
+];
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
@@ -29,7 +38,10 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
       },
       isLoading: false,
     }),
-    useWorkspaceDirectory: () => ({ data: undefined, isLoading: false }),
+    useWorkspaceDirectory: (_conv: string | undefined, dirPath: string | null) => ({
+      data: dirPath === "src" ? ws.srcEntries : undefined,
+      isLoading: ws.srcLoading,
+    }),
   };
 });
 
@@ -169,6 +181,8 @@ function openSessionPicker(testId: string) {
 let convSeq = 0;
 beforeEach(() => {
   localStorage.clear();
+  ws.srcEntries = SRC_ENTRIES;
+  ws.srcLoading = false;
   sessionSnapshot.labels = {};
   sessionSnapshot.agentTemplateId = null;
   childSessionsMock.children = [];
@@ -281,6 +295,33 @@ describe("2+ member session composer", () => {
     type("@");
     expect(screen.getByText("@architect")).toBeInTheDocument();
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
+  });
+
+  it("drops the Members section once the token drills into a directory", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    renderComposer();
+    type("@src");
+    fireEvent.click(screen.getByTitle("Open src"));
+    // Drilled in ("@src/"): the empty filter must not bring every member back
+    // at row 0 — only files remain, so Enter acts on the file row rather than
+    // replacing the path with "@<role> ".
+    expect(screen.queryByText("@architect")).toBeNull();
+    expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
+  });
+
+  it("offers no member row while the drilled directory listing loads", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    ws.srcEntries = [];
+    ws.srcLoading = true;
+    renderComposer();
+    type("@src");
+    fireEvent.click(screen.getByTitle("Open src"));
+    expect(screen.queryByText("@architect")).toBeNull();
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea().value).toBe("@src/");
   });
 
   it("keeps no-member sessions on their normal model / effort controls", () => {

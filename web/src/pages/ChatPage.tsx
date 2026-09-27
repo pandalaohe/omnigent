@@ -3341,9 +3341,14 @@ function ComposerImpl(
   const mentionEntries: WorkspaceFile[] =
     mentionEnabled && mention ? rankMentionEntries(mentionSourceEntries, mentionFilter) : [];
   // Member rows lead the "@" menu in a 2+ member session, sharing the typed
-  // filter with the file rows (roles are matched the same way).
+  // filter with the file rows (roles are matched the same way) — but only
+  // while the token is root-level. Once it carries a directory path ("@src/")
+  // the roles would survive the now-empty filter and steal the top row from
+  // the file listing, so a stray Enter/Tab would replace the path with a role.
   const mentionMembers: SessionMember[] =
-    memberMentionEnabled && mention ? filterMemberMentions(sessionMembers, mentionFilter) : [];
+    memberMentionEnabled && mention && !mention.query.includes("/")
+      ? filterMemberMentions(sessionMembers, mentionFilter)
+      : [];
   // True while a mention token is active but its listing hasn't resolved yet:
   // the cold-boot root fetch, or a sub-directory's first load after drilling
   // in. During this window ``mentionEntries`` is transiently empty (so the
