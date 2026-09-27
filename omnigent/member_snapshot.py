@@ -58,27 +58,34 @@ def member_entries_from_labels(labels: Mapping[str, str] | None) -> dict[str, di
     return entries
 
 
+# The web composer's attachment preamble. Its text can carry ``@`` inside a
+# file path (``[Attached: /tmp/@executor.txt]``), so mentions are matched
+# against the text with every attachment span removed.
+_ATTACHED_SPAN_RE = re.compile(r"\[Attached:[^\]]*\]")
+
+
 def parse_role_mentions(text: str, roles: Iterable[str]) -> list[tuple[str, str]]:
     """Return ``(role, segment)`` for each ``@role`` / ``[role]`` mention.
 
-    ``@role`` and ``[role]`` are equivalent, and only exact role names match —
-    so a web ``[Attached: …]`` preamble (or any other bracketed text) never
-    parses as a mention. A mention's segment is the text between it and the
-    next mention, stripped; the text before the first mention belongs to no
-    pair. Repeated mentions yield repeated pairs.
+    ``@role`` and ``[role]`` are equivalent, and only exact role names match.
+    ``[Attached: …]`` spans are excluded before matching, so a path inside one
+    can never surface as a mention. A mention's segment is the text between it
+    and the next mention, stripped; the text before the first mention belongs
+    to no pair. Repeated mentions yield repeated pairs.
     """
     role_list = {role for role in roles if isinstance(role, str) and role}
     if not text or not role_list:
         return []
+    scrubbed = _ATTACHED_SPAN_RE.sub(" ", text)
     ordered_roles = sorted(role_list, key=lambda role: (-len(role), role))
     alternation = "|".join(re.escape(role) for role in ordered_roles)
     pattern = re.compile(
         rf"(?:(?<![\w@-])@(?P<at>{alternation})(?![\w-]))|(?:\[(?P<square>{alternation})\])"
     )
-    matches = list(pattern.finditer(text))
+    matches = list(pattern.finditer(scrubbed))
     pairs: list[tuple[str, str]] = []
     for index, match in enumerate(matches):
         role = match.group("at") or match.group("square")
-        segment_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        pairs.append((role, text[match.end() : segment_end].strip()))
+        segment_end = matches[index + 1].start() if index + 1 < len(matches) else len(scrubbed)
+        pairs.append((role, scrubbed[match.end() : segment_end].strip()))
     return pairs

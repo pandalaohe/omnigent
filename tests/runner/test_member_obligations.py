@@ -69,6 +69,20 @@ def test_parse_role_mentions_ignores_attached_preamble() -> None:
     ]
 
 
+def test_parse_role_mentions_ignores_role_text_inside_attachment_marker() -> None:
+    """An ``@`` inside an ``[Attached: …]`` path is not a mention (review probe)."""
+    assert (
+        parse_role_mentions(
+            "[Attached: /tmp/@executor.txt] summarize this file",
+            ["executor"],
+        )
+        == []
+    )
+    assert parse_role_mentions("@executor read [Attached: /tmp/@executor.txt]", ["executor"]) == [
+        ("executor", "read")
+    ]
+
+
 def test_parse_role_mentions_repeats_and_empty_cases() -> None:
     """Repeated mentions yield repeated pairs; no roles / no text match nothing."""
     assert parse_role_mentions("[executor] one @executor two", ["executor"]) == [
