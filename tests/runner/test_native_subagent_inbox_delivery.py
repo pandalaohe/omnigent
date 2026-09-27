@@ -1330,10 +1330,16 @@ class _FlakyChildReportServerClient(_SnapshotServerClient):
 
 
 @pytest.mark.asyncio
-async def test_untracked_terminal_report_retries_with_wake_backoff(
+async def test_untracked_terminal_report_is_single_shot(
     _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A transient report failure retries with the wake-post backoff, then lands."""
+    """A lost terminal report is not retried; reconciliation owns recovery.
+
+    A retry carries no dispatch id, so a late retry that lands after the parent
+    started the child's next dispatch would complete that newer entry. The
+    report is one bounded attempt; the parent runner's reconciliation rebuilds
+    the result from dispatch-attributed evidence instead.
+    """
     sleeps: list[float] = []
 
     async def _record_sleep(seconds: float) -> None:
@@ -1373,20 +1379,15 @@ async def test_untracked_terminal_report_retries_with_wake_backoff(
         app.state.mark_subagent_terminal_and_wake(
             CHILD_SESSION_ID, status="completed", output="review complete: LGTM"
         )
-        reports: list[dict[str, Any]] = []
         for _ in range(200):
-            reports = [
-                kwargs.get("json")
-                for url, kwargs in server_client.posts
-                if url.rstrip("/").endswith(f"/v1/sessions/{CHILD_SESSION_ID}/events")
-            ]
-            if reports:
+            if server_client.attempts:
                 break
             await asyncio.sleep(0.01)
+        # Give any (wrongly) scheduled retry time to fire before asserting.
+        await asyncio.sleep(0.05)
 
-    assert server_client.attempts == 2, "the failed report must be retried once"
-    assert sleeps == [runner_app._WAKE_POST_RETRY_BASE_DELAY_S]
-    assert reports and reports[-1]["data"]["status"] == "completed"
+    assert server_client.attempts == 1, "the terminal report must not be retried"
+    assert sleeps == [], "a lost report must not back off and retry"
 
 
 @pytest.mark.asyncio

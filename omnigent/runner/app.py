@@ -9382,9 +9382,13 @@ def create_runner_app(
         delivery has no parent inbox to reach; posting the edge to the server
         routes it through the parent-runner forward. The same report recovers a
         local child whose work entry a restart wiped, one polling interval
-        sooner than the reconciliation backstop. Transient failures retry with
-        the same bounded backoff as the parent wake POST; the server-side
-        forward dedupes a repeated terminal, so a retry cannot double-deliver.
+        sooner than the reconciliation backstop.
+
+        Deliberately single-shot: the report carries no dispatch id, so a retry
+        that lands after the parent started the child's next dispatch would be
+        applied to that newer entry. A failed report is recovered by the parent
+        runner's reconciliation, which rebuilds only terminal evidence the
+        server paired with the dispatch (or the dispatch's own transcript turn).
 
         :param child_session_id: The sub-agent child session id.
         :param status: Server-vocabulary status, e.g. ``"completed"``.
@@ -9392,50 +9396,21 @@ def create_runner_app(
         """
         from omnigent.native._native_post_delivery import post_external_session_status
 
-        for attempt in range(1, _WAKE_POST_MAX_ATTEMPTS + 1):
-            try:
-                await post_external_session_status(
-                    server_client,
-                    session_id=child_session_id,
-                    status=status,
-                    output=output,
-                )
-                return
-            except (httpx.HTTPError, asyncio.TimeoutError) as exc:
-                retryable = isinstance(exc, asyncio.TimeoutError) or _wake_post_is_retryable(exc)
-                last_attempt = attempt >= _WAKE_POST_MAX_ATTEMPTS
-                _logger.debug(
-                    "Sub-agent terminal report attempt %d/%d for %s failed (retryable=%s): %r",
-                    attempt,
-                    _WAKE_POST_MAX_ATTEMPTS,
-                    child_session_id,
-                    retryable,
-                    exc,
-                    extra={"session_id": child_session_id},
-                )
-                if last_attempt or not retryable:
-                    _logger.warning(
-                        "Failed to report an untracked sub-agent terminal status for %s "
-                        "after %d attempt(s); the parent runner's polling recovery "
-                        "remains the backstop",
-                        child_session_id,
-                        attempt,
-                        extra={"session_id": child_session_id},
-                    )
-                    return
-                delay_s = min(
-                    _WAKE_POST_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
-                    _WAKE_POST_RETRY_MAX_DELAY_S,
-                )
-                await _wake_retry_sleep(delay_s)
-            except Exception:  # noqa: BLE001 — unexpected; the polling backstop re-delivers
-                _logger.warning(
-                    "Failed to report an untracked sub-agent terminal status for %s",
-                    child_session_id,
-                    exc_info=True,
-                    extra={"session_id": child_session_id},
-                )
-                return
+        try:
+            await post_external_session_status(
+                server_client,
+                session_id=child_session_id,
+                status=status,
+                output=output,
+            )
+        except Exception:  # noqa: BLE001 — the parent runner's reconciliation is the backstop
+            _logger.warning(
+                "Failed to report an untracked sub-agent terminal status for %s; "
+                "the parent runner's reconciliation remains the backstop",
+                child_session_id,
+                exc_info=True,
+                extra={"session_id": child_session_id},
+            )
 
     def _post_untracked_subagent_terminal_soon(
         child_session_id: str, *, status: str, output: str | None
