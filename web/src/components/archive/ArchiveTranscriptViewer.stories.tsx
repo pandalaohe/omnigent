@@ -44,8 +44,8 @@ const items: ConversationItem[] = [
           "",
           "中文正文也需要按照手机宽度自动换行，不应把搜索框或右侧操作按钮挤出屏幕。",
           "",
-          "```typescript",
-          'const report = { status: "complete", source: "example-project", preserveSearch: true };',
+          "```json",
+          '{ "status": "complete", "source": "example-project", "preserveSearch": true }',
           "```",
           "",
           "| Check | Result |",
@@ -95,14 +95,12 @@ const meta = {
           });
         }}
       >
-        <div className="fixed inset-0 flex items-center justify-center overflow-hidden bg-background">
-          <div
-            data-testid="archive-reader-story-frame"
-            className="flex h-full max-h-[700px] max-w-full overflow-hidden border bg-background"
-            style={{ width: context.parameters.readerWidth ?? 390 }}
-          >
-            <Story />
-          </div>
+        <div
+          data-testid="archive-reader-story-frame"
+          className="flex h-[700px] max-w-full overflow-hidden border bg-background"
+          style={{ width: context.parameters.readerWidth ?? 390 }}
+        >
+          <Story />
         </div>
       </StoryQueryRouter>
     ),
