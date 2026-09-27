@@ -1699,6 +1699,93 @@ describe("FileViewer agent preview request", () => {
     expect(viewModeOf()).toBe("source");
   });
 
+  it("a same-file line citation after an agent preview open lands on source", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "source",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    let guard: FileNavigationGuard | undefined;
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return vi.fn();
+    });
+    function GuardedViewer({ position }: { position?: { line: number } }) {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "notes.md", position, initialSearch: "preview=1" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    const view = render(<GuardedViewer />);
+    expect(viewModeOf()).toBe("preview");
+
+    // openFile("notes.md", { line: 3 }) — the same file, no preview request.
+    const navigate = vi.fn();
+    act(() => guard!("notes.md", { line: 3 }, navigate));
+    expect(navigate).toHaveBeenCalledTimes(1);
+    view.rerender(<GuardedViewer position={{ line: 3 }} />);
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("a later plain open of the same file returns to the stored mode", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "editor",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    let guard: FileNavigationGuard | undefined;
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return vi.fn();
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "notes.md", initialSearch: "preview=1" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    render(<GuardedViewer />);
+    expect(viewModeOf()).toBe("preview");
+
+    // openFile("notes.md") with no options — the request named one open.
+    const navigate = vi.fn();
+    act(() => guard!("notes.md", undefined, navigate));
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(viewModeOf()).toBe("editor");
+  });
+
   it("returns to the chosen mode when View source follows a request that displaced diff", async () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     writeFileViewPreferences({

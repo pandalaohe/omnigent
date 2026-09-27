@@ -949,12 +949,22 @@ function FileViewerBody({
   useLayoutEffect(() => {
     if (!open || !registerNavigationGuard) return;
     return registerNavigationGuard((destination, options, navigate) => {
+      // A consumed preview request names one open, so a same-path open that
+      // doesn't ask for preview drops the override — but only once navigation
+      // proceeds, so a cancelled unsaved-edit confirmation keeps the preview.
+      const proceed =
+        destination === path && !options?.preview
+          ? () => {
+              setPreviewOverridePath(null);
+              navigate();
+            }
+          : navigate;
       // A line citation or a preview request leaves the editor, so both must
-      // confirm unsaved edits; any other open of the same path is a no-op.
+      // confirm unsaved edits; a plain same-path open needs no confirmation.
       if (destination !== path || ((options?.line || options?.preview) && viewMode === "editor")) {
-        guardDirty(navigate);
+        guardDirty(proceed);
       } else {
-        navigate();
+        proceed();
       }
     });
   }, [open, path, viewMode, guardDirty, registerNavigationGuard]);
