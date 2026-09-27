@@ -22,6 +22,7 @@ from omnigent.server.project_placement import (
     load_entries,
     root_on_host,
 )
+from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._host_worktree import (
     WorktreeHostUnavailableError,
     WorktreeProxyError,
@@ -55,6 +56,7 @@ async def resolve_member_worktree_on_host(
     project_store: Any,
     binding_store: Any,
     host_registry: Any,
+    host_store: Any,
     feature_flags: Any,
 ) -> MemberWorktree:
     """
@@ -64,21 +66,43 @@ async def resolve_member_worktree_on_host(
     target host, and its recorded branch must be checked out in one of that
     host directory's worktrees — the member runs where the lead works.
 
+    The target host is authorized first, with the same rule ``GET
+    /v1/hosts/{id}`` uses (owner check, skipped when auth is disabled): a
+    caller-supplied project must not turn this route into a probe of another
+    owner's host.
+
     :param conversation: The lead session row (needs ``project_id``,
         ``git_branch``, ``workspace``).
     :param host_id: The member's target host.
-    :param user_id: Caller used for the owner-scoped project read, or ``None``
-        when auth is disabled.
+    :param user_id: Caller used for the host and owner-scoped project reads, or
+        ``None`` when auth is disabled.
     :param project_store: Project store, or ``None`` (a server without one
         cannot map a repository to another host).
     :param binding_store: Per-host binding / entry store, or ``None``.
     :param host_registry: Live host tunnel registry, or ``None``.
+    :param host_store: Persistent host registrations, used to authorize the
+        target host before any host request.
     :param feature_flags: Feature flags driving the placement gates.
     :returns: The resolved :class:`MemberWorktree`.
+    :raises HTTPException: 404 if the host is unknown; 403 if it is owned by a
+        different user.
     :raises OmnigentError: 400 naming the missing fact (no project, no
         directory on the host, no recorded branch, no matching worktree) or
         409 when the host cannot be reached for the worktree listing.
     """
+    if host_store is None:
+        raise OmnigentError(
+            "this server cannot verify the target host's owner",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+    # Ownership runs FIRST: before the project read, the registry lookup, and
+    # the worktree listing (which contacts the host). Cross-user host probe.
+    await asyncio.to_thread(
+        resolve_host_owner,
+        user_id=user_id,
+        host_id=host_id,
+        host_store=host_store,
+    )
     if project_store is None:
         raise OmnigentError(
             "this server cannot resolve a project's repository on another host",

@@ -14,10 +14,11 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes import _member_placement
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._host_worktree import (
@@ -27,6 +28,7 @@ from omnigent.server.routes._host_worktree import (
 from omnigent.server.routes._member_placement import resolve_member_worktree_on_host
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 _LEAD_ID = "conv_lead_cross_host"
 _PROJECT_ID = "0123456789abcdef0123456789abcdef"
@@ -34,6 +36,7 @@ _HOST_B = "host_b"
 _REPO = "/host-b/repo"
 _WORKTREE = "/host-b/repo/.worktrees/feature-x"
 _BRANCH = "feature/x"
+_ALICE = "alice@example.com"
 
 
 class _FakeProjectStore:
@@ -48,6 +51,18 @@ class _FakeProjectStore:
         if self._project is not None and self._project.id == project_id:
             return self._project
         return None
+
+
+class _FakeHostStore:
+    """A host store holding the member host, owned by *owner*, or nothing."""
+
+    def __init__(self, host_id: str = _HOST_B, *, owner: str | None = _ALICE) -> None:
+        self._hosts = (
+            {host_id: SimpleNamespace(host_id=host_id, user_id=owner)} if owner is not None else {}
+        )
+
+    def get_host(self, host_id: str) -> Any | None:
+        return self._hosts.get(host_id)
 
 
 class _FakeBindingStore:
@@ -101,6 +116,7 @@ async def _resolve(
     host_connected: bool = True,
     worktrees: list[dict[str, Any]] | None = None,
     worktree_error: Exception | None = None,
+    host_store: Any | None = None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Any:
     """Call the resolver against fakes, with the host listing stubbed."""
@@ -118,10 +134,11 @@ async def _resolve(
     return await resolve_member_worktree_on_host(
         conversation=conversation,
         host_id=_HOST_B,
-        user_id="alice@example.com",
+        user_id=_ALICE,
         project_store=_FakeProjectStore(project),
         binding_store=_FakeBindingStore(),
         host_registry=_FakeHostRegistry(host_connected),
+        host_store=host_store if host_store is not None else _FakeHostStore(),
         feature_flags=None,
     )
 
@@ -136,6 +153,36 @@ async def test_resolves_the_branch_worktree(monkeypatch: pytest.MonkeyPatch) -> 
     assert resolved.workspace == _WORKTREE
     assert resolved.repository == _REPO
     assert resolved.branch == _BRANCH
+
+
+@pytest.mark.asyncio
+async def test_foreign_host_is_refused_before_the_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A host owned by another user is a 403 and is never contacted."""
+    with pytest.raises(HTTPException) as excinfo:
+        await _resolve(
+            conversation=_conversation(),
+            project=_project(),
+            worktree_error=AssertionError("the host must not be contacted for a foreign host"),
+            host_store=_FakeHostStore(owner="bob@example.com"),
+            monkeypatch=monkeypatch,
+        )
+
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.detail == "not your host"
+
+
+@pytest.mark.asyncio
+async def test_unknown_host_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unregistered target host is a 404, before any project resolution."""
+    with pytest.raises(HTTPException) as excinfo:
+        await _resolve(
+            conversation=_conversation(),
+            project=_project(),
+            host_store=_FakeHostStore(owner=None),
+            monkeypatch=monkeypatch,
+        )
+
+    assert excinfo.value.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -279,6 +326,7 @@ async def member_worktree_app(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> A
         prefix="/v1",
     )
     app.state.project_host_binding_store = _FakeBindingStore()
+    app.state.host_store = _FakeHostStore()
 
     async def _fake_list(
         *, host_registry: Any, host_conn: Any, repo_path: str, branch: str
@@ -341,3 +389,53 @@ async def test_route_unknown_session_is_404(member_worktree_app: Any) -> None:
     response = await _get_member_worktree(app, f"conv_{'0' * 32}", _HOST_B)
 
     assert response.status_code == 404, response.text
+
+
+@pytest.mark.asyncio
+async def test_route_refuses_a_foreign_host(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An authenticated caller cannot probe another owner's host via the route."""
+    store = SqlAlchemyConversationStore(db_uri)
+    lead = store.create_conversation(project_id=_PROJECT_ID, git_branch=_BRANCH)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(_ALICE)
+    permissions.grant(_ALICE, lead.id, LEVEL_READ)
+
+    app = FastAPI()
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    app.include_router(
+        sessions_module.create_sessions_router(
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=_FakeHostRegistry(),
+            project_store=_FakeProjectStore(_project()),
+            permission_store=permissions,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        ),
+        prefix="/v1",
+    )
+    app.state.project_host_binding_store = _FakeBindingStore()
+    app.state.host_store = _FakeHostStore(owner="bob@example.com")
+
+    async def _fail_list(**kwargs: Any) -> Any:
+        raise AssertionError("the host must not be contacted for a foreign host")
+
+    monkeypatch.setattr(_member_placement, "list_worktrees_and_match_branch", _fail_list)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/v1/sessions/{lead.id}/member-worktree",
+            params={"host_id": _HOST_B},
+            headers={"X-Forwarded-Email": _ALICE},
+        )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "not your host"

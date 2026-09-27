@@ -1540,10 +1540,12 @@ def register_core_routes(
         A joint-agent member saved on another host runs there in the checkout
         of the same repository and branch the lead session is working in. The
         runner resolving a remote member dispatch calls this before creating
-        the child: the repository is mapped to *host_id* through the lead
-        session's project, and the lead's recorded branch is matched against
-        that host's worktrees. Every missing fact is a 4xx naming it, so the
-        member dispatch fails loud instead of running somewhere else.
+        the child: the target host is authorized for the caller (same owner
+        rule as ``GET /v1/hosts/{id}``), the repository is mapped to *host_id*
+        through the lead session's project, and the lead's recorded branch is
+        matched against that host's worktrees. Every missing fact is a 4xx
+        naming it, so the member dispatch fails loud instead of running
+        somewhere else.
 
         :param request: The incoming FastAPI request (for ``app.state``).
         :param response: The FastAPI response (for cache headers).
@@ -1553,6 +1555,8 @@ def register_core_routes(
         :raises OmnigentError: 403/404 without read access to the session;
             400/409 when the project, host directory, branch, or worktree is
             missing.
+        :raises HTTPException: 404 if the target host is unknown; 403 if it
+            is owned by a different user.
         """
         response.headers["Cache-Control"] = "no-store"
         user_id = _get_user_id(request, auth_provider)
@@ -1575,6 +1579,7 @@ def register_core_routes(
                 if host_registry is not None
                 else getattr(request.app.state, "host_registry", None)
             ),
+            host_store=getattr(request.app.state, "host_store", None),
             feature_flags=getattr(request.app.state, "feature_flags", None),
         )
         return {
