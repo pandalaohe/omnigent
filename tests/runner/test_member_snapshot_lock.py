@@ -233,7 +233,48 @@ async def test_matching_explicit_values_are_allowed(monkeypatch: pytest.MonkeyPa
     assert len(bodies) == 1
     assert bodies[0]["model_override"] == _MEMBER_MODEL
     assert bodies[0]["reasoning_effort"] == "high"
-    assert bodies[0]["harness_override"] == "claude-sdk"
+    # The matching harness is a no-op: the child resolves the snapshot harness
+    # from its spec, so no override rides the create body.
+    assert "harness_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_matching_explicit_harness_needs_no_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit harness equal to the snapshot is a no-op, allowlist or not."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_harness_noop",
+        labels=_member_labels(),
+        dispatch_args={"harness": "claude-sdk"},
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert len(bodies) == 1
+    assert "harness_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_explicit_harness_still_needs_the_allowlist_without_a_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A role with no snapshot entry keeps the override allowlist gate."""
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_harness_no_snapshot",
+        labels=None,
+        dispatch_args={"harness": "claude-sdk"},
+    )
+
+    assert output.startswith("Error:")
+    assert "allowed_harnesses" in output
+    assert bodies == []
 
 
 @pytest.mark.asyncio

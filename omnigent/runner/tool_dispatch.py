@@ -3101,7 +3101,18 @@ async def _execute_subagent_tool(
         # ``POST /v1/sessions`` harness_override is bounded only by the global
         # allowlist.
         harness_override_canonical: str | None = None
-        if harness_override is not None:
+        # A snapshot member's explicit harness that equals its frozen entry is a
+        # no-op — the lock above already rejected a differing one — so treat the
+        # argument as absent and skip the override allowlist, which a frozen
+        # member never needs to opt into.
+        locked_harness = (
+            _member_harness_name(member_entry.get("harness")) if member_entry is not None else None
+        )
+        snapshot_harness_matches = (
+            harness_override is not None
+            and _member_harness_name(harness_override) == locked_harness
+        )
+        if harness_override is not None and not snapshot_harness_matches:
             from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 
             canonical = canonicalize_harness(harness_override) or harness_override
