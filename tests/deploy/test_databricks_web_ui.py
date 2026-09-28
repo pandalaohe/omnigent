@@ -124,6 +124,8 @@ def test_app_wires_the_user_preferences_store() -> None:
     wired = {keyword.arg: keyword.value for keyword in create_app_calls[0].keywords}
     assert isinstance(wired.get("user_preferences_store"), ast.Name)
     assert wired["user_preferences_store"].id == "user_preferences_store"
+    # Without the catalog cache store the calling-defaults routes do not mount.
+    assert isinstance(wired.get("host_model_catalog_cache_store"), ast.Name)
 
 
 def test_app_extractor_extracts_normal_archive(tmp_path: Path) -> None:

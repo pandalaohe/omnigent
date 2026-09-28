@@ -179,6 +179,36 @@ def test_docker_entrypoint_wires_the_peer_message_store(
     assert app.state.peer_message_store is not None
 
 
+def test_docker_entrypoint_wires_the_host_model_catalog_cache_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The container path must mount ``/v1/calling-defaults``.
+
+    ``create_app`` only mounts the calling-defaults routes when it gets the
+    catalog cache store, and session create reads it from ``app.state`` to
+    check project defaults against what each host offers.
+    """
+    from fastapi.testclient import TestClient
+
+    from deploy.docker.entrypoint import build_app, run_migrations
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}\n")
+    database_url = f"sqlite:///{tmp_path / 'entrypoint.db'}"
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
+
+    run_migrations(database_url)
+    app = build_app().app
+
+    response = TestClient(app).get("/v1/calling-defaults/catalogs")
+    assert response.status_code != 404, response.text
+    assert app.state.host_model_catalog_cache_store is not None
+
+
 def test_docker_entrypoint_runs_the_schema_initializer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

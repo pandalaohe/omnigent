@@ -194,6 +194,7 @@ try:
     from omnigent.stores.global_instructions_store.sqlalchemy_store import (
         SqlAlchemyGlobalInstructionsStore,
     )
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.peer_message_store.sqlalchemy_store import (
         SqlAlchemyPeerMessageStore,
@@ -257,6 +258,7 @@ try:
     assignment_store = SqlAlchemyAssignmentStore(DB_URI)
     peer_message_store = SqlAlchemyPeerMessageStore(DB_URI)
     host_store = HostStore(DB_URI)
+    host_model_catalog_cache_store = HostModelCatalogCacheStore(DB_URI)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
     user_preferences_store = SqlAlchemyUserPreferencesStore(DB_URI)
 
@@ -304,6 +306,7 @@ try:
         assignment_store=assignment_store,
         peer_message_store=peer_message_store,
         host_store=host_store,
+        host_model_catalog_cache_store=host_model_catalog_cache_store,
         scheduled_task_store=scheduled_task_store,
         user_preferences_store=user_preferences_store,
         auth_provider=auth_provider,
