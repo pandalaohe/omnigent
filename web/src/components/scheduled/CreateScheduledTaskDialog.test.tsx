@@ -1425,6 +1425,31 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(input.reasoningEffort).toBe("medium");
     expect(input).not.toHaveProperty("permissionMode");
   });
+
+  it("resends a kept override on update when the agent is switched", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          reasoningEffort: "high",
+        })}
+      />,
+    );
+    // Switch to another model/effort-capable agent and pick the stored effort
+    // again: the server clears whatever the PATCH omits on a switch, so "high"
+    // must ride along even though it matches the task's current value.
+    fireEvent.click(screen.getByTestId("pick-agent-polly"));
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.agentId).toBe("ag_1");
+    expect(input.reasoningEffort).toBe("high");
+  });
 });
 
 describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", () => {
