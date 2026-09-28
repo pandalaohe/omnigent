@@ -7138,10 +7138,7 @@ def _handle_mcp_request(
                 "Omnigent tools are available as MCP tools when the "
                 "active Omnigent turn advertises them; local sys_os_* "
                 "tools are available outside an active turn for "
-                "workspace file and shell access. Sessions created for a project "
-                "are filed under it and start in that project's directory on the "
-                "target host; a child session joins its parent's project and keeps its "
-                "parent's working tree."
+                "workspace file and shell access."
             ),
         }
     if method == "tools/list":
