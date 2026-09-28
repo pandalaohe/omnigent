@@ -119,6 +119,7 @@ import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutEditor } from "@/components/KeyboardShortcutEditor";
 import { ApprovalTimeoutSettings } from "@/components/ApprovalTimeoutSettings";
 import { ArtifactSharingSettings } from "@/components/ArtifactSharingSettings";
+import { CallingDefaultsSection } from "@/components/CallingDefaultsSection";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
 import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
@@ -380,6 +381,7 @@ export function SettingsPage() {
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
       {section === "agents" && <AgentsSettings />}
+      {section === "calling-defaults" && <CallingDefaultsSettingsSection />}
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
@@ -2188,6 +2190,17 @@ function ContextUsageSection() {
         <CompactProgressIndicatorControl />
         <ContextUsageSettings />
       </div>
+    </Section>
+  );
+}
+
+function CallingDefaultsSettingsSection() {
+  return (
+    <Section
+      title="Calling defaults"
+      description="Model and reasoning effort defaults per host and harness. Projects can override them per host."
+    >
+      <CallingDefaultsSection />
     </Section>
   );
 }

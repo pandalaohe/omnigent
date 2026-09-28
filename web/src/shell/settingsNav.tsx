@@ -22,6 +22,7 @@ import {
   SettingsIcon,
   Share2Icon,
   ShieldCheckIcon,
+  SlidersHorizontalIcon,
   TerminalIcon,
   UserCogIcon,
   UsersIcon,
@@ -38,6 +39,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 export type SettingsSectionId =
   | "agents"
   | "appearance"
+  | "calling-defaults"
   | "customize"
   | "general"
   | "git"
@@ -65,6 +67,7 @@ export const HEADERLESS_SECTIONS: readonly SettingsSectionId[] = ["customize"];
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "agents",
   "appearance",
+  "calling-defaults",
   "customize",
   "general",
   "git",
@@ -118,6 +121,7 @@ export function settingsNavGroups(
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
     { id: "agents", label: "Agents", icon: BotIcon },
+    { id: "calling-defaults", label: "Calling defaults", icon: SlidersHorizontalIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },
