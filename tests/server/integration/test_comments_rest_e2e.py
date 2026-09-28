@@ -367,8 +367,8 @@ async def test_send_formats_multifile_message_with_anchors(
     beta_pos = msg.index("src/beta.py")
     assert alpha_pos < beta_pos, "Comments should be grouped alphabetically by file path"
 
-    # Anchor content appears quoted in the message
-    assert '"old_var_name"' in msg, "Anchor content should appear quoted in the message"
+    # Anchor content appears quoted in the Excerpt block
+    assert "> old_var_name" in msg, "Anchor content should appear quoted in the Excerpt block"
 
     # Both bodies present
     assert "Rename variable" in msg
