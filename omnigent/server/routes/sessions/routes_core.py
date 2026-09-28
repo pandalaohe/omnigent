@@ -27,6 +27,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from omnigent.calling_defaults import load_master
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
@@ -1156,6 +1157,24 @@ def register_core_routes(
         # call must not do. A 1-member bundle resolves to no labels. A create
         # that names an owned library Agent (the interactive New Chat label)
         # takes that Agent's saved member hosts.
+        member_project_config: dict[str, Any] | None = None
+        if parsed_metadata.project_id is not None and project_store is not None:
+            # Best-effort: a failed project read leaves the member chain to the
+            # master layers instead of aborting an otherwise valid create.
+            try:
+                member_project = await asyncio.to_thread(
+                    project_store.get, parsed_metadata.project_id, user_id=user_id
+                )
+            except Exception:
+                _logger.warning(
+                    "member snapshot: project lookup failed for %s; members use "
+                    "their declared values and the master table",
+                    parsed_metadata.project_id,
+                    exc_info=True,
+                )
+            else:
+                if member_project is not None:
+                    member_project_config = member_project.config
         member_labels = await _member_snapshot_labels(
             spec,
             host_id=parsed_metadata.host_id,
@@ -1164,6 +1183,10 @@ def register_core_routes(
                 template_id=(parsed_metadata.labels or {}).get("omnigent:agent-template-id"),
                 owner=user_id,
                 custom_agents_store=getattr(request.app.state, "custom_agents_store", None),
+            ),
+            project_config=member_project_config,
+            master=await load_master(
+                user_id, getattr(request.app.state, "user_preferences_store", None)
             ),
         )
         if member_labels:

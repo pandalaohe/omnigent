@@ -1865,6 +1865,105 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+async def _session_snapshot(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> _JsonObject | None:
+    """Read one session's JSON snapshot, or ``None`` when unreadable.
+
+    Shared by the dispatch's calling-defaults lookup and parent-model
+    inheritance so one dispatch costs at most one session read.
+    """
+    try:
+        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    return _string_object_dict(payload)
+
+
+async def _fetch_dispatch_calling(
+    *,
+    server_client: httpx.AsyncClient,
+    snapshot: _JsonObject | None,
+    agent: str,
+    harness: str | None,
+    want_model: bool,
+    want_effort: bool,
+) -> tuple[str | None, str | None]:
+    """Read the calling-defaults chain for one built-in member dispatch.
+
+    The server resolves the session's project / host defaults for the child's
+    harness; the runner cannot read the project config or the owner's master
+    table itself. Best-effort: a transport error, non-200, or malformed body
+    is logged and resolves to ``(None, None)`` so the dispatch falls back to
+    parent-model inheritance / the sub-agent spec effort rather than failing.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param snapshot: The parent session's already-read snapshot, or ``None``;
+        its ``project_id`` / ``host_id`` scope the chain.
+    :param agent: The sub-agent's name, sent as the explicit agent.
+    :param harness: The child's resolved harness, or ``None``.
+    :param want_model: Whether the caller uses the chain's model; ``False``
+        (an explicit / pinned value already won) drops it from the result.
+    :param want_effort: Whether the caller uses the chain's effort.
+    :returns: ``(model, effort)`` from the chain; each is ``None`` when
+        unwanted or unresolved.
+    """
+    snapshot = snapshot or {}
+    params: dict[str, str] = {}
+    project_id = _optional_string(snapshot.get("project_id"))
+    host_id = _optional_string(snapshot.get("host_id"))
+    if project_id:
+        params["project_id"] = project_id
+    if host_id:
+        params["host_id"] = host_id
+    params["agent_id"] = agent
+    if harness:
+        params["harness"] = harness
+    try:
+        resp = await server_client.get("/v1/calling-defaults/resolve", params=params, timeout=10.0)
+    except (httpx.HTTPError, RuntimeError) as exc:
+        _logger.warning(
+            "sys_session_send: calling-defaults lookup failed for sub-agent %r "
+            "(%s); falling back to parent-model inheritance / the spec effort",
+            agent,
+            type(exc).__name__,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return None, None
+    if resp.status_code != 200:
+        _logger.warning(
+            "sys_session_send: calling-defaults lookup for sub-agent %r returned "
+            "%s; falling back to parent-model inheritance / the spec effort",
+            agent,
+            resp.status_code,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return None, None
+    try:
+        payload = _string_object_dict(resp.json())
+    except ValueError:
+        payload = None
+    if payload is None:
+        _logger.warning(
+            "sys_session_send: calling-defaults lookup for sub-agent %r returned "
+            "a malformed body; falling back to parent-model inheritance / the "
+            "spec effort",
+            agent,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return None, None
+    model = _optional_string(payload.get("model"))
+    effort = _optional_string(payload.get("effort"))
+    return (model if want_model else None, effort if want_effort else None)
+
+
 async def _inherited_parent_model(
     *,
     server_client: httpx.AsyncClient,
@@ -1872,6 +1971,7 @@ async def _inherited_parent_model(
     sub_agent_name: str,
     agent_spec: AgentSpec | None,
     child_harness: str | None,
+    snapshot: _JsonObject | None = None,
 ) -> str | None:
     """
     Resolve the parent session's model for a dispatch that names none.
@@ -1900,6 +2000,8 @@ async def _inherited_parent_model(
     :param sub_agent_name: Name of the sub-agent being dispatched.
     :param agent_spec: Parent agent's spec.
     :param child_harness: The child's resolved harness, e.g. ``"claude-sdk"``.
+    :param snapshot: The parent session snapshot already read for this
+        dispatch to reuse, or ``None`` to read it here.
     :returns: The parent's effective model to inherit, or ``None`` when
         inheritance does not apply.
     """
@@ -1909,18 +2011,13 @@ async def _inherited_parent_model(
         return None
     if not harness_supports_model_override(child_harness):
         return None
-    try:
-        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
-    except (httpx.HTTPError, RuntimeError):
-        return None
-    if resp.status_code != 200:
-        return None
-    snap = _string_object_dict(resp.json())
-    if snap is None:
+    if snapshot is None:
+        snapshot = await _session_snapshot(server_client, conversation_id)
+    if snapshot is None:
         return None
     # Effective selection: an explicit per-session override wins over the
     # spec/CLI-resolved model; both may be absent.
-    raw_model = snap.get("model_override") or snap.get("llm_model")
+    raw_model = snapshot.get("model_override") or snapshot.get("llm_model")
     if not isinstance(raw_model, str) or not raw_model:
         return None
     try:
@@ -1940,7 +2037,7 @@ async def _inherited_parent_model(
     if (
         child_harness is not None
         and not _harness_has_inference_binding(child_harness)
-        and _child_is_foreign_harness(child_harness, snap.get("harness"))
+        and _child_is_foreign_harness(child_harness, snapshot.get("harness"))
     ):
         _logger.info(
             "sys_session_send: not inheriting parent model %r for sub-agent %r "
@@ -1949,7 +2046,7 @@ async def _inherited_parent_model(
             parent_model,
             sub_agent_name,
             child_harness,
-            snap.get("harness"),
+            snapshot.get("harness"),
             extra={"session_id": runner_primary_session_id()},
         )
         return None
@@ -3390,6 +3487,34 @@ async def _execute_subagent_tool(
             # launch starts a runner there (F2b).
             create_body["host_id"] = remote_host
             create_body["workspace"] = remote_workspace
+        # A dispatch with no member snapshot (built-in joint agents) takes an
+        # unset model / effort from the calling-defaults chain for the
+        # session's project / host before parent-model inheritance and the
+        # sub-agent spec fallbacks. A pinned spec value keeps its field out of
+        # the chain; the one session read serves the chain and inheritance.
+        chain_model: str | None = None
+        chain_effort: str | None = None
+        session_snapshot: _JsonObject | None = None
+        if member_entry is None:
+            sub_executor = getattr(
+                _find_subagent_spec(str(sub_agent_name), agent_spec), "executor", None
+            )
+            pinned_model = getattr(sub_executor, "model", None)
+            pinned_effort = getattr(sub_executor, "reasoning_effort", None)
+            want_model = model is None and not (isinstance(pinned_model, str) and pinned_model)
+            want_effort = reasoning_effort is None and not (
+                isinstance(pinned_effort, str) and pinned_effort
+            )
+            if want_model or want_effort:
+                session_snapshot = await _session_snapshot(server_client, conversation_id)
+                chain_model, chain_effort = await _fetch_dispatch_calling(
+                    server_client=server_client,
+                    snapshot=session_snapshot,
+                    agent=str(sub_agent_name),
+                    harness=child_harness,
+                    want_model=want_model,
+                    want_effort=want_effort,
+                )
         if model is not None:
             # Reject up front when the child harness would silently
             # ignore the persisted override — no silent drops.
@@ -3429,11 +3554,11 @@ async def _execute_subagent_tool(
         else:
             # No explicit per-dispatch model. A snapshot member runs the
             # session's frozen model — parent inheritance never applies to it;
-            # otherwise inherit the parent session's selection so the user's
-            # chosen model governs the whole session tree. Best-effort — skipped
-            # when the sub-agent spec pins its own model, the harness has no
-            # override plumbing, or the parent model's family cannot run on the
-            # child harness.
+            # otherwise the calling-defaults chain, then the parent session's
+            # selection, so the user's chosen defaults govern the whole session
+            # tree. Best-effort — skipped when the sub-agent spec pins its own
+            # model, the harness has no override plumbing, or the parent model's
+            # family cannot run on the child harness.
             snapshot_model = (
                 member_entry.get("model")
                 if member_entry is not None
@@ -3456,25 +3581,36 @@ async def _execute_subagent_tool(
                         )
                     )
             elif member_entry is None:
-                inherited = await _inherited_parent_model(
-                    server_client=server_client,
-                    conversation_id=conversation_id,
-                    sub_agent_name=str(sub_agent_name),
-                    agent_spec=agent_spec,
-                    child_harness=child_harness,
-                )
-                if inherited is not None:
-                    create_body["model_override"] = _normalize_subagent_model(
-                        inherited,
+                if chain_model is not None:
+                    if harness_supports_model_override(child_harness):
+                        create_body["model_override"] = _normalize_subagent_model(
+                            chain_model,
+                            sub_agent_name=str(sub_agent_name),
+                            agent_spec=agent_spec,
+                            harness=child_harness,
+                        )
+                else:
+                    inherited = await _inherited_parent_model(
+                        server_client=server_client,
+                        conversation_id=conversation_id,
                         sub_agent_name=str(sub_agent_name),
                         agent_spec=agent_spec,
-                        harness=child_harness,
+                        child_harness=child_harness,
+                        snapshot=session_snapshot,
                     )
-        # A dispatch that names no effort inherits the sub-agent spec's
-        # ``executor.reasoning_effort``, so a worker's default is declared
-        # once in its config instead of depending on the orchestrator
-        # remembering to pass it on every dispatch. A snapshot member's
-        # effort is the session's frozen value instead.
+                    if inherited is not None:
+                        create_body["model_override"] = _normalize_subagent_model(
+                            inherited,
+                            sub_agent_name=str(sub_agent_name),
+                            agent_spec=agent_spec,
+                            harness=child_harness,
+                        )
+        # A dispatch that names no effort takes the calling-defaults chain for
+        # a session without a member snapshot, else the sub-agent spec's
+        # ``executor.reasoning_effort``, so a worker's default is declared once
+        # in its config instead of depending on the orchestrator remembering to
+        # pass it on every dispatch. A snapshot member's effort is the
+        # session's frozen value instead.
         effective_effort = reasoning_effort
         effort_source = "sys_session_send"
         if effective_effort is None and member_entry is not None:
@@ -3482,6 +3618,9 @@ async def _execute_subagent_tool(
             if isinstance(snapshot_effort, str) and snapshot_effort:
                 effective_effort = snapshot_effort
                 effort_source = f"member {sub_agent_name!r} snapshot"
+        if effective_effort is None and chain_effort is not None:
+            effective_effort = chain_effort
+            effort_source = "calling defaults"
         if effective_effort is None:
             sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
             # ``getattr``: sub-specs also arrive as structural stubs that

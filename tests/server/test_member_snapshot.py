@@ -30,12 +30,14 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import AuthProvider
 from omnigent.server.custom_agents_store import CustomAgentsStore
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 _HOST_ID = "7a2b1c9dfe310a4bb2cc56d1a0e47b3c"
 _WORKSPACE = "/repo"
@@ -67,9 +69,12 @@ def joint_bundle(
     lead_harness: str = "codex",
     worker_model: str = "worker-model",
     worker_harness: str = "claude-sdk",
-    worker_effort: str = "medium",
+    worker_effort: str | None = "medium",
     worker_name: str = "researcher",
 ) -> bytes:
+    worker_effort_field = (
+        f" reasoning_effort: {worker_effort}," if worker_effort is not None else ""
+    )
     return _bundle(
         lead=f"""spec_version: 1
 name: custom-reviewer
@@ -80,7 +85,7 @@ executor: {{type: omnigent, model: {lead_model}, reasoning_effort: high,
         worker=f"""spec_version: 1
 name: {worker_name}
 description: Research support
-executor: {{type: omnigent, model: {worker_model}, reasoning_effort: {worker_effort},
+executor: {{type: omnigent, model: {worker_model},{worker_effort_field}
   config: {{harness: {worker_harness}}}}}
 """,
     )
@@ -102,6 +107,8 @@ class _MemberServer:
     conversations: SqlAlchemyConversationStore
     hosts: HostStore
     custom: CustomAgentsStore
+    projects: SqlAlchemyProjectStore
+    prefs: SqlAlchemyUserPreferencesStore
 
 
 @pytest.fixture()
@@ -109,6 +116,8 @@ def member_server(runtime_init: None, db_uri: str, tmp_path: Path) -> _MemberSer
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     conversations = SqlAlchemyConversationStore(db_uri)
     hosts = HostStore(db_uri)
+    projects = SqlAlchemyProjectStore(db_uri)
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -118,6 +127,8 @@ def member_server(runtime_init: None, db_uri: str, tmp_path: Path) -> _MemberSer
         permission_store=SqlAlchemyPermissionStore(db_uri),
         auth_provider=HeaderAuth(),
         host_store=hosts,
+        project_store=projects,
+        user_preferences_store=prefs,
     )
     # The snapshot resolution is this file's subject; the multipart host
     # workspace round-trip and runner launch have their own coverage, so a
@@ -128,6 +139,8 @@ def member_server(runtime_init: None, db_uri: str, tmp_path: Path) -> _MemberSer
         conversations=conversations,
         hosts=hosts,
         custom=CustomAgentsStore(db_uri),
+        projects=projects,
+        prefs=prefs,
     )
 
 
@@ -370,6 +383,72 @@ async def test_missing_default_row_keeps_model_null(
     )
 
     assert entries["researcher"]["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_member_chain_keeps_saved_model_and_fills_unset_effort(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scenario 14: the member's saved model wins; the project chain fills effort."""
+    _arm_host(member_server.hosts)
+    _stub_catalog(monkeypatch)
+    project = member_server.projects.create(
+        "d1" * 16,
+        "Chain project",
+        _USER,
+        config={
+            "calling_defaults": {
+                _HOST_ID: {
+                    "harnesses": {"claude-sdk": {"model": "chain-model", "effort": "xhigh"}}
+                }
+            }
+        },
+    )
+
+    entries = await _member_labels_after_create(
+        member_server,
+        joint_bundle(worker_effort=None),
+        metadata={
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "project_id": project.id,
+        },
+    )
+
+    assert entries["researcher"]["model"] == "worker-model"
+    assert entries["researcher"]["effort"] == "xhigh"
+    # No chain entry for the lead's harness, so its saved values stay.
+    assert entries["custom-reviewer"]["model"] == "lead-model"
+    assert entries["custom-reviewer"]["effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_chain_model_precedes_the_catalog_is_default_row(
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``default`` member model takes the chain's model before the catalog row."""
+    _arm_host(member_server.hosts)
+    _stub_catalog(monkeypatch)
+    project = member_server.projects.create(
+        "d2" * 16,
+        "Chain project",
+        _USER,
+        config={
+            "calling_defaults": {_HOST_ID: {"harnesses": {"claude-sdk": {"model": "chain-model"}}}}
+        },
+    )
+
+    entries = await _member_labels_after_create(
+        member_server,
+        joint_bundle(worker_model="default"),
+        metadata={
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "project_id": project.id,
+        },
+    )
+
+    assert entries["researcher"]["model"] == "chain-model"
 
 
 @pytest.mark.asyncio

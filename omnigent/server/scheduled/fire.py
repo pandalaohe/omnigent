@@ -54,9 +54,10 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
+from omnigent.calling_defaults import load_master
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
-from omnigent.entities import Conversation, ScheduledTask
+from omnigent.entities import Conversation, Project, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.sdk_permission_modes import (
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
@@ -880,9 +881,13 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
     There is no ``agents`` row to bind: the saved bundle is copied into a fresh
     session-scoped ``ag_`` agent, with the task's model / effort / permission
     overrides applied and the template label recording the source ``ca_`` id.
+    The task's project and the owner's master table reach the launch so a
+    joint bundle's unset member values resolve through the calling-defaults
+    chain, like the interactive multipart create.
     """
     custom_agents_store = deps.custom_agents_store
     assert custom_agents_store is not None  # gated by _is_library_agent_task
+    project = await _task_project(deps, task)
     result = await launch_library_agent(
         custom_agents_store=custom_agents_store,
         artifact_store=deps.artifact_store,
@@ -898,6 +903,8 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
             reasoning_effort=task.reasoning_effort,
             permission_mode=task.permission_mode,
         ),
+        project_config=project.config if project is not None else None,
+        master=await load_master(task.user_id, deps.preferences_store),
     )
     conv: Conversation | None = await asyncio.to_thread(
         deps.conversation_store.get_conversation, result.session_id
@@ -908,6 +915,37 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
             code=ErrorCode.INTERNAL_ERROR,
         )
     return conv
+
+
+async def _task_project(deps: FireDeps, task: ScheduledTask) -> Project | None:
+    """Load the task's project while it still exists and belongs to the owner.
+
+    A gone / foreign project (or an unwired project store) resolves to ``None``
+    with a warning, so the chain falls back to the master layers and a fire
+    never fails on a stale project reference.
+    """
+    if task.project_id is None or deps.project_store is None:
+        return None
+    try:
+        project = await asyncio.to_thread(
+            deps.project_store.get, task.project_id, user_id=task.user_id
+        )
+    except Exception:  # noqa: BLE001 — a project read must never fail a fire
+        _logger.warning(
+            "scheduled fire: could not load project %s for task %s; using master layers",
+            task.project_id,
+            task.id,
+            exc_info=True,
+        )
+        return None
+    if project is None:
+        _logger.warning(
+            "scheduled fire: task %s project %s is gone or not owned by %r; using master layers",
+            task.id,
+            task.project_id,
+            task.user_id,
+        )
+    return project
 
 
 async def _resolve_fire_calling(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
@@ -921,37 +959,16 @@ async def _resolve_fire_calling(deps: FireDeps, task: ScheduledTask) -> Schedule
     requires one and never resolves it from defaults.
 
     The task's project applies only while it still exists and belongs to the
-    task owner; a gone / foreign project (or an unwired project store) falls
-    back to the master layers with a warning and never fails the fire. A saved
-    library Agent task keeps its existing library launch untouched.
+    task owner (see :func:`_task_project`); a gone / foreign project falls back
+    to the master layers and never fails the fire. A saved library Agent task
+    keeps its existing library launch untouched.
 
     :raises OmnigentError: A K5 refusal — a default-sourced model / effort the
         fresh catalog does not offer; the caller records the failed run.
     """
     if _is_library_agent_task(deps, task):
         return task
-    project = None
-    if task.project_id is not None and deps.project_store is not None:
-        try:
-            project = await asyncio.to_thread(
-                deps.project_store.get, task.project_id, user_id=task.user_id
-            )
-        except Exception:  # noqa: BLE001 — a project read must never fail a fire
-            _logger.warning(
-                "scheduled fire: could not load project %s for task %s; using master layers",
-                task.project_id,
-                task.id,
-                exc_info=True,
-            )
-        else:
-            if project is None:
-                _logger.warning(
-                    "scheduled fire: task %s project %s is gone or not owned by %r; "
-                    "using master layers",
-                    task.id,
-                    task.project_id,
-                    task.user_id,
-                )
+    project = await _task_project(deps, task)
     explicit: dict[str, Any] = {
         "agent_id": task.agent_id,
         "model_override": task.model_override,

@@ -31,12 +31,14 @@ from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
@@ -101,6 +103,8 @@ class _LibraryServer:
     tasks: SqlAlchemyScheduledTaskStore
     hosts: HostStore
     custom: CustomAgentsStore
+    projects: SqlAlchemyProjectStore
+    prefs: SqlAlchemyUserPreferencesStore
 
 
 @pytest.fixture()
@@ -112,6 +116,8 @@ def library_server(runtime_init: None, db_uri: str, tmp_path: Path) -> _LibraryS
     tasks = SqlAlchemyScheduledTaskStore(db_uri)
     hosts = HostStore(db_uri)
     custom = CustomAgentsStore(db_uri)
+    projects = SqlAlchemyProjectStore(db_uri)
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
     app = create_app(
         agents,
         SqlAlchemyFileStore(db_uri),
@@ -123,13 +129,17 @@ def library_server(runtime_init: None, db_uri: str, tmp_path: Path) -> _LibraryS
         host_store=hosts,
         auth_provider=UnifiedAuthProvider(source="header"),
         custom_agents_store=custom,
+        project_store=projects,
+        user_preferences_store=prefs,
     )
     permissions.ensure_user(_OWNER, is_admin=False)
     permissions.ensure_user("bob@example.com", is_admin=False)
     # A local row is all the pinned-host ownership check resolves against; the
     # host never has to be online for create validation.
     hosts.upsert_on_connect(_HOST_ID, "alice-laptop", _OWNER)
-    return _LibraryServer(app, artifacts, agents, conversations, permissions, tasks, hosts, custom)
+    return _LibraryServer(
+        app, artifacts, agents, conversations, permissions, tasks, hosts, custom, projects, prefs
+    )
 
 
 @pytest.fixture()
@@ -264,6 +274,8 @@ def _fire_deps(server: _LibraryServer) -> FireDeps:
         host_registry=None,
         artifact_store=server.artifacts,
         custom_agents_store=server.custom,
+        project_store=server.projects,
+        preferences_store=server.prefs,
     )
 
 
@@ -361,6 +373,50 @@ async def test_fire_writes_member_snapshot_labels(
         "effort": None,
         "lead": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_fire_member_snapshot_uses_the_tasks_project_chain(
+    client: httpx.AsyncClient, library_server: _LibraryServer
+) -> None:
+    """A fired joint Agent's unset member effort fills from the task's project.
+
+    The worker's saved model is kept; its unset effort takes the project's
+    per-host default for the worker harness, which only resolves if the fire
+    path passes the task's project into the snapshot.
+    """
+    project = (
+        await client.post(
+            "/v1/projects",
+            json={
+                "name": "P",
+                "config": {
+                    "calling_defaults": {_HOST_ID: {"harnesses": {"codex": {"effort": "xhigh"}}}}
+                },
+            },
+            headers=_headers(),
+        )
+    ).json()
+    agent_id = await _create_joint_agent(client)
+    task_id = await _create_library_task(client, agent_id, project_id=project["id"])
+    dispatched: list[Any] = []
+
+    async def _dispatch(conv: Any, task: Any) -> None:
+        dispatched.append(conv)
+
+    on_fire = build_on_fire(_fire_deps(library_server), launch_dispatch=_dispatch)
+    await on_fire(0, task_id)
+    await _drain()
+
+    assert len(dispatched) == 1
+    session = library_server.conversations.get_conversation(dispatched[0].id)
+    assert session is not None
+    worker = parse_member_entry(session.labels[member_label_key("researcher")])
+    assert worker is not None
+    assert worker["model"] == "worker-model"
+    assert worker["effort"] == "xhigh"
+    lead = parse_member_entry(session.labels[member_label_key("library-runner")])
+    assert lead is not None and lead["effort"] is None
 
 
 @pytest.mark.asyncio

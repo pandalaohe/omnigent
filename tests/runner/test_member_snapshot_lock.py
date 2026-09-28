@@ -80,6 +80,8 @@ async def _dispatch(
     labels: dict[str, str] | None = None,
     parent_snapshot: dict[str, Any] | None = None,
     dispatch_args: dict[str, Any] | None = None,
+    resolve_payload: dict[str, Any] | None = None,
+    resolve_queries: list[dict[str, str]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """
     Drive one named ``sys_session_send`` and capture the child create bodies.
@@ -93,6 +95,11 @@ async def _dispatch(
         ``GET /v1/sessions/{conv_id}``; ``None`` serves a 404.
     :param dispatch_args: Extra ``args``-object fields (model / effort /
         harness) for the dispatch.
+    :param resolve_payload: JSON the mock server returns for
+        ``GET /v1/calling-defaults/resolve``; ``None`` serves a 404 so the
+        dispatch falls back to parent-model inheritance.
+    :param resolve_queries: When given, each calling-defaults request's query
+        params are appended.
     :returns: ``(tool_output, create_bodies)``.
     """
     from omnigent.runner import app as runner_app
@@ -104,11 +111,17 @@ async def _dispatch(
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
-        """Serve labels, the parent snapshot, child lookup, create, and events."""
+        """Serve labels, the parent snapshot, the chain, child lookup, create, events."""
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv_id}/labels":
             if labels is None:
                 return httpx.Response(404, json={"error": "not found"})
             return httpx.Response(200, json={"labels": labels})
+        if request.method == "GET" and request.url.path == "/v1/calling-defaults/resolve":
+            if resolve_queries is not None:
+                resolve_queries.append(dict(request.url.params))
+            if resolve_payload is None:
+                return httpx.Response(404, json={"error": "not found"})
+            return httpx.Response(200, json=resolve_payload)
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv_id}":
             if parent_snapshot is None:
                 return httpx.Response(404, json={"error": "not found"})
@@ -372,8 +385,9 @@ async def test_unavailable_member_refuses_dispatch(monkeypatch: pytest.MonkeyPat
 async def test_session_without_member_labels_still_inherits_parent_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unrelated labels leave today's parent-model inheritance in place."""
+    """A failed chain lookup leaves today's parent-model inheritance in place."""
     _stub_worker_launchable(monkeypatch)
+    queries: list[dict[str, str]] = []
 
     output, bodies = await _dispatch(
         monkeypatch,
@@ -387,11 +401,111 @@ async def test_session_without_member_labels_still_inherits_parent_model(
             "model_override": _PARENT_MODEL,
             "llm_model": None,
         },
+        resolve_queries=queries,
     )
 
     payload = json.loads(output)
     assert payload["status"] == "launching", output
     assert bodies[0]["model_override"] == _PARENT_MODEL
+    # The chain was consulted and failed (404), so inheritance took over.
+    assert queries == [{"agent_id": "worker", "harness": "claude-sdk"}]
+
+
+@pytest.mark.asyncio
+async def test_builtin_member_takes_the_calling_defaults_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario 15: the chain's model / effort fill a dispatch without a snapshot."""
+    _stub_worker_launchable(monkeypatch)
+    queries: list[dict[str, str]] = []
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("codex-native"),
+        conv_id="conv_member_chain",
+        labels={"unrelated": "1"},
+        parent_snapshot={
+            "id": "conv_member_chain",
+            "agent_id": "ag_parent",
+            "harness": "claude-sdk",
+            "model_override": _PARENT_MODEL,
+            "llm_model": None,
+            "project_id": "proj_polly",
+            "host_id": "host_hds",
+        },
+        resolve_payload={"model": "gpt-6-astra", "effort": "medium"},
+        resolve_queries=queries,
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert bodies[0]["model_override"] == "gpt-6-astra"
+    assert bodies[0]["reasoning_effort"] == "medium"
+    assert queries == [
+        {
+            "project_id": "proj_polly",
+            "host_id": "host_hds",
+            "agent_id": "worker",
+            "harness": "codex-native",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_model_and_pinned_spec_beat_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit dispatch model wins; a spec-pinned value keeps its field."""
+    _stub_worker_launchable(monkeypatch)
+
+    _output, explicit_bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_chain_explicit",
+        labels={"unrelated": "1"},
+        parent_snapshot={"id": "conv_member_chain_explicit", "agent_id": "ag_parent"},
+        dispatch_args={"model": _MEMBER_MODEL},
+        resolve_payload={"model": "chain-model", "effort": "medium"},
+    )
+    assert explicit_bodies[0]["model_override"] == _MEMBER_MODEL
+    # The unset effort still comes from the chain.
+    assert explicit_bodies[0]["reasoning_effort"] == "medium"
+
+    _output, pinned_bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk", worker_model="pinned-model"),
+        conv_id="conv_member_chain_pinned",
+        labels={"unrelated": "1"},
+        parent_snapshot={"id": "conv_member_chain_pinned", "agent_id": "ag_parent"},
+        resolve_payload={"model": "chain-model", "effort": "medium"},
+    )
+    assert "model_override" not in pinned_bodies[0]
+    assert pinned_bodies[0]["reasoning_effort"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_member_never_consults_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frozen member's dispatch stays on its snapshot values, no chain lookup."""
+    _stub_worker_launchable(monkeypatch)
+    queries: list[dict[str, str]] = []
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_chain_frozen",
+        labels=_member_labels(),
+        parent_snapshot={"id": "conv_member_chain_frozen", "agent_id": "ag_parent"},
+        resolve_payload={"model": "chain-model", "effort": "medium"},
+        resolve_queries=queries,
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert bodies[0]["model_override"] == _MEMBER_MODEL
+    assert bodies[0]["reasoning_effort"] == "high"
+    assert queries == []
 
 
 @pytest.mark.asyncio

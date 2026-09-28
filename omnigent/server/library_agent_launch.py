@@ -162,6 +162,8 @@ async def launch_library_agent(
     owner: str | None,
     agent_id: str,
     launch: LibraryAgentLaunch,
+    project_config: dict | None = None,
+    master: dict | None = None,
 ) -> CreatedSessionResponse:
     """Create a session-scoped copy of an owner's saved Agent bundle.
 
@@ -178,6 +180,10 @@ async def launch_library_agent(
     :param owner: Task/request owner; ``None`` maps to the local identity.
     :param agent_id: The owned ``ca_`` id to launch.
     :param launch: Per-session values (title, host/workspace, overrides).
+    :param project_config: The task's project config, whose per-host set
+        supplies unset member values. ``None`` skips the project layers.
+    :param master: The owner's ``calling_defaults`` master table. ``None``
+        skips the master layer.
     :returns: The created session and its session-scoped agent id.
     :raises OmnigentError: ``NOT_FOUND`` when the owner's Agent or its bundle
         is gone.
@@ -230,6 +236,8 @@ async def launch_library_agent(
                 owner=owner,
                 custom_agents_store=custom_agents_store,
             ),
+            project_config=project_config,
+            master=master,
         )
     )
 

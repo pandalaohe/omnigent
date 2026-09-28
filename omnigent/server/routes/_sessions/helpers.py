@@ -40,6 +40,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
+from omnigent.calling_defaults import resolve_calling
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.db.utils import generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -10417,6 +10418,8 @@ async def _member_snapshot_labels(
     host_id: str | None,
     host_store: HostStore | None,
     member_hosts: Mapping[str, str] | None = None,
+    project_config: dict | None = None,
+    master: dict | None = None,
 ) -> dict[str, str]:
     """
     Resolve one session's member-snapshot labels, or ``{}`` for a 1-member agent.
@@ -10427,10 +10430,11 @@ async def _member_snapshot_labels(
     lock a member's dispatch overrides and to refuse work routed to a member
     that cannot run. A member's host is its saved ``host_id`` (F2a), else the
     session host; its availability and catalog ``isDefault`` model resolve
-    against that host. The model is the member's own, or — for none /
-    ``"default"`` — the member host's catalog default row for the harness;
-    without a catalog it stays null, never the literal ``"default"``. A value
-    that would exceed a label column is a 400, never truncated.
+    against that host. The model is the member's own, else the calling-defaults
+    chain for the member host / harness, else — for none / ``"default"`` — the
+    member host's catalog default row; without either it stays null, never the
+    literal ``"default"``. The effort is the member's own, else the chain's. A
+    value that would exceed a label column is a 400, never truncated.
 
     Resolution is best-effort: a failed host-store or catalog lookup logs a
     warning and leaves that fact out of the labels, so a transient resolver
@@ -10443,6 +10447,10 @@ async def _member_snapshot_labels(
         per-harness readiness. ``None`` skips availability resolution.
     :param member_hosts: The launched library Agent's saved ``{role: host_id}``
         map. A role absent from it (or a blank value) uses the session host.
+    :param project_config: The session's project config, whose per-host set
+        supplies unset member values. ``None`` skips the project layers.
+    :param master: The owner's ``calling_defaults`` master table. ``None``
+        skips the master layer.
     :returns: ``{label_key: compact_json_value}``; empty for a 1-member agent.
     :raises OmnigentError: 400 when a member's label key or value would
         overflow its column.
@@ -10483,18 +10491,44 @@ async def _member_snapshot_labels(
     for member in members:
         role = str(member["name"])
         harness = member.get("harness")
-        # None / "default" mean "let the catalog decide"; the literal must never
-        # reach the runner, which treats a snapshot model as an explicit
-        # override. The catalog step fills the isDefault row when one exists.
+        # None / "default" mean "let the defaults decide"; the literal must
+        # never reach the runner, which treats a snapshot model as an explicit
+        # override. The chain / catalog steps fill the value when one exists.
         member_model = member.get("model")
         if member_model == "default":
             member_model = None
+        member_effort = member.get("reasoning_effort")
         host = member_host(member)
+        # The member's own saved values are explicit; the calling-defaults
+        # chain fills an unset / "default" field for the member host and
+        # harness before the catalog default below. A member with nothing
+        # saved gets today's values back when no project / master applies.
+        explicit: dict[str, Any] = {"agent_id": role}
+        explicit_fields = {"agent_id"}
+        if isinstance(harness, str) and harness:
+            explicit["harness_override"] = harness
+            explicit_fields.add("harness_override")
+        if isinstance(member_model, str) and member_model:
+            explicit["model_override"] = member_model
+            explicit_fields.add("model_override")
+        if isinstance(member_effort, str) and member_effort:
+            explicit["reasoning_effort"] = member_effort
+            explicit_fields.add("reasoning_effort")
+        resolution = resolve_calling(
+            explicit=explicit,
+            explicit_fields=explicit_fields,
+            project_config=project_config,
+            master=master or {},
+            host_id=host,
+            # The member's harness is explicit above; the role names no
+            # ``agents`` row to resolve a harness from.
+            agent_harness=lambda _agent_id: None,
+        )
         entry: dict[str, Any] = {
             "host": host,
             "harness": harness,
-            "model": member_model,
-            "effort": member.get("reasoning_effort"),
+            "model": resolution.model,
+            "effort": resolution.effort,
             "lead": bool(member.get("lead")),
         }
         reason: str | None = None
