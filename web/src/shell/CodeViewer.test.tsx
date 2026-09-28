@@ -4,7 +4,7 @@ import type { useFileContent } from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
-import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { HTML_PANEL_SANDBOX } from "./codeViewerHelpers";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -714,7 +714,9 @@ describe("CodeViewer HTML preview sandbox", () => {
     const iframe = await screen.findByTitle("HTML preview");
     const sandbox = iframe.getAttribute("sandbox") ?? "";
     // Full-string lock: any change to the sandbox flags must be deliberate.
-    expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
+    // In-panel artifacts drop allow-top-navigation so they can't navigate the
+    // host page away (the standalone raw view keeps it).
+    expect(sandbox).toBe(HTML_PANEL_SANDBOX);
     // #778: scripts must run inside the preview.
     expect(sandbox).toContain("allow-scripts");
     // Security invariant: the artifact must never share the app's origin.

@@ -52,6 +52,8 @@ export const BRIDGE_MSG = {
   commentClick: "omni:commentClick",
   /** iframe → parent: the selection collapsed without hitting a comment. */
   selectionCleared: "omni:selectionCleared",
+  /** iframe → parent: a panel-mode link that names a workspace file. */
+  openPath: "omni:openPath",
 } as const;
 
 /** Rect of a selection in the iframe's own viewport coordinates. */
@@ -82,6 +84,18 @@ export interface BridgeSelectionCleared {
   type: typeof BRIDGE_MSG.selectionCleared;
 }
 
+/**
+ * A panel-mode link that leaves this artifact for another workspace file.
+ * `href` is the anchor's RAW attribute — resolving it would clamp a `..` above
+ * the token segment — and `base` the frame's `document.baseURI`, so the parent
+ * resolves against the frame's own page rather than a possibly stale one.
+ */
+export interface BridgeOpenPath {
+  type: typeof BRIDGE_MSG.openPath;
+  href: string;
+  base: string;
+}
+
 export interface BridgeReady {
   type: typeof BRIDGE_MSG.ready;
   /** The frame's `location.pathname`, so the parent can derive which bundle
@@ -91,11 +105,14 @@ export interface BridgeReady {
 
 /** Any message the iframe can send to the parent (post-handshake). */
 export type InboundBridgeMessage =
-  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared;
+  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared | BridgeOpenPath;
 
 // ---------------------------------------------------------------------------
 // Inbound message validation
 // ---------------------------------------------------------------------------
+
+/** Shared href/base cap, so a hostile frame can't ship the parent a novel. */
+const MAX_OPEN_PATH_CHARS = 4096;
 
 function isRect(r: unknown): r is BridgeRect {
   if (typeof r !== "object" || r === null) return false;
@@ -141,6 +158,16 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
       return null;
     case BRIDGE_MSG.selectionCleared:
       return { type: BRIDGE_MSG.selectionCleared };
+    case BRIDGE_MSG.openPath:
+      if (
+        typeof d.href === "string" &&
+        typeof d.base === "string" &&
+        d.href.length <= MAX_OPEN_PATH_CHARS &&
+        d.base.length <= MAX_OPEN_PATH_CHARS
+      ) {
+        return { type: BRIDGE_MSG.openPath, href: d.href, base: d.base };
+      }
+      return null;
     default:
       return null;
   }
