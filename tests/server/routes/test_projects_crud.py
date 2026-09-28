@@ -197,6 +197,57 @@ async def test_patch_empty_config_clears_it(project_client: httpx.AsyncClient) -
     assert resp.json()["config"] == {}
 
 
+async def test_create_rejects_malformed_calling_defaults(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """A malformed calling_defaults config is 400 and stores nothing."""
+    resp = await project_client.post(
+        "/v1/projects",
+        json={
+            "name": "Bad",
+            "config": {"calling_defaults": {"HDS": {"harnesses": {"codex": {"model": 5}}}}},
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+    assert (await project_client.get("/v1/projects")).json() == {"object": "list", "data": []}
+
+
+async def test_create_roundtrips_valid_calling_defaults(project_client: httpx.AsyncClient) -> None:
+    """A valid calling_defaults config round-trips through create."""
+    config = {
+        "calling_defaults": {
+            "HDS": {
+                "agent_id": "codex-sdk",
+                "harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}},
+            }
+        }
+    }
+    created = (
+        await project_client.post("/v1/projects", json={"name": "P", "config": config})
+    ).json()
+    assert created["config"] == config
+
+
+async def test_patch_rejects_malformed_calling_defaults(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """A rejected PATCH leaves the stored config untouched."""
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "config": {"host_id": "keep"}}
+        )
+    ).json()
+    resp = await project_client.patch(
+        f"/v1/projects/{created['id']}",
+        json={"config": {"host_id": "new", "calling_defaults": {"HDS": {"agent_id": 5}}}},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+    stored = (await project_client.get(f"/v1/projects/{created['id']}")).json()
+    assert stored["config"] == {"host_id": "keep"}
+
+
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     """DELETE removes the project; a second delete 404s."""
     created = (await project_client.post("/v1/projects", json={"name": "Doomed"})).json()

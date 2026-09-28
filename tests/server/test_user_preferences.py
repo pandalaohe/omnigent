@@ -660,6 +660,36 @@ def test_approval_timeout_owner_resolution() -> None:
 
 
 @pytest.mark.asyncio
+async def test_preferences_api_accepts_the_calling_defaults_namespaces(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """Both calling-defaults namespaces are allowlisted and round-trip."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "calling@example.com"}
+        master = {"HDS": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
+        patched = await client.patch(
+            "/v1/me/preferences/calling_defaults",
+            headers=headers,
+            json={"value": master},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["calling_defaults"] == master
+
+        last = {"enabled": True, "p:proj": {"HDS": {"last_agent_id": "codex-sdk"}}}
+        patched = await client.patch(
+            "/v1/me/preferences/calling_last",
+            headers=headers,
+            json={"value": last},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["calling_last"] == last
+
+
+@pytest.mark.asyncio
 async def test_preferences_api_accepts_the_approval_timeout_namespace(
     db_uri: str,
     runtime_init: None,

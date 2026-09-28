@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from omnigent.calling_defaults import validate_project_calling_defaults
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
@@ -50,6 +51,16 @@ def _to_response(project: Project) -> dict[str, Any]:
     }
 
 
+def _validate_calling_defaults(config: dict[str, Any]) -> None:
+    """Validate the config's per-host calling defaults when the key is present.
+
+    :param config: Incoming project config.
+    :raises OmnigentError: 400 when ``calling_defaults`` has a bad shape.
+    """
+    if "calling_defaults" in config:
+        validate_project_calling_defaults(config["calling_defaults"])
+
+
 def create_projects_router(
     project_store: ProjectStore,
     auth_provider: AuthProvider | None = None,
@@ -77,6 +88,7 @@ def create_projects_router(
             if the caller already has a project with this name.
         """
         user_id = require_user(request, auth_provider)
+        _validate_calling_defaults(body.config)
         project = await asyncio.to_thread(
             project_store.create,
             uuid.uuid4().hex,
@@ -165,6 +177,8 @@ def create_projects_router(
             projects.
         """
         user_id = require_user(request, auth_provider)
+        if body.config is not None:
+            _validate_calling_defaults(body.config)
         project = await asyncio.to_thread(
             project_store.update,
             project_id,

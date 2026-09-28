@@ -30,8 +30,10 @@ class Project:
     :param config: Default session settings as an opaque JSON object (host,
         workspace, harness, model, reasoning effort, git base-branch, …), or an
         empty dict when none are stored. The key vocabulary is owned by the
-        client; the store persists and returns it whole. These are hints the
-        new-chat dialog pre-fills, not enforced requirements.
+        client; the store persists and returns it whole, except the
+        ``calling_defaults`` per-host set, which is shape-validated on write.
+        These are hints the new-chat dialog pre-fills, not enforced
+        requirements.
     :param collaboration_enabled: Cross-host collaboration switch. Gates
         creation, refresh, claim and start only — never in-flight attempts.
     :param collaboration_revision: Bumped by every collaboration-config

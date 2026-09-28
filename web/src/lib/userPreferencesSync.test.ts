@@ -129,6 +129,35 @@ describe("user preference synchronization", () => {
     });
   });
 
+  it("collects and hydrates the calling-defaults namespaces", async () => {
+    const callingDefaults = {
+      "host-1": { codex: { model: "gpt-6-sol", effort: "high" } },
+    };
+    const callingLast = {
+      enabled: true,
+      "p:abc": { "host-1": { last_agent_id: "codex-sdk", agents: {} } },
+    };
+    localStorage.setItem("omnigent:calling-defaults", JSON.stringify(callingDefaults));
+    localStorage.setItem("omnigent:calling-last", JSON.stringify(callingLast));
+    expect(collectLocalUserPreferences().settings.calling_defaults).toEqual(callingDefaults);
+    expect(collectLocalUserPreferences().settings.calling_last).toEqual(callingLast);
+
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: { calling_defaults: { "host-2": {} }, calling_last: { enabled: false } },
+      },
+      vi.fn(),
+    );
+
+    expect(JSON.parse(localStorage.getItem("omnigent:calling-defaults") ?? "null")).toEqual({
+      "host-2": {},
+    });
+    expect(JSON.parse(localStorage.getItem("omnigent:calling-last") ?? "null")).toEqual({
+      enabled: false,
+    });
+  });
+
   it("cancels queued sync when switching to an older Server", async () => {
     vi.useFakeTimers();
     const currentServer = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));

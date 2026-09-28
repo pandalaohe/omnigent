@@ -6,7 +6,9 @@ export type UserPreferenceNamespace =
   | "context_indicator"
   | "usage_context"
   | "agent_badges"
-  | "agent_pins";
+  | "agent_pins"
+  | "calling_defaults"
+  | "calling_last";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -48,6 +50,14 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     agent_pins: {
       storageKey: "omnigent:agent-pins",
       eventName: "omnigent:agent-pins-changed",
+    },
+    calling_defaults: {
+      storageKey: "omnigent:calling-defaults",
+      eventName: "omnigent:calling-defaults-changed",
+    },
+    calling_last: {
+      storageKey: "omnigent:calling-last",
+      eventName: "omnigent:calling-last-changed",
     },
   };
 

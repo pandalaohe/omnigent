@@ -10487,7 +10487,9 @@
                 "usage_context",
                 "agent_badges",
                 "approval_timeout",
-                "agent_pins"
+                "agent_pins",
+                "calling_defaults",
+                "calling_last"
               ]
             },
             "title": "Settings",
@@ -13253,6 +13255,8 @@
                         "agent_badges",
                         "agent_pins",
                         "approval_timeout",
+                        "calling_defaults",
+                        "calling_last",
                         "context_indicator",
                         "keyboard_shortcuts",
                         "mobile_assistant",
@@ -13331,7 +13335,9 @@
                 "usage_context",
                 "agent_badges",
                 "approval_timeout",
-                "agent_pins"
+                "agent_pins",
+                "calling_defaults",
+                "calling_last"
               ],
               "title": "Namespace",
               "type": "string"
