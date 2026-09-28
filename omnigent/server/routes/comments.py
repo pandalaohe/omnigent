@@ -7,6 +7,7 @@ Comments can be sent to the agent as a formatted message via the
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
@@ -35,6 +36,55 @@ from omnigent.stores.comment_store.visitor_comments import (
 from omnigent.stores.permission_store import PermissionStore
 
 
+def _escape_line_breaks(text: str) -> str:
+    """Escape every character that could break out of a single output line.
+
+    Used for file paths, which are not quoted: C0 controls and the Unicode
+    line and paragraph separators become ``\\uXXXX`` escapes so a path always
+    stays on its ``File:`` line. All other characters (including ``\\`` and
+    ``"``) are unchanged.
+
+    :param text: The path or other single-line value to escape.
+    :returns: The text with line-break-capable characters escaped.
+    """
+    return "".join(
+        f"\\u{ord(char):04x}" if ord(char) < 0x20 or char in "\u0085\u2028\u2029" else char
+        for char in text
+    )
+
+
+def _excerpt_lines(anchor_content: str | None) -> list[str]:
+    """Quote an anchor snippet as ``Excerpt:`` and ``> ``-prefixed lines.
+
+    Each line of the anchor is kept verbatim — indentation and blank lines
+    included, a blank line rendering as ``>``. ``str.splitlines`` splits on
+    every Unicode line boundary, so no raw separator survives into the output.
+
+    :param anchor_content: The selected-text snapshot, or ``None``.
+    :returns: The excerpt block lines, or an empty list when there is no
+        anchor content.
+    """
+    if not anchor_content:
+        return []
+    return ["Excerpt:"] + [f"> {line}" if line else ">" for line in anchor_content.splitlines()]
+
+
+def _quoted_comment_body(body: str) -> str:
+    """Quote a comment body as one escaped JSON string literal.
+
+    JSON escaping covers quotes, backslashes, and C0 controls; the Unicode
+    line and paragraph separators it leaves raw are escaped here too, so a
+    body can never span output lines or forge a following entry.
+
+    :param body: The comment body text.
+    :returns: The body as one double-quoted line.
+    """
+    quoted = json.dumps(body, ensure_ascii=False)
+    for separator in ("\u0085", "\u2028", "\u2029"):
+        quoted = quoted.replace(separator, f"\\u{ord(separator):04x}")
+    return quoted
+
+
 def _comment_sections(
     comments: list[Comment],
     *,
@@ -43,14 +93,15 @@ def _comment_sections(
     """Render the ``File:`` sections for *comments*.
 
     Groups comments by file path (alphabetical) and sorts within each group
-    by ``start_index`` ascending. Each bullet shows the anchor_content
-    snippet when available plus the character range (start–end), so the
-    agent can locate the relevant section without needing pre-computed line
-    numbers.
+    by ``start_index`` ascending. Each entry carries the character range
+    (start–end), the anchor content as an ``Excerpt:`` block quoted line by
+    line, and the body as one escaped double-quoted line, so a line break or
+    an embedded quote cannot forge another entry. The range lets the agent
+    locate the relevant section without pre-computed line numbers.
 
     :param comments: The comments to render.
-    :param bullet_label: Optional label prefixed to each bullet, used to
-        attribute visitor comments to their author.
+    :param bullet_label: Optional label inserted into each entry's comment
+        line, used to attribute visitor comments to their author.
     :returns: The section lines, or an empty list when there are no comments.
     """
     by_path: dict[str, list[Comment]] = {}
@@ -60,11 +111,18 @@ def _comment_sections(
     lines: list[str] = []
     for path in sorted(by_path):
         lines.append("")
-        lines.append(f"File: {path}")
-        for c in sorted(by_path[path], key=lambda c: c.start_index):
-            anchor = f'"{c.anchor_content.strip()}" ' if c.anchor_content else ""
-            label = f"{bullet_label(c)}: " if bullet_label is not None else ""
-            lines.append(f"• {label}{anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
+        lines.append(f"File: {_escape_line_breaks(path)}")
+        for index, c in enumerate(sorted(by_path[path], key=lambda c: c.start_index)):
+            if index:
+                lines.append("")
+            lines.append(f"Location: characters {c.start_index}–{c.end_index}")
+            lines.extend(_excerpt_lines(c.anchor_content))
+            prefix = (
+                f"Visitor comment ({bullet_label(c)})"
+                if bullet_label is not None
+                else "User comment"
+            )
+            lines.append(f"{prefix}: {_quoted_comment_body(c.body)}")
 
     return lines
 
@@ -72,10 +130,11 @@ def _comment_sections(
 def _format_message(comments: list[Comment]) -> str:
     """Format a list of comments into a human-readable message for the agent.
 
-    The owner's comments keep the standard listing. Visitor comments are
-    appended in their own untrusted-feedback section, each bullet prefixed
-    with the visitor label, so a comment relayed from a shared link is
-    never presented as an instruction from the user.
+    The owner's comments keep the standard listing, each body on its own
+    ``User comment:`` line. Visitor comments are appended in their own
+    untrusted-feedback section, each body on a labelled
+    ``Visitor comment (…):`` line, so a comment relayed from a shared link
+    is never presented as an instruction from the user.
 
     :param comments: The comments to format.
     :returns: A multi-line string suitable for posting to the agent.
