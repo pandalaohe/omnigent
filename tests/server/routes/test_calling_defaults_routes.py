@@ -269,6 +269,27 @@ async def test_resolve_reads_the_master_table_through_the_agents_harness(
     assert body["problems"] == []
 
 
+async def test_resolve_a_named_member_with_an_explicit_harness(
+    client: httpx.AsyncClient, stores: _Stores
+) -> None:
+    """A built-in joint member is named, not an id: the chain still resolves."""
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.prefs.patch_namespace(
+        "local",
+        "calling_defaults",
+        {HOST_A: {"codex-native": {"model": "gpt-6-astra", "effort": "high"}}},
+    )
+
+    resp = await client.get(
+        "/v1/calling-defaults/resolve",
+        params={"host_id": HOST_A, "agent_id": "researcher", "harness": "codex-native"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["model"] == "gpt-6-astra"
+    assert body["effort"] == "high"
+
+
 async def test_resolve_project_default_flags_a_missing_model_and_stale_skips(
     client: httpx.AsyncClient, stores: _Stores
 ) -> None:

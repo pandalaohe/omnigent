@@ -27,6 +27,7 @@ from omnigent.calling_defaults import (
     load_master,
     resolve_calling,
 )
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -271,14 +272,22 @@ def create_calling_defaults_router(
             explicit["harness_override"] = canonicalize_harness(harness) or harness
             explicit_fields.add("harness_override")
 
+        def agent_row(effective_agent_id: str) -> Any | None:
+            # A saved library Agent or a built-in joint member (named, not an
+            # id) has no ``agents`` row; its id would not even bind against the
+            # UUID-typed lookup, which answers 404 for the whole request.
+            if agent_store is None or is_library_agent_id(effective_agent_id):
+                return None
+            try:
+                uuid_to_bytes(effective_agent_id)
+            except InvalidUuidError:
+                return None
+            return agent_store.get(effective_agent_id)
+
         def agent_harness(effective_agent_id: str) -> str | None:
             from omnigent.server.routes._sessions.orchestration import _create_resolved_harness
 
-            # A saved library Agent has no ``agents`` row; the id would not
-            # even bind against the UUID-typed lookup.
-            if agent_store is None or is_library_agent_id(effective_agent_id):
-                return None
-            agent = agent_store.get(effective_agent_id)
+            agent = agent_row(effective_agent_id)
             if agent is None:
                 return None
             return _create_resolved_harness(agent, None, agent_cache)
@@ -307,12 +316,8 @@ def create_calling_defaults_router(
                 }
 
         agent_name: str | None = None
-        if (
-            resolution.agent_id is not None
-            and agent_store is not None
-            and not is_library_agent_id(resolution.agent_id)
-        ):
-            agent = await asyncio.to_thread(agent_store.get, resolution.agent_id)
+        if resolution.agent_id is not None:
+            agent = await asyncio.to_thread(agent_row, resolution.agent_id)
             agent_name = getattr(agent, "name", None)
         problems = check_calling_defaults(
             resolution=resolution,
