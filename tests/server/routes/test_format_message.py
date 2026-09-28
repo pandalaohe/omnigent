@@ -109,8 +109,15 @@ def test_format_message_single_comment_renders_the_full_entry() -> None:
         "Location: characters 4–9\n"
         "Excerpt:\n"
         "> x = 1\n"
+        "\n"
         'User comment: "rename"'
     )
+    lines = result.splitlines()
+    last_quote_index = max(i for i, line in enumerate(lines) if line.startswith(">"))
+    assert lines[last_quote_index + 1 : last_quote_index + 3] == [
+        "",
+        'User comment: "rename"',
+    ]
     assert VISITOR_FEEDBACK_HEADER not in result
 
 
@@ -163,7 +170,8 @@ def test_format_message_whitespace_only_anchor_is_kept_verbatim() -> None:
 
     excerpt_index = lines.index("Excerpt:")
     assert lines[excerpt_index + 1] == ">   "
-    assert lines[excerpt_index + 2] == 'User comment: "note"'
+    assert lines[excerpt_index + 2] == ""
+    assert lines[excerpt_index + 3] == 'User comment: "note"'
 
 
 def test_format_message_body_is_escaped_onto_one_line() -> None:

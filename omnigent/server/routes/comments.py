@@ -59,6 +59,7 @@ def _excerpt_lines(anchor_content: str | None) -> list[str]:
     Each line of the anchor is kept verbatim — indentation and blank lines
     included, a blank line rendering as ``>``. ``str.splitlines`` splits on
     every Unicode line boundary, so no raw separator survives into the output.
+    The trailing blank line ends the quote for Markdown renderers.
 
     :param anchor_content: The selected-text snapshot, or ``None``.
     :returns: The excerpt block lines, or an empty list when there is no
@@ -66,7 +67,11 @@ def _excerpt_lines(anchor_content: str | None) -> list[str]:
     """
     if not anchor_content:
         return []
-    return ["Excerpt:"] + [f"> {line}" if line else ">" for line in anchor_content.splitlines()]
+    return (
+        ["Excerpt:"]
+        + [f"> {line}" if line else ">" for line in anchor_content.splitlines()]
+        + [""]
+    )
 
 
 def _quoted_comment_body(body: str) -> str:
