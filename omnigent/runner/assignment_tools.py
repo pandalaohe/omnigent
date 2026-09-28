@@ -533,7 +533,7 @@ async def _dispatch(
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
-    for key in ("target_agent_id", "task", "idempotency_key"):
+    for key in ("task", "idempotency_key"):
         if not args.get(key):
             return json.dumps({"error": f"{tool_name} requires '{key}'"})
     try:
@@ -583,7 +583,6 @@ async def _dispatch(
     payload: dict[str, object] = {
         "id": assignment_id,
         "source_session_id": conversation_id,
-        "target_agent_id": args["target_agent_id"],
         "task": args["task"],
         "repositories": [
             {
@@ -597,6 +596,8 @@ async def _dispatch(
         ],
         "idempotency_key": args["idempotency_key"],
     }
+    if args.get("target_agent_id") is not None:
+        payload["target_agent_id"] = args["target_agent_id"]
     if args.get("host_id") is not None:
         payload["requested_host_id"] = args["host_id"]
     for key in (
@@ -604,6 +605,7 @@ async def _dispatch(
         "execution_root",
         "model_override",
         "harness_override",
+        "reasoning_effort",
         "start_deadline",
     ):
         if args.get(key) is not None:

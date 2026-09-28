@@ -40,6 +40,7 @@ from omnigent.server.project_placement import (
 )
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_store import ProjectStore
@@ -82,15 +83,12 @@ async def resolve_create_calling(
     path_label: str,
     parent_session_id: str | None = None,
 ) -> CallingResolution:
-    """Resolve one create's agent / model / effort through the shared chain.
+    """Resolve one create's agent / model / effort from a request's stores.
 
-    Runs the pure :func:`omnigent.calling_defaults.resolve_calling` with the
-    stores wired on the request's app, then applies the create-time K5
-    refusals: no resolved agent when the request omitted one, a default that
-    names a saved joint (``ca_``) agent, a default agent whose harness the
-    host reports as not launchable, and a default-sourced model / effort the
-    cached catalog does not offer. Explicit request values keep today's
-    validation only.
+    The route-facing wrapper over :func:`resolve_create_calling_stores`; it
+    reads the stores wired on ``request.app.state`` and keeps every create
+    route on one call shape. Non-request callers (the assignment
+    coordinator) call the core directly with explicit stores.
 
     :param request: The create request whose ``app.state`` carries the
         stores; ``None`` degrades to the project layers only.
@@ -107,26 +105,93 @@ async def resolve_create_calling(
     :returns: The resolved calling triple.
     :raises OmnigentError: ``INVALID_INPUT`` for any refused default.
     """
+    state = getattr(getattr(request, "app", None), "state", None)
+    return await resolve_create_calling_stores(
+        user_id=user_id,
+        project=project,
+        host_id=host_id,
+        explicit=explicit,
+        explicit_fields=explicit_fields,
+        path_label=path_label,
+        parent_session_id=parent_session_id,
+        host_store=getattr(state, "host_store", None),
+        agent_store=getattr(state, "agent_store", None),
+        agent_cache=getattr(state, "agent_cache", None),
+        preferences_store=getattr(state, "user_preferences_store", None),
+        catalog_store=getattr(state, "host_model_catalog_cache_store", None),
+    )
+
+
+async def resolve_create_calling_stores(
+    *,
+    user_id: str | None,
+    project: Project | None,
+    host_id: str | None,
+    explicit: dict[str, Any],
+    explicit_fields: set[str],
+    path_label: str,
+    parent_session_id: str | None = None,
+    host_store: HostStore | None = None,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+    preferences_store: Any | None = None,
+    catalog_store: HostModelCatalogCacheStore | None = None,
+) -> CallingResolution:
+    """Resolve one create's agent / model / effort through the shared chain.
+
+    Runs the pure :func:`omnigent.calling_defaults.resolve_calling` with the
+    given stores, then applies the create-time K5 refusals: no resolved
+    agent when the request omitted one, a default that names a saved joint
+    (``ca_``) agent, a default agent whose harness the host reports as not
+    launchable, and a default-sourced model / effort the cached catalog does
+    not offer. Explicit request values keep today's validation only.
+
+    :param user_id: Owner of the master table and the host.
+    :param project: Project whose per-host set applies, or ``None``.
+    :param host_id: Host the caller will place the session on, or ``None``.
+    :param explicit: Request values keyed ``agent_id`` / ``harness_override``
+        / ``model_override`` / ``reasoning_effort``.
+    :param explicit_fields: The subset of those keys the request supplied.
+    :param path_label: The create path named in the library-agent refusal,
+        e.g. ``"hand-off"``.
+    :param parent_session_id: The caller's parent session, named when a child
+        has no project and no default agent.
+    :param host_store: Host registrations for the readiness check, or
+        ``None`` when unknown.
+    :param agent_store: Agent store resolving an id to its harness.
+    :param agent_cache: Cache loading the agent's parsed spec.
+    :param preferences_store: Preferences store holding the owner's master
+        table, or ``None``.
+    :param catalog_store: Cached host model catalogs for the offered check,
+        or ``None``.
+    :returns: The resolved calling triple.
+    :raises OmnigentError: ``INVALID_INPUT`` for any refused default.
+    """
     from omnigent.server.library_agent_launch import is_library_agent_id
     from omnigent.server.routes._sessions.orchestration import _create_resolved_harness
-
-    state = getattr(getattr(request, "app", None), "state", None)
-    host_store = getattr(state, "host_store", None)
-    agent_store = getattr(state, "agent_store", None)
-    agent_cache = getattr(state, "agent_cache", None)
-    preferences_store = getattr(state, "user_preferences_store", None)
-    catalog_store = getattr(state, "host_model_catalog_cache_store", None)
 
     host = None
     if host_id is not None and host_store is not None:
         host = await asyncio.to_thread(host_store.get_host, host_id)
 
+    def get_agent(agent_id: str) -> Any | None:
+        # Agent lookups only enrich the resolution (harness, display name);
+        # a store fault degrades to the project layers rather than failing a
+        # placement that could still launch.
+        if agent_store is None:
+            return None
+        try:
+            return agent_store.get(agent_id)
+        except Exception:  # noqa: BLE001
+            _logger.warning("Agent lookup failed for %s", agent_id, exc_info=True)
+            return None
+
     def agent_harness(effective_agent_id: str) -> str | None:
         # A saved library Agent has no ``agents`` row; the id would not even
         # bind against the UUID-typed lookup.
-        if agent_store is None or is_library_agent_id(effective_agent_id):
+        if is_library_agent_id(effective_agent_id):
             return None
-        agent = agent_store.get(effective_agent_id)
+        agent = get_agent(effective_agent_id)
         if agent is None:
             return None
         return _create_resolved_harness(agent, None, agent_cache)
@@ -159,12 +224,8 @@ async def resolve_create_calling(
         raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
 
     agent = None
-    if (
-        resolution.agent_id is not None
-        and agent_store is not None
-        and not is_library_agent_id(resolution.agent_id)
-    ):
-        agent = await asyncio.to_thread(agent_store.get, resolution.agent_id)
+    if resolution.agent_id is not None and not is_library_agent_id(resolution.agent_id):
+        agent = await asyncio.to_thread(get_agent, resolution.agent_id)
     catalog: dict[str, Any] | None = None
     if host_id is not None and resolution.harness is not None and catalog_store is not None:
         records = await asyncio.to_thread(catalog_store.list, [host_id])

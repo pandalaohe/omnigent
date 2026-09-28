@@ -44,7 +44,10 @@ from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
-from omnigent.server.routes._session_create_validation import validate_session_agent
+from omnigent.server.routes._session_create_validation import (
+    validate_session_agent,
+    validate_session_model_metadata,
+)
 from omnigent.server.routes.project_collaboration import _validate_ref_name
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.assignment_store import (
@@ -89,7 +92,8 @@ class AssignmentCreateRequest(BaseModel):
     :param id: Caller-generated id, 32 lowercase hex, stable across retries.
     :param source_session_id: The dispatching session; its project is the
         assignment's project and the caller needs owner access on it.
-    :param target_agent_id: The agent to launch on arrival.
+    :param target_agent_id: The agent to launch on arrival, or ``None`` to
+        take the destination host's project default agent at placement.
     :param requested_host_id: The named destination host, or ``None``.
     :param binding_name: Which binding of the destination host to run in.
     :param task: The natural-language instruction blob.
@@ -99,6 +103,7 @@ class AssignmentCreateRequest(BaseModel):
         required with more than one repository, defaulted otherwise.
     :param model_override: Per-assignment model override, or ``None``.
     :param harness_override: Per-assignment harness override, or ``None``.
+    :param reasoning_effort: Per-assignment reasoning effort, or ``None``.
     :param start_deadline: Epoch seconds bounding the wait, or ``None``.
     :param idempotency_key: Caller key; unique with ``source_session_id``.
     """
@@ -107,7 +112,7 @@ class AssignmentCreateRequest(BaseModel):
 
     id: str
     source_session_id: str
-    target_agent_id: str
+    target_agent_id: str | None = None
     requested_host_id: str | None = None
     binding_name: str = "primary"
     task: str = Field(min_length=1)
@@ -116,6 +121,7 @@ class AssignmentCreateRequest(BaseModel):
     execution_root: str | None = None
     model_override: str | None = None
     harness_override: str | None = None
+    reasoning_effort: str | None = None
     start_deadline: int | None = None
     idempotency_key: str = Field(min_length=1)
 
@@ -255,6 +261,59 @@ def _create_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+async def _refuse_agent_omitted_dispatch(
+    *,
+    project: Any,
+    requested_host_id: str | None,
+    host_store: Any | None,
+) -> None:
+    """Refuse a dispatch no destination could serve with a default agent.
+
+    An agent-omitted dispatch is placed on the destination host's project
+    default agent, so a project with none must fail here — REST 400, nothing
+    queued — instead of waiting forever. A saved joint (``ca_``) default is
+    refused with the fix named: server-side dispatch cannot launch it.
+
+    :param project: The dispatching session's project.
+    :param requested_host_id: The named destination host, or ``None``.
+    :param host_store: Host registrations for the display name, or ``None``.
+    :raises OmnigentError: ``INVALID_INPUT`` naming the missing / unusable
+        setting.
+    """
+    from omnigent.calling_defaults import (
+        default_agent_for_host_or_legacy,
+        has_default_agent,
+    )
+    from omnigent.server.library_agent_launch import is_library_agent_id
+
+    if requested_host_id is None:
+        if not has_default_agent(project.config):
+            raise OmnigentError(
+                f"Project '{project.name}' has no default agent on any host. "
+                "Pass agent_id, or set it in Project settings › Hosts.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return
+    host_label = requested_host_id
+    if host_store is not None:
+        host = await asyncio.to_thread(host_store.get_host, requested_host_id)
+        if host is not None and host.name:
+            host_label = host.name
+    default_agent = default_agent_for_host_or_legacy(project.config, requested_host_id)
+    if default_agent is None:
+        raise OmnigentError(
+            f"Project '{project.name}' has no default agent on host '{host_label}'. "
+            "Pass agent_id, or set it in Project settings › Hosts.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if is_library_agent_id(default_agent):
+        raise OmnigentError(
+            f"Default agent '{default_agent}' for host '{host_label}' is a saved "
+            "joint agent; sys_assignment_dispatch cannot launch it. Pass agent_id.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def _input_to_response(entry: AssignmentInputEntry) -> dict[str, Any]:
     """Convert an input entry to a response dict.
 
@@ -313,6 +372,7 @@ def _assignment_to_response(assignment: Assignment) -> dict[str, Any]:
         "metadata": assignment.metadata,
         "model_override": assignment.model_override,
         "harness_override": assignment.harness_override,
+        "reasoning_effort": assignment.reasoning_effort,
         "start_deadline": assignment.start_deadline,
         "state": assignment.state,
         "wait_reason": assignment.wait_reason,
@@ -605,9 +665,10 @@ def create_assignments_router(
         :returns: The inserted (201) or already-stored (200) assignment.
         :raises HTTPException: 404 when the feature is disabled.
         :raises OmnigentError: 401 if unauthenticated, 403/404 per session
-            access, 400 on a bad id, unfiled session, unknown repository,
-            bad commit or missing execution root, 409 when the project
-            switch is off or the payload changed under a reused key.
+            access, 400 on a bad id, unfiled session, missing default agent
+            for an agent-omitted dispatch, unknown repository, bad commit,
+            invalid reasoning_effort or missing execution root, 409 when the
+            project switch is off or the payload changed under a reused key.
         """
         owner = require_user(request, auth_provider)
         if not _ID_RE.fullmatch(body.id):
@@ -652,21 +713,34 @@ def create_assignments_router(
                 host_id=body.requested_host_id,
                 host_store=host_store,
             )
-        try:
-            await validate_session_agent(
-                user_id=owner,
-                agent_id=body.target_agent_id,
-                agent_store=agent_store,
-                permission_store=permission_store,
-                conversation_store=conversation_store,
+        validated_effort: str | None = None
+        if body.reasoning_effort is not None:
+            _, validated_effort = validate_session_model_metadata(
+                model_override=None,
+                reasoning_effort=body.reasoning_effort,
             )
-        except OmnigentError as exc:
-            if exc.code == ErrorCode.NOT_FOUND and "Agent not found" in exc.message:
-                raise OmnigentError(
-                    f"unknown target agent {body.target_agent_id!r}",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            raise
+        if body.target_agent_id is None:
+            await _refuse_agent_omitted_dispatch(
+                project=project,
+                requested_host_id=body.requested_host_id,
+                host_store=host_store,
+            )
+        else:
+            try:
+                await validate_session_agent(
+                    user_id=owner,
+                    agent_id=body.target_agent_id,
+                    agent_store=agent_store,
+                    permission_store=permission_store,
+                    conversation_store=conversation_store,
+                )
+            except OmnigentError as exc:
+                if exc.code == ErrorCode.NOT_FOUND and "Agent not found" in exc.message:
+                    raise OmnigentError(
+                        f"unknown target agent {body.target_agent_id!r}",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
+                raise
         names = [repo.repository_name for repo in body.repositories]
         for name in names:
             _validate_ref_name(name, kind="repository")
@@ -706,21 +780,25 @@ def create_assignments_router(
                 code=ErrorCode.INVALID_INPUT,
             )
         sent_repositories = [repo.model_dump() for repo in body.repositories]
-        digest = _create_digest(
-            {
-                "source_session_id": body.source_session_id,
-                "target_agent_id": body.target_agent_id,
-                "requested_host_id": body.requested_host_id,
-                "binding_name": body.binding_name,
-                "task": body.task,
-                "metadata": body.metadata,
-                "repositories": sent_repositories,
-                "execution_root": body.execution_root,
-                "model_override": body.model_override,
-                "harness_override": body.harness_override,
-                "start_deadline": body.start_deadline,
-            }
-        )
+        # Absent effort is left out of the digest so payloads composed before
+        # the field existed keep their digest; an explicit null is carried by
+        # explicit_null_fields, not the digest.
+        digest_fields: dict[str, Any] = {
+            "source_session_id": body.source_session_id,
+            "target_agent_id": body.target_agent_id,
+            "requested_host_id": body.requested_host_id,
+            "binding_name": body.binding_name,
+            "task": body.task,
+            "metadata": body.metadata,
+            "repositories": sent_repositories,
+            "execution_root": body.execution_root,
+            "model_override": body.model_override,
+            "harness_override": body.harness_override,
+            "start_deadline": body.start_deadline,
+        }
+        if validated_effort is not None:
+            digest_fields["reasoning_effort"] = validated_effort
+        digest = _create_digest(digest_fields)
         pre_existing = await asyncio.to_thread(assignment_store.get, body.id)
         if pre_existing is not None:
             if pre_existing.owner_user_id != owner:
@@ -746,6 +824,11 @@ def create_assignments_router(
             )
             for repo in body.repositories
         ]
+        explicit_null_fields = sorted(
+            name
+            for name in ("model_override", "reasoning_effort")
+            if name in body.model_fields_set and getattr(body, name) is None
+        )
         created = await asyncio.to_thread(
             assignment_store.create,
             Assignment(
@@ -764,6 +847,8 @@ def create_assignments_router(
                 metadata=body.metadata,
                 model_override=body.model_override,
                 harness_override=body.harness_override,
+                reasoning_effort=validated_effort,
+                explicit_null_fields=explicit_null_fields or None,
                 start_deadline=body.start_deadline,
             ),
         )

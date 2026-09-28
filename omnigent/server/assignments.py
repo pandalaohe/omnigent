@@ -22,8 +22,9 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from omnigent.calling_defaults import CallingResolution, default_agent_for_host_or_legacy
 from omnigent.entities import (
     Assignment,
     AssignmentAttempt,
@@ -33,6 +34,7 @@ from omnigent.entities import (
     ProjectRepository,
 )
 from omnigent.entities.assignment import TERMINAL_STATES
+from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     HostAssignmentPrepareFrame,
     HostAssignmentPrepareRepository,
@@ -45,6 +47,7 @@ from omnigent.runtime.agent_cache import AgentCache
 
 if TYPE_CHECKING:
     from omnigent.server.runner_session_init import RunnerSessionInitializer
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.server.assignment_host import (
     host_supports_assignments,
     prepare_assignment_on_host,
@@ -254,6 +257,8 @@ class AssignmentCoordinator:
         runner_session_initializer: RunnerSessionInitializer | None = None,
         agent_store: AgentStore | None = None,
         agent_cache: AgentCache | None = None,
+        preferences_store: Any | None = None,
+        catalog_store: HostModelCatalogCacheStore | None = None,
     ) -> None:
         self._assignment_store = assignment_store
         self._project_store = project_store
@@ -277,6 +282,11 @@ class AssignmentCoordinator:
         # execution root, as before this field existed.
         self._agent_store = agent_store
         self._agent_cache = agent_cache
+        # Placement resolves the project's calling defaults for an
+        # agent-omitted assignment; the owner's master table and the host
+        # catalogs are the same stores the create routes read.
+        self._preferences_store = preferences_store
+        self._catalog_store = catalog_store
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._host_tasks: dict[str, asyncio.Task[None]] = {}
         self._release_holds: dict[str, tuple[int, int | None]] = {}
@@ -645,6 +655,13 @@ class AssignmentCoordinator:
             host_id_value = host.host_id
             conn = self._host_registry.get(host_id_value)
             if conn is None or not host_supports_assignments(conn):
+                continue
+            # An agent-omitted assignment can only land where a project
+            # default agent exists; a host without one is ineligible, not a
+            # waiting reason of its own.
+            if assignment.target_agent_id is None and (
+                default_agent_for_host_or_legacy(project.config, host_id_value) is None
+            ):
                 continue
             binding = await self._resolve_binding(
                 assignment.project_id, host_id_value, assignment.binding_name
@@ -1461,11 +1478,11 @@ class AssignmentCoordinator:
     async def _resolve_target_agent_spec_cwd(self, agent_id: str | None) -> str | None:
         """Read the target agent's ``os_env.cwd`` for the entry-boundary check.
 
-        Mirrors ``routes/hosts.py`` ``_resolve_agent_spec_cwd``, resolved from
-        ``assignment.target_agent_id`` directly since no session row exists
+        Mirrors ``routes/hosts.py`` ``_resolve_agent_spec_cwd``, resolved
+        from the placement's effective agent id since no session row exists
         yet at this point in ``_place``.
 
-        :param agent_id: The assignment's target agent, or ``None``.
+        :param agent_id: The effective agent, or ``None``.
         :returns: The agent's ``os_env.cwd``, or ``None`` when unresolvable.
         """
         if agent_id is None or self._agent_store is None or self._agent_cache is None:
@@ -1476,6 +1493,57 @@ class AssignmentCoordinator:
         loaded = await asyncio.to_thread(self._agent_cache.load, agent.id, agent.bundle_location)
         os_env = getattr(loaded.spec, "os_env", None)
         return getattr(os_env, "cwd", None) if os_env is not None else None
+
+    async def _resolve_placement_calling(
+        self, assignment: Assignment, host_id: str
+    ) -> CallingResolution:
+        """Resolve the effective agent / model / effort on the chosen host.
+
+        Explicit assignment values — and nulls the dispatcher marked
+        explicit — win; the rest comes from the project's per-host set and
+        the owner's master table. A K5 refusal raises for the caller to fail
+        the attempt with its text.
+
+        :param assignment: The row being placed.
+        :param host_id: The host `_blocking_reason` chose.
+        :returns: The resolved calling triple.
+        :raises OmnigentError: ``INVALID_INPUT`` for any refused default.
+        """
+        from omnigent.server.routes._session_create_validation import (
+            resolve_create_calling_stores,
+        )
+
+        explicit: dict[str, Any] = {
+            "agent_id": assignment.target_agent_id,
+            "model_override": assignment.model_override,
+            "harness_override": assignment.harness_override,
+            "reasoning_effort": assignment.reasoning_effort,
+        }
+        explicit_fields: set[str] = set(assignment.explicit_null_fields or ())
+        if assignment.target_agent_id is not None:
+            explicit_fields.add("agent_id")
+        if assignment.model_override is not None:
+            explicit_fields.add("model_override")
+        if assignment.harness_override is not None:
+            explicit_fields.add("harness_override")
+        if assignment.reasoning_effort is not None:
+            explicit_fields.add("reasoning_effort")
+        project = await asyncio.to_thread(
+            self._project_store.get, assignment.project_id, user_id=assignment.owner_user_id
+        )
+        return await resolve_create_calling_stores(
+            user_id=assignment.owner_user_id,
+            project=project,
+            host_id=host_id,
+            explicit=explicit,
+            explicit_fields=explicit_fields,
+            path_label="sys_assignment_dispatch",
+            host_store=self._host_store,
+            agent_store=self._agent_store,
+            agent_cache=self._agent_cache,
+            preferences_store=self._preferences_store,
+            catalog_store=self._catalog_store,
+        )
 
     async def _place(
         self,
@@ -1491,6 +1559,14 @@ class AssignmentCoordinator:
             await self._fail_before_launch(assignment, attempt, "prepare returned no directory")
             return
 
+        # The default agent must resolve before anything is granted or
+        # created; a refused default ends the attempt with its text.
+        try:
+            resolution = await self._resolve_placement_calling(assignment, host_id)
+        except OmnigentError as exc:
+            await self._fail_before_launch(assignment, attempt, exc.message)
+            return
+
         # Launch at the project's entry on this host when one is
         # set and it passes the same agent-boundary check the execution
         # root itself would; every other case launches at the execution
@@ -1503,7 +1579,7 @@ class AssignmentCoordinator:
             spec_cwd: str | None = None
             spec_loaded = True
             try:
-                spec_cwd = await self._resolve_target_agent_spec_cwd(assignment.target_agent_id)
+                spec_cwd = await self._resolve_target_agent_spec_cwd(resolution.agent_id)
             except Exception:  # noqa: BLE001
                 # A store/cache failure loading the spec is a failed
                 # boundary, never a failed placement: the session still
@@ -1547,7 +1623,7 @@ class AssignmentCoordinator:
         try:
             conv: Conversation = await asyncio.to_thread(
                 self._conversation_store.create_conversation,
-                agent_id=assignment.target_agent_id,
+                agent_id=resolution.agent_id,
                 title=f"Assignment: {title}",
                 host_id=host_id,
                 workspace=workspace,
@@ -1570,13 +1646,18 @@ class AssignmentCoordinator:
         except Exception as exc:  # noqa: BLE001
             await self._fail_before_launch(assignment, attempt, str(exc) or "create failed")
             return
-        if assignment.model_override is not None or assignment.harness_override is not None:
+        if (
+            resolution.model is not None
+            or resolution.effort is not None
+            or assignment.harness_override is not None
+        ):
             try:
                 await asyncio.to_thread(
                     self._conversation_store.update_conversation,
                     conv.id,
-                    model_override=assignment.model_override,
+                    model_override=resolution.model,
                     harness_override=assignment.harness_override,
+                    reasoning_effort=resolution.effort,
                 )
             except Exception as exc:  # noqa: BLE001
                 await self._fail_before_launch(assignment, attempt, str(exc) or "update failed")

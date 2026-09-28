@@ -101,7 +101,7 @@ def test_schemas_are_closed_objects_with_required_lists() -> None:
     )
 
     expected_required = {
-        SysAssignmentDispatchTool: {"target_agent_id", "task", "repositories", "idempotency_key"},
+        SysAssignmentDispatchTool: {"task", "repositories", "idempotency_key"},
         SysAssignmentGetTool: {"assignment_id"},
         SysAssignmentListTool: set(),
         SysAssignmentSendTool: {"assignment_id", "body", "idempotency_key"},
@@ -114,6 +114,16 @@ def test_schemas_are_closed_objects_with_required_lists() -> None:
         assert params["type"] == "object"
         assert params["additionalProperties"] is False
         assert set(params["required"]) == required
+
+
+def test_dispatch_agent_is_optional_and_effort_is_accepted() -> None:
+    """Dispatch omits the agent (host default) and takes a reasoning effort."""
+    from omnigent.tools.builtins.assignments import SysAssignmentDispatchTool
+
+    params = SysAssignmentDispatchTool().get_schema()["function"]["parameters"]
+    assert "target_agent_id" not in params["required"]
+    assert "reasoning_effort" in params["properties"]
+    assert "default agent" in params["properties"]["target_agent_id"]["description"]
 
 
 def test_descriptions_state_the_commit_rule() -> None:

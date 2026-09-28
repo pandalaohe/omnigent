@@ -237,6 +237,76 @@ async def test_complete_result_guides_only_successful_assignment(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_payload_omits_absent_agent_and_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An agent-omitted dispatch sends no target_agent_id / reasoning_effort."""
+    from omnigent.runner import assignment_tools
+
+    posted: list[dict[str, Any]] = []
+
+    class _DispatchClient(_RecordingClient):
+        async def get(self, url: str, **_kwargs: Any) -> _Resp:
+            if url.startswith("/v1/sessions/"):
+                return _Resp(body={"project_id": "project", "host_id": "host"})
+            if url.endswith("/collaboration"):
+                return _Resp(
+                    body={
+                        "enabled": True,
+                        "repositories": [{"name": "root", "id": "repo-1"}],
+                        "bindings": [
+                            {
+                                "enabled": True,
+                                "host_id": "host",
+                                "repository_id": "repo-1",
+                                "workspace": "/work",
+                            }
+                        ],
+                    }
+                )
+            raise AssertionError(f"unexpected GET {url}")
+
+        async def post(self, url: str, **kwargs: Any) -> _Resp:
+            assert url == "/v1/assignments"
+            posted.append(kwargs["json"])
+            return _Resp(body={"state": "failed"})
+
+    async def _commit(*_args: Any) -> str:
+        return "a" * 40
+
+    async def _digest(*_args: Any) -> tuple[str, str]:
+        return "d" * 64, ".agents/project/manifest.json"
+
+    monkeypatch.setattr(assignment_tools, "_resolve_commit", _commit)
+    monkeypatch.setattr(assignment_tools, "_manifest_digest_for", _digest)
+
+    base: dict[str, Any] = {
+        "task": "Do it",
+        "repositories": [{"repository_name": "root", "commit": "a" * 40}],
+        "idempotency_key": "k1",
+    }
+    out, _ = await _run("sys_assignment_dispatch", base, _DispatchClient())
+    assert out["state"] == "failed", out
+    (bare,) = posted
+    assert "target_agent_id" not in bare
+    assert "reasoning_effort" not in bare
+
+    out, _ = await _run(
+        "sys_assignment_dispatch",
+        {
+            **base,
+            "idempotency_key": "k2",
+            "target_agent_id": "ag_1",
+            "reasoning_effort": "high",
+        },
+        _DispatchClient(),
+    )
+    assert out["state"] == "failed", out
+    assert posted[1]["target_agent_id"] == "ag_1"
+    assert posted[1]["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
 async def test_missing_args_error_before_http() -> None:
     client = _RecordingClient()
     for tool_name, args in [

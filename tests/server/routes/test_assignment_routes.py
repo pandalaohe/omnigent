@@ -31,6 +31,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.server.routes.assignments import AssignmentRepositoryInput, _create_digest
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignmentStore
@@ -230,20 +231,24 @@ def _create_payload(
     source_session_id: str,
     *,
     assignment_id: str | None = None,
-    target_agent_id: str = AGENT_ID,
+    target_agent_id: str | None = AGENT_ID,
     repositories: list[dict[str, Any]] | None = None,
     task: str = "Do the thing",
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """A minimal valid create body with fresh id and idempotency key."""
+    """A minimal valid create body with fresh id and idempotency key.
+
+    ``target_agent_id=None`` omits the key entirely (agent-omitted dispatch).
+    """
     payload: dict[str, Any] = {
         "id": assignment_id or uuid.uuid4().hex,
         "source_session_id": source_session_id,
-        "target_agent_id": target_agent_id,
         "task": task,
         "repositories": repositories if repositories is not None else _repos("root"),
         "idempotency_key": f"key-{uuid.uuid4().hex[:8]}",
     }
+    if target_agent_id is not None:
+        payload["target_agent_id"] = target_agent_id
     if extra:
         payload.update(extra)
     return payload
@@ -351,6 +356,19 @@ async def _setup_dispatch(client: httpx.AsyncClient, db_uri: str) -> dict[str, s
     await _register_repo(client, project_id)
     session_id = _make_session(db_uri, project_id=project_id)
     return {"project_id": project_id, "session_id": session_id}
+
+
+async def _set_project_config(
+    client: httpx.AsyncClient,
+    project_id: str,
+    config: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> None:
+    """Replace a project's config (the calling-defaults set lives there)."""
+    resp = await client.patch(
+        f"/v1/projects/{project_id}", json={"config": config}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
 
 
 # ── Gate split ────────────────────────────────────────────────
@@ -613,6 +631,155 @@ async def test_create_requested_host_owned_by_other_user_403(
         headers=_as_user(ALICE),
     )
     assert resp.status_code == 403, resp.text
+
+
+async def test_create_agent_omitted_refuses_without_default(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Scenario 9: no default agent anywhere → 400 at dispatch, nothing queued."""
+    setup = await _setup_dispatch(client, db_uri)
+    resp = await client.post(
+        "/v1/assignments", json=_create_payload(setup["session_id"], target_agent_id=None)
+    )
+    assert resp.status_code == 400, resp.text
+    message = resp.json()["error"]["message"]
+    assert "no default agent on any host" in message
+    assert "Pass agent_id" in message
+    HostStore(db_uri).upsert_on_connect(_HOST_A, "box-a", "local")
+    resp = await client.post(
+        "/v1/assignments",
+        json=_create_payload(
+            setup["session_id"], target_agent_id=None, extra={"requested_host_id": _HOST_A}
+        ),
+    )
+    assert resp.status_code == 400, resp.text
+    message = resp.json()["error"]["message"]
+    assert "has no default agent on host 'box-a'" in message
+    assert (await client.get("/v1/assignments")).json()["data"] == []
+
+
+async def test_create_agent_omitted_refuses_library_default(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Scenario 17: a saved joint agent default is refused naming the setting."""
+    setup = await _setup_dispatch(client, db_uri)
+    HostStore(db_uri).upsert_on_connect(_HOST_A, "box-a", "local")
+    await _set_project_config(
+        client,
+        setup["project_id"],
+        {"calling_defaults": {_HOST_A: {"agent_id": "ca_polly"}}},
+    )
+    resp = await client.post(
+        "/v1/assignments",
+        json=_create_payload(
+            setup["session_id"], target_agent_id=None, extra={"requested_host_id": _HOST_A}
+        ),
+    )
+    assert resp.status_code == 400, resp.text
+    message = resp.json()["error"]["message"]
+    assert "ca_polly" in message
+    assert "saved joint agent" in message
+    assert "sys_assignment_dispatch cannot launch it" in message
+    assert "Pass agent_id" in message
+    assert (await client.get("/v1/assignments")).json()["data"] == []
+
+
+async def test_create_agent_omitted_accepts_launchable_default(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The route half of scenario 8: the default is resolved at placement."""
+    setup = await _setup_dispatch(client, db_uri)
+    HostStore(db_uri).upsert_on_connect(_HOST_A, "box-a", "local")
+    await _set_project_config(
+        client,
+        setup["project_id"],
+        {"calling_defaults": {_HOST_A: {"agent_id": AGENT_ID}}},
+    )
+    resp = await client.post(
+        "/v1/assignments",
+        json=_create_payload(
+            setup["session_id"], target_agent_id=None, extra={"requested_host_id": _HOST_A}
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["target_agent_id"] is None
+    assert body["requested_host_id"] == _HOST_A
+
+
+async def test_create_persists_effort_and_explicit_nulls(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Effort persists; only explicitly-nulled fields are recorded."""
+    setup = await _setup_dispatch(client, db_uri)
+    store = SqlAlchemyAssignmentStore(db_uri)
+    resp = await client.post(
+        "/v1/assignments",
+        json=_create_payload(
+            setup["session_id"],
+            extra={"reasoning_effort": "high", "model_override": None},
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["reasoning_effort"] == "high"
+    row = store.get(resp.json()["id"])
+    assert row is not None
+    assert row.reasoning_effort == "high"
+    assert row.explicit_null_fields == ["model_override"]
+
+    resp = await client.post(
+        "/v1/assignments",
+        json=_create_payload(setup["session_id"], extra={"reasoning_effort": None}),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["reasoning_effort"] is None
+    row = store.get(resp.json()["id"])
+    assert row is not None
+    assert row.explicit_null_fields == ["reasoning_effort"]
+
+
+async def test_create_invalid_reasoning_effort_400(client: httpx.AsyncClient, db_uri: str) -> None:
+    """An effort outside the shared vocabulary never reaches the store."""
+    setup = await _setup_dispatch(client, db_uri)
+    resp = await client.post(
+        "/v1/assignments",
+        json=_create_payload(setup["session_id"], extra={"reasoning_effort": "bogus"}),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "invalid reasoning_effort" in resp.json()["error"]["message"]
+
+
+async def test_create_digest_carries_effort_only_when_given(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A payload without reasoning_effort keeps its pre-field digest."""
+    setup = await _setup_dispatch(client, db_uri)
+    store = SqlAlchemyAssignmentStore(db_uri)
+    base = _create_payload(setup["session_id"])
+    assert (await client.post("/v1/assignments", json=base)).status_code == 201
+    digest_payload = {
+        "source_session_id": setup["session_id"],
+        "target_agent_id": AGENT_ID,
+        "requested_host_id": None,
+        "binding_name": "primary",
+        "task": base["task"],
+        "metadata": None,
+        "repositories": [
+            AssignmentRepositoryInput(**repo).model_dump() for repo in base["repositories"]
+        ],
+        "execution_root": None,
+        "model_override": None,
+        "harness_override": None,
+        "start_deadline": None,
+    }
+    row = store.get(base["id"])
+    assert row is not None and row.request_digest == _create_digest(digest_payload)
+
+    with_effort = _create_payload(setup["session_id"], extra={"reasoning_effort": "high"})
+    assert (await client.post("/v1/assignments", json=with_effort)).status_code == 201
+    digest_payload["reasoning_effort"] = "high"
+    row = store.get(with_effort["id"])
+    assert row is not None and row.request_digest == _create_digest(digest_payload)
 
 
 # ── Published ─────────────────────────────────────────────────

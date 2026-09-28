@@ -405,6 +405,18 @@
             "description": "Per-assignment model override, or `None`.",
             "title": "Model Override"
           },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-assignment reasoning effort, or `None`.",
+            "title": "Reasoning Effort"
+          },
           "repositories": {
             "description": "The pinned input repositories, one entry each.",
             "items": {
@@ -445,9 +457,16 @@
             "title": "Start Deadline"
           },
           "target_agent_id": {
-            "description": "The agent to launch on arrival.",
-            "title": "Target Agent Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The agent to launch on arrival, or `None` to take the destination host's project default agent at placement.",
+            "title": "Target Agent Id"
           },
           "task": {
             "description": "The natural-language instruction blob.",
@@ -459,7 +478,6 @@
         "required": [
           "id",
           "source_session_id",
-          "target_agent_id",
           "task",
           "repositories",
           "idempotency_key"
@@ -11146,7 +11164,7 @@
         ]
       },
       "post": {
-        "description": "Create an assignment in `preparing` with a caller-supplied id.\n\nThe session's project is the assignment's project; input refs are\nderived server-side and returned so the caller pushes to exactly\nthose. Idempotent: the same id (or `source_session_id` +\n`idempotency_key`) with the same digest returns the stored row.\n\n**Parameters**\n\n- `body` \u2014 The dispatch fields.\n\n**Returns:** The inserted (201) or already-stored (200) assignment.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 403/404 per session access, 400 on a bad id, unfiled session, unknown repository, bad commit or missing execution root, 409 when the project switch is off or the payload changed under a reused key.",
+        "description": "Create an assignment in `preparing` with a caller-supplied id.\n\nThe session's project is the assignment's project; input refs are\nderived server-side and returned so the caller pushes to exactly\nthose. Idempotent: the same id (or `source_session_id` +\n`idempotency_key`) with the same digest returns the stored row.\n\n**Parameters**\n\n- `body` \u2014 The dispatch fields.\n\n**Returns:** The inserted (201) or already-stored (200) assignment.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 403/404 per session access, 400 on a bad id, unfiled session, missing default agent for an agent-omitted dispatch, unknown repository, bad commit, invalid reasoning_effort or missing execution root, 409 when the project switch is off or the payload changed under a reused key.",
         "operationId": "create_assignment_v1_assignments_post",
         "requestBody": {
           "content": {

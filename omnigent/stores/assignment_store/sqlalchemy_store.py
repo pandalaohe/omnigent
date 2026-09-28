@@ -134,6 +134,37 @@ def _decode_metadata(raw: str | None) -> dict[str, Any] | None:
     return decoded if isinstance(decoded, dict) else None
 
 
+def _encode_explicit_null_fields(fields: list[str] | None) -> str | None:
+    """Pack the explicit-null field list (``None`` when empty / unset).
+
+    :param fields: Field names the dispatcher sent as explicit nulls.
+    :returns: Compact JSON array string, or ``None``.
+    """
+    if not fields:
+        return None
+    return json.dumps(list(fields), separators=(",", ":"))
+
+
+def _decode_explicit_null_fields(raw: str | None) -> list[str] | None:
+    """Unpack the stored explicit-null field list (``None`` when unset).
+
+    A malformed blob reads as unset rather than failing the read.
+
+    :param raw: The stored JSON blob, or ``None``.
+    :returns: The decoded field names, or ``None``.
+    """
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, list):
+        return None
+    names = [item for item in decoded if isinstance(item, str)]
+    return names or None
+
+
 def _assignment_to_entity(row: SqlAssignment) -> Assignment:
     """
     Convert a :class:`SqlAssignment` ORM row to an :class:`Assignment`.
@@ -160,6 +191,8 @@ def _assignment_to_entity(row: SqlAssignment) -> Assignment:
         metadata=_decode_metadata(row.metadata_json),
         model_override=row.model_override,
         harness_override=row.harness_override,
+        reasoning_effort=row.reasoning_effort,
+        explicit_null_fields=_decode_explicit_null_fields(row.explicit_null_fields),
         start_deadline=row.start_deadline,
         state=row.state,
         wait_reason=row.wait_reason,
@@ -301,6 +334,8 @@ class SqlAlchemyAssignmentStore(AssignmentStore):
                 inputs_json=inputs_to_json(assignment.inputs),
                 model_override=assignment.model_override,
                 harness_override=assignment.harness_override,
+                reasoning_effort=assignment.reasoning_effort,
+                explicit_null_fields=_encode_explicit_null_fields(assignment.explicit_null_fields),
                 start_deadline=assignment.start_deadline,
                 idempotency_key=assignment.idempotency_key,
                 request_digest=assignment.request_digest,

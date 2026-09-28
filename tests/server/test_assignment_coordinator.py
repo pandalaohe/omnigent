@@ -22,10 +22,13 @@ import pytest
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Assignment, AssignmentInputEntry
 from omnigent.host.frames import HostAssignmentPrepareResultFrame
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import assignments as assignments_mod
 from omnigent.server.assignment_host import AssignmentHostUnavailableError
 from omnigent.server.assignments import AssignmentCoordinator, next_check_at
 from omnigent.server.auth import LEVEL_OWNER
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignmentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -37,6 +40,7 @@ from omnigent.stores.project_repository_store.sqlalchemy_store import (
     SqlAlchemyProjectRepositoryStore,
 )
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests.server.helpers import build_agent_bundle
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -80,6 +84,8 @@ def _input(
 class _FakeHost:
     host_id: str
     user_id: str
+    name: str = ""
+    configured_harnesses: dict[str, object] | None = None
 
 
 class FakeHostStore:
@@ -200,13 +206,16 @@ def _seed_waiting(
     model_override: str | None = None,
     harness_override: str | None = None,
     binding_name: str = "primary",
+    target_agent_id: str | None = AGENT_ID,
+    reasoning_effort: str | None = None,
+    explicit_null_fields: list[str] | None = None,
 ) -> Assignment:
     created = assignment_store.create(
         Assignment(
             id=_uid(f"{seed}-id"),
             project_id=project_id,
             source_session_id=_uid(f"{seed}-sess"),
-            target_agent_id=AGENT_ID,
+            target_agent_id=target_agent_id,
             task=task,
             inputs=inputs or [_input()],
             idempotency_key=f"key-{seed}",
@@ -216,6 +225,8 @@ def _seed_waiting(
             binding_name=binding_name,
             model_override=model_override,
             harness_override=harness_override,
+            reasoning_effort=reasoning_effort,
+            explicit_null_fields=explicit_null_fields,
             start_deadline=start_deadline,
         )
     )
@@ -281,6 +292,25 @@ def _coordinator(
         agent_store=agent_store,
         agent_cache=agent_cache,
     )
+
+
+def _agent_stores(
+    db_uri: str, tmp_path: Path, *, harness: str = "codex"
+) -> tuple[SqlAlchemyAgentStore, AgentCache]:
+    """A real agent store + cache whose bundle declares *harness*."""
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    location = f"{AGENT_ID}/bundle"
+    artifacts.put(
+        location,
+        build_agent_bundle(
+            name=f"calling-{harness}",
+            executor={"type": "omnigent", "config": {"harness": harness}},
+        ),
+    )
+    if agent_store.get(AGENT_ID) is None:
+        agent_store.create(AGENT_ID, f"calling-{harness}", location)
+    return agent_store, AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache")
 
 
 def _install_placement_fakes(
@@ -833,6 +863,267 @@ async def test_placement_initializes_receiver_with_flag(
     assert snapshot["project_assignments_enabled"] is flag
     row = stores["assignment"].get(assignment.id)
     assert row is not None and row.state == "running"
+
+
+# ── 2b. calling defaults at placement ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_placement_uses_host_default_agent_and_project_defaults(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scenario 8: an agent-omitted assignment takes the host's default set."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-default")
+    project_id = _uid("default-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/work/default",
+    )
+    stores["project"].update(
+        project_id,
+        user_id=ALICE,
+        config={
+            "calling_defaults": {
+                host_id: {
+                    "agent_id": AGENT_ID,
+                    "harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}},
+                }
+            }
+        },
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "default-agent",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+        target_agent_id=None,
+    )
+    monkeypatch.setattr(
+        assignments_mod,
+        "prepare_assignment_on_host",
+        _prepare_ok({"root": "/prepared/default"}),
+    )
+    _install_placement_fakes(monkeypatch)
+    agent_store, agent_cache = _agent_stores(db_uri, tmp_path)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        agent_store=agent_store,
+        agent_cache=agent_cache,
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "running", row
+    attempt = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
+    assert attempt is not None and attempt.session_id is not None
+    conv = stores["conversation"].get_conversation(attempt.session_id)
+    assert conv is not None
+    assert conv.agent_id == AGENT_ID
+    assert conv.model_override == "gpt-6-sol"
+    assert conv.reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_host_without_default_agent_is_skipped(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K7e step 2: a host without a default agent is ineligible, not a wait."""
+    stores = _stores(db_uri)
+    bare_host = _uid("host-bare")
+    default_host = _uid("host-with-default")
+    project_id = _uid("skip-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    for host_id in (bare_host, default_host):
+        _make_binding(
+            stores["binding"],
+            project_id=project_id,
+            host_id=host_id,
+            repo_id=repo.id,
+            workspace=f"/work/{host_id}",
+        )
+    stores["project"].update(
+        project_id,
+        user_id=ALICE,
+        config={"calling_defaults": {default_host: {"agent_id": AGENT_ID}}},
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "skip-bare",
+        project_id=project_id,
+        owner=ALICE,
+        inputs=[_input("root", revision=repo.revision)],
+        target_agent_id=None,
+    )
+    monkeypatch.setattr(
+        assignments_mod,
+        "prepare_assignment_on_host",
+        _prepare_ok({"root": "/prepared/skip"}),
+    )
+    _install_placement_fakes(monkeypatch)
+    agent_store, agent_cache = _agent_stores(db_uri, tmp_path)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry(
+            {
+                bare_host: _conn(bare_host, owner=ALICE, assignments=True),
+                default_host: _conn(default_host, owner=ALICE, assignments=True),
+            }
+        ),
+        host_store=FakeHostStore([_FakeHost(bare_host, ALICE), _FakeHost(default_host, ALICE)]),
+        permission_store=FakePermissionStore(),
+        agent_store=agent_store,
+        agent_cache=agent_cache,
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "running", row
+    assert row.resolved_host_id == default_host
+    attempt = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
+    assert attempt is not None and attempt.session_id is not None
+    conv = stores["conversation"].get_conversation(attempt.session_id)
+    assert conv is not None and conv.agent_id == AGENT_ID
+
+
+@pytest.mark.asyncio
+async def test_placement_keeps_explicit_null_effort(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stored explicit null is never refilled from the project defaults."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-null-effort")
+    project_id = _uid("null-effort-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/work/null-effort",
+    )
+    stores["project"].update(
+        project_id,
+        user_id=ALICE,
+        config={
+            "calling_defaults": {
+                host_id: {
+                    "agent_id": AGENT_ID,
+                    "harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}},
+                }
+            }
+        },
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "null-effort",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+        target_agent_id=AGENT_ID,
+        reasoning_effort=None,
+        explicit_null_fields=["reasoning_effort"],
+    )
+    monkeypatch.setattr(
+        assignments_mod,
+        "prepare_assignment_on_host",
+        _prepare_ok({"root": "/prepared/null-effort"}),
+    )
+    _install_placement_fakes(monkeypatch)
+    agent_store, agent_cache = _agent_stores(db_uri, tmp_path)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+        agent_store=agent_store,
+        agent_cache=agent_cache,
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "running", row
+    attempt = stores["assignment"].get_attempt(assignment.id, row.active_attempt_id)
+    assert attempt is not None and attempt.session_id is not None
+    conv = stores["conversation"].get_conversation(attempt.session_id)
+    assert conv is not None
+    assert conv.model_override == "gpt-6-sol"
+    assert conv.reasoning_effort is None
+
+
+@pytest.mark.asyncio
+async def test_placement_refuses_library_default_agent(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A K5 refusal at placement ends the attempt with the refusal text."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-ca-default")
+    project_id = _uid("ca-default-proj")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/work/ca-default",
+    )
+    stores["project"].update(
+        project_id,
+        user_id=ALICE,
+        config={"calling_defaults": {host_id: {"agent_id": "ca_polly"}}},
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "ca-default",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+        target_agent_id=None,
+    )
+    monkeypatch.setattr(
+        assignments_mod,
+        "prepare_assignment_on_host",
+        _prepare_ok({"root": "/prepared/ca-default"}),
+    )
+    _install_placement_fakes(monkeypatch)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=FakePermissionStore(),
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "waiting", row
+    assert row.active_attempt_id is None
+    assert row.wait_reason is not None
+    assert "ca_polly" in row.wait_reason
+    assert "saved joint agent" in row.wait_reason
+    assert "sys_assignment_dispatch cannot launch it" in row.wait_reason
 
 
 # ── 3. scenario 3: offline past deadline ──────────────────────────────────

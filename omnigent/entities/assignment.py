@@ -278,7 +278,8 @@ class Assignment:
         retries so a retried create is recognised.
     :param project_id: The collaboration project.
     :param source_session_id: The session that dispatched the assignment.
-    :param target_agent_id: The agent to launch on arrival.
+    :param target_agent_id: The agent to launch on arrival, or ``None`` to
+        take the destination host's project default agent at placement.
     :param task: The natural-language instruction blob.
     :param inputs: The immutable dispatch snapshot: one entry per
         repository, with exactly one ``is_execution_root`` entry.
@@ -297,6 +298,11 @@ class Assignment:
         for the agent default.
     :param harness_override: Per-assignment harness override, or ``None``
         for the agent default.
+    :param reasoning_effort: Per-assignment reasoning-effort hint, or
+        ``None`` for the agent default.
+    :param explicit_null_fields: Request field names the dispatcher sent as
+        explicit nulls, so placement never refills them from the
+        calling-defaults chain.
     :param start_deadline: Unix epoch seconds bounding the wait, or ``None``
         to wait until cancelled.
     :param state: Lifecycle state (see :class:`AssignmentState`).
@@ -319,7 +325,7 @@ class Assignment:
     id: str
     project_id: str
     source_session_id: str
-    target_agent_id: str
+    target_agent_id: str | None
     task: str
     inputs: list[AssignmentInputEntry]
     idempotency_key: str
@@ -334,6 +340,8 @@ class Assignment:
     metadata: dict[str, Any] | None = None
     model_override: str | None = None
     harness_override: str | None = None
+    reasoning_effort: str | None = None
+    explicit_null_fields: list[str] | None = None
     start_deadline: int | None = None
     state: str = AssignmentState.PREPARING.value
     wait_reason: str | None = None

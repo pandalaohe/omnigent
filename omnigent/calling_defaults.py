@@ -125,6 +125,39 @@ def default_agent_for_host(
     return _setting(entry.get("agent_id")) if entry is not None else None
 
 
+def default_agent_for_host_or_legacy(
+    project_config: Mapping[str, Any] | None, host_id: str | None
+) -> str | None:
+    """The project's default agent for one host: per-host entry, then legacy.
+
+    The same order :func:`resolve_calling` walks when a request omits the
+    agent; assignment dispatch and placement need the read without a full
+    resolution.
+    """
+    return default_agent_for_host(project_config, host_id) or _project_legacy(
+        project_config, "agent_id"
+    )
+
+
+def has_default_agent(project_config: Mapping[str, Any] | None) -> bool:
+    """Whether any host could supply a project default agent.
+
+    Counts the legacy ``agent_id`` (host-independent) and every per-host
+    entry; the caller decides whether the found agent is launchable.
+    """
+    if _project_legacy(project_config, "agent_id") is not None:
+        return True
+    if not isinstance(project_config, Mapping):
+        return False
+    defaults = project_config.get("calling_defaults")
+    if not isinstance(defaults, Mapping):
+        return False
+    return any(
+        isinstance(entry, Mapping) and _setting(entry.get("agent_id")) is not None
+        for entry in defaults.values()
+    )
+
+
 def _master_entry(
     master: Mapping[str, Any], host_id: str | None, harness: str | None
 ) -> Mapping[str, Any] | None:

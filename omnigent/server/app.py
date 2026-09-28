@@ -1800,6 +1800,8 @@ def create_app(
                 runner_session_initializer=runner_session_initializer,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                preferences_store=user_preferences_store,
+                catalog_store=host_model_catalog_cache_store,
             )
             await assignment_coordinator.start()
         app_inst.state.assignment_coordinator = assignment_coordinator

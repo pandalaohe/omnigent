@@ -252,10 +252,11 @@ class SysAssignmentDispatchTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Hand a unit of work to a named agent on a host: the receiving "
-            "session auto-starts in a prepared worktree and reports back. The "
-            "assignment is filed under this session's project. Only committed "
-            "work is sent — commit first; nothing is committed for you."
+            "Hand a unit of work to an agent on a host: the receiving session "
+            "auto-starts in a prepared worktree and reports back. Omit "
+            "target_agent_id to use the destination host's project default "
+            "agent. The assignment is filed under this session's project. Only "
+            "committed work is sent — commit first; nothing is committed for you."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -270,7 +271,11 @@ class SysAssignmentDispatchTool(Tool):
                     "properties": {
                         "target_agent_id": {
                             "type": "string",
-                            "description": "The agent to run on arrival, e.g. 'ag_abc123'.",
+                            "description": (
+                                "The agent to run on arrival, e.g. 'ag_abc123'. Omit to "
+                                "use the destination host's default agent for this "
+                                "session's project."
+                            ),
                         },
                         "task": {
                             "type": "string",
@@ -345,6 +350,10 @@ class SysAssignmentDispatchTool(Tool):
                             "type": "string",
                             "description": "Optional per-assignment harness override.",
                         },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": "Optional per-assignment reasoning effort.",
+                        },
                         "start_deadline": {
                             "type": "integer",
                             "description": (
@@ -353,7 +362,7 @@ class SysAssignmentDispatchTool(Tool):
                             ),
                         },
                     },
-                    "required": ["target_agent_id", "task", "repositories", "idempotency_key"],
+                    "required": ["task", "repositories", "idempotency_key"],
                     "additionalProperties": False,
                 },
             },
