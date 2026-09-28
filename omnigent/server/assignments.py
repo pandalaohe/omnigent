@@ -1567,6 +1567,27 @@ class AssignmentCoordinator:
             await self._fail_before_launch(assignment, attempt, exc.message)
             return
 
+        # A default-sourced agent skipped the dispatch route's session-agent
+        # authorization (explicit target_agent_id only), so authorize it here
+        # before any grant or row; an unwired agent store cannot authorize.
+        if assignment.target_agent_id is None and self._agent_store is not None:
+            from omnigent.server.routes._session_create_validation import (
+                validate_session_agent,
+            )
+
+            assert resolution.agent_id is not None
+            try:
+                await validate_session_agent(
+                    user_id=assignment.owner_user_id,
+                    agent_id=resolution.agent_id,
+                    agent_store=self._agent_store,
+                    permission_store=self._permission_store,
+                    conversation_store=self._conversation_store,
+                )
+            except OmnigentError as exc:
+                await self._fail_before_launch(assignment, attempt, exc.message)
+                return
+
         # Launch at the project's entry on this host when one is
         # set and it passes the same agent-boundary check the execution
         # root itself would; every other case launches at the execution

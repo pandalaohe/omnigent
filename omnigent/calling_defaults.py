@@ -644,16 +644,24 @@ class _PreferencesReader(Protocol):
 async def load_master(user_id: str | None, store: _PreferencesReader | None) -> dict:
     """Read one owner's ``calling_defaults`` master table, defaulting on gaps.
 
-    Fail-safe like the approval-timeout reader: a missing store / user, a
-    store error, or a non-object namespace resolves to ``{}`` so no create
-    path ever fails on a malformed preference row.
+    Fail-safe like the approval-timeout reader: a missing store, a store
+    error, or a non-object namespace resolves to ``{}`` so no create path
+    ever fails on a malformed preference row. A ``None`` owner is the
+    single-user server's reserved ``"local"`` identity, where its
+    preferences are stored, so that owner still reads the master table.
 
-    :param user_id: Owner whose master table applies, or ``None``.
+    :param user_id: Owner whose master table applies, or ``None`` for the
+        single-user ``"local"`` owner.
     :param store: Preferences store, or ``None`` when the server has none.
     :returns: The owner's master table, or ``{}``.
     """
-    if user_id is None or store is None:
+    if store is None:
         return {}
+    if user_id is None:
+        # Lazy so this pure module stays importable without the server stack.
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+
+        user_id = RESERVED_USER_LOCAL
     try:
         envelope = await asyncio.to_thread(store.get, user_id)
     except Exception:  # noqa: BLE001 — a preference read must never fail a create

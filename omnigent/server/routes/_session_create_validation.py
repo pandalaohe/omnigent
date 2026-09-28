@@ -356,10 +356,18 @@ async def resolve_project_session_create(
         )
         if "agent_id" not in fields_set and resolution.agent_id is not None:
             updates["agent_id"] = resolution.agent_id
-        if "model_override" not in fields_set and resolution.model is not None:
-            updates["model_override"] = resolution.model
-        if "reasoning_effort" not in fields_set and resolution.effort is not None:
-            updates["reasoning_effort"] = resolution.effort
+        # Routing-on creates own model and effort per turn: a pinned default
+        # would silently disable the router for the whole session (a pinned
+        # model wins over the router). The agent fill above is unaffected.
+        routing_requested = (
+            getattr(body, "cost_control_mode_override", None) == "on"
+            or getattr(body, "harness_override", None) == "auto"
+        )
+        if not routing_requested:
+            if "model_override" not in fields_set and resolution.model is not None:
+                updates["model_override"] = resolution.model
+            if "reasoning_effort" not in fields_set and resolution.effort is not None:
+                updates["reasoning_effort"] = resolution.effort
     elif project is None:
         if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
             raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)

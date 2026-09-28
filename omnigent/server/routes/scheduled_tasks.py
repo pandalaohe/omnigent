@@ -710,15 +710,13 @@ def create_scheduled_tasks_router(
             if project is None:
                 raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         fields = body.model_dump(exclude_unset=True)
-        # A field set to a value stops being an explicit null; one set to null
-        # becomes one. Fields the caller did not send keep their state.
+        # Explicit nulls are a create-time record (K7c). A PATCHed field stops
+        # being one either way: a value sets it, a null clears it back to
+        # "Default" (inherit the project / master defaults at fire). Fields the
+        # caller did not send keep their state.
         explicit_nulls = set(existing.explicit_null_fields or ())
         for field_name in ("model_override", "reasoning_effort"):
-            if field_name not in body.model_fields_set:
-                continue
-            if getattr(body, field_name) is None:
-                explicit_nulls.add(field_name)
-            else:
+            if field_name in body.model_fields_set:
                 explicit_nulls.discard(field_name)
         fields["explicit_null_fields"] = sorted(explicit_nulls) or None
         target_agent_id = fields.get("agent_id") or existing.agent_id

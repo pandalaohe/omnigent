@@ -4943,14 +4943,21 @@ export function NewChatLandingScreen() {
   // a notice. Re-runs per (project, host, agent-pick generation).
   useEffect(() => {
     if (projectParam === "" || configProjectId === null) return;
-    if (sandboxSelected || selectedHostId === null) return;
-    const seedKey = `${configProjectId}|${selectedHostId}|${agentPickGenerationRef.current}`;
+    // A sandbox has no concrete host; the project's legacy / master layers
+    // still seed its agent, model and effort (a hostless resolve).
+    const seedHostId = sandboxSelected ? null : selectedHostId;
+    if (seedHostId === null && !sandboxSelected) return;
+    const seedKey = `${configProjectId}|${seedHostId ?? "sandbox"}|${agentPickGenerationRef.current}`;
     if (callingSeedAppliedRef.current === seedKey) return;
     // Claim the key before the fetch: a failure leaves today's generic
     // defaults in place instead of retrying on every render.
     callingSeedAppliedRef.current = seedKey;
-    const seedHost = allHosts.find((host) => host.host_id === selectedHostId) ?? null;
-    const { enabled: carryEnabled, carry } = callingLastContext(configProjectId, selectedHostId);
+    const seedHost =
+      seedHostId === null ? null : (allHosts.find((host) => host.host_id === seedHostId) ?? null);
+    const { enabled: carryEnabled, carry } =
+      seedHostId === null
+        ? { enabled: false, carry: null }
+        : callingLastContext(configProjectId, seedHostId);
     // The picks the seed is computed from: an apply only overwrites a field
     // that still holds this value, so a pick made while the fetch was in
     // flight survives (the touched rules already ran inside the seed).
@@ -4958,8 +4965,13 @@ export function NewChatLandingScreen() {
     const seedFromEffort = pickedEffort;
     void resolveCallingSeed({
       projectId: configProjectId,
-      hostId: selectedHostId,
-      hostLabel: seedHost?.name ?? selectedHostId,
+      hostId: seedHostId,
+      hostLabel:
+        seedHostId === null
+          ? sandboxProvider !== null
+            ? sandboxOptionLabel(sandboxProvider)
+            : sandboxLabel
+          : (seedHost?.name ?? seedHostId),
       current: {
         agentId: effectiveAgentId,
         model: seedFromModel,
@@ -6123,10 +6135,16 @@ export function NewChatLandingScreen() {
                           )?.args ?? [])
                         : undefined,
             // Model + reasoning effort, persisted on the session row before
-            // the runner launches. An unselected ("") knob is omitted so the
-            // harness keeps its own configured/default value.
-            model_override: normalizedModelOverride ?? undefined,
-            reasoning_effort: normalizedReasoningEffort ?? undefined,
+            // the runner launches. An unselected ("") knob is normally omitted;
+            // on a project visit a knob the user touched and cleared must ride
+            // as an explicit null, or the server refills it from the project's
+            // defaults.
+            model_override:
+              normalizedModelOverride ??
+              (createProjectId !== null && modelTouchedRef.current ? null : undefined),
+            reasoning_effort:
+              normalizedReasoningEffort ??
+              (createProjectId !== null && effortTouchedRef.current ? null : undefined),
             ...(sdkHarness === "claude-sdk" ? { permission_mode: permissionMode } : {}),
             ...(sdkHarness === "codex" ? { approval_mode: approvalMode } : {}),
             cost_control_mode_override: costControlOverride,

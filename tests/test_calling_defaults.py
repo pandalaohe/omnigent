@@ -13,6 +13,7 @@ from omnigent.calling_defaults import (
     validate_project_calling_defaults,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 
 
@@ -464,7 +465,12 @@ async def test_load_master_reads_the_namespace_and_defaults_on_gaps(db_uri: str)
     store.patch_namespace("shape@example.com", "calling_defaults", "not-an-object")
     assert await load_master("shape@example.com", store) == {}
 
+    # The single-user server stores its preferences under the reserved
+    # "local" identity, so a None owner reads that master table.
+    local = {"host_1": {"codex-native": {"model": "gpt-6-local"}}}
+    store.patch_namespace(RESERVED_USER_LOCAL, "calling_defaults", local)
+    assert await load_master(None, store) == local
+
     assert await load_master("nobody@example.com", store) == {}
-    assert await load_master(None, store) == {}
     assert await load_master("alice@example.com", None) == {}
     assert await load_master("broken@example.com", _RaisingStore()) == {}

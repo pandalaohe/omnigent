@@ -877,6 +877,32 @@ async def test_projectless_fire_uses_the_master_native_layer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_single_user_fire_reads_the_local_master_table() -> None:
+    """F5: a task owned by None (single-user) still resolves the master table."""
+    conv_store = FakeConversationStore()
+    # The store serves the same table regardless of owner, so only the
+    # None → "local" mapping can explain the resolved model.
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    deps = _chain_deps(
+        store,
+        conv_store,
+        preferences_store=FakePreferencesStore(
+            {"host_1": {"claude-native": {"model": "master-local"}}}
+        ),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.updated[0]["model_override"] == "master-local"
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
 async def test_explicit_null_effort_skips_the_project_default() -> None:
     """Scenario 25: a stored explicit null beats the project, then spec applies."""
     conv_store = FakeConversationStore()

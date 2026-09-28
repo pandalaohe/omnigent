@@ -415,17 +415,28 @@ export function CreateScheduledTaskDialog({
         ? { projectId: effectiveProjectId === "" ? null : effectiveProjectId }
         : {};
       if (editingTask) {
-        // Thread model/effort ONLY when the agent supports them. Each control's
-        // "" (Default) maps to `null` so an update CLEARS a previously-set
-        // override; a non-default pick sends the value. When the agent has no
-        // model/effort surface we send neither key (left untouched server-side).
-        const overrides = showModelEffort
-          ? {
-              modelOverride: pickedModel === "" ? null : pickedModel,
-              reasoningEffort: pickedEffort === "" ? null : pickedEffort,
-              permissionMode: pickedPermission === "" ? null : pickedPermission,
-            }
-          : {};
+        // Thread model/effort ONLY when the agent supports them, and only the
+        // controls the user actually changed: a changed value sends the value,
+        // a cleared previously-set value sends `null` (back to "Default" =
+        // inherit the project / master defaults), an unchanged control is
+        // omitted so the stored override stays untouched. When the agent has
+        // no model/effort surface none of the keys are sent.
+        const overrides: {
+          modelOverride?: string | null;
+          reasoningEffort?: string | null;
+          permissionMode?: string | null;
+        } = {};
+        if (showModelEffort) {
+          if (pickedModel !== (editingTask.modelOverride ?? "")) {
+            overrides.modelOverride = pickedModel === "" ? null : pickedModel;
+          }
+          if (pickedEffort !== (editingTask.reasoningEffort ?? "")) {
+            overrides.reasoningEffort = pickedEffort === "" ? null : pickedEffort;
+          }
+          if (pickedPermission !== (editingTask.permissionMode ?? "")) {
+            overrides.permissionMode = pickedPermission === "" ? null : pickedPermission;
+          }
+        }
         await updateMutation.mutateAsync({
           id: editingTask.id,
           input: {

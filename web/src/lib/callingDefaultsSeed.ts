@@ -43,7 +43,8 @@ export interface CallingSeed {
 
 export interface CallingSeedInput {
   projectId: string;
-  hostId: string;
+  /** `null` on a hostless target (a managed sandbox): project layers only. */
+  hostId: string | null;
   hostLabel: string;
   current: CallingSeedCurrent;
   touched: CallingSeedTouched;
@@ -114,6 +115,9 @@ function effortNotice(oldValue: string, next: string | null, hostLabel: string):
  */
 export async function resolveCallingSeed(input: CallingSeedInput): Promise<CallingSeed> {
   const { projectId, hostId, hostLabel, current, touched } = input;
+  // A hostless target has no `calling_last` entry to prefer and no catalog to
+  // judge against; resolve alone seeds it.
+  const carry = hostId === null ? null : input.carry;
   const base = await resolveCallingDefaults({ projectId, hostId });
   const notices: string[] = [];
 
@@ -131,10 +135,10 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
     }
   } else if (
     input.carryEnabled &&
-    input.carry?.last_agent_id &&
-    input.isAgentUsable(input.carry.last_agent_id)
+    carry?.last_agent_id &&
+    input.isAgentUsable(carry.last_agent_id)
   ) {
-    agentId = input.carry.last_agent_id;
+    agentId = carry.last_agent_id;
   } else {
     agentId = base.agent_id;
   }
@@ -143,9 +147,11 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
   if (agentId !== null && agentId !== base.agent_id) {
     resolution = await resolveCallingDefaults({ projectId, hostId, agentId });
   }
+  // The switch gates carry-over; a remembered entry is only a preference while
+  // the toggle is on, even when it names the resolved default.
   const carriedEntry =
-    agentId !== null && input.carry?.last_agent_id === agentId
-      ? input.carry.agents[agentId]
+    input.carryEnabled && agentId !== null && carry?.last_agent_id === agentId
+      ? carry.agents[agentId]
       : undefined;
   const carryModel = carriedEntry?.model ?? null;
   const carryEffort = carriedEntry?.effort ?? null;
@@ -159,7 +165,10 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
       // The offered check is a courtesy; resolve alone still seeds.
       rows = [];
     }
-    catalog = rows.find((row) => row.host_id === hostId && row.harness === resolution.harness);
+    catalog =
+      hostId === null
+        ? undefined
+        : rows.find((row) => row.host_id === hostId && row.harness === resolution.harness);
   }
 
   let model: string | null;

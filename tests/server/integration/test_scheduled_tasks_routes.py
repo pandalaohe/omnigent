@@ -1941,19 +1941,21 @@ async def test_patch_sets_and_clears_the_project(
 async def test_create_and_patch_track_explicit_null_overrides(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """K7c: explicit nulls persist, a later value removes them, omissions keep them."""
+    """K7c: nulls are explicit at create only; a PATCH returns them to inheritance."""
     _make_user(db_uri)
     task_id = (
         await auth_client.post(
             "/v1/scheduled-tasks",
-            json=_create_body(reasoning_effort=None),
+            json=_create_body(reasoning_effort=None, model_override=None),
             headers=_headers(),
         )
     ).json()["id"]
     store = SqlAlchemyScheduledTaskStore(db_uri)
     stored = store.get(task_id)
-    assert stored is not None and stored.explicit_null_fields == ["reasoning_effort"]
+    assert stored is not None
+    assert stored.explicit_null_fields == ["model_override", "reasoning_effort"]
 
+    # A value stops that one field being an explicit null.
     valued = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
         json={"reasoning_effort": "high"},
@@ -1961,8 +1963,18 @@ async def test_create_and_patch_track_explicit_null_overrides(
     )
     assert valued.status_code == 200, valued.text
     stored = store.get(task_id)
-    assert stored is not None and stored.explicit_null_fields is None
+    assert stored is not None and stored.explicit_null_fields == ["model_override"]
 
+    # A PATCH that does not touch a field leaves its explicit-null state alone.
+    renamed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
+    )
+    assert renamed.status_code == 200, renamed.text
+    stored = store.get(task_id)
+    assert stored is not None and stored.explicit_null_fields == ["model_override"]
+
+    # PATCHing to null is the "Default" choice: the override clears and the
+    # field stops being an explicit null, so the fire inherits the chain again.
     nulled = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
         json={"reasoning_effort": None, "model_override": None},
@@ -1970,14 +1982,4 @@ async def test_create_and_patch_track_explicit_null_overrides(
     )
     assert nulled.status_code == 200, nulled.text
     stored = store.get(task_id)
-    assert stored is not None
-    assert stored.explicit_null_fields == ["model_override", "reasoning_effort"]
-
-    # A PATCH that does not touch the overrides leaves the list unchanged.
-    renamed = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
-    )
-    assert renamed.status_code == 200, renamed.text
-    stored = store.get(task_id)
-    assert stored is not None
-    assert stored.explicit_null_fields == ["model_override", "reasoning_effort"]
+    assert stored is not None and stored.explicit_null_fields is None

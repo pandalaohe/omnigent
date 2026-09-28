@@ -1355,6 +1355,18 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
   }
 
+  /** Open the gear and choose a control's "Default" row (a user clear). */
+  function clearFromGear(agentId: string, control: "model" | "effort"): void {
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    fireEvent.pointerDown(picker, { button: 0 });
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${control}-default`));
+    const menu = screen.queryByTestId(
+      control === "model" ? "new-chat-landing-agent-models" : "new-chat-landing-agent-efforts",
+    );
+    if (menu) fireEvent.keyDown(menu, { key: "Escape" });
+  }
+
   beforeEach(() => {
     setTwoHosts();
     setNativeAgents();
@@ -1560,6 +1572,112 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     expect(body.model_override).toBe("opus-5-5");
     // "minimal" is not on the Claude ladder, so the resolve effort wins.
     expect(body.reasoning_effort).toBe("xhigh");
+  });
+
+  it("ignores calling-last values while carry-over is OFF", async () => {
+    // The history is recorded regardless of the switch; with the switch off
+    // the resolve result must seed, even when the remembered agent IS the
+    // resolved default.
+    localStorage.setItem(
+      "omnigent:calling-last",
+      JSON.stringify({
+        enabled: false,
+        "p:proj_alpha": {
+          [HDS]: {
+            last_agent_id: AG_CODEX,
+            agents: {
+              [AG_CODEX]: {
+                harness: "codex-native",
+                model: "gpt-6-luna",
+                effort: "xhigh",
+                at: 1,
+              },
+            },
+          },
+        },
+      }),
+    );
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_CODEX);
+    expect(body.model_override).toBe("gpt-6-sol");
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("sends explicit nulls for a model and effort cleared on a project visit", async () => {
+    // Codex effort options derive from the model rows' supportedReasoningEfforts;
+    // give the seeded models one so the effort control has something to clear.
+    vi.mocked(useHostModelOptions).mockImplementation((_hostId, harness) =>
+      harness === "codex-native"
+        ? ({
+            data: [
+              { id: "gpt-6-sol", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+              { id: "gpt-6-luna", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+            ],
+          } as ReturnType<typeof useHostModelOptions>)
+        : ({ data: [] } as unknown as ReturnType<typeof useHostModelOptions>),
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+    // The seed pinned gpt-6-sol / high; the user clears both to Default. The
+    // dialog must send the values it shows, or the server refills the project
+    // defaults into the session.
+    clearFromGear(AG_CODEX, "effort");
+    clearFromGear(AG_CODEX, "model");
+
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBeNull();
+    expect(body.reasoning_effort).toBeNull();
+  });
+
+  it("seeds the project agent on a sandbox visit without a concrete host", async () => {
+    const AG_SANDBOX = "ag_sandbox_default";
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent({
+          id: AG_CODEX,
+          name: "codex-native-ui",
+          display_name: "Codex",
+          harness: "codex-native",
+        }),
+        agent({
+          id: AG_CLAUDE,
+          name: "claude-code-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+        }),
+        agent({
+          id: AG_SANDBOX,
+          name: "sandbox-default",
+          display_name: "Sandbox Default",
+          harness: "claude-native",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    setProjectConfig({ host_id: "__sandbox__", agent_id: AG_SANDBOX });
+    mockResolveFromConfig();
+    renderSandboxLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Sandbox Default/,
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_SANDBOX);
+    // The hostless resolve ran project-only; a sandbox create sends no host_id.
+    expect(vi.mocked(resolveCallingDefaults)).toHaveBeenCalledWith({
+      projectId: "proj_alpha",
+      hostId: null,
+    });
+    expect("host_id" in body).toBe(false);
+    expect(body.host_type).toBe("managed");
   });
 
   it("leaves a non-project visit on the remembered per-harness pick", async () => {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tarfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -862,6 +863,86 @@ async def test_child_takes_parent_project_host_default(
     assert body["model_override"] == "gpt-6-sol"
     assert body["reasoning_effort"] == "high"
     assert body["project_id"] == project_id
+
+
+async def test_sub_agent_child_keeps_an_unset_model(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """F2: a named sub-agent create never takes server-side default fill.
+
+    The runner deliberately omits the worker's model so the member's own spec
+    decides; filling it from the project would pin a model the worker's spec
+    left unset.
+    """
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+    )
+    parent = await calling_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"project_id": project_id})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(
+                    name="sub-agent-parent",
+                    sub_agents=[{"name": "impl"}],
+                    executor={"type": "omnigent", "config": {"harness": "codex"}},
+                ),
+                "application/gzip",
+            )
+        },
+        headers=_headers(),
+    )
+    assert parent.status_code == 201, parent.text
+    parent_session_id = parent.json()["session_id"]
+    parent_agent = await calling_client.get(
+        f"/v1/sessions/{parent_session_id}/agent", headers=_headers()
+    )
+    assert parent_agent.status_code == 200, parent_agent.text
+
+    child = await calling_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent_agent.json()["id"],
+            "parent_session_id": parent_session_id,
+            "sub_agent_name": "impl",
+            "host_id": HDS,
+            "workspace": "/work",
+        },
+        headers=_headers(),
+    )
+    assert child.status_code == 201, child.text
+    assert child.json()["model_override"] is None
+    assert child.json()["reasoning_effort"] is None
+
+
+async def test_routing_on_create_does_not_fill_default_model(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """F3a: a routing-on create owns model / effort; defaults must not pin them."""
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "host_id": HDS,
+            "workspace": "/work",
+            "cost_control_mode_override": "on",
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    # The agent still fills; a pinned model would silently disable the router.
+    assert body["agent_id"] == CODEX_AGENT_ID
+    assert body["model_override"] is None
+    assert body["reasoning_effort"] is None
 
 
 async def test_child_without_default_names_the_project_setting(

@@ -33,6 +33,7 @@ from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignme
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
     SqlAlchemyProjectHostBindingStore,
 )
@@ -45,6 +46,7 @@ from tests.server.helpers import build_agent_bundle
 pytestmark = [pytest.mark.asyncio]
 
 ALICE = "alice@example.com"
+BOB = "bob@example.com"
 AGENT_ID = "087b7cb7ac30abf4debfaa578d052ec6"
 
 
@@ -1124,6 +1126,74 @@ async def test_placement_refuses_library_default_agent(
     assert "ca_polly" in row.wait_reason
     assert "saved joint agent" in row.wait_reason
     assert "sys_assignment_dispatch cannot launch it" in row.wait_reason
+
+
+@pytest.mark.asyncio
+async def test_placement_refuses_another_users_session_scoped_default_agent(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A default-sourced agent must pass the session-agent authorization."""
+    stores = _stores(db_uri)
+    host_id = _uid("host-scoped-default")
+    project_id = _uid("scoped-default-proj")
+    scoped_agent_id = _uid("bob-scoped-agent")
+    _make_project(stores["project"], project_id, owner=ALICE, enabled=True)
+    repo = _make_repo(stores["repository"], project_id, "root")
+    _make_binding(
+        stores["binding"],
+        project_id=project_id,
+        host_id=host_id,
+        repo_id=repo.id,
+        workspace="/work/scoped-default",
+    )
+    # BOB's private session-scoped agent, created atomically with his session.
+    stores["conversation"].create_session_with_agent(
+        agent_id=scoped_agent_id,
+        agent_name="bob-private",
+        agent_bundle_location=f"{scoped_agent_id}/bundle",
+        agent_description=None,
+        created_by=BOB,
+    )
+    stores["project"].update(
+        project_id,
+        user_id=ALICE,
+        config={"calling_defaults": {host_id: {"agent_id": scoped_agent_id}}},
+    )
+    assignment = _seed_waiting(
+        stores["assignment"],
+        "scoped-default",
+        project_id=project_id,
+        owner=ALICE,
+        requested_host_id=host_id,
+        inputs=[_input("root", revision=repo.revision)],
+        target_agent_id=None,
+    )
+    monkeypatch.setattr(
+        assignments_mod,
+        "prepare_assignment_on_host",
+        _prepare_ok({"root": "/prepared/scoped-default"}),
+    )
+    _install_placement_fakes(monkeypatch)
+    agent_store, agent_cache = _agent_stores(db_uri, tmp_path)
+    coordinator = _coordinator(
+        stores,
+        registry=FakeHostRegistry({host_id: _conn(host_id, owner=ALICE, assignments=True)}),
+        host_store=FakeHostStore([_FakeHost(host_id, ALICE)]),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        agent_store=agent_store,
+        agent_cache=agent_cache,
+    )
+    coordinator.trigger(assignment.id)
+    await coordinator.wait_for_idle()
+    await coordinator.shutdown()
+
+    row = stores["assignment"].get(assignment.id)
+    assert row is not None and row.state == "waiting", row
+    assert row.active_attempt_id is None
+    assert row.wait_reason is not None and "Conversation not found" in row.wait_reason
+    # BOB's session is the only conversation: no placement row was created.
+    conversations = stores["conversation"].list_conversations().data
+    assert len(conversations) == 1 and conversations[0].agent_id == scoped_agent_id
 
 
 # ── 3. scenario 3: offline past deadline ──────────────────────────────────

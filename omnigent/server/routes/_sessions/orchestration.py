@@ -10030,7 +10030,10 @@ async def _create_session_from_existing_agent(
         host_store=getattr(request.app.state, "host_store", None),
         fill_host=True,
         request=request,
-        apply_calling_defaults=True,
+        # A named sub-agent child carries the parent bundle's agent and gets its
+        # model / effort from the runner's own member resolution; filling them
+        # here would pin a model the worker's spec deliberately left unset.
+        apply_calling_defaults=body.sub_agent_name is None,
         parent_project=parent_project,
         parent_host_id=parent_host_id,
         calling_path_label=calling_path_label,

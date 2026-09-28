@@ -45,7 +45,8 @@ export interface CallingDefaultsSyncOptions {
 
 export interface CallingDefaultsResolveOptions {
   projectId?: string;
-  hostId?: string;
+  /** Omitted / `null` resolves the project's host-independent layers only. */
+  hostId?: string | null;
   agentId?: string;
   harness?: string;
 }

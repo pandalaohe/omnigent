@@ -515,11 +515,11 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input.agentId).toBe("ag_claude_native");
-    // The target harness carries model/effort/permission controls, so the PATCH
-    // states them explicitly — at Default, i.e. cleared.
-    expect(input.modelOverride).toBeNull();
-    expect(input.reasoningEffort).toBeNull();
-    expect(input.permissionMode).toBeNull();
+    // The task had no overrides (all at Default) and the user changed none, so
+    // the PATCH omits them; the server clears stale settings on the rebind.
+    expect(input).not.toHaveProperty("modelOverride");
+    expect(input).not.toHaveProperty("reasoningEffort");
+    expect(input).not.toHaveProperty("permissionMode");
   });
 
   it("round-trips non-quarter-hour edit times through the update payload", async () => {
@@ -552,6 +552,8 @@ describe("CreateScheduledTaskDialog edit mode", () => {
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync).not.toHaveBeenCalled();
+    // Untouched override controls are omitted, not resent as nulls: the
+    // stored values (here: none) stay whatever the task carries.
     expect(updateMutateAsync.mock.calls[0][0]).toEqual({
       id: "st_1",
       input: {
@@ -559,9 +561,6 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         prompt: "Updated prompt",
         rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=30",
         timezone: "America/Los_Angeles",
-        modelOverride: null,
-        reasoningEffort: null,
-        permissionMode: null,
       },
     });
   });
@@ -588,9 +587,10 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input).not.toHaveProperty("agentId");
-    expect(input.modelOverride).toBe("opus");
-    expect(input.reasoningEffort).toBe("high");
-    expect(input.permissionMode).toBe("acceptEdits");
+    // Unchanged controls are omitted, so the stored settings survive the PATCH.
+    expect(input).not.toHaveProperty("modelOverride");
+    expect(input).not.toHaveProperty("reasoningEffort");
+    expect(input).not.toHaveProperty("permissionMode");
   });
 
   it("keeps the task's settings when the current agent is re-picked", async () => {
@@ -610,7 +610,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input).not.toHaveProperty("agentId");
-    expect(input.permissionMode).toBe("bypassPermissions");
+    expect(input).not.toHaveProperty("permissionMode");
   });
 
   it("blocks update when the existing RRULE cannot be represented by the form", () => {
@@ -1335,7 +1335,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     });
   });
 
-  it("sends Claude SDK model, effort, and permission on update", async () => {
+  it("sends changed Claude SDK model, effort, and permission on update", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -1349,12 +1349,19 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       />,
     );
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
+    // Pick a different value in each control: the PATCH states exactly those.
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Sonnet" }));
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Medium" }));
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Plan" }));
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-      modelOverride: "opus",
-      reasoningEffort: "high",
-      permissionMode: "bypassPermissions",
+      modelOverride: "sonnet",
+      reasoningEffort: "medium",
+      permissionMode: "plan",
     });
   });
 
@@ -1389,7 +1396,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
   });
 
-  it("threads model + effort + permission through update on edit, nulling a cleared override", async () => {
+  it("sends only the changed overrides on update, nulling a cleared one", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -1402,17 +1409,21 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         })}
       />,
     );
-    // Reset the model back to Default; leave effort + permission untouched.
+    // Reset the model back to Default (a cleared previously-set override) and
+    // change the effort (a new value); leave permission untouched.
     fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Medium" }));
 
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
-    // Cleared model → null; untouched effort + permission → the prefilled values.
+    // Cleared model → null (back to inherit); changed effort → the value;
+    // untouched permission → omitted so the stored mode survives.
     expect(input.modelOverride).toBeNull();
-    expect(input.reasoningEffort).toBe("high");
-    expect(input.permissionMode).toBe("plan");
+    expect(input.reasoningEffort).toBe("medium");
+    expect(input).not.toHaveProperty("permissionMode");
   });
 });
 
