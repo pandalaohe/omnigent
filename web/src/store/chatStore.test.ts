@@ -33,6 +33,7 @@ import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+import { readCallingLast } from "@/lib/callingDefaults";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import {
@@ -10577,6 +10578,59 @@ describe("chatStore — session configuration scope", () => {
 
     expect(patchCallsFor("conv_codex_supported")).toEqual([{ reasoning_effort: "high" }]);
     expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+  });
+
+  it("records an accepted effort change in calling_last for a project session (scenario 19)", async () => {
+    seedSession("conv_carry", []);
+    withSnapshot("conv_carry", { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+    await useChatStore.getState().switchTo("conv_carry");
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.split("?")[0] === "/v1/sessions/conv_carry" && init?.method === "PATCH") {
+        return mockResponse({
+          id: "conv_carry",
+          agent_id: "ag_carry",
+          host_id: "host_carry",
+          project_id: "proj_carry",
+          harness: "claude-native",
+          model_override: "opus",
+          reasoning_effort: "max",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: {},
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().setEffort("max");
+
+    expect(readCallingLast().projects["p:proj_carry"]?.host_carry?.agents.ag_carry).toMatchObject({
+      harness: "claude-native",
+      model: "opus",
+      effort: "max",
+    });
+  });
+
+  it("writes nothing to calling_last when the effort PATCH fails", async () => {
+    seedSession("conv_carry_fail", []);
+    withSnapshot("conv_carry_fail", { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+    await useChatStore.getState().switchTo("conv_carry_fail");
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.split("?")[0] === "/v1/sessions/conv_carry_fail" && init?.method === "PATCH") {
+        return mockResponse(
+          { error: { code: "invalid_input", message: "no" } },
+          { ok: false, status: 400 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(useChatStore.getState().setEffort("max")).rejects.toThrow();
+
+    expect(readCallingLast().projects["p:proj_carry_fail"]).toBeUndefined();
   });
 
   it.each(["claude-sdk", "codex"])("PATCHes effort on an active %s session", async (harness) => {

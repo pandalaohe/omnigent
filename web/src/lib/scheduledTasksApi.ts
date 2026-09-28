@@ -55,6 +55,12 @@ export interface ScheduledTask {
   workspace: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
   hostId: string | null;
+  /**
+   * Project whose calling defaults apply at fire time, or `null` for the
+   * master table only. Pre-filled from the creating session when there is one.
+   * Optional on the wire: older recorded fixtures omit it.
+   */
+  projectId?: string | null;
   /** Where firings run — a connected host, or a fresh managed sandbox per fire. */
   executionTarget: ScheduledTaskExecutionTarget;
   state: ScheduledTaskState;
@@ -105,6 +111,8 @@ export interface CreateScheduledTaskInput {
   workspace?: string | null;
   /** Optional pinned host. */
   hostId?: string | null;
+  /** Optional project whose calling defaults apply at fire time. */
+  projectId?: string | null;
   /**
    * Where firings run. Omit (or `connected_host`) for the connected-host
    * behavior; `managed_sandbox` provisions a fresh sandbox each fire and must
@@ -135,6 +143,8 @@ export interface UpdateScheduledTaskInput {
   permissionMode?: string | null;
   workspace?: string;
   hostId?: string;
+  /** Rebind the task's project; `null` clears it (master layers only). */
+  projectId?: string | null;
   /**
    * Switch where firings run. `managed_sandbox` clears any pinned host; do not
    * also set `hostId` / `workspace` in the same update.
@@ -159,6 +169,7 @@ interface ScheduledTaskWire {
   permission_mode: string | null;
   workspace: string | null;
   host_id: string | null;
+  project_id?: string | null;
   execution_target: ScheduledTaskExecutionTarget;
   state: ScheduledTaskState;
   last_run_at: number | null;
@@ -235,6 +246,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     permissionMode: wire.permission_mode,
     workspace: wire.workspace,
     hostId: wire.host_id,
+    projectId: wire.project_id ?? null,
     executionTarget: wire.execution_target,
     state: wire.state,
     lastRunAt: wire.last_run_at,
@@ -296,6 +308,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
+  if (input.projectId != null) body.project_id = input.projectId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   const res = await authenticatedFetch("/v1/scheduled-tasks", {
     method: "POST",
@@ -325,6 +338,7 @@ export async function updateScheduledTask(
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
+  if (input.projectId !== undefined) body.project_id = input.projectId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.state !== undefined) body.state = input.state;
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {

@@ -12,6 +12,7 @@
 
 import { useMemo, useState } from "react";
 import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
+import { useSearchParams } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -42,6 +43,10 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 ];
 
 export function TasksPage() {
+  const [searchParams] = useSearchParams();
+  // A `?project=` context (the same param the project pencil / composer use)
+  // pre-fills the create dialog's Project select.
+  const currentProjectName = searchParams.get("project");
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
@@ -270,6 +275,7 @@ export function TasksPage() {
         initialName={prefill?.name}
         initialPrompt={prefill?.prompt}
         editingTask={editingTask}
+        currentProjectName={currentProjectName}
       />
     </PageScroll>
   );

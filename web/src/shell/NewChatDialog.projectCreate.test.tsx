@@ -35,6 +35,20 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ToastModule from "@/components/ui/toast";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
+import type * as CallingDefaultsApiModule from "@/lib/callingDefaultsApi";
+
+// The server-side calling-defaults resolve; the default implementation mirrors
+// the project config so these create-shape cases keep their seeded agent.
+vi.mock("@/lib/callingDefaultsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CallingDefaultsApiModule>()),
+  resolveCallingDefaults: vi.fn(),
+  listCallingDefaultCatalogs: vi.fn(),
+}));
+import {
+  listCallingDefaultCatalogs,
+  resolveCallingDefaults,
+  type CallingDefaultsResolution,
+} from "@/lib/callingDefaultsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -206,9 +220,10 @@ function rootsForConfig(config: ProjectConfig | undefined): ProjectHostRoots {
   const hostId = config?.host_id;
   const configHostId = hostId && hostId !== "__sandbox__" ? hostId : null;
   return {
-    roots: configHostId && config?.workspace
-      ? [{ host_id: configHostId, workspace: config.workspace, source: "config" }]
-      : [],
+    roots:
+      configHostId && config?.workspace
+        ? [{ host_id: configHostId, workspace: config.workspace, source: "config" }]
+        : [],
     default_host_id: configHostId,
     default_host_reason: configHostId ? "config" : "none",
   };
@@ -219,6 +234,35 @@ function setProjects(
   isLoading = false,
 ): void {
   vi.mocked(useProjects).mockReturnValue({ data, isLoading } as ReturnType<typeof useProjects>);
+}
+
+function resolution(overrides: Partial<CallingDefaultsResolution> = {}): CallingDefaultsResolution {
+  return {
+    agent_id: null,
+    harness: null,
+    model: null,
+    effort: null,
+    sources: {},
+    problems: [],
+    ...overrides,
+  };
+}
+
+function mockResolveFromConfig(): void {
+  vi.mocked(resolveCallingDefaults).mockImplementation(async (options = {}) => {
+    const config = options.projectId
+      ? vi.mocked(useProjectConfig)(options.projectId).data
+      : undefined;
+    const agentId = options.agentId ?? config?.agent_id ?? null;
+    const row = agentId
+      ? (vi.mocked(useAvailableAgents)().data ?? []).find((candidate) => candidate.id === agentId)
+      : undefined;
+    return resolution({
+      agent_id: agentId,
+      harness: row?.harness ?? null,
+      model: config?.model ?? null,
+    });
+  });
 }
 
 /** Serve a git repo (has an is_main worktree) at REPO; [] elsewhere. */
@@ -333,6 +377,8 @@ beforeEach(() => {
   setRepoIsGit();
   setProjects([{ id: "proj_alpha", name: "Alpha" }]);
   setProjectConfig({});
+  vi.mocked(listCallingDefaultCatalogs).mockResolvedValue([]);
+  mockResolveFromConfig();
   vi.mocked(useProjectHostRoots).mockImplementation((id) => {
     const config = id === null ? undefined : vi.mocked(useProjectConfig)(id).data;
     return {
@@ -349,7 +395,7 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen project-aware create (first-class project_id)", () => {
-  it("sends project_id and omits config-seeded agent_id + workspace when nothing was overridden", async () => {
+  it("sends project_id and the resolved agent while omitting the config workspace", async () => {
     setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
     renderLanding();
     await waitFor(() =>
@@ -358,9 +404,9 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
 
     const body = await submitAndReadBody();
     expect(body.project_id).toBe("proj_alpha");
-    // Config-seeded and untouched: the server default-fills these from the
-    // project config, so the request omits them entirely.
-    expect("agent_id" in body).toBe(false);
+    // The dialog sends the agent it shows; the untouched workspace seed is
+    // omitted for server default-fill.
+    expect(body.agent_id).toBe("ag_other");
     expect("workspace" in body).toBe(false);
     // The host is not part of the omission contract — still sent explicitly.
     expect(body.host_id).toBe("host_1");
@@ -469,8 +515,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     const body = await submitAndReadBody();
     expect(body.project_id).toBe("proj_alpha");
     expect(body.workspace).toBe(REPO);
-    // The agent was never touched — still omitted.
-    expect("agent_id" in body).toBe(false);
+    // The agent was never touched — the resolved value still rides.
+    expect(body.agent_id).toBe("ag_other");
   });
 
   it("sends workspace when the user explicitly selects a recent path", async () => {
@@ -486,7 +532,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     const body = await submitAndReadBody();
     expect(body.project_id).toBe("proj_alpha");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
-    expect("agent_id" in body).toBe(false);
+    expect(body.agent_id).toBe("ag_other");
   });
 
   it("sends workspace when the user explicitly selects an existing worktree", async () => {
@@ -525,7 +571,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     const body = await submitAndReadBody();
     expect(body.project_id).toBe("proj_alpha");
     expect(body.workspace).toBe(EXISTING_WORKTREE);
-    expect("agent_id" in body).toBe(false);
+    expect(body.agent_id).toBe("ag_other");
   });
 
   it("pins workspace and git to explicit null on a sandbox create under a project", async () => {
@@ -548,8 +594,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("git" in body).toBe(true);
     expect(body.git).toBeNull();
     expect("host_id" in body).toBe(false);
-    // The untouched config agent is still omitted for default-fill.
-    expect("agent_id" in body).toBe(false);
+    // The resolved agent is still what the dialog shows and sends.
+    expect(body.agent_id).toBe("ag_other");
   });
 
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
@@ -646,8 +692,7 @@ const NO_WORKTREES: HostWorktree[] = [];
 /** Serve the checkout's worktrees for either of its directories; [] elsewhere. */
 function setCheckoutWorktrees(): void {
   vi.mocked(useHostWorktrees).mockImplementation((hostId, path) => {
-    const known =
-      hostId === "host_1" && (path === ENTRY_CHECKOUT || path === CHECKOUT_WORKTREE);
+    const known = hostId === "host_1" && (path === ENTRY_CHECKOUT || path === CHECKOUT_WORKTREE);
     return {
       data: known ? CHECKOUT_WORKTREES : NO_WORKTREES,
       isError: false,

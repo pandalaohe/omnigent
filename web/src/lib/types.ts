@@ -285,6 +285,13 @@ export interface Session {
    * older recorded fixtures may omit it (treated as `null`).
    */
   hostId?: string | null;
+  /**
+   * First-class project this session is filed under (``ProjectSummary.id``),
+   * or ``null`` when unfiled. Distinct from the legacy ``omni_project``
+   * label. Optional like the other snapshot-derived fields: older recorded
+   * fixtures may omit it (treated as `null`).
+   */
+  projectId?: string | null;
   /** Current host reachability; absent when the snapshot omits liveness. */
   hostOnline?: boolean;
   /**

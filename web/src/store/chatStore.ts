@@ -77,6 +77,7 @@ import {
   updateSession,
 } from "@/lib/sessionsApi";
 import { isStaleCursorError } from "@/lib/staleCursor";
+import { recordCallingLast } from "@/lib/callingDefaults";
 import type {
   McpServerStartup,
   SessionInputConsumedEvent,
@@ -1774,6 +1775,24 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   return prompt;
 }
 
+/**
+ * Remember one accepted in-session model / effort change for carry-over (K3).
+ *
+ * Web-only and project-scoped: only a session filed under a first-class
+ * project with a host can key the memory, and only a server-confirmed change
+ * reaches here. The values are the PATCH response's canonical ones, so a
+ * rejected alias never lands in the memory.
+ */
+function recordSessionCallingLast(session: Session): void {
+  const { projectId, hostId, agentId, harness } = session;
+  if (projectId == null || hostId == null || !agentId || !harness) return;
+  recordCallingLast(projectId, hostId, agentId, {
+    harness,
+    model: session.modelOverride ?? null,
+    effort: session.reasoningEffort ?? null,
+  });
+}
+
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
@@ -2903,7 +2922,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         setterFor(conversationId)({ sessionReasoningEffort: null });
         return;
       }
-      await updateSession(conversationId, { reasoningEffort: effort });
+      const updated = await updateSession(conversationId, { reasoningEffort: effort });
+      recordSessionCallingLast(updated);
     }
   },
 
@@ -2948,6 +2968,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // The override belongs to the session that was PATCHed, so apply it there
       // even if the user has since switched away.
       setterFor(conversationId)({ sessionModelOverride: canonical });
+      // Carry-over memory (K3): an accepted model change records the
+      // session's canonical triple; a failed PATCH never reaches here.
+      recordSessionCallingLast(session);
     }
   },
 

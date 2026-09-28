@@ -125,6 +125,11 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  /**
+   * First-class project this session is filed under, or ``null`` when
+   * unfiled. Distinct from the legacy ``omni_project`` label in `labels`.
+   */
+  project_id?: string | null;
   runner_online?: boolean | null;
   host_online?: boolean | null;
   /**
@@ -342,6 +347,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     runnerId: wire.runner_id,
     runnerOnline: wire.runner_online ?? undefined,
     hostId: wire.host_id ?? null,
+    projectId: wire.project_id ?? null,
     hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,

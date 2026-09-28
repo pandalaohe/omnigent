@@ -4,47 +4,37 @@ import type { ProjectHostRoots } from "@/lib/projectsApi";
 
 type ProjectPrefillPhase = "location" | "settled";
 
-/** Project config supplies agent and sandbox hints; host roots supply real-host placement. */
+/** Project config supplies placement hints; host roots supply real-host placement. */
 export interface ProjectPrefillConfig {
   hostId?: string;
   workspace?: string;
-  agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
   useWorktree?: boolean;
-  /** Default model for the configured agent's harness. Not seeded by this
-   *  machine — the composer's harness-seed effect consumes it directly (it owns
-   *  the model slot and would otherwise clobber a machine write). */
-  model?: string;
 }
 
 export interface ProjectPrefillState {
   /** Project this machine is seeding for; "" = plain visit (starts done). */
   project: string;
-  /** Location track: seed host/workspace from roots, then settle. */
+  /** Location track: seed host/workspace from roots, then settle. The agent /
+   *  model / effort seeds come from the server calling-defaults chain once the
+   *  host is known (see `callingDefaultsSeed`), not from this machine. */
   phase: ProjectPrefillPhase;
-  /** Agent track, independent so a slow agents fetch can't hold up the
-   *  location seeding (or the generic defaults gated on "settled"). */
-  agentSeeded: boolean;
 }
 
 export function initialPrefillState(project: string): ProjectPrefillState {
-  const plain = project === "";
   return {
     project,
-    phase: plain ? "settled" : "location",
-    agentSeeded: plain,
+    phase: project === "" ? "settled" : "location",
   };
 }
 
-/** True once both tracks are done and stepping is a no-op. */
+/** True once the location track is done and stepping is a no-op. */
 export function prefillDone(state: ProjectPrefillState): boolean {
-  return state.phase === "settled" && state.agentSeeded;
+  return state.phase === "settled";
 }
 
 interface ProjectPrefillInputs {
   hosts: Host[] | undefined;
-  /** Pickable agents; undefined = still loading. */
-  agents: { id: string }[] | undefined;
   sandboxSelected: boolean;
   /** Whether the server offers managed sandbox hosts. Gates seeding a stored
    *  sandbox default — an OSS server that no longer offers it drops the hint. */
@@ -52,9 +42,6 @@ interface ProjectPrefillInputs {
   /** Live host pick; a mid-flight manual switch aborts the default host seeding
    *  so a stored host can't clobber the user's own choice. */
   selectedHostId: string | null;
-  /** Last-used agent id from localStorage (readLastAgentId()) — the generic
-   *  agent fallback when the config sets none. */
-  lastAgentId: string | null;
   /** undefined waits for the config query; {} has no config hints. */
   config: ProjectPrefillConfig | undefined;
   /** undefined waits for a first-class project's roots; null is a label-only folder. */
@@ -63,7 +50,6 @@ interface ProjectPrefillInputs {
 
 interface ProjectPrefillWrites {
   hostId?: string;
-  agentId?: string;
   workspace?: string;
   /** Select the managed sandbox as the target (config.hostId was the sandbox
    *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
@@ -73,47 +59,18 @@ interface ProjectPrefillWrites {
 /**
  * One transition. null = keep waiting for data; otherwise the next state
  * plus slot writes to apply (fill-empty-only; the component enforces that).
- * The agent seed and the location phase advance independently, mirroring
- * the data they wait on: agents can lag the host list.
  */
 export function projectPrefillStep(
   state: ProjectPrefillState,
   inputs: ProjectPrefillInputs,
 ): { state: ProjectPrefillState; writes: ProjectPrefillWrites } | null {
   const writes: ProjectPrefillWrites = {};
-  let next = state;
 
   // Wait for config before the location track can choose the sandbox branch.
   if (inputs.config === undefined) return null;
 
-  if (!state.agentSeeded) {
-    const { agents, lastAgentId, config } = inputs;
-    // A blank/whitespace-only stored id is "not configured", not a real agent
-    // — fall through to the generic default instead of seeding a value the
-    // composer could only surface as "agent unavailable".
-    if (config?.agentId != null && config.agentId.trim() !== "") {
-      // A configured agent seeds verbatim, without waiting for (or checking)
-      // the picker list — the create API accepts session-scoped agents the
-      // caller can read, so absence from the list doesn't mean unusable.
-      // Never substitute the last-used agent for a configured one; if the id
-      // truly can't be resolved the composer surfaces an explicit
-      // "configured agent unavailable" state instead.
-      next = { ...next, agentSeeded: true };
-      writes.agentId = config.agentId;
-    } else if (agents !== undefined) {
-      // No configured agent: need the pickable agents to judge whether the
-      // last-used agent is still selectable; wait for them.
-      next = { ...next, agentSeeded: true };
-      if (lastAgentId && agents.some((a) => a.id === lastAgentId)) {
-        writes.agentId = lastAgentId;
-      }
-    }
-  }
-
-  const location = locationStep(next, inputs, writes);
-  if (location !== null) next = location;
-
-  if (next === state) return null; // both tracks waiting on data
+  const next = locationStep(state, inputs, writes);
+  if (next === null) return null;
   return { state: next, writes };
 }
 

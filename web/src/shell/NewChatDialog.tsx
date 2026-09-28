@@ -179,6 +179,9 @@ import {
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
+import { callingLastContext, resolveCallingSeed } from "@/lib/callingDefaultsSeed";
+import { recordCallingLast } from "@/lib/callingDefaults";
+import type { CallingDefaultsProblem } from "@/lib/callingDefaultsApi";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
@@ -2266,10 +2269,15 @@ interface LandingDraft {
   pickedModel: string;
   pickedEffort: string;
   costControlMode: CostControlMode;
-  // Whether the agent / workspace slots still hold an untouched project-config
-  // seed (drives the create's field omission). Parked so a same-project detour
+  // Whether the agent / model / effort picker was touched this visit. Parked
+  // so a same-project detour keeps a user pick authoritative over the
+  // calling-defaults seed (D28).
+  agentTouched: boolean;
+  modelTouched: boolean;
+  effortTouched: boolean;
+  // Whether the workspace slot still holds an untouched project-config seed
+  // (drives the create's field omission). Parked so a same-project detour
   // neither turns an untouched seed into an "explicit" value nor the reverse.
-  agentFromConfig: boolean;
   workspaceFromConfig: boolean;
 }
 
@@ -2325,11 +2333,12 @@ export function NewChatLandingScreen() {
     () => readNewChatPickerOptionsCache(pickerCacheKey),
     [pickerCacheKey],
   );
-  // Project config supplies agent/worktree hints; host roots supply placement.
+  // Project config supplies placement (host / workspace / worktree) hints;
+  // host roots supply real-host placement. The agent / model / effort come
+  // from the server calling-defaults chain once the host is known.
   // `?project=` carries the project NAME, so resolve it to the first-class id
   // the config endpoint needs; a label-only folder (id null) or plain visit
-  // has no config to read. Resolved before the agent catalog below so the
-  // configured agent can be pinned into discovery.
+  // has no config to read.
   const { data: projectList, isLoading: projectListLoading } = useProjects();
   const configProjectId = useMemo(
     () =>
@@ -2360,9 +2369,7 @@ export function NewChatLandingScreen() {
     return {
       hostId: c.host_id,
       workspace: c.workspace,
-      agentId: c.agent_id,
       useWorktree: c.use_worktree,
-      model: c.model,
     };
   }, [
     projectParam,
@@ -2372,7 +2379,10 @@ export function NewChatLandingScreen() {
     storedProjectConfig,
   ]);
 
-  // Preserve a configured agent through name deduplication when it is in the
+  // Agent the calling-defaults seed resolved for this project visit; pinned
+  // into discovery so a per-host default outside the first page stays pickable.
+  const [callingSeedAgentId, setCallingSeedAgentId] = useState<string | null>(null);
+  // Preserve a seeded agent through name deduplication when it is in the
   // catalog or first 30 Mine sessions. Templates render while Mine is loading.
   const {
     data: agents,
@@ -2380,7 +2390,7 @@ export function NewChatLandingScreen() {
     isError: agentsError,
     isPlaceholderData: agentsArePlaceholder,
   } = useAvailableAgents({
-    pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
+    pinnedAgentIds: callingSeedAgentId != null ? [callingSeedAgentId] : [],
   });
   // The fork's managed agent library: server-side custom agents that are not
   // in the session-derived catalog. Merged into the picker below.
@@ -2417,13 +2427,13 @@ export function NewChatLandingScreen() {
       selectableSessionAgents([
         // A session-derived row for an agent that came from a library template
         // is a duplicate of the catalog entry below, so it is dropped — unless
-        // the project pinned that exact id, which must stay selectable.
+        // the seed pinned that exact id, which must stay selectable.
         ...((agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? []).filter(
-          (agent) => !agent.templateId || agent.id === prefillConfig?.agentId,
+          (agent) => !agent.templateId || agent.id === callingSeedAgentId,
         ),
         ...(customCatalog.data ?? []).map(customAgentForPicker),
       ]),
-    [agents, agentsLoading, cachedPickerOptions, customCatalog.data, prefillConfig?.agentId],
+    [agents, agentsLoading, cachedPickerOptions, customCatalog.data, callingSeedAgentId],
   );
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
@@ -2491,7 +2501,18 @@ export function NewChatLandingScreen() {
           // the other visit's workspace — drop the marker with it so the
           // seed/retract machinery starts clean for this visit.
           autoSeededBranch: "",
+          // Slots parked under another project's visit are dropped with their
+          // touched flags, so this project's calling defaults seed cleanly.
+          agentTouched: false,
+          modelTouched: false,
+          effortTouched: false,
         };
+
+  // Touched pickers for the calling-defaults seed; a same-project remount
+  // restores them with the drafted picks.
+  const agentTouchedRef = useRef(restoredDraft?.agentTouched ?? false);
+  const modelTouchedRef = useRef(restoredDraft?.modelTouched ?? false);
+  const effortTouchedRef = useRef(restoredDraft?.effortTouched ?? false);
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2749,9 +2770,8 @@ export function NewChatLandingScreen() {
   const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
   // Source tracking for the create's field-omission contract: true while the
-  // slot holds an untouched agent config or project root seed. Any user pick,
-  // including an identical value, clears the corresponding ref and is sent.
-  const agentFromConfigRef = useRef<boolean>(restoredDraft?.agentFromConfig ?? false);
+  // workspace slot holds an untouched project root seed. Any user pick,
+  // including an identical value, clears the ref and is sent.
   const workspaceFromConfigRef = useRef<boolean>(restoredDraft?.workspaceFromConfig ?? false);
   const [branchName, setBranchName] = useState<string>(() => restoredDraft?.branchName ?? "");
   // Branch the worktree-default effect auto-seeded (empty = none), so it can
@@ -2908,7 +2928,9 @@ export function NewChatLandingScreen() {
     pickedModel,
     pickedEffort,
     costControlMode,
-    agentFromConfig: agentFromConfigRef.current,
+    agentTouched: agentTouchedRef.current,
+    modelTouched: modelTouchedRef.current,
+    effortTouched: effortTouchedRef.current,
     workspaceFromConfig: workspaceFromConfigRef.current,
   };
   useEffect(() => {
@@ -2986,16 +3008,20 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // State machine driving the project prefill: a location seed from host roots
-  // plus an independent agent seed. The generic
-  // host/workspace defaults below hold off until it settles so they can't win
-  // the race against the project's placement.
+  // State machine driving the project prefill: a location seed from host
+  // roots. The generic host/workspace defaults below hold off until it
+  // settles so they can't win the race against the project's placement.
   const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
     initialPrefillState(projectParam),
   );
-  // The generic defaults gate on the location track only — the agent seed
-  // waits on its own fetch and must not hold up the host/workspace fill.
   const prefillSettled = prefill.phase === "settled";
+  // Calling-defaults seed (K8): the agent / model / effort for a project visit
+  // resolve from the server chain once the host is known. Touched flags are
+  // per visit; the applied key is (project, host, agent-pick generation).
+  const [callingSeedNotices, setCallingSeedNotices] = useState<string[]>([]);
+  const [callingSeedProblems, setCallingSeedProblems] = useState<CallingDefaultsProblem[]>([]);
+  const callingSeedAppliedRef = useRef<string | null>(null);
+  const agentPickGenerationRef = useRef(0);
   // Host whose workspace was already seeded once, so a host re-pick doesn't
   // clobber the field (used by the per-host seeding effect below).
   const seededHostRef = useRef<string | null>(null);
@@ -3039,12 +3065,23 @@ export function NewChatLandingScreen() {
     // would clone the previous project's repo into this project's sandbox.
     setSandboxRepoSelections([]);
     setPendingRepoUrl("");
-    agentFromConfigRef.current = false;
     workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     setPickerEdits(null);
     seededConfigSigRef.current = prefillConfigSig;
+    callingSeedAppliedRef.current = null;
+    agentPickGenerationRef.current = 0;
+    agentTouchedRef.current = false;
+    // A settings edit re-seeds the agent and placed defaults but keeps this
+    // visit's model / effort picks, matching the pre-resolve behavior.
+    if (projectChanged) {
+      modelTouchedRef.current = false;
+      effortTouchedRef.current = false;
+    }
+    setCallingSeedNotices([]);
+    setCallingSeedProblems([]);
+    setCallingSeedAgentId(null);
     setPrefill(initialPrefillState(projectParam));
   }, [projectParam, prefill.project, prefillConfigSig]);
 
@@ -3299,14 +3336,15 @@ export function NewChatLandingScreen() {
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
   const pendingAgentAllowedOnTarget = !sandboxSelected;
-  // A configured agent absent from templates and the first 30 Mine sessions
-  // stays unavailable until the user explicitly chooses another agent.
+  // A seeded agent absent from templates and the first 30 Mine sessions stays
+  // unavailable until the user explicitly chooses another agent (the pin above
+  // gives discovery a chance to resolve it first).
   const configuredAgentUnavailable =
     projectParam !== "" &&
-    prefillConfig?.agentId != null &&
+    callingSeedAgentId != null &&
     agents !== undefined &&
     !agentsArePlaceholder &&
-    !agentList.some((a) => a.id === prefillConfig.agentId);
+    !agentList.some((a) => a.id === callingSeedAgentId);
   // While the list is catalog-only placeholder data, a persisted pick that
   // isn't in it yet may be a scan-discovered agent still loading — hold the
   // selection empty instead of silently defaulting to the first catalog row.
@@ -3987,14 +4025,17 @@ export function NewChatLandingScreen() {
     const modelSelectionHarness =
       selectionHarness ?? (sandboxInferenceConfigured ? previewHarness : null);
     if (!modelSelectionHarness) return;
-    userPickedModelRef.current = true;
     if (model === MODEL_SELECT_SMART) {
+      // Routing is not a model value: it owns the model per turn, so it does
+      // not count as touching the model pick (a project default may still
+      // take the field back on a later seed).
       setPickedModel("");
       setPickedEffort("");
       setCostControlMode("on");
       rememberPickerOptions(modelSelectionHarness, { routing: "on", model: "", effort: "" });
       return;
     }
+    modelTouchedRef.current = true;
     // Picking the Fusion family lands on its default combo id, which the Lead /
     // Effort / Sidekick selectors then refine.
     const fusionDescriptor = fusionOption(pickerModelOptions)?.fusion;
@@ -4024,6 +4065,7 @@ export function NewChatLandingScreen() {
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectionHarness) return;
+    effortTouchedRef.current = true;
     const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
     setPickedEffort(picked);
     rememberPickerOptions(selectionHarness, { effort: picked });
@@ -4058,7 +4100,7 @@ export function NewChatLandingScreen() {
     : (pickerFusion?.default ?? "");
   const selectFusionModel = (modelUid: string) => {
     if (!selectedNativeHarness) return;
-    userPickedModelRef.current = true;
+    modelTouchedRef.current = true;
     setPickedModel(modelUid);
     setPickedEffort("");
     setCostControlMode(null);
@@ -4359,49 +4401,17 @@ export function NewChatLandingScreen() {
   // Clear shared state on agent changes; the harness seed restores its own
   // saved options. Initial agent resolution must preserve the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
-  // Tracks an explicit model pick the user committed in this composer visit
-  // (via the model picker). Once set, an async project-config arrival or
-  // cache refresh must not reseed the project default over the user's choice;
-  // an agent switch starts a fresh visit and re-arms the seed.
-  const userPickedModelRef = useRef(false);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
     if (prev === undefined || prev === null || prev === effectiveAgentId) return;
-    userPickedModelRef.current = false;
     setBypassSandbox(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
-  // A project-configured default model (Project settings) outranks the user's
-  // remembered per-harness pick — but only while the composer sits on the
-  // project's configured agent; switching to another agent falls back to the
-  // remembered pick / harness default.
-  const projectDefaultModel =
-    prefillConfig?.model != null &&
-    prefillConfig.agentId != null &&
-    effectiveAgentId === prefillConfig.agentId
-      ? prefillConfig.model
-      : prefillConfig === undefined && cachedPickerOptions?.agent.id === effectiveAgentId
-        ? cachedPickerOptions.model
-        : null;
-  // The same default validated against the selected harness's current vocab.
-  // An unknown/retired stored id must behave as "no project default": the
-  // model seed falls back to the remembered pick, and the remembered-routing
-  // seed below stays live (an invalid pin must not suppress it).
-  const projectModelVocab =
-    selectedNativeHarness === "pi-native"
-      ? piModelOptions
-      : selectedNativeHarness === "claude-native"
-        ? claudeModelOptions
-        : selectedNativeHarness === "devin-native"
-          ? devinModelOptions
-          : selectedNativeHarness === "codex-native"
-            ? codexModelOptions
-            : [];
-  const projectDefaultModelValid =
-    projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
-      ? projectDefaultModel
-      : null;
+  // A first-class project visit owns model / effort through the calling-defaults
+  // seed, so the per-harness localStorage memory (and its remembered routing)
+  // must not reseed them here — only the permission-mode knobs stay remembered.
+  const projectVisit = configProjectId !== null;
   // Seed the harness's knobs from the user's last picks when the selected
   // harness changes (including the first mount), so a returning user starts a
   // new session on the options they used last for that harness instead of the
@@ -4431,47 +4441,38 @@ export function NewChatLandingScreen() {
     // two are mutually exclusive, and sending both makes the server treat the
     // session as model-pinned and never route. Read from storage (not state) so
     // this holds on every run of this effect — including the re-run when the
-    // model catalog resolves, which lands after the routing seed below.
+    // model catalog resolves.
     const storedRoutingOn = stored.routing === "on";
-    // The project's configured default model (validated against the current
-    // vocab) outranks both the remembered pick and remembered routing while
-    // the composer sits on the project's configured agent — unless the user
-    // already committed an explicit pick this visit, which always wins.
-    const projectSeed = (options: readonly { id: string }[]) =>
-      !userPickedModelRef.current &&
-      projectDefaultModel != null &&
-      options.some((m) => m.id === projectDefaultModel)
-        ? projectDefaultModel
-        : null;
     if (sdkHarness !== null) {
       const sdkModes = sdkPermissionOptions(sdkHarness)!;
       const sdkMode = resolve(sdkModes, sdkInitialPermissionMode(sdkHarness)!);
       if (sdkHarness === "claude-sdk") setPermissionMode(sdkMode);
       else setApprovalMode(sdkMode);
-      const model =
-        stored.model != null &&
-        (hostSdkModelOptions === undefined ||
-          sdkModelOptions.some((row) => row.id === stored.model))
-          ? stored.model
-          : "";
-      setPickedModel(model);
-      setPickedEffort(
-        stored.effort != null &&
+      if (!projectVisit) {
+        const model =
+          stored.model != null &&
           (hostSdkModelOptions === undefined ||
-            effortLevelsFor(
-              sdkHarness,
-              sdkModelOptions,
-              model || sdkModelOptions.find((row) => row.isDefault)?.id,
-            )?.includes(stored.effort))
-          ? stored.effort
-          : "",
-      );
-    } else if (selectedNativeHarness === "pi-native") {
-      setPickedModel(
-        projectSeed(piModelOptions) ??
-          (stored.model != null && piModelOptions.some((model) => model.id === stored.model)
+            sdkModelOptions.some((row) => row.id === stored.model))
             ? stored.model
-            : ""),
+            : "";
+        setPickedModel(model);
+        setPickedEffort(
+          stored.effort != null &&
+            (hostSdkModelOptions === undefined ||
+              effortLevelsFor(
+                sdkHarness,
+                sdkModelOptions,
+                model || sdkModelOptions.find((row) => row.isDefault)?.id,
+              )?.includes(stored.effort))
+            ? stored.effort
+            : "",
+        );
+      }
+    } else if (selectedNativeHarness === "pi-native" && !projectVisit) {
+      setPickedModel(
+        stored.model != null && piModelOptions.some((model) => model.id === stored.model)
+          ? stored.model
+          : "",
       );
       setPickedEffort(
         stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
@@ -4483,58 +4484,60 @@ export function NewChatLandingScreen() {
       setPermissionMode(
         resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
       );
-      // The model + effort picker remembers its own last pick (same per-harness
-      // snapshot the mode knob uses), validated against the current vocab. With
-      // nothing stored (or a retired id) it resolves to "" — unselected, so the
-      // create omits the override and Claude Code uses its own configured model.
-      setPickedModel(
-        projectSeed(claudeModelOptions) ??
-          (!storedRoutingOn &&
-          stored.model != null &&
-          claudeModelOptions.some((m) => m.id === stored.model)
+      if (!projectVisit) {
+        // The model + effort picker remembers its own last pick (same per-harness
+        // snapshot the mode knob uses), validated against the current vocab. With
+        // nothing stored (or a retired id) it resolves to "" — unselected, so the
+        // create omits the override and Claude Code uses its own configured model.
+        setPickedModel(
+          !storedRoutingOn &&
+            stored.model != null &&
+            claudeModelOptions.some((m) => m.id === stored.model)
             ? stored.model
-            : ""),
-      );
-      setPickedEffort(
-        !storedRoutingOn &&
-          stored.effort != null &&
-          CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
-          ? stored.effort
-          : "",
-      );
+            : "",
+        );
+        setPickedEffort(
+          !storedRoutingOn &&
+            stored.effort != null &&
+            CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+            ? stored.effort
+            : "",
+        );
+      }
     } else if (supportsApprovalMode) {
       setBypassSandbox(
         selectedNativeHarness === "codex-native" &&
           stored.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
       );
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
-      // A remembered routing "on" outranks a remembered concrete model, and
-      // also drops any model/effort left in the shared state (e.g. seeded for
-      // Claude Code before the harness switch).
-      const seededCodexModel =
-        (selectedNativeHarness === "codex-native" ? projectSeed(codexModelOptions) : null) ??
-        (!storedRoutingOn &&
-        selectedNativeHarness === "codex-native" &&
-        stored.model != null &&
-        codexModelOptions.some((m) => m.id === stored.model)
-          ? stored.model
-          : "");
-      setPickedModel(seededCodexModel);
-      // Restore the remembered Codex effort only while the seeded model's
-      // ladder (the catalog default's when no model is pinned) still offers
-      // it — anything else resolves to "" so a level another harness left in
-      // the shared state never rides a Codex create.
-      setPickedEffort(
-        !storedRoutingOn &&
+      if (!projectVisit) {
+        // A remembered routing "on" outranks a remembered concrete model, and
+        // also drops any model/effort left in the shared state (e.g. seeded for
+        // Claude Code before the harness switch).
+        const seededCodexModel =
+          !storedRoutingOn &&
           selectedNativeHarness === "codex-native" &&
-          stored.effort != null &&
-          codexEffortLevelsForModel(
-            codexModelOptions,
-            seededCodexModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
-          ).includes(stored.effort)
-          ? stored.effort
-          : "",
-      );
+          stored.model != null &&
+          codexModelOptions.some((m) => m.id === stored.model)
+            ? stored.model
+            : "";
+        setPickedModel(seededCodexModel);
+        // Restore the remembered Codex effort only while the seeded model's
+        // ladder (the catalog default's when no model is pinned) still offers
+        // it — anything else resolves to "" so a level another harness left in
+        // the shared state never rides a Codex create.
+        setPickedEffort(
+          !storedRoutingOn &&
+            selectedNativeHarness === "codex-native" &&
+            stored.effort != null &&
+            codexEffortLevelsForModel(
+              codexModelOptions,
+              seededCodexModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+            ).includes(stored.effort)
+            ? stored.effort
+            : "",
+        );
+      }
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     } else if (supportsAgySkipPermissions) {
@@ -4544,10 +4547,8 @@ export function NewChatLandingScreen() {
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
     }
-    // Reseed on harness changes, when the selected host's catalog resolves,
-    // and when the project's configured default model settles (its config
-    // loads async, so the first run may see it as null); capability flags are
-    // derived from the same harness and stay omitted.
+    // Reseed on harness changes and when the selected host's catalog resolves;
+    // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sandboxInferenceConfigured,
@@ -4558,7 +4559,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
-    projectDefaultModel,
+    configProjectId,
   ]);
   useEffect(() => {
     if (!sandboxInferenceConfigured || sandboxModels.data?.status !== "ready") return;
@@ -4586,11 +4587,9 @@ export function NewChatLandingScreen() {
   // switch itself (the router always routes), so it's left alone.
   useEffect(() => {
     if (!selectedNativeHarness || autoRoutingSelected) return;
-    // A *valid* project-configured default model is an explicit pin: a
-    // remembered routing "on" must not re-enter routing and clear it (the
-    // setter drops the model pick when routing turns on). An invalid stored
-    // id never seeds a pin, so it must not suppress the remembered routing.
-    if (projectDefaultModelValid != null && !userPickedModelRef.current) return;
+    // A project visit's model / effort / routing are resolve-owned; the
+    // remembered routing must not re-enter and clear a seeded model.
+    if (projectVisit) return;
     const storedRouting =
       (pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
         ? pickerEdits.options.routing
@@ -4602,7 +4601,7 @@ export function NewChatLandingScreen() {
     smartRoutingEligible,
     effectiveAgentId,
     autoRoutingSelected,
-    projectDefaultModelValid,
+    projectVisit,
     setCostControlMode,
     pickerEdits,
   ]);
@@ -4895,22 +4894,17 @@ export function NewChatLandingScreen() {
   // Existing worktrees stay visible while a new branch name is drafted. The
   // two actions are deliberately separate: radio selection binds an existing
   // worktree; the text field requests a new one.
-  // Project prefill: seed host / workspace from roots and agent from config.
-  // An opt-in worktree is generated by the dedicated effect below once
+  // Project prefill: seed host / workspace from roots. The agent / model /
+  // effort seed comes from the calling-defaults effect below once the host is
+  // known. An opt-in worktree is generated by the dedicated effect below once
   // the workspace is in place.
   useEffect(() => {
     if (prefill.project !== projectParam || prefillDone(prefill)) return;
     const step = projectPrefillStep(prefill, {
       hosts,
-      // The pickable list, not the raw one — a hidden agent's id would seed
-      // a pick that effectiveAgentId rejects. Raw undefined = still loading;
-      // placeholder (catalog-only) data counts as loading too, so the prefill
-      // never seeds or validates a pick against a partial list.
-      agents: agents === undefined || agentsArePlaceholder ? undefined : agentList,
       sandboxSelected,
       managedSandboxesEnabled,
       selectedHostId,
-      lastAgentId: readLastAgentId(),
       config: prefillConfig,
       roots: configProjectId === null ? null : projectHostRoots,
     });
@@ -4921,15 +4915,6 @@ export function NewChatLandingScreen() {
       setSandboxProvider(defaultSandboxProvider());
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
-    if (writes.agentId !== undefined) {
-      setPickedAgentId((cur) => cur ?? writes.agentId!);
-      if (pickedAgentId === null) {
-        setPickedHarness(readLastHarness(writes.agentId));
-        // Config-sourced seed into an empty slot (as opposed to the last-agent
-        // fallback): the create omits the field until any other write flips this.
-        agentFromConfigRef.current = writes.agentId === prefillConfig?.agentId;
-      }
-    }
     if (writes.workspace !== undefined) {
       setWorkspace((cur) => {
         if (cur !== "") return cur;
@@ -4942,18 +4927,102 @@ export function NewChatLandingScreen() {
     prefill,
     projectParam,
     hosts,
-    agents,
-    agentsArePlaceholder,
-    agentList,
     sandboxSelected,
     managedSandboxesEnabled,
     selectedHostId,
-    pickedAgentId,
     prefillConfig,
     configProjectId,
     projectHostRoots,
     defaultSandboxProvider,
   ]);
+
+  // Calling-defaults seed (K8): once project + host are known, resolve the
+  // agent / model / effort through the server chain and seed the untouched
+  // pickers. A touched pick survives a host switch only while the new host
+  // still offers it (D28/D30); otherwise the resolved value replaces it with
+  // a notice. Re-runs per (project, host, agent-pick generation).
+  useEffect(() => {
+    if (projectParam === "" || configProjectId === null) return;
+    if (sandboxSelected || selectedHostId === null) return;
+    const seedKey = `${configProjectId}|${selectedHostId}|${agentPickGenerationRef.current}`;
+    if (callingSeedAppliedRef.current === seedKey) return;
+    // Claim the key before the fetch: a failure leaves today's generic
+    // defaults in place instead of retrying on every render.
+    callingSeedAppliedRef.current = seedKey;
+    const seedHost = allHosts.find((host) => host.host_id === selectedHostId) ?? null;
+    const { enabled: carryEnabled, carry } = callingLastContext(configProjectId, selectedHostId);
+    // The picks the seed is computed from: an apply only overwrites a field
+    // that still holds this value, so a pick made while the fetch was in
+    // flight survives (the touched rules already ran inside the seed).
+    const seedFromModel = pickedModel;
+    const seedFromEffort = pickedEffort;
+    void resolveCallingSeed({
+      projectId: configProjectId,
+      hostId: selectedHostId,
+      hostLabel: seedHost?.name ?? selectedHostId,
+      current: {
+        agentId: effectiveAgentId,
+        model: seedFromModel,
+        effort: seedFromEffort,
+      },
+      touched: {
+        agent: agentTouchedRef.current,
+        model: modelTouchedRef.current,
+        effort: effortTouchedRef.current,
+      },
+      carryEnabled,
+      carry,
+      isAgentUsable: (agentId) => {
+        const entry = agentList.find((candidate) => candidate.id === agentId);
+        if (!entry) return false;
+        const harness = nativeCodingAgentForAvailableAgent(entry)?.harness ?? entry.harness ?? null;
+        return harness === null || !harnessUnconfiguredOnHost(harness, seedHost);
+      },
+      agentLabel: (agentId) => {
+        if (agentId === null) return "the default agent";
+        const entry = agentList.find((candidate) => candidate.id === agentId);
+        return entry?.display_name ?? agentId;
+      },
+    }).then(
+      (seed) => {
+        // A newer seed (host switch or agent pick) claimed the key meanwhile.
+        if (callingSeedAppliedRef.current !== seedKey) return;
+        setCallingSeedProblems(seed.problems);
+        setCallingSeedNotices(seed.notices);
+        setCallingSeedAgentId(seed.agentId);
+        if (seed.agentId !== effectiveAgentId) {
+          setPickedAgentId(seed.agentId);
+          if (seed.agentId !== null) setPickedHarness(readLastHarness(seed.agentId));
+        }
+        // A pick committed while the resolve was in flight outranks the seed.
+        _setPickedModel((current) => (current === seedFromModel ? (seed.model ?? "") : current));
+        setPickedEffort((current) => (current === seedFromEffort ? (seed.effort ?? "") : current));
+        // A routed session never pins a model, so a seeded model clears it.
+        if (seed.model !== null) setCostControlMode(null);
+      },
+      () => {
+        // Resolve failure keeps today's generic / remembered defaults.
+      },
+    );
+    // Reads the live picks at resolve time; only host / project / agent picks
+    // start a new seed (the applied key guards the rest).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectParam, configProjectId, selectedHostId, sandboxSelected, effectiveAgentId]);
+
+  // While a project's config is still loading, the last cached picker snapshot
+  // (this user × project) previews its model so the composer doesn't flash
+  // "Models unavailable"; the resolve seed replaces it once the host is known.
+  const cachedPreviewModel =
+    prefillConfig === undefined &&
+    cachedPickerOptions !== null &&
+    cachedPickerOptions.model !== "" &&
+    cachedPickerOptions.agent.id === effectiveAgentId
+      ? cachedPickerOptions.model
+      : null;
+  useEffect(() => {
+    if (cachedPreviewModel === null) return;
+    _setPickedModel((current) => (current === "" ? cachedPreviewModel : current));
+  }, [cachedPreviewModel]);
 
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
@@ -5407,6 +5476,13 @@ export function NewChatLandingScreen() {
     ...configSummary.filter((detail) => detail.label === "Connection"),
   ];
 
+  // A user agent pick this visit: the calling-defaults seed must not replace
+  // it (D28), and the generation lets the seed effect re-run for the new agent.
+  function markAgentTouched(): void {
+    agentTouchedRef.current = true;
+    agentPickGenerationRef.current += 1;
+  }
+
   // Pick top-level Smart Routing. The create call needs a concrete agent_id, so
   // bind the Claude wrapper as a placeholder — the server routes from the first
   // message and rebinds to the wrapper it picked, which is why the picker
@@ -5416,11 +5492,11 @@ export function NewChatLandingScreen() {
   // row behind it degrades to the default pick (see the guard above).
   const handleSelectSmartRoutingHarness = () => {
     agentExplicitlySelectedRef.current = true;
+    markAgentTouched();
     setSmartRoutingDropped(null);
     const placeholder = smartRoutingWrappers.claude;
     if (placeholder == null) return;
     setPickerEdits(null);
-    agentFromConfigRef.current = false;
     setPickedAgentId(placeholder.id);
     writeLastAgentId(placeholder.id);
     setPickedHarness(AUTO_NATIVE_HARNESS_ID);
@@ -5434,6 +5510,7 @@ export function NewChatLandingScreen() {
   // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
     agentExplicitlySelectedRef.current = true;
+    markAgentTouched();
     setSmartRoutingDropped(null);
     if (agent.id !== effectiveAgentId) {
       const remembered = readLastHarness(agent.id);
@@ -5446,9 +5523,6 @@ export function NewChatLandingScreen() {
     // Re-picking the placeholder leaves top-level Smart Routing. A bundle's
     // routed brain stays configured until changed through Agent Harness.
     else if (pickedHarness === AUTO_NATIVE_HARNESS_ID) handleSetPickedHarness(null, agent.id);
-    // An explicit pick — even of the value the config seeded — is the user's
-    // own choice: send it with the create rather than default-filling.
-    agentFromConfigRef.current = false;
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
     if (pickerEdits?.agentId !== agent.id) {
@@ -5476,8 +5550,8 @@ export function NewChatLandingScreen() {
   };
   const handleSelectPending = () => {
     agentExplicitlySelectedRef.current = true;
+    markAgentTouched();
     setPickerEdits(null);
-    agentFromConfigRef.current = false;
     setPickedAgentId(PENDING_AGENT_ID);
     setPickedHarness(null);
   };
@@ -5846,13 +5920,8 @@ export function NewChatLandingScreen() {
       const localProject =
         selectedProject !== "" ? { id: createProjectId, name: selectedProject } : undefined;
       let rememberedProjectId = createProjectId;
-      // The server fills untouched agent config and host root seeds. A user
-      // pick clears the source ref even when the picked value is identical.
-      const agentFromProjectConfig =
-        createProjectId !== null &&
-        agentFromConfigRef.current &&
-        prefillConfig?.agentId != null &&
-        effectiveAgentId === prefillConfig.agentId;
+      // The server fills an untouched host root seed. A user pick clears the
+      // source ref even when the picked value is identical.
       const workspaceFromProjectConfig =
         createProjectId !== null &&
         workspaceFromConfigRef.current &&
@@ -5981,9 +6050,9 @@ export function NewChatLandingScreen() {
             ...backgroundSessionTitlesRequestHeaders(),
           },
           body: JSON.stringify({
-            // Config-seeded agent on a `project_id` create: omitted so the
-            // server default-fills it from the project config.
-            ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
+            // The dialog sends the agent it shows (the calling-defaults seed
+            // included), so the server receives an explicit value.
+            agent_id: effectiveAgentId,
             ...(createProjectId !== null ? { project_id: createProjectId } : {}),
             ...(sandboxSelected
               ? {
@@ -6216,6 +6285,24 @@ export function NewChatLandingScreen() {
               ),
           );
           return [...withoutMatch, project];
+        });
+      }
+      // Carry-over memory (K3): only a project session records, and only after
+      // a successful create. The values are the ones the dialog showed and
+      // sent; a sandbox create has no host to key on.
+      if (
+        rememberedProjectId !== null &&
+        !sandboxSelected &&
+        selectedHostId !== null &&
+        effectiveAgentId !== null &&
+        effectiveAgentId !== PENDING_AGENT_ID &&
+        !smartRoutingHarnessSelected &&
+        selectionHarness !== null
+      ) {
+        recordCallingLast(rememberedProjectId, selectedHostId, effectiveAgentId, {
+          harness: selectionHarness,
+          model: normalizedModelOverride,
+          effort: normalizedReasoningEffort,
         });
       }
       // A successful create becomes the remembered destination for every
@@ -7583,6 +7670,38 @@ export function NewChatLandingScreen() {
                 })}
               </span>
             </p>
+          )}
+
+          {/* Host switch replaced a touched pick with the new host's default
+              (D30) — name the field so the swap is never silent. */}
+          {callingSeedNotices.length > 0 && !selectedAgentUnconfigured && (
+            <div
+              className="flex flex-col gap-1 pl-2 text-xs text-amber-600 dark:text-amber-500"
+              data-testid="new-chat-landing-calling-notice"
+            >
+              {callingSeedNotices.map((notice) => (
+                <p key={notice} className="flex items-center gap-2">
+                  <TriangleAlertIcon className="size-3.5 shrink-0" />
+                  <span>{notice}</span>
+                </p>
+              ))}
+            </div>
+          )}
+
+          {/* A project default the cached catalog does not offer. Advisory:
+              the create still goes through with the shown (explicit) values. */}
+          {callingSeedProblems.length > 0 && (
+            <div
+              className="flex flex-col gap-1 pl-2 text-xs text-amber-600 dark:text-amber-500"
+              data-testid="new-chat-landing-calling-problems"
+            >
+              {callingSeedProblems.map((problem) => (
+                <p key={`${problem.field}:${problem.message}`} className="flex items-center gap-2">
+                  <TriangleAlertIcon className="size-3.5 shrink-0" />
+                  <span>{problem.message}</span>
+                </p>
+              ))}
+            </div>
           )}
 
           {automaticHarnessFallback?.candidate && automaticHarnessFallback.rejectedPreference && (

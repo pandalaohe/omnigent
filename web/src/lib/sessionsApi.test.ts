@@ -146,6 +146,7 @@ describe("createSession", () => {
       agentName: null,
       runnerId: undefined,
       hostId: null,
+      projectId: null,
       hostResumable: false,
       archived: false,
       status: "idle",

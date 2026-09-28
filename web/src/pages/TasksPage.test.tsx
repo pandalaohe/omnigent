@@ -30,11 +30,13 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialName,
     initialPrompt,
     editingTask,
+    currentProjectName,
   }: {
     open: boolean;
     initialName?: string;
     initialPrompt?: string;
     editingTask?: ScheduledTask | null;
+    currentProjectName?: string | null;
   }) =>
     open ? (
       <div
@@ -43,6 +45,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-initial-prompt={initialPrompt ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
+        data-current-project={currentProjectName ?? ""}
       />
     ) : null,
 }));
@@ -303,6 +306,19 @@ describe("New task button", () => {
     fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
     expect(screen.queryByTestId("new-task-omnigent")).toBeNull();
     expect(screen.queryByTestId("new-task-manual")).toBeNull();
+  });
+
+  it("forwards the surrounding ?project= context to the create dialog", () => {
+    setTasks([]);
+    render(
+      <MemoryRouter initialEntries={["/tasks?project=Alpha"]}>
+        <TasksPage />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open").getAttribute("data-current-project")).toBe(
+      "Alpha",
+    );
   });
 });
 

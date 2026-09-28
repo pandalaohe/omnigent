@@ -32,6 +32,23 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as CallingDefaultsApiModule from "@/lib/callingDefaultsApi";
+
+// The calling-defaults chain is a server read; each case controls what it
+// resolves. The default implementation mirrors the old web-side config seeds
+// so cases that don't care about a per-host default keep their shape.
+vi.mock("@/lib/callingDefaultsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CallingDefaultsApiModule>()),
+  resolveCallingDefaults: vi.fn(),
+  listCallingDefaultCatalogs: vi.fn(),
+}));
+import {
+  listCallingDefaultCatalogs,
+  resolveCallingDefaults,
+  type CallingDefaultsCatalogRow,
+  type CallingDefaultsResolution,
+} from "@/lib/callingDefaultsApi";
+import { readCallingLast } from "@/lib/callingDefaults";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -162,9 +179,10 @@ function rootsForConfig(config: ProjectConfig | undefined): ProjectHostRoots {
   const hostId = config?.host_id;
   const configHostId = hostId && hostId !== "__sandbox__" ? hostId : null;
   return {
-    roots: configHostId && config?.workspace
-      ? [{ host_id: configHostId, workspace: config.workspace, source: "config" }]
-      : [],
+    roots:
+      configHostId && config?.workspace
+        ? [{ host_id: configHostId, workspace: config.workspace, source: "config" }]
+        : [],
     default_host_id: configHostId,
     default_host_reason: configHostId ? "config" : "none",
   };
@@ -375,6 +393,8 @@ beforeEach(() => {
       isError: false,
     } as ReturnType<typeof useProjectHostRoots>;
   });
+  vi.mocked(listCallingDefaultCatalogs).mockResolvedValue([]);
+  mockResolveFromConfig();
 });
 
 function setHostsAndAgents(): void {
@@ -382,6 +402,40 @@ function setHostsAndAgents(): void {
   vi.mocked(useAvailableAgents).mockReturnValue({
     data: [agent(), agent({ id: "ag_other", name: "other", display_name: "Other" })],
   } as ReturnType<typeof useAvailableAgents>);
+}
+
+function resolution(overrides: Partial<CallingDefaultsResolution> = {}): CallingDefaultsResolution {
+  return {
+    agent_id: null,
+    harness: null,
+    model: null,
+    effort: null,
+    sources: {},
+    problems: [],
+    ...overrides,
+  };
+}
+
+/**
+ * A default resolve that mirrors the project config the way the server chain
+ * would: the configured agent, its harness, and the legacy project model.
+ * Cases about per-host defaults override the mock outright.
+ */
+function mockResolveFromConfig(): void {
+  vi.mocked(resolveCallingDefaults).mockImplementation(async (options = {}) => {
+    const config = options.projectId
+      ? vi.mocked(useProjectConfig)(options.projectId).data
+      : undefined;
+    const agentId = options.agentId ?? config?.agent_id ?? null;
+    const row = agentId
+      ? (vi.mocked(useAvailableAgents)().data ?? []).find((candidate) => candidate.id === agentId)
+      : undefined;
+    return resolution({
+      agent_id: agentId,
+      harness: row?.harness ?? null,
+      model: config?.model ?? null,
+    });
+  });
 }
 
 afterEach(() => {
@@ -420,12 +474,11 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
     );
     const body = await submitAndReadBody();
-    // Beta's seeded slots are still config-values, so the create omits them
-    // for server default-fill under Beta's project_id. Had Alpha's drafted
-    // agent survived, it would differ from Beta's config and be sent
-    // explicitly — the omission is the assertion.
+    // Beta's resolved agent replaced Alpha's drafted pick; the create sends
+    // the value it shows, under Beta's project_id. The workspace stayed a
+    // config-value, so it is omitted for server default-fill.
     expect(body.project_id).toBe("proj_beta");
-    expect("agent_id" in body).toBe(false);
+    expect(body.agent_id).toBe("ag_hello");
     expect("workspace" in body).toBe(false);
   });
 
@@ -473,12 +526,11 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
     const body = await submitAndReadBody();
-    // The configured agent held (untouched → omitted for default-fill). Had
-    // last-agent-id displaced it, the differing agent would be sent explicitly.
+    // The resolved agent held over last-agent-id and rides explicitly.
     expect(body.project_id).toBe("proj_alpha");
-    expect("agent_id" in body).toBe(false);
+    expect(body.agent_id).toBe("ag_pinned");
     expect("workspace" in body).toBe(false);
-    // The composer must thread the configured agent into discovery's pins —
+    // The composer must thread the seeded agent into discovery's pins —
     // that's what makes the session-scoped row above resolvable at all.
     expect(
       vi
@@ -525,10 +577,11 @@ describe("NewChatLandingScreen project prefill", () => {
     );
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
-    // Untouched config-seeded slots are omitted for server default-fill.
+    // The resolved agent is sent explicitly; the untouched workspace seed is
+    // omitted for server default-fill.
     expect(body.project_id).toBe("proj_alpha");
     expect("workspace" in body).toBe(false);
-    expect("agent_id" in body).toBe(false);
+    expect(body.agent_id).toBe("ag_other");
     // No opt-in worktree → no git block.
     expect(body.git).toBeUndefined();
   });
@@ -614,24 +667,24 @@ describe("NewChatLandingScreen project prefill", () => {
     await expectNoProjectRoot();
   });
 
-  it("waits for the projects list before settling, so a config agent isn't lost to a race", async () => {
+  it("waits for the projects list before the calling seed can resolve", async () => {
     // The projects list resolves name → id; until it loads the id is falsely
-    // null. The prefill must WAIT rather than settle from the generic default,
-    // or the stored default agent would never apply.
+    // null, so no resolve can run. The seed must WAIT rather than settle on
+    // the generic default, or the stored default agent would never apply.
     setProjects(undefined, true); // still loading
     setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
     const { rerender } = renderLanding();
 
-    // Projects finish loading → config resolves and the agent seeds.
+    // Projects finish loading → the resolve runs and the agent seeds.
     setProjects([{ id: "proj_alpha", name: "Alpha" }]);
     rerender(<NewChatLandingScreen />);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Other/),
+    );
 
     const body = await submitAndReadBody();
-    // The config agent seeded (and stayed) → omitted for default-fill. A
-    // premature settle would have picked the generic default, which differs
-    // from the config and would ride explicitly.
     expect(body.project_id).toBe("proj_alpha");
-    expect("agent_id" in body).toBe(false);
+    expect(body.agent_id).toBe("ag_other");
   });
 
   it("reseeds from the new project when another pencil is clicked while mounted", async () => {
@@ -654,11 +707,11 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
     );
     const body = await submitAndReadBody();
-    // Reseeded to Beta's config (the chip check above proves the UI): both
-    // slots stayed config-values, omitted under Beta's project_id.
+    // Reseeded to Beta's resolve (the chip check above proves the UI); the
+    // workspace stayed a config-value, omitted under Beta's project_id.
     expect(body.project_id).toBe("proj_beta");
     expect("workspace" in body).toBe(false);
-    expect("agent_id" in body).toBe(false);
+    expect(body.agent_id).toBe("ag_other");
   });
 
   it("clears a drafted sandbox repository on an in-place project switch (screen stays mounted)", async () => {
@@ -848,11 +901,11 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.git).toBeUndefined();
   });
 
-  // ── Project default model ── the stored `model` seeds the composer's model
-  // pick (→ create-body model_override) while the composer sits on the
-  // project's configured agent. These pin the seed itself plus the two races
-  // around it: an invalid stored id must behave as "no default", and an
-  // async-arriving config must not clobber a pick the user already committed.
+  // ── Project default model ── the server resolve seeds the composer's model
+  // pick (→ create-body model_override) for the effective agent. These pin
+  // the seed itself plus the two races around it: the localStorage memory is
+  // not consulted on project visits, and an async-arriving config must not
+  // clobber a pick the user already committed.
   const CLAUDE_AGENT_ID = "ag_claude";
   const HARNESS_OPTIONS_KEY = "omnigent:last-mode-by-harness";
 
@@ -878,7 +931,12 @@ describe("NewChatLandingScreen project prefill", () => {
 
   it("seeds the create body's model_override from the project's stored default model", async () => {
     setClaudeAgentAndModels();
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    setProjectConfig({
+      host_id: "host_1",
+      workspace: REPO,
+      agent_id: CLAUDE_AGENT_ID,
+      model: "opus",
+    });
     renderLanding();
 
     await waitFor(() =>
@@ -887,9 +945,8 @@ describe("NewChatLandingScreen project prefill", () => {
       ),
     );
     const body = await submitAndReadBody();
-    // The waitFor above proves the configured agent is selected (an unchanged
-    // config agent is omitted from the body for default-fill, so assert the
-    // model_override contract that is the point of this test).
+    // The waitFor above proves the resolved agent is selected; the resolved
+    // model rides explicitly.
     expect(body.model_override).toBe("opus");
   });
 
@@ -899,7 +956,12 @@ describe("NewChatLandingScreen project prefill", () => {
       HARNESS_OPTIONS_KEY,
       JSON.stringify({ "claude-native": { model: "sonnet" } }),
     );
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    setProjectConfig({
+      host_id: "host_1",
+      workspace: REPO,
+      agent_id: CLAUDE_AGENT_ID,
+      model: "opus",
+    });
     renderLanding();
 
     await waitFor(() =>
@@ -911,15 +973,19 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.model_override).toBe("opus");
   });
 
-  it("treats an invalid stored project model as no default (remembered pick still seeds)", async () => {
-    // A retired/unknown id must not seed — and must not displace the user's
-    // remembered pick, which stays the effective model.
+  it("keeps the remembered per-harness model out of a project visit", async () => {
+    // Project visits resolve model / effort from the server chain, so the
+    // localStorage memory is not consulted: with no resolved model the create
+    // sends no override (the harness default), not the remembered pick.
     setClaudeAgentAndModels();
     localStorage.setItem(
       HARNESS_OPTIONS_KEY,
       JSON.stringify({ "claude-native": { model: "sonnet" } }),
     );
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "retired-model" });
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID });
+    vi.mocked(resolveCallingDefaults).mockResolvedValue(
+      resolution({ agent_id: CLAUDE_AGENT_ID, harness: "claude-native" }),
+    );
     renderLanding();
 
     await waitFor(() =>
@@ -928,7 +994,7 @@ describe("NewChatLandingScreen project prefill", () => {
       ),
     );
     const body = await submitAndReadBody();
-    expect(body.model_override).toBe("sonnet");
+    expect(body.model_override).toBeUndefined();
   });
 
   it("does not clobber a user's committed model pick when the project config arrives late", async () => {
@@ -952,7 +1018,12 @@ describe("NewChatLandingScreen project prefill", () => {
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
 
     // The project default (Opus) lands afterwards — it must not reseed.
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    setProjectConfig({
+      host_id: "host_1",
+      workspace: REPO,
+      agent_id: CLAUDE_AGENT_ID,
+      model: "opus",
+    });
     rerender(<NewChatLandingScreen />);
 
     const body = await submitAndReadBody();
@@ -985,7 +1056,12 @@ describe("NewChatLandingScreen project prefill", () => {
 
     // Remount for the SAME project, now with a stored model default. The
     // restored routing draft must not shadow the pin.
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    setProjectConfig({
+      host_id: "host_1",
+      workspace: REPO,
+      agent_id: CLAUDE_AGENT_ID,
+      model: "opus",
+    });
     renderRoutingLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
@@ -1142,5 +1218,369 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
+  });
+});
+
+// K8: a project visit seeds the agent / model / effort from the server
+// resolve once the host is known. Touched fields survive a host switch only
+// while the new host still offers them (D28/D30); untouched fields follow the
+// new host. Carry-over ON prefers the last-used project × host entry.
+describe("NewChatLandingScreen calling-defaults seeding", () => {
+  const HDS = "host_1";
+  const TMB = "host_2";
+  const AG_CODEX = "ag_codex";
+  const AG_CLAUDE = "ag_claude";
+  const TMB_REPO = "/Users/corey/projects/alpha-tmb";
+
+  function setTwoHosts(): void {
+    vi.mocked(useHosts).mockReturnValue({
+      data: [
+        host({
+          host_id: HDS,
+          name: "HDS",
+          configured_harnesses: { "codex-native": true, "claude-native": true },
+        }),
+        host({
+          host_id: TMB,
+          name: "TMB",
+          configured_harnesses: { "claude-native": true },
+        }),
+      ],
+    } as ReturnType<typeof useHosts>);
+  }
+
+  function setNativeAgents(): void {
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent({
+          id: AG_CODEX,
+          name: "codex-native-ui",
+          display_name: "Codex",
+          harness: "codex-native",
+        }),
+        agent({
+          id: AG_CLAUDE,
+          name: "claude-code-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+  }
+
+  function setBothRoots(): void {
+    vi.mocked(useProjectHostRoots).mockReturnValue({
+      data: {
+        roots: [
+          { host_id: HDS, workspace: REPO, source: "config" },
+          { host_id: TMB, workspace: TMB_REPO, source: "binding" },
+        ],
+        default_host_id: HDS,
+        default_host_reason: "config",
+      },
+      isLoading: false,
+      isError: false,
+    } as ReturnType<typeof useProjectHostRoots>);
+  }
+
+  function setModelOptions(): void {
+    vi.mocked(useHostModelOptions).mockImplementation((_hostId, harness) => {
+      if (harness === "codex-native") {
+        return { data: [{ id: "gpt-6-sol" }, { id: "gpt-6-luna" }] } as ReturnType<
+          typeof useHostModelOptions
+        >;
+      }
+      if (harness === "claude-native") {
+        return { data: [{ id: "opus-5-5" }, { id: "sonnet" }] } as ReturnType<
+          typeof useHostModelOptions
+        >;
+      }
+      return { data: [] } as unknown as ReturnType<typeof useHostModelOptions>;
+    });
+  }
+
+  function catalogRow(
+    hostId: string,
+    harness: string,
+    models: string[],
+  ): CallingDefaultsCatalogRow {
+    return {
+      host_id: hostId,
+      harness,
+      models: models.map((id) => ({ id })),
+      fetched_at: 1,
+      stale: false,
+      error: null,
+    };
+  }
+
+  function seedCatalogs(): void {
+    vi.mocked(listCallingDefaultCatalogs).mockResolvedValue([
+      catalogRow(HDS, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
+      catalogRow(HDS, "claude-native", ["opus-5-5", "sonnet"]),
+      catalogRow(TMB, "claude-native", ["opus-5-5", "sonnet"]),
+    ]);
+  }
+
+  /** HDS resolves Codex + gpt-6-sol/high; TMB resolves Claude Code + opus-5-5/xhigh. */
+  function seedResolutions(): void {
+    vi.mocked(resolveCallingDefaults).mockImplementation(async (options = {}) => {
+      if (options.hostId === TMB || options.agentId === AG_CLAUDE) {
+        return resolution({
+          agent_id: AG_CLAUDE,
+          harness: "claude-native",
+          model: "opus-5-5",
+          effort: "xhigh",
+        });
+      }
+      return resolution({
+        agent_id: AG_CODEX,
+        harness: "codex-native",
+        model: "gpt-6-sol",
+        effort: "high",
+      });
+    });
+  }
+
+  function switchHost(hostId: string): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId(`new-chat-landing-host-${hostId}`));
+  }
+
+  function pickModelFromGear(agentId: string, modelId: string): void {
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    fireEvent.pointerDown(picker, { button: 0 });
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-model-${modelId}`));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+  }
+
+  beforeEach(() => {
+    setTwoHosts();
+    setNativeAgents();
+    setBothRoots();
+    setModelOptions();
+    seedCatalogs();
+    seedResolutions();
+    setProjectConfig({ host_id: HDS, workspace: REPO });
+  });
+
+  it("seeds the agent, model, and effort from resolve for the configured host", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.agent_id).toBe(AG_CODEX);
+    expect(body.model_override).toBe("gpt-6-sol");
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("records the created session's calling last for its project and host", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+
+    await submitAndReadBody();
+    expect(readCallingLast().projects["p:proj_alpha"]?.[HDS]).toMatchObject({
+      last_agent_id: AG_CODEX,
+      agents: { [AG_CODEX]: { harness: "codex-native", model: "gpt-6-sol", effort: "high" } },
+    });
+  });
+
+  it("follows the new host's resolve for untouched fields after a host switch", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+
+    switchHost(TMB);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_CLAUDE);
+    expect(body.model_override).toBe("opus-5-5");
+    expect(body.reasoning_effort).toBe("xhigh");
+    expect(screen.queryByTestId("new-chat-landing-calling-notice")).toBeNull();
+  });
+
+  it("replaces a touched agent that is not available on the new host and names it (scenario 20)", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+    // Re-pick the seeded agent: an explicit user pick this visit.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${AG_CODEX}`));
+
+    switchHost(TMB);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+
+    expect(screen.getByTestId("new-chat-landing-calling-notice")).toHaveTextContent(
+      "Codex is not available on TMB; using Claude Code.",
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_CLAUDE);
+    expect(body.model_override).toBe("opus-5-5");
+  });
+
+  it("replaces a touched model the new host does not offer and names it (scenario 21)", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+    pickModelFromGear(AG_CODEX, "gpt-6-luna");
+
+    switchHost(TMB);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+
+    expect(screen.getByTestId("new-chat-landing-calling-notice")).toHaveTextContent(
+      'Model "gpt-6-luna" is not available on TMB; using "opus-5-5".',
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_CLAUDE);
+    expect(body.model_override).toBe("opus-5-5");
+  });
+
+  it("keeps a touched model the new host still offers", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+    pickModelFromGear(AG_CODEX, "gpt-6-luna");
+    // The new host runs the same harness and catalog, so both the touched
+    // agent and its touched model survive the switch.
+    vi.mocked(useHosts).mockReturnValue({
+      data: [
+        host({
+          host_id: HDS,
+          name: "HDS",
+          configured_harnesses: { "codex-native": true, "claude-native": true },
+        }),
+        host({
+          host_id: TMB,
+          name: "TMB",
+          configured_harnesses: { "codex-native": true, "claude-native": true },
+        }),
+      ],
+    } as ReturnType<typeof useHosts>);
+    vi.mocked(listCallingDefaultCatalogs).mockResolvedValue([
+      catalogRow(HDS, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
+      catalogRow(TMB, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
+    ]);
+
+    switchHost(TMB);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_CODEX);
+    expect(body.model_override).toBe("gpt-6-luna");
+    expect(screen.queryByTestId("new-chat-landing-calling-notice")).toBeNull();
+  });
+
+  it("seeds carry-over's last agent and its offered model and effort", async () => {
+    localStorage.setItem(
+      "omnigent:calling-last",
+      JSON.stringify({
+        enabled: true,
+        "p:proj_alpha": {
+          [HDS]: {
+            last_agent_id: AG_CLAUDE,
+            agents: {
+              [AG_CLAUDE]: {
+                harness: "claude-native",
+                model: "opus-5-5",
+                effort: "xhigh",
+                at: 1,
+              },
+            },
+          },
+        },
+      }),
+    );
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_CLAUDE);
+    expect(body.model_override).toBe("opus-5-5");
+    expect(body.reasoning_effort).toBe("xhigh");
+  });
+
+  it("falls back to the resolve result for a carry-over value the host does not offer", async () => {
+    localStorage.setItem(
+      "omnigent:calling-last",
+      JSON.stringify({
+        enabled: true,
+        "p:proj_alpha": {
+          [HDS]: {
+            last_agent_id: AG_CLAUDE,
+            agents: {
+              [AG_CLAUDE]: {
+                harness: "claude-native",
+                model: "retired-model",
+                effort: "minimal",
+                at: 1,
+              },
+            },
+          },
+        },
+      }),
+    );
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_CLAUDE);
+    expect(body.model_override).toBe("opus-5-5");
+    // "minimal" is not on the Claude ladder, so the resolve effort wins.
+    expect(body.reasoning_effort).toBe("xhigh");
+  });
+
+  it("leaves a non-project visit on the remembered per-harness pick", async () => {
+    searchParams = new URLSearchParams("");
+    vi.mocked(resolveCallingDefaults).mockClear();
+    localStorage.setItem("omnigent:last-agent-id", AG_CLAUDE);
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": { model: "sonnet", effort: "low" } }),
+    );
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(AG_CLAUDE);
+    expect(body.model_override).toBe("sonnet");
+    expect(body.reasoning_effort).toBe("low");
+    expect(vi.mocked(resolveCallingDefaults)).not.toHaveBeenCalled();
   });
 });

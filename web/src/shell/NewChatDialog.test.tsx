@@ -29,6 +29,7 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
+import type * as CallingDefaultsApiModule from "@/lib/callingDefaultsApi";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -253,13 +254,29 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // The composer's project chip lists projects via useProjects; stub it to an
 // empty list so it doesn't fire its own authenticatedFetch (which would skew
 // the create-POST call-count / call-order assertions below).
-const { useConversationsMock, useProjectsMock, useProjectConfigMock, useProjectHostRootsMock } =
-  vi.hoisted(() => ({
-    useConversationsMock: vi.fn(),
-    useProjectsMock: vi.fn(),
-    useProjectConfigMock: vi.fn(),
-    useProjectHostRootsMock: vi.fn(),
-  }));
+const {
+  useConversationsMock,
+  useProjectsMock,
+  useProjectConfigMock,
+  useProjectHostRootsMock,
+  resolveCallingDefaultsMock,
+  listCallingDefaultCatalogsMock,
+} = vi.hoisted(() => ({
+  useConversationsMock: vi.fn(),
+  useProjectsMock: vi.fn(),
+  useProjectConfigMock: vi.fn(),
+  useProjectHostRootsMock: vi.fn(),
+  resolveCallingDefaultsMock: vi.fn(),
+  listCallingDefaultCatalogsMock: vi.fn(),
+}));
+// The calling-defaults chain is a server read; stub it so project-visit tests
+// control the seed without HTTP plumbing. The default implementation mirrors
+// the project config the way the server chain would.
+vi.mock("@/lib/callingDefaultsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CallingDefaultsApiModule>()),
+  resolveCallingDefaults: resolveCallingDefaultsMock,
+  listCallingDefaultCatalogs: listCallingDefaultCatalogsMock,
+}));
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   // Empty projects list → no ?project= name resolves to an id, so the project
@@ -1284,6 +1301,24 @@ function setupLandingMocks() {
   useProjectsMock.mockReturnValue({ ...SUCCESS_QUERY_STATE, data: [] });
   useProjectConfigMock.mockReset();
   useProjectConfigMock.mockReturnValue(DISABLED_QUERY_RESULT);
+  resolveCallingDefaultsMock.mockReset();
+  resolveCallingDefaultsMock.mockImplementation(async (options = {}) => {
+    const config = options.projectId ? useProjectConfigMock(options.projectId).data : undefined;
+    const agentId = options.agentId ?? config?.agent_id ?? null;
+    const row = agentId
+      ? (useAvailableAgentsMock().data ?? []).find((candidate) => candidate.id === agentId)
+      : undefined;
+    return {
+      agent_id: agentId,
+      harness: row?.harness ?? null,
+      model: config?.model ?? null,
+      effort: null,
+      sources: {},
+      problems: [],
+    };
+  });
+  listCallingDefaultCatalogsMock.mockReset();
+  listCallingDefaultCatalogsMock.mockResolvedValue([]);
   useProjectHostRootsMock.mockReset();
   useProjectHostRootsMock.mockReturnValue({
     ...SUCCESS_QUERY_STATE,
@@ -1935,12 +1970,8 @@ describe("NewChatLandingScreen initial picker loading", () => {
     );
   });
 
-  it("waits for project config, pinned agents, and the configured host's model before showing its defaults", () => {
+  it("waits for project config, the resolved agent's pin, and the configured host's model before showing its defaults", async () => {
     localStorage.setItem(LAST_AGENT_KEY, "a2");
-    localStorage.setItem(
-      HARNESS_OPTIONS_KEY,
-      JSON.stringify({ "claude-native": { model: "opus", effort: "max" } }),
-    );
     mockHosts([host("online"), host("online", 2)]);
     useProjectsMock.mockReturnValue({ ...PENDING_QUERY_STATE, data: undefined });
     useProjectConfigMock.mockImplementation((id: string | null) =>
@@ -1976,8 +2007,11 @@ describe("NewChatLandingScreen initial picker loading", () => {
       data: { roots: [], default_host_id: "host_2", default_host_reason: "config" },
     });
     editDraft("Waiting for the pinned agent");
+    // The resolve is async: the pinned-agent query starts once the seed lands.
+    await waitFor(() =>
+      expect(useAvailableAgentsMock).toHaveBeenCalledWith({ pinnedAgentIds: ["a1"] }),
+    );
     expect(expectLoading()).toBe(loading);
-    expect(useAvailableAgentsMock).toHaveBeenCalledWith({ pinnedAgentIds: ["a1"] });
 
     pinnedAgentsReady = true;
     editDraft("Waiting for the configured host's models");
@@ -1992,7 +2026,6 @@ describe("NewChatLandingScreen initial picker loading", () => {
     mockModelQueries(() => preferredModels);
     editDraft("The project defaults are ready");
     expect(expectReadyPicker()).toHaveTextContent("Fable 5.1");
-    expect(expectReadyPicker()).toHaveTextContent("Max");
     expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(/machine-2/);
   });
 });
@@ -2496,7 +2529,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
 
   it.each([false, true])(
     "late project defaults preserve edited fields without freezing untouched ones (model edited: %s)",
-    (editModel) => {
+    async (editModel) => {
       const projectConfig = {
         ...SUCCESS_QUERY_STATE,
         data: {
@@ -2520,6 +2553,10 @@ describe("NewChatLandingScreen cached picker preview", () => {
         },
       });
       const { unmount } = renderLanding({}, "/?project=Alpha");
+      // The resolve seed is async; let it land before the cache snapshot.
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Sonnet 4.6"),
+      );
       unmount();
       resetLandingDraft();
       useProjectConfigMock.mockReturnValue(pendingModels);
@@ -2547,8 +2584,10 @@ describe("NewChatLandingScreen cached picker preview", () => {
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
         target: { value: "Keep my explicit choices" },
       });
-      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
-        editModel ? "Opus 4.8" : "Haiku 4.5",
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
+          editModel ? "Opus 4.8" : "Haiku 4.5",
+        ),
       );
       expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
       expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();

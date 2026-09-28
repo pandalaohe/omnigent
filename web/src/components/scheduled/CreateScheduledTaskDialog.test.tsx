@@ -8,6 +8,7 @@
 
 import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
+import type * as UseConversationsModule from "@/hooks/useConversations";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +24,12 @@ import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import { useProjects } from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
+  useProjects: vi.fn(),
+}));
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // Saved library Agents: keep the real `customAgentForPicker` row mapping and
@@ -254,6 +261,7 @@ beforeEach(() => {
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
   mockCustomAgents();
+  vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useProjects>);
   vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({
     data: undefined,
   } as ReturnType<typeof hostsHook.useHostModelOptions>);
@@ -1131,6 +1139,62 @@ describe("CreateScheduledTaskDialog submit", () => {
     renderDialog();
     expect(screen.queryByTestId("schedule-preview")).toBeNull();
     expect(screen.queryByText(/Reads as:/i)).toBeNull();
+  });
+});
+
+describe("CreateScheduledTaskDialog project field", () => {
+  function openProjectSelect() {
+    const trigger = screen.getByTestId("task-project-trigger");
+    fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger);
+  }
+
+  it("pre-fills the project from the surrounding context and sends project_id", async () => {
+    vi.mocked(useProjects).mockReturnValue({
+      data: [{ id: "proj_alpha", name: "Alpha" }],
+    } as ReturnType<typeof useProjects>);
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} currentProjectName="Alpha" />);
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Alpha");
+
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ projectId: "proj_alpha" });
+  });
+
+  it("omits project_id for 'No project'", async () => {
+    vi.mocked(useProjects).mockReturnValue({
+      data: [{ id: "proj_alpha", name: "Alpha" }],
+    } as ReturnType<typeof useProjects>);
+    renderDialog();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("projectId");
+  });
+
+  it("pre-fills an edited task's project and sends a cleared project as null", async () => {
+    vi.mocked(useProjects).mockReturnValue({
+      data: [{ id: "proj_alpha", name: "Alpha" }],
+    } as ReturnType<typeof useProjects>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "proj_alpha" })}
+      />,
+    );
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Alpha");
+
+    openProjectSelect();
+    fireEvent.click(await screen.findByRole("option", { name: "No project" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
   });
 });
 

@@ -1,7 +1,8 @@
-// Pure state-machine tests for the project-prefill config seeding. The
-// component-level rules live in NewChatDialog.projectPrefill.test.tsx; these
-// pin the transitions that need mid-flight timing (a user acting between the
-// config loading and resolving), which the rendered harness can't sequence.
+// Pure state-machine tests for the project-prefill location seeding. The
+// component-level rules (agent / model / effort seeding included) live in
+// NewChatDialog.projectPrefill.test.tsx; these pin the transitions that need
+// mid-flight timing (a user acting between the config loading and resolving),
+// which the rendered harness can't sequence.
 import { describe, expect, it } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
@@ -19,11 +20,9 @@ function inputs(
 ): Parameters<typeof projectPrefillStep>[1] {
   return {
     hosts,
-    agents: [{ id: "ag_hello" }],
     sandboxSelected: false,
     managedSandboxesEnabled: false,
     selectedHostId: null,
-    lastAgentId: null,
     config: {},
     roots: null as ProjectHostRoots | null | undefined,
     ...overrides,
@@ -39,7 +38,7 @@ function runToDone(stepInputs: ReturnType<typeof inputs>) {
     if (step === null) break;
     state = step.state;
     Object.assign(writes, step.writes);
-    if (state.phase === "settled" && state.agentSeeded) break;
+    if (state.phase === "settled") break;
   }
   return { state, writes };
 }
@@ -64,17 +63,13 @@ describe("projectPrefill location seeding", () => {
       initialPrefillState("Alpha"),
       inputs({ hosts: undefined, roots }),
     );
-    // The agent track can settle independently, but the host seed must wait
-    // for the host list, so the location phase stays open (no host write).
-    expect(step).not.toBeNull();
-    expect(step!.state.phase).toBe("location");
-    expect(step!.writes.hostId).toBeUndefined();
+    // The host seed must wait for the host list, so nothing transitions yet.
+    expect(step).toBeNull();
   });
 
   it("waits for project roots before choosing a host", () => {
     const step = projectPrefillStep(initialPrefillState("Alpha"), inputs({ roots: undefined }));
-    expect(step!.state.phase).toBe("location");
-    expect(step!.writes.hostId).toBeUndefined();
+    expect(step).toBeNull();
   });
 
   it("seeds the default host and its root", () => {
@@ -82,7 +77,6 @@ describe("projectPrefill location seeding", () => {
     expect(writes.hostId).toBe("host_2");
     expect(writes.workspace).toBe("/repo/beta");
     expect(state.phase).toBe("settled");
-    expect(state.agentSeeded).toBe(true);
   });
 
   it("settles a label-only folder without a host root", () => {
@@ -173,76 +167,5 @@ describe("projectPrefill location seeding", () => {
       }),
     );
     expect(writes.selectSandbox).toBeUndefined();
-  });
-});
-
-describe("projectPrefill agent seeding", () => {
-  it("seeds the agent from config when it is a pickable agent", () => {
-    const { writes } = runToDone(
-      inputs({ agents: [{ id: "ag_hello" }, { id: "ag_cfg" }], config: { agentId: "ag_cfg" } }),
-    );
-    expect(writes.agentId).toBe("ag_cfg");
-  });
-
-  it("falls back to the last-used agent when config sets none", () => {
-    const { writes } = runToDone(
-      inputs({ agents: [{ id: "ag_hello" }], lastAgentId: "ag_hello", config: {} }),
-    );
-    expect(writes.agentId).toBe("ag_hello");
-  });
-
-  it("seeds a config agent missing from the picker list verbatim — never the last-used", () => {
-    // The create API accepts session-scoped agents the caller can read, so a
-    // configured agent absent from the list is seeded as-is; if it's truly
-    // unresolvable the composer surfaces an explicit unavailable state.
-    // Substituting last-agent-id here silently rebound project sessions to
-    // whatever agent the user last touched.
-    const { writes } = runToDone(
-      inputs({
-        agents: [{ id: "ag_hello" }],
-        lastAgentId: "ag_hello",
-        config: { agentId: "ag_gone" },
-      }),
-    );
-    expect(writes.agentId).toBe("ag_gone");
-  });
-
-  it("seeds a config agent before the picker list has loaded", () => {
-    const step = projectPrefillStep(
-      initialPrefillState("Alpha"),
-      inputs({ agents: undefined, config: { agentId: "ag_cfg" } }),
-    );
-    expect(step).not.toBeNull();
-    expect(step!.state.agentSeeded).toBe(true);
-    expect(step!.writes.agentId).toBe("ag_cfg");
-  });
-
-  it("treats a blank config agent id as absent and falls back to the last-used agent", () => {
-    // An empty or whitespace-only stored id is "not configured" — seeding it
-    // verbatim would trip the composer's "agent unavailable" state for a
-    // config that names no agent at all.
-    for (const agentId of ["", "   "]) {
-      const { writes } = runToDone(
-        inputs({ agents: [{ id: "ag_hello" }], lastAgentId: "ag_hello", config: { agentId } }),
-      );
-      expect(writes.agentId).toBe("ag_hello");
-    }
-  });
-
-  it("seeds no agent when neither config nor last-used is available", () => {
-    const { state, writes } = runToDone(inputs({ lastAgentId: null, config: {} }));
-    expect(writes.agentId).toBeUndefined();
-    // Still marks the track done so the generic defaults can proceed.
-    expect(state.agentSeeded).toBe(true);
-  });
-
-  it("waits for the agents list before settling the agent track", () => {
-    const step = projectPrefillStep(
-      initialPrefillState("Alpha"),
-      inputs({ agents: undefined, config: { hostId: "host_1" } }),
-    );
-    // Host track can still settle, but the agent track stays open.
-    expect(step).not.toBeNull();
-    expect(step!.state.agentSeeded).toBe(false);
   });
 });

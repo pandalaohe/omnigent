@@ -28,6 +28,7 @@ import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
+import { useProjects } from "@/hooks/useConversations";
 import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
@@ -59,6 +60,7 @@ export function CreateScheduledTaskDialog({
   initialName,
   initialPrompt,
   editingTask = null,
+  currentProjectName = null,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -67,10 +69,15 @@ export function CreateScheduledTaskDialog({
   initialName?: string;
   initialPrompt?: string;
   editingTask?: ScheduledTask | null;
+  /** Project NAME of the context the dialog was opened in (e.g. the
+   *  `?project=` route param); resolved against the projects list to pre-fill
+   *  the Project select on create. */
+  currentProjectName?: string | null;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: customAgents } = useCustomAgents(open);
   const { data: hosts } = useHosts({ enabled: open });
+  const { data: projects } = useProjects();
   const info = useServerInfo();
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
@@ -249,6 +256,16 @@ export function CreateScheduledTaskDialog({
   // Optional pinned host/workspace. "" = unset (server resolves at fire time).
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
+  // Project whose calling defaults apply at fire time. Until the user touches
+  // the select, the value follows the surrounding context (or the edited
+  // task), so a late projects-list load still pre-fills it.
+  const [projectId, setProjectId] = useState<string>("");
+  const [projectTouched, setProjectTouched] = useState(false);
+  const defaultProjectId =
+    editingTask !== null
+      ? (editingTask.projectId ?? "")
+      : ((projects ?? []).find((project) => project.name === currentProjectName)?.id ?? "");
+  const effectiveProjectId = projectTouched ? projectId : defaultProjectId;
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
   // "managed_sandbox") instead of a connected host; hides the host/workspace
   // pickers. Only offered when the server advertises managed sandboxes.
@@ -279,6 +296,8 @@ export function CreateScheduledTaskDialog({
         setHostId(editingTask.hostId ?? "");
         setWorkspace(editingTask.workspace ?? "");
         setSandboxMode(editingTask.executionTarget === "managed_sandbox");
+        setProjectId("");
+        setProjectTouched(false);
       } else {
         setName(initialName ?? "");
         setPrompt(initialPrompt ?? "");
@@ -291,6 +310,8 @@ export function CreateScheduledTaskDialog({
         setHostId("");
         setWorkspace("");
         setSandboxMode(false);
+        setProjectId("");
+        setProjectTouched(false);
       }
       setError(null);
     }
@@ -298,6 +319,11 @@ export function CreateScheduledTaskDialog({
   }, [open, initialName, initialPrompt, editingTask]);
 
   const hostOptions = hosts ?? [];
+  // Label-only folders have no first-class id, so they cannot key a task's
+  // project (the server default-fills those from the creating session).
+  const projectOptions = (projects ?? []).flatMap((project) =>
+    project.id === null ? [] : [{ id: project.id, name: project.name }],
+  );
   const preservePinnedHost = isEdit && editingTask?.hostId != null;
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
@@ -346,6 +372,8 @@ export function CreateScheduledTaskDialog({
     setWorkspace("");
     setWorkspaceBrowserOpen(false);
     setSandboxMode(false);
+    setProjectId("");
+    setProjectTouched(false);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -379,6 +407,13 @@ export function CreateScheduledTaskDialog({
           ? { workspace: workspace.trim() }
           : {}),
       };
+      // The task's project is threaded only when it changed (a create with no
+      // project omits it, so the server can pre-fill from the creating
+      // session); a cleared select sends an explicit null.
+      const projectChanged = effectiveProjectId !== (editingTask?.projectId ?? "");
+      const projectPatch = projectChanged
+        ? { projectId: effectiveProjectId === "" ? null : effectiveProjectId }
+        : {};
       if (editingTask) {
         // Thread model/effort ONLY when the agent supports them. Each control's
         // "" (Default) maps to `null` so an update CLEARS a previously-set
@@ -396,6 +431,7 @@ export function CreateScheduledTaskDialog({
           input: {
             ...input,
             ...overrides,
+            ...projectPatch,
             // Only on a real switch: sending the unchanged agent is a server-side
             // no-op, but omitting it keeps the PATCH honest about what changed.
             ...(agentChanged && effectiveAgentId !== null ? { agentId: effectiveAgentId } : {}),
@@ -406,6 +442,7 @@ export function CreateScheduledTaskDialog({
         await createMutation.mutateAsync({
           ...input,
           agentId: effectiveAgentId,
+          ...projectPatch,
           // Include an override only when the agent supports model/effort AND the
           // user picked a non-default value; an unselected control is omitted so
           // the create uses the agent's configured defaults.
@@ -591,6 +628,42 @@ export function CreateScheduledTaskDialog({
               intentionally has no visible control. It is still sent in the create
               payload so the schedule evaluates in the user's local zone. */}
 
+          {/* Project whose calling defaults apply at each fire. Pre-filled
+              from the surrounding context (or the edited task) until the user
+              changes it; "No project" leaves the master table in charge. */}
+          <div className="flex flex-col gap-1.5" data-testid="task-project-field">
+            <Label htmlFor="task-project">Project (optional)</Label>
+            <Select
+              value={effectiveProjectId === "" ? UNSET_PROJECT : effectiveProjectId}
+              componentId="tasks.scheduled.project"
+              onValueChange={(v) => {
+                setProjectTouched(true);
+                setProjectId(v === UNSET_PROJECT ? "" : v);
+              }}
+              onOpenChange={handleSelectOpenChange}
+            >
+              <SelectTrigger
+                id="task-project"
+                data-testid="task-project-trigger"
+                className="w-full"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent position="popper" align="start">
+                <SelectItem value={UNSET_PROJECT}>No project</SelectItem>
+                {projectOptions.map((project) => (
+                  <SelectItem key={project.id} value={project.id}>
+                    {project.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-sm text-muted-foreground">
+              Runs on this project&apos;s calling defaults for the host; no project uses the master
+              table.
+            </p>
+          </div>
+
           {/* Host / execution target. When the server offers managed sandboxes,
               a "New Sandbox" entry sits in the same picker (mirroring the New Chat
               composer): choosing it provisions a FRESH sandbox per fire
@@ -732,6 +805,9 @@ export function CreateScheduledTaskDialog({
 
 /** Sentinel Select value for "no pinned host" — Radix Select disallows "". */
 const UNSET_HOST = "__unset_host__";
+
+/** Sentinel Select value for "no project" — Radix Select disallows "". */
+const UNSET_PROJECT = "__unset_project__";
 
 /** Sentinel Select value for the "New Sandbox" option (execution_target=managed_sandbox). */
 const SANDBOX_HOST = "__sandbox__";

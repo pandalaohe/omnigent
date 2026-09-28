@@ -35,7 +35,23 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
+import type * as CallingDefaultsApiModule from "@/lib/callingDefaultsApi";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
+
+// The calling-defaults chain is a server read; an empty resolution keeps these
+// create-shape cases on the generic (agent list / host) defaults.
+vi.mock("@/lib/callingDefaultsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CallingDefaultsApiModule>()),
+  resolveCallingDefaults: vi.fn(async () => ({
+    agent_id: null,
+    harness: null,
+    model: null,
+    effort: null,
+    sources: {},
+    problems: [],
+  })),
+  listCallingDefaultCatalogs: vi.fn(async () => []),
+}));
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -205,15 +221,22 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   useProjects: () => ({ data: projects }),
   useProjectConfig: () => ({ data: projectConfig, isLoading: false }),
   useProjectHostRoots: () => ({
-    data: projectConfig?.host_id && projectConfig.host_id !== "__sandbox__"
-      ? {
-          roots: projectConfig.workspace
-            ? [{ host_id: projectConfig.host_id, workspace: projectConfig.workspace, source: "config" }]
-            : [],
-          default_host_id: projectConfig.host_id,
-          default_host_reason: "config",
-        }
-      : { roots: [], default_host_id: null, default_host_reason: "none" },
+    data:
+      projectConfig?.host_id && projectConfig.host_id !== "__sandbox__"
+        ? {
+            roots: projectConfig.workspace
+              ? [
+                  {
+                    host_id: projectConfig.host_id,
+                    workspace: projectConfig.workspace,
+                    source: "config",
+                  },
+                ]
+              : [],
+            default_host_id: projectConfig.host_id,
+            default_host_reason: "config",
+          }
+        : { roots: [], default_host_id: null, default_host_reason: "none" },
     isLoading: false,
     isError: false,
   }),
