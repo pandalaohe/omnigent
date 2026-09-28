@@ -25,6 +25,7 @@ import {
   RunnerOfflineError,
   browseLocationBase,
   browseLocationSegment,
+  fetchWorkspaceAllFiles,
   isRunnerUnavailable503,
   looksLikeWorkspaceFilePath,
   relativizeToWorkspace,
@@ -1571,5 +1572,28 @@ describe("browse-location wire form (survives a slash-merging proxy)", () => {
     const url = String(fetchMock.mock.calls[1][0]);
     expect(url).toContain("/filesystem/src/inner?");
     expect(url).not.toContain("base=");
+  });
+});
+
+describe("fetchWorkspaceAllFiles", () => {
+  it("returns the listing's has_more flag as truncated", async () => {
+    // The strict listing must preserve whether the page was cut off: a caller
+    // deciding "this path does not exist" has to know a miss may just live
+    // past the limit. 403/404 remain distinct elsewhere in the function.
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ object: "list", data: [dirEntry("cut.md")], has_more: true }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ object: "list", data: [dirEntry("whole.md")], has_more: false }),
+      );
+
+    const cut = await fetchWorkspaceAllFiles("conv_1");
+    expect(cut.truncated).toBe(true);
+    expect(cut.data.map((f) => f.path)).toEqual(["cut.md"]);
+
+    const whole = await fetchWorkspaceAllFiles("conv_1");
+    expect(whole.truncated).toBe(false);
   });
 });

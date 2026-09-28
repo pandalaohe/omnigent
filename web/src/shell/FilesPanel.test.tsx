@@ -7,6 +7,8 @@ import {
   type WorkspaceChangedFile,
   type WorkspaceFile,
   PathUnreachableError,
+  RunnerOfflineError,
+  fetchWorkspaceAllFiles,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceDirectories,
@@ -16,6 +18,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
+import { FileViewerContext } from "./FileViewerContext";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
@@ -39,12 +42,19 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   useWorkspaceDirectories: vi.fn(() => new Map()),
   useWorkspaceEnvironment: vi.fn(),
   useWorkspaceFileSearch: vi.fn(),
+  // Typed paths list their parent directly, fresh, so the test controls the
+  // one listing that decides between "file", "missing" and "incomplete".
+  fetchWorkspaceAllFiles: vi.fn(),
   // Real exports consumed by `instanceof` checks (FlatFileList's offline
   // hint, FilesPanel's unreachable-location message); the full module mock
   // would otherwise drop them (undefined → instanceof throws).
-  RunnerOfflineError: class RunnerOfflineError extends Error {},
+  RunnerOfflineError: class extends Error {},
   PathUnreachableError: class extends Error {
-    reachableRoots: string[] = [];
+    reachableRoots: string[];
+    constructor(message?: string, reachableRoots: string[] = []) {
+      super(message);
+      this.reachableRoots = reachableRoots;
+    }
   },
 }));
 
@@ -76,9 +86,21 @@ const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useDirectoriesMock = vi.mocked(useWorkspaceDirectories);
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useSearchMock = vi.mocked(useWorkspaceFileSearch);
+const fetchAllFilesMock = vi.mocked(fetchWorkspaceAllFiles);
 const allFilesRefetchMock = vi.fn(() => Promise.resolve());
 const changedFilesRefetchMock = vi.fn(() => Promise.resolve());
 const searchRefetchMock = vi.fn(() => Promise.resolve());
+// Stable FileViewer context for the typed-path flow: a module-scope value
+// keeps the context-value lint rule quiet across renders.
+const typedOpenFileMock = vi.fn();
+const TYPED_VIEWER = {
+  openFile: typedOpenFileMock,
+  openGithubTab: () => undefined,
+  isChangedPath: () => false,
+  conversationId: undefined as string | undefined,
+  workspaceRoot: "/home/user/proj",
+  workspaceHome: "/home/user",
+};
 
 function file(path: string, bytes = 10): WorkspaceFile {
   return {
@@ -247,6 +269,7 @@ beforeEach(() => {
   useDirectoriesMock.mockClear();
   useEnvironmentMock.mockReset();
   useSearchMock.mockReset();
+  fetchAllFilesMock.mockReset();
   allFilesRefetchMock.mockClear();
   changedFilesRefetchMock.mockClear();
   searchRefetchMock.mockClear();
@@ -259,26 +282,27 @@ afterEach(() => {
 });
 
 describe("FilesPanel working folder directory", () => {
-  it("shows the directory basename with the former heading typography", () => {
+  it("shows the full path with the former heading typography", () => {
     renderPanel({
       conversationId: "conv_wdir_posix",
       files: [],
       workingDir: "/home/user/my-project",
     });
-    const path = screen.getByText("my-project");
-    expect(path).toHaveClass("font-medium", "text-ui");
-    expect(path).not.toHaveClass("font-mono");
+    const field = screen.getByTestId("browse-location-path");
+    expect(field).toHaveTextContent("/home/user/my-project");
+    expect(field.querySelector("bdi")?.parentElement).toHaveClass("font-medium", "text-ui");
+    expect(field.querySelector("bdi")?.parentElement).not.toHaveClass("font-mono");
     expect(screen.queryByRole("button", { name: "Back to working folder" })).toBeNull();
   });
 
-  it("does not use the native title tooltip because the custom tooltip shows the full path", () => {
+  it("shows the full path in the location field", () => {
     renderPanel({
       conversationId: "conv_wdir_title",
       files: [],
       workingDir: "/home/user/my-project",
     });
-    const el = screen.getByText("my-project");
-    expect(el).not.toHaveAttribute("title");
+    const field = screen.getByTestId("browse-location-path");
+    expect(field).toHaveTextContent("/home/user/my-project");
   });
 
   it("handles Windows-style paths correctly", () => {
@@ -287,7 +311,9 @@ describe("FilesPanel working folder directory", () => {
       files: [],
       workingDir: "C:\\Users\\foo\\my-project",
     });
-    expect(screen.getByText("my-project")).toBeInTheDocument();
+    expect(screen.getByTestId("browse-location-path")).toHaveTextContent(
+      "C:\\Users\\foo\\my-project",
+    );
   });
 
   it("does not render a directory label when workingDir is null", () => {
@@ -356,7 +382,9 @@ describe("FilesPanel header role", () => {
     );
 
     expect(screen.queryByText("Working folder")).toBeNull();
-    expect(screen.getByText("workspace")).toHaveClass("font-medium", "text-ui");
+    const field = screen.getByTestId("browse-location-path");
+    expect(field).toHaveTextContent("/home/user/workspace");
+    expect(field.querySelector("bdi")?.parentElement).toHaveClass("font-medium", "text-ui");
     expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
 
@@ -1530,10 +1558,9 @@ describe("FilesPanel browse location", () => {
     roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
   };
 
-  it("stays a plain label when the session has nowhere else to go", () => {
-    // A confined agent with no declared grants can only ever see its
-    // workspace, so the navigation affordance must not appear at all --
-    // the panel looks exactly as it did before this control existed.
+  it("keeps the typed field but no picker when the session has nowhere else to go", () => {
+    // A confined agent can only ever see its workspace, so the directory
+    // picker must not appear -- but the path can still be typed or pasted.
     renderPanel({
       conversationId: "conv_confined",
       files: [],
@@ -1541,8 +1568,8 @@ describe("FilesPanel browse location", () => {
       reachable: CONFINED,
     });
 
-    expect(screen.queryByTestId("browse-location-path")).toBeNull();
-    expect(screen.getByText("proj")).toBeInTheDocument();
+    expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Browse folders" })).toBeNull();
     expect(screen.getByRole("button", { name: "Go to parent folder" })).toBeDisabled();
   });
 
@@ -1599,7 +1626,7 @@ describe("FilesPanel browse location", () => {
     useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
       location === "/etc" ? allFilesResult([file("hosts")]) : allFilesResult([]),
     );
-    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByRole("button", { name: "Browse folders" }));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
     fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
@@ -1618,7 +1645,7 @@ describe("FilesPanel browse location", () => {
       reachable: UNCONFINED,
     });
 
-    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByRole("button", { name: "Browse folders" }));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
     expect(useAllFilesMock).not.toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
     fireEvent.click(screen.getByTestId("stub-picker-confirm"));
@@ -1652,7 +1679,7 @@ describe("FilesPanel browse location", () => {
       workingDir: "/home/user/proj",
       reachable: UNCONFINED,
     });
-    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByRole("button", { name: "Browse folders" }));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
     fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     expect(useAllFilesMock).toHaveBeenLastCalledWith(
@@ -1685,7 +1712,7 @@ describe("FilesPanel browse location", () => {
       workingDir: "/home/user/proj",
       reachable: UNCONFINED,
     });
-    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByRole("button", { name: "Browse folders" }));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
     fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     first.unmount();
@@ -1737,9 +1764,11 @@ describe("FilesPanel browse location", () => {
       </MemoryRouter>,
     );
 
-    // Confined sessions render the plain label, so the message rides with the
-    // panel rather than the (absent) location bar.
-    expect(screen.getByText(/outside this session's reach/)).toBeInTheDocument();
+    // The refusal rides the location bar's error line even though the
+    // confined branch has no picker.
+    expect(screen.getByTestId("browse-location-error")).toHaveTextContent(
+      "Path '/etc' is outside this session's reach. Reachable: /home/user/proj",
+    );
   });
 });
 
@@ -1757,12 +1786,13 @@ describe("FilesPanel browse permission", () => {
     } as unknown as ReturnType<typeof useSession>);
   });
 
-  it("hides the control from a collaborator who is not the session owner", () => {
+  it("offers no folder picker to a collaborator who is not the session owner", () => {
     // `reachable` describes what the ENVIRONMENT can reach and is identical
     // for every viewer, so it cannot decide this on its own. Everything past
     // the workspace is the owner's own machine: a collaborator's browse is
     // refused 403, and the picker itself reads the owner-scoped host
-    // filesystem endpoint — so the control would open onto an error.
+    // filesystem endpoint — so the picker would open onto an error. Typing a
+    // path is still allowed; the server gates what it may read.
     vi.mocked(useSession).mockReturnValue({
       session: { hostId: "host_test", permissionLevel: 2 },
     } as unknown as ReturnType<typeof useSession>);
@@ -1774,9 +1804,8 @@ describe("FilesPanel browse permission", () => {
       reachable: UNCONFINED_REACH,
     });
 
-    expect(screen.queryByTestId("browse-location-path")).toBeNull();
-    // Still the plain label — the collaborator keeps the workspace view.
-    expect(screen.getByText("proj")).toBeInTheDocument();
+    expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Browse folders" })).toBeNull();
   });
 
   it("keeps the control for the session owner", () => {
@@ -1866,7 +1895,7 @@ describe("FilesPanel header copy path", () => {
       reachable: UNCONFINED_REACH,
     });
 
-    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByRole("button", { name: "Browse folders" }));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
     fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
@@ -1894,7 +1923,7 @@ describe("FilesPanel double-click navigation", () => {
 
     expect(useAllFilesMock).toHaveBeenCalledWith("conv_dblclick", { enabled: true }, "src");
     // The header still names the absolute directory the user is standing in.
-    expect(screen.getByText("src")).toBeInTheDocument();
+    expect(screen.getByTestId("browse-location-path")).toHaveTextContent("/home/user/proj/src");
   });
 
   it("re-attaches the browsed folder when opening a file the tree named", () => {
@@ -1922,5 +1951,222 @@ describe("FilesPanel double-click navigation", () => {
     fireEvent.click(screen.getByText("App.tsx"));
 
     expect(onFileSelect).toHaveBeenCalledWith("src/App.tsx");
+  });
+});
+
+describe("FilesPanel typed location path", () => {
+  const UNCONFINED = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+  const CONFINED = {
+    unconfined: false,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  function renderTypedPanel({
+    conversationId,
+    onFileSelect = vi.fn(),
+    reachable = UNCONFINED,
+  }: {
+    conversationId: string;
+    onFileSelect?: (path: string) => void;
+    reachable?: typeof UNCONFINED | typeof CONFINED;
+  }) {
+    typedOpenFileMock.mockReset();
+    useAllFilesMock.mockReturnValue(allFilesResult([]));
+    useChangedFilesMock.mockReturnValue(changedFilesResult([]));
+    useDirectoryMock.mockReturnValue(directoryResult());
+    useEnvironmentMock.mockReturnValue(environmentResult("/home/user/proj", reachable));
+    useSearchMock.mockReturnValue(searchResult());
+
+    return render(
+      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FileViewerContext.Provider value={TYPED_VIEWER}>
+                <FilesPanel
+                  sort="recent"
+                  onSortChange={vi.fn()}
+                  flatView={false}
+                  onFileSelect={onFileSelect}
+                  showHidden={false}
+                  onShowHiddenChange={vi.fn()}
+                />
+              </FileViewerContext.Provider>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function enterPath(text: string) {
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    const input = screen.getByRole("textbox", { name: "File or folder path" });
+    fireEvent.change(input, { target: { value: text } });
+    fireEvent.keyDown(input, { key: "Enter" });
+  }
+
+  afterEach(() => {
+    // Restore the suite default (owner) — a mockReturnValue set per test
+    // would otherwise leak into later suites.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test" },
+    } as unknown as ReturnType<typeof useSession>);
+  });
+
+  it("browses to a folder typed as a path", async () => {
+    renderTypedPanel({ conversationId: "conv_typed_dir" });
+    fetchAllFilesMock.mockResolvedValue({ available: true, data: [dir("src")], truncated: false });
+
+    enterPath("src");
+
+    // The root listing holds the entry; the panel then re-roots relatively,
+    // the same wire form a double-click uses.
+    await waitFor(() => expect(fetchAllFilesMock).toHaveBeenCalledWith("conv_typed_dir", ""));
+    await waitFor(() =>
+      expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_typed_dir", expect.anything(), "src"),
+    );
+    expect(typedOpenFileMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("browse-location-path")).toHaveTextContent("/home/user/proj/src");
+  });
+
+  it("browses the filesystem root when the owner types /", async () => {
+    renderTypedPanel({ conversationId: "conv_typed_root" });
+
+    enterPath("/");
+
+    // "/" is a root, not a folder to look up: the panel re-roots to it, sent
+    // absolute because it lies outside the workspace.
+    await waitFor(() =>
+      expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_typed_root", expect.anything(), "/"),
+    );
+    expect(fetchAllFilesMock).not.toHaveBeenCalled();
+    expect(typedOpenFileMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["workspace-relative", "conv_typed_slash_rel", "report/sub/"],
+    ["absolute", "conv_typed_slash_abs", "/home/user/proj/report/sub/"],
+  ])("browses a %s folder path with a trailing slash", async (_label, conversationId, typed) => {
+    renderTypedPanel({ conversationId });
+    fetchAllFilesMock.mockResolvedValue({ available: true, data: [dir("sub")], truncated: false });
+
+    enterPath(typed);
+
+    await waitFor(() => expect(fetchAllFilesMock).toHaveBeenCalledWith(conversationId, "report"));
+    await waitFor(() =>
+      expect(useAllFilesMock).toHaveBeenLastCalledWith(
+        conversationId,
+        expect.anything(),
+        "report/sub",
+      ),
+    );
+    expect(typedOpenFileMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["workspace-relative", "src/App.tsx:12"],
+    ["absolute", "/home/user/proj/src/App.tsx:12"],
+    ["home-relative", "~/proj/src/App.tsx:12"],
+  ])("opens a %s file path at its cited line", async (_label, typed) => {
+    renderTypedPanel({ conversationId: "conv_typed_file" });
+    fetchAllFilesMock.mockResolvedValue({
+      available: true,
+      data: [file("App.tsx")],
+      truncated: false,
+    });
+
+    enterPath(typed);
+
+    await waitFor(() =>
+      expect(typedOpenFileMock).toHaveBeenCalledWith("src/App.tsx", { line: 12 }),
+    );
+    expect(screen.queryByRole("textbox", { name: "File or folder path" })).toBeNull();
+  });
+
+  it("reports a missing path inline and keeps the typed text", async () => {
+    renderTypedPanel({ conversationId: "conv_typed_missing" });
+    fetchAllFilesMock.mockResolvedValue({ available: true, data: [], truncated: false });
+
+    enterPath("nope/x.md");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("browse-location-error")).toHaveTextContent("Not found: nope/x.md"),
+    );
+    expect(screen.getByRole("textbox", { name: "File or folder path" })).toHaveValue("nope/x.md");
+    expect(typedOpenFileMock).not.toHaveBeenCalled();
+  });
+
+  it("treats an absent parent folder as not found", async () => {
+    renderTypedPanel({ conversationId: "conv_typed_absent" });
+    fetchAllFilesMock.mockResolvedValue({ available: false, data: [], truncated: false });
+
+    enterPath("gone/x.md");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("browse-location-error")).toHaveTextContent("Not found: gone/x.md"),
+    );
+  });
+
+  it("surfaces the reachable roots when the path is refused", async () => {
+    renderTypedPanel({ conversationId: "conv_typed_refused" });
+    fetchAllFilesMock.mockRejectedValue(
+      new PathUnreachableError("Path '/etc' is outside this session's reach", ["/home/user/proj"]),
+    );
+
+    enterPath("/etc/hosts");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("browse-location-error")).toHaveTextContent(
+        "Path '/etc' is outside this session's reach. Reachable: /home/user/proj",
+      ),
+    );
+  });
+
+  it("opens a path the truncated parent page may have missed", async () => {
+    renderTypedPanel({ conversationId: "conv_typed_truncated" });
+    fetchAllFilesMock.mockResolvedValue({ available: true, data: [], truncated: true });
+
+    enterPath("deep/thing.md:3");
+
+    await waitFor(() =>
+      expect(typedOpenFileMock).toHaveBeenCalledWith("deep/thing.md", { line: 3 }),
+    );
+    expect(screen.queryByTestId("browse-location-error")).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "File or folder path" })).toBeNull();
+  });
+
+  it("reports a runner that cannot answer right now", async () => {
+    renderTypedPanel({ conversationId: "conv_typed_offline" });
+    fetchAllFilesMock.mockRejectedValue(new RunnerOfflineError());
+
+    enterPath("a/b.md");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("browse-location-error")).toHaveTextContent(
+        "Couldn't check a/b.md right now",
+      ),
+    );
+  });
+
+  it("accepts a typed path from a confined viewer", async () => {
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: 2 },
+    } as unknown as ReturnType<typeof useSession>);
+    renderTypedPanel({ conversationId: "conv_typed_confined", reachable: CONFINED });
+    fetchAllFilesMock.mockResolvedValue({
+      available: true,
+      data: [file("App.tsx")],
+      truncated: false,
+    });
+
+    enterPath("src/App.tsx");
+
+    await waitFor(() => expect(typedOpenFileMock).toHaveBeenCalledWith("src/App.tsx", undefined));
+    expect(screen.queryByRole("button", { name: "Browse folders" })).toBeNull();
   });
 });

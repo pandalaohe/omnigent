@@ -387,6 +387,16 @@ export const HTML_PREVIEW_SANDBOX =
   "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-top-navigation allow-downloads";
 
 /**
+ * Sandbox flags for the HTML artifact iframe inside the app's panel:
+ * {@link HTML_PREVIEW_SANDBOX} without `allow-top-navigation`, so artifact JS
+ * in the panel cannot navigate the whole omnigent tab away. The standalone
+ * raw view and the embed preview keep the full-browser surface.
+ */
+export const HTML_PANEL_SANDBOX = HTML_PREVIEW_SANDBOX.split(" ")
+  .filter((flag) => flag !== "allow-top-navigation")
+  .join(" ");
+
+/**
  * Prepare HTML artifact content for the preview iframe by forcing every link to
  * open in a new tab (issue #777: "We should always make it open in a new
  * window").

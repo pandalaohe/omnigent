@@ -1,5 +1,5 @@
-import { ArrowLeftIcon, FolderDotIcon } from "lucide-react";
-import { useState } from "react";
+import { ArrowLeftIcon, FolderDotIcon, FolderSearchIcon } from "lucide-react";
+import { type KeyboardEvent, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -24,31 +24,25 @@ interface BrowseLocationBarProps {
   reach: WorkspaceReach | null;
   /** Navigate to an absolute path. */
   onNavigate: (absolutePath: string) => void;
+  /**
+   * Commit a typed file or folder path. Resolves to the error message to show
+   * under the field (which stays open with the text), or null once the path
+   * opened or navigated, which closes the field.
+   */
+  onOpenPath: (text: string) => Promise<string | null>;
   /** Message shown under the path when the last navigation was refused. */
   error?: string | null;
 }
 
 /**
- * Working-folder path in the files header, clickable to browse elsewhere.
+ * Working-folder path in the files header: an editable field plus navigation.
  *
- * The path opens the same directory browser the new-session flow uses to pick
- * a workspace, so choosing where to look is one interaction the user has
- * already learned — and it brings that browser's roots, typed path, Host pin,
- * folder search, Up / Home, and show-hidden controls along with it. Navigation
- * remains provisional until Confirm, matching every other workspace-browser
- * invocation.
- *
- * Falls back to a plain path label when the full browser is unavailable. The
- * parent button remains enabled only while moving upward stays inside the
+ * Clicking the path swaps it for a text input seeded with the current absolute
+ * path and fully selected; Enter commits it as a file or folder path, Escape or
+ * blur restores. The folder picker lives on its own trailing button, shown only
+ * where roaming is allowed; the field itself is offered to every viewer. The
+ * parent button stays enabled only while moving upward remains inside the
  * workspace, avoiding an owner-scoped host browse that would be refused.
- *
- * @param current Absolute path currently shown.
- * @param workspace Absolute workspace root, for the picker's return button.
- * @param hostId Host whose filesystem to browse.
- * @param canBrowseOutside Whether this viewer is allowed to leave the workspace.
- * @param reach The session's reported reach, or null while loading.
- * @param onNavigate Fired with the absolute path to browse to.
- * @param error Message to show when the last navigation was refused.
  */
 export function BrowseLocationBar({
   current,
@@ -57,31 +51,72 @@ export function BrowseLocationBar({
   canBrowseOutside,
   reach,
   onNavigate,
+  onOpenPath,
   error,
 }: BrowseLocationBarProps) {
-  const [open, setOpen] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(current);
+  const [commitError, setCommitError] = useState<string | null>(null);
+  // Identifies the live edit attempt: a commit's late result applies only
+  // while its own attempt is still current.
+  const attempt = useRef(0);
+  // Ref, not state: a second Enter in the same event loop tick must not slip
+  // past a guard that only takes effect on the next render.
+  const committing = useRef(false);
   const canRoam = canBrowseOutside && (reach?.unconfined ?? false) && hostId !== null;
   const parent = parentPath(current);
   const navigableParent =
     parent !== null && (canRoam || pathIsWithin(parent, workspace)) ? parent : null;
+  const shownError = commitError ?? error;
 
-  if (!canRoam) {
-    return (
-      <TooltipProvider>
-        <span className="flex min-w-0 flex-1 items-center gap-[2px]">
-          <ParentFolderButton parent={navigableParent} onNavigate={onNavigate} />
-          <WorkspaceRootButton current={current} workspace={workspace} onNavigate={onNavigate} />
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="inline-block min-w-0 flex-1 truncate font-medium text-ui">
-                {basename(current)}
-              </span>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">{current}</TooltipContent>
-          </Tooltip>
-        </span>
-      </TooltipProvider>
-    );
+  function startEditing() {
+    attempt.current += 1;
+    committing.current = false;
+    setDraft(current);
+    setCommitError(null);
+    setEditing(true);
+  }
+
+  function cancelEditing() {
+    attempt.current += 1;
+    committing.current = false;
+    setEditing(false);
+    setCommitError(null);
+  }
+
+  async function commit() {
+    if (committing.current) return;
+    const id = attempt.current;
+    committing.current = true;
+    try {
+      const message = await onOpenPath(draft);
+      // A cancelled or restarted edit owns the bar now; its promise decides.
+      if (attempt.current !== id) return;
+      if (message === null) {
+        setEditing(false);
+        setCommitError(null);
+      } else {
+        setCommitError(message);
+      }
+    } finally {
+      if (attempt.current === id) committing.current = false;
+    }
+  }
+
+  function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      // An IME's confirming Enter must not commit a half-composed path.
+      if (!event.nativeEvent.isComposing && draft.trim() !== "") void commit();
+      return;
+    }
+    if (event.key === "Escape") {
+      // A drawer hosted around this bar closes on a window-level Escape;
+      // cancelling the edit must not also dismiss that panel.
+      event.stopPropagation();
+      cancelEditing();
+    }
   }
 
   return (
@@ -89,30 +124,64 @@ export function BrowseLocationBar({
       <span className="flex min-w-0 items-center gap-[2px]">
         <ParentFolderButton parent={navigableParent} onNavigate={onNavigate} />
         <WorkspaceRootButton current={current} workspace={workspace} onNavigate={onNavigate} />
-        <button
-          type="button"
-          title={open ? undefined : current}
-          aria-label={`Working folder: ${current}. Click to browse.`}
-          aria-expanded={open}
-          onClick={() => setOpen(true)}
-          className="min-w-0 flex-1 cursor-pointer rounded px-1 py-0.5 text-left hover:bg-muted hover:text-foreground"
-          data-testid="browse-location-path"
-        >
-          <PathText path={current} />
-        </button>
+        {editing ? (
+          <input
+            autoFocus
+            aria-label="File or folder path"
+            className="min-w-0 flex-1 rounded border border-border bg-transparent px-1 py-0.5 font-medium text-ui outline-none focus:border-ring"
+            onBlur={cancelEditing}
+            onChange={(event) => setDraft(event.target.value)}
+            onFocus={(event) => event.currentTarget.select()}
+            onKeyDown={handleKeyDown}
+            value={draft}
+          />
+        ) : (
+          <button
+            type="button"
+            title={current}
+            aria-label={`Working folder: ${current}. Click to edit the path.`}
+            onClick={startEditing}
+            className="min-w-0 flex-1 cursor-pointer rounded px-1 py-0.5 text-left hover:bg-muted hover:text-foreground"
+            data-testid="browse-location-path"
+          >
+            <PathText path={current} />
+          </button>
+        )}
+        {canRoam && (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Browse folders"
+                  aria-expanded={pickerOpen}
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                  onClick={() => setPickerOpen(true)}
+                >
+                  <FolderSearchIcon />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Browse folders</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
       </span>
-      <WorkspacePickerDialog
-        open={open}
-        onOpenChange={setOpen}
-        hostId={hostId}
-        initialPath={current}
-        workspacePath={workspace}
-        onConfirm={onNavigate}
-      />
-      {error && (
+      {shownError && (
         <span className="truncate text-[10px] text-destructive" data-testid="browse-location-error">
-          {error}
+          {shownError}
         </span>
+      )}
+      {canRoam && (
+        <WorkspacePickerDialog
+          open={pickerOpen}
+          onOpenChange={setPickerOpen}
+          hostId={hostId}
+          initialPath={current}
+          workspacePath={workspace}
+          onConfirm={onNavigate}
+        />
       )}
     </span>
   );
@@ -195,17 +264,6 @@ function PathText({ path }: { path: string }) {
       <bdi dir="ltr">{path}</bdi>
     </span>
   );
-}
-
-/**
- * Last path segment, or "/" for the filesystem root.
- *
- * Splits on both separators: a Windows host reports its workspace with
- * backslashes, and those sessions still need a readable folder name.
- */
-function basename(absolutePath: string): string {
-  if (absolutePath === "/" || absolutePath === "") return "/";
-  return absolutePath.split(/[/\\]/).filter(Boolean).pop() ?? absolutePath;
 }
 
 function parentPath(absolutePath: string): string | null {

@@ -163,6 +163,39 @@ describe("parseBridgeMessage", () => {
     });
   });
 
+  it("accepts an openPath message carrying string href and base", () => {
+    expect(
+      parseBridgeMessage(
+        {
+          ...base,
+          type: BRIDGE_MSG.openPath,
+          href: "../outside.html",
+          base: "http://host/v1/artifacts/tok/index.html",
+        },
+        NONCE,
+      ),
+    ).toEqual({
+      type: BRIDGE_MSG.openPath,
+      href: "../outside.html",
+      base: "http://host/v1/artifacts/tok/index.html",
+    });
+  });
+
+  it("rejects an openPath message with non-string or oversized fields", () => {
+    const msg = (href: unknown, baseValue: unknown = "http://host/") => ({
+      ...base,
+      type: BRIDGE_MSG.openPath,
+      href,
+      base: baseValue,
+    });
+    expect(parseBridgeMessage(msg(7), NONCE)).toBeNull();
+    expect(parseBridgeMessage(msg("../x", 7), NONCE)).toBeNull();
+    expect(parseBridgeMessage(msg("a".repeat(4097)), NONCE)).toBeNull();
+    expect(parseBridgeMessage(msg("../x", "b".repeat(4097)), NONCE)).toBeNull();
+    // Exactly at the cap is still accepted.
+    expect(parseBridgeMessage(msg("a".repeat(4096)), NONCE)).not.toBeNull();
+  });
+
   it("rejects a wrong nonce (spoof from artifact JS)", () => {
     expect(
       parseBridgeMessage({ ...base, nonce: "other", type: BRIDGE_MSG.selectionCleared }, NONCE),
@@ -364,10 +397,16 @@ describe("omni-html-bridge.js runtime", () => {
     return win;
   }
 
-  function clickAnchor(win: BridgeWindow, href: string, target?: string): MouseEvent {
+  function clickAnchor(
+    win: BridgeWindow,
+    href: string,
+    target?: string,
+    download?: boolean,
+  ): MouseEvent {
     const anchor = win.document.createElement("a");
     anchor.href = href;
     if (target) anchor.setAttribute("target", target);
+    if (download) anchor.setAttribute("download", "");
     win.document.body.appendChild(anchor);
     const ev = new win.MouseEvent("click", { bubbles: true, cancelable: true });
     anchor.dispatchEvent(ev);
@@ -379,6 +418,13 @@ describe("omni-html-bridge.js runtime", () => {
     const open = vi.fn(() => null);
     win.open = open;
     return open;
+  }
+
+  /** Let queued MessagePort deliveries run. */
+  function flushPorts() {
+    return new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
   }
 
   afterEach(() => {
@@ -413,12 +459,16 @@ describe("omni-html-bridge.js runtime", () => {
     channel.port2.close();
   });
 
-  it("adopts the init port, reports its pathname, and routes links out of the bundle", async () => {
+  it("adopts the init port, reports its pathname, and routes links by origin", async () => {
     const win = startBridge(BUNDLE_URL, NONCE);
 
     const channel = new MessageChannel();
-    const ready = new Promise<Record<string, unknown>>((resolve) => {
-      channel.port2.onmessage = (ev) => resolve(ev.data as Record<string, unknown>);
+    const messages: Record<string, unknown>[] = [];
+    const ready = new Promise<void>((resolve) => {
+      channel.port2.onmessage = (ev) => {
+        messages.push(ev.data as Record<string, unknown>);
+        if ((ev.data as { type?: string }).type === BRIDGE_MSG.ready) resolve();
+      };
     });
     win.dispatchEvent(
       new win.MessageEvent("message", {
@@ -427,7 +477,8 @@ describe("omni-html-bridge.js runtime", () => {
       }),
     );
 
-    await expect(ready).resolves.toMatchObject({
+    await ready;
+    expect(messages[0]).toMatchObject({
       source: BRIDGE_SOURCE,
       nonce: NONCE,
       type: BRIDGE_MSG.ready,
@@ -441,20 +492,27 @@ describe("omni-html-bridge.js runtime", () => {
     expect(open).toHaveBeenCalledWith("https://example.com/x", "_blank", "noopener,noreferrer");
     expect(external.defaultPrevented).toBe(true);
 
-    // Same bundle: left to the frame (relative resolution intact).
+    // Same bundle without a target: left native, so the page's own handlers
+    // keep control and the bridge neither posts it nor moves the frame.
     open.mockClear();
     const sibling = clickAnchor(win, "page2.html");
     expect(open).not.toHaveBeenCalled();
     expect(sibling.defaultPrevented).toBe(false);
 
-    // Same origin but a different token: still outside this bundle.
+    // Same origin but a different token: outside this bundle, so the parent
+    // opens it in the file viewer instead of a 404 tab.
+    messages.length = 0;
     const otherToken = clickAnchor(win, "/omni/v1/artifacts/OTHER/x.html");
-    expect(open).toHaveBeenCalledWith(
-      "http://localhost:3000/omni/v1/artifacts/OTHER/x.html",
-      "_blank",
-      "noopener,noreferrer",
-    );
+    expect(open).not.toHaveBeenCalled();
     expect(otherToken.defaultPrevented).toBe(true);
+    await flushPorts();
+    expect(messages).toContainEqual({
+      source: BRIDGE_SOURCE,
+      nonce: NONCE,
+      type: BRIDGE_MSG.openPath,
+      href: "/omni/v1/artifacts/OTHER/x.html",
+      base: BUNDLE_URL,
+    });
 
     channel.port1.close();
     channel.port2.close();
@@ -472,6 +530,8 @@ describe("omni-html-bridge.js runtime", () => {
     // though the page path carries a second `v1/artifacts` segment.
     const sibling = clickAnchor(win, "../../../sibling.html");
     expect(open).not.toHaveBeenCalled();
+    // No target: left native. Being read as outside the bundle would have
+    // prevented the click to post openPath instead.
     expect(sibling.defaultPrevented).toBe(false);
   });
 
@@ -510,16 +570,183 @@ describe("omni-html-bridge.js runtime", () => {
     return channel;
   }
 
-  it("leaves panel-mode link handling unchanged when the init carries no visit flag", async () => {
+  it("navigates the frame for in-bundle links with an escaping target", async () => {
     const win = startBridge(BUNDLE_URL, NONCE);
     const channel = await initBridge(win, undefined);
+    const open = stubOpen(win);
+
+    // `_top`/`_parent` would navigate the top page and `_blank` opens a tab;
+    // the panel keeps the frame in charge of all three.
+    const top = clickAnchor(win, "#top-sec", "_top");
+    expect(top.defaultPrevented).toBe(true);
+    expect(win.location.href).toBe(`${BUNDLE_URL}#top-sec`);
+
+    const parent = clickAnchor(win, "#parent-sec", "_parent");
+    expect(parent.defaultPrevented).toBe(true);
+    expect(win.location.href).toBe(`${BUNDLE_URL}#parent-sec`);
+
+    const blank = clickAnchor(win, "#blank-sec", "_blank");
+    expect(blank.defaultPrevented).toBe(true);
+    expect(win.location.href).toBe(`${BUNDLE_URL}#blank-sec`);
+    expect(open).not.toHaveBeenCalled();
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("uses the base target for an in-bundle link with no target attribute", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = await initBridge(win, undefined);
+    const open = stubOpen(win);
+
+    const base = win.document.createElement("base");
+    base.setAttribute("target", "_blank");
+    win.document.head.appendChild(base);
+    const inherited = clickAnchor(win, "#inherited-sec");
+    expect(inherited.defaultPrevented).toBe(true);
+    expect(win.location.href).toBe(`${BUNDLE_URL}#inherited-sec`);
+    expect(open).not.toHaveBeenCalled();
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("leaves an in-bundle link with no escaping target native", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = await initBridge(win, undefined);
+    const open = stubOpen(win);
+
+    const sibling = clickAnchor(win, "page2.html");
+    expect(sibling.defaultPrevented).toBe(false);
+    expect(open).not.toHaveBeenCalled();
+    expect(win.location.href).toBe(BUNDLE_URL);
+
+    // A target-less fragment: had the bridge assigned it, the frame would have
+    // moved to #tab1.
+    const fragment = clickAnchor(win, "#tab1");
+    expect(fragment.defaultPrevented).toBe(false);
+    expect(win.location.href).toBe(BUNDLE_URL);
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("prefers the anchor's own target over the inherited base target", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = await initBridge(win, undefined);
+    const open = stubOpen(win);
+
+    const base = win.document.createElement("base");
+    base.setAttribute("target", "_blank");
+    win.document.head.appendChild(base);
+    const self = clickAnchor(win, "#self-sec", "_self");
+    expect(self.defaultPrevented).toBe(false);
+    expect(win.location.href).toBe(BUNDLE_URL);
+    expect(open).not.toHaveBeenCalled();
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("lets the page's own handler cancel an in-bundle fragment link (scenario 30)", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = await initBridge(win, undefined);
+    const open = stubOpen(win);
+
+    const anchor = win.document.createElement("a");
+    anchor.setAttribute("href", "#tab2");
+    const onClick = vi.fn((ev: Event) => ev.preventDefault());
+    anchor.addEventListener("click", onClick);
+    win.document.body.appendChild(anchor);
+    const ev = new win.MouseEvent("click", { bubbles: true, cancelable: true });
+    anchor.dispatchEvent(ev);
+
+    expect(onClick).toHaveBeenCalledTimes(1);
+    expect(ev.defaultPrevented).toBe(true);
+    // The bridge's capture listener runs first: leaving the click alone is
+    // what lets the handler cancel before any frame navigation happens.
+    expect(win.location.href).toBe(BUNDLE_URL);
+    expect(open).not.toHaveBeenCalled();
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("keeps an in-bundle download link native even with an escaping target", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = await initBridge(win, undefined);
+    const open = stubOpen(win);
+
+    const download = clickAnchor(win, "report.pdf", "_blank", true);
+    expect(download.defaultPrevented).toBe(false);
+    expect(open).not.toHaveBeenCalled();
+    expect(win.location.href).toBe(BUNDLE_URL);
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("posts openPath for a file: link or a link above the bundle", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = new MessageChannel();
+    const messages: Record<string, unknown>[] = [];
+    const ready = new Promise<void>((resolve) => {
+      channel.port2.onmessage = (ev) => {
+        messages.push(ev.data as Record<string, unknown>);
+        if ((ev.data as { type?: string }).type === BRIDGE_MSG.ready) resolve();
+      };
+    });
+    win.dispatchEvent(
+      new win.MessageEvent("message", {
+        data: { source: BRIDGE_SOURCE, nonce: NONCE, type: BRIDGE_MSG.init },
+        ports: [channel.port1],
+      }),
+    );
+    await ready;
+    messages.length = 0;
 
     const open = stubOpen(win);
-    const top = clickAnchor(win, "page2.html", "_top");
-    expect(top.defaultPrevented).toBe(false);
+
+    const file = clickAnchor(win, "file:///abs/ws/outside.html");
+    expect(file.defaultPrevented).toBe(true);
     expect(open).not.toHaveBeenCalled();
-    // The panel's own preview keeps the native frame navigation.
-    expect(win.location.href).toBe(BUNDLE_URL);
+
+    // `../..` from the entry reaches /omni/v1/outside.html: same origin but
+    // outside the artifact prefix, so it belongs to the parent, not the frame.
+    const escape = clickAnchor(win, "../../outside.html");
+    expect(escape.defaultPrevented).toBe(true);
+    expect(open).not.toHaveBeenCalled();
+
+    await flushPorts();
+    expect(messages).toEqual([
+      {
+        source: BRIDGE_SOURCE,
+        nonce: NONCE,
+        type: BRIDGE_MSG.openPath,
+        href: "file:///abs/ws/outside.html",
+        base: BUNDLE_URL,
+      },
+      {
+        source: BRIDGE_SOURCE,
+        nonce: NONCE,
+        type: BRIDGE_MSG.openPath,
+        href: "../../outside.html",
+        base: BUNDLE_URL,
+      },
+    ]);
+
+    channel.port1.close();
+    channel.port2.close();
+  });
+
+  it("leaves non-http schemes native in panel mode", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    const channel = await initBridge(win, undefined);
+    const open = stubOpen(win);
+
+    const mailto = clickAnchor(win, "mailto:someone@example.com");
+    expect(mailto.defaultPrevented).toBe(false);
+    expect(open).not.toHaveBeenCalled();
 
     channel.port1.close();
     channel.port2.close();

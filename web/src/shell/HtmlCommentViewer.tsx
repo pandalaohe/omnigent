@@ -3,11 +3,11 @@
 // users can select rendered text and attach review comments — parity with the
 // Markdown (TipTap) and code (Monaco/Shiki) comment surfaces.
 //
-// The iframe stays sandboxed WITHOUT `allow-same-origin` (see HTML_PREVIEW_SANDBOX),
-// so the parent can't touch its DOM directly. All selection capture and
-// highlight painting happens inside the iframe via the injected bridge, relayed
-// over a private MessageChannel. See htmlCommentBridge.ts for the protocol and
-// trust model.
+// The iframe stays sandboxed WITHOUT `allow-same-origin` (see
+// HTML_PANEL_SANDBOX / HTML_PREVIEW_SANDBOX), so the parent can't touch its DOM
+// directly. All selection capture and highlight painting happens inside the
+// iframe via the injected bridge, relayed over a private MessageChannel. See
+// htmlCommentBridge.ts for the protocol and trust model.
 //
 // Standalone the frame loads the artifact URL as `src`, so relative resources
 // and in-bundle links resolve inside the bundle and the server inlines the
@@ -26,10 +26,17 @@ import {
   fetchArtifactSource,
   useArtifactEntry,
 } from "@/hooks/useArtifactLink";
+import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { getEmbedRoot, hasOmnigentHostFetcher } from "@/lib/host";
 import { withBasePath } from "@/lib/basePath";
 import { randomUUID } from "@/lib/randomUUID";
-import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { showToast } from "@/components/ui/toast";
+import {
+  type ActiveSelection,
+  HTML_PANEL_SANDBOX,
+  HTML_PREVIEW_SANDBOX,
+} from "./codeViewerHelpers";
+import { useFileViewer, useWorkspacePaths } from "./FileViewerContext";
 import {
   anchorOccurrence,
   BRIDGE_MSG,
@@ -150,6 +157,137 @@ function artifactTail(url: string): string | null {
   return match ? match[1] : null;
 }
 
+/** Decoded copy of `value`, or the raw string when its escapes are malformed. */
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** Scheme name of a URL-shaped string, e.g. `file` or `http`, else null. */
+function urlScheme(value: string): string | null {
+  const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(value);
+  return match ? match[1].toLowerCase() : null;
+}
+
+/**
+ * Path part of a decoded absolute URL string. The string is already decoded,
+ * and `URL.pathname` would re-encode literal spaces/escapes, so the path is
+ * sliced out by hand instead.
+ */
+function absoluteUrlPath(value: string): string {
+  const rest = value.slice(urlScheme(value)!.length + 1);
+  if (!rest.startsWith("//")) return rest.startsWith("/") ? rest : `/${rest}`;
+  const slash = rest.indexOf("/", 2);
+  return slash === -1 ? "/" : rest.slice(slash);
+}
+
+/** Whether two absolute URLs share a protocol and host (ports included). */
+function sameOrigin(value: string, base: string): boolean {
+  try {
+    const a = new URL(value);
+    const b = new URL(base);
+    return a.protocol === b.protocol && a.host === b.host;
+  } catch {
+    return false;
+  }
+}
+
+/** Directory part of a posix path; a trailing slash names a directory already. */
+function posixDir(path: string): string {
+  if (path.endsWith("/")) return path;
+  return path.slice(0, path.lastIndexOf("/") + 1);
+}
+
+/** Join a posix directory with a relative path, without resolving `..`. */
+function posixJoin(dir: string, relative: string): string {
+  if (!dir) return relative;
+  return dir.endsWith("/") ? dir + relative : `${dir}/${relative}`;
+}
+
+/**
+ * Normalise `.`/`..` segments by hand. `URL` would clamp a `..` above the root
+ * in place, hiding the escape this helper must report.
+ */
+function normalizePosixPath(path: string): string {
+  const absolute = path.startsWith("/");
+  const out: string[] = [];
+  for (const segment of path.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      if (out.length > 0 && out[out.length - 1] !== "..") out.pop();
+      else if (!absolute) out.push("..");
+      continue;
+    }
+    out.push(segment);
+  }
+  return (absolute ? "/" : "") + out.join("/");
+}
+
+/**
+ * Resolve a link the preview bridge reported to a path the file viewer can
+ * open, or null.
+ *
+ * `href` is the anchor's raw attribute (URL resolution would clamp a `..`
+ * above the artifact token segment) and `base` its `document.baseURI`, so a
+ * `<base href>` and an in-frame navigation both resolve against the page the
+ * frame is actually showing. A relative link is resolved by hand against the
+ * base's workspace directory — never `URL`, which clamps the escape — and the
+ * candidate is then handed to {@link resolveChatFilePath} so an absolute path
+ * under the workspace collapses to workspace-relative and the canonical-form
+ * checks are shared.
+ */
+export function resolveFrameLinkPath(
+  href: string,
+  base: string,
+  entryPath: string,
+  root: string | null,
+  home: string | null,
+): string | null {
+  // A fragment or query never names a different file. Decode so the candidate
+  // matches the workspace path the rest of the app speaks; a malformed escape
+  // keeps the raw form rather than dropping the link.
+  const target = safeDecode(href.split("#")[0].split("?")[0]);
+  if (!target) return null;
+
+  const scheme = urlScheme(target);
+  let candidate: string;
+  if (scheme === "file") {
+    candidate = absoluteUrlPath(target);
+  } else if (scheme === "http" || scheme === "https") {
+    // Only a same-origin URL can name a file this session can open.
+    if (!sameOrigin(target, base)) return null;
+    candidate = absoluteUrlPath(target);
+  } else if (scheme) {
+    return null;
+  } else if (target.startsWith("/")) {
+    candidate = target;
+  } else {
+    let basePath: string | null;
+    try {
+      basePath = new URL(base).pathname;
+    } catch {
+      basePath = null;
+    }
+    if (basePath === null) return null;
+    const tail = ARTIFACT_TAIL_RE.exec(basePath);
+    // Inside the artifact route the base names a workspace page, so the href
+    // joins its directory there. A base outside the route contributes only its
+    // own host-absolute directory.
+    const pagePath = tail
+      ? joinBundlePath(bundleRoot(entryPath), safeDecode(tail[1]))
+      : safeDecode(basePath);
+    candidate = posixJoin(posixDir(pagePath), target);
+  }
+
+  const normalized = normalizePosixPath(candidate);
+  // A relative escape that climbs above its base would leave the workspace.
+  if (normalized === ".." || normalized.startsWith("../")) return null;
+  return resolveChatFilePath(normalized, root, home)?.path ?? null;
+}
+
 export function HtmlCommentViewer({
   conversationId,
   path,
@@ -162,6 +300,8 @@ export function HtmlCommentViewer({
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const isEmbed = hasOmnigentHostFetcher();
+  const openFile = useFileViewer();
+  const { root: workspaceRoot, home: workspaceHome } = useWorkspacePaths();
 
   // Embed mode cannot carry an iframe `src` through the host fetcher: it keeps
   // the client-injected srcdoc (bridge + fresh nonce per content load, which
@@ -231,6 +371,12 @@ export function HtmlCommentViewer({
   activeSelectionRef.current = activeSelection;
   const onFrameChangeRef = useRef(onFrameChange);
   onFrameChangeRef.current = onFrameChange;
+  const openFileRef = useRef(openFile);
+  openFileRef.current = openFile;
+  // The workspace root/home can arrive after the channel effect has run, so the
+  // message handler reads the latest pair instead of a stale closure.
+  const workspacePathsRef = useRef({ root: workspaceRoot, home: workspaceHome });
+  workspacePathsRef.current = { root: workspaceRoot, home: workspaceHome };
 
   // Reset per-file page state; FileViewer resets its own frame on path change.
   // The generation bump drops source fetches started for the previous inputs.
@@ -419,6 +565,14 @@ export function HtmlCommentViewer({
       } else if (msg.type === BRIDGE_MSG.selectionCleared) {
         onSetActiveSelectionRef.current(null);
         setFloating(null);
+      } else if (msg.type === BRIDGE_MSG.openPath) {
+        // The desktop and mobile layouts both mount a viewer; a page script can
+        // click a link in the hidden copy. Only a rendered frame may open files.
+        if (!iframe.getClientRects().length) return;
+        const { root, home } = workspacePathsRef.current;
+        const resolved = resolveFrameLinkPath(msg.href, msg.base, path, root, home);
+        if (resolved) openFileRef.current?.(resolved);
+        else showToast(`Can't open ${msg.href}`);
       }
     };
 
@@ -519,7 +673,7 @@ export function HtmlCommentViewer({
       <iframe
         ref={iframeRef}
         src={withBasePath(entry.url)}
-        sandbox={HTML_PREVIEW_SANDBOX}
+        sandbox={HTML_PANEL_SANDBOX}
         title="HTML preview"
         className="w-full h-full border-0"
       />

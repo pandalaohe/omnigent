@@ -11,12 +11,18 @@
 //   • no `ready` within 4 s → an "unavailable" notice.
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { showToast } from "@/components/ui/toast";
 import { authenticatedFetch } from "@/lib/identity";
 import * as host from "@/lib/host";
-import { HtmlCommentViewer } from "./HtmlCommentViewer";
-import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { FileViewerContext } from "./FileViewerContext";
+import { HtmlCommentViewer, resolveFrameLinkPath } from "./HtmlCommentViewer";
+import {
+  type ActiveSelection,
+  HTML_PANEL_SANDBOX,
+  HTML_PREVIEW_SANDBOX,
+} from "./codeViewerHelpers";
 import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
 
 // Permissions gate the floating "Add comment" button; default to editable.
@@ -27,6 +33,9 @@ vi.mock("@/lib/host", async (importOriginal) => ({
   ...(await importOriginal<typeof host>()),
   hasOmnigentHostFetcher: vi.fn(() => false),
 }));
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+
+const toastMock = vi.mocked(showToast);
 
 const NONCE = "nonce-1";
 const ENTRY_URL = "/v1/artifacts/tok/index.html";
@@ -67,6 +76,27 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function ViewerContext({
+  openFile,
+  children,
+}: {
+  openFile: (path: string) => void;
+  children: ReactNode;
+}) {
+  const value = useMemo(
+    () => ({
+      openFile,
+      openGithubTab: () => {},
+      isChangedPath: () => false,
+      conversationId: "conv_1",
+      workspaceRoot: "/abs/ws",
+      workspaceHome: "/abs/home",
+    }),
+    [openFile],
+  );
+  return <FileViewerContext.Provider value={value}>{children}</FileViewerContext.Provider>;
+}
+
 function renderViewer(
   props: {
     path?: string;
@@ -76,23 +106,27 @@ function renderViewer(
     onSetActiveSelection?: (
       sel: { start_index: number; end_index: number; anchor_content: string } | null,
     ) => void;
+    openFile?: (path: string) => void;
   } = {},
 ) {
   const onFrameChange = props.onFrameChange ?? vi.fn();
   const onSetActiveSelection = props.onSetActiveSelection ?? vi.fn();
+  const openFile = props.openFile ?? vi.fn();
   const utils = render(
-    <HtmlCommentViewer
-      conversationId="conv_1"
-      path={props.path ?? ENTRY_PATH}
-      content={props.content ?? ENTRY_SOURCE}
-      truncated={props.truncated ?? false}
-      comments={[]}
-      activeSelection={null}
-      onSetActiveSelection={onSetActiveSelection}
-      onFrameChange={onFrameChange}
-    />,
+    <ViewerContext openFile={openFile}>
+      <HtmlCommentViewer
+        conversationId="conv_1"
+        path={props.path ?? ENTRY_PATH}
+        content={props.content ?? ENTRY_SOURCE}
+        truncated={props.truncated ?? false}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={onSetActiveSelection}
+        onFrameChange={onFrameChange}
+      />
+    </ViewerContext>,
   );
-  return { ...utils, onFrameChange, onSetActiveSelection };
+  return { ...utils, onFrameChange, onSetActiveSelection, openFile };
 }
 
 /** The viewer for one path, for tests that rerender it onto another path. */
@@ -172,8 +206,9 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     expect(iframe.getAttribute("srcdoc")).toBeNull();
 
     const sandbox = iframe.getAttribute("sandbox") ?? "";
-    expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
-    expect(sandbox).toContain("allow-top-navigation");
+    expect(sandbox).toBe(HTML_PANEL_SANDBOX);
+    // The panel's artifact must not navigate the host page away.
+    expect(sandbox).not.toContain("allow-top-navigation");
     expect(sandbox).toContain("allow-downloads");
     // Security-critical invariant: the artifact must never share the app origin.
     expect(sandbox).not.toContain("allow-same-origin");
@@ -731,6 +766,98 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
   });
 });
 
+describe("resolveFrameLinkPath", () => {
+  const ROOT = "/abs/ws";
+  const HOME = "/abs/home";
+  const bundled = (tail: string) => `http://host/v1/artifacts/tok/${tail}`;
+  const entry = "reports/index.html";
+
+  it.each([
+    ["page2.html", bundled("index.html"), entry, "reports/page2.html", "relative sibling"],
+    [
+      "../outside.html",
+      bundled("sub/page2.html"),
+      entry,
+      "reports/outside.html",
+      "../ escapes to a workspace file",
+    ],
+    [
+      "../../outside.html",
+      bundled("index.html"),
+      "index.html",
+      null,
+      "../ climbs above the workspace root",
+    ],
+    ["../../x.html", bundled("sub/"), entry, "x.html", "<base href=sub/> base"],
+    ["y.html", "http://host/x/", entry, "/x/y.html", "base outside the artifact route"],
+    ["/abs/ws/x.html", bundled("index.html"), entry, "x.html", "host-absolute path"],
+    ["file:///abs/ws/x.html", bundled("index.html"), entry, "x.html", "file: URL"],
+    ["http://host/abs/ws/x.html", bundled("index.html"), entry, "x.html", "same-origin http URL"],
+    ["http://other/abs/ws/x.html", bundled("index.html"), entry, null, "cross-origin http URL"],
+    [
+      "page2.html?q=1#sec",
+      bundled("index.html"),
+      entry,
+      "reports/page2.html",
+      "query and fragment stripped",
+    ],
+    ["", bundled("index.html"), entry, null, "empty href"],
+    ["#sec", bundled("index.html"), entry, null, "fragment-only href"],
+  ])("%s from %s -> %s (%s)", (href, base, entryPath, expected, _why) => {
+    expect(resolveFrameLinkPath(href, base, entryPath, ROOT, HOME)).toBe(expected);
+  });
+});
+
+describe("HtmlCommentViewer openPath handling", () => {
+  function rects(iframe: HTMLIFrameElement) {
+    vi.spyOn(iframe, "getClientRects").mockReturnValue({ length: 1 } as unknown as DOMRectList);
+  }
+
+  it("opens a resolved workspace file when the frame has client rects", async () => {
+    const { openFile } = renderViewer();
+    const { iframe, postMessage } = await openFrame();
+    rects(iframe);
+
+    await sendFromFrame(postMessage, {
+      type: BRIDGE_MSG.openPath,
+      href: "../outside.html",
+      base: "http://host/v1/artifacts/tok/sub/page2.html",
+    });
+
+    expect(openFile).toHaveBeenCalledWith("reports/outside.html");
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores an openPath message while the frame is hidden", async () => {
+    const { openFile } = renderViewer();
+    const { postMessage } = await openFrame();
+
+    await sendFromFrame(postMessage, {
+      type: BRIDGE_MSG.openPath,
+      href: "../outside.html",
+      base: "http://host/v1/artifacts/tok/sub/page2.html",
+    });
+
+    expect(openFile).not.toHaveBeenCalled();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("toasts a link that escapes above the workspace root", async () => {
+    const { openFile } = renderViewer({ path: "index.html" });
+    const { iframe, postMessage } = await openFrame();
+    rects(iframe);
+
+    await sendFromFrame(postMessage, {
+      type: BRIDGE_MSG.openPath,
+      href: "../outside.html",
+      base: "http://host/v1/artifacts/tok/index.html",
+    });
+
+    expect(openFile).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledWith("Can't open ../outside.html");
+  });
+});
+
 describe("HtmlCommentViewer embed mode", () => {
   it("keeps the srcdoc bridge and never mints when a host fetcher is installed", () => {
     vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
@@ -742,6 +869,10 @@ describe("HtmlCommentViewer embed mode", () => {
     expect(srcdoc).toContain("omni-html-comment");
     expect(srcdoc).toContain('<base target="_blank">');
     expect(iframe.getAttribute("src")).toBeNull();
+    // The embed preview keeps the full-browser sandbox (out of scope here).
+    const sandbox = iframe.getAttribute("sandbox") ?? "";
+    expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
+    expect(sandbox).toContain("allow-top-navigation");
 
     expect(authenticatedFetchMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();

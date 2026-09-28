@@ -15,6 +15,7 @@
     selection: "omni:selection",
     commentClick: "omni:commentClick",
     selectionCleared: "omni:selectionCleared",
+    openPath: "omni:openPath",
   };
 
   // The highlight styles live here rather than in the injected markup so the
@@ -322,12 +323,12 @@
     send({ type: T.selectionCleared });
   }
 
-  // A plain click on an http(s) link outside this artifact's
-  // `/v1/artifacts/<token>/` prefix (same scheme and host) opens in a new tab;
-  // in-bundle links, mailto:, fragments and non-artifact pages stay native.
-  // In visit mode a cross-origin link also opens in a new tab (the shell's CSP
-  // frames only its own origin), and a same-origin link targeting `_top` /
-  // `_parent` navigates the frame itself instead of the shell.
+  // A plain click on a link. Panel mode keeps the top page out of it: an
+  // in-bundle link whose effective target (`target`, else the first
+  // `<base target>`) is `_top`/`_parent`/`_blank` navigates the frame itself;
+  // a link naming another workspace file is posted to the parent to open in the
+  // file viewer; an external site opens a new tab; other in-bundle clicks stay
+  // native. Visit mode: cross-origin -> tab, `_top`/`_parent` -> frame.
   function onDocumentClick(e) {
     if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.defaultPrevented) {
       return;
@@ -346,26 +347,59 @@
     } catch {
       return;
     }
-    if (url.protocol !== "http:" && url.protocol !== "https:") return;
     var sameOrigin = url.protocol === location.protocol && url.host === location.host;
-    if (VISIT) {
-      var linkTarget = (anchor.getAttribute("target") || "").toLowerCase();
-      if (sameOrigin && (linkTarget === "_top" || linkTarget === "_parent")) {
+    var inBundle = sameOrigin && url.pathname.indexOf(m[1]) === 0;
+    if (!VISIT) {
+      // A workspace file outside this artifact: the parent resolves the raw
+      // href against its own base, since URL resolution clamps a `..` above
+      // the token segment and would lose the target.
+      if (url.protocol === "file:" || (sameOrigin && !inBundle)) {
         e.preventDefault();
-        window.location.assign(url.href);
+        send({ type: T.openPath, href: anchor.getAttribute("href"), base: document.baseURI });
         return;
       }
-      if (!sameOrigin) {
-        e.preventDefault();
-        window.open(url.href, "_blank", "noopener");
+      if (url.protocol !== "http:" && url.protocol !== "https:") return;
+      if (inBundle) {
+        // Capture runs before the page's own handlers, so only a target that
+        // would leave the frame is taken over; a download stays native.
+        var effectiveTarget = anchor.getAttribute("target");
+        if (effectiveTarget === null) {
+          var baseEl = document.querySelector("base[target]");
+          effectiveTarget = baseEl ? baseEl.getAttribute("target") : "";
+        }
+        effectiveTarget = (effectiveTarget || "").toLowerCase();
+        if (
+          !anchor.hasAttribute("download") &&
+          (effectiveTarget === "_top" ||
+            effectiveTarget === "_parent" ||
+            effectiveTarget === "_blank")
+        ) {
+          e.preventDefault();
+          window.location.assign(url.href);
+        }
         return;
       }
+      e.preventDefault();
+      window.open(url.href, "_blank", "noopener,noreferrer");
+      return;
     }
-    if (sameOrigin && url.pathname.indexOf(m[1]) === 0) {
+    if (url.protocol !== "http:" && url.protocol !== "https:") return;
+    var linkTarget = (anchor.getAttribute("target") || "").toLowerCase();
+    if (sameOrigin && (linkTarget === "_top" || linkTarget === "_parent")) {
+      e.preventDefault();
+      window.location.assign(url.href);
+      return;
+    }
+    if (!sameOrigin) {
+      e.preventDefault();
+      window.open(url.href, "_blank", "noopener");
+      return;
+    }
+    if (inBundle) {
       return;
     }
     e.preventDefault();
-    window.open(url.href, "_blank", VISIT ? "noopener" : "noopener,noreferrer");
+    window.open(url.href, "_blank", "noopener");
   }
 
   // Also react to programmatic / keyboard selection (mouseup alone misses

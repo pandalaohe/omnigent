@@ -304,6 +304,11 @@ export interface WorkspaceFile {
 export interface WorkspaceAllFilesResult {
   available: boolean;
   data: WorkspaceFile[];
+  /**
+   * True when the server stopped listing before the directory was covered
+   * (`has_more`), so a file missing from `data` may still exist.
+   */
+  truncated: boolean;
 }
 
 interface FilesystemListResponse {
@@ -354,7 +359,14 @@ function mapFilesystemEntries(
   });
 }
 
-async function fetchWorkspaceAllFiles(
+/**
+ * List one directory with its statuses intact: 403 and 404 stay distinct
+ * errors and a cut-off page reports `truncated`, so a caller can tell
+ * "refused", "missing" and "incomplete" apart. {@link fetchDirEntriesTolerant}
+ * folds all three into an empty listing for callers that only ask "is this
+ * file here?".
+ */
+export async function fetchWorkspaceAllFiles(
   conversationId: string,
   location = "",
 ): Promise<WorkspaceAllFilesResult> {
@@ -366,7 +378,7 @@ async function fetchWorkspaceAllFiles(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?${params}`,
   );
   if (res.status === 404) {
-    return { available: false, data: [] };
+    return { available: false, data: [], truncated: false };
   }
   // The caller asked for somewhere this session may not browse. Surfaced as a
   // typed error so the panel can name what IS reachable instead of rendering
@@ -389,7 +401,11 @@ async function fetchWorkspaceAllFiles(
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as FilesystemListResponse;
-  return { available: true, data: mapFilesystemEntries(json, location) };
+  return {
+    available: true,
+    data: mapFilesystemEntries(json, location),
+    truncated: !!json.has_more,
+  };
 }
 
 /**
@@ -756,14 +772,19 @@ function hasUnsafeSegments(rel: string): boolean {
 }
 
 /** One tolerant parent-directory page: its entries plus whether it was cut off. */
-interface DirListingPage {
+export interface DirListingPage {
   files: WorkspaceFile[];
   /** True when the listing was truncated (`has_more`), so a file missing
    * from `files` may simply live past the page limit — absence unproven. */
   truncated: boolean;
 }
 
-async function fetchDirEntriesTolerant(
+/**
+ * List a directory for a "does this file exist?" check: 403 and 404 both
+ * degrade to an empty page and an unavailable runner returns null, so a
+ * caller only reads a definitive miss off a complete page.
+ */
+export async function fetchDirEntriesTolerant(
   conversationId: string,
   dirPath: string,
 ): Promise<DirListingPage | null> {
