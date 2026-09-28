@@ -4470,6 +4470,7 @@ def server(
     from omnigent.stores.global_instructions_store.sqlalchemy_store import (
         SqlAlchemyGlobalInstructionsStore,
     )
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
     from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
@@ -4501,6 +4502,7 @@ def server(
     peer_message_store = SqlAlchemyPeerMessageStore(db_uri)
     session_handoff_store = SqlAlchemySessionHandoffStore(db_uri)
     user_preferences_store = SqlAlchemyUserPreferencesStore(db_uri)
+    host_model_catalog_cache_store = HostModelCatalogCacheStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -4696,6 +4698,7 @@ def server(
         session_handoff_store=session_handoff_store,
         auth_provider=auth_provider,
         host_store=host_store,
+        host_model_catalog_cache_store=host_model_catalog_cache_store,
         account_store=account_store,
         user_preferences_store=user_preferences_store,
         policy_modules=cfg.get("policy_modules"),

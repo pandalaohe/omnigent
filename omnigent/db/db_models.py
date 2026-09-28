@@ -1649,6 +1649,44 @@ class SqlHost(OmnigentBase):
     )
 
 
+class SqlHostModelCatalogCache(OmnigentBase):
+    """
+    SQLAlchemy model for the ``host_model_catalog_cache`` table.
+
+    One row per ``(workspace_id, host_id, harness)``: the model catalog
+    the host last answered a ``host.model_options`` request with, so the
+    web pickers and the create-time offered check read a cached list
+    instead of blocking on a live tunnel. A failed sync keeps the
+    previous ``payload`` and records ``error``; a first-time failure
+    stores an empty payload, so the pair reads as stale-but-known.
+
+    :param host_id: The host the catalog came from (relates to
+        ``hosts.host_id``). No DB foreign key (Rule R032).
+    :param harness: Canonical harness id, e.g. ``"codex-native"``.
+    :param payload: JSON list of model-option rows, opaque to SQL.
+    :param fetched_at: Unix epoch seconds of the last successful sync,
+        or ``None`` when only a failed sync has been recorded.
+    :param error: The last sync's failure text, or ``None`` after a
+        successful one.
+    """
+
+    __tablename__ = "host_model_catalog_cache"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    host_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    harness: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    fetched_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.
@@ -1730,6 +1768,13 @@ class SqlScheduledTask(OmnigentBase):
         ``agents`` row. Exactly one of ``agent_id`` / ``custom_agent_id`` is
         set, so the store surfaces their single set value as the entity's
         ``agent_id``. No DB foreign key (schema Rule R032).
+    :param project_id: The project the task was created in, whose calling
+        defaults apply at fire time (relates to ``projects.id``). ``None``
+        means the master table only. No DB foreign key (Rule R032).
+    :param explicit_null_fields: JSON list of request field names the creator
+        sent as explicit nulls, so a deferred fire does not refill them from
+        the calling-defaults chain. Opaque, never SQL-queried. ``None`` when
+        the creator omitted the fields entirely.
     :param model_override: Per-task LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
@@ -1804,6 +1849,10 @@ class SqlScheduledTask(OmnigentBase):
     # that column). Exactly one of agent_id / custom_agent_id is set (see
     # ck_scheduled_tasks_agent_binding); no DB foreign key (Rule R032).
     custom_agent_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Relates to projects.id. No DB foreign key (Rule R032); NULL = master only.
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # JSON list of request fields sent as explicit nulls; opaque, never queried.
+    explicit_null_fields: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Per-task overrides — None means fall back to the agent default. Widths
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -2156,10 +2205,16 @@ class SqlAssignment(OmnigentBase):
     :param owner_user_id: The dispatching user, or ``None`` in single-user
         mode.
     :param target_agent_id: The agent to launch on arrival (relates to
-        ``agents.id``). No DB foreign key (Rule R032).
+        ``agents.id``), or ``None`` to take the destination host's project
+        default agent at placement. No DB foreign key (Rule R032).
     :param requested_host_id: The named destination host, or ``None`` to
         resolve once to the owner's freshest eligible online host.
     :param resolved_host_id: Written once at claim time, then never changed.
+    :param reasoning_effort: Per-assignment reasoning-effort hint, or ``None``
+        for the agent default.
+    :param explicit_null_fields: JSON list of request field names the creator
+        sent as explicit nulls, so placement does not refill them from the
+        calling-defaults chain. Opaque, never SQL-queried.
     :param binding_name: Which binding of the destination host to run in;
         ``primary`` is the conventional value.
     :param resolved_binding_id: The binding snapshot the work started
@@ -2223,8 +2278,9 @@ class SqlAssignment(OmnigentBase):
     # Relates to conversations.id. No DB foreign key (Rule R032).
     source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # Relates to agents.id. No DB foreign key (Rule R032).
-    target_agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Relates to agents.id. No DB foreign key (Rule R032). NULL = take the
+    # destination host's project default agent at placement.
+    target_agent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # Relates to hosts.host_id. No DB foreign key (Rule R032).
     requested_host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     resolved_host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
@@ -2243,6 +2299,9 @@ class SqlAssignment(OmnigentBase):
     inputs_json: Mapped[str] = mapped_column(CompressedText, nullable=False)
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     harness_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # JSON list of request fields sent as explicit nulls; opaque, never queried.
+    explicit_null_fields: Mapped[str | None] = mapped_column(Text, nullable=True)
     start_deadline: Mapped[int | None] = mapped_column(Integer, nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     request_digest: Mapped[str] = mapped_column(String(128), nullable=False)

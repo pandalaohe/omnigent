@@ -100,6 +100,7 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes.assignments import create_assignments_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
+from omnigent.server.routes.calling_defaults import create_calling_defaults_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.custom_agents import create_custom_agents_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -163,6 +164,7 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.global_instructions_store import GlobalInstructionsStore
+from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
@@ -1409,6 +1411,7 @@ def create_app(
     session_handoff_store: SessionHandoffStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
+    host_model_catalog_cache_store: HostModelCatalogCacheStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
     custom_agents_store: CustomAgentsStore | None = None,
@@ -1491,6 +1494,9 @@ def create_app(
     :param host_store: Store for host registrations. ``None``
         disables host connectivity features (list hosts, launch
         runners on remote hosts).
+    :param host_model_catalog_cache_store: Store for the per-host
+        harness model catalogs the calling-defaults sync caches. Mounts
+        the ``/v1/calling-defaults`` routes together with ``host_store``.
     :param user_preferences_store: Store for authenticated, cross-device user
         preferences. ``None`` leaves ``/v1/me.preferences`` unset and makes
         preference mutation endpoints unavailable.
@@ -3750,6 +3756,24 @@ def create_app(
             create_project_host_roots_router(project_store, auth_provider),
             prefix="/v1",
             tags=["projects"],
+        )
+    # Host model-catalog cache + the calling-defaults resolver every create
+    # path shares. Mounted with hosts; the project / preference layers
+    # degrade to "none" when their stores are not wired.
+    if host_store is not None and host_model_catalog_cache_store is not None:
+        app.include_router(
+            create_calling_defaults_router(
+                host_store=host_store,
+                host_registry=host_registry,
+                catalog_store=host_model_catalog_cache_store,
+                project_store=project_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+                user_preferences_store=user_preferences_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["calling_defaults"],
         )
     # Cross-host collaboration configuration (enable switch, registered
     # repositories, per-host bindings). Mounted only when the project store

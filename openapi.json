@@ -901,6 +901,218 @@
         "title": "BrowserActionRequestEvent",
         "type": "object"
       },
+      "CallingDefaultsCatalogRow": {
+        "description": "One cached `(host, harness)` model catalog and its staleness.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last sync's failure text, or `None`.",
+            "title": "Error"
+          },
+          "fetched_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds of the last successful sync, or `None` when only a failed one is recorded.",
+            "title": "Fetched At"
+          },
+          "harness": {
+            "description": "Canonical harness id, e.g. `\"codex-native\"`.",
+            "title": "Harness",
+            "type": "string"
+          },
+          "host_id": {
+            "description": "Host the catalog was fetched from.",
+            "title": "Host Id",
+            "type": "string"
+          },
+          "models": {
+            "description": "The host's model-option rows as reported.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "stale": {
+            "description": "Whether the row should be treated as untrustworthy \u2014 its last sync failed, or the host is offline on this replica.",
+            "title": "Stale",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "host_id",
+          "harness",
+          "models",
+          "stale"
+        ],
+        "title": "CallingDefaultsCatalogRow",
+        "type": "object"
+      },
+      "CallingDefaultsCatalogsResponse": {
+        "description": "Response for sync and catalogs: one row per cached (host, harness).",
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/CallingDefaultsCatalogRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "rows"
+        ],
+        "title": "CallingDefaultsCatalogsResponse",
+        "type": "object"
+      },
+      "CallingDefaultsProblem": {
+        "description": "One default-sourced value the host's catalog does not offer.",
+        "properties": {
+          "field": {
+            "description": "`\"model\"` or `\"effort\"`.",
+            "title": "Field",
+            "type": "string"
+          },
+          "message": {
+            "description": "User-facing refusal naming the setting and the host.",
+            "title": "Message",
+            "type": "string"
+          },
+          "setting": {
+            "description": "Source token, e.g. `\"project_host\"`.",
+            "title": "Setting",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "setting",
+          "message"
+        ],
+        "title": "CallingDefaultsProblem",
+        "type": "object"
+      },
+      "CallingDefaultsResolveResponse": {
+        "description": "The resolved calling triple plus any offered-check problems.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Effective agent id, or `None`.",
+            "title": "Agent Id"
+          },
+          "effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Effective reasoning effort, or `None`.",
+            "title": "Effort"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Effective harness, or `None`.",
+            "title": "Harness"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Effective model override, or `None`.",
+            "title": "Model"
+          },
+          "problems": {
+            "description": "Default values the cached catalog does not offer; empty when the catalog is missing, empty, or stale.",
+            "items": {
+              "$ref": "#/components/schemas/CallingDefaultsProblem"
+            },
+            "title": "Problems",
+            "type": "array"
+          },
+          "sources": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Per-field source tokens (`agent`, `model`, `effort`).",
+            "title": "Sources",
+            "type": "object"
+          }
+        },
+        "required": [
+          "sources"
+        ],
+        "title": "CallingDefaultsResolveResponse",
+        "type": "object"
+      },
+      "CallingDefaultsSyncRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/calling-defaults/sync`.\n\nBoth fields narrow the softest: a missing field keeps every candidate\nthe caller's online hosts can answer.",
+        "properties": {
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional filter narrowing the sync to one harness.",
+            "title": "Harness"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional filter narrowing the sync to one owned host.",
+            "title": "Host Id"
+          }
+        },
+        "title": "CallingDefaultsSyncRequest",
+        "type": "object"
+      },
       "CancelRequest": {
         "additionalProperties": false,
         "description": "Body for `POST /v1/assignments/{id}/cancel`.",
@@ -11534,6 +11746,172 @@
           }
         },
         "summary": "Branding Logo"
+      }
+    },
+    "/v1/calling-defaults/catalogs": {
+      "get": {
+        "description": "Return the caller's own cached catalogs, stale rows included.\n\n**Returns:** `{\"rows\": [...]}` for the caller's hosts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated.",
+        "operationId": "list_calling_default_catalogs_v1_calling_defaults_catalogs_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallingDefaultsCatalogsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Calling Default Catalogs",
+        "tags": [
+          "calling_defaults"
+        ]
+      }
+    },
+    "/v1/calling-defaults/resolve": {
+      "get": {
+        "description": "Resolve one create's calling triple; a pure read.\n\n**Returns:** The resolved triple, its per-field sources, and any default values the cached catalog does not offer.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated, 404 for an unknown / foreign project or an unowned host.",
+        "operationId": "resolve_calling_defaults_v1_calling_defaults_resolve_get",
+        "parameters": [
+          {
+            "description": "Owning project whose per-host set applies, or `None` for the master layers only.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
+            }
+          },
+          {
+            "description": "Placement host, or `None` when unknown yet.",
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "description": "Explicit agent, or `None` to take the default.",
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "description": "Explicit harness override, or `None`.",
+            "in": "query",
+            "name": "harness",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Harness"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallingDefaultsResolveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Calling Defaults",
+        "tags": [
+          "calling_defaults"
+        ]
+      }
+    },
+    "/v1/calling-defaults/sync": {
+      "post": {
+        "description": "Refresh the caller's cached host model catalogs.\n\n**Parameters**\n\n- `body` \u2014 Optional host / harness filters.\n\n**Returns:** Every cached row for the caller's hosts after the sync.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 unauthenticated, 404 for an unowned `host_id` filter.",
+        "operationId": "sync_calling_defaults_v1_calling_defaults_sync_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CallingDefaultsSyncRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallingDefaultsCatalogsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sync Calling Defaults",
+        "tags": [
+          "calling_defaults"
+        ]
       }
     },
     "/v1/custom-agents": {

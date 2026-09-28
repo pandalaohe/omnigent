@@ -307,11 +307,24 @@ def _format_sync_time(fetched_at: object) -> str:
     return datetime.fromtimestamp(fetched_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _setting_phrase(setting: str, project_name: str | None) -> str:
+    """Name the layer a source token came from in the user's words."""
+    if setting in ("project_host", "project_host_native"):
+        project = f"project {project_name!r}" if project_name else "the project"
+        return f"{project} host settings"
+    if setting == "project_legacy":
+        project = f"project {project_name!r}" if project_name else "the project"
+        return f"{project} All hosts row"
+    return "the master table"
+
+
 def _offered_problem(
     field: str,
     value: str,
     setting: str,
     harness: str,
+    host_id: str,
+    project_name: str | None,
     catalog: Mapping[str, Any],
 ) -> dict[str, str]:
     """Build one ``check_offered`` problem in the shared message shape."""
@@ -319,8 +332,9 @@ def _offered_problem(
         "field": field,
         "setting": setting,
         "message": (
-            f"Default {field} {value!r} from {setting} is not offered by {harness} "
-            f"(last sync {_format_sync_time(catalog.get('fetched_at'))}). "
+            f"Default {field} {value!r} from {_setting_phrase(setting, project_name)} is not "
+            f"offered by host {host_id!r} ({harness}, last sync "
+            f"{_format_sync_time(catalog.get('fetched_at'))}). "
             f"Change the setting or pass {field}."
         ),
     }
@@ -333,6 +347,8 @@ def check_offered(
     effort: str | None,
     catalog: dict | None,
     sources: dict[str, str],
+    host_id: str,
+    project_name: str | None = None,
 ) -> list[dict]:
     """Report default-sourced model / effort values a fresh catalog lacks.
 
@@ -349,6 +365,9 @@ def check_offered(
     :param catalog: ``{"models": [...], "error": str | None, "fetched_at":
         int | None}`` for the (host, harness) pair, or ``None``.
     :param sources: The resolution's per-field source tokens.
+    :param host_id: Host the message names, e.g. ``"HDS"``.
+    :param project_name: Project the message names for a project-sourced
+        value, or ``None`` when no project applies.
     :returns: Zero or more ``{"field", "setting", "message"}`` problems.
     """
     if not isinstance(catalog, Mapping):
@@ -365,14 +384,20 @@ def check_offered(
         and model_source not in _EXPLICIT_SOURCES
         and model not in _catalog_model_ids(rows)
     ):
-        problems.append(_offered_problem("model", model, model_source, harness, catalog))
+        problems.append(
+            _offered_problem("model", model, model_source, harness, host_id, project_name, catalog)
+        )
     effort_source = sources.get("effort", "none")
     if effort is not None and effort_source not in _EXPLICIT_SOURCES:
         offered = _catalog_efforts(rows, model)
         if offered is None:
             offered = efforts_for_harness(harness)
         if offered and effort not in offered:
-            problems.append(_offered_problem("effort", effort, effort_source, harness, catalog))
+            problems.append(
+                _offered_problem(
+                    "effort", effort, effort_source, harness, host_id, project_name, catalog
+                )
+            )
     return problems
 
 

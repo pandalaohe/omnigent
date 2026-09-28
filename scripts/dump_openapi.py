@@ -353,6 +353,7 @@ def _build_app_with_stub_stores() -> Any:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
     from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
@@ -381,6 +382,7 @@ def _build_app_with_stub_stores() -> Any:
         ),
         # Pass stores so conditionally-mounted routes stay in the spec.
         host_store=HostStore(db_uri),
+        host_model_catalog_cache_store=HostModelCatalogCacheStore(db_uri),
         policy_store=SqlAlchemyPolicyStore(db_uri),
         project_store=SqlAlchemyProjectStore(db_uri),
         project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),

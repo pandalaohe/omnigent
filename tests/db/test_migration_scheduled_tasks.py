@@ -61,6 +61,10 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "user_id",
         "agent_id",
         "custom_agent_id",
+        # Added by a23c20260928 (calling defaults): the owning project and
+        # the creator's explicit-null field list.
+        "project_id",
+        "explicit_null_fields",
         "account_generation",
         "model_override",
         "reasoning_effort",

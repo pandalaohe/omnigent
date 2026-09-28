@@ -261,17 +261,46 @@ def test_check_offered_flags_a_default_model_missing_from_the_catalog() -> None:
         effort=None,
         catalog=_catalog([{"id": "gpt-5.5"}]),
         sources={"model": "project_host", "effort": "none"},
+        host_id="HDS",
+        project_name="P",
     )
     assert problems == [
         {
             "field": "model",
             "setting": "project_host",
             "message": (
-                "Default model 'gpt-6-sol' from project_host is not offered by codex "
-                "(last sync 2023-11-14 22:13 UTC). Change the setting or pass model."
+                "Default model 'gpt-6-sol' from project 'P' host settings is not offered "
+                "by host 'HDS' (codex, last sync 2023-11-14 22:13 UTC). "
+                "Change the setting or pass model."
             ),
         }
     ]
+
+
+def test_check_offered_names_the_master_table() -> None:
+    """A master-sourced value names the master table, not a project."""
+    (problem,) = check_offered(
+        harness="codex",
+        model="gpt-6-sol",
+        effort=None,
+        catalog=_catalog([{"id": "gpt-5.5"}]),
+        sources={"model": "master", "effort": "none"},
+        host_id="HDS",
+    )
+    assert problem["setting"] == "master"
+    assert "from the master table is not offered by host 'HDS'" in problem["message"]
+
+    (legacy,) = check_offered(
+        harness="codex",
+        model="legacy-model",
+        effort=None,
+        catalog=_catalog([{"id": "gpt-5.5"}]),
+        sources={"model": "project_legacy", "effort": "none"},
+        host_id="HDS",
+        project_name="P",
+    )
+    assert legacy["setting"] == "project_legacy"
+    assert "from project 'P' All hosts row is not offered by host 'HDS'" in legacy["message"]
 
 
 def test_check_offered_flags_an_unoffered_default_effort() -> None:
@@ -282,6 +311,8 @@ def test_check_offered_flags_an_unoffered_default_effort() -> None:
         effort="high",
         catalog=_catalog([{"id": "gpt-6-sol", "supportedReasoningEfforts": ["low", "medium"]}]),
         sources={"model": "project_host", "effort": "project_host"},
+        host_id="HDS",
+        project_name="P",
     )
     assert len(problems) == 1
     assert problems[0]["field"] == "effort"
@@ -295,7 +326,12 @@ def test_check_offered_skips_a_stale_or_empty_catalog() -> None:
     sources = {"model": "project_host", "effort": "project_host"}
     assert (
         check_offered(
-            harness="codex", model="gpt-6-sol", effort="high", catalog=stale, sources=sources
+            harness="codex",
+            model="gpt-6-sol",
+            effort="high",
+            catalog=stale,
+            sources=sources,
+            host_id="HDS",
         )
         == []
     )
@@ -306,12 +342,18 @@ def test_check_offered_skips_a_stale_or_empty_catalog() -> None:
             effort="high",
             catalog=_catalog([]),
             sources=sources,
+            host_id="HDS",
         )
         == []
     )
     assert (
         check_offered(
-            harness="codex", model="gpt-6-sol", effort="high", catalog=None, sources=sources
+            harness="codex",
+            model="gpt-6-sol",
+            effort="high",
+            catalog=None,
+            sources=sources,
+            host_id="HDS",
         )
         == []
     )
@@ -327,6 +369,7 @@ def test_check_offered_accepts_effort_option_objects_and_uses_the_ladder() -> No
             effort="high",
             catalog=_catalog(objects),
             sources={"model": "master", "effort": "master"},
+            host_id="HDS",
         )
         == []
     )
@@ -339,6 +382,7 @@ def test_check_offered_accepts_effort_option_objects_and_uses_the_ladder() -> No
             effort="ultra",
             catalog=_catalog(bare),
             sources={"model": "master_native", "effort": "master_native"},
+            host_id="HDS",
         )
         == []
     )
@@ -348,6 +392,7 @@ def test_check_offered_accepts_effort_option_objects_and_uses_the_ladder() -> No
         effort="ultra",
         catalog=_catalog([{"id": "claude-opus-4-8"}]),
         sources={"model": "master", "effort": "master"},
+        host_id="HDS",
     )
     assert [problem["field"] for problem in problems] == ["effort"]
 
@@ -361,6 +406,7 @@ def test_check_offered_ignores_explicit_sources() -> None:
             effort="high",
             catalog=_catalog([{"id": "gpt-5.5"}]),
             sources={"model": "explicit", "effort": "explicit"},
+            host_id="HDS",
         )
         == []
     )

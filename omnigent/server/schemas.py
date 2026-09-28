@@ -256,6 +256,83 @@ class NativeModelOption(BaseModel):
     isDefault: bool | None = None
 
 
+class CallingDefaultsSyncRequest(BaseModel):
+    """Body for ``POST /v1/calling-defaults/sync``.
+
+    Both fields narrow the softest: a missing field keeps every candidate
+    the caller's online hosts can answer.
+
+    :param host_id: Optional filter narrowing the sync to one owned host.
+    :param harness: Optional filter narrowing the sync to one harness.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    host_id: str | None = None
+    harness: str | None = None
+
+
+class CallingDefaultsCatalogRow(BaseModel):
+    """One cached ``(host, harness)`` model catalog and its staleness.
+
+    :param host_id: Host the catalog was fetched from.
+    :param harness: Canonical harness id, e.g. ``"codex-native"``.
+    :param models: The host's model-option rows as reported.
+    :param fetched_at: Unix epoch seconds of the last successful sync,
+        or ``None`` when only a failed one is recorded.
+    :param stale: Whether the row should be treated as untrustworthy —
+        its last sync failed, or the host is offline on this replica.
+    :param error: The last sync's failure text, or ``None``.
+    """
+
+    host_id: str
+    harness: str
+    models: list[dict[str, Any]]
+    fetched_at: int | None = None
+    stale: bool
+    error: str | None = None
+
+
+class CallingDefaultsCatalogsResponse(BaseModel):
+    """Response for sync and catalogs: one row per cached (host, harness)."""
+
+    rows: list[CallingDefaultsCatalogRow]
+
+
+class CallingDefaultsProblem(BaseModel):
+    """One default-sourced value the host's catalog does not offer.
+
+    :param field: ``"model"`` or ``"effort"``.
+    :param setting: Source token, e.g. ``"project_host"``.
+    :param message: User-facing refusal naming the setting and the host.
+    """
+
+    field: str
+    setting: str
+    message: str
+
+
+class CallingDefaultsResolveResponse(BaseModel):
+    """The resolved calling triple plus any offered-check problems.
+
+    :param agent_id: Effective agent id, or ``None``.
+    :param harness: Effective harness, or ``None``.
+    :param model: Effective model override, or ``None``.
+    :param effort: Effective reasoning effort, or ``None``.
+    :param sources: Per-field source tokens (``agent``, ``model``,
+        ``effort``).
+    :param problems: Default values the cached catalog does not offer;
+        empty when the catalog is missing, empty, or stale.
+    """
+
+    agent_id: str | None = None
+    harness: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    sources: dict[str, str]
+    problems: list[CallingDefaultsProblem] = Field(default_factory=list)
+
+
 class PolicySummary(BaseModel):
     """
     Safe subset of a policy's spec for API exposure.
