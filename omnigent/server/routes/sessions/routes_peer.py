@@ -213,9 +213,9 @@ def latest_input_depth(
                     and not data.is_meta
                 ):
                     text = _first_text_block(data.content)
-                    if text is None or text.startswith("[System:"):
+                    if text is not None and text.startswith("[System:"):
                         continue
-                    if text.startswith("[Peer message from session "):
+                    if text is not None and text.startswith("[Peer message from session "):
                         match = _PEER_ENVELOPE_HEADER_RE.match(text)
                         if match is None:
                             continue

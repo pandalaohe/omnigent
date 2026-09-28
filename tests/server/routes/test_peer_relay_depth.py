@@ -222,6 +222,28 @@ def test_later_user_message_resets(stores: Stores) -> None:
     assert latest_input_depth(conversations, peers, session) == 0
 
 
+def test_attachment_only_user_message_resets(stores: Stores) -> None:
+    """T5b: an attachment-only web message is human input and resets the chain."""
+    conversations, peers = stores
+    session = _conv(conversations, "attachment-only")
+    record = _seed_peer(
+        peers, sender_id=_conv(conversations, "other"), receiver_id=session, depth=30
+    )
+    _append_envelope(conversations, record)
+    assert latest_input_depth(conversations, peers, session) == 30
+
+    _append(
+        conversations,
+        session,
+        MessageData(
+            role="user",
+            content=[{"type": "input_image", "image_url": "data:image/png;base64,AA=="}],
+        ),
+        type_="message",
+    )
+    assert latest_input_depth(conversations, peers, session) == 0
+
+
 def test_mirrored_message_resets(stores: Stores) -> None:
     """T6: a forwarder-mirrored user item is human input all the same."""
     conversations, peers = stores
