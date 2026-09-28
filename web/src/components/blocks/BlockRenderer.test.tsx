@@ -1883,6 +1883,9 @@ describe("BlockRenderer inline file-path linkification", () => {
     // confirms the file exists. A failure here means the existence check
     // didn't run or didn't linkify a real, unchanged workspace file.
     const link = await screen.findByRole("button", { name: EXISTING_PATH });
+    // Wait for the parent listing to confirm the file: the verified link
+    // underlines, the unverified re-check span does not.
+    await waitFor(() => expect(link).toHaveClass("underline"));
     link.click();
     expect(openFile).toHaveBeenCalledWith(EXISTING_PATH);
 
@@ -1892,10 +1895,10 @@ describe("BlockRenderer inline file-path linkification", () => {
     expect(fetchMock.mock.calls[0][0]).toContain(`/filesystem/${EXISTING_PARENT}`);
   });
 
-  it("leaves a path-shaped span as plain code when no such file exists", async () => {
+  it("renders a path-shaped span as a plain-code re-check affordance when no such file exists", async () => {
     // Parent dir listing comes back 404 (or without the file) → not a real
-    // file → must stay inert code, never a link. Guards against linkifying
-    // every path-shaped string.
+    // file yet → stays plain code rather than an underlined link, but a click
+    // can re-check later. Guards against linkifying every path-shaped string.
     fetchMock.mockResolvedValue(NOT_FOUND_RESPONSE);
     const openFile = vi.fn();
     renderMessage("See `projects/ghost/missing.md` for details.", {
@@ -1908,7 +1911,9 @@ describe("BlockRenderer inline file-path linkification", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     const span = await screen.findByText("projects/ghost/missing.md");
     expect(span.tagName).toBe("CODE");
-    expect(screen.queryByRole("button", { name: "projects/ghost/missing.md" })).toBeNull();
+    expect(span).toHaveAttribute("role", "button");
+    expect(span).toHaveAttribute("title", "Check again and open");
+    expect(span).not.toHaveClass("underline");
   });
 
   it("links an agent-changed file without any filesystem round-trip", async () => {
@@ -1963,6 +1968,9 @@ describe("BlockRenderer inline file-path linkification", () => {
     // workspace-relative `foo.md` — failure means tilde-expand/strip-root or
     // the root-level existence check broke.
     const link = await screen.findByRole("button", { name: "~/ws/foo.md" });
+    // Wait for the parent listing to confirm the file: the verified link
+    // underlines, the unverified re-check span does not.
+    await waitFor(() => expect(link).toHaveClass("underline"));
     link.click();
     expect(openFile).toHaveBeenCalledWith("foo.md");
     // Parent of a root-level file is the workspace root → bare /filesystem,
@@ -1985,6 +1993,9 @@ describe("BlockRenderer inline file-path linkification", () => {
     });
 
     const link = await screen.findByRole("button", { name: "/home/u/ws/src/app.ts" });
+    // Wait for the parent listing to confirm the file: the verified link
+    // underlines, the unverified re-check span does not.
+    await waitFor(() => expect(link).toHaveClass("underline"));
     link.click();
     expect(openFile).toHaveBeenCalledWith("src/app.ts");
     expect(fetchMock.mock.calls[0][0]).toContain("/filesystem/src?");
@@ -2007,6 +2018,9 @@ describe("BlockRenderer inline file-path linkification", () => {
     });
 
     const link = await screen.findByRole("button", { name: "/etc/hosts" });
+    // Wait for the parent listing to confirm the file: the verified link
+    // underlines, the unverified re-check span does not.
+    await waitFor(() => expect(link).toHaveClass("underline"));
     link.click();
     expect(openFile).toHaveBeenCalledWith("/etc/hosts");
     expect(fetchMock).toHaveBeenCalledTimes(1);

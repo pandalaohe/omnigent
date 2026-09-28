@@ -31,7 +31,14 @@ import {
   useIsChangedPath,
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
-import { resolveChatFilePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  fetchDirEntriesTolerant,
+  looksLikeWorkspaceFilePath,
+  resolveChatFilePath,
+  useWorkspaceFileExists,
+} from "@/hooks/useWorkspaceChangedFiles";
+import { parentDirectoryOf } from "@/hooks/useSelectionFileMatch";
+import { useQueryClient } from "@tanstack/react-query";
 import { showToast } from "@/components/ui/toast";
 
 // Streamdown hands each component override the source hast node alongside the
@@ -59,6 +66,20 @@ interface WorkspaceFileOpener {
   unopenable: boolean;
   /** The path resolution produced, for feedback messaging; "" when none. */
   resolvedPath: string;
+  /** True when a FileViewer is mounted, so a click has somewhere to open. */
+  hasFileViewer: boolean;
+  /** The resolved path, or null when the text doesn't resolve to one. */
+  linkPath: string | null;
+  /**
+   * The parent directory whose listing would confirm `linkPath`, or null.
+   * Matches the query key `useWorkspaceFileExists` uses, so a re-check shares
+   * that cache entry.
+   */
+  parentDir: string | null;
+  /** True when `linkPath` is path-shaped and worth a fresh listing on click. */
+  pathShaped: boolean;
+  /** Opens `linkPath` at its cited line once a check allows it. */
+  reveal: (() => void) | null;
 }
 
 /**
@@ -87,6 +108,11 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
   // home, …) → never a link.
   const resolution = cited ? resolveChatFilePath(cited, root, home) : null;
   const linkPath = resolution?.path ?? null;
+  const parentDir = linkPath ? parentDirectoryOf(linkPath) : null;
+  // Untrusted relative candidates must pass the same path-shape gate the
+  // existence check uses; a trusted resolution already proved its shape.
+  const pathShaped =
+    !!linkPath && ((resolution?.trusted ?? false) || looksLikeWorkspaceFilePath(linkPath));
 
   // Only relative paths can be in the changed-files list (it speaks
   // workspace-relative); an outside-workspace absolute is never a change.
@@ -98,6 +124,16 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
     openFile && linkPath && !isChanged ? linkPath : null,
     resolution?.trusted ?? false,
   );
+  const openResolved =
+    openFile && linkPath
+      ? () =>
+          citedLine === null
+            ? openFile(linkPath)
+            : openFile(linkPath, {
+                line: citedLine,
+                ...(citation.column ? { column: citation.column } : {}),
+              })
+      : null;
 
   if (!openFile || !linkPath || !(isChanged || exists)) {
     // An absolute / "~"-relative citation is unjudgeable until the workspace
@@ -112,18 +148,22 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
       // completed listing (skipped/pending/errored checks stay unverified).
       unopenable: !!openFile && !rootPending && (linkPath === null || (settled && !exists)),
       resolvedPath: linkPath ?? "",
+      hasFileViewer: !!openFile,
+      linkPath,
+      parentDir,
+      pathShaped,
+      reveal: openResolved,
     };
   }
   return {
-    open: () =>
-      citedLine === null
-        ? openFile(linkPath)
-        : openFile(linkPath, {
-            line: citedLine,
-            ...(citation.column ? { column: citation.column } : {}),
-          }),
+    open: openResolved,
     unopenable: false,
     resolvedPath: linkPath,
+    hasFileViewer: !!openFile,
+    linkPath,
+    parentDir,
+    pathShaped,
+    reveal: openResolved,
   };
 }
 
@@ -141,10 +181,12 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
  * agent-changed file — resolved synchronously, the fast path, and the only
  * path that may be an uncommitted/deleted file — or (b) a path-shaped string
  * that the filesystem API confirms points at a real file in the workspace.
- * Everything else (prose-y inline code, non-existent paths) falls back to a
- * styled `<code>` matching Streamdown's default inline appearance. The span
- * always *displays* the original text the agent wrote; only the link target
- * uses the resolved relative path.
+ * A path-shaped string that is not confirmed (absent, or never checked) stays
+ * a `role="button"` span that re-lists its parent on click, since the file may
+ * have been created after render. Everything else (prose-y inline code) falls
+ * back to a styled `<code>` matching Streamdown's default inline appearance.
+ * The span always *displays* the original text the agent wrote; only the link
+ * target uses the resolved relative path.
  *
  * Rendered by Streamdown as a real component (via the `inlineCode` slot), so
  * it may call hooks: the existence query re-renders this span when it settles,
@@ -157,10 +199,47 @@ function WorkspacePathInlineCode({
   ...codeProps
 }: WithHastNode<React.ComponentPropsWithoutRef<"code">>) {
   const text = typeof codeChildren === "string" ? codeChildren : "";
-  // A backtick span is prose by default (`git status`, `useState`), so a
-  // non-openable one just stays styled inline code — only an explicit
-  // markdown link (WorkspaceFileLink) earns dead-path feedback.
-  const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
+  // A backtick span is prose by default (`git status`, `useState`); only a
+  // path-shaped one earns the re-check affordance below.
+  const {
+    open: openWorkspaceFile,
+    hasFileViewer,
+    linkPath,
+    parentDir,
+    pathShaped,
+    reveal,
+  } = useWorkspaceFileOpener(text);
+  const conversationId = useFileViewerConversationId();
+  const queryClient = useQueryClient();
+
+  // A file can be created after the span rendered, so a path-shaped span that
+  // was absent (or never checked) re-lists its parent on click.
+  const recheckAndOpen = () => {
+    if (!conversationId || parentDir === null || !linkPath) {
+      showToast("Couldn't check right now");
+      return;
+    }
+    void queryClient
+      .fetchQuery({
+        queryKey: ["workspace-dir-listing", conversationId, parentDir],
+        queryFn: () => fetchDirEntriesTolerant(conversationId, parentDir),
+        staleTime: 0,
+      })
+      .then((listing) => {
+        if (!listing) {
+          showToast("Couldn't check right now");
+          return;
+        }
+        const found = listing.files.some((e) => e.type === "file" && e.path === linkPath);
+        // A miss on a cut-off listing isn't proof of absence; the viewer's
+        // own not-found state is the truthful answer there.
+        if (found || listing.truncated) reveal?.();
+        else showToast(`Not found yet: ${linkPath}`);
+      })
+      .catch(() => {
+        showToast("Couldn't check right now");
+      });
+  };
 
   if (openWorkspaceFile) {
     // Rendered as an inline <code> (not a <button>): a button is laid out as
@@ -185,6 +264,29 @@ function WorkspacePathInlineCode({
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
             openWorkspaceFile();
+          }
+        }}
+        {...codeProps}
+      >
+        {codeChildren}
+      </code>
+    );
+  }
+  if (hasFileViewer && pathShaped && linkPath) {
+    // A path-shaped span that isn't confirmed (absent, or unchecked): no
+    // underline, so it reads as plain code until a click proves the file.
+    return (
+      <code
+        role="button"
+        tabIndex={0}
+        title="Check again and open"
+        data-streamdown="inline-code"
+        className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui cursor-pointer", className)}
+        onClick={recheckAndOpen}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            recheckAndOpen();
           }
         }}
         {...codeProps}

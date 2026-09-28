@@ -260,15 +260,16 @@ describe("cited positions", () => {
     },
   );
 
-  it.each([
-    "docs/notes.md:abc",
-    "docs/notes.md#heading",
-    "docs/notes.md#Lx",
-    "docs/notes.md?line=12",
-  ])("leaves an unsupported suffix inert: %s", (citation) => {
-    renderMarkdown(`\`${citation}\``, ["docs/notes.md"]);
-    expect(screen.queryByRole("button", { name: citation })).toBeNull();
-  });
+  // `docs/notes.md:abc` is not a citation `splitWorkspaceFileCitation`
+  // recognizes, so the whole string stays path-shaped and re-checks on click;
+  // these suffixes are rejected by resolution alone and stay inert.
+  it.each(["docs/notes.md#heading", "docs/notes.md#Lx", "docs/notes.md?line=12"])(
+    "leaves an unsupported suffix inert: %s",
+    (citation) => {
+      renderMarkdown(`\`${citation}\``, ["docs/notes.md"]);
+      expect(screen.queryByRole("button", { name: citation })).toBeNull();
+    },
+  );
 });
 
 // Files OUTSIDE the workspace root. The FileViewer and filesystem API open
@@ -305,7 +306,11 @@ describe("links to files outside the workspace", () => {
     fetchMock.mockResolvedValue(dirListing(["/etc/hosts"]));
     renderMarkdown("see `/etc/hosts` for the mapping", [], FILE_VIEWER_WITH_SESSION);
 
-    fireEvent.click(await screen.findByRole("button", { name: "/etc/hosts" }));
+    const link = await screen.findByRole("button", { name: "/etc/hosts" });
+    // Wait for the parent listing to confirm the file: the verified link
+    // underlines, the unverified re-check span does not.
+    await waitFor(() => expect(link).toHaveClass("underline"));
+    fireEvent.click(link);
     expect(openFile).toHaveBeenCalledWith("/etc/hosts");
   });
 
@@ -409,5 +414,92 @@ describe("dead file links give feedback instead of a silent no-op", () => {
     const message = String(toastMock.mock.calls[0][0]);
     expect(message).toContain("doesn't resolve");
     expect(message).not.toContain("wasn't found");
+  });
+});
+
+// Workspace-relative parent listings echo full relative paths, unlike the
+// absolute (base=host) listings `dirListing` models.
+function relativeListing(paths: string[], truncated = false): Response {
+  return jsonResponse({
+    object: "list",
+    data: paths.map((path) => ({
+      id: path,
+      name: path.split("/").pop(),
+      path,
+      type: "file",
+      bytes: 5,
+      modified_at: 1,
+    })),
+    has_more: truncated,
+    truncated,
+  });
+}
+
+// A path-shaped inline-code span whose existence check settled absent (or
+// never ran) is not a dead end: a click lists the parent fresh and opens the
+// file if it appeared since render.
+describe("inline-code re-check on click", () => {
+  it("opens a path that appeared after render", async () => {
+    let created = false;
+    fetchMock.mockImplementation(async () =>
+      created ? relativeListing(["report/new.html"]) : relativeListing([]),
+    );
+    renderMarkdown("see `report/new.html` for the draft", [], FILE_VIEWER_WITH_SESSION);
+
+    const span = await screen.findByRole("button", { name: "report/new.html" });
+    expect(span.tagName).toBe("CODE");
+    expect(span).toHaveAttribute("title", "Check again and open");
+
+    created = true;
+    fireEvent.click(span);
+    await waitFor(() => expect(openFile).toHaveBeenCalledWith("report/new.html"));
+  });
+
+  it("toasts when the fresh listing completes without the file", async () => {
+    fetchMock.mockResolvedValue(relativeListing([]));
+    renderMarkdown("see `report/none.html` for details", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "report/none.html" }));
+
+    await waitFor(() => expect(toastMock).toHaveBeenCalledWith("Not found yet: report/none.html"));
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("opens on a truncated listing rather than claiming absence", async () => {
+    fetchMock.mockResolvedValue(relativeListing([], true));
+    renderMarkdown("see `report/maybe.html` for details", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "report/maybe.html" }));
+
+    await waitFor(() => expect(openFile).toHaveBeenCalledWith("report/maybe.html"));
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("toasts when the runner is offline", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+    renderMarkdown("see `report/offline.html` for details", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "report/offline.html" }));
+
+    await waitFor(() => expect(toastMock).toHaveBeenCalledWith("Couldn't check right now"));
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("toasts when the fresh listing errors", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error: {} }, 500));
+    renderMarkdown("see `report/broken.html` for details", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "report/broken.html" }));
+
+    await waitFor(() => expect(toastMock).toHaveBeenCalledWith("Couldn't check right now"));
+  });
+
+  it("keeps prose inline code a plain non-button span", () => {
+    renderMarkdown("Run `git status` to check.", [], FILE_VIEWER_WITH_SESSION);
+
+    const span = screen.getByText("git status");
+    expect(span.tagName).toBe("CODE");
+    expect(span).not.toHaveAttribute("role");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
