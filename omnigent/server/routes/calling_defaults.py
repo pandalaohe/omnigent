@@ -23,7 +23,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from omnigent.calling_defaults import (
     MODEL_OPTION_HARNESSES,
-    check_offered,
+    check_calling_defaults,
     load_master,
     resolve_calling,
 )
@@ -243,6 +243,8 @@ def create_calling_defaults_router(
         :raises OmnigentError: 401 unauthenticated, 404 for an unknown /
             foreign project or an unowned host.
         """
+        from omnigent.server.library_agent_launch import is_library_agent_id
+
         user_id = require_user(request, auth_provider)
         owner = _owner(user_id)
 
@@ -272,7 +274,9 @@ def create_calling_defaults_router(
         def agent_harness(effective_agent_id: str) -> str | None:
             from omnigent.server.routes._sessions.orchestration import _create_resolved_harness
 
-            if agent_store is None:
+            # A saved library Agent has no ``agents`` row; the id would not
+            # even bind against the UUID-typed lookup.
+            if agent_store is None or is_library_agent_id(effective_agent_id):
                 return None
             agent = agent_store.get(effective_agent_id)
             if agent is None:
@@ -302,14 +306,25 @@ def create_calling_defaults_router(
                     "fetched_at": record["fetched_at"],
                 }
 
-        problems = check_offered(
-            harness=resolution.harness or "",
-            model=resolution.model,
-            effort=resolution.effort,
-            catalog=catalog,
-            sources=resolution.sources,
+        agent_name: str | None = None
+        if (
+            resolution.agent_id is not None
+            and agent_store is not None
+            and not is_library_agent_id(resolution.agent_id)
+        ):
+            agent = await asyncio.to_thread(agent_store.get, resolution.agent_id)
+            agent_name = getattr(agent, "name", None)
+        problems = check_calling_defaults(
+            resolution=resolution,
             host_id=resolved_host_id or "",
+            host_name=host.name if host is not None and host.name else None,
+            configured_harnesses=host.configured_harnesses if host is not None else None,
+            catalog=catalog,
+            agent_name=agent_name,
             project_name=project.name if project is not None else None,
+            # The preview names the paths that would refuse; New Chat itself
+            # launches a saved joint agent through its own library flow.
+            path_label="server-side creates",
         )
         return CallingDefaultsResolveResponse(
             agent_id=resolution.agent_id,

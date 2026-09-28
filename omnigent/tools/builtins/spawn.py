@@ -945,8 +945,9 @@ class SysSessionCreateTool(Tool):
     session. The child inherits the caller's runner (co-location), so it
     starts executing as soon as a message is queued.
 
-    Two addressing modes — exactly one of ``agent_id`` or
-    ``config_path`` must be given:
+    Two optional addressing modes — at most one of ``agent_id`` or
+    ``config_path``; with neither the child launches the parent
+    project's default agent for its host:
 
     - **By agent id** — an existing agent the caller can see (a
       built-in/template or session-bound entry from ``sys_agent_list``
@@ -960,6 +961,9 @@ class SysSessionCreateTool(Tool):
       with ``sys_os_write``). The runner bundles the source and
       proxies the multipart ``POST /v1/sessions`` create, registering
       a fresh session-scoped agent.
+    - **Neither** — the JSON create omits ``agent_id``, so the server
+      fills the parent project's per-host default agent (and its model
+      / effort). An error when the project has no default for the host.
 
     An optional ``message`` is queued as the child's first user turn;
     an optional ``title`` labels the session.
@@ -990,13 +994,15 @@ class SysSessionCreateTool(Tool):
             "exploration, scoped reads) prefer your native subagent "
             "tool if you have one; use sys_session_create to launch "
             "another registered agent or a durable, independently "
-            "visible session. Two modes — provide "
-            "exactly one: agent_id launches an existing agent (any "
+            "visible session. Two optional modes — provide at most "
+            "one: agent_id launches an existing agent (any "
             "agent_id from sys_agent_list's builtins or session_agents, "
             "or from sys_agent_get); config_path uploads a new agent "
             "from a local agent config YAML, agent directory, or "
             ".tar.gz bundle in your working directory (e.g. authored "
-            "with sys_os_write) and launches it. Always use agent_id "
+            "with sys_os_write) and launches it. Omit both to launch "
+            "the parent project's default agent for the child's host. "
+            "Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. The new session is always a child of the calling "
@@ -1015,10 +1021,10 @@ class SysSessionCreateTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict. Exactly one of ``agent_id`` /
-            ``config_path`` is required — the mode split is enforced
-            in the runner handler (the schema can't express
-            "exactly one of two fields" portably across providers).
+            ``"function"`` sub-dict. ``agent_id`` / ``config_path``
+            are optional and mutually exclusive; the mode split is
+            enforced in the runner handler (the schema can't express
+            "at most one of two fields" portably across providers).
         """
         return {
             "type": "function",
@@ -1036,7 +1042,10 @@ class SysSessionCreateTool(Tool):
                                 "sys_agent_list (both builtins and "
                                 "session_agents rows carry it) or "
                                 "sys_agent_get (a session's agent). "
-                                "Use instead of config_path."
+                                "Mutually exclusive with config_path; "
+                                "omit both to launch the parent "
+                                "project's default agent for the "
+                                "child's host."
                             ),
                         },
                         "config_path": {
@@ -1092,10 +1101,10 @@ class SysSessionCreateTool(Tool):
                             ],
                             "description": (
                                 "Optional reasoning level for the child "
-                                "session, e.g. 'high'. Only valid with "
-                                "'agent_id', and only for harnesses with "
-                                "effort plumbing; omit to use the agent's "
-                                "default."
+                                "session, e.g. 'high'. Not valid with "
+                                "'config_path', and only for harnesses "
+                                "with effort plumbing; omit to use the "
+                                "agent's default."
                             ),
                         },
                     },

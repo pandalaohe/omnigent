@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_availability import is_harness_availability
 from omnigent.util.reasoning_effort import EFFORT_VALUES, efforts_for_harness
 
 _logger = logging.getLogger(__name__)
@@ -40,6 +41,10 @@ MODEL_OPTION_HARNESSES: tuple[str, ...] = (
 )
 
 _EXPLICIT_SOURCES = frozenset({"explicit", "none"})
+
+#: Saved library Agent ids (``POST /v1/custom-agents``); no agent-omitted
+#: server create path can launch one, so a default that names one is refused.
+_LIBRARY_AGENT_ID_PREFIX = "ca_"
 
 
 @dataclass(frozen=True)
@@ -106,6 +111,18 @@ def _project_legacy(project_config: Mapping[str, Any] | None, key: str) -> str |
     if not isinstance(project_config, Mapping):
         return None
     return _setting(project_config.get(key))
+
+
+def default_agent_for_host(
+    project_config: Mapping[str, Any] | None, host_id: str | None
+) -> str | None:
+    """The project's per-host default agent id, or ``None`` when unset.
+
+    The single-layer read the hand-off start needs before it commits to an
+    agent; a full create resolves through :func:`resolve_calling` instead.
+    """
+    entry = _project_host_entry(project_config, host_id)
+    return _setting(entry.get("agent_id")) if entry is not None else None
 
 
 def _master_entry(
@@ -398,6 +415,112 @@ def check_offered(
                     "effort", effort, effort_source, harness, host_id, project_name, catalog
                 )
             )
+    return problems
+
+
+def _readiness_problem(
+    *,
+    resolution: CallingResolution,
+    agent_label: str,
+    host_id: str,
+    host_name: str | None,
+    configured_harnesses: Mapping[str, Any] | None,
+    project_name: str | None,
+) -> dict[str, str] | None:
+    """A default agent's harness that the host reports as not launchable.
+
+    A missing readiness map (older host build), a missing entry, or a value
+    outside the known readiness states all mean "unknown" and pass.
+    """
+    if configured_harnesses is None or resolution.harness is None:
+        return None
+    readiness = configured_harnesses.get(resolution.harness)
+    if readiness is True or not is_harness_availability(readiness):
+        # Ready, or a value the host never reports: unknown passes.
+        return None
+    source = resolution.sources.get("agent", "none")
+    label = host_name or host_id
+    return {
+        "field": "agent",
+        "setting": source,
+        "message": (
+            f"Default agent {agent_label!r} from "
+            f"{_setting_phrase(source, project_name)} is not ready on host {label!r}: "
+            f"harness {resolution.harness!r} is {readiness!r}. "
+            "Change the setting or pass agent_id."
+        ),
+    }
+
+
+def check_calling_defaults(
+    *,
+    resolution: CallingResolution,
+    host_id: str,
+    host_name: str | None,
+    configured_harnesses: Mapping[str, Any] | None,
+    catalog: dict | None,
+    agent_name: str | None,
+    project_name: str | None,
+    path_label: str,
+) -> list[dict]:
+    """Report every K5 problem a resolved calling triple has.
+
+    Shared by :func:`omnigent.server.routes._session_create_validation.
+    resolve_create_calling` (which raises the first message) and the resolve
+    route (which returns them as ``problems``), so the web preview and the
+    server agree. An explicit agent keeps today's validation only.
+
+    :param resolution: The resolved calling triple.
+    :param host_id: Host id, used by the offered messages.
+    :param host_name: Host display name for the readiness message, or ``None``.
+    :param configured_harnesses: The host's per-harness readiness map, or
+        ``None`` when unknown.
+    :param catalog: The cached ``(host, harness)`` catalog row, or ``None``.
+    :param agent_name: The resolved agent's display name, or ``None``.
+    :param project_name: Project the messages name, or ``None``.
+    :param path_label: The create path named in the library-agent refusal,
+        e.g. ``"hand-off"``.
+    :returns: Zero or more ``{"field", "setting", "message"}`` problems, agent
+        problems first.
+    """
+    sources = resolution.sources
+    agent_source = sources.get("agent", "none")
+    problems: list[dict] = []
+    if resolution.agent_id is not None and agent_source not in _EXPLICIT_SOURCES:
+        agent_label = agent_name or resolution.agent_id
+        if resolution.agent_id.startswith(_LIBRARY_AGENT_ID_PREFIX):
+            problems.append(
+                {
+                    "field": "agent",
+                    "setting": agent_source,
+                    "message": (
+                        f"Default agent {agent_label!r} for host "
+                        f"{host_name or host_id!r} is a saved joint agent; {path_label} "
+                        "cannot launch it. Pass agent_id."
+                    ),
+                }
+            )
+        readiness = _readiness_problem(
+            resolution=resolution,
+            agent_label=agent_label,
+            host_id=host_id,
+            host_name=host_name,
+            configured_harnesses=configured_harnesses,
+            project_name=project_name,
+        )
+        if readiness is not None:
+            problems.append(readiness)
+    problems.extend(
+        check_offered(
+            harness=resolution.harness or "",
+            model=resolution.model,
+            effort=resolution.effort,
+            catalog=catalog,
+            sources=sources,
+            host_id=host_id,
+            project_name=project_name,
+        )
+    )
     return problems
 
 

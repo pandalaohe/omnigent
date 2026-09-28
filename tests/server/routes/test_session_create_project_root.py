@@ -136,6 +136,7 @@ async def test_config_root_rejection_explicit_workspace_and_hostless_create(
         body=ProjectSessionCreateRequest(project_id=project_id, host_id="h1"),
         user_id=ALICE,
         project_store=app.state.project_store,
+        apply_calling_defaults=True,
     )
     assert config_root.body.workspace == "/c"
     explicit_host_type = await resolve_project_session_create(
@@ -143,6 +144,7 @@ async def test_config_root_rejection_explicit_workspace_and_hostless_create(
         user_id=ALICE,
         project_store=app.state.project_store,
         fill_host=True,
+        apply_calling_defaults=True,
     )
     assert explicit_host_type.body.host_id is None
     assert explicit_host_type.body.workspace == "/c"
@@ -178,6 +180,7 @@ async def test_resolver_binding_and_host_choices(app: FastAPI, client: httpx.Asy
         project_store=app.state.project_store,
         binding_store=app.state.project_host_binding_store,
         feature_flags=app.state.feature_flags,
+        apply_calling_defaults=True,
     )
     assert resolved.body.workspace == "/b"
     filled = await resolve_project_session_create(
@@ -187,6 +190,7 @@ async def test_resolver_binding_and_host_choices(app: FastAPI, client: httpx.Asy
         binding_store=app.state.project_host_binding_store,
         feature_flags=app.state.feature_flags,
         fill_host=True,
+        apply_calling_defaults=True,
     )
     assert (filled.body.host_id, filled.body.workspace) == ("h1", "/b")
 
@@ -233,6 +237,7 @@ async def test_ambiguous_host_fill_and_switch_gate(
         feature_flags=app.state.feature_flags,
         host_store=app.state.host_store,
         fill_host=True,
+        apply_calling_defaults=True,
     )
     assert (filled.body.host_id, filled.body.workspace) == ("h1", "/one")
 
@@ -492,6 +497,7 @@ async def test_project_entry_fills_create_and_host_roots(
         user_id=ALICE,
         project_store=app.state.project_store,
         binding_store=app.state.project_host_binding_store,
+        apply_calling_defaults=True,
     )
     assert resolved.body.workspace == "/e"
     assert (resolved.entry, resolved.checkout) == ("/e", "/b")
@@ -504,6 +510,7 @@ async def test_project_entry_fills_create_and_host_roots(
         user_id=ALICE,
         project_store=app.state.project_store,
         binding_store=app.state.project_host_binding_store,
+        apply_calling_defaults=True,
     )
     assert explicit.body.workspace == "/elsewhere"
     assert (explicit.entry, explicit.checkout) == ("/e", "/b")

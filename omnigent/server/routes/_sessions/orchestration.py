@@ -41,6 +41,7 @@ from omnigent.entities import (
     ErrorData,
     MessageData,
     NewConversationItem,
+    Project,
     ResourceEventData,
 )
 from omnigent.entities.conversation import (
@@ -9960,6 +9961,7 @@ async def _create_session_from_existing_agent(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     project_store: ProjectStore | None = None,
     conversation_id: str | None = None,
+    calling_path_label: str = "POST /v1/sessions",
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -9989,6 +9991,8 @@ async def _create_session_from_existing_agent(
         ``file_id`` references in ``initial_items`` before forwarding
         to the runner.
     :param artifact_store: Optional binary content store for the same.
+    :param calling_path_label: The create path named in a refused calling
+        default, e.g. ``"hand-off"`` for the receiver create.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -9999,6 +10003,24 @@ async def _create_session_from_existing_agent(
     )
 
     request_fields_set = body.model_fields_set
+    # The parent's project and host feed a child's calling defaults, so the
+    # owner-checked lookup runs before the resolver. The parent conversation
+    # is reused below for runner affinity.
+    parent_conv: Conversation | None = None
+    parent_project: Project | None = None
+    parent_host_id: str | None = None
+    if body.parent_session_id is not None:
+        parent_conv = conversation_store.get_conversation(body.parent_session_id)
+        if parent_conv is not None:
+            parent_host_id = parent_conv.host_id
+            if (
+                "project_id" not in request_fields_set
+                and parent_conv.project_id is not None
+                and project_store is not None
+            ):
+                parent_project = await asyncio.to_thread(
+                    project_store.get, parent_conv.project_id, user_id=user_id
+                )
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
@@ -10007,6 +10029,11 @@ async def _create_session_from_existing_agent(
         feature_flags=getattr(request.app.state, "feature_flags", None),
         host_store=getattr(request.app.state, "host_store", None),
         fill_host=True,
+        request=request,
+        apply_calling_defaults=True,
+        parent_project=parent_project,
+        parent_host_id=parent_host_id,
+        calling_path_label=calling_path_label,
     )
     body = project_resolution.body
     creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
@@ -10363,37 +10390,21 @@ async def _create_session_from_existing_agent(
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
-    child_project_id: str | None = None
-    parent_conv: Conversation | None = None
-    if body.parent_session_id is not None:
-        parent_conv = conversation_store.get_conversation(body.parent_session_id)
-        if parent_conv is not None:
-            inherited_runner_id = parent_conv.runner_id
-            if body.host_id is not None and body.host_id != parent_conv.host_id:
-                # Cross-host member child (SCC06 F2b): the parent's runner
-                # cannot serve the member's host. Leave it unbound so the
-                # create route's host launch starts a runner on that host.
+    # The parent lookup ran before the resolver; a parent project only counts
+    # for inheritance when this caller still owns it.
+    child_project_id: str | None = parent_project.id if parent_project is not None else None
+    if body.parent_session_id is not None and parent_conv is not None:
+        inherited_runner_id = parent_conv.runner_id
+        if body.host_id is not None and body.host_id != parent_conv.host_id:
+            # Cross-host member child (SCC06 F2b): the parent's runner
+            # cannot serve the member's host. Leave it unbound so the
+            # create route's host launch starts a runner on that host.
+            inherited_runner_id = None
+        # Defense-in-depth: don't inherit a runner the caller doesn't own.
+        if inherited_runner_id is not None and user_id is not None and runner_router is not None:
+            runner_owner = runner_router.runner_owner(inherited_runner_id)
+            if runner_owner is not None and runner_owner != user_id:
                 inherited_runner_id = None
-            if (
-                "project_id" not in request_fields_set
-                and parent_conv.project_id is not None
-                and project_store is not None
-                and await asyncio.to_thread(
-                    project_store.get, parent_conv.project_id, user_id=user_id
-                )
-                is not None
-            ):
-                child_project_id = parent_conv.project_id
-            # Defense-in-depth: don't inherit a runner the
-            # caller doesn't own.
-            if (
-                inherited_runner_id is not None
-                and user_id is not None
-                and runner_router is not None
-            ):
-                runner_owner = runner_router.runner_owner(inherited_runner_id)
-                if runner_owner is not None and runner_owner != user_id:
-                    inherited_runner_id = None
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must

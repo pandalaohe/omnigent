@@ -2044,6 +2044,11 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.project_host_binding_store = project_host_binding_store
+    # The create-time calling-defaults resolver reads these four stores off
+    # ``request.app.state``; None degrades to the project layers only.
+    app.state.agent_cache = agent_cache
+    app.state.user_preferences_store = user_preferences_store
+    app.state.host_model_catalog_cache_store = host_model_catalog_cache_store
     if host_store is not None:
         host_registry.launch_authorizer = partial(
             host_store.admit_launch, require_account_owner=runner_account_store is not None

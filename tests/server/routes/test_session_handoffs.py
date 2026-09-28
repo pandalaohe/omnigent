@@ -1972,3 +1972,32 @@ def test_format_handoff_brief_names_worktree_or_workspace(
     workspace_brief = format_handoff_brief(record, "Target", ENTRY, None, None)
     assert "Workspace: /entry" in workspace_brief
     assert "Worktree:" not in workspace_brief
+
+
+@pytest.mark.asyncio
+async def test_start_prefers_per_host_default_agent(handoff_env: dict[str, Any]) -> None:
+    """K7d: the per-host project default outranks the legacy config agent."""
+    env = handoff_env
+    host_id = "1" * 32
+    other_agent_id = generate_agent_id()
+    env["agents"].create(other_agent_id, "other-agent", "test:///bundle")
+    env["projects"].update(
+        env["project"].id,
+        user_id=ALICE,
+        config={
+            **env["project"].config,
+            "calling_defaults": {host_id: {"agent_id": other_agent_id}},
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json=_start_body(),
+            headers=_headers(env["sender_token"]),
+        )
+    assert response.status_code == 200, response.text
+    records = env["handoffs"].list_for_sender(env["sender"].id, 0, 20)
+    assert records, response.text
+    assert records[0].git_plan["agent_id"] == other_agent_id

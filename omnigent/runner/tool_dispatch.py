@@ -4461,7 +4461,7 @@ async def _send_to_existing_session(
 
 
 def _build_session_create_body(
-    agent_id: str,
+    agent_id: str | None,
     conversation_id: str,
     title: object,
     message: object,
@@ -4478,13 +4478,18 @@ def _build_session_create_body(
     message becomes the child's first queued user turn via
     ``initial_items``.
 
+    ``agent_id`` is included only when the caller named one: an omitted
+    key (not an explicit ``null``) lets the server take the parent
+    project's default agent for the child's host.
+
     ``model`` and ``reasoning_effort`` are passed through unvalidated:
     this path never resolves the child's harness (the agent is named by
     id and resolved server-side), so neither can be checked against the
     harness's capabilities here. The server validates both against their
     vocabularies at create.
 
-    :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
+    :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``,
+        or ``None`` to let the server resolve the project default.
     :param conversation_id: The caller's session id — the forced parent.
     :param title: Optional session label; included only when a non-empty
         string.
@@ -4497,9 +4502,10 @@ def _build_session_create_body(
     :returns: The JSON request body.
     """
     body: _JsonObject = {
-        "agent_id": agent_id,
         "parent_session_id": conversation_id,
     }
+    if isinstance(agent_id, str) and agent_id:
+        body["agent_id"] = agent_id
     if isinstance(title, str) and title:
         body["title"] = title
     if isinstance(model, str) and model:
@@ -4520,7 +4526,7 @@ def _finalize_created_session(
     data: _JsonObject,
     *,
     conversation_id: str,
-    agent_id: str,
+    agent_id: str | None,
     title: object,
     publish_event: Callable[[str, _JsonObject], None] | None,
 ) -> str:
@@ -4535,7 +4541,8 @@ def _finalize_created_session(
 
     :param data: The :class:`SessionResponse` JSON from the create call.
     :param conversation_id: The caller (parent) session id.
-    :param agent_id: The launched agent id, e.g. ``"ag_abc123"``.
+    :param agent_id: The launched agent id, e.g. ``"ag_abc123"``, or the
+        server-resolved default.
     :param title: The caller-supplied title (or non-str when absent).
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
@@ -4592,7 +4599,7 @@ async def _execute_session_create(
     """
     Create a child session (``sys_session_create``).
 
-    Two modes, split on the provided argument (exactly one required):
+    Two optional modes, split on the provided argument (at most one):
 
     - ``agent_id`` — spawn from an existing agent via the JSON
       ``POST /v1/sessions`` create.
@@ -4600,6 +4607,9 @@ async def _execute_session_create(
       config YAML, agent directory, or pre-built ``.tar.gz`` bundle
       inside the caller's working directory) via the multipart
       ``POST /v1/sessions`` create.
+    - neither — the JSON create carries no ``agent_id`` key, so the
+      server takes the parent project's default agent for the child's
+      host (and its model / effort).
 
     Both modes force ``parent_session_id`` to the caller (child-only).
     The child inherits the caller's runner (server-side affinity), so a
@@ -4611,8 +4621,8 @@ async def _execute_session_create(
 
     Maps a 404 to ``agent_not_found`` and 401/403 to ``access_denied``.
 
-    :param args: Parsed arguments; exactly one of ``agent_id`` /
-        ``config_path`` required, ``title`` / ``message`` optional.
+    :param args: Parsed arguments; at most one of ``agent_id`` /
+        ``config_path``, ``title`` / ``message`` optional.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The caller's session id — the forced parent;
@@ -4633,15 +4643,17 @@ async def _execute_session_create(
     config_path = args.get("config_path")
     has_agent_id = isinstance(agent_id, str) and bool(agent_id)
     has_config_path = isinstance(config_path, str) and bool(config_path)
-    if has_agent_id == has_config_path:
-        # Fail loud on both-or-neither: the two modes create different
-        # agents, so silently preferring one would mislaunch.
+    if has_agent_id and has_config_path:
+        # Fail loud on both: the two modes create different agents, so
+        # silently preferring one would mislaunch. Neither is valid and
+        # takes the parent project's default agent.
         return json.dumps(
             {
                 "error": (
-                    "sys_session_create requires exactly one of 'agent_id' "
+                    "sys_session_create takes at most one of 'agent_id' "
                     "(existing agent) or 'config_path' (new agent from a "
-                    "local config)"
+                    "local config); omit both to use the parent project's "
+                    "default agent"
                 )
             }
         )
@@ -4668,7 +4680,7 @@ async def _execute_session_create(
             runner_workspace=runner_workspace,
         )
     body = _build_session_create_body(
-        str(agent_id),
+        str(agent_id) if has_agent_id else None,
         conversation_id,
         args.get("title"),
         args.get("message"),
@@ -4693,7 +4705,8 @@ async def _execute_session_create(
     return _finalize_created_session(
         data,
         conversation_id=conversation_id,
-        agent_id=str(agent_id),
+        # Neither-mode creates get the agent the server resolved.
+        agent_id=str(agent_id) if has_agent_id else data.get("agent_id"),
         title=args.get("title"),
         publish_event=publish_event,
     )

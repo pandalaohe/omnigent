@@ -7729,22 +7729,10 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        # Both modes at once: the two create different agents, so the
-        # handler must refuse rather than silently pick one.
-        {"agent_id": "ag_x", "config_path": "helper.yaml"},
-        # Neither mode: nothing to launch.
-        {"title": "auth"},
-    ],
-)
-async def test_sys_session_create_requires_exactly_one_mode(
-    arguments: dict[str, Any],
-) -> None:
+async def test_sys_session_create_rejects_both_modes() -> None:
     """
-    ``sys_session_create`` rejects both-or-neither of ``agent_id`` /
-    ``config_path`` without touching the server.
+    ``sys_session_create`` rejects both ``agent_id`` and ``config_path``
+    at once without touching the server.
 
     If the mode split regressed to a silent preference, an orchestrator
     passing both could launch the wrong agent with no signal.
@@ -7760,13 +7748,56 @@ async def test_sys_session_create_requires_exactly_one_mode(
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_create",
-            arguments=json.dumps(arguments),
+            arguments=json.dumps({"agent_id": "ag_x", "config_path": "helper.yaml"}),
             server_client=server_client,
             conversation_id="conv_caller",
         )
 
     info = json.loads(output)
-    assert "exactly one of 'agent_id'" in info["error"]
+    assert "at most one of 'agent_id'" in info["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_neither_mode_omits_the_agent_key() -> None:
+    """
+    Scenario 29: with neither mode the request body carries no
+    ``agent_id`` key (an explicit null would suppress the server's
+    default), and the handle reports the agent the server resolved.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_child",
+                    "agent_id": "ag_default",
+                    "agent_name": "project-default",
+                    "status": "idle",
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"title": "auth"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert "agent_id" not in captured
+    assert captured["parent_session_id"] == "conv_caller"
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_child"
+    assert handle["agent_id"] == "ag_default"
 
 
 def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:

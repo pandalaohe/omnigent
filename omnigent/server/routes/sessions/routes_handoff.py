@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from omnigent.calling_defaults import default_agent_for_host
 from omnigent.db.db_models import uuid_to_bytes
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionHandoff
@@ -548,6 +549,7 @@ def register_handoff_routes(
                                 background_title_coordinator=background_title_coordinator,
                                 project_store=project_store,
                                 conversation_id=record.receiver_session_id,
+                                calling_path_label="hand-off",
                             )
                             created = True
                         except Exception as exc:
@@ -888,7 +890,11 @@ def register_handoff_routes(
             if root is None:
                 return _problem("needs_input", "no_root", candidates)
             repo = root.checkout if root.source == "entry" and root.checkout else root.workspace
-            agent_key = body.agent or project.config.get("agent_id")
+            agent_key = (
+                body.agent
+                or default_agent_for_host(project.config, host_id)
+                or project.config.get("agent_id")
+            )
             if not isinstance(agent_key, str) or not agent_key:
                 return _problem("needs_input", "agent_required")
             agent = (

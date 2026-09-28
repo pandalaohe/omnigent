@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
 import pytest_asyncio
+import yaml
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
@@ -22,10 +25,13 @@ from omnigent.server.schemas import (
     SessionCreateRequest,
     SessionResponse,
 )
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import build_agent_bundle
@@ -430,6 +436,7 @@ async def test_git_default_fill_with_differing_workspace(db_uri: str) -> None:
         ),
         user_id=ALICE,
         project_store=project_store,
+        apply_calling_defaults=True,
     )
     # The omitted git block is default-filled from config; an explicit workspace
     # outside the project root is a deliberate choice and is left untouched.
@@ -498,6 +505,7 @@ async def test_shared_chokepoint_is_reusable_by_non_route_creators(
         body=ProjectSessionCreateRequest(project_id=project.id),
         user_id=ALICE,
         project_store=project_store,
+        apply_calling_defaults=True,
     )
     assert resolved.body.agent_id == CUSTOM_AGENT_ID
     assert resolved.body.workspace == "/scheduled"
@@ -564,3 +572,372 @@ async def test_import_with_unowned_or_unknown_project_is_404(
         )
         assert response.status_code == 404, response.text
         assert "Project not found" in response.text
+
+
+# ── Calling defaults on the opted-in JSON create (K1, K4, K5, K7a/b) ──────
+#
+# The host-facing seams are faked (no live host on this replica): workspace
+# validation is replaced so a host-bound create can persist, and the create
+# route's launch attempt is skipped by clearing ``host_registry``.
+
+HDS = "a" * 32
+TMB = "b" * 32
+CODEX_AGENT_ID = "587b7cb7ac30abf4debfaa578d052ec6"
+CLAUDE_AGENT_ID = "687b7cb7ac30abf4debfaa578d052ec7"
+
+
+def _harness_bundle(harness: str) -> bytes:
+    """A minimal agent bundle whose executor declares *harness*."""
+    config = yaml.safe_dump(
+        {
+            "spec_version": 1,
+            "name": f"calling-{harness}",
+            "executor": {"type": "omnigent", "config": {"harness": harness}},
+            "prompt": "hi",
+        }
+    )
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+        data = config.encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+@pytest.fixture()
+def calling_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """App with the calling-defaults stores wired on ``app.state``."""
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agents = SqlAlchemyAgentStore(db_uri)
+    for agent_id, harness in (
+        (CODEX_AGENT_ID, "codex"),
+        (CLAUDE_AGENT_ID, "claude-native"),
+    ):
+        location = f"{agent_id}/bundle"
+        artifacts.put(location, _harness_bundle(harness))
+        agents.create(agent_id, f"calling-{harness}", location)
+    app = create_app(
+        agent_store=agents,
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+        host_store=HostStore(db_uri),
+        host_model_catalog_cache_store=HostModelCatalogCacheStore(db_uri),
+        user_preferences_store=SqlAlchemyUserPreferencesStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+    # No live host: the create route skips the launch attempt.
+    app.state.host_registry = None
+    return app
+
+
+@pytest_asyncio.fixture()
+async def calling_client(calling_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=calling_app), base_url="http://test"
+    ) as client:
+        yield client
+
+
+@pytest.fixture()
+def calling_seams(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    async def echo_workspace(**kwargs: object) -> str:
+        return str(kwargs["workspace"])
+
+    monkeypatch.setattr(orchestration, "_validate_session_workspace", echo_workspace)
+
+
+def _per_host_set(agent_id: str, harness: str, model: str, effort: str) -> dict[str, object]:
+    return {"agent_id": agent_id, "harnesses": {harness: {"model": model, "effort": effort}}}
+
+
+async def test_per_host_set_fills_agent_model_and_effort(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """Scenarios 1 + 2: each host's own set supplies the whole triple."""
+    project_id = await _project(
+        calling_client,
+        {
+            "calling_defaults": {
+                HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high"),
+                TMB: _per_host_set(CLAUDE_AGENT_ID, "claude-native", "opus-5-5", "xhigh"),
+            }
+        },
+    )
+    for host_id, agent_id, model, effort in (
+        (HDS, CODEX_AGENT_ID, "gpt-6-sol", "high"),
+        (TMB, CLAUDE_AGENT_ID, "opus-5-5", "xhigh"),
+    ):
+        response = await calling_client.post(
+            "/v1/sessions",
+            json={"project_id": project_id, "host_id": host_id, "workspace": "/work"},
+            headers=_headers(),
+        )
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["agent_id"] == agent_id
+        assert body["model_override"] == model
+        assert body["reasoning_effort"] == effort
+
+
+async def test_explicit_model_wins_and_project_supplies_effort(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """Scenario 3: resolution is per field — explicit model, project effort."""
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "host_id": HDS,
+            "workspace": "/work",
+            "model_override": "gpt-6-luna",
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["model_override"] == "gpt-6-luna"
+    assert body["reasoning_effort"] == "high"
+
+
+async def test_explicit_null_effort_stays_null(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """Scenario 4: an explicit JSON null is never replaced by a default."""
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "host_id": HDS,
+            "workspace": "/work",
+            "reasoning_effort": None,
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["model_override"] == "gpt-6-sol"
+    assert body["reasoning_effort"] is None
+
+
+async def test_library_default_agent_refused_on_json_create(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """K1: an agent-omitted create refuses a saved joint agent default."""
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: {"agent_id": "ca_polly"}}},
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        headers=_headers(),
+    )
+    assert response.status_code == 400, response.text
+    message = response.json()["error"]["message"]
+    assert "ca_polly" in message
+    assert "saved joint agent" in message
+    assert "POST /v1/sessions cannot launch it" in message
+    assert "Pass agent_id" in message
+
+
+async def test_default_agent_unready_harness_refused(
+    calling_app: FastAPI,
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """K5 readiness: a host-reported unavailable harness refuses the default."""
+    calling_app.state.host_store.upsert_on_connect(HDS, "hds", ALICE)
+    calling_app.state.host_store.update_harness_readiness(HDS, {"codex": False})
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: {"agent_id": CODEX_AGENT_ID}}},
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        headers=_headers(),
+    )
+    assert response.status_code == 400, response.text
+    message = response.json()["error"]["message"]
+    assert "not ready on host 'hds'" in message
+    assert "harness 'codex' is False" in message
+
+
+async def test_fresh_catalog_missing_default_model_refused(
+    calling_app: FastAPI,
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """Scenario 11: a fresh catalog that lacks the default model refuses it."""
+    calling_app.state.host_store.upsert_on_connect(HDS, "hds", ALICE)
+    calling_app.state.host_model_catalog_cache_store.upsert(
+        HDS, "codex", [{"id": "gpt-5.5", "supportedReasoningEfforts": ["high"]}], 1700000000
+    )
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        headers=_headers(),
+    )
+    assert response.status_code == 400, response.text
+    message = response.json()["error"]["message"]
+    assert "Default model 'gpt-6-sol'" in message
+    assert "project 'project-alice@example.com' host settings" in message
+    assert f"host '{HDS}'" in message
+    assert "codex" in message
+    assert "last sync" in message
+
+
+async def test_stale_catalog_does_not_block(
+    calling_app: FastAPI,
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """Scenario 13: a catalog row with an error skips the offered checks."""
+    calling_app.state.host_store.upsert_on_connect(HDS, "hds", ALICE)
+    calling_app.state.host_model_catalog_cache_store.upsert(
+        HDS, "codex", [{"id": "gpt-5.5"}], 1700000000
+    )
+    calling_app.state.host_model_catalog_cache_store.mark_error(HDS, "codex", "unsupported")
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["model_override"] == "gpt-6-sol"
+    assert body["reasoning_effort"] == "high"
+
+
+async def test_child_takes_parent_project_host_default(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """Scenario 10: a child with no agent takes the parent's host default."""
+    project_id = await _project(
+        calling_client,
+        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+    )
+    parent = await calling_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        headers=_headers(),
+    )
+    assert parent.status_code == 201, parent.text
+    child = await calling_client.post(
+        "/v1/sessions",
+        json={"parent_session_id": parent.json()["id"]},
+        headers=_headers(),
+    )
+    assert child.status_code == 201, child.text
+    body = child.json()
+    assert body["agent_id"] == CODEX_AGENT_ID
+    assert body["model_override"] == "gpt-6-sol"
+    assert body["reasoning_effort"] == "high"
+    assert body["project_id"] == project_id
+
+
+async def test_child_without_default_names_the_project_setting(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """Scenario 10: no default agent → an error naming the missing setting."""
+    project_id = await _project(calling_client, {})
+    parent = await calling_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "host_id": HDS,
+            "workspace": "/work",
+            "agent_id": CLAUDE_AGENT_ID,
+        },
+        headers=_headers(),
+    )
+    assert parent.status_code == 201, parent.text
+    child = await calling_client.post(
+        "/v1/sessions",
+        json={"parent_session_id": parent.json()["id"]},
+        headers=_headers(),
+    )
+    assert child.status_code == 400, child.text
+    message = child.json()["error"]["message"]
+    assert f"has no default agent on host '{HDS}'" in message
+    assert "Pass agent_id" in message
+
+
+async def test_child_with_unfiled_parent_names_both(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """A child whose parent has no project names both missing pieces."""
+    parent = await calling_client.post(
+        "/v1/sessions",
+        json={"agent_id": CLAUDE_AGENT_ID},
+        headers=_headers(),
+    )
+    assert parent.status_code == 201, parent.text
+    child = await calling_client.post(
+        "/v1/sessions",
+        json={"parent_session_id": parent.json()["id"]},
+        headers=_headers(),
+    )
+    assert child.status_code == 400, child.text
+    message = child.json()["error"]["message"]
+    assert "agent_id is required" in message
+    assert "parent session has no project" in message
+
+
+async def test_import_ignores_calling_defaults(
+    calling_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Import keeps its source agent: the chain never fills its fields."""
+    _seed_claude_import_agent(db_uri)
+    project_id = await _project(
+        calling_client,
+        {
+            "workspace": "/work/import",
+            "model": "gpt-6-sol",
+            "calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")},
+        },
+    )
+    response = await calling_client.post(
+        "/v1/imports",
+        json=_import_payload("calling-defaults-import", project_id=project_id),
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    session = await calling_client.get(
+        f"/v1/sessions/{response.json()['session_id']}", headers=_headers()
+    )
+    assert session.status_code == 200, session.text
+    assert session.json()["agent_id"] == builtin_agent_id("claude-native-ui")
+    assert session.json()["model_override"] is None
+    assert session.json()["reasoning_effort"] is None

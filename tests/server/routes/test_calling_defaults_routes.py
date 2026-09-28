@@ -351,3 +351,61 @@ async def test_resolve_foreign_project_and_host_404(
         headers=_as_user(BOB),
     )
     assert owned.status_code == 200, owned.text
+
+
+async def test_resolve_reports_default_agent_readiness_and_library_problems(
+    client: httpx.AsyncClient, stores: _Stores
+) -> None:
+    """The preview reports the create helper's K5 checks as problems.
+
+    A default agent whose host reports its harness unready, and a default
+    naming a saved joint agent, both surface here instead of raising so the
+    web picker sees what an agent-omitted create would refuse.
+    """
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"codex": False})
+    _seed_agent(stores, AGENT_ID, harness="codex")
+
+    project = (
+        await client.post(
+            "/v1/projects",
+            json={
+                "name": "Unready",
+                "config": {"calling_defaults": {HOST_A: {"agent_id": AGENT_ID}}},
+            },
+        )
+    ).json()
+    body = (
+        await client.get(
+            "/v1/calling-defaults/resolve",
+            params={"project_id": project["id"], "host_id": HOST_A},
+        )
+    ).json()
+    assert body["agent_id"] == AGENT_ID
+    (problem,) = body["problems"]
+    assert problem["field"] == "agent"
+    assert problem["setting"] == "project_host"
+    assert "not ready on host 'box-a'" in problem["message"]
+    assert "harness 'codex' is False" in problem["message"]
+
+    library_project = (
+        await client.post(
+            "/v1/projects",
+            json={
+                "name": "Joint",
+                "config": {"calling_defaults": {HOST_A: {"agent_id": "ca_polly"}}},
+            },
+        )
+    ).json()
+    body = (
+        await client.get(
+            "/v1/calling-defaults/resolve",
+            params={"project_id": library_project["id"], "host_id": HOST_A},
+        )
+    ).json()
+    assert body["agent_id"] == "ca_polly"
+    (problem,) = body["problems"]
+    assert problem["field"] == "agent"
+    assert "ca_polly" in problem["message"]
+    assert "saved joint agent" in problem["message"]
+    assert "server-side creates" in problem["message"]

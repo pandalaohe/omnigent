@@ -11,10 +11,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
+from omnigent.calling_defaults import (
+    CallingResolution,
+    check_calling_defaults,
+    load_master,
+    resolve_calling,
+)
+from omnigent.entities.project import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
@@ -38,7 +45,14 @@ from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
 
+if TYPE_CHECKING:
+    from starlette.requests import Request
+
 _logger = logging.getLogger(__name__)
+
+#: Request fields the calling-defaults chain may fill; presence (even a
+#: JSON ``null``) always wins over a default.
+_CALLING_FIELDS = frozenset({"agent_id", "harness_override", "model_override", "reasoning_effort"})
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,125 @@ class ProjectCreateResolution:
     checkout: str | None = None
 
 
+async def resolve_create_calling(
+    *,
+    request: Request | None,
+    user_id: str | None,
+    project: Project | None,
+    host_id: str | None,
+    explicit: dict[str, Any],
+    explicit_fields: set[str],
+    path_label: str,
+    parent_session_id: str | None = None,
+) -> CallingResolution:
+    """Resolve one create's agent / model / effort through the shared chain.
+
+    Runs the pure :func:`omnigent.calling_defaults.resolve_calling` with the
+    stores wired on the request's app, then applies the create-time K5
+    refusals: no resolved agent when the request omitted one, a default that
+    names a saved joint (``ca_``) agent, a default agent whose harness the
+    host reports as not launchable, and a default-sourced model / effort the
+    cached catalog does not offer. Explicit request values keep today's
+    validation only.
+
+    :param request: The create request whose ``app.state`` carries the
+        stores; ``None`` degrades to the project layers only.
+    :param user_id: Owner of the master table and the host.
+    :param project: Project whose per-host set applies, or ``None``.
+    :param host_id: Host the caller will place the session on, or ``None``.
+    :param explicit: Request values keyed ``agent_id`` / ``harness_override``
+        / ``model_override`` / ``reasoning_effort``.
+    :param explicit_fields: The subset of those keys the request supplied.
+    :param path_label: The create path named in the library-agent refusal,
+        e.g. ``"hand-off"``.
+    :param parent_session_id: The caller's parent session, named when a child
+        has no project and no default agent.
+    :returns: The resolved calling triple.
+    :raises OmnigentError: ``INVALID_INPUT`` for any refused default.
+    """
+    from omnigent.server.library_agent_launch import is_library_agent_id
+    from omnigent.server.routes._sessions.orchestration import _create_resolved_harness
+
+    state = getattr(getattr(request, "app", None), "state", None)
+    host_store = getattr(state, "host_store", None)
+    agent_store = getattr(state, "agent_store", None)
+    agent_cache = getattr(state, "agent_cache", None)
+    preferences_store = getattr(state, "user_preferences_store", None)
+    catalog_store = getattr(state, "host_model_catalog_cache_store", None)
+
+    host = None
+    if host_id is not None and host_store is not None:
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+
+    def agent_harness(effective_agent_id: str) -> str | None:
+        # A saved library Agent has no ``agents`` row; the id would not even
+        # bind against the UUID-typed lookup.
+        if agent_store is None or is_library_agent_id(effective_agent_id):
+            return None
+        agent = agent_store.get(effective_agent_id)
+        if agent is None:
+            return None
+        return _create_resolved_harness(agent, None, agent_cache)
+
+    master = await load_master(user_id, preferences_store)
+    resolution = await asyncio.to_thread(
+        resolve_calling,
+        explicit=explicit,
+        explicit_fields=explicit_fields,
+        project_config=project.config if project is not None else None,
+        master=master,
+        host_id=host_id,
+        agent_harness=agent_harness,
+    )
+
+    if resolution.agent_id is None and "agent_id" not in explicit_fields:
+        host_label = host.name if host is not None and host.name else host_id or "unknown"
+        if project is not None:
+            raise OmnigentError(
+                f"Project '{project.name}' has no default agent on host '{host_label}'. "
+                "Pass agent_id, or set it in Project settings › Hosts.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if parent_session_id is not None:
+            raise OmnigentError(
+                "agent_id is required: the parent session has no project, so there is no "
+                "host default agent. Pass agent_id, or file the parent session in a project.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
+
+    agent = None
+    if (
+        resolution.agent_id is not None
+        and agent_store is not None
+        and not is_library_agent_id(resolution.agent_id)
+    ):
+        agent = await asyncio.to_thread(agent_store.get, resolution.agent_id)
+    catalog: dict[str, Any] | None = None
+    if host_id is not None and resolution.harness is not None and catalog_store is not None:
+        records = await asyncio.to_thread(catalog_store.list, [host_id])
+        record = next((row for row in records if row["harness"] == resolution.harness), None)
+        if record is not None:
+            catalog = {
+                "models": record["models"],
+                "error": record["error"],
+                "fetched_at": record["fetched_at"],
+            }
+    problems = check_calling_defaults(
+        resolution=resolution,
+        host_id=host_id or "",
+        host_name=host.name if host is not None and host.name else None,
+        configured_harnesses=host.configured_harnesses if host is not None else None,
+        catalog=catalog,
+        agent_name=getattr(agent, "name", None),
+        project_name=project.name if project is not None else None,
+        path_label=path_label,
+    )
+    if problems:
+        raise OmnigentError(problems[0]["message"], code=ErrorCode.INVALID_INPUT)
+    return resolution
+
+
 async def resolve_project_session_create(
     *,
     body: Any,
@@ -66,72 +199,111 @@ async def resolve_project_session_create(
     feature_flags: FeatureFlags | None = None,
     host_store: HostStore | None = None,
     fill_host: bool = False,
+    request: Request | None = None,
+    apply_calling_defaults: bool = False,
+    parent_project: Project | None = None,
+    parent_host_id: str | None = None,
+    calling_path_label: str = "POST /v1/sessions",
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
     Field presence, rather than value, controls defaulting.  Consequently an
     explicit JSON ``null`` remains explicit and is never replaced by a project
     hint.  Unknown and foreign projects deliberately share one 404 response.
+
+    With *apply_calling_defaults* the host resolves first (the per-host
+    default agent needs it) and agent / model / effort come from
+    :func:`resolve_create_calling`; only omitted fields are filled. A child
+    with no ``project_id`` uses *parent_project* for the chain and
+    *parent_host_id* as its host when the request names none.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
-    if "project_id" not in fields_set or project_id is None:
+    explicit_fields = fields_set & _CALLING_FIELDS
+    project: Project | None = None
+    if "project_id" in fields_set and project_id is not None:
+        if project_store is None:
+            raise OmnigentError(
+                "Project not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+
+    updates: dict[str, Any] = {}
+    bindings: Any = []
+    entries: Any = []
+    gates_on = False
+    if project is not None:
+        config = project.config
+        # The legacy agent_id fill moved into the calling chain below; config
+        # keeps supplying git, whose semantics have no chain.
+        if "git" not in fields_set and "git" in config and "git" in body.__class__.model_fields:
+            updates["git"] = config["git"]
+        bindings = await load_bindings(binding_store, project.id)
+        entries = await load_entries(binding_store, project.id)
+        gates_on = bindings_apply(project, feature_flags)
+        if (
+            fill_host
+            and "host_id" not in fields_set
+            and "workspace" not in fields_set
+            and body.parent_session_id is None
+            and "host_type" not in fields_set
+        ):
+            roots = host_roots(project, bindings, gates_on=gates_on, entries=entries)
+            eligible = await load_eligible_host_ids(
+                host_store, user_id, (root.host_id for root in roots)
+            )
+            chosen = default_host(project, roots, eligible_host_ids=eligible)
+            if chosen.reason == "ambiguous":
+                names = ", ".join(
+                    root.host_id for root in roots if eligible is None or root.host_id in eligible
+                )
+                raise OmnigentError(
+                    f"Project '{project.name}' has a directory on several hosts "
+                    f"({names}). Pass host_id.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if chosen.host_id is not None:
+                updates["host_id"] = chosen.host_id
+        if "workspace" not in fields_set:
+            host_id = updates.get("host_id", body.host_id)
+            if host_id is not None:
+                root = root_on_host(project, bindings, host_id, gates_on=gates_on, entries=entries)
+                if root is None:
+                    raise OmnigentError(
+                        f"Project '{project.name}' has no directory on host '{host_id}'. "
+                        "Pass workspace, or set this host's directory in the project settings.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                updates["workspace"] = root.workspace
+            elif "workspace" in config and "workspace" in body.__class__.model_fields:
+                updates["workspace"] = config["workspace"]
+
+    if apply_calling_defaults:
+        calling_host_id = updates.get("host_id", getattr(body, "host_id", None)) or parent_host_id
+        resolution = await resolve_create_calling(
+            request=request,
+            user_id=user_id,
+            project=project if project is not None else parent_project,
+            host_id=calling_host_id,
+            explicit=body.model_dump(),
+            explicit_fields=explicit_fields,
+            path_label=calling_path_label,
+            parent_session_id=getattr(body, "parent_session_id", None),
+        )
+        if "agent_id" not in fields_set and resolution.agent_id is not None:
+            updates["agent_id"] = resolution.agent_id
+        if "model_override" not in fields_set and resolution.model is not None:
+            updates["model_override"] = resolution.model
+        if "reasoning_effort" not in fields_set and resolution.effort is not None:
+            updates["reasoning_effort"] = resolution.effort
+    elif project is None:
         if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
             raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
         return ProjectCreateResolution(body=body)
-    if project_store is None:
-        raise OmnigentError(
-            "Project not found",
-            code=ErrorCode.NOT_FOUND,
-        )
-    project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
-    if project is None:
-        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
 
-    config = project.config
-    updates: dict[str, Any] = {}
-    for field in ("agent_id", "git"):
-        if field not in fields_set and field in config and field in body.__class__.model_fields:
-            updates[field] = config[field]
-    bindings = await load_bindings(binding_store, project.id)
-    entries = await load_entries(binding_store, project.id)
-    gates_on = bindings_apply(project, feature_flags)
-    if (
-        fill_host
-        and "host_id" not in fields_set
-        and "workspace" not in fields_set
-        and body.parent_session_id is None
-        and "host_type" not in fields_set
-    ):
-        roots = host_roots(project, bindings, gates_on=gates_on, entries=entries)
-        eligible = await load_eligible_host_ids(
-            host_store, user_id, (root.host_id for root in roots)
-        )
-        chosen = default_host(project, roots, eligible_host_ids=eligible)
-        if chosen.reason == "ambiguous":
-            names = ", ".join(
-                root.host_id for root in roots if eligible is None or root.host_id in eligible
-            )
-            raise OmnigentError(
-                f"Project '{project.name}' has a directory on several hosts "
-                f"({names}). Pass host_id.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if chosen.host_id is not None:
-            updates["host_id"] = chosen.host_id
-    if "workspace" not in fields_set:
-        host_id = updates.get("host_id", body.host_id)
-        if host_id is not None:
-            root = root_on_host(project, bindings, host_id, gates_on=gates_on, entries=entries)
-            if root is None:
-                raise OmnigentError(
-                    f"Project '{project.name}' has no directory on host '{host_id}'. "
-                    "Pass workspace, or set this host's directory in the project settings.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            updates["workspace"] = root.workspace
-        elif "workspace" in config and "workspace" in body.__class__.model_fields:
-            updates["workspace"] = config["workspace"]
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as

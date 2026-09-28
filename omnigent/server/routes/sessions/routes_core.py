@@ -760,10 +760,19 @@ def register_core_routes(
             payload = await request.json()
             # Dispatch on the VALUE, not key presence: a null project_id is
             # "no project", so it must keep the legacy request shape (and its
-            # 422 contract) byte-identical to an absent key.
+            # 422 contract) byte-identical to an absent key. A child create
+            # that omits the agent also opts into the project shape, so the
+            # server can fill the parent project's default agent.
             create_model = (
                 ProjectSessionCreateRequest
-                if isinstance(payload, dict) and payload.get("project_id") is not None
+                if isinstance(payload, dict)
+                and (
+                    payload.get("project_id") is not None
+                    or (
+                        payload.get("parent_session_id") is not None
+                        and payload.get("agent_id") is None
+                    )
+                )
                 else SessionCreateRequest
             )
             body = create_model.model_validate(payload)
