@@ -105,7 +105,6 @@ from omnigent.update_check import (
     _find_repo_root,
     _probe_installed_distribution,
     _read_installed_wheel_info,
-    _remote_git_head,
     _run_upgrade_command,
     _split_vcs_url,
     _uv_tool_receipt_path,
@@ -9303,6 +9302,60 @@ def _valid_git_sha(value: object) -> str | None:
     return candidate
 
 
+_CUSTOM_HOST_LOOKUP_TIMEOUT_S = 20.0
+_CUSTOM_HOST_LOOKUP_ATTEMPTS = 2
+
+
+def _resolve_custom_host_channel_head() -> str:
+    """Resolve the custom Host channel commit, naming why a lookup failed.
+
+    Unlike ``_remote_git_head``, this gates an update the user asked for, so it
+    retries a transient failure and reports its cause instead of returning ``None``.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    repo_url, ref = _split_vcs_url(_CUSTOM_HOST_CHANNEL_URL)
+    label = ref or "HEAD"
+    failure = ""
+    for _attempt in range(_CUSTOM_HOST_LOOKUP_ATTEMPTS):
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", repo_url, label],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_CUSTOM_HOST_LOOKUP_TIMEOUT_S,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            failure = f"`git ls-remote` timed out after {_CUSTOM_HOST_LOOKUP_TIMEOUT_S:.0f}s"
+            continue
+        except FileNotFoundError:
+            failure = "`git` was not found on PATH"
+            break
+        except OSError as exc:
+            failure = f"`git ls-remote` could not start ({exc})"
+            break
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or "(no stderr)"
+            failure = f"`git ls-remote` exited with status {result.returncode}: {stderr}"
+            continue
+        first = result.stdout.split("\n", 1)[0].strip()
+        sha = first.split("\t", 1)[0].strip() if first else ""
+        resolved = _valid_git_sha(sha)
+        if resolved is not None:
+            return resolved
+        failure = f"the fork has no {label!r} branch"
+        break
+    exc = click.ClickException(
+        f"Couldn't resolve {_CUSTOM_HOST_CHANNEL!r} from our fork: {failure}. "
+        "Check network/git access, then retry."
+    )
+    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    raise exc
+
+
 def _write_custom_host_rollback(commit_sha: str) -> None:
     """Atomically remember the one commit the custom Host can roll back to."""
     from omnigent.install_ledger import atomic_write_json
@@ -9912,12 +9965,7 @@ def _host_update_custom_impl(
         target_url = f"{_CUSTOM_HOST_VCS_URL}@{target_sha}"
     else:
         target_url = _CUSTOM_HOST_CHANNEL_URL
-        target_sha = _valid_git_sha(_remote_git_head(target_url))
-        if target_sha is None:
-            raise click.ClickException(
-                f"Couldn't resolve {_CUSTOM_HOST_CHANNEL!r} from our fork. "
-                "Check network/git access."
-            )
+        target_sha = _resolve_custom_host_channel_head()
 
     # Resolve the moving channel once, then install that exact revision on
     # every platform. A push during uv/pipx installation must not change it.

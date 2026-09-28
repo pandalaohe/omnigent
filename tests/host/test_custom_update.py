@@ -12,10 +12,12 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import click
 import pytest
 from click.testing import CliRunner
 
 from omnigent.cli import _HostDaemonRecord, cli
+from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 from omnigent.update_check import _InstalledWheelInfo
 
 _WINDOWS_PWSH = shutil.which("pwsh") if sys.platform == "win32" else None
@@ -66,7 +68,7 @@ def test_custom_update_dry_run_targets_fork_channel_and_preserves_extras(
     monkeypatch.setattr(cli_module, "IS_WINDOWS", is_windows)
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_remote_git_head", lambda _url: new, raising=False)
+    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
 
     result = CliRunner().invoke(cli, ["host", "update", "custom", "--dry-run"])
 
@@ -88,7 +90,7 @@ def test_custom_update_restarts_supervisor_after_install_failure(
     new = "b" * 40
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_remote_git_head", lambda _url: new, raising=False)
+    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -151,7 +153,7 @@ def test_custom_update_verifies_commit_and_host_reconnect(
     new = "b" * 40
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_remote_git_head", lambda _url: new, raising=False)
+    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -240,7 +242,7 @@ def test_custom_update_refuses_to_pause_when_session_query_fails(
     paused: list[bool] = []
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_remote_git_head", lambda _url: new)
+    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -342,6 +344,108 @@ def test_custom_fork_url_detection_covers_supported_spellings(url: str) -> None:
     assert cli_module._is_custom_host_vcs_url(url)
 
 
+def test_custom_host_channel_lookup_retries_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    sha = "c" * 40
+    calls: list[list[str]] = []
+    outcomes = iter(
+        [
+            subprocess.TimeoutExpired(cmd="git ls-remote", timeout=20.0),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=f"{sha}\trefs/heads/local/host-custom\n",
+            ),
+        ]
+    )
+
+    def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        outcome = next(outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    assert cli_module._resolve_custom_host_channel_head() == sha
+    assert len(calls) == 2
+
+
+def test_custom_host_channel_lookup_reports_timeout_after_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    calls: list[int] = []
+
+    def _run(*_args: object, **_kwargs: object) -> object:
+        calls.append(1)
+        raise subprocess.TimeoutExpired(cmd="git ls-remote", timeout=20.0)
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli_module._resolve_custom_host_channel_head()
+
+    assert "timed out after 20s" in str(excinfo.value)
+    assert getattr(excinfo.value, SUPPRESS_RECOVERY_HINT_ATTR) is True
+    assert len(calls) == 2
+
+
+def test_custom_host_channel_lookup_reports_git_failure_and_suppresses_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    calls: list[int] = []
+
+    def _run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=128,
+            stdout="",
+            stderr=(
+                "fatal: unable to access 'https://github.com/pandalaohe/omnigent.git/': "
+                "Could not resolve host: github.com\n"
+            ),
+        )
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli_module._resolve_custom_host_channel_head()
+
+    message = str(excinfo.value)
+    assert "status 128" in message
+    assert "Could not resolve host" in message
+    assert getattr(excinfo.value, SUPPRESS_RECOVERY_HINT_ATTR) is True
+    assert len(calls) == 2
+
+
+def test_custom_host_channel_lookup_names_missing_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    calls: list[int] = []
+
+    def _run(*_args: object, **_kwargs: object) -> object:
+        calls.append(1)
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    with pytest.raises(click.ClickException, match="`git` was not found on PATH"):
+        cli_module._resolve_custom_host_channel_head()
+
+    assert len(calls) == 1
+
+
 def test_custom_rollback_receipt_round_trip_and_schema_validation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -375,7 +479,7 @@ def test_custom_update_checks_supervisor_before_draining(
     drained: list[bool] = []
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_remote_git_head", lambda _url: new)
+    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -505,7 +609,7 @@ def test_windows_custom_update_schedules_detached_helper(
     monkeypatch.setattr(cli_module, "IS_WINDOWS", True)
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_remote_git_head", lambda _url: new)
+    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
     monkeypatch.setattr(cli_module, "_load_existing_host_id", lambda: "host-1")
     monkeypatch.setattr(cli_module, "_drain_custom_host_sessions", lambda *_a, **_k: None)
     monkeypatch.setattr(cli_module, "_custom_host_records", lambda _host_id: [])
