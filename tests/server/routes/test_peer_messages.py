@@ -4,8 +4,8 @@ Builds the full app with the ``session_peer_messaging`` flag on (or off),
 two runner-bound sessions, and a fake ``post_event_impl`` that records
 inline-delivery calls and returns scripted shapes. Covers every
 disposition row, the four order-sensitive precedences, closed detection,
-native failure mapping, ``wait_seconds``, guard concurrency, thread cap,
-reply detection, and the GET / action routes.
+native failure mapping, ``wait_seconds``, guard concurrency, the relay
+depth hold and rate delays, reply detection, and the GET / action routes.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.entities import SessionPeerMessage
+from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
@@ -35,7 +37,7 @@ from omnigent.server.routes.sessions.routes_peer import (
     PEER_HOLD_LIFETIME,
     PEER_PAIR_LIMIT,
     PEER_QUEUE_LIFETIME,
-    PEER_THREAD_LIMIT,
+    PEER_SENDER_LIMIT,
     PeerSendRequest,
     format_peer_envelope,
     register_peer_routes,
@@ -239,6 +241,55 @@ def _send(
         "json": {"sender_session_id": sender_id, "text": text, **extra},
         "headers": _headers(ALICE, token),
     }
+
+
+def _mirror_envelope(
+    peer_env: dict[str, Any],
+    record: SessionPeerMessage,
+    *,
+    conversation_id: str,
+    text: str = "peer body",
+) -> None:
+    """Append one record's real envelope to a conversation as user input."""
+    envelope = format_peer_envelope(
+        sender_session_id=record.sender_session_id,
+        sender_title="Sender",
+        sender_agent_name=None,
+        sender_project_id=None,
+        ref=record.ref,
+        peer_id=record.id,
+        text=text,
+    )
+    peer_env["conv_store"].append(
+        conversation_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp-{uuid.uuid4().hex}",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": envelope}]),
+            )
+        ],
+    )
+
+
+def _seed_trigger_depth(peer_env: dict[str, Any], depth: int) -> SessionPeerMessage:
+    """Seed a delivered record whose envelope is the sender's latest input."""
+    sender = peer_env["sender"]
+    record = peer_env["peer_store"].create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=peer_env["receiver"].id,
+            receiver_session_id=sender.id,
+            ref=f"trigger-{uuid.uuid4().hex}",
+            text="trigger",
+            state="delivered",
+            relay_depth=depth,
+            created_at=1,
+            expires_at=2,
+        )
+    )
+    _mirror_envelope(peer_env, record, conversation_id=sender.id, text="trigger body")
+    return record
 
 
 # ── envelope ────────────────────────────────────────────────────────
@@ -934,10 +985,11 @@ async def test_concurrent_identical_sends_admit_once(
     assert dropped["reason"] == "duplicate"
 
 
-async def test_seven_distinct_concurrent_sends_admit_six(
+async def test_seven_distinct_concurrent_sends_delay_the_seventh(
     peer_env: dict[str, Any],
 ) -> None:
-    """Seven distinct concurrent sends within 60 s admit exactly six."""
+    """T14/T14b: the seventh send in the pair window is queued with a rate
+    delay, and a backlog to one receiver does not delay another."""
     from fastapi import Request
 
     sender = peer_env["sender"]
@@ -976,66 +1028,95 @@ async def test_seven_distinct_concurrent_sends_admit_six(
         return await routes[0].endpoint(request, target.id, body)
 
     results = await asyncio.gather(*[_one(i) for i in range(PEER_PAIR_LIMIT + 1)])
-    admitted = [r for r in results if r["disposition"] != "refused"]
-    refused = [r for r in results if r["disposition"] == "refused"]
-    assert len(admitted) == PEER_PAIR_LIMIT, results
-    assert len(refused) == 1
-    assert refused[0]["reason"] == "burst"
+    delivered = [r for r in results if r["disposition"] == "delivered"]
+    delayed = [r for r in results if r["disposition"] == "queued"]
+    assert len(delivered) == PEER_PAIR_LIMIT, results
+    assert len(delayed) == 1, results
+    assert delayed[0]["reason"] == "rate_delay"
+    delayed_record = peer_env["peer_store"].get(delayed[0]["peer_id"])
+    first_record = peer_env["peer_store"].get(delivered[0]["peer_id"])
+    assert delayed_record is not None and delayed_record.not_before is not None
+    assert first_record is not None
+    assert delayed_record.not_before >= first_record.created_at + 59
+
+    other = conv_store.create_conversation(
+        title=f"other-{uuid.uuid4().hex[:6]}", agent_id=AGENT_ID, runner_id="rb"
+    )
+    peer_env["perm_store"].grant(ALICE, other.id, LEVEL_OWNER)
+    elsewhere = await peer_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=other.id,
+        text=f"elsewhere-{uuid.uuid4().hex}",
+        correlation_id=None,
+    )
+    assert elsewhere["disposition"] == "delivered"
+    elsewhere_record = peer_env["peer_store"].get(elsewhere["peer_id"])
+    assert elsewhere_record is not None and elsewhere_record.not_before is None
 
 
-async def test_thread_cap(peer_client: httpx.AsyncClient, peer_env: dict[str, Any]) -> None:
-    """The 21st record on one correlation id is refused(thread_limit).
-
-    Uses an offline receiver (pending records keep their reservations, so
-    only the duplicate text hash is consumed per send) with a fresh sender
-    per attempt, staying under both the pair and sender budgets.
-    """
+async def test_no_cap_on_records_sharing_one_ref(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """T1: 40 sends on one correlation id all store; none is refused."""
+    sender = peer_env["sender"]
     receiver = peer_env["receiver"]
-    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
-    peer_env["offline_ids"].add(receiver.id)
     ref = f"thread-{uuid.uuid4().hex}"
-    try:
-        for i in range(PEER_THREAD_LIMIT):
-            sender_token, _ = _runner_pair()
-            sender_runner = token_bound_runner_id(sender_token)
-            thread_sender = conv_store.create_conversation(
-                title=f"thread-{i}-{uuid.uuid4().hex[:6]}",
-                agent_id=AGENT_ID,
-                runner_id=sender_runner,
-            )
-            peer_env["perm_store"].grant(ALICE, thread_sender.id, LEVEL_OWNER)
-            marker = uuid.uuid5(uuid.NAMESPACE_DNS, f"{ref}-{i}").hex
-            resp = await peer_client.post(
-                f"/v1/sessions/{receiver.id}/peer-messages",
-                json={
-                    "sender_session_id": thread_sender.id,
-                    "text": f"thread message {marker}",
-                    "correlation_id": ref,
-                    "wait_seconds": 600,
-                },
-                headers=_headers(ALICE, sender_token),
-            )
-            assert resp.json()["disposition"] == "pending", resp.text
-        sender_token, _ = _runner_pair()
-        sender_runner = token_bound_runner_id(sender_token)
-        last_sender = conv_store.create_conversation(
-            title=f"thread-last-{uuid.uuid4().hex[:6]}",
-            agent_id=AGENT_ID,
-            runner_id=sender_runner,
-        )
-        peer_env["perm_store"].grant(ALICE, last_sender.id, LEVEL_OWNER)
+    dispositions = []
+    for index in range(40):
         resp = await peer_client.post(
             f"/v1/sessions/{receiver.id}/peer-messages",
             json={
-                "sender_session_id": last_sender.id,
-                "text": f"thread message {uuid.uuid4().hex}",
+                "sender_session_id": sender.id,
+                "text": f"thread message {index} {uuid.uuid4().hex}",
                 "correlation_id": ref,
                 "wait_seconds": 600,
             },
-            headers=_headers(ALICE, sender_token),
+            headers=_headers(ALICE, peer_env["sender_token"]),
         )
-        assert resp.json()["disposition"] == "refused"
-        assert resp.json()["reason"] == "thread_limit"
+        assert resp.status_code == 200, resp.text
+        dispositions.append(resp.json()["disposition"])
+    assert set(dispositions) <= {"delivered", "queued"}, dispositions
+    assert "refused" not in dispositions
+    assert peer_env["peer_store"].count_for_ref(ref) == 40
+
+
+async def test_rate_delay_on_pending_path(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """T14c: the seventh send to an offline receiver is pending with the
+    wait shifted out by the rate delay, and still stores its depth."""
+    receiver = peer_env["receiver"]
+    sender = peer_env["sender"]
+    peer_env["offline_ids"].add(receiver.id)
+    try:
+        for index in range(PEER_PAIR_LIMIT):
+            resp = await peer_client.post(
+                f"/v1/sessions/{receiver.id}/peer-messages",
+                json={
+                    "sender_session_id": sender.id,
+                    "text": f"offline {index} {uuid.uuid4().hex}",
+                    "wait_seconds": 600,
+                },
+                headers=_headers(ALICE, peer_env["sender_token"]),
+            )
+            assert resp.json()["disposition"] == "pending", resp.text
+        resp = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={
+                "sender_session_id": sender.id,
+                "text": f"offline last {uuid.uuid4().hex}",
+                "wait_seconds": 120,
+            },
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert resp.json()["disposition"] == "pending", resp.text
+        record = peer_env["peer_store"].get(resp.json()["peer_id"])
+        assert record is not None
+        assert record.not_before is not None
+        assert record.relay_depth == 1
+        # expires_at is now + wait + ceil(delay); not_before is the rounded
+        # wall deadline, so the two differ by the wait (rounding aside).
+        assert abs(record.expires_at - record.not_before - 120) <= 2
     finally:
         peer_env["offline_ids"].discard(receiver.id)
 
@@ -1277,33 +1358,152 @@ async def test_send_denied_for_unrelated_user(
     assert resp.status_code in (403, 404), resp.text
 
 
-async def test_system_send_bypasses_thread_limit(peer_env: dict[str, Any]) -> None:
-    """A mandatory system message is admitted even when its ref is full."""
-    from omnigent.entities import SessionPeerMessage
-
+async def test_relay_depth_limit_holds_but_system_sends_bypass(
+    peer_env: dict[str, Any],
+) -> None:
+    """T11: a depth-31 agent send is held(relay_limit); a system send is not."""
     sender, receiver = peer_env["sender"], peer_env["receiver"]
-    ref = f"full-{uuid.uuid4().hex}"
-    for index in range(PEER_THREAD_LIMIT):
-        peer_env["peer_store"].create(
-            SessionPeerMessage(
-                id=uuid.uuid4().hex,
-                sender_session_id=sender.id,
-                receiver_session_id=receiver.id,
-                ref=ref,
-                text=f"prior {index}",
-                state="delivered",
-                created_at=1,
-                expires_at=2,
-            )
-        )
+    _seed_trigger_depth(peer_env, 30)
     result = await peer_env["app"].state.peer_send(
         sender=sender,
         receiver_id=receiver.id,
-        text="required result",
-        correlation_id=ref,
+        text=f"relay hop {uuid.uuid4().hex}",
+        correlation_id=None,
+    )
+    assert result["disposition"] == "held"
+    assert result["reason"] == "relay_limit"
+    held_record = peer_env["peer_store"].get(result["peer_id"])
+    assert held_record is not None
+    assert held_record.state == "held"
+    assert held_record.relay_depth == 31
+
+    system = await peer_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text=f"required result {uuid.uuid4().hex}",
+        correlation_id=None,
         system=True,
     )
-    assert result["disposition"] == "delivered"
+    assert system["disposition"] == "delivered"
+    assert peer_env["peer_store"].get(system["peer_id"]).relay_depth == 31
+
+
+async def test_release_resets_relay_depth(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """T12: release writes depth 0; the receiver's next send is depth 1."""
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+    _seed_trigger_depth(peer_env, 30)
+    held = await peer_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text=f"relay hop {uuid.uuid4().hex}",
+        correlation_id=None,
+    )
+    assert held["disposition"] == "held"
+
+    released = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages/{held['peer_id']}/action",
+        json={"action": "release"},
+        headers=_headers(ALICE, None),
+    )
+    assert released.status_code == 200, released.text
+    assert released.json()["state"] == "pending"
+    released_record = peer_env["peer_store"].get(held["peer_id"])
+    assert released_record is not None
+    assert released_record.relay_depth == 0
+
+    # Stand in for the sweeper's delivery: the released record settles and
+    # its envelope becomes the receiver's latest input.
+    peer_env["peer_store"].transition(held["peer_id"], "delivered", None, ("pending",))
+    _mirror_envelope(peer_env, released_record, conversation_id=receiver.id, text="relay hop")
+
+    response = await peer_client.post(
+        f"/v1/sessions/{sender.id}/peer-messages",
+        json={
+            "sender_session_id": receiver.id,
+            "text": f"reply {uuid.uuid4().hex}",
+        },
+        headers=_headers(ALICE, peer_env["receiver_token"]),
+    )
+    assert response.json()["disposition"] == "delivered", response.text
+    next_record = peer_env["peer_store"].get(response.json()["peer_id"])
+    assert next_record is not None
+    assert next_record.relay_depth == 1
+
+
+async def test_rate_delay_sender_budget_never_holds(peer_env: dict[str, Any]) -> None:
+    """T16: the 61st send from one sender is queued, not held or refused."""
+    sender = peer_env["sender"]
+    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
+    receivers = []
+    for index in range(11):
+        receiver = conv_store.create_conversation(
+            title=f"budget-{index}", agent_id=AGENT_ID, runner_id="rb"
+        )
+        peer_env["perm_store"].grant(ALICE, receiver.id, LEVEL_OWNER)
+        receivers.append(receiver)
+    send = peer_env["app"].state.peer_send
+    first_created: int | None = None
+    for index in range(PEER_SENDER_LIMIT):
+        result = await send(
+            sender=sender,
+            receiver_id=receivers[index % len(receivers)].id,
+            text=f"budget-{index}-{uuid.uuid4().hex}",
+            correlation_id=None,
+        )
+        assert result["disposition"] == "delivered", result
+        if first_created is None:
+            first_created = peer_env["peer_store"].get(result["peer_id"]).created_at
+    result = await send(
+        sender=sender,
+        receiver_id=receivers[0].id,
+        text=f"budget-last-{uuid.uuid4().hex}",
+        correlation_id=None,
+    )
+    assert result["disposition"] == "queued", result
+    assert result["reason"] == "rate_delay"
+    record = peer_env["peer_store"].get(result["peer_id"])
+    assert record is not None
+    assert record.not_before is not None
+    assert first_created is not None
+    assert record.not_before >= first_created + 598
+
+
+async def test_rate_delay_deadline_rounds_wall_clock(
+    peer_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T16b: not_before rounds the whole wall deadline, not just the delay."""
+    sender, receiver = peer_env["sender"], peer_env["receiver"]
+
+    class _FrozenTime:
+        wall = 1000.90
+        mono = 1000.90
+
+        def time(self) -> float:
+            return self.wall
+
+        def monotonic(self) -> float:
+            return self.mono
+
+    frozen = _FrozenTime()
+    monkeypatch.setattr(peer_module, "time", frozen)
+    send = peer_env["app"].state.peer_send
+    for index in range(PEER_PAIR_LIMIT):
+        delivered = await send(
+            sender=sender, receiver_id=receiver.id, text=f"round-{index}", correlation_id=None
+        )
+        assert delivered["disposition"] == "delivered", delivered
+    frozen.wall = 1001.95
+    frozen.mono = 1001.95
+    delayed = await send(
+        sender=sender, receiver_id=receiver.id, text="round-last", correlation_id=None
+    )
+    assert delayed["disposition"] == "queued", delayed
+    assert delayed["reason"] == "rate_delay"
+    record = peer_env["peer_store"].get(delayed["peer_id"])
+    assert record is not None and record.not_before is not None
+    assert record.not_before >= 1061
 
 
 async def test_peer_id_returns_existing_without_delivery(peer_env: dict[str, Any]) -> None:

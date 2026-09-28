@@ -93,6 +93,32 @@ describe("PeerHeldPanel", () => {
     expect(row1).toHaveTextContent("From conv_sen · ref=corr-1");
   });
 
+  it("shows a relay-limit reason line on held rows only", async () => {
+    listPeerMessagesMock.mockResolvedValue([
+      record({ id: "peer_held", state: "held", reason: "relay_limit" }),
+      record({ id: "peer_pending", state: "pending", reason: "offline" }),
+    ]);
+
+    render(<PeerHeldPanel sessionId="conv_receiver" open onOpenChange={() => {}} />);
+    await screen.findAllByTestId("peer-held-row");
+
+    expect(screen.getByTestId("peer-held-reason")).toHaveTextContent(
+      "Paused: automatic relay chain passed 30 hops without you. Release to continue.",
+    );
+    const pendingRow = document.querySelector('[data-peer-id="peer_pending"]');
+    expect(pendingRow).not.toBeNull();
+    expect(pendingRow).not.toHaveTextContent("offline");
+  });
+
+  it("shows the raw reason code for other held reasons", async () => {
+    listPeerMessagesMock.mockResolvedValue([record({ id: "peer_held", reason: "policy" })]);
+
+    render(<PeerHeldPanel sessionId="conv_receiver" open onOpenChange={() => {}} />);
+    await screen.findByTestId("peer-held-row");
+
+    expect(screen.getByTestId("peer-held-reason")).toHaveTextContent("policy");
+  });
+
   it("does not fetch while closed", () => {
     render(<PeerHeldPanel sessionId="conv_receiver" open={false} onOpenChange={() => {}} />);
     expect(listPeerMessagesMock).not.toHaveBeenCalled();

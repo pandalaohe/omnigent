@@ -77,10 +77,8 @@ def test_upgrade_head_creates_peer_messages_with_indexes(tmp_path: Path) -> None
     } <= columns
     pk = set(inspector.get_pk_constraint("session_peer_messages")["constrained_columns"])
     assert pk == {"workspace_id", "id"}
-    got_indexes = {
-        index["name"] for index in inspector.get_indexes("session_peer_messages")
-    }
-    assert _EXPECTED_INDEXES <= got_indexes
+    got_indexes = {index["name"] for index in inspector.get_indexes("session_peer_messages")}
+    assert got_indexes >= _EXPECTED_INDEXES
 
     _downgrade(uri, engine, "a12c20260913")
     inspector = sa.inspect(engine)
@@ -90,6 +88,44 @@ def test_upgrade_head_creates_peer_messages_with_indexes(tmp_path: Path) -> None
         # leaves the other branch's head stamped alongside it.
         stamped = set(conn.scalars(sa.text("SELECT version_num FROM alembic_version")))
         assert "a12c20260913" in stamped, stamped
+
+    engine.dispose()
+    clear_engine_cache()
+
+
+def test_relay_depth_columns_upgrade_and_downgrade(tmp_path: Path) -> None:
+    """a22c20260928 adds both columns with the documented defaults; down drops them."""
+    uri = f"sqlite:///{tmp_path / 'peer-relay-depth.db'}"
+    engine = sa.create_engine(uri)
+
+    _upgrade(uri, engine, "a21c20260927")
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("session_peer_messages")}
+    assert "relay_depth" not in columns
+    assert "not_before" not in columns
+
+    _upgrade(uri, engine, "a22c20260928")
+    by_name = {c["name"]: c for c in sa.inspect(engine).get_columns("session_peer_messages")}
+    assert by_name["relay_depth"]["nullable"] is False
+    assert str(by_name["relay_depth"]["default"]).strip("'\"") == "1"
+    assert by_name["not_before"]["nullable"] is True
+    assert by_name["not_before"]["default"] is None
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO session_peer_messages "
+                "(workspace_id, id, sender_session_id, receiver_session_id, ref, "
+                "text, state, created_at, expires_at) "
+                "VALUES (0, :id, :sender, :receiver, 'r1', 'x', 'delivered', 1, 2)"
+            ),
+            {"id": "a" * 32, "sender": "b" * 32, "receiver": "c" * 32},
+        )
+        assert conn.scalar(sa.text("SELECT relay_depth FROM session_peer_messages")) == 1
+        assert conn.scalar(sa.text("SELECT not_before FROM session_peer_messages")) is None
+
+    _downgrade(uri, engine, "a21c20260927")
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("session_peer_messages")}
+    assert "relay_depth" not in columns
+    assert "not_before" not in columns
 
     engine.dispose()
     clear_engine_cache()

@@ -282,6 +282,10 @@ class PeerSweeper:
             # action route (held -> pending); the sweeper never delivers
             # one on its own.
             return
+        if record.not_before is not None and record.not_before > now:
+            # A rate-delayed record waits for its slot; expiry, closed,
+            # refusal and owner checks above still ran first.
+            return
         # Captured before the CAS below: some store implementations hand
         # back the same mutable row on every read, so ``record.state``
         # itself can flip to ``delivering`` as a side effect of that CAS.

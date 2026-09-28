@@ -57,6 +57,36 @@ def test_create_and_get_round_trip(store: SqlAlchemyPeerMessageStore) -> None:
     assert store.get(_uid("missing")) is None
 
 
+def test_relay_depth_and_not_before_round_trip(store: SqlAlchemyPeerMessageStore) -> None:
+    """The relay-depth and not-before columns round-trip, with their defaults."""
+    seeded = store.create(_record("rd", relay_depth=7, not_before=1234))
+    assert seeded.relay_depth == 7
+    assert seeded.not_before == 1234
+    fetched = store.get(seeded.id)
+    assert fetched is not None
+    assert fetched.relay_depth == 7
+    assert fetched.not_before == 1234
+
+    defaulted = store.create(_record("rd-default"))
+    assert defaulted.relay_depth == 1
+    assert defaulted.not_before is None
+
+
+def test_transition_writes_relay_depth(store: SqlAlchemyPeerMessageStore) -> None:
+    """``transition(relay_depth=...))`` resets the depth; omitting it leaves it."""
+    record = store.create(_record("tr", relay_depth=31))
+    assert (
+        store.transition(record.id, "pending", expected_states=("pending",), relay_depth=0) is True
+    )
+    updated = store.get(record.id)
+    assert updated is not None
+    assert updated.relay_depth == 0
+    assert store.transition(record.id, "queued", expected_states=("pending",)) is True
+    kept = store.get(record.id)
+    assert kept is not None
+    assert kept.relay_depth == 0
+
+
 def test_transition_compare_and_set(store: SqlAlchemyPeerMessageStore) -> None:
     """A matching expected state moves; a stale one returns ``False``."""
     record = store.create(_record("t1"))

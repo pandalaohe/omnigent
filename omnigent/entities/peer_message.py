@@ -33,6 +33,10 @@ class SessionPeerMessage:
     :param reply_peer_id: The reply record's id, or ``None``.
     :param replied_at: Unix epoch seconds the reply was recorded, or
         ``None``.
+    :param relay_depth: Relay hops since the sender's latest human input
+        (1 when that input was human, else the trigger's depth + 1).
+    :param not_before: Earliest Unix epoch second the sweeper may deliver
+        this record, or ``None`` when it may deliver immediately.
     :param workspace_id: Tenant partition key that owns this row.
     """
 
@@ -49,4 +53,6 @@ class SessionPeerMessage:
     expires_at: int = 0
     reply_peer_id: str | None = None
     replied_at: int | None = None
+    relay_depth: int = 1
+    not_before: int | None = None
     workspace_id: int = 0

@@ -97,6 +97,7 @@ class PeerMessageStore(ABC):
         expected_states: tuple[str, ...] | None = None,
         *,
         expires_at: int | None = None,
+        relay_depth: int | None = None,
     ) -> bool:
         """
         Compare-and-set a record's state.
@@ -114,6 +115,8 @@ class PeerMessageStore(ABC):
         :param expires_at: New expiry, or omitted to leave it. Used by the
             sweeper's startup reconciliation, which resets a crash-orphaned
             ``delivering`` record's expiry when it reverts to ``pending``.
+        :param relay_depth: New relay depth, or omitted to leave it. Used
+            by the release action, which resets a held record's chain.
         :returns: ``True`` when exactly one row changed, else ``False``.
         """
         ...

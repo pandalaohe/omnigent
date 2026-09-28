@@ -42,6 +42,8 @@ def _record_to_entity(row: SqlSessionPeerMessage) -> SessionPeerMessage:
         expires_at=row.expires_at,
         reply_peer_id=row.reply_peer_id,
         replied_at=row.replied_at,
+        relay_depth=row.relay_depth,
+        not_before=row.not_before,
         workspace_id=row.workspace_id,
     )
 
@@ -96,6 +98,8 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                 expires_at=record.expires_at,
                 reply_peer_id=record.reply_peer_id,
                 replied_at=record.replied_at,
+                relay_depth=record.relay_depth,
+                not_before=record.not_before,
             )
             session.add(row)
             session.flush()
@@ -157,6 +161,7 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
         expected_states: tuple[str, ...] | None = None,
         *,
         expires_at: int | None = None,
+        relay_depth: int | None = None,
     ) -> bool:
         """Compare-and-set a record's state; ``False`` on a lost race."""
         values: dict[str, Any] = {"state": state, "updated_at": now_epoch()}
@@ -164,6 +169,8 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
             values["reason"] = reason
         if expires_at is not None:
             values["expires_at"] = expires_at
+        if relay_depth is not None:
+            values["relay_depth"] = relay_depth
 
         def write(session: Session) -> bool:
             stmt = update(SqlSessionPeerMessage).where(

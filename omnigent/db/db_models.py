@@ -2517,7 +2517,7 @@ class SqlSessionPeerMessage(OmnigentBase):
     :param receiver_session_id: The receiving session (relates to
         ``conversations.id``). No DB foreign key (Rule R032).
     :param correlation_id: Optional caller correlation id (≤ 64 chars),
-        used to thread replies and bound per-thread record counts.
+        used to thread replies and match them to the original record.
     :param ref: ``correlation_id`` or the id hex — the envelope always
         carries it so a reply can be matched to this record.
     :param text: Message text. Opaque free text, never SQL-filtered —
@@ -2534,6 +2534,10 @@ class SqlSessionPeerMessage(OmnigentBase):
         (Rule R032).
     :param replied_at: Unix epoch seconds the reply was recorded, or
         ``None``.
+    :param relay_depth: Relay hops since the sender's latest human input
+        (1 when that input was human, else the trigger's depth + 1).
+    :param not_before: Earliest Unix epoch second the sweeper may deliver
+        this record, or ``None`` when it may deliver immediately.
     """
 
     __tablename__ = "session_peer_messages"
@@ -2563,6 +2567,10 @@ class SqlSessionPeerMessage(OmnigentBase):
     # Relates to session_peer_messages.id. No DB foreign key (Rule R032).
     reply_peer_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     replied_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    relay_depth: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", default=1
+    )
+    not_before: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # Receiver-side reads: the sweeper and the held panel.

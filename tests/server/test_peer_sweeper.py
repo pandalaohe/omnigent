@@ -88,6 +88,7 @@ class _FakePeerStore(PeerMessageStore):
         expected_states: tuple[str, ...] | None = None,
         *,
         expires_at: int | None = None,
+        relay_depth: int | None = None,
     ) -> bool:
         with self._lock:
             row = self._rows.get(peer_id)
@@ -100,6 +101,8 @@ class _FakePeerStore(PeerMessageStore):
                 row.reason = reason
             if expires_at is not None:
                 row.expires_at = expires_at
+            if relay_depth is not None:
+                row.relay_depth = relay_depth
             return True
 
     def mark_replied(self, peer_id: str, reply_peer_id: str, replied_at: int) -> bool:
@@ -357,6 +360,20 @@ async def test_held_record_before_expiry_untouched(harness: _Harness) -> None:
     assert _row(harness.store, record.id).state == "held"
     assert harness.deliver.calls == []
     assert harness.post_event.calls == []
+
+
+async def test_not_before_gates_delivery(harness: _Harness) -> None:
+    """A queued record waits for its slot, then delivers on a later tick."""
+    record = harness.seed_record(state="queued", not_before=harness._now + 30)
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "queued"
+    assert harness.deliver.calls == []
+    assert harness.post_event.calls == []
+
+    harness._now += 30
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "delivered"
+    assert len(harness.deliver.calls) == 1
 
 
 async def test_busy_receiver_left_untouched(harness: _Harness) -> None:
