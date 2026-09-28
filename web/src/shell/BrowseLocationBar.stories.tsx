@@ -9,7 +9,13 @@ const meta = {
   title: "Components/Workspace/BrowseLocationBar",
   component: BrowseLocationBar,
   tags: ["visual-snapshot"],
-  args: { current: workspace, workspace, hostId: workspaceStoryHost, onNavigate: () => undefined },
+  args: {
+    current: workspace,
+    workspace,
+    hostId: workspaceStoryHost,
+    onNavigate: () => undefined,
+    onOpenPath: async () => null,
+  },
   decorators: [
     (Story) => (
       <StoryQueryRouter>

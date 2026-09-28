@@ -20,16 +20,21 @@ import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHeal
 import { useChatStore } from "@/store/chatStore";
 import {
   PathUnreachableError,
+  fetchWorkspaceAllFiles,
   joinBrowseLocation,
   relativizeToWorkspace,
+  resolveChatFilePath,
   useWorkspaceChangedFiles,
   useWorkspaceAllFiles,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
+  type WorkspaceAllFilesResult,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { BrowseLocationBar } from "./BrowseLocationBar";
 import { CopyPathButton } from "./CopyPathButton";
+import { useFileViewer } from "./FileViewerContext";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import {
@@ -226,6 +231,21 @@ function SearchFilterInput({
  */
 const browseLocationCache = new Map<string, string>();
 
+/** Strip the wrapping quotes or backticks a copied path arrives in. */
+function stripPathQuoting(text: string): string {
+  return text
+    .trim()
+    .replace(/^[`"']+/, "")
+    .replace(/[`"']+$/, "");
+}
+
+/** The bar's reachable-roots wording for a refused path. */
+function unreachableMessage(error: PathUnreachableError): string {
+  return error.reachableRoots.length > 0
+    ? `${error.message}. Reachable: ${error.reachableRoots.join(", ")}`
+    : error.message;
+}
+
 /**
  * Right-side Files card. Always visible on desktop.
  *
@@ -291,9 +311,12 @@ export function FilesPanel({
     enabled: true,
   });
   const workspaceRoot = envQuery.data?.root ?? null;
+  const workspaceHome = envQuery.data?.home ?? null;
   // The picker browses the host's filesystem, the same source the new-session
   // workspace chip uses.
   const { session } = useSession(conversationId);
+  const canBrowseOutside = isOwnerLevel(session?.permissionLevel ?? null);
+  const openFile = useFileViewer();
   // Absolute path currently browsed. Null tracks the workspace root. Seeded
   // from the per-conversation cache so the location survives the panel
   // unmounting while a file is open in the viewer.
@@ -358,18 +381,95 @@ export function FilesPanel({
     [onFileSelect, locationParam],
   );
 
+  /**
+   * Open or browse a path typed into the location field.
+   *
+   * Copied quotes and a `:line[:col]` citation are stripped; `~` expands with
+   * the runner home and a relative path resolves against the workspace root.
+   * The path's PARENT is listed fresh so a refusal (403) stays distinct from a
+   * missing folder, and the matching entry decides: a directory re-roots the
+   * panel, a file opens in the viewer at the cited line. Returns the message
+   * to show under the field, or null when the path was opened or browsed.
+   */
+  const openTypedPath = useCallback(
+    async (text: string): Promise<string | null> => {
+      if (!conversationId || !workspaceRoot) {
+        return `Couldn't check ${stripPathQuoting(text) || text} right now`;
+      }
+      const stripped = stripPathQuoting(text);
+      const citation = splitWorkspaceFileCitation(stripped);
+      // Copied folder paths often carry a trailing slash; "/" itself is a root.
+      const typed = citation.path !== "/" ? citation.path.replace(/\/+$/, "") : citation.path;
+      if (!typed) return `Not found: ${stripped}`;
+      const homeExpanded =
+        workspaceHome && (typed === "~" || typed.startsWith("~/"))
+          ? workspaceHome.replace(/\/+$/, "") + typed.slice(1)
+          : typed;
+      // A path that IS a root is browsed directly, not resolved as an entry.
+      if (homeExpanded === workspaceRoot) {
+        navigateTo(workspaceRoot);
+        return null;
+      }
+      if (homeExpanded === "/" && canBrowseOutside) {
+        navigateTo("/");
+        return null;
+      }
+      const resolved = resolveChatFilePath(typed, workspaceRoot, workspaceHome);
+      if (!resolved) return `Not found: ${typed}`;
+      const candidate = resolved.path;
+      const slash = candidate.lastIndexOf("/");
+      const parent = slash < 0 ? "" : candidate.slice(0, slash) || "/";
+
+      let listing: WorkspaceAllFilesResult;
+      try {
+        listing = await fetchWorkspaceAllFiles(conversationId, parent);
+      } catch (error) {
+        return error instanceof PathUnreachableError
+          ? unreachableMessage(error)
+          : `Couldn't check ${candidate} right now`;
+      }
+      if (!listing.available) return `Not found: ${candidate}`;
+
+      const openCandidate = () => {
+        const options = citation.line
+          ? { line: citation.line, ...(citation.column ? { column: citation.column } : {}) }
+          : undefined;
+        if (openFile) openFile(candidate, options);
+        // Outside AppShell (tests, Storybook) the panel's own select path is
+        // the only viewer feed; it carries no line target.
+        else onFileSelect(candidate);
+        return null;
+      };
+      const entry = listing.data.find((f) => joinBrowseLocation(parent, f.path) === candidate);
+      if (!entry) {
+        // A truncated page can't prove absence; let the viewer answer.
+        return listing.truncated ? openCandidate() : `Not found: ${candidate}`;
+      }
+      if (entry.type === "directory") {
+        navigateTo(
+          candidate.startsWith("/") ? candidate : joinBrowseLocation(workspaceRoot, candidate),
+        );
+        return null;
+      }
+      return openCandidate();
+    },
+    [
+      canBrowseOutside,
+      conversationId,
+      navigateTo,
+      onFileSelect,
+      openFile,
+      workspaceHome,
+      workspaceRoot,
+    ],
+  );
+
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
   // A refused location must say so on the bar. Rendering an empty tree instead
   // would read as "this directory is empty", which is a different fact.
   const unreachable =
     allFilesQuery.error instanceof PathUnreachableError ? allFilesQuery.error : null;
-  const locationError =
-    browseError ??
-    (unreachable
-      ? unreachable.reachableRoots.length > 0
-        ? `${unreachable.message}. Reachable: ${unreachable.reachableRoots.join(", ")}`
-        : unreachable.message
-      : null);
+  const locationError = browseError ?? (unreachable ? unreachableMessage(unreachable) : null);
   const changedFiles = changedQuery.data?.data ?? [];
   const hiddenFilesCount = changedFiles.filter((f) =>
     f.path.split("/").some((seg) => seg.startsWith(".")),
@@ -474,9 +574,10 @@ export function FilesPanel({
             current={workingDir}
             workspace={workspaceRoot}
             hostId={session?.hostId ?? null}
-            canBrowseOutside={isOwnerLevel(session?.permissionLevel ?? null)}
+            canBrowseOutside={canBrowseOutside}
             reach={envQuery.data?.reachable ?? null}
             onNavigate={navigateTo}
+            onOpenPath={openTypedPath}
             error={locationError}
           />
         )}
