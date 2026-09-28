@@ -13,11 +13,24 @@
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 
+/** One harness's model / effort override under a host's calling defaults. */
+export interface ProjectCallingDefaultsHarness {
+  model?: string;
+  effort?: string;
+}
+
+/** One host's per-project default agent and harness overrides. */
+export interface ProjectCallingDefaultsHost {
+  agent_id?: string;
+  harnesses?: Record<string, ProjectCallingDefaultsHarness>;
+}
+
 /**
  * Default session settings a project stores, pre-filled into the new-chat
  * composer. All fields optional — an unset key means "no default for this
  * slot". The vocabulary is client-owned; the server persists the object whole
- * and never acts on it, so adding a key here needs no backend change.
+ * and never acts on it, so adding a key here needs no backend change — except
+ * `calling_defaults`, whose shape the server validates on PATCH.
  */
 export interface ProjectConfig {
   /** Default host id, or the sandbox sentinel. */
@@ -51,6 +64,12 @@ export interface ProjectConfig {
    * the harness's own configured default.
    */
   model?: string;
+  /**
+   * Per-host default agent plus `harness -> {model, effort}` overrides, keyed
+   * by host id. The server validates this key's shape on PATCH; an unset host
+   * falls through the resolution chain to the user's master table.
+   */
+  calling_defaults?: Record<string, ProjectCallingDefaultsHost>;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

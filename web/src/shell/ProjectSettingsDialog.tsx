@@ -3,20 +3,20 @@
 // the new-chat composer pre-fill host / working directory / agent and the
 // isolated-worktree default when starting a session in the project.
 //
-// Scope mirrors what the composer prefills today: host, workspace, agent,
-// whether new sessions start in a fresh git worktree, the base branch a
-// worktree forks from (which overrides the user-global default in Settings ›
-// Git), and — when the default agent is a native harness with a model choice
-// (Claude Code / Codex) — a default model for new sessions. Reasoning-effort /
-// harness stay per-agent run config, out of scope here. The host and agent
-// pickers reuse the composer's components; the working directory reuses its
-// filesystem browser (inline, so it scrolls inside the modal).
+// "Session defaults" is a Hosts block: a per-host list (directory + default
+// agent / model / effort) with a detail pane at >= md and a single-open
+// accordion below, plus an "All hosts" row carrying the legacy
+// `config.agent_id` / `config.model` fallback. Per-host sets live in
+// `config.calling_defaults`, shape-validated server-side; the resolution chain
+// that consumes them is server-side. The All-hosts agent picker reuses the
+// composer's component, and the working directory reuses its filesystem
+// browser (inline, so it scrolls inside the modal).
 // Fields are optional: an unset one stores no default (an absent key), and an
 // all-default dialog stores an empty config.
 
-import { ChevronDownIcon } from "lucide-react";
+import { ChevronDownIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -26,25 +26,37 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
-import { selectableSessionAgents } from "@/lib/agentGrouping";
+import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isSdkAgent, selectableSessionAgents } from "@/lib/agentGrouping";
+import { CALLING_DEFAULT_HARNESSES, callingHarnessLabel } from "@/lib/callingDefaults";
+import {
+  listCallingDefaultCatalogs,
+  syncCallingDefaults,
+  type CallingDefaultsCatalogRow,
+} from "@/lib/callingDefaultsApi";
 import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { ProjectCollaborationSection } from "./ProjectCollaborationSection";
-import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
-import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { nativeModelLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
+import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
+import { harnessReadinessOnHost } from "@/lib/harnessSetup";
+import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import { effortLevelsFor } from "@/lib/modelEffortOptions";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
@@ -60,13 +72,19 @@ import {
   type ProjectConfig,
   type ProjectHostEntry,
 } from "@/lib/projectsApi";
-import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { ApiError } from "@/lib/sessionsApi";
+import type { NativeModelOption } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { AgentHarnessPicker } from "./NewChatDialog";
+import { ProjectCollaborationSection } from "./ProjectCollaborationSection";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
 const NONE = "__none__";
+
+/** List-row id for the legacy all-hosts fallback row (never a real host id). */
+const ALL_HOSTS = "__all_hosts__";
 
 /** A labeled row: label + optional hint on the left, the control on the right. */
 function Field({
@@ -112,6 +130,20 @@ interface DirectoryRow {
   path: string;
 }
 
+/** One harness entry inside a host's calling-defaults draft. */
+interface HarnessSetDraft {
+  model: string | null;
+  effort: string | null;
+}
+
+/** One host's draft: its directory entry plus `config.calling_defaults[host]`. */
+interface HostRowDraft extends DirectoryRow {
+  agentId: string | null;
+  /** Every harness entry, keyed by canonical harness id. The selected agent's
+   *  harness is "the set"; every other key shows under "Other harness models". */
+  harnesses: Record<string, HarnessSetDraft>;
+}
+
 /**
  * Seed the directory rows from the project's stored entries. A project with
  * no entry yet falls back to the config's `workspace` when it names a
@@ -127,6 +159,187 @@ function seedDirectoryRows(entries: ProjectHostEntry[], config: ProjectConfig): 
     return [{ hostId, path: workspace }];
   }
   return [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeHarnessSet(value: unknown): HarnessSetDraft {
+  const set: HarnessSetDraft = { model: null, effort: null };
+  if (!isRecord(value)) return set;
+  if (typeof value.model === "string" && value.model !== "") set.model = value.model;
+  if (typeof value.effort === "string" && value.effort !== "") set.effort = value.effort;
+  return set;
+}
+
+/** Parse one stored `calling_defaults[host]`; malformed fields are dropped. */
+function sanitizeHostDefault(value: unknown): {
+  agentId: string | null;
+  harnesses: Record<string, HarnessSetDraft>;
+} {
+  const parsed: { agentId: string | null; harnesses: Record<string, HarnessSetDraft> } = {
+    agentId: null,
+    harnesses: {},
+  };
+  if (!isRecord(value)) return parsed;
+  if (typeof value.agent_id === "string" && value.agent_id !== "") parsed.agentId = value.agent_id;
+  if (isRecord(value.harnesses)) {
+    for (const [harness, entry] of Object.entries(value.harnesses)) {
+      if (harness !== "") parsed.harnesses[harness] = sanitizeHarnessSet(entry);
+    }
+  }
+  return parsed;
+}
+
+/**
+ * Seed the host rows from the entries plus the stored calling defaults. A host
+ * with a stored default but no entry still gets a row, so its setting stays
+ * visible (and deletable) instead of being dropped by the next save.
+ */
+function seedHostRows(entries: ProjectHostEntry[], config: ProjectConfig): HostRowDraft[] {
+  const rows: HostRowDraft[] = seedDirectoryRows(entries, config).map((row) => ({
+    ...row,
+    agentId: null,
+    harnesses: {},
+  }));
+  const defaults = isRecord(config.calling_defaults) ? config.calling_defaults : {};
+  for (const [hostId, value] of Object.entries(defaults)) {
+    if (hostId === "") continue;
+    const parsed = sanitizeHostDefault(value);
+    const existing = rows.find((row) => row.hostId === hostId);
+    if (existing) {
+      existing.agentId = parsed.agentId;
+      existing.harnesses = parsed.harnesses;
+    } else {
+      rows.push({ hostId, path: "", ...parsed });
+    }
+  }
+  return rows;
+}
+
+/** Build the server-shaped `config.calling_defaults`, omitting empty entries. */
+function buildCallingDefaults(rows: readonly HostRowDraft[]): ProjectConfig["calling_defaults"] {
+  const defaults: NonNullable<ProjectConfig["calling_defaults"]> = {};
+  for (const row of rows) {
+    const entry: NonNullable<ProjectConfig["calling_defaults"]>[string] = {};
+    if (row.agentId) entry.agent_id = row.agentId;
+    const harnesses: NonNullable<typeof entry.harnesses> = {};
+    for (const [harness, set] of Object.entries(row.harnesses)) {
+      const clean: { model?: string; effort?: string } = {};
+      if (set.model) clean.model = set.model;
+      if (set.effort) clean.effort = set.effort;
+      if (Object.keys(clean).length > 0) harnesses[harness] = clean;
+    }
+    if (Object.keys(harnesses).length > 0) entry.harnesses = harnesses;
+    if (Object.keys(entry).length > 0) defaults[row.hostId] = entry;
+  }
+  return Object.keys(defaults).length > 0 ? defaults : undefined;
+}
+
+/** The harness's ladder, keeping a stored value the catalog doesn't list. */
+function effortLevelsForSet(
+  harness: string,
+  models: readonly NativeModelOption[],
+  set: HarnessSetDraft,
+): string[] {
+  const levels = Array.from(new Set(effortLevelsFor(harness, models, set.model) ?? []));
+  if (set.effort && !levels.includes(set.effort)) levels.unshift(set.effort);
+  return levels;
+}
+
+/** The canonical harness an agent runs, or null for an unknown bundle. */
+function agentHarness(agent: AvailableAgent): string | null {
+  return nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness ?? null;
+}
+
+/** A joint agent stores no model / effort of its own — its members do. */
+function isJointAgent(agent: AvailableAgent): boolean {
+  return agent.id.startsWith("ca_") || (agent.members?.length ?? 0) > 1;
+}
+
+/** The harness whose model / effort the host detail shows as "the set". */
+function selectedHarnessFor(agent: AvailableAgent | null): string | null {
+  if (agent === null || isJointAgent(agent)) return null;
+  return agentHarness(agent);
+}
+
+/** Same usability rule as the composer picker: unready agents aren't offered. */
+function agentUsableOnHost(agent: AvailableAgent, host: Host | undefined): boolean {
+  if (agent.id.startsWith("ca_") && !agent.harness) return true;
+  return harnessReadinessOnHost(agent.harness, host).selectable;
+}
+
+function pairKey(hostId: string, harness: string): string {
+  return `${hostId}\u0000${harness}`;
+}
+
+function catalogFor(
+  catalogs: readonly CallingDefaultsCatalogRow[],
+  hostId: string,
+  harness: string,
+): CallingDefaultsCatalogRow | undefined {
+  return catalogs.find((row) => row.host_id === hostId && row.harness === harness);
+}
+
+/** Merge filtered-sync rows over the loaded list, replacing matching pairs. */
+function mergeCatalogRows(
+  previous: readonly CallingDefaultsCatalogRow[],
+  next: readonly CallingDefaultsCatalogRow[],
+): CallingDefaultsCatalogRow[] {
+  const byPair = new Map(previous.map((row) => [pairKey(row.host_id, row.harness), row]));
+  for (const row of next) byPair.set(pairKey(row.host_id, row.harness), row);
+  return [...byPair.values()];
+}
+
+function catalogModelLabel(
+  catalogs: readonly CallingDefaultsCatalogRow[],
+  hostId: string,
+  harness: string,
+  model: string | null,
+): string | null {
+  if (!model) return null;
+  const option = catalogFor(catalogs, hostId, harness)?.models.find(
+    (candidate) => candidate.id === model,
+  );
+  return option ? nativeModelLabel(option) : model;
+}
+
+/** The list row's chip: agent · model · effort, or the unset fallback. */
+function hostRowSummary(
+  row: HostRowDraft,
+  agents: readonly AvailableAgent[],
+  catalogs: readonly CallingDefaultsCatalogRow[],
+): string {
+  const agent = row.agentId ? (agents.find((a) => a.id === row.agentId) ?? null) : null;
+  if (agent === null && row.agentId) {
+    // Discovery hasn't resolved the stored agent; show its id, not "Not set".
+    return row.agentId;
+  }
+  if (agent) {
+    const parts = [agent.display_name];
+    if (isJointAgent(agent)) {
+      parts.push("Set by members");
+    } else {
+      const harness = selectedHarnessFor(agent);
+      const set = harness ? row.harnesses[harness] : undefined;
+      const model = harness
+        ? catalogModelLabel(catalogs, row.hostId, harness, set?.model ?? null)
+        : null;
+      if (model) parts.push(model);
+      if (set?.effort) parts.push(normalizeEffortLabel(set.effort));
+    }
+    return parts.join(" · ");
+  }
+  for (const [harness, set] of Object.entries(row.harnesses)) {
+    if (!set.model && !set.effort) continue;
+    const parts = [callingHarnessLabel(harness)];
+    const model = catalogModelLabel(catalogs, row.hostId, harness, set.model);
+    if (model) parts.push(model);
+    if (set.effort) parts.push(normalizeEffortLabel(set.effort));
+    return parts.join(" · ");
+  }
+  return "Not set · uses master table";
 }
 
 function errorMessage(error: unknown): string {
@@ -145,6 +358,140 @@ interface EntryHookOutcome {
   result: PostBindResult;
   /** Save surfaces only warnings; a per-row run shows any status. */
   source: "save" | "run";
+}
+
+/**
+ * The cached `(host, harness)` catalogs behind the per-host dropdowns: one list
+ * when the dialog opens, then at most one filtered sync per missing pair.
+ * Failures are ignored — a missing pair still offers the stored value + Default.
+ */
+function useCallingDefaultCatalogs(open: boolean) {
+  const [catalogs, setCatalogs] = useState<CallingDefaultsCatalogRow[]>([]);
+  const requestedPairs = useRef(new Set<string>());
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    requestedPairs.current.clear();
+    void listCallingDefaultCatalogs()
+      .then((rows) => {
+        if (alive.current) setCatalogs(rows);
+      })
+      .catch(() => {
+        // Dropdowns fall back to the stored value + Default.
+      });
+  }, [open]);
+  const ensureCatalog = (hostId: string, harness: string) => {
+    if (catalogFor(catalogs, hostId, harness) !== undefined) return;
+    const key = pairKey(hostId, harness);
+    if (requestedPairs.current.has(key)) return;
+    requestedPairs.current.add(key);
+    void syncCallingDefaults({ hostId, harness })
+      .then((rows) => {
+        if (alive.current) setCatalogs((previous) => mergeCatalogRows(previous, rows));
+      })
+      .catch(() => {
+        // A failed sync leaves the pair absent; the dropdown stays usable.
+      });
+  };
+  return { catalogs, ensureCatalog };
+}
+
+/** A "Default"-clearing model dropdown for one (host, harness) catalog pair. */
+function HostModelSelect({
+  value,
+  models,
+  testId,
+  disabled,
+  onOpen,
+  onOpenChange,
+  onChange,
+}: {
+  value: string | null;
+  models: readonly NativeModelOption[];
+  testId: string;
+  disabled?: boolean;
+  onOpen?: () => void;
+  onOpenChange?: (open: boolean) => void;
+  onChange: (model: string | null) => void;
+}) {
+  const options = models.map((model) => ({ id: model.id, label: nativeModelLabel(model) }));
+  if (value && !options.some((option) => option.id === value)) {
+    options.unshift({ id: value, label: value });
+  }
+  return (
+    <Select
+      value={value ?? MODEL_SELECT_DEFAULT}
+      onValueChange={(next) => onChange(next === MODEL_SELECT_DEFAULT ? null : next)}
+      onOpenChange={(open) => {
+        if (open) onOpen?.();
+        onOpenChange?.(open);
+      }}
+      disabled={disabled}
+    >
+      <SelectTrigger className="h-8 w-full min-w-0" aria-label="Model" data-testid={testId}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
+        <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+        {options.map((option) => (
+          <SelectItem key={option.id} value={option.id}>
+            <span className="block min-w-0 truncate" title={option.label}>
+              {option.label}
+            </span>
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+/** A "Default"-clearing effort dropdown over the harness's effort ladder. */
+function HostEffortSelect({
+  value,
+  levels,
+  testId,
+  disabled,
+  onOpen,
+  onOpenChange,
+  onChange,
+}: {
+  value: string | null;
+  levels: readonly string[];
+  testId: string;
+  disabled?: boolean;
+  onOpen?: () => void;
+  onOpenChange?: (open: boolean) => void;
+  onChange: (effort: string | null) => void;
+}) {
+  return (
+    <Select
+      value={value ?? EFFORT_SELECT_NONE}
+      onValueChange={(next) => onChange(next === EFFORT_SELECT_NONE ? null : next)}
+      onOpenChange={(open) => {
+        if (open) onOpen?.();
+        onOpenChange?.(open);
+      }}
+      disabled={disabled}
+    >
+      <SelectTrigger className="h-8 w-full min-w-0" aria-label="Effort" data-testid={testId}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
+        <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+        {levels.map((level) => (
+          <SelectItem key={level} value={level}>
+            {normalizeEffortLabel(level)}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
 }
 
 export function ProjectSettingsDialog({
@@ -179,6 +526,7 @@ export function ProjectSettingsDialog({
     pinnedAgentIds: stored?.agent_id != null ? [stored.agent_id] : [],
   });
   const info = useServerInfo();
+  const isCompact = useIsMobileViewport();
   // Collaboration config lives outside this form (its actions apply
   // immediately, never through Save) and only for a first-class project.
   const showCollaboration = projectId !== null && isFeatureEnabled(info, "project_assignments");
@@ -191,11 +539,17 @@ export function ProjectSettingsDialog({
   // Draft fields. Seeded from the stored config + entries each time the dialog
   // opens (or the fetches arrive); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
-  // One directory per host — the project's entry rows. The Host field above is
-  // the default host; the rows are independent of it.
-  const [directoryRows, setDirectoryRows] = useState<DirectoryRow[]>([]);
+  // One row per host: its directory entry plus its `calling_defaults` draft.
+  // The Host field above is the default host; the rows are independent of it.
+  const [hostRows, setHostRows] = useState<HostRowDraft[]>([]);
+  // Which row's detail is shown: a host id or ALL_HOSTS; null below md when
+  // the accordion is collapsed. Below md this is the single open accordion
+  // row; at >= md it's the highlighted list row.
+  const [selectedRowId, setSelectedRowId] = useState<string | null>(ALL_HOSTS);
   // Which row's filesystem browser is expanded (host id), if any.
   const [openRow, setOpenRow] = useState<string | null>(null);
+  // Which row's "Other harness models" list is expanded, if any.
+  const [otherHarnessOpenFor, setOtherHarnessOpenFor] = useState<string | null>(null);
   // The first entry write to fail on Save: its server message renders on that
   // row, the sequence stops, and no config is written.
   const [entriesError, setEntriesError] = useState<{ hostId: string; message: string } | null>(
@@ -229,20 +583,23 @@ export function ProjectSettingsDialog({
   // through to the user-global default in Settings › Git). Only meaningful
   // alongside the worktree default, but kept independent so it survives toggling.
   const [baseBranch, setBaseBranch] = useState("");
+  // Legacy "All hosts" defaults (`config.agent_id` / `config.model`), shown in
+  // the All hosts row's detail.
   const [agentId, setAgentId] = useState<string | null>(null);
   // Default model for new sessions, only meaningful when the default agent is
   // a native harness with a model choice; NONE stores no default (unset key).
   const [model, setModel] = useState<string>(NONE);
   const [activeTab, setActiveTab] = useState("defaults");
   const tabsId = useId();
+  const { catalogs, ensureCatalog } = useCallingDefaultCatalogs(open);
   const { data: collaborationStatus } = useQuery({
     queryKey: ["project-collaboration", projectId],
     queryFn: () => getProjectCollaboration(projectId!),
     enabled: open && showCollaboration,
     retry: false,
   });
-  // The single "Project directory" row set. A label-only folder has no stored
-  // project yet, so there is nothing to fetch until Save promotes it.
+  // The single host-row set. A label-only folder has no stored project yet, so
+  // there is nothing to fetch until Save promotes it.
   const {
     data: storedEntries,
     isPending: entriesPending,
@@ -268,7 +625,7 @@ export function ProjectSettingsDialog({
   // Sandbox hosts are server-provisioned launch targets, never entry hosts
   // (the entries API refuses them).
   const addableHosts = (hosts.data ?? []).filter(
-    (host) => !host.sandbox_provider && !directoryRows.some((row) => row.hostId === host.host_id),
+    (host) => !host.sandbox_provider && !hostRows.some((row) => row.hostId === host.host_id),
   );
 
   useEffect(() => {
@@ -327,13 +684,16 @@ export function ProjectSettingsDialog({
     if (entriesLoading) return;
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
-    setDirectoryRows(seedDirectoryRows(entries, c));
+    const rows = seedHostRows(entries, c);
+    setHostRows(rows);
+    setSelectedRowId(rows[0]?.hostId ?? ALL_HOSTS);
     setSavedEntries(new Map(entries.map((entry) => [entry.host_id, entry.workspace])));
     setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setModel(c.model ?? NONE);
     setOpenRow(null);
+    setOtherHarnessOpenFor(null);
     setEntriesError(null);
     setSaveError(null);
   }, [open, stored, loadFailed, entriesLoadFailed, entriesLoading, entries]);
@@ -342,40 +702,93 @@ export function ProjectSettingsDialog({
   // rows whose path changed (or that are new), DELETEs for persisted rows the
   // user removed. Comparing against `savedEntries` (not the query's rows) is
   // what lets a retry converge after a partial failure.
-  const changedRows = directoryRows.filter((row) => {
+  const changedRows = hostRows.filter((row) => {
     const path = row.path.trim();
     return path !== "" && savedEntries.get(row.hostId) !== path;
   });
   const removedHostIds = [...savedEntries.keys()].filter(
-    (entryHostId) => !directoryRows.some((row) => row.hostId === entryHostId),
+    (entryHostId) => !hostRows.some((row) => row.hostId === entryHostId),
   );
   // The default host's row supplies the config's `workspace` mirror. A missing
   // row, a blank path, or the sandbox default host leaves it unset.
   const defaultRow =
     hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE
-      ? directoryRows.find((row) => row.hostId === hostId)
+      ? hostRows.find((row) => row.hostId === hostId)
       : undefined;
   const defaultHostRowPath = defaultRow ? trimOrUndef(defaultRow.path) : undefined;
 
-  const addDirectoryRow = (rowHostId: string) => {
+  const addHostRow = (rowHostId: string) => {
     setEntriesError(null);
-    setDirectoryRows((rows) =>
+    setHostRows((rows) =>
       rows.some((row) => row.hostId === rowHostId)
         ? rows
-        : [...rows, { hostId: rowHostId, path: "" }],
+        : [...rows, { hostId: rowHostId, path: "", agentId: null, harnesses: {} }],
+    );
+    setOtherHarnessOpenFor(null);
+    setSelectedRowId(rowHostId);
+  };
+
+  const removeHostRow = (rowHostId: string) => {
+    const index = hostRows.findIndex((row) => row.hostId === rowHostId);
+    const neighbour = hostRows[index + 1] ?? hostRows[index - 1];
+    setEntriesError(null);
+    setOpenRow((current) => (current === rowHostId ? null : current));
+    setOtherHarnessOpenFor((current) => (current === rowHostId ? null : current));
+    setHostRows((rows) => rows.filter((row) => row.hostId !== rowHostId));
+    setSelectedRowId((current) =>
+      current === rowHostId ? (neighbour?.hostId ?? ALL_HOSTS) : current,
     );
   };
 
-  const removeDirectoryRow = (rowHostId: string) => {
-    setEntriesError(null);
-    setOpenRow((current) => (current === rowHostId ? null : current));
-    setDirectoryRows((rows) => rows.filter((row) => row.hostId !== rowHostId));
+  // Below md a row tap toggles the single-open accordion; at >= md it only
+  // moves the highlight (the detail pane is always visible).
+  const selectRow = (rowId: string) => {
+    setOtherHarnessOpenFor(null);
+    setSelectedRowId((current) => (isCompact && current === rowId ? null : rowId));
   };
 
   const setDirectoryPath = (rowHostId: string, path: string) => {
     setEntriesError(null);
-    setDirectoryRows((rows) =>
-      rows.map((row) => (row.hostId === rowHostId ? { ...row, path } : row)),
+    setHostRows((rows) => rows.map((row) => (row.hostId === rowHostId ? { ...row, path } : row)));
+  };
+
+  const setRowAgent = (rowHostId: string, nextAgentId: string | null) => {
+    setHostRows((rows) =>
+      rows.map((row) => (row.hostId === rowHostId ? { ...row, agentId: nextAgentId } : row)),
+    );
+  };
+
+  const setHarnessField = (
+    rowHostId: string,
+    harness: string,
+    field: "model" | "effort",
+    value: string | null,
+  ) => {
+    setHostRows((rows) =>
+      rows.map((row) => {
+        if (row.hostId !== rowHostId) return row;
+        const current = row.harnesses[harness] ?? { model: null, effort: null };
+        return {
+          ...row,
+          harnesses: { ...row.harnesses, [harness]: { ...current, [field]: value } },
+        };
+      }),
+    );
+  };
+
+  const addOtherHarness = (rowHostId: string, harness: string) => {
+    setHarnessField(rowHostId, harness, "model", null);
+    ensureCatalog(rowHostId, harness);
+  };
+
+  const removeOtherHarness = (rowHostId: string, harness: string) => {
+    setHostRows((rows) =>
+      rows.map((row) => {
+        if (row.hostId !== rowHostId) return row;
+        const next = { ...row.harnesses };
+        Reflect.deleteProperty(next, harness);
+        return { ...row, harnesses: next };
+      }),
     );
   };
 
@@ -443,6 +856,12 @@ export function ProjectSettingsDialog({
     const agentUnresolved = agentId != null && selectedAgent === null;
     if (supportsModelDefault && model !== NONE) config.model = model;
     else if (!agentUnresolved) delete config.model;
+    // Per-host sets are rebuilt from the drafts: a deleted row drops its key,
+    // and cleared fields / empty harness groups are omitted entirely (never a
+    // "default" / clear word).
+    const callingDefaults = buildCallingDefaults(hostRows);
+    if (callingDefaults) config.calling_defaults = callingDefaults;
+    else delete config.calling_defaults;
 
     setEntriesError(null);
     setSaveError(null);
@@ -476,6 +895,9 @@ export function ProjectSettingsDialog({
           // eslint-disable-next-line no-await-in-loop
           written = await putProjectEntry(id, row.hostId, path);
         } catch (error) {
+          // Select the row so its detail (where the message renders) is on
+          // screen; the user may have been editing another host.
+          setSelectedRowId(row.hostId);
           setEntriesError({ hostId: row.hostId, message: errorMessage(error) });
           return;
         }
@@ -544,8 +966,8 @@ export function ProjectSettingsDialog({
     hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
 
   // The default host is a config field of its own — changing it leaves the
-  // per-host directory rows untouched. Close any open browser so the newly
-  // selected default host's row starts collapsed.
+  // per-host rows untouched. Close any open browser so the newly selected
+  // default host's row starts collapsed.
   const onHostChange = (nextHostId: string) => {
     if (nextHostId !== hostId) setOpenRow(null);
     setHostId(nextHostId);
@@ -603,6 +1025,592 @@ export function ProjectSettingsDialog({
   // The host the agent picker's readiness badges check against (its config
   // hints show whether a harness is set up there). Null when no concrete host.
   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
+
+  const allHostsSummary =
+    [
+      selectedAgent?.display_name ?? agentId,
+      model !== NONE ? (modelOptions.find((o) => o.id === model)?.label ?? model) : undefined,
+    ]
+      .filter(Boolean)
+      .join(" · ") || "Not set";
+
+  const renderDirectoryField = (row: HostRowDraft) => {
+    const rowHost = hostsById.get(row.hostId);
+    const browsable = rowHost?.status === "online";
+    const rowOpen = openRow === row.hostId;
+    const disabled = isLoading || saving;
+    return (
+      <div className="flex min-w-0 flex-col gap-1.5">
+        {browsable ? (
+          // A compact trigger showing the row's current path; clicking opens
+          // the shared workspace browser dialog. Navigation there is
+          // provisional until the user confirms a folder, which becomes this
+          // row's path.
+          <>
+            <button
+              type="button"
+              onClick={() => setOpenRow(row.hostId)}
+              aria-expanded={rowOpen}
+              disabled={disabled}
+              data-testid={`project-settings-entry-browse-${row.hostId}`}
+              aria-label={`Project directory on ${rowHost?.name ?? row.hostId}`}
+              className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <span
+                className={
+                  row.path ? "min-w-0 truncate font-mono" : "truncate text-muted-foreground"
+                }
+                title={row.path || undefined}
+              >
+                {row.path || "Browse…"}
+              </span>
+              <ChevronDownIcon
+                className={`size-4 shrink-0 opacity-50 transition-transform ${
+                  rowOpen ? "rotate-180" : ""
+                }`}
+              />
+            </button>
+            <WorkspacePickerDialog
+              open={rowOpen}
+              onOpenChange={(next) => setOpenRow(next ? row.hostId : null)}
+              hostId={row.hostId}
+              initialPath={row.path}
+              onConfirm={(path) => setDirectoryPath(row.hostId, path)}
+            />
+          </>
+        ) : (
+          <input
+            data-testid={`project-settings-entry-path-${row.hostId}`}
+            aria-label={`Project directory on ${rowHost?.name ?? row.hostId}`}
+            className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            placeholder="/path/to/repo"
+            value={row.path}
+            title={row.path || undefined}
+            onChange={(e) => setDirectoryPath(row.hostId, e.target.value)}
+            disabled={disabled}
+          />
+        )}
+        {savedEntries.has(row.hostId) && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-auto self-start p-0 text-muted-foreground text-sm hover:bg-transparent"
+            data-testid={`project-settings-entry-run-post-bind-${row.hostId}`}
+            onClick={() => void runPostBindCommand(row.hostId)}
+            disabled={disabled || runningPostBindHostId !== null}
+          >
+            Run post-bind command
+          </Button>
+        )}
+      </div>
+    );
+  };
+
+  const renderEntryOutcome = (row: HostRowDraft) => {
+    const rowOutcome = entryHookOutcomes.get(row.hostId);
+    const rowOutcomeWarning = rowOutcome
+      ? WARNING_HOOK_STATUSES.has(rowOutcome.result.status)
+      : false;
+    const showOutcome =
+      rowOutcome !== undefined && (rowOutcome.source === "run" || rowOutcomeWarning);
+    const rowError = entriesError?.hostId === row.hostId ? entriesError : null;
+    if (!showOutcome && !rowError) return null;
+    return (
+      <>
+        {showOutcome && rowOutcome && (
+          <div
+            className={
+              rowOutcomeWarning ? "text-destructive text-ui" : "text-ui text-muted-foreground"
+            }
+            role="status"
+            data-testid={`project-settings-entry-post-bind-${row.hostId}`}
+          >
+            {rowOutcome.result.status === "ok" ? (
+              "Post-bind command succeeded"
+            ) : (
+              <>
+                {rowOutcomeWarning ? "Directory saved; " : ""}post-bind command{" "}
+                {hookStatusLabel(rowOutcome.result.status)}
+                {rowOutcome.result.error ? `: ${rowOutcome.result.error}` : ""}
+                {typeof rowOutcome.result.exit_code === "number"
+                  ? ` (exit code ${rowOutcome.result.exit_code})`
+                  : ""}
+                {rowOutcome.result.output ? (
+                  <pre className="mt-1 whitespace-pre-wrap">{rowOutcome.result.output}</pre>
+                ) : null}
+              </>
+            )}
+          </div>
+        )}
+        {rowError && (
+          <p
+            className="text-destructive text-ui"
+            role="alert"
+            data-testid={`project-settings-entry-error-${row.hostId}`}
+          >
+            {rowError.message}
+          </p>
+        )}
+      </>
+    );
+  };
+
+  const renderAgentSelect = (row: HostRowDraft) => {
+    const rowHost = hostsById.get(row.hostId);
+    const candidates = agentList.filter(
+      (agent) => agentUsableOnHost(agent, rowHost) || agent.id === row.agentId,
+    );
+    const sdkAgents = candidates.filter(isSdkAgent);
+    const otherAgents = candidates.filter((agent) => !isSdkAgent(agent));
+    const storedMissing = row.agentId !== null && !agentList.some((a) => a.id === row.agentId);
+    const renderItem = (agent: AvailableAgent) => (
+      <SelectItem key={agent.id} value={agent.id}>
+        <span className="block min-w-0 truncate" title={agent.display_name}>
+          {agent.display_name}
+        </span>
+      </SelectItem>
+    );
+    return (
+      <Select
+        value={row.agentId ?? NONE}
+        onValueChange={(value) => setRowAgent(row.hostId, value === NONE ? null : value)}
+        onOpenChange={onDropdownOpenChange}
+        disabled={isLoading || saving}
+      >
+        <SelectTrigger
+          className="w-full min-w-0"
+          data-testid={`project-settings-host-agent-${row.hostId}`}
+        >
+          <SelectValue placeholder="Default (none)" />
+        </SelectTrigger>
+        <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
+          <SelectItem value={NONE}>Default (none)</SelectItem>
+          {sdkAgents.length > 0 && (
+            <SelectGroup>
+              <SelectLabel>SDK</SelectLabel>
+              {sdkAgents.map(renderItem)}
+            </SelectGroup>
+          )}
+          {otherAgents.length > 0 && (
+            <SelectGroup>
+              <SelectLabel>Agents</SelectLabel>
+              {otherAgents.map(renderItem)}
+            </SelectGroup>
+          )}
+          {storedMissing && row.agentId !== null && (
+            <SelectItem value={row.agentId}>{row.agentId}</SelectItem>
+          )}
+        </SelectContent>
+      </Select>
+    );
+  };
+
+  const renderHarnessSetFields = (row: HostRowDraft, harness: string) => {
+    const set = row.harnesses[harness] ?? { model: null, effort: null };
+    const models = catalogFor(catalogs, row.hostId, harness)?.models ?? [];
+    const levels = effortLevelsForSet(harness, models, set);
+    return (
+      <>
+        <Field label="Model" hint="Default model for new sessions on this host">
+          <HostModelSelect
+            value={set.model}
+            models={models}
+            testId={`project-settings-host-model-${row.hostId}`}
+            disabled={isLoading || saving}
+            onOpen={() => ensureCatalog(row.hostId, harness)}
+            onOpenChange={onDropdownOpenChange}
+            onChange={(next) => setHarnessField(row.hostId, harness, "model", next)}
+          />
+        </Field>
+        <Field label="Effort" hint="Default thinking effort for new sessions on this host">
+          <HostEffortSelect
+            value={set.effort}
+            levels={levels}
+            testId={`project-settings-host-effort-${row.hostId}`}
+            disabled={isLoading || saving}
+            onOpen={() => ensureCatalog(row.hostId, harness)}
+            onOpenChange={onDropdownOpenChange}
+            onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
+          />
+        </Field>
+      </>
+    );
+  };
+
+  const renderOtherHarnessSection = (row: HostRowDraft, selectedHarness: string | null) => {
+    const otherRows = Object.entries(row.harnesses).filter(
+      ([harness]) => harness !== selectedHarness,
+    );
+    const candidates = CALLING_DEFAULT_HARNESSES.filter(
+      (harness) => harness !== selectedHarness && !(harness in row.harnesses),
+    );
+    if (otherRows.length === 0 && candidates.length === 0) return null;
+    const expanded = otherHarnessOpenFor === row.hostId;
+    const disabled = isLoading || saving;
+    return (
+      <div className="flex min-w-0 flex-col gap-1.5">
+        <button
+          type="button"
+          className="flex min-w-0 items-center gap-1 self-start text-sm text-muted-foreground hover:text-foreground"
+          aria-expanded={expanded}
+          onClick={() => setOtherHarnessOpenFor(expanded ? null : row.hostId)}
+          data-testid={`project-settings-host-other-toggle-${row.hostId}`}
+        >
+          <ChevronDownIcon
+            className={cn("size-4 shrink-0 transition-transform", expanded && "rotate-180")}
+          />
+          <span className="min-w-0 truncate">
+            Other harness models{otherRows.length > 0 ? ` (${otherRows.length})` : ""}
+          </span>
+        </button>
+        {expanded && (
+          <div className="flex min-w-0 flex-col gap-2">
+            {otherRows.map(([harness, set]) => {
+              const models = catalogFor(catalogs, row.hostId, harness)?.models ?? [];
+              const levels = effortLevelsForSet(harness, models, set);
+              return (
+                <div
+                  key={harness}
+                  className="flex min-w-0 flex-col gap-1.5 rounded-md border p-2"
+                  data-testid={`project-settings-host-other-${row.hostId}-${harness}`}
+                >
+                  <div className="flex min-w-0 items-center justify-between gap-2">
+                    <span
+                      className="min-w-0 truncate text-ui font-medium"
+                      title={callingHarnessLabel(harness)}
+                    >
+                      {callingHarnessLabel(harness)}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="shrink-0 text-muted-foreground hover:text-destructive"
+                      aria-label={`Delete ${callingHarnessLabel(harness)} setting`}
+                      onClick={() => removeOtherHarness(row.hostId, harness)}
+                      disabled={disabled}
+                      data-testid={`project-settings-host-other-remove-${row.hostId}-${harness}`}
+                    >
+                      <Trash2Icon />
+                    </Button>
+                  </div>
+                  <div className="grid min-w-0 grid-cols-1 gap-1.5 sm:grid-cols-2">
+                    <HostModelSelect
+                      value={set.model}
+                      models={models}
+                      testId={`project-settings-host-other-model-${row.hostId}-${harness}`}
+                      disabled={disabled}
+                      onOpen={() => ensureCatalog(row.hostId, harness)}
+                      onOpenChange={onDropdownOpenChange}
+                      onChange={(next) => setHarnessField(row.hostId, harness, "model", next)}
+                    />
+                    <HostEffortSelect
+                      value={set.effort}
+                      levels={levels}
+                      testId={`project-settings-host-other-effort-${row.hostId}-${harness}`}
+                      disabled={disabled}
+                      onOpen={() => ensureCatalog(row.hostId, harness)}
+                      onOpenChange={onDropdownOpenChange}
+                      onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+            {candidates.length > 0 && (
+              <Select
+                value={NONE}
+                onValueChange={(harness) => {
+                  if (harness !== NONE) addOtherHarness(row.hostId, harness);
+                }}
+                onOpenChange={onDropdownOpenChange}
+                disabled={disabled}
+              >
+                <SelectTrigger
+                  className="w-full min-w-0"
+                  data-testid={`project-settings-host-other-add-${row.hostId}`}
+                >
+                  <SelectValue placeholder="Add harness row" />
+                </SelectTrigger>
+                <SelectContent
+                  position="popper"
+                  align="start"
+                  className="w-(--radix-select-trigger-width)"
+                >
+                  <SelectItem value={NONE}>Add harness row</SelectItem>
+                  {candidates.map((harness) => (
+                    <SelectItem key={harness} value={harness}>
+                      {callingHarnessLabel(harness)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderHostDetail = (row: HostRowDraft) => {
+    const agent = row.agentId ? (agentList.find((a) => a.id === row.agentId) ?? null) : null;
+    const harness = selectedHarnessFor(agent);
+    const joint = agent !== null && isJointAgent(agent);
+    return (
+      <div
+        className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
+        data-testid={`project-settings-host-detail-${row.hostId}`}
+      >
+        <Field label="Directory" hint="Where new sessions open on this host">
+          {renderDirectoryField(row)}
+        </Field>
+        <Field label="Agent" hint="Default agent / harness for new sessions on this host">
+          {renderAgentSelect(row)}
+        </Field>
+        {joint ? (
+          <Field label="Model & effort" hint="Joint agents take their members' settings">
+            <span
+              className="text-ui text-muted-foreground"
+              data-testid={`project-settings-host-members-${row.hostId}`}
+            >
+              Set by members
+            </span>
+          </Field>
+        ) : harness ? (
+          renderHarnessSetFields(row, harness)
+        ) : null}
+        {renderOtherHarnessSection(row, harness)}
+        {renderEntryOutcome(row)}
+      </div>
+    );
+  };
+
+  const renderHostRow = (row: HostRowDraft) => {
+    const rowHost = hostsById.get(row.hostId);
+    const name = rowHost?.name ?? row.hostId;
+    const summary = hostRowSummary(row, agentList, catalogs);
+    const selected = selectedRowId === row.hostId;
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        data-testid={`project-settings-entry-${row.hostId}`}
+        className={cn(
+          "flex min-w-0 cursor-pointer flex-col gap-1 rounded-md border p-2 text-left",
+          selected && "border-primary/60 bg-muted/40",
+        )}
+        onClick={() => selectRow(row.hostId)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            selectRow(row.hostId);
+          }
+        }}
+      >
+        <div className="flex min-w-0 items-center gap-1">
+          <span className="min-w-0 flex-1 truncate text-ui font-medium" title={name}>
+            {name}
+          </span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0 text-muted-foreground"
+            aria-label={`Edit ${name}`}
+            title="Edit"
+            onClick={(event) => {
+              event.stopPropagation();
+              selectRow(row.hostId);
+            }}
+            data-testid={`project-settings-entry-edit-${row.hostId}`}
+          >
+            <PencilIcon />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0 text-muted-foreground hover:text-destructive"
+            aria-label={`Delete ${name}`}
+            title="Delete"
+            onClick={(event) => {
+              event.stopPropagation();
+              removeHostRow(row.hostId);
+            }}
+            disabled={isLoading || saving}
+            data-testid={`project-settings-entry-remove-${row.hostId}`}
+          >
+            <Trash2Icon />
+          </Button>
+        </div>
+        <span
+          className={cn(
+            "min-w-0 truncate text-xs",
+            row.path ? "font-mono" : "text-muted-foreground",
+          )}
+          title={row.path || undefined}
+          data-testid={`project-settings-host-path-${row.hostId}`}
+        >
+          {row.path || "No directory"}
+        </span>
+        <span
+          className="min-w-0 max-w-full truncate self-start rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+          title={summary}
+          data-testid={`project-settings-host-summary-${row.hostId}`}
+        >
+          {summary}
+        </span>
+      </div>
+    );
+  };
+
+  const renderAllHostsRow = () => {
+    const selected = selectedRowId === ALL_HOSTS;
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        data-testid="project-settings-all-hosts"
+        className={cn(
+          "flex min-w-0 cursor-pointer flex-col gap-1 rounded-md border p-2 text-left",
+          selected && "border-primary/60 bg-muted/40",
+        )}
+        onClick={() => selectRow(ALL_HOSTS)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            selectRow(ALL_HOSTS);
+          }
+        }}
+      >
+        <div className="flex min-w-0 items-center gap-1">
+          <span className="min-w-0 flex-1 truncate text-ui font-medium">All hosts</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0 text-muted-foreground"
+            aria-label="Edit the all-hosts defaults"
+            title="Edit"
+            onClick={(event) => {
+              event.stopPropagation();
+              selectRow(ALL_HOSTS);
+            }}
+            data-testid="project-settings-all-hosts-edit"
+          >
+            <PencilIcon />
+          </Button>
+        </div>
+        <span
+          className="min-w-0 max-w-full truncate self-start rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+          title={allHostsSummary}
+          data-testid="project-settings-all-hosts-summary"
+        >
+          {allHostsSummary}
+        </span>
+      </div>
+    );
+  };
+
+  const renderAllHostsDetail = () => (
+    <div
+      className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
+      data-testid="project-settings-all-hosts-detail"
+    >
+      <p className="text-sm text-muted-foreground">
+        The legacy fallback for hosts without their own set.
+      </p>
+      <Field label="Agent" hint="Default agent / harness for new sessions">
+        <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
+          <AgentHarnessPicker
+            agentEntries={agentEntries}
+            harnessEntries={harnessEntries}
+            effectiveAgentId={agentId}
+            agentLabel={agentLabel}
+            hasAgents={agentList.length > 0}
+            host={warningHost}
+            onSelectAgent={(a) => {
+              // A model default belongs to the picked harness's vocab —
+              // don't carry an alias onto a different agent.
+              if (a.id !== agentId) setModel(NONE);
+              setAgentId(a.id);
+            }}
+            pendingAgent={null}
+            pendingAgentId="__unused_pending_agent__"
+            onSelectPending={() => {}}
+            // No interactive create flow here, so hide the "Create custom
+            // agent" action and leave the handler inert.
+            onCreateCustomAgent={() => {}}
+            allowCreateCustomAgent={false}
+            sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
+            // Modal so the menu establishes its own scroll context and can
+            // scroll inside the Dialog's scroll-lock (a non-modal dropdown
+            // portals outside that lock and can't scroll). The dismiss
+            // guard on DialogContent keeps this modal dropdown's own close
+            // from bubbling up and closing the settings dialog.
+            dropdownModal
+            onOpenChange={onDropdownOpenChange}
+            // Bound the menu height so it scrolls inside the modal instead
+            // of running off the bottom; fixed width matches the composer.
+            contentClassName="max-h-80 w-80"
+            contentAlign="end"
+            // Fill the field column and match the sibling <Select> triggers
+            // (full width, bordered, h-8) so the control right-aligns with
+            // the host / effort dropdowns instead of floating mid-row.
+            triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
+            triggerLabelClassName="max-w-none text-ui"
+          />
+          {agentId && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
+              onClick={() => {
+                setAgentId(null);
+                setModel(NONE);
+              }}
+            >
+              Clear
+            </Button>
+          )}
+        </div>
+      </Field>
+      {supportsModelDefault && (
+        <Field
+          label="Model"
+          hint={
+            modelPickerEmpty
+              ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
+              : "Default model for new sessions with this agent"
+          }
+        >
+          <Select
+            value={model}
+            onValueChange={setModel}
+            onOpenChange={onDropdownOpenChange}
+            disabled={isLoading || modelPickerEmpty}
+          >
+            <SelectTrigger className="w-full" data-testid="project-settings-model">
+              <SelectValue placeholder="No default" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={NONE}>No default</SelectItem>
+              {modelOptions.map((m) => (
+                <SelectItem key={m.id} value={m.id}>
+                  {m.label}
+                </SelectItem>
+              ))}
+              {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
+            </SelectContent>
+          </Select>
+        </Field>
+      )}
+    </div>
+  );
+
+  const selectedRow = hostRows.find((row) => row.hostId === selectedRowId) ?? null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -692,202 +1700,89 @@ export function ProjectSettingsDialog({
             </Select>
           </Field>
 
-          {/* One project directory per host — the project's entry rows. The
-              Host field above stays the default host; these rows are what
-              sessions open in. */}
-          <div className="grid min-w-0 grid-cols-1 gap-1.5">
+          {/* One row per host: its project directory plus its per-host session
+              defaults. At >= md the selected row's detail shows in the right
+              pane; below md each row expands inline (single-open). The "All
+              hosts" row carries the legacy config.agent_id / config.model. */}
+          <div className="grid min-w-0 grid-cols-1 gap-2">
             <div className="flex min-w-0 flex-col">
-              <span className="font-medium text-ui">Project directory</span>
+              <span className="font-medium text-ui">Hosts</span>
               <span className="text-muted-foreground text-sm">
-                Where new sessions open — one directory per host
+                Per-host directories and session defaults
               </span>
             </div>
-            <div className="flex min-w-0 flex-col gap-2" data-testid="project-settings-directories">
-              {directoryRows.length === 0 && (
-                <p
-                  className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
-                  data-testid="project-settings-directories-empty"
-                >
-                  No project directory yet
-                </p>
-              )}
-              {directoryRows.map((row) => {
-                const rowHost = hostsById.get(row.hostId);
-                const rowError = entriesError?.hostId === row.hostId ? entriesError : null;
-                // The filesystem browser needs a live host; an offline or
-                // unregistered host falls back to typing a path.
-                const browsable = rowHost?.status === "online";
-                const rowOpen = openRow === row.hostId;
-                const rowSaved = savedEntries.has(row.hostId);
-                const rowOutcome = entryHookOutcomes.get(row.hostId);
-                const rowOutcomeWarning = rowOutcome
-                  ? WARNING_HOOK_STATUSES.has(rowOutcome.result.status)
-                  : false;
-                const showOutcome =
-                  rowOutcome !== undefined && (rowOutcome.source === "run" || rowOutcomeWarning);
-                return (
-                  <div
-                    key={row.hostId}
-                    className="flex min-w-0 flex-col gap-1.5 rounded-md border p-2"
-                    data-testid={`project-settings-entry-${row.hostId}`}
+            <div className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,15rem)_minmax(0,1fr)]">
+              <div
+                className="flex min-w-0 flex-col gap-2"
+                data-testid="project-settings-directories"
+              >
+                {hostRows.length === 0 && (
+                  <p
+                    className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
+                    data-testid="project-settings-directories-empty"
                   >
-                    <div className="flex min-w-0 items-center justify-between gap-2">
-                      <span
-                        className="min-w-0 truncate text-ui"
-                        title={rowHost?.name ?? row.hostId}
-                      >
-                        {rowHost?.name ?? row.hostId}
-                      </span>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-auto shrink-0 p-0 text-muted-foreground text-sm hover:bg-transparent"
-                        data-testid={`project-settings-entry-remove-${row.hostId}`}
-                        onClick={() => removeDirectoryRow(row.hostId)}
-                        disabled={isLoading || saving}
-                      >
-                        Remove
-                      </Button>
+                    No project directory yet
+                  </p>
+                )}
+                {hostRows.map((row) =>
+                  isCompact ? (
+                    <div key={row.hostId} className="flex min-w-0 flex-col gap-2">
+                      {renderHostRow(row)}
+                      {selectedRowId === row.hostId && renderHostDetail(row)}
                     </div>
-                    {browsable ? (
-                      // A compact trigger showing the row's current path;
-                      // clicking opens the shared workspace browser dialog.
-                      // Navigation there is provisional until the user
-                      // confirms a folder, which becomes this row's path.
-                      <div className="relative flex flex-col gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => setOpenRow(row.hostId)}
-                          aria-expanded={rowOpen}
-                          disabled={isLoading || saving}
-                          data-testid={`project-settings-entry-browse-${row.hostId}`}
-                          aria-label={`Project directory on ${rowHost?.name ?? row.hostId}`}
-                          className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          <span
-                            className={
-                              row.path
-                                ? "min-w-0 truncate font-mono"
-                                : "truncate text-muted-foreground"
-                            }
-                            title={row.path || undefined}
-                          >
-                            {row.path || "Browse…"}
-                          </span>
-                          <ChevronDownIcon
-                            className={`size-4 shrink-0 opacity-50 transition-transform ${
-                              rowOpen ? "rotate-180" : ""
-                            }`}
-                          />
-                        </button>
-                        <WorkspacePickerDialog
-                          open={rowOpen}
-                          onOpenChange={(next) => setOpenRow(next ? row.hostId : null)}
-                          hostId={row.hostId}
-                          initialPath={row.path}
-                          onConfirm={(path) => setDirectoryPath(row.hostId, path)}
-                        />
-                      </div>
-                    ) : (
-                      <input
-                        data-testid={`project-settings-entry-path-${row.hostId}`}
-                        aria-label={`Project directory on ${rowHost?.name ?? row.hostId}`}
-                        className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                        placeholder="/path/to/repo"
-                        value={row.path}
-                        title={row.path || undefined}
-                        onChange={(e) => setDirectoryPath(row.hostId, e.target.value)}
-                        disabled={isLoading || saving}
-                      />
-                    )}
-                    {rowSaved && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-auto self-start p-0 text-muted-foreground text-sm hover:bg-transparent"
-                        data-testid={`project-settings-entry-run-post-bind-${row.hostId}`}
-                        onClick={() => void runPostBindCommand(row.hostId)}
-                        disabled={isLoading || saving || runningPostBindHostId !== null}
-                      >
-                        Run post-bind command
-                      </Button>
-                    )}
-                    {showOutcome && rowOutcome && (
-                      <div
-                        className={
-                          rowOutcomeWarning
-                            ? "text-destructive text-ui"
-                            : "text-ui text-muted-foreground"
-                        }
-                        role="status"
-                        data-testid={`project-settings-entry-post-bind-${row.hostId}`}
-                      >
-                        {rowOutcome.result.status === "ok" ? (
-                          "Post-bind command succeeded"
-                        ) : (
-                          <>
-                            {rowOutcomeWarning ? "Directory saved; " : ""}post-bind command{" "}
-                            {hookStatusLabel(rowOutcome.result.status)}
-                            {rowOutcome.result.error ? `: ${rowOutcome.result.error}` : ""}
-                            {typeof rowOutcome.result.exit_code === "number"
-                              ? ` (exit code ${rowOutcome.result.exit_code})`
-                              : ""}
-                            {rowOutcome.result.output ? (
-                              <pre className="mt-1 whitespace-pre-wrap">
-                                {rowOutcome.result.output}
-                              </pre>
-                            ) : null}
-                          </>
-                        )}
-                      </div>
-                    )}
-                    {rowError && (
-                      <p
-                        className="text-destructive text-ui"
-                        role="alert"
-                        data-testid={`project-settings-entry-error-${row.hostId}`}
-                      >
-                        {rowError.message}
-                      </p>
-                    )}
-                  </div>
-                );
-              })}
-              {entriesError && !directoryRows.some((row) => row.hostId === entriesError.hostId) && (
-                // A DELETE that failed has no row left to carry the message.
-                <p
-                  className="text-destructive text-ui"
-                  role="alert"
-                  data-testid="project-settings-entries-error"
-                >
-                  {entriesError.message}
-                </p>
-              )}
-              {addableHosts.length > 0 && (
-                // A menu-shaped Select: its value never changes, so picking a
-                // host adds a row and the trigger keeps reading "Add host".
-                <Select
-                  value={NONE}
-                  onValueChange={(value) => {
-                    if (value !== NONE) addDirectoryRow(value);
-                  }}
-                  onOpenChange={onDropdownOpenChange}
-                  disabled={isLoading || saving}
-                >
-                  <SelectTrigger className="w-full" data-testid="project-settings-add-host">
-                    <SelectValue placeholder="Add host" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={NONE}>Add host</SelectItem>
-                    {addableHosts.map((host) => (
-                      <SelectItem key={host.host_id} value={host.host_id}>
-                        {host.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                  ) : (
+                    <Fragment key={row.hostId}>{renderHostRow(row)}</Fragment>
+                  ),
+                )}
+                {renderAllHostsRow()}
+                {isCompact && selectedRowId === ALL_HOSTS && renderAllHostsDetail()}
+                {addableHosts.length > 0 && (
+                  // A menu-shaped Select: its value never changes, so picking a
+                  // host adds a row and the trigger keeps reading "Add host".
+                  <Select
+                    value={NONE}
+                    onValueChange={(value) => {
+                      if (value !== NONE) addHostRow(value);
+                    }}
+                    onOpenChange={onDropdownOpenChange}
+                    disabled={isLoading || saving}
+                  >
+                    <SelectTrigger className="w-full" data-testid="project-settings-add-host">
+                      <SelectValue placeholder="Add host" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={NONE}>Add host</SelectItem>
+                      {addableHosts.map((host) => (
+                        <SelectItem key={host.host_id} value={host.host_id}>
+                          {host.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+                {entriesError && !hostRows.some((row) => row.hostId === entriesError.hostId) && (
+                  // A DELETE that failed has no row left to carry the message.
+                  <p
+                    className="text-destructive text-ui"
+                    role="alert"
+                    data-testid="project-settings-entries-error"
+                  >
+                    {entriesError.message}
+                  </p>
+                )}
+              </div>
+              {!isCompact && (
+                <div className="min-w-0">
+                  {selectedRow ? (
+                    renderHostDetail(selectedRow)
+                  ) : selectedRowId === ALL_HOSTS ? (
+                    renderAllHostsDetail()
+                  ) : (
+                    <p className="text-muted-foreground text-ui">
+                      Select a host to edit its defaults.
+                    </p>
+                  )}
+                </div>
               )}
             </div>
           </div>
@@ -922,94 +1817,6 @@ export function ProjectSettingsDialog({
                 onChange={(e) => setBaseBranch(e.target.value)}
                 disabled={isLoading}
               />
-            </Field>
-          )}
-
-          <Field label="Agent" hint="Default agent / harness for new sessions">
-            <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
-              <AgentHarnessPicker
-                agentEntries={agentEntries}
-                harnessEntries={harnessEntries}
-                effectiveAgentId={agentId}
-                agentLabel={agentLabel}
-                hasAgents={agentList.length > 0}
-                host={warningHost}
-                onSelectAgent={(a) => {
-                  // A model default belongs to the picked harness's vocab —
-                  // don't carry an alias onto a different agent.
-                  if (a.id !== agentId) setModel(NONE);
-                  setAgentId(a.id);
-                }}
-                pendingAgent={null}
-                pendingAgentId="__unused_pending_agent__"
-                onSelectPending={() => {}}
-                // No interactive create flow here, so hide the "Create custom
-                // agent" action and leave the handler inert.
-                onCreateCustomAgent={() => {}}
-                allowCreateCustomAgent={false}
-                sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
-                // Modal so the menu establishes its own scroll context and can
-                // scroll inside the Dialog's scroll-lock (a non-modal dropdown
-                // portals outside that lock and can't scroll). The dismiss
-                // guard on DialogContent keeps this modal dropdown's own close
-                // from bubbling up and closing the settings dialog.
-                dropdownModal
-                onOpenChange={onDropdownOpenChange}
-                // Bound the menu height so it scrolls inside the modal instead
-                // of running off the bottom; fixed width matches the composer.
-                contentClassName="max-h-80 w-80"
-                contentAlign="end"
-                // Fill the field column and match the sibling <Select> triggers
-                // (full width, bordered, h-8) so the control right-aligns with
-                // the host / effort dropdowns instead of floating mid-row.
-                triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
-                triggerLabelClassName="max-w-none text-ui"
-              />
-              {agentId && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
-                  onClick={() => {
-                    setAgentId(null);
-                    setModel(NONE);
-                  }}
-                >
-                  Clear
-                </Button>
-              )}
-            </div>
-          </Field>
-
-          {supportsModelDefault && (
-            <Field
-              label="Model"
-              hint={
-                modelPickerEmpty
-                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
-                  : "Default model for new sessions with this agent"
-              }
-            >
-              <Select
-                value={model}
-                onValueChange={setModel}
-                onOpenChange={onDropdownOpenChange}
-                disabled={isLoading || modelPickerEmpty}
-              >
-                <SelectTrigger className="w-full" data-testid="project-settings-model">
-                  <SelectValue placeholder="No default" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={NONE}>No default</SelectItem>
-                  {modelOptions.map((m) => (
-                    <SelectItem key={m.id} value={m.id}>
-                      {m.label}
-                    </SelectItem>
-                  ))}
-                  {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
-                </SelectContent>
-              </Select>
             </Field>
           )}
 

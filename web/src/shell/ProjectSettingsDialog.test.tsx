@@ -41,12 +41,20 @@ const {
   hostModelOptionsMock,
   serverInfoMock,
   workspacePickerPropsMock,
+  listCatalogsMock,
+  syncCatalogsMock,
 } = vi.hoisted(() => ({
   hostsMock: vi.fn(),
   availableAgentsMock: vi.fn(),
   hostModelOptionsMock: vi.fn(),
   serverInfoMock: vi.fn(),
   workspacePickerPropsMock: vi.fn(),
+  listCatalogsMock: vi.fn(),
+  syncCatalogsMock: vi.fn(),
+}));
+vi.mock("@/lib/callingDefaultsApi", () => ({
+  listCallingDefaultCatalogs: () => listCatalogsMock(),
+  syncCallingDefaults: (options: unknown) => syncCatalogsMock(options),
 }));
 const LAPTOP = {
   host_id: "h1",
@@ -122,6 +130,33 @@ function entry(hostId: string, workspace: string) {
   return { host_id: hostId, workspace, updated_at: null };
 }
 
+async function pickOption(triggerTestId: string, optionName: string) {
+  fireEvent.click(screen.getByTestId(triggerTestId));
+  fireEvent.click(await screen.findByRole("option", { name: optionName }));
+}
+
+function catalogRow(hostId: string, harness: string, models: Record<string, unknown>[]) {
+  return { host_id: hostId, harness, models, fetched_at: 1_700_000_000, stale: false, error: null };
+}
+
+/** Force the max-md breakpoint on, so the dialog renders its accordion. */
+function useMobileViewport(): () => void {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    matches: query === "(max-width: 767.98px)",
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return () => {
+    window.matchMedia = original;
+  };
+}
+
 function renderDialog(projectId: string | null = "p_1", onOpenChangeSpy?: (open: boolean) => void) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onOpenChange = onOpenChangeSpy ?? vi.fn();
@@ -160,9 +195,13 @@ beforeEach(() => {
   hostModelOptionsMock.mockReset();
   serverInfoMock.mockReset();
   workspacePickerPropsMock.mockReset();
+  listCatalogsMock.mockReset();
+  syncCatalogsMock.mockReset();
   hostsMock.mockReturnValue({ data: [LAPTOP] });
   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
   hostModelOptionsMock.mockReturnValue({ data: [] });
+  listCatalogsMock.mockResolvedValue([]);
+  syncCatalogsMock.mockResolvedValue([]);
   serverInfoMock.mockReturnValue({
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
@@ -627,6 +666,8 @@ describe("ProjectSettingsDialog", () => {
 
     fireEvent.click(screen.getByTestId("project-settings-entry-browse-h1"));
     fireEvent.click(screen.getByText("pick dir"));
+    // h2's detail pane renders only once its row is selected.
+    fireEvent.click(screen.getByTestId("project-settings-entry-h2"));
     fireEvent.click(screen.getByTestId("project-settings-entry-browse-h2"));
     fireEvent.click(screen.getByText("pick dir"));
     // Row h1 commits; row h2's PUT fails — partial progress still refreshes.
@@ -649,8 +690,9 @@ describe("ProjectSettingsDialog", () => {
     // Entries are not refetched (that would reseed the drafts) and no config lands.
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["project-entries", "p_1"] });
     expect(updateMock).not.toHaveBeenCalled();
-    expect(screen.getByTestId("project-settings-entry-browse-h1")).toHaveTextContent("/picked/dir");
+    // h2's detail keeps its draft; h1's list row keeps its own.
     expect(screen.getByTestId("project-settings-entry-browse-h2")).toHaveTextContent("/picked/dir");
+    expect(screen.getByTestId("project-settings-host-path-h1")).toHaveTextContent("/picked/dir");
   });
 
   it("promotes a label-only folder first, then PUTs the entry with the new id (scenario 26)", async () => {
@@ -961,6 +1003,320 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Collaboration" }), { button: 0 });
     expect(screen.getByTestId("project-collaboration-repo-url")).toHaveValue(
       "https://example.com/draft.git",
+    );
+  });
+
+  // The per-host defaults editor: a list row per host with its directory and
+  // a summary chip, the selected row's detail on the right, and the stored
+  // `config.calling_defaults` round-tripped by Save.
+  const codexSdkAgent = () =>
+    pickerAgent({
+      id: "ag_codex_sdk",
+      name: "codex-sdk",
+      display_name: "Codex SDK",
+      harness: "codex",
+    });
+
+  it("renders the host list chip and round-trips the stored per-host set", async () => {
+    hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo/one")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: { codex: { model: "gpt-6-sol", effort: "high" } },
+          },
+        },
+      },
+    });
+    listCatalogsMock.mockResolvedValue([
+      catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
+    ]);
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-host-summary-h1")).toHaveTextContent(
+        "Codex SDK · GPT-6-Sol · High",
+      ),
+    );
+    // The first row is selected, so its detail shows the set.
+    expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent("GPT-6-Sol");
+    expect(screen.getByTestId("project-settings-host-effort-h1")).toHaveTextContent("High");
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: { codex: { model: "gpt-6-sol", effort: "high" } },
+          },
+        },
+      }),
+    );
+  });
+
+  it("adds a host and edits its agent / model / effort (one sync per pair)", async () => {
+    hostsMock.mockReturnValue({
+      data: [{ ...LAPTOP, configured_harnesses: { "claude-native": true, "codex-native": false } }],
+    });
+    availableAgentsMock.mockReturnValue({
+      data: [
+        claudeAgent(),
+        pickerAgent({
+          id: "ag_codex",
+          name: "codex-native-ui",
+          display_name: "Codex",
+          harness: "codex-native",
+        }),
+      ],
+    });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    syncCatalogsMock.mockResolvedValue([
+      catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }]),
+    ]);
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-add-host"));
+    fireEvent.click(await screen.findByRole("option", { name: "Laptop" }));
+
+    // Only agents usable on this host are offered: Claude Code is ready, the
+    // host-reported-unready Codex is not.
+    fireEvent.click(screen.getByTestId("project-settings-host-agent-h1"));
+    expect(await screen.findByRole("option", { name: "Claude Code" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Codex" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "Claude Code" }));
+
+    // Opening the model dropdown syncs the missing (h1, claude-native) pair
+    // once; the now-cached pair is not re-synced by the sibling dropdown.
+    await pickOption("project-settings-host-model-h1", "Opus");
+    expect(syncCatalogsMock).toHaveBeenCalledTimes(1);
+    expect(syncCatalogsMock).toHaveBeenCalledWith({ hostId: "h1", harness: "claude-native" });
+    fireEvent.click(screen.getByTestId("project-settings-host-effort-h1"));
+    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+    expect(syncCatalogsMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_claude",
+            harnesses: { "claude-native": { model: "opus", effort: "high" } },
+          },
+        },
+      }),
+    );
+  });
+
+  it("clears model and effort with Default without storing a clear word", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: { codex: { model: "gpt-6-sol", effort: "high" } },
+          },
+        },
+      },
+    });
+    listCatalogsMock.mockResolvedValue([
+      catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
+    ]);
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-host-summary-h1")).toHaveTextContent(
+        "Codex SDK · GPT-6-Sol · High",
+      ),
+    );
+
+    await pickOption("project-settings-host-model-h1", "Default");
+    await pickOption("project-settings-host-effort-h1", "Default");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: { h1: { agent_id: "ag_codex_sdk" } },
+      }),
+    );
+  });
+
+  it("deletes a host row and drops both its entry and its calling_defaults key", async () => {
+    hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo/one"), entry("h2", "/repo/two")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: { agent_id: "ag_claude" },
+          h2: { agent_id: "ag_claude", harnesses: { "claude-native": { model: "opus" } } },
+        },
+      },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h2")).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-entry-remove-h2"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() => expect(deleteEntryMock).toHaveBeenCalledWith("p_1", "h2"));
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      calling_defaults: { h1: { agent_id: "ag_claude" } },
+    });
+  });
+
+  it("hides model and effort for a joint agent and says Set by members", async () => {
+    availableAgentsMock.mockReturnValue({
+      data: [
+        pickerAgent({
+          id: "ca_joint",
+          name: "my-joint",
+          display_name: "My Joint",
+          harness: "codex",
+        }),
+      ],
+    });
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { calling_defaults: { h1: { agent_id: "ca_joint" } } },
+    });
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-host-members-h1")).toHaveTextContent(
+        "Set by members",
+      ),
+    );
+    expect(screen.getByTestId("project-settings-host-summary-h1")).toHaveTextContent(
+      "My Joint · Set by members",
+    );
+    expect(screen.queryByTestId("project-settings-host-model-h1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("project-settings-host-effort-h1")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: { h1: { agent_id: "ca_joint" } },
+      }),
+    );
+  });
+
+  it("moves the legacy agent / model into the All hosts row and round-trips them", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", model: "opus" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-entry-h1")).toBeInTheDocument(),
+    );
+    // The host detail is selected, not the legacy fallback.
+    expect(screen.queryByTestId("project-settings-agent")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-all-hosts"));
+    expect(screen.getByTestId("project-settings-agent")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-model")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+    );
+  });
+
+  it("truncates a 200-character directory with the full path in the title", async () => {
+    const longPath = `/${"a".repeat(199)}`;
+    listEntriesMock.mockResolvedValue([entry("h1", longPath)]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+
+    const pathEl = await screen.findByTestId("project-settings-host-path-h1");
+    expect(pathEl).toHaveTextContent(longPath);
+    expect(pathEl).toHaveAttribute("title", longPath);
+    expect(pathEl.className).toContain("truncate");
+  });
+
+  it("opens one host detail at a time in the accordion below md", async () => {
+    const restoreViewport = useMobileViewport();
+    try {
+      hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
+      listEntriesMock.mockResolvedValue([entry("h1", "/one"), entry("h2", "/two")]);
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      renderDialog();
+
+      // The first row starts expanded; the second stays collapsed.
+      expect(await screen.findByTestId("project-settings-host-detail-h1")).toBeInTheDocument();
+      expect(screen.queryByTestId("project-settings-host-detail-h2")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId("project-settings-entry-h2"));
+      expect(screen.getByTestId("project-settings-host-detail-h2")).toBeInTheDocument();
+      expect(screen.queryByTestId("project-settings-host-detail-h1")).not.toBeInTheDocument();
+
+      // Tapping the open row collapses it.
+      fireEvent.click(screen.getByTestId("project-settings-entry-h2"));
+      expect(screen.queryByTestId("project-settings-host-detail-h2")).not.toBeInTheDocument();
+    } finally {
+      restoreViewport();
+    }
+  });
+
+  it("adds and deletes an other-harness model row", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: { agent_id: "ag_claude", harnesses: { "claude-native": { model: "opus" } } },
+        },
+      },
+    });
+    syncCatalogsMock.mockResolvedValue([
+      catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
+    ]);
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-host-detail-h1")).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
+    fireEvent.click(screen.getByTestId("project-settings-host-other-add-h1"));
+    fireEvent.click(await screen.findByRole("option", { name: "Codex SDK" }));
+    await pickOption("project-settings-host-other-model-h1-codex", "GPT-6-Sol");
+    expect(screen.getByTestId("project-settings-host-other-h1-codex")).toBeInTheDocument();
+
+    // Deleting the row omits its harness entry from the next save.
+    fireEvent.click(screen.getByTestId("project-settings-host-other-remove-h1-codex"));
+    expect(screen.queryByTestId("project-settings-host-other-h1-codex")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: {
+          h1: { agent_id: "ag_claude", harnesses: { "claude-native": { model: "opus" } } },
+        },
+      }),
     );
   });
 });
