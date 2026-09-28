@@ -142,6 +142,42 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
 # ── state enum ────────────────────────────────────────────────────────────────
 
 
+def test_project_and_explicit_nulls_round_trip(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``project_id`` / ``explicit_null_fields`` persist, and update clears them."""
+    created = store.create(
+        scheduled_task_id=_uid("st_project"),
+        name="filed",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=_uid("proj_1"),
+        explicit_null_fields=["model_override", "reasoning_effort"],
+    )
+    assert created.project_id == _uid("proj_1")
+    assert created.explicit_null_fields == ["model_override", "reasoning_effort"]
+
+    reread = store.get(_uid("st_project"))
+    assert reread is not None
+    assert reread.project_id == _uid("proj_1")
+    assert reread.explicit_null_fields == ["model_override", "reasoning_effort"]
+
+    # Omitting either field leaves it unchanged.
+    unchanged = store.update(_uid("st_project"), name="renamed")
+    assert unchanged is not None
+    assert unchanged.project_id == _uid("proj_1")
+    assert unchanged.explicit_null_fields == ["model_override", "reasoning_effort"]
+
+    # A passing explicit None clears each column.
+    cleared = store.update(_uid("st_project"), project_id=None, explicit_null_fields=None)
+    assert cleared is not None
+    assert cleared.project_id is None
+    assert cleared.explicit_null_fields is None
+
+
 def test_state_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> None:
     """Every valid state name survives the string→int→string round trip.
 

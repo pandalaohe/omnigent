@@ -48,6 +48,8 @@ class ScheduledTaskStore(ABC):
         agent_id: str,
         timezone: str,
         *,
+        project_id: str | None = None,
+        explicit_null_fields: list[str] | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
@@ -72,6 +74,10 @@ class ScheduledTaskStore(ABC):
             to ``agent_id`` and the other to ``custom_agent_id``; exactly one
             column is set per row.
         :param timezone: IANA timezone the trigger is evaluated in.
+        :param project_id: Owning project whose calling defaults apply at fire
+            time, or ``None`` for master-table-only.
+        :param explicit_null_fields: Request field names the creator sent as
+            explicit nulls; persisted as a JSON list.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
         :param permission_mode: Optional native-harness permission mode
@@ -141,6 +147,8 @@ class ScheduledTaskStore(ABC):
         rrule: str | None = None,
         agent_id: str | None = None,
         timezone: str | None = None,
+        project_id: str | None = _UNSET,
+        explicit_null_fields: builtins.list[str] | None = _UNSET,
         model_override: str | None = _UNSET,
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
@@ -155,7 +163,8 @@ class ScheduledTaskStore(ABC):
         """
         Update mutable fields of a task.
 
-        Most parameters use ``None`` to mean "leave unchanged". For the per-task
+        Most parameters use ``None`` to mean "leave unchanged". For the
+        ``project_id`` / ``explicit_null_fields`` columns, the per-task
         overrides (``model_override``, ``reasoning_effort``,
         ``permission_mode``), ``host_id``, ``max_cost_usd``, and
         ``last_run_conversation_id``, the sentinel default means "not provided /

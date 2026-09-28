@@ -44,7 +44,9 @@ class SysScheduledTaskCreateTool(Tool):
             "MCP-only / chat tasks that touch no code directory). Optionally PIN "
             "a connected host and/or a workspace on it; with no pinned host it "
             "runs on your live host at fire time (the owner must have an online "
-            "host then, else the run is recorded as failed). The task fires "
+            "host then, else the run is recorded as failed). The task is filed "
+            "in the calling session's project by default, so that project's "
+            "model / effort defaults apply on every fire. The task fires "
             "automatically on its schedule until deleted."
         )
 
@@ -74,6 +76,14 @@ class SysScheduledTaskCreateTool(Tool):
                             "description": (
                                 "The agent to run, e.g. 'ag_abc123' — from "
                                 "sys_agent_list or sys_agent_get."
+                            ),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional project to file the task in. Defaults to the "
+                                "calling session's project; that project's per-host "
+                                "model / effort defaults apply at fire time."
                             ),
                         },
                         "timezone": {

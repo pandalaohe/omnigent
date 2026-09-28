@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 from typing import Any
 
 from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
@@ -58,6 +59,30 @@ def _bound_agent_id(row: SqlScheduledTask) -> str:
     return row.agent_id
 
 
+def _encode_explicit_null_fields(fields: list[str] | None) -> str | None:
+    """Pack the explicit-null field list (``None`` when empty / unset)."""
+    if not fields:
+        return None
+    return json.dumps(list(fields), separators=(",", ":"))
+
+
+def _decode_explicit_null_fields(raw: str | None) -> list[str] | None:
+    """Unpack the stored explicit-null field list (``None`` when unset).
+
+    A malformed blob reads as unset rather than failing the read.
+    """
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, list):
+        return None
+    names = [item for item in decoded if isinstance(item, str)]
+    return names or None
+
+
 def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
     """
     Convert a :class:`SqlScheduledTask` ORM row to a :class:`ScheduledTask`.
@@ -76,6 +101,8 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         created_at=row.created_at,
         workspace_id=row.workspace_id or DEFAULT_WORKSPACE_ID,
         rrule=row.rrule,
+        project_id=row.project_id,
+        explicit_null_fields=_decode_explicit_null_fields(row.explicit_null_fields),
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
         permission_mode=row.permission_mode,
@@ -157,6 +184,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         agent_id: str,
         timezone: str,
         *,
+        project_id: str | None = None,
+        explicit_null_fields: list[str] | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
@@ -182,6 +211,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 agent_id=agent_column,
                 custom_agent_id=custom_agent_column,
                 timezone=timezone,
+                project_id=project_id,
+                explicit_null_fields=_encode_explicit_null_fields(explicit_null_fields),
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
@@ -290,6 +321,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         rrule: str | None = None,
         agent_id: str | None = None,
         timezone: str | None = None,
+        project_id: str | None = _UNSET,
+        explicit_null_fields: builtins.list[str] | None = _UNSET,
         model_override: str | None = _UNSET,
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
@@ -303,11 +336,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
-        ``None`` leaves most fields unchanged. For the per-task overrides
-        (``model_override``, ``reasoning_effort``, ``permission_mode``),
-        ``workspace``, ``host_id``, ``max_cost_usd``, and
-        ``last_run_conversation_id``, the sentinel default means "not provided /
-        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        ``None`` leaves most fields unchanged. For ``project_id`` /
+        ``explicit_null_fields``, the per-task overrides (``model_override``,
+        ``reasoning_effort``, ``permission_mode``), ``workspace``, ``host_id``,
+        ``max_cost_usd``, and ``last_run_conversation_id``, the sentinel
+        default means "not provided / leave unchanged"; passing ``None``
+        explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (a set
         ``bypassPermissions`` can be turned back off), and clearing both
         ``host_id`` and ``workspace`` unpins a task (e.g. switching it to
@@ -344,6 +378,14 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if timezone is not None and row.timezone != timezone:
                 row.timezone = timezone
                 changed = True
+            if project_id is not _UNSET and row.project_id != project_id:
+                row.project_id = project_id
+                changed = True
+            if explicit_null_fields is not _UNSET:
+                encoded_nulls = _encode_explicit_null_fields(explicit_null_fields)
+                if row.explicit_null_fields != encoded_nulls:
+                    row.explicit_null_fields = encoded_nulls
+                    changed = True
             if model_override is not _UNSET and row.model_override != model_override:
                 row.model_override = model_override
                 changed = True

@@ -81,6 +81,7 @@ async def test_create_posts_payload() -> None:
                 "prompt": "go",
                 "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
                 "agent_id": "ag_1",
+                "project_id": "proj_1",
                 "workspace": "/repo",
                 "host_id": "host_1",
                 "base_branch": "main",
@@ -88,6 +89,7 @@ async def test_create_posts_payload() -> None:
             }
         ),
         server_client=client,
+        conversation_id="conv_caller",
     )
     verb, url, body = client.calls[0]
     assert (verb, url) == ("POST", "/v1/scheduled-tasks")
@@ -96,6 +98,9 @@ async def test_create_posts_payload() -> None:
         "prompt": "go",
         "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         "agent_id": "ag_1",
+        "project_id": "proj_1",
+        # The calling session rides along so the server can inherit its project.
+        "source_session_id": "conv_caller",
         "workspace": "/repo",
         "host_id": "host_1",
     }  # unknown fields filtered out
@@ -230,6 +235,7 @@ def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
     # no-workspace research / summary / chat-only task omits both.
     assert "workspace" in properties
     assert "host_id" in properties
+    assert "project_id" in properties
     assert "base_branch" not in properties
     assert "workspace" not in schema["required"]
     assert "host_id" not in schema["required"]

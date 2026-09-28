@@ -5760,6 +5760,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "prompt",
     "rrule",
     "agent_id",
+    "project_id",
     "timezone",
     "model_override",
     "reasoning_effort",
@@ -5799,6 +5800,7 @@ async def _execute_scheduled_task_tool(
     arguments: str,
     *,
     server_client: httpx.AsyncClient | None,
+    conversation_id: str | None = None,
 ) -> str:
     """
     Runner-local handler for the ``sys_scheduled_task_*`` family.
@@ -5813,6 +5815,8 @@ async def _execute_scheduled_task_tool(
     :param arguments: JSON-encoded arguments string from the LLM.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
+    :param conversation_id: The calling session id, sent as
+        ``source_session_id`` on create so the server can inherit its project.
     :returns: Tool output JSON string.
     """
     if server_client is None:
@@ -5827,6 +5831,8 @@ async def _execute_scheduled_task_tool(
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
+            if conversation_id is not None:
+                payload["source_session_id"] = conversation_id
             resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
@@ -7899,6 +7905,7 @@ async def execute_tool(
                 tool_name,
                 arguments,
                 server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _ASSIGNMENT_TOOLS:
             from omnigent.runner.assignment_tools import execute_assignment_tool

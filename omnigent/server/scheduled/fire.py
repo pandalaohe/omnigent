@@ -73,6 +73,7 @@ from omnigent.server.library_agent_launch import (
 )
 from omnigent.server.routes._session_create_validation import (
     CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
+    resolve_create_calling_stores,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
@@ -164,6 +165,12 @@ class FireDeps:
     # task may target a ``ca_`` Agent; ``None`` leaves ``ca_`` ids unknown, as
     # before.
     custom_agents_store: Any | None = None
+    # Calling-defaults chain: the task's project, the owner's master table,
+    # and the cached host catalogs. Each unwired store degrades to the layers
+    # that remain readable (no project → master layers only).
+    project_store: Any | None = None
+    preferences_store: Any | None = None
+    catalog_store: Any | None = None
 
 
 @dataclass
@@ -470,6 +477,26 @@ async def _run_fire_for_task(
                     error_code=exc.error_code,
                 )
                 return
+
+        # Fill an unset model / effort from the project / master chain now that
+        # the host is authorized. A K5 refusal is recorded like every other
+        # failed fire, with the shared message text.
+        try:
+            effective = await _resolve_fire_calling(deps, effective)
+        except OmnigentError as exc:
+            _logger.warning(
+                "scheduled fire: task %s calling defaults refused: %s", task.id, exc.message
+            )
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error=exc.message,
+                error_code=exc.code,
+            )
+            return
 
         # Check connected-host workspaces, including the resolved HOME default,
         # against the agent's cwd boundary. A new sandbox has no workspace yet.
@@ -881,6 +908,75 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
             code=ErrorCode.INTERNAL_ERROR,
         )
     return conv
+
+
+async def _resolve_fire_calling(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+    """Fill an unset model / effort from the task's calling-defaults chain.
+
+    The task's stored values win; an explicit ``None`` recorded in
+    ``explicit_null_fields`` counts as explicitly unset and stays out of the
+    chain. Every unset field resolves for the task's host and agent through
+    :func:`resolve_create_calling_stores`; the spec-effort fallback then applies
+    in :func:`_create_session`. The agent is always explicit — a scheduled task
+    requires one and never resolves it from defaults.
+
+    The task's project applies only while it still exists and belongs to the
+    task owner; a gone / foreign project (or an unwired project store) falls
+    back to the master layers with a warning and never fails the fire. A saved
+    library Agent task keeps its existing library launch untouched.
+
+    :raises OmnigentError: A K5 refusal — a default-sourced model / effort the
+        fresh catalog does not offer; the caller records the failed run.
+    """
+    if _is_library_agent_task(deps, task):
+        return task
+    project = None
+    if task.project_id is not None and deps.project_store is not None:
+        try:
+            project = await asyncio.to_thread(
+                deps.project_store.get, task.project_id, user_id=task.user_id
+            )
+        except Exception:  # noqa: BLE001 — a project read must never fail a fire
+            _logger.warning(
+                "scheduled fire: could not load project %s for task %s; using master layers",
+                task.project_id,
+                task.id,
+                exc_info=True,
+            )
+        else:
+            if project is None:
+                _logger.warning(
+                    "scheduled fire: task %s project %s is gone or not owned by %r; "
+                    "using master layers",
+                    task.id,
+                    task.project_id,
+                    task.user_id,
+                )
+    explicit: dict[str, Any] = {
+        "agent_id": task.agent_id,
+        "model_override": task.model_override,
+        "reasoning_effort": task.reasoning_effort,
+    }
+    explicit_fields: set[str] = {"agent_id"}
+    if task.model_override is not None:
+        explicit_fields.add("model_override")
+    if task.reasoning_effort is not None:
+        explicit_fields.add("reasoning_effort")
+    explicit_fields.update(task.explicit_null_fields or ())
+    resolution = await resolve_create_calling_stores(
+        user_id=task.user_id,
+        project=project,
+        host_id=task.host_id,
+        explicit=explicit,
+        explicit_fields=explicit_fields,
+        path_label="scheduled tasks",
+        host_store=deps.host_store,
+        agent_store=deps.agent_store,
+        agent_cache=deps.agent_cache,
+        preferences_store=deps.preferences_store,
+        catalog_store=deps.catalog_store,
+    )
+    return replace(task, model_override=resolution.model, reasoning_effort=resolution.effort)
 
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:

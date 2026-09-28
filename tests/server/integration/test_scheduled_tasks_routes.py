@@ -28,6 +28,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
@@ -70,6 +71,9 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
         permission_store=SqlAlchemyPermissionStore(db_uri),
         scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+        # A real project store so project create authorization + the
+        # source-session project inheritance resolve against actual rows.
+        project_store=SqlAlchemyProjectStore(db_uri),
         # A real host store so pinned-host create authorization (existence +
         # ownership) resolves against actual host rows. Without it,
         # ``app.state.host_store`` is None and the route skips the check.
@@ -1793,3 +1797,187 @@ async def test_run_now_503_when_scheduler_not_running(
     auth_app.state.scheduled_task_run_now = None
     resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
     assert resp.status_code == 503, resp.text
+
+
+# ── project_id + explicit nulls (D29, K7c) ───────────────────────────────────
+
+
+def _seed_project(db_uri: str, project_id: str, owner: str) -> str:
+    SqlAlchemyProjectStore(db_uri).create(project_id, f"project-{project_id}", owner)
+    return project_id
+
+
+def _seed_session_in_project(
+    db_uri: str,
+    conversation_id: str,
+    agent_id: str,
+    project_id: str,
+    owner: str,
+) -> str:
+    from omnigent.server.auth import LEVEL_OWNER
+
+    SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=agent_id, conversation_id=conversation_id, project_id=project_id
+    )
+    SqlAlchemyPermissionStore(db_uri).grant(owner, conversation_id, LEVEL_OWNER)
+    return conversation_id
+
+
+async def test_create_stores_explicit_project_and_surfaces_it(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    project_id = _seed_project(db_uri, uuid4().hex, "alice@example.com")
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(project_id=project_id), headers=_headers()
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["project_id"] == project_id
+    stored = SqlAlchemyScheduledTaskStore(db_uri).get(created["id"])
+    assert stored is not None and stored.project_id == project_id
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.json()["project_id"] == project_id
+
+
+async def test_create_rejects_unknown_and_foreign_project(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    foreign = _seed_project(db_uri, uuid4().hex, "bob@example.com")
+
+    unknown = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(project_id=uuid4().hex),
+        headers=_headers(),
+    )
+    assert unknown.status_code == 404, unknown.text
+    foreign_resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(project_id=foreign),
+        headers=_headers(),
+    )
+    assert foreign_resp.status_code == 404, foreign_resp.text
+
+
+async def test_create_inherits_project_from_the_calling_session(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """D29: an omitted ``project_id`` takes the caller's session's project."""
+    _make_user(db_uri)
+    project_id = _seed_project(db_uri, uuid4().hex, "alice@example.com")
+    session_id = _seed_session_in_project(
+        db_uri,
+        uuid4().hex,
+        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        project_id,
+        "alice@example.com",
+    )
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=session_id),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] == project_id
+
+
+async def test_create_ignores_a_foreign_source_session(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The prefill is owner-checked: another user's session yields no project."""
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    project_id = _seed_project(db_uri, uuid4().hex, "bob@example.com")
+    session_id = _seed_session_in_project(
+        db_uri,
+        uuid4().hex,
+        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        project_id,
+        "bob@example.com",
+    )
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=session_id),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] is None
+
+
+async def test_patch_sets_and_clears_the_project(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    project_id = _seed_project(db_uri, uuid4().hex, "alice@example.com")
+    foreign = _seed_project(db_uri, uuid4().hex, "bob@example.com")
+    task_id = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()["id"]
+
+    set_resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"project_id": project_id}, headers=_headers()
+    )
+    assert set_resp.status_code == 200, set_resp.text
+    assert set_resp.json()["project_id"] == project_id
+
+    foreign_resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"project_id": foreign}, headers=_headers()
+    )
+    assert foreign_resp.status_code == 404, foreign_resp.text
+
+    clear_resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"project_id": None}, headers=_headers()
+    )
+    assert clear_resp.status_code == 200, clear_resp.text
+    assert clear_resp.json()["project_id"] is None
+    stored = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+    assert stored is not None and stored.project_id is None
+
+
+async def test_create_and_patch_track_explicit_null_overrides(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """K7c: explicit nulls persist, a later value removes them, omissions keep them."""
+    _make_user(db_uri)
+    task_id = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(reasoning_effort=None),
+            headers=_headers(),
+        )
+    ).json()["id"]
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    stored = store.get(task_id)
+    assert stored is not None and stored.explicit_null_fields == ["reasoning_effort"]
+
+    valued = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"reasoning_effort": "high"},
+        headers=_headers(),
+    )
+    assert valued.status_code == 200, valued.text
+    stored = store.get(task_id)
+    assert stored is not None and stored.explicit_null_fields is None
+
+    nulled = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"reasoning_effort": None, "model_override": None},
+        headers=_headers(),
+    )
+    assert nulled.status_code == 200, nulled.text
+    stored = store.get(task_id)
+    assert stored is not None
+    assert stored.explicit_null_fields == ["model_override", "reasoning_effort"]
+
+    # A PATCH that does not touch the overrides leaves the list unchanged.
+    renamed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
+    )
+    assert renamed.status_code == 200, renamed.text
+    stored = store.get(task_id)
+    assert stored is not None
+    assert stored.explicit_null_fields == ["model_override", "reasoning_effort"]

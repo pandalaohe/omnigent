@@ -25,14 +25,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.library_agent_launch import (
     is_library_agent_id,
     library_agent_lead_harness,
     load_library_agent_bundle,
 )
-from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
@@ -46,6 +46,7 @@ from omnigent.server.routes._session_create_validation import (
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -69,6 +70,13 @@ class CreateScheduledTaskRequest(BaseModel):
     rrule: str
     agent_id: str
     timezone: str = "UTC"
+    # The task's project, whose per-host calling defaults apply at fire time.
+    # Omitted + a ``source_session_id`` (the runner tool path) inherits the
+    # calling session's project; an explicit null means no project.
+    project_id: str | None = None
+    # The session the create came from. Only used to inherit ``project_id``
+    # when the caller omitted it; direct REST callers leave it unset.
+    source_session_id: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
     # Harness permission mode (Claude Code or SDK), e.g. "acceptEdits" or
@@ -113,6 +121,9 @@ class UpdateScheduledTaskRequest(BaseModel):
     # handler, which clears any the caller does not resend.
     agent_id: str | None = Field(default=None, min_length=1)
     timezone: str | None = None
+    # An explicit null clears the task's project (master-table defaults apply
+    # at fire time); an unset field leaves it unchanged.
+    project_id: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None
@@ -171,6 +182,7 @@ def _to_response(
         # attribute are now ``user_id``.
         "owner_user_id": task.user_id,
         "agent_id": task.agent_id,
+        "project_id": task.project_id,
         "timezone": task.timezone,
         "created_at": task.created_at,
         "model_override": task.model_override,
@@ -236,6 +248,7 @@ def create_scheduled_tasks_router(
     auth_provider: AuthProvider | None = None,
     custom_agents_store: CustomAgentsStore | None = None,
     artifact_store: Any | None = None,
+    project_store: ProjectStore | None = None,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -249,6 +262,9 @@ def create_scheduled_tasks_router(
         task target; when ``None`` a ``ca_`` id is an unknown agent, as before.
     :param artifact_store: Store holding saved-Agent bundle bytes, used to
         validate a ``ca_`` target's lead harness and ``os_env.cwd`` boundary.
+    :param project_store: Project store for resolving (and owner-checking) a
+        task's ``project_id``; ``None`` makes every project reference a 404
+        and skips session project inheritance.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -419,6 +435,45 @@ def create_scheduled_tasks_router(
             )
         return canonical_workspace, validated_model, validated_effort
 
+    async def _resolve_create_project(
+        *,
+        owner: str,
+        fields_set: set[str],
+        project_id: str | None,
+        source_session_id: str | None,
+    ) -> str | None:
+        """Resolve a create's project, owner-checking every lookup.
+
+        An explicit non-null ``project_id`` must be the caller's project —
+        unknown and foreign share one 404. An omitted field with a
+        ``source_session_id`` inherits the calling session's project (D29),
+        best-effort: an unknown / foreign session, a session with no project,
+        or a project gone or no longer the caller's leaves the task
+        projectless instead of failing the create, because the session is only
+        a prefill hint (the runner tool path) and the task works without it.
+        """
+        user_id = None if owner == RESERVED_USER_LOCAL else owner
+        if "project_id" in fields_set and project_id is not None:
+            if project_store is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+            if project is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            return project.id
+        if "project_id" in fields_set or source_session_id is None or project_store is None:
+            return None
+        try:
+            await require_access(
+                owner, source_session_id, LEVEL_READ, permission_store, conversation_store
+            )
+        except OmnigentError:
+            return None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, source_session_id)
+        if conv is None or conv.project_id is None:
+            return None
+        project = await asyncio.to_thread(project_store.get, conv.project_id, user_id=user_id)
+        return project.id if project is not None else None
+
     def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
         return task.user_id == owner and (
             current_account_user() is None
@@ -445,6 +500,12 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
+        project_id = await _resolve_create_project(
+            owner=owner,
+            fields_set=set(body.model_fields_set),
+            project_id=body.project_id,
+            source_session_id=body.source_session_id,
+        )
         permission_mode = validate_session_permission_mode(body.permission_mode)
         workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
@@ -457,6 +518,13 @@ def create_scheduled_tasks_router(
             permission_mode=permission_mode,
             execution_target=body.execution_target,
         )
+        # An explicitly-sent null override is persisted so a later fire does
+        # not refill it from the project / master chain.
+        explicit_null_fields = sorted(
+            name
+            for name in ("model_override", "reasoning_effort")
+            if name in body.model_fields_set and getattr(body, name) is None
+        )
         task = store.create(
             scheduled_task_id=uuid.uuid4().hex,
             name=body.name,
@@ -465,6 +533,8 @@ def create_scheduled_tasks_router(
             user_id=None if owner == RESERVED_USER_LOCAL else owner,
             agent_id=body.agent_id,
             timezone=body.timezone,
+            project_id=project_id,
+            explicit_null_fields=explicit_null_fields or None,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
             permission_mode=permission_mode,
@@ -631,7 +701,26 @@ def create_scheduled_tasks_router(
             _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
+        # A non-null project must be the caller's; an explicit null clears the
+        # task's project. Unknown and foreign share one 404.
+        if "project_id" in body.model_fields_set and body.project_id is not None:
+            if project_store is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            project = await asyncio.to_thread(project_store.get, body.project_id, user_id=owner_id)
+            if project is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         fields = body.model_dump(exclude_unset=True)
+        # A field set to a value stops being an explicit null; one set to null
+        # becomes one. Fields the caller did not send keep their state.
+        explicit_nulls = set(existing.explicit_null_fields or ())
+        for field_name in ("model_override", "reasoning_effort"):
+            if field_name not in body.model_fields_set:
+                continue
+            if getattr(body, field_name) is None:
+                explicit_nulls.add(field_name)
+            else:
+                explicit_nulls.discard(field_name)
+        fields["explicit_null_fields"] = sorted(explicit_nulls) or None
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
         if agent_changed:

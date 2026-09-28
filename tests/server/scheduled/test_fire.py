@@ -227,6 +227,9 @@ class _FakeHost:
     sandbox_provider: str | None = None
     # A dormant managed host still has its provider, even without a sandbox id.
     sandbox_id: str | None = None
+    # Read by the calling-defaults readiness check (unknown → passes).
+    name: str | None = None
+    configured_harnesses: dict[str, object] | None = None
 
 
 class _FakeSandboxConfig:
@@ -303,6 +306,64 @@ class FakePolicyStore:
         return None
 
 
+@dataclass
+class _FakeProject:
+    id: str
+    name: str
+    user_id: str | None = None
+    config: dict[str, Any] = field(default_factory=dict)
+
+
+class FakeProjectStore:
+    """Owner-scoped project lookup: a foreign or unknown id reads as missing."""
+
+    def __init__(self, projects: dict[str, _FakeProject] | None = None) -> None:
+        self.projects = projects or {}
+
+    def get(self, project_id: str, *, user_id: str | None) -> _FakeProject | None:
+        project = self.projects.get(project_id)
+        if project is None or project.user_id != user_id:
+            return None
+        return project
+
+
+class FakePreferencesStore:
+    """Serves the ``calling_defaults`` master table out of one envelope."""
+
+    def __init__(self, master: dict[str, Any] | None = None) -> None:
+        self.master = master or {}
+
+    def get(self, user_id: str) -> dict[str, Any]:
+        return {"settings": {"calling_defaults": self.master}}
+
+
+class FakeCatalogStore:
+    """Serves cached ``(host, harness)`` catalog rows from a fixed list."""
+
+    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+        self.rows = rows or []
+
+    def list(self, host_ids: list[str]) -> list[dict[str, Any]]:
+        return [row for row in self.rows if row["host_id"] in host_ids]
+
+
+def _catalog_row(
+    harness: str,
+    models: list[dict[str, Any]],
+    *,
+    host_id: str = "host_1",
+    error: str | None = None,
+    fetched_at: int | None = 1_700_000_000,
+) -> dict[str, Any]:
+    return {
+        "host_id": host_id,
+        "harness": harness,
+        "models": models,
+        "error": error,
+        "fetched_at": fetched_at,
+    }
+
+
 def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
     return FireDeps(
         scheduled_task_store=sched_store,
@@ -319,6 +380,9 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         artifact_store=overrides.get("artifact_store"),
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
+        project_store=overrides.get("project_store"),
+        preferences_store=overrides.get("preferences_store"),
+        catalog_store=overrides.get("catalog_store"),
     )
 
 
@@ -709,6 +773,232 @@ async def test_no_reasoning_effort_when_spec_has_none() -> None:
     await _drain()
 
     assert not any("reasoning_effort" in u for u in conv_store.updated)
+
+
+# ── calling-defaults chain at fire (K7f) ─────────────────────────────────────
+
+
+def _chain_deps(
+    store: FakeScheduledTaskStore,
+    conv_store: FakeConversationStore,
+    *,
+    harness: str = "claude-native",
+    spec_effort: str | None = None,
+    project_store: FakeProjectStore | None = None,
+    preferences_store: FakePreferencesStore | None = None,
+    catalog_store: FakeCatalogStore | None = None,
+) -> FireDeps:
+    """Deps whose agent ``ag_1`` resolves to *harness* plus the chain stores."""
+    return _deps(
+        store,
+        permission_store=FakePermissionStore(),
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness=harness, reasoning_effort=spec_effort),
+        project_store=project_store,
+        preferences_store=preferences_store,
+        catalog_store=catalog_store,
+    )
+
+
+def _project(config: dict[str, Any], *, user_id: str = "alice@example.com") -> FakeProjectStore:
+    return FakeProjectStore(
+        {"proj_1": _FakeProject(id="proj_1", name="P", user_id=user_id, config=config)}
+    )
+
+
+@pytest.mark.asyncio
+async def test_fire_uses_the_tasks_project_defaults() -> None:
+    """Scenario 23: an unset model / effort resolves from the task's project."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(user_id="alice@example.com", project_id="proj_1")}
+    )
+    deps = _chain_deps(
+        store,
+        conv_store,
+        project_store=_project(
+            {
+                "calling_defaults": {
+                    "host_1": {
+                        "harnesses": {"claude-native": {"model": "gpt-6-sol", "effort": "high"}}
+                    }
+                }
+            }
+        ),
+        preferences_store=FakePreferencesStore(
+            {"host_1": {"claude-native": {"model": "master-model", "effort": "low"}}}
+        ),
+        catalog_store=FakeCatalogStore(
+            [
+                _catalog_row(
+                    "claude-native",
+                    [{"id": "gpt-6-sol", "supportedReasoningEfforts": ["low", "high"]}],
+                )
+            ]
+        ),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.updated[0]["model_override"] == "gpt-6-sol"
+    assert conv_store.updated[0]["reasoning_effort"] == "high"
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_projectless_fire_uses_the_master_native_layer() -> None:
+    """Scenario 24: no project still resolves from the master table."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
+    deps = _chain_deps(
+        store,
+        conv_store,
+        harness="codex",
+        preferences_store=FakePreferencesStore(
+            {"host_1": {"codex-native": {"model": "gpt-6-astra"}}}
+        ),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.updated[0]["model_override"] == "gpt-6-astra"
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_explicit_null_effort_skips_the_project_default() -> None:
+    """Scenario 25: a stored explicit null beats the project, then spec applies."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                user_id="alice@example.com",
+                project_id="proj_1",
+                explicit_null_fields=["reasoning_effort"],
+            )
+        }
+    )
+    deps = _chain_deps(
+        store,
+        conv_store,
+        spec_effort="medium",
+        project_store=_project(
+            {
+                "calling_defaults": {
+                    "host_1": {
+                        "harnesses": {"claude-native": {"model": "gpt-6-sol", "effort": "high"}}
+                    }
+                }
+            }
+        ),
+        catalog_store=FakeCatalogStore(
+            [
+                _catalog_row(
+                    "claude-native",
+                    [{"id": "gpt-6-sol", "supportedReasoningEfforts": ["medium", "high"]}],
+                )
+            ]
+        ),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # The project model still applies (per-field independence); the effort
+    # keeps the explicit null and falls through to the spec value.
+    assert conv_store.updated[0]["model_override"] == "gpt-6-sol"
+    assert conv_store.updated[0]["reasoning_effort"] == "medium"
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_deleted_project_falls_back_to_master_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Scenario 30: a gone project uses master layers; the fire still succeeds."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="omnigent.server.scheduled.fire")
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(user_id="alice@example.com", project_id="proj_gone")}
+    )
+    deps = _chain_deps(
+        store,
+        conv_store,
+        project_store=FakeProjectStore(),
+        preferences_store=FakePreferencesStore(
+            {"host_1": {"claude-native": {"model": "gpt-6-astra"}}}
+        ),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.updated[0]["model_override"] == "gpt-6-astra"
+    assert store.runs[0]["status"] == "running"
+    assert any("using master layers" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_fire_refuses_a_default_model_the_catalog_does_not_offer() -> None:
+    """A K5 offered miss fails the fire run with the shared refusal text."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(user_id="alice@example.com", project_id="proj_1")}
+    )
+    deps = _chain_deps(
+        store,
+        conv_store,
+        project_store=_project(
+            {
+                "calling_defaults": {
+                    "host_1": {"harnesses": {"claude-native": {"model": "gpt-6-sol"}}}
+                }
+            }
+        ),
+        catalog_store=FakeCatalogStore(
+            [
+                _catalog_row(
+                    "claude-native",
+                    [{"id": "gpt-6-luna", "supportedReasoningEfforts": ["low"]}],
+                )
+            ]
+        ),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "invalid_input"
+    assert "is not offered by host" in store.runs[0]["error"]
+    assert "Change the setting or pass model" in store.runs[0]["error"]
 
 
 @pytest.mark.asyncio

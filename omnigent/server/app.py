@@ -1924,6 +1924,12 @@ def create_app(
                 # just below at mount time; this closure sees that value when
                 # the lifespan runs.
                 custom_agents_store=custom_agents_store,
+                # Calling-defaults chain at fire time: the task's project
+                # (owner-checked per fire), the owner's master table, and the
+                # cached host catalogs for the offered check.
+                project_store=project_store,
+                preferences_store=user_preferences_store,
+                catalog_store=host_model_catalog_cache_store,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -3733,6 +3739,7 @@ def create_app(
                 auth_provider=auth_provider,
                 custom_agents_store=custom_agents_store,
                 artifact_store=artifact_store,
+                project_store=project_store,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],

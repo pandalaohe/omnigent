@@ -41,6 +41,13 @@ class ScheduledTask:
     :param timezone: IANA timezone the trigger is evaluated in,
         e.g. ``"America/Los_Angeles"``.
     :param created_at: Unix epoch seconds at row creation.
+    :param project_id: The first-class project the task was created in, whose
+        per-host calling defaults apply at fire time, or ``None`` when the
+        task has no project (master table only).
+    :param explicit_null_fields: Request field names the creator sent as
+        explicit nulls — e.g. ``["reasoning_effort"]``. A listed field counts
+        as explicitly unset at fire time, so the calling-defaults chain does
+        not refill it. ``None`` when the creator omitted every field.
     :param model_override: Per-task LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
@@ -82,6 +89,8 @@ class ScheduledTask:
     timezone: str
     created_at: int
     workspace_id: int = 0
+    project_id: str | None = None
+    explicit_null_fields: list[str] | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None
