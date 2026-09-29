@@ -1725,6 +1725,7 @@ async def _send_to_in_flight_child(
     created_by: str | None = None,
     remote: bool = False,
     host_id: str | None = None,
+    placement_label: str | None = None,
 ) -> str:
     """Steer a message into a sub-agent whose turn is already in flight.
 
@@ -1779,6 +1780,8 @@ async def _send_to_in_flight_child(
         then reaches this runner only through the server).
     :param host_id: Host running the child when ``remote``, e.g.
         ``"host_a1b2c3"``.
+    :param placement_label: Where the child runs, e.g.
+        ``"fn · ~/projects/app"``; recorded on a freshly registered entry.
     :returns: A JSON handle on success; a descriptive error string otherwise.
     """
     from omnigent.runner import app as _runner_app
@@ -1837,6 +1840,7 @@ async def _send_to_in_flight_child(
                 work_id=work_id,
                 remote=remote,
                 host_id=host_id,
+                placement_label=placement_label,
             )
             fresh.status = "running"
             # Best-effort dispatch-id stamp for restart recovery only; the
@@ -1921,6 +1925,186 @@ async def _session_snapshot(
     except ValueError:
         return None
     return _string_object_dict(payload)
+
+
+# Metadata-only session read: transcript, liveness, and subtree usage excluded.
+_SESSION_METADATA_PARAMS: dict[str, str] = {
+    "include_items": "false",
+    "include_liveness": "false",
+    "include_usage": "false",
+}
+
+# Host-name lookups are stable for a runner process; cache the successes so a
+# wake/recovery path never re-reads the same host.
+_HOST_NAME_CACHE: dict[str, str] = {}
+
+# How long a remote create waits for the child's runner to come online when
+# the first message POST is refused, and how often it rechecks. Tests patch
+# these to stay fast.
+_REMOTE_CHILD_READY_TIMEOUT_S = 120.0
+_REMOTE_CHILD_READY_POLL_S = 3.0
+
+
+async def _fetch_session_metadata(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> _JsonObject | None:
+    """Read one session's metadata-only snapshot, or ``None`` when unreadable."""
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{session_id}",
+            params=_SESSION_METADATA_PARAMS,
+            timeout=10.0,
+        )
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    return _string_object_dict(payload)
+
+
+async def _effective_host_id(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    snapshot: _JsonObject | None = None,
+) -> str | None:
+    """Return the first non-null host id at or above *session_id*.
+
+    A child row usually carries no host binding of its own; it runs on the
+    runner its nearest host-bound ancestor is pinned to. The walk reads
+    metadata-only snapshots and stops at the root or on a cycle.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param session_id: Session to resolve, e.g. ``"conv_child123"``.
+    :param snapshot: The session's already-read snapshot, or ``None`` to
+        fetch it.
+    :returns: The effective host id, or ``None`` when no host is bound.
+    """
+    seen = {session_id}
+    current = snapshot
+    if current is None:
+        current = await _session_snapshot(server_client, session_id)
+    while current is not None:
+        host_id = _optional_string(current.get("host_id"))
+        if host_id:
+            return host_id
+        parent_id = _optional_string(current.get("parent_session_id"))
+        if not parent_id or parent_id in seen:
+            return None
+        seen.add(parent_id)
+        current = await _fetch_session_metadata(server_client, parent_id)
+    return None
+
+
+async def _host_name_for(
+    server_client: httpx.AsyncClient,
+    host_id: str,
+) -> str | None:
+    """Resolve a host's display name, cached per host id.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param host_id: Host id, e.g. ``"host_a1b2c3"``.
+    :returns: The host name, or ``None`` when the lookup fails. Failures are
+        not cached, so a later call can recover.
+    """
+    cached = _HOST_NAME_CACHE.get(host_id)
+    if cached is not None:
+        return cached
+    try:
+        resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    payload = _string_object_dict(resp.json())
+    name = payload.get("name") if payload is not None else None
+    if isinstance(name, str) and name:
+        _HOST_NAME_CACHE[host_id] = name
+        return name
+    return None
+
+
+async def _resolve_host(
+    server_client: httpx.AsyncClient,
+    host: str,
+) -> tuple[tuple[str, str] | None, str | None]:
+    """Resolve a host id or exact name to ``(host_id, host_name)``.
+
+    Names are matched case-insensitively against the caller's registered
+    hosts; a miss reports the known names so the model can correct itself.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param host: Caller-supplied host id or name.
+    :returns: ``((host_id, name), None)`` on success, or ``(None, reason)``.
+    """
+    try:
+        resp = await server_client.get("/v1/hosts", timeout=30.0)
+    except httpx.HTTPError as exc:
+        return None, f"host lookup failed: {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        return None, f"host lookup returned {resp.status_code}"
+    payload = _string_object_dict(resp.json())
+    rows = payload.get("hosts") if payload is not None else None
+    if not isinstance(rows, list):
+        return None, "host lookup returned no hosts"
+    hosts = [row for raw in rows if (row := _string_object_dict(raw)) is not None]
+    names = sorted(name for row in hosts if isinstance(name := row.get("name"), str) and name)
+    for row in hosts:
+        if row.get("host_id") == host:
+            name = row.get("name")
+            return (host, name if isinstance(name, str) and name else host), None
+    lowered = host.casefold()
+    for row in hosts:
+        name = row.get("name")
+        host_id = row.get("host_id")
+        if isinstance(name, str) and name.casefold() == lowered and isinstance(host_id, str):
+            return (host_id, name), None
+    known = ", ".join(names) if names else "(none)"
+    return None, f"no registered host matches {host!r}; known hosts: {known}"
+
+
+def _short_cwd(cwd: str) -> str:
+    """Collapse a path for a placement label.
+
+    The path under the home directory reads ``~/…``; anything else keeps its
+    last two components.
+
+    :param cwd: Absolute directory path, e.g. ``"/home/alice/projects/app"``.
+    :returns: The shortened form, e.g. ``"~/projects/app"`` or ``"b/c"``.
+    """
+    normalized = cwd.rstrip("/")
+    home = str(Path.home()).rstrip("/")
+    if home and (normalized == home or normalized.startswith(home + "/")):
+        relative = normalized[len(home) :].lstrip("/")
+        return "~" if not relative else f"~/{relative}"
+    parts = [part for part in normalized.split("/") if part]
+    return "/".join(parts[-2:]) if parts else cwd
+
+
+def _placement_label(host_name: str | None, cwd: str | None) -> str | None:
+    """Build ``"<host> · <cwd short>"``, omitting unknown pieces."""
+    parts = []
+    if host_name:
+        parts.append(host_name)
+    if cwd:
+        parts.append(_short_cwd(cwd))
+    return " · ".join(parts) if parts else None
+
+
+async def _placement_label_for(
+    server_client: httpx.AsyncClient,
+    *,
+    host_id: str | None,
+    workspace: str | None,
+) -> str | None:
+    """Resolve a child's placement label from its host id and cwd."""
+    host_name = await _host_name_for(server_client, host_id) if host_id else None
+    return _placement_label(host_name, workspace)
 
 
 async def _fetch_dispatch_calling(
@@ -2969,6 +3153,51 @@ async def _child_on_another_host(
     return lead_host != child_host
 
 
+async def _host_readiness(
+    host_id: str,
+    *,
+    server_client: httpx.AsyncClient,
+    harness: str | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Read a target host's current readiness and display name.
+
+    The snapshot's ``unavailable`` reason covers create-time facts; this reads
+    the host's current status through the server so a host that went offline
+    (or lost the harness) is refused at dispatch. A readiness map that says
+    nothing about the member harness does not block, mirroring the snapshot
+    writer's rule.
+
+    :param host_id: The target host id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param harness: A harness to check for readiness, or ``None`` to skip it.
+    :returns: ``(reason, name)`` — a human reason when the host cannot run
+        work, else ``None``; ``name`` is the host's display name when known.
+    """
+    try:
+        resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
+    except httpx.HTTPError as exc:
+        return f"host lookup failed: {type(exc).__name__}: {exc}", None
+    if resp.status_code == 404:
+        return "the host is not registered", None
+    if resp.status_code in (401, 403):
+        return "the host is not accessible to this session's owner", None
+    if resp.status_code != 200:
+        return f"host lookup returned {resp.status_code}", None
+    body = resp.json()
+    raw_name = body.get("name")
+    name = raw_name if isinstance(raw_name, str) and raw_name else None
+    if body.get("status") != "online":
+        return "the host is offline", name
+    readiness = body.get("configured_harnesses")
+    if harness and isinstance(readiness, dict):
+        reported = readiness.get(harness)
+        if reported is not None and reported is not True:
+            reason = reported if isinstance(reported, str) and reported else "not configured"
+            return f"harness {harness!r} is not ready there ({reason})", name
+    return None, name
+
+
 async def _member_host_dispatch_error(
     role: str,
     host_id: str,
@@ -2979,12 +3208,6 @@ async def _member_host_dispatch_error(
     """
     Re-check the member's target host at dispatch time.
 
-    The snapshot's ``unavailable`` reason covers create-time facts; this reads
-    the host's current status through the server so a host that went offline
-    (or lost the harness) is refused at dispatch. A readiness map that says
-    nothing about the member harness does not block, mirroring the snapshot
-    writer's rule.
-
     :param role: The named sub-agent role, e.g. ``"researcher"``.
     :param host_id: The member's target host id.
     :param harness: The member's frozen harness, or ``None`` to skip the
@@ -2993,34 +3216,10 @@ async def _member_host_dispatch_error(
     :returns: An error string naming role, host, and reason, or ``None`` when
         the host is online and the harness is reported ready.
     """
-    try:
-        resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
-    except httpx.HTTPError as exc:
-        return _member_dispatch_unavailable_error(
-            role, host_id, f"host lookup failed: {type(exc).__name__}: {exc}"
-        )
-    if resp.status_code == 404:
-        return _member_dispatch_unavailable_error(role, host_id, "the host is not registered")
-    if resp.status_code in (401, 403):
-        return _member_dispatch_unavailable_error(
-            role, host_id, "the host is not accessible to this session's owner"
-        )
-    if resp.status_code != 200:
-        return _member_dispatch_unavailable_error(
-            role, host_id, f"host lookup returned {resp.status_code}"
-        )
-    body = resp.json()
-    if body.get("status") != "online":
-        return _member_dispatch_unavailable_error(role, host_id, "the host is offline")
-    readiness = body.get("configured_harnesses")
-    if harness and isinstance(readiness, dict):
-        reported = readiness.get(harness)
-        if reported is not None and reported is not True:
-            reason = reported if isinstance(reported, str) and reported else "not configured"
-            return _member_dispatch_unavailable_error(
-                role, host_id, f"harness {harness!r} is not ready there ({reason})"
-            )
-    return None
+    reason, _name = await _host_readiness(host_id, server_client=server_client, harness=harness)
+    if reason is None:
+        return None
+    return _member_dispatch_unavailable_error(role, host_id, reason)
 
 
 async def _member_workspace_on_host(
@@ -3298,6 +3497,8 @@ async def _execute_subagent_tool(
         conversation_id=conversation_id,
     )
     remote_child = remote_host is not None
+    remote_workspace: str | None = None
+    member_host_name: str | None = None
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -3376,6 +3577,9 @@ async def _execute_subagent_tool(
                 created_by=dispatch_created_by,
                 remote=remote_child,
                 host_id=remote_host,
+                placement_label=_placement_label(
+                    member_host_name, _optional_string(existing.get("workspace"))
+                ),
             )
     else:
         _auto_ordinal = False
@@ -3407,19 +3611,20 @@ async def _execute_subagent_tool(
             session_name = f"{sub_agent_name}-{ordinal}"
             _auto_ordinal = True
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
-        remote_workspace: str | None = None
+        remote_workspace = None
         if remote_host is not None:
             member_harness = _member_harness_name(
                 member_entry.get("harness") if member_entry is not None else None
             )
-            host_error = await _member_host_dispatch_error(
-                str(sub_agent_name),
+            host_reason, member_host_name = await _host_readiness(
                 remote_host,
-                member_harness or child_harness,
                 server_client=server_client,
+                harness=member_harness or child_harness,
             )
-            if host_error is not None:
-                return host_error
+            if host_reason is not None:
+                return _member_dispatch_unavailable_error(
+                    str(sub_agent_name), remote_host, host_reason
+                )
             remote_workspace, workspace_error = await _member_workspace_on_host(
                 server_client, conversation_id, remote_host
             )
@@ -3846,6 +4051,7 @@ async def _execute_subagent_tool(
         work_id=work_id,
         remote=remote_child,
         host_id=remote_host,
+        placement_label=_placement_label(member_host_name, remote_workspace),
     )
     if remote_child_bound:
         # A new remote child's ``running`` edge is emitted on its own host's
@@ -4356,6 +4562,11 @@ async def _send_to_existing_session(
         server_client=server_client,
         conversation_id=conversation_id,
     )
+    child_placement = await _placement_label_for(
+        server_client,
+        host_id=child_host,
+        workspace=_optional_string(snap_data.get("workspace")),
+    )
     existing_work = _runner_app.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status == "launching":
         # No active turn to inject into yet; a send now could race a parallel
@@ -4387,6 +4598,7 @@ async def _send_to_existing_session(
             created_by=created_by,
             remote=remote_child,
             host_id=child_host if remote_child else None,
+            placement_label=child_placement,
         )
     work_id = _runner_app.new_subagent_work_id()
     stamp_error = await _patch_subagent_label(
@@ -4411,6 +4623,7 @@ async def _send_to_existing_session(
         work_id=work_id,
         remote=remote_child,
         host_id=child_host if remote_child else None,
+        placement_label=child_placement,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -4457,23 +4670,290 @@ async def _send_to_existing_session(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _CreatePlacement:
+    """Resolved placement for one ``sys_session_create`` (D14).
+
+    :param host_id: Host the child is placed on when a placement field is in
+        play, or ``None`` for today's inherit.
+    :param host_name: Display name of that host when known, e.g. ``"fn"``.
+    :param workspace: Absolute workspace to send, or ``None``.
+    :param git: Wire ``git`` options (``branch_name`` / ``base_branch``).
+    :param project_id: Explicit project, or ``None`` for the parent's.
+    :param caller_host_id: The caller's effective host; decides same-host
+        placement (no placement fields needed) and the remote start mark.
+    """
+
+    host_id: str | None = None
+    host_name: str | None = None
+    workspace: str | None = None
+    git: _JsonObject | None = None
+    project_id: str | None = None
+    caller_host_id: str | None = None
+
+
+def _worktree_options(worktree: object) -> tuple[_JsonObject | None, str | None]:
+    """Validate a ``worktree`` argument into ``SessionGitOptions`` wire fields.
+
+    :param worktree: The raw argument, e.g.
+        ``{"branch": "fix-auth", "base": "main"}``.
+    :returns: ``(git_body, error)``; ``git_body`` is ``None`` when absent.
+    """
+    if worktree is None:
+        return None, None
+    if not isinstance(worktree, dict):
+        return None, "'worktree' must be an object with a non-empty 'branch'"
+    extra = sorted(set(worktree) - {"branch", "base"})
+    if extra:
+        return None, f"unexpected 'worktree' field: {extra[0]}"
+    branch = worktree.get("branch")
+    if not isinstance(branch, str) or not branch.strip():
+        return None, "'worktree.branch' must be a non-empty string"
+    git: _JsonObject = {"branch_name": branch.strip()}
+    base = worktree.get("base")
+    if base is not None:
+        if not isinstance(base, str) or not base.strip():
+            return None, "'worktree.base' must be a non-empty string"
+        git["base_branch"] = base.strip()
+    return git, None
+
+
+async def _caller_cwd(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    caller_snapshot: _JsonObject | None,
+    runner_workspace: Path | None,
+) -> str | None:
+    """Return the caller's working directory: its workspace, else the runner's."""
+    snapshot = caller_snapshot
+    if snapshot is None:
+        snapshot = await _fetch_session_metadata(server_client, conversation_id)
+    workspace = _optional_string(snapshot.get("workspace")) if snapshot is not None else None
+    if workspace:
+        return workspace
+    if runner_workspace is not None:
+        return str(runner_workspace)
+    return None
+
+
+async def _resolve_create_placement(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    caller_snapshot: _JsonObject | None,
+    runner_workspace: Path | None,
+) -> tuple[_CreatePlacement | None, str | None]:
+    """Resolve ``sys_session_create`` placement per the combination rules.
+
+    ``nothing`` and ``host`` equal to the caller's effective host inherit
+    today's behaviour (no placement fields sent). A workspace or worktree
+    with no explicit host is placed on the caller's effective host; a
+    different host requires a workspace or worktree and is pre-checked for
+    host readiness.
+
+    :param args: Parsed tool arguments.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session id.
+    :param caller_snapshot: The caller's already-read snapshot, or ``None``.
+    :param runner_workspace: The runner workspace, the cwd fallback.
+    :returns: ``(placement, None)`` on success, ``(None, error)`` on refusal.
+    """
+    for name in ("host", "workspace", "project_id"):
+        value = args.get(name)
+        if value is not None and (not isinstance(value, str) or not value):
+            return None, json.dumps(
+                {
+                    "error": "invalid_placement",
+                    "message": f"'{name}' must be a non-empty string",
+                }
+            )
+    raw_host = args.get("host")
+    raw_workspace = args.get("workspace")
+    raw_project = args.get("project_id")
+    host_arg = raw_host if isinstance(raw_host, str) else None
+    workspace_arg = raw_workspace if isinstance(raw_workspace, str) else None
+    project_id = raw_project if isinstance(raw_project, str) else None
+    git, worktree_error = _worktree_options(args.get("worktree"))
+    if worktree_error is not None:
+        return None, json.dumps({"error": "invalid_placement", "message": worktree_error})
+
+    caller_host = await _effective_host_id(
+        server_client, conversation_id, snapshot=caller_snapshot
+    )
+    placement = _CreatePlacement(project_id=project_id, caller_host_id=caller_host)
+    target_host_id = caller_host
+    target_host_name: str | None = None
+    if host_arg is not None:
+        resolved, host_error = await _resolve_host(server_client, host_arg)
+        if resolved is None:
+            return None, json.dumps(
+                {"error": "host_not_found", "host": host_arg, "message": host_error}
+            )
+        target_host_id, target_host_name = resolved
+
+    same_host = host_arg is None or target_host_id == caller_host
+    workspace_out = workspace_arg
+    if workspace_out is None and git is not None:
+        # A worktree is cut from the caller's working directory (the repo).
+        workspace_out = await _caller_cwd(
+            server_client, conversation_id, caller_snapshot, runner_workspace
+        )
+    if host_arg is not None and not same_host and workspace_out is None:
+        return None, json.dumps(
+            {
+                "error": "workspace_required_on_other_host",
+                "host": target_host_id,
+                "message": (
+                    "placing a child on another host requires 'workspace' (or "
+                    "'worktree') so the child has a directory there"
+                ),
+            }
+        )
+    if not same_host:
+        # The named-send path's target-host pre-check: registered, online,
+        # harness ready. The child's harness is resolved server-side, so the
+        # harness check is skipped here; the same read names the host.
+        # Not same_host implies an explicit host resolved above.
+        assert target_host_id is not None
+        host_reason, readiness_name = await _host_readiness(
+            target_host_id, server_client=server_client
+        )
+        if host_reason is not None:
+            return None, _member_dispatch_unavailable_error(
+                str(args.get("title") or "child session"), target_host_id, host_reason
+            )
+        if target_host_name is None:
+            target_host_name = readiness_name
+    if same_host and workspace_out is None and git is None:
+        # Explicit host equal to the caller's own, nothing else to place:
+        # exactly today's inherit — no placement fields sent.
+        return placement, None
+    if workspace_out is None and git is None:
+        return placement, None
+    return dataclasses.replace(
+        placement,
+        host_id=target_host_id,
+        host_name=target_host_name,
+        workspace=workspace_out,
+        git=git,
+    ), None
+
+
+def _message_post_accepted(resp: httpx.Response) -> bool:
+    """Whether a child message POST actually reached a runner.
+
+    The server answers a native-terminal child whose runner is offline with
+    202 ``{"queued": true, "forwarded": false}``: the message is history only
+    and no turn runs, so it counts as refused.
+    """
+    if resp.status_code >= 400:
+        return False
+    try:
+        payload = resp.json()
+    except ValueError:
+        return True
+    return not (isinstance(payload, dict) and payload.get("forwarded") is False)
+
+
+def _message_post_needs_runner_wait(resp: httpx.Response) -> bool:
+    """Whether a refused message POST may succeed once the runner connects."""
+    if resp.status_code == 503:
+        return True
+    if resp.status_code >= 400:
+        return False
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("forwarded") is False
+
+
+async def _wait_for_runner_online(
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    *,
+    timeout_s: float | None = None,
+) -> bool:
+    """Poll a child's snapshot until its runner is online or the budget ends.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: The cross-host child session id.
+    :param timeout_s: Budget override; defaults to 120 s.
+    :returns: ``True`` when the child's ``runner_online`` became true.
+    """
+    timeout = _REMOTE_CHILD_READY_TIMEOUT_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + timeout
+    while True:
+        snapshot = await _fetch_session_metadata(server_client, child_session_id)
+        if snapshot is not None and snapshot.get("runner_online") is True:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(_REMOTE_CHILD_READY_POLL_S)
+
+
+async def _post_created_child_message(
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    message: str,
+    *,
+    remote: bool,
+) -> str | None:
+    """Post a newly created child's first message, waiting out a remote launch.
+
+    The create itself never carries the message: on another host the server
+    stores ``initial_items`` as history only, so the first turn runs only
+    when the message reaches the child's own runner. When the POST is
+    refused because that runner is not online yet, poll for up to 120 s and
+    post once more.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: The new child session id.
+    :param message: The first user message text.
+    :param remote: Whether the child runs on another host.
+    :returns: ``None`` on success; a short error description otherwise.
+    """
+    content: list[_JsonObject] = [{"type": "input_text", "text": message}]
+    try:
+        resp = await _post_child_message_event(
+            server_client, child_session_id, content=content, created_by=None
+        )
+    except httpx.HTTPError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    if _message_post_accepted(resp):
+        return None
+    if remote and _message_post_needs_runner_wait(resp):
+        if await _wait_for_runner_online(server_client, child_session_id):
+            try:
+                resp = await _post_child_message_event(
+                    server_client, child_session_id, content=content, created_by=None
+                )
+            except httpx.HTTPError as exc:
+                return f"{type(exc).__name__}: {exc}"
+            if _message_post_accepted(resp):
+                return None
+    return f"{resp.status_code} {resp.text[:200]}"
+
+
 def _build_session_create_body(
     agent_id: str | None,
     conversation_id: str,
     title: object,
-    message: object,
     model: object = None,
     reasoning_effort: object = None,
+    placement: _CreatePlacement | None = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``,
-    ``model``, and ``reasoning_effort`` are included when provided; the
-    message becomes the child's first queued user turn via
-    ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``model``, and
+    ``reasoning_effort`` are included when provided. The first user message
+    is deliberately not part of the create: it is posted as a separate event
+    after the work entry is registered, so a fast first turn cannot outrun
+    its tracking.
 
     ``agent_id`` is included only when the caller named one: an omitted
     key (not an explicit ``null``) lets the server take the parent
@@ -4490,12 +4970,11 @@ def _build_session_create_body(
     :param conversation_id: The caller's session id — the forced parent.
     :param title: Optional session label; included only when a non-empty
         string.
-    :param message: Optional first user message; included only when a
-        non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
+    :param placement: Resolved placement; omitted fields are not sent.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -4509,42 +4988,55 @@ def _build_session_create_body(
         body["model_override"] = model
     if isinstance(reasoning_effort, str) and reasoning_effort:
         body["reasoning_effort"] = reasoning_effort
-    if isinstance(message, str) and message:
-        body["initial_items"] = [
-            {
-                "type": "message",
-                "data": {"role": "user", "content": [{"type": "input_text", "text": message}]},
-            }
-        ]
+    if placement is not None:
+        if placement.host_id is not None:
+            body["host_id"] = placement.host_id
+        if placement.workspace is not None:
+            body["workspace"] = placement.workspace
+        if placement.project_id is not None:
+            body["project_id"] = placement.project_id
+        if placement.git is not None:
+            body["git"] = placement.git
     return body
 
 
-def _finalize_created_session(
+async def _finalize_created_session(
     data: _JsonObject,
     *,
+    server_client: httpx.AsyncClient,
     conversation_id: str,
     agent_id: str | None,
     title: object,
     publish_event: Callable[[str, _JsonObject], None] | None,
+    message: object = None,
+    placement: _CreatePlacement | None = None,
+    inherited_host_id: str | None = None,
 ) -> str:
     """
-    Register fan-out, emit ``session.created``, and build the handle.
+    Register the created child, post its first message, and build the handle.
 
-    Records the child→parent mapping so the child's status/preview
-    deltas fan out onto the caller's stream, publishes a transient
-    ``session.created`` event (durability comes from the server's
-    conversation row), and returns the handle the orchestrator uses to
-    drive / monitor the child.
+    Every create that carries a message runs create → register → post: the
+    work entry exists before the child can run, so a fast first turn cannot
+    race its tracking. A remote child is marked started only after the POST
+    is accepted; a failed POST marks the entry failed and returns
+    ``child_not_ready``. The handle reports where the child runs (D24):
+    ``host_id`` / ``host_name`` / ``workspace`` / ``worktree`` /
+    ``git_branch`` / ``harness``.
 
     :param data: The :class:`SessionResponse` JSON from the create call.
+    :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller (parent) session id.
     :param agent_id: The launched agent id, e.g. ``"ag_abc123"``, or the
         server-resolved default.
     :param title: The caller-supplied title (or non-str when absent).
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
-    :returns: JSON handle ``{conversation_id, kind, agent_id,
-        agent_name, title, status}``.
+    :param message: Optional first user message to post.
+    :param placement: Resolved placement, or ``None`` for the config-path
+        create (which keeps the parent's runner).
+    :param inherited_host_id: Effective host inherited from the caller,
+        used when the child row carries no host of its own.
+    :returns: JSON handle, or a ``child_not_ready`` error.
     """
     from omnigent.runner import app as _runner_app
     from omnigent.server.schemas import SessionCreatedEvent
@@ -4562,6 +5054,60 @@ def _finalize_created_session(
         tool=agent_label,
         session_name=label,
     )
+
+    meta = await _fetch_session_metadata(server_client, child_id)
+    meta_host = _optional_string(meta.get("host_id")) if meta is not None else None
+    workspace = _optional_string(meta.get("workspace")) if meta is not None else None
+    if workspace is None and placement is not None:
+        workspace = placement.workspace
+    host_id = (
+        meta_host or (placement.host_id if placement is not None else None) or inherited_host_id
+    )
+    host_name = placement.host_name if placement is not None else None
+    if host_name is None and host_id is not None:
+        host_name = await _host_name_for(server_client, host_id)
+    placement_label = _placement_label(host_name, workspace)
+    remote = (
+        placement is not None
+        and placement.host_id is not None
+        and placement.host_id != placement.caller_host_id
+    )
+
+    if isinstance(message, str) and message:
+        _runner_app.register_subagent_work(
+            parent_session_id=conversation_id,
+            child_session_id=child_id,
+            agent=agent_label,
+            title=label,
+            work_id=_runner_app.new_subagent_work_id(),
+            remote=remote,
+            host_id=host_id if remote else None,
+            placement_label=placement_label,
+        )
+        post_error = await _post_created_child_message(
+            server_client, child_id, message, remote=remote
+        )
+        if post_error is not None:
+            _runner_app.mark_subagent_work_terminal(
+                child_id,
+                status="failed",
+                output=(
+                    f"Error: child session {child_id} was created but its first "
+                    f"message could not be delivered: {post_error}"
+                ),
+            )
+            return json.dumps(
+                {
+                    "error": "child_not_ready",
+                    "conversation_id": child_id,
+                    "message": post_error,
+                }
+            )
+        if remote:
+            # The first turn's running edge stays on the child's host; the
+            # accepted POST is the start proof this runner has.
+            _runner_app.mark_subagent_work_started(child_id)
+
     evt = SessionCreatedEvent(
         type="session.created",
         conversation_id=conversation_id,
@@ -4580,6 +5126,12 @@ def _finalize_created_session(
             "title": title if isinstance(title, str) else None,
             "status": data.get("status") or "created",
             "project_id": data.get("project_id"),
+            "host_id": host_id,
+            "host_name": host_name,
+            "workspace": workspace,
+            "worktree": _optional_string(meta.get("worktree")) if meta is not None else None,
+            "git_branch": _optional_string(meta.get("git_branch")) if meta is not None else None,
+            "harness": _optional_string(meta.get("harness")) if meta is not None else None,
         }
     )
 
@@ -4677,22 +5229,27 @@ _PLACEMENT_ARG_KEYS = ("host", "workspace", "project_id", "worktree")
 async def _child_session_create_refusal(
     server_client: httpx.AsyncClient,
     conversation_id: str,
+    *,
+    snapshot: _JsonObject | None = None,
 ) -> str | None:
     """Return the tool error when the calling session is itself a child (D2).
 
     Long-lived children are the mother session's job: a child that needs
     workers uses its harness's own sub-agents, or asks its mother with
     ``sys_session_send``. The check reads the caller's snapshot (one
-    metadata-only GET) and runs before any create POST; nested named sends
-    create through the server route directly, so they are unaffected.
+    metadata-only GET when not already at hand) and runs before any create
+    POST; nested named sends create through the server route directly, so
+    they are unaffected.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The calling session id.
+    :param snapshot: The caller's already-read snapshot, or ``None``.
     :returns: The refusal JSON, or ``None`` when the caller is top-level or
         its snapshot is unreadable (fail open, matching the create path's
         existing tolerance of a transient lookup hiccup).
     """
-    snapshot = await _session_snapshot(server_client, conversation_id)
+    if snapshot is None:
+        snapshot = await _session_snapshot(server_client, conversation_id)
     if snapshot is None or not _optional_string(snapshot.get("parent_session_id")):
         return None
     return json.dumps(
@@ -4782,9 +5339,7 @@ async def _execute_session_create(
         # only the config bundle and keeps the parent's runner, and its
         # metadata schema forbids placement extras, so a placement argument
         # would be silently dropped. Refuse instead.
-        placement_given = sorted(
-            key for key in _PLACEMENT_ARG_KEYS if args.get(key) is not None
-        )
+        placement_given = sorted(key for key in _PLACEMENT_ARG_KEYS if args.get(key) is not None)
         if placement_given:
             return json.dumps(
                 {
@@ -4818,16 +5373,29 @@ async def _execute_session_create(
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
         )
-    refusal = await _child_session_create_refusal(server_client, conversation_id)
+    caller_snapshot = await _session_snapshot(server_client, conversation_id)
+    refusal = await _child_session_create_refusal(
+        server_client, conversation_id, snapshot=caller_snapshot
+    )
     if refusal is not None:
         return refusal
+    placement, placement_error = await _resolve_create_placement(
+        args,
+        server_client=server_client,
+        conversation_id=conversation_id,
+        caller_snapshot=caller_snapshot,
+        runner_workspace=runner_workspace,
+    )
+    if placement is None:
+        assert placement_error is not None
+        return placement_error
     body = _build_session_create_body(
         str(agent_id) if has_agent_id else None,
         conversation_id,
         args.get("title"),
-        args.get("message"),
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
+        placement=placement,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -4846,13 +5414,17 @@ async def _execute_session_create(
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
         return json.dumps({"error": "server did not return a child session id"})
-    return _finalize_created_session(
+    return await _finalize_created_session(
         data,
+        server_client=server_client,
         conversation_id=conversation_id,
         # Neither-mode creates get the agent the server resolved.
         agent_id=str(agent_id) if has_agent_id else data.get("agent_id"),
         title=args.get("title"),
+        message=args.get("message"),
         publish_event=publish_event,
+        placement=placement,
+        inherited_host_id=placement.caller_host_id,
     )
 
 
@@ -4895,58 +5467,6 @@ def _bundle_local_agent_source(source: Path) -> bytes:
                         arcname=str(file_path.relative_to(bundle_dir)),
                     )
         return buf.getvalue()
-
-
-async def _post_child_first_message(
-    child_session_id: str,
-    message: str,
-    server_client: httpx.AsyncClient,
-) -> str | None:
-    """
-    Queue a bundle-created child's first user message.
-
-    Posted as a separate event so the server's post_event forwards it
-    to the runner and starts the child turn (same pattern as
-    named-mode ``sys_session_send``).
-
-    :param child_session_id: The new child session id,
-        e.g. ``"conv_abc123"``.
-    :param message: The first user message text.
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: ``None`` on success; a JSON error string (carrying the
-        created ``conversation_id`` so the orchestrator can retry via
-        ``sys_session_send``) on failure.
-    """
-    try:
-        msg_resp = await server_client.post(
-            f"/v1/sessions/{child_session_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": message}],
-                },
-            },
-            timeout=30.0,
-        )
-    except httpx.HTTPError as exc:
-        return json.dumps(
-            {
-                "error": f"child session created but message failed: {exc}",
-                "conversation_id": child_session_id,
-            }
-        )
-    if msg_resp.status_code >= 400:
-        return json.dumps(
-            {
-                "error": (
-                    "child session created but message failed: "
-                    f"{msg_resp.status_code} {msg_resp.text[:200]}"
-                ),
-                "conversation_id": child_session_id,
-            }
-        )
-    return None
 
 
 async def _upload_config_bundle(
@@ -5038,9 +5558,9 @@ async def _session_create_from_config_path(
 
     Delegates the resolve/bundle/upload pipeline to
     :func:`_upload_config_bundle`, validates the server's
-    ``CreatedSessionResponse``, queues the optional first ``message``
-    via :func:`_post_child_first_message`, and returns the
-    orchestrator handle.
+    ``CreatedSessionResponse``, and hands the optional first ``message``
+    to :func:`_finalize_created_session` (which registers the work entry
+    before posting it), returning the orchestrator handle.
 
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
@@ -5079,13 +5599,7 @@ async def _session_create_from_config_path(
             }
         )
 
-    message = args.get("message")
-    if isinstance(message, str) and message:
-        message_error = await _post_child_first_message(child_session_id, message, server_client)
-        if message_error is not None:
-            return message_error
-
-    return _finalize_created_session(
+    return await _finalize_created_session(
         # Adapt the multipart CreatedSessionResponse shape to the
         # session-snapshot keys _finalize_created_session reads.
         {
@@ -5094,10 +5608,13 @@ async def _session_create_from_config_path(
             "status": "created",
             "project_id": data.get("project_id"),
         },
+        server_client=server_client,
         conversation_id=conversation_id,
         agent_id=created_agent_id,
         title=args.get("title"),
+        message=args.get("message"),
         publish_event=publish_event,
+        inherited_host_id=await _effective_host_id(server_client, conversation_id),
     )
 
 
@@ -9647,6 +10164,9 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         agent = payload.get("agent") or payload.get("tool_name", "sub_agent")
         title = payload.get("title", "")
         target = f"{agent}:{title}" if title else str(agent)
+        placement_label = payload.get("placement_label")
+        if isinstance(placement_label, str) and placement_label:
+            target = f"{target} [{placement_label}]"
         if status == "completed":
             if not has_output:
                 return (

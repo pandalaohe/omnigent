@@ -1236,6 +1236,10 @@ class _SessionSnapshot:
     :param wrapper_label: The child's ``omnigent.wrapper`` label, e.g.
         ``"claude-code-native-ui-subagent"``. ``None`` when the server
         recorded no label or the fetch failed.
+    :param host_id: The session's own host binding, e.g. ``"host_a1b2c3"``.
+        ``None`` for a hostless row (a co-located child on its parent's
+        runner); the REST loader fills it, the init envelope does not carry
+        it.
     """
 
     ok: bool
@@ -1248,6 +1252,7 @@ class _SessionSnapshot:
     agent_name: str | None = None
     wrapper_label: str | None = None
     worktree: str | None = None
+    host_id: str | None = None
 
 
 async def _read_file_in_root(root: str, relative_path: str) -> str:
@@ -1794,6 +1799,8 @@ class _SubagentWorkEntry:
         child's own runner and never reach this one.
     :param host_id: Host running the child when ``remote``, e.g.
         ``"host_a1b2c3"``; ``None`` for a same-host child.
+    :param placement_label: Where the child runs, as ``"<host> · <cwd>"``,
+        e.g. ``"fn · ~/projects/app"``; ``None`` when unknown.
     :param started_monotonic: Runner-local monotonic instant this dispatch
         was registered, used by the remote-member liveness interval.
     :param last_remote_check_monotonic: Runner-local monotonic instant of the
@@ -1814,6 +1821,7 @@ class _SubagentWorkEntry:
     delivered: bool = False
     remote: bool = False
     host_id: str | None = None
+    placement_label: str | None = None
     started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
     last_remote_check_monotonic: float | None = None
 
@@ -2094,6 +2102,7 @@ def register_subagent_work(
     work_id: str | None = None,
     remote: bool = False,
     host_id: str | None = None,
+    placement_label: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -2117,6 +2126,8 @@ def register_subagent_work(
         :attr:`_SubagentWorkEntry.remote`.
     :param host_id: Host running the child when ``remote``, e.g.
         ``"host_a1b2c3"``; see :attr:`_SubagentWorkEntry.host_id`.
+    :param placement_label: Where the child runs, as ``"<host> · <cwd>"``;
+        see :attr:`_SubagentWorkEntry.placement_label`.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -2137,6 +2148,7 @@ def register_subagent_work(
         created_by=created_by,
         remote=remote,
         host_id=host_id,
+        placement_label=placement_label,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
@@ -2601,6 +2613,7 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
             "title": entry.title,
             "status": entry.status,
             "output": output,
+            "placement_label": entry.placement_label,
         }
     )
     entry.delivered = True
@@ -2999,7 +3012,14 @@ def _subagent_delivery_not_confirmed_response(
     )
 
 
-def _format_subagent_wake_notice(*, agent: str, title: str, status: str, pending: int) -> str:
+def _format_subagent_wake_notice(
+    *,
+    agent: str,
+    title: str,
+    status: str,
+    pending: int,
+    placement_label: str | None = None,
+) -> str:
     """
     Build the framework notice that wakes a parent after a child finishes.
 
@@ -3008,13 +3028,18 @@ def _format_subagent_wake_notice(*, agent: str, title: str, status: str, pending
     :param status: Terminal child status, e.g. ``"completed"``, ``"failed"``,
         or ``"cancelled"``.
     :param pending: Number of undrained items in the parent inbox, e.g. ``3``.
+    :param placement_label: Where the child ran, e.g. ``"fn · ~/projects/app"``;
+        appended in brackets after the identity when known.
     :returns: A ``[System: ...]`` notice string, e.g. ``"[System: sub-agent
         researcher/auth finished (completed) — 1 result waiting in inbox. Call
         sys_read_inbox to collect.]"``.
     """
     noun = "result" if pending == 1 else "results"
+    identity = f"{agent}/{title}"
+    if placement_label:
+        identity = f"{identity} [{placement_label}]"
     return (
-        f"[System: sub-agent {agent}/{title} finished ({status}) — "
+        f"[System: sub-agent {identity} finished ({status}) — "
         f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
     )
 
@@ -4307,6 +4332,7 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             wrapper_label: str | None = None
+            host_id: str | None = None
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -4333,6 +4359,9 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    raw_host_id = body.get("host_id")
+                    if isinstance(raw_host_id, str) and raw_host_id:
+                        host_id = raw_host_id
                     raw_labels = body.get("labels")
                     if isinstance(raw_labels, dict):
                         raw_wrapper = raw_labels.get(WRAPPER_LABEL_KEY)
@@ -4351,6 +4380,7 @@ def create_runner_app(
                 agent_name=agent_name,
                 wrapper_label=wrapper_label,
                 worktree=worktree,
+                host_id=host_id,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -6462,11 +6492,17 @@ def create_runner_app(
         if not parent_id or parent_id == conv_id:
             return None
         agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
+        from omnigent.runner.tool_dispatch import _placement_label_for
+
         return register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            host_id=snapshot.host_id,
+            placement_label=await _placement_label_for(
+                server_client, host_id=snapshot.host_id, workspace=snapshot.workspace
+            ),
         )
 
     async def _is_mirrored_claude_agent_tool_child(conv_id: str) -> bool:
@@ -9386,6 +9422,7 @@ def create_runner_app(
             title=entry.title,
             status=entry.status,
             pending=inbox.qsize(),
+            placement_label=entry.placement_label,
         )
         if is_rewake and notice == _last_rewake_notice.get(entry.parent_session_id):
             return
