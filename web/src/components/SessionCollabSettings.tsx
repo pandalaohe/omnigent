@@ -3,13 +3,18 @@ import { useEffect, useState, type ReactNode } from "react";
 import { HelpTip } from "@/components/HelpTip";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
+import { useHosts, type Host } from "@/hooks/useHosts";
 import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences";
+import { HOST_COLORS, hostDisplayName, type HostColorPreferences } from "@/lib/hostColors";
+import { patchHostColor } from "@/lib/hostColorPreferences";
 import { Link } from "@/lib/routing";
 import {
   SESSION_COLLAB_BOUNDS,
   writeSessionCollabPreferences,
   type SessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
+import { cn } from "@/lib/utils";
 
 const HINTS = {
   enabled:
@@ -89,8 +94,56 @@ function SettingRow({
   );
 }
 
+/**
+ * One host's colour picker: eight palette swatches and a reset back to the
+ * automatic hash colour. Rows with no pick read "Automatic".
+ */
+function HostColorRow({ host, preferences }: { host: Host; preferences: HostColorPreferences }) {
+  const selected = preferences[host.host_id] ?? null;
+  const name = hostDisplayName(host.host_id, host);
+  return (
+    <div
+      className="flex items-center justify-between gap-4"
+      data-testid="host-color-row"
+      data-host-id={host.host_id}
+    >
+      <span className="min-w-0 truncate text-sm text-foreground">{name}</span>
+      <div className="flex shrink-0 items-center gap-1.5">
+        {HOST_COLORS.map((entry) => (
+          <button
+            key={entry.key}
+            type="button"
+            aria-label={`${name} colour: ${entry.key}`}
+            aria-pressed={selected === entry.key}
+            title={entry.key}
+            onClick={() => patchHostColor(host.host_id, entry.key)}
+            className={cn(
+              "size-4 rounded-[4px] border border-black/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+              selected === entry.key && "ring-2 ring-ring ring-offset-1 ring-offset-card",
+            )}
+            style={{ backgroundColor: entry.hex }}
+          />
+        ))}
+        {selected === null ? (
+          <span className="ml-1 w-16 text-right text-xs text-muted-foreground">Automatic</span>
+        ) : (
+          <button
+            type="button"
+            onClick={() => patchHostColor(host.host_id, null)}
+            className="ml-1 text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+          >
+            Reset to automatic
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function SessionCollabSettings() {
   const preferences = useSessionCollabPreferences();
+  const { data: hosts } = useHosts();
+  const hostColorPreferences = useHostColorPreferences();
   const update = (patch: Partial<SessionCollabPreferences>) =>
     writeSessionCollabPreferences({ ...preferences, ...patch });
   const disabled = !preferences.enabled;
@@ -232,6 +285,26 @@ export function SessionCollabSettings() {
             className="shrink-0"
           />
         </SettingRow>
+      </div>
+
+      <h2 className="mt-3 text-ui font-medium">Host colours</h2>
+      <div
+        className="rounded-xl border border-border bg-card p-4"
+        data-testid="host-colors-settings"
+      >
+        <p className="mb-3 text-sm text-muted-foreground">
+          The badge beside a sub-agent in the Agents rail takes its colour from the host that runs
+          it. Hosts without a pick get a stable automatic colour derived from their name.
+        </p>
+        {hosts && hosts.length > 0 ? (
+          <div className="flex flex-col gap-3">
+            {hosts.map((host) => (
+              <HostColorRow key={host.host_id} host={host} preferences={hostColorPreferences} />
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">No hosts are connected yet.</p>
+        )}
       </div>
 
       <p className="text-sm text-muted-foreground">

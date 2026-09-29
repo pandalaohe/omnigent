@@ -1,4 +1,4 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, type QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { setSessionParent } from "@/lib/sessionHost";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -65,6 +65,40 @@ export interface ChildSessionInfo {
    * not routed (routing off, or a server that predates the field).
    */
   routed_model?: string | null;
+  /**
+   * Effective host: the child's own ``host_id``, else the nearest
+   * host-bound ancestor's. ``null`` when no ancestor is host-bound.
+   */
+  host_id?: string | null;
+  /** Effective cwd: own ``worktree ?? workspace``, else the nearest ancestor's. */
+  cwd?: string | null;
+  /**
+   * Branch taken from the same row the effective cwd came from. ``null``
+   * when that row recorded none — never mixed with another row's branch.
+   */
+  git_branch?: string | null;
+  /** Resolved harness, e.g. ``"codex-native"``. Drives the badge vendor. */
+  harness?: string | null;
+  /** Bound agent row id. For native children this is the parent's row. */
+  agent_id?: string | null;
+  /** Bound agent row name; ``null`` when the row is missing. */
+  agent_name?: string | null;
+  /**
+   * Bundled member identity when the child is a member of a saved bundle
+   * (the bound agent row then belongs to the parent bundle).
+   */
+  sub_agent_name?: string | null;
+  /** Whether the child is archived (belongs to the rail's past zone). */
+  archived?: boolean;
+  /** Epoch seconds the child entered the archive; ``null`` when active. */
+  archived_at?: number | null;
+  /** Epoch seconds the child was created (rail ordering). */
+  created_at?: number | null;
+  /**
+   * Keep-warm state fed by a later change; ``"warm"``/``"cold"`` render the
+   * row pill, ``null``/absent renders nothing.
+   */
+  warm_state?: "warm" | "cold" | null;
 }
 
 /**
@@ -87,11 +121,62 @@ interface ChildSessionWire {
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
+  host_id?: string | null;
+  cwd?: string | null;
+  git_branch?: string | null;
+  harness?: string | null;
+  agent_id?: string | null;
+  agent_name?: string | null;
+  sub_agent_name?: string | null;
+  archived?: boolean;
+  archived_at?: number | null;
+  created_at?: number | null;
+  warm_state?: string | null;
 }
 
 interface ChildSessionsResponse {
   object: "list";
   data: ChildSessionWire[];
+  has_more?: boolean;
+  last_id?: string | null;
+}
+
+interface ChildSessionsPage {
+  data: ChildSessionInfo[];
+  has_more: boolean;
+  last_id: string | null;
+}
+
+function mapChildSession(row: ChildSessionWire): ChildSessionInfo {
+  return {
+    id: row.id,
+    title: row.title,
+    task_summary: row.task_summary ?? null,
+    tool: row.tool,
+    session_name: row.session_name,
+    labels: row.labels ?? {},
+    current_task_status: row.current_task_status,
+    last_task_error: parseChildSessionError(row.last_task_error),
+    busy: row.busy,
+    activity_unverified: row.activity_unverified ?? false,
+    ...(row.native_activity_unverified !== undefined
+      ? { native_activity_unverified: row.native_activity_unverified === true }
+      : {}),
+    last_message_preview: row.last_message_preview ?? null,
+    pending_elicitations_count: row.pending_elicitations_count ?? 0,
+    routed_model: row.routed_model ?? null,
+    host_id: row.host_id ?? null,
+    cwd: row.cwd ?? null,
+    git_branch: row.git_branch ?? null,
+    harness: row.harness ?? null,
+    agent_id: row.agent_id ?? null,
+    agent_name: row.agent_name ?? null,
+    sub_agent_name: row.sub_agent_name ?? null,
+    archived: row.archived ?? false,
+    archived_at: row.archived_at ?? null,
+    created_at: row.created_at ?? null,
+    warm_state: row.warm_state === "warm" || row.warm_state === "cold" ? row.warm_state : null,
+  };
 }
 
 /**
@@ -176,14 +261,19 @@ interface UseChildSessionsResult {
 }
 
 /**
- * Fetch child sessions for a parent session.
+ * Fetch one page of a parent's child sessions.
  *
- * Exported for unit testing of the HTTP-shape contract; production
- * code should call ``useChildSessions``.
+ * ``after`` is the cursor (child id) to resume from; the page reports
+ * ``has_more``/``last_id`` so the caller can continue.
  */
-export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
+async function fetchChildSessionPage(
+  sessionId: string,
+  params: { zone: "active" | "past"; limit: number; after?: string | null },
+): Promise<ChildSessionsPage> {
+  const query = new URLSearchParams({ zone: params.zone, limit: String(params.limit) });
+  if (params.after) query.set("after", params.after);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
+    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions?${query.toString()}`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
@@ -191,24 +281,38 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   // session-scoped requests key by this session's host before their own
   // snapshot loads.
   for (const row of json.data) setSessionParent(row.id, sessionId);
-  return json.data.map((row) => ({
-    id: row.id,
-    title: row.title,
-    task_summary: row.task_summary ?? null,
-    tool: row.tool,
-    session_name: row.session_name,
-    labels: row.labels ?? {},
-    current_task_status: row.current_task_status,
-    last_task_error: parseChildSessionError(row.last_task_error),
-    busy: row.busy,
-    activity_unverified: row.activity_unverified ?? false,
-    ...(row.native_activity_unverified !== undefined
-      ? { native_activity_unverified: row.native_activity_unverified === true }
-      : {}),
-    last_message_preview: row.last_message_preview ?? null,
-    pending_elicitations_count: row.pending_elicitations_count ?? 0,
-    routed_model: row.routed_model ?? null,
-  }));
+  const hasMore = json.has_more === true;
+  const lastId = json.last_id ?? null;
+  // A page that claims more without advancing would silently truncate the
+  // list, so surface it as the rail's error state instead.
+  if (hasMore && (!lastId || lastId === params.after)) {
+    throw new Error("Malformed child-session pagination: has_more without a new cursor");
+  }
+  return { data: json.data.map(mapChildSession), has_more: hasMore, last_id: lastId };
+}
+
+/**
+ * Fetch a parent's active (non-archived) child sessions — every page.
+ *
+ * The rail groups the whole active set by host/cwd, so a partial first
+ * page is not enough: follow ``after`` while the server reports more,
+ * with no cap (the expected scale is tens, and D13 is a load limit, not a
+ * page size). Malformed pagination throws.
+ *
+ * Exported for unit testing of the HTTP-shape contract; production
+ * code should call ``useChildSessions``.
+ */
+export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
+  const all: ChildSessionInfo[] = [];
+  let after: string | null = null;
+  for (;;) {
+    // Each page's cursor comes from the previous response — inherently serial.
+    // oxlint-disable-next-line no-await-in-loop
+    const page = await fetchChildSessionPage(sessionId, { zone: "active", limit: 100, after });
+    all.push(...page.data);
+    if (!page.has_more || page.last_id === null) return all;
+    after = page.last_id;
+  }
 }
 
 /**
@@ -248,5 +352,61 @@ export function useChildSessions(
     children: data ?? [],
     isLoading,
     error: (error as Error | null) ?? null,
+  };
+}
+
+/** Page size for the past zone's manual "Load more" paging. */
+export const PAST_CHILD_SESSIONS_PAGE_SIZE = 20;
+
+interface UsePastChildSessionsResult {
+  children: ChildSessionInfo[];
+  isLoading: boolean;
+  error: Error | null;
+  hasNextPage: boolean;
+  isFetchingNextPage: boolean;
+  fetchNextPage: () => void;
+}
+
+/**
+ * Archived children of a parent, newest-archived first, paged 20 at a time.
+ *
+ * The query lives under the active child key as ``[…, "past"]``, so every
+ * existing invalidation of ``childSessionsQueryKey`` (spawn, archive move,
+ * watch frame) also refreshes this list. ``enabled`` keeps the fetch off
+ * until the past zone is expanded.
+ */
+export function usePastChildSessions(
+  conversationId: string | null,
+  enabled: boolean,
+): UsePastChildSessionsResult {
+  const sessionId = isTempConvId(conversationId) ? null : conversationId;
+  const query = useInfiniteQuery({
+    queryKey:
+      sessionId === null
+        ? ["conversation", null, "child_sessions", "past"]
+        : [...childSessionsQueryKey(sessionId), "past"],
+    queryFn: ({ pageParam }) =>
+      fetchChildSessionPage(sessionId as string, {
+        zone: "past",
+        limit: PAST_CHILD_SESSIONS_PAGE_SIZE,
+        after: pageParam,
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) =>
+      lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
+    enabled: sessionId !== null && enabled,
+    staleTime: 60_000,
+    retry: false,
+    refetchOnMount: false,
+  });
+  return {
+    children: query.data?.pages.flatMap((page) => page.data) ?? [],
+    isLoading: query.isLoading,
+    error: (query.error as Error | null) ?? null,
+    hasNextPage: query.hasNextPage,
+    isFetchingNextPage: query.isFetchingNextPage,
+    fetchNextPage: () => {
+      void query.fetchNextPage();
+    },
   };
 }

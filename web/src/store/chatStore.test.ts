@@ -9077,31 +9077,22 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       ...overrides,
     });
 
-    it("upserts a new child into the cached list", () => {
+    it("does not insert an unknown child from a delta, and refetches the list", () => {
+      // Membership is the server's call: a partial patch would materialize a
+      // row missing every field it did not carry, and a status edge for an
+      // archived child would resurrect it.
       client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      const spy = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({
         type: "session_child_session_updated",
         conversationId: "conv_parent",
         childSessionId: "conv_child1",
         child: child(),
       });
-      const cached = client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"));
-      expect(cached).toEqual([
-        {
-          id: "conv_child1",
-          title: "researcher:auth",
-          task_summary: null,
-          tool: "researcher",
-          session_name: "auth",
-          labels: {},
-          current_task_status: "in_progress",
-          last_task_error: null,
-          busy: true,
-          last_message_preview: "looking…",
-          // Insert path defaults the count to 0 when the delta omits it.
-          pending_elicitations_count: 0,
-        },
-      ]);
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
     });
 
     it("merges an existing child in place on a status change", () => {
@@ -9296,19 +9287,16 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(row?.last_task_error).toBeNull();
     });
 
-    it("initializes a cold child-sessions cache from a full delta", () => {
-      // Snapshot-on-connect / spawn deltas carry full rows, so a cold
-      // cache is seeded (lets child status update without a mounted hook).
+    it("invalidates instead of seeding a cold child-sessions cache from a delta", () => {
+      const spy = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({
         type: "session_child_session_updated",
         conversationId: "conv_parent",
         childSessionId: "conv_child1",
         child: child(),
       });
-      const cached = client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"));
-      expect(cached).toHaveLength(1);
-      expect(cached?.[0].id).toBe("conv_child1");
-      expect(cached?.[0].busy).toBe(true);
+      expect(client.getQueryData(childSessionsQueryKey("conv_parent"))).toBeUndefined();
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
     });
 
     it("refetches the parent's child list when a child goes idle without a preview", () => {
@@ -9326,9 +9314,9 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
     });
 
-    it("does NOT refetch when the idle delta already carries a preview", () => {
-      // In-process harnesses include the preview in the delta — the in-place
-      // patch suffices, so no refetch is triggered.
+    it("refetches for an unknown child even when the idle delta carries a preview", () => {
+      // An in-process harness delta with a preview is still only a delta: an
+      // unknown row must come from the server, not from the patch.
       client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
       const spy = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({
@@ -9337,7 +9325,122 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         childSessionId: "conv_child1",
         child: { id: "conv_child1", busy: false, last_message_preview: "done." },
       });
-      expect(spy).not.toHaveBeenCalled();
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
+    });
+
+    it("merges the new placement and agent fields onto an existing row", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          task_summary: null,
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "in_progress",
+          busy: true,
+          last_message_preview: "digging",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          host_id: "host-1",
+          cwd: "/work/rail",
+          git_branch: "feature/scc18",
+          harness: "codex-native",
+          agent_id: "ag_1",
+          agent_name: "codex",
+          sub_agent_name: "researcher",
+          warm_state: "warm",
+          archived_at: null,
+        },
+      });
+      expect(
+        client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))?.[0],
+      ).toMatchObject({
+        host_id: "host-1",
+        cwd: "/work/rail",
+        git_branch: "feature/scc18",
+        harness: "codex-native",
+        agent_id: "ag_1",
+        agent_name: "codex",
+        sub_agent_name: "researcher",
+        warm_state: "warm",
+        archived_at: null,
+        // Untouched fields survive the partial merge.
+        last_message_preview: "digging",
+      });
+    });
+
+    it("removes an archived child from the active list and invalidates the past zone", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          task_summary: null,
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "completed",
+          busy: false,
+          last_message_preview: "done",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          archived: true,
+          archived_at: 1_700_000_000,
+          busy: false,
+          last_message_preview: "done",
+        },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      expect(spy).toHaveBeenCalledWith({
+        queryKey: [...childSessionsQueryKey("conv_parent"), "past"],
+      });
+    });
+
+    it("does not resurrect an archived child on a later status delta", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: { id: "conv_child1", busy: true, current_task_status: "in_progress" },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
+    });
+
+    it("invalidates the prefix key when an absent row is unarchived", () => {
+      // Prefix matching refreshes both zones, so the past row disappears from
+      // the archive list and reappears in the active list in one refetch.
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: { id: "conv_child1", archived: false },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
     });
   });
 

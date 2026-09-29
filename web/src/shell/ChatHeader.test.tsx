@@ -6,13 +6,25 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
+import { copyText } from "@/lib/clipboard";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
+import type { ChildSessionLike } from "./subagentRailGroups";
 import { ChatHeader } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
+
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: () => ({
+    data: [{ host_id: "h1", name: "TMB", owner: "u", status: "online" }],
+  }),
+}));
+
+vi.mock("@/lib/clipboard", () => ({
+  copyText: vi.fn().mockResolvedValue(undefined),
+}));
 
 const { isIOSShellMock, isAndroidShellMock, isMobileMock } = vi.hoisted(() => ({
   isIOSShellMock: vi.fn(() => false),
@@ -66,6 +78,8 @@ function renderHeader(props: {
   sidebarOpen: boolean;
   isChildSession?: boolean;
   subAgentName?: string | null;
+  childSession?: ChildSessionLike | null;
+  childCwd?: string | null;
   conversationId?: string;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
@@ -96,6 +110,8 @@ function renderHeader(props: {
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
             isChildSession={props.isChildSession ?? false}
             subAgentName={props.subAgentName ?? null}
+            childSession={props.childSession}
+            childCwd={props.childCwd}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
             // right-panel toggle / rail entries all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
@@ -423,6 +439,52 @@ describe("ChatHeader — conversation breadcrumb", () => {
     });
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
     expect(screen.queryByText("general-purpose")).toBeNull();
+  });
+
+  it("shows the child's badge, own name and placement chip when the snapshot is known", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "SCC10",
+      titleLinkTo: "/c/parent-123",
+      childSession: {
+        id: "child-9",
+        title: "researcher:auth",
+        agent_name: "researcher",
+        host_id: "h1",
+        labels: {},
+      },
+      childCwd: "/Users/u/projects/x/y/z",
+    });
+
+    expect(screen.getByTestId("breadcrumb-child-label")).toHaveTextContent("auth");
+    const chip = screen.getByTestId("breadcrumb-child-placement");
+    expect(chip).toHaveTextContent("researcher @ TMB · ~/projects/x/y/z");
+    expect(chip).toHaveAttribute("title", "/Users/u/projects/x/y/z");
+  });
+
+  it("copies the full child cwd when the placement chip is clicked", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "SCC10",
+      titleLinkTo: "/c/parent-123",
+      childSession: {
+        id: "child-9",
+        title: "researcher:auth",
+        agent_name: "researcher",
+        host_id: "h1",
+        labels: {},
+      },
+      childCwd: "/Users/u/projects/x/y/z",
+    });
+
+    vi.mocked(copyText).mockClear();
+    fireEvent.click(screen.getByTestId("breadcrumb-child-placement"));
+
+    expect(copyText).toHaveBeenCalledWith("/Users/u/projects/x/y/z");
   });
 
   it("falls back to a 'Sub-agent' segment before the agent snapshot loads", () => {

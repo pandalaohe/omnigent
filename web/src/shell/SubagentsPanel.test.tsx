@@ -1,23 +1,15 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import {
-  BookOpenIcon,
-  Code2Icon,
-  CompassIcon,
-  FileTextIcon,
-  FlaskConicalIcon,
-  ScanSearchIcon,
-  SearchIcon,
-} from "lucide-react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { OttoIcon } from "@/components/icons/OttoIcon";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
-import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
+import { shortenPath } from "./subagentRailGroups";
+import { SubagentsPanel } from "./SubagentsPanel";
 
-const { stopSessionMutate, stopSessionState } = vi.hoisted(() => {
+const { stopSessionMutate, stopSessionState, hostsState, pastState } = vi.hoisted(() => {
   const mutate = vi.fn();
   return {
     stopSessionMutate: mutate,
@@ -27,14 +19,28 @@ const { stopSessionMutate, stopSessionState } = vi.hoisted(() => {
       isError: false,
       error: null as Error | null,
     },
+    hostsState: { hosts: [] as { host_id: string; name: string }[] },
+    pastState: {
+      children: [] as { id: string }[],
+      isLoading: false,
+      error: null as Error | null,
+      hasNextPage: false,
+      isFetchingNextPage: false,
+      fetchNextPage: vi.fn(),
+    },
   };
 });
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
-  // hook itself is replaced.
+  // hooks themselves are replaced.
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
+  usePastChildSessions: () => pastState,
+}));
+
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: () => ({ data: hostsState.hosts }),
 }));
 
 vi.mock("@/hooks/useSession", () => ({
@@ -84,11 +90,15 @@ function renderPanel({
   rootSessionId = "conv_parent",
   initialEntries,
 }: RenderOptions & { initialEntries?: string[] } = {}) {
-  return render(
+  const buildElement = () => (
     <MemoryRouter initialEntries={initialEntries}>
-      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-    </MemoryRouter>,
+      <TooltipProvider delayDuration={0}>
+        <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+      </TooltipProvider>
+    </MemoryRouter>
   );
+  const result = render(buildElement());
+  return { ...result, rerenderPanel: () => result.rerender(buildElement()) };
 }
 
 /** Build a full ChildSessionInfo, defaulting the fields a given test
@@ -135,24 +145,6 @@ function mockChildTree(tree: Record<string, ChildSessionInfo[]>) {
   }));
 }
 
-/** Agent-type → category-icon expectations. Order-sensitive cases (review
- *  before code, test before code) guard the substring precedence. */
-const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
-  ["Explore", SearchIcon],
-  ["deep-researcher", BookOpenIcon],
-  ["planner", CompassIcon],
-  ["architect", CompassIcon],
-  ["code-reviewer", ScanSearchIcon],
-  ["pr-test-analyzer", FlaskConicalIcon],
-  ["frontend_engineer", Code2Icon],
-  // Both halves of the doc/writ branch, so neither sub-condition can be
-  // dropped without a test failing.
-  ["documentation", FileTextIcon],
-  ["technical-writer", FileTextIcon],
-  ["general-purpose", OttoIcon],
-  [null, OttoIcon],
-];
-
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
@@ -160,6 +152,14 @@ beforeEach(() => {
   stopSessionState.isPending = false;
   stopSessionState.isError = false;
   stopSessionState.error = null;
+  hostsState.hosts = [];
+  pastState.children = [];
+  pastState.isLoading = false;
+  pastState.error = null;
+  pastState.hasNextPage = false;
+  pastState.isFetchingNextPage = false;
+  pastState.fetchNextPage = vi.fn();
+  localStorage.clear();
   // Default: parent's status is idle. Tests override per-case.
   useSessionMock.mockReturnValue({
     session: {
@@ -696,96 +696,112 @@ describe("SubagentsPanel", () => {
     expect(within(row).queryByText("1eca7625-9d2f-4c6b-8a31-7f5e2c0d4b8a")).toBeNull();
   });
 
-  it("uses native logos for Claude Code, Codex, OpenCode, and Kiro child rows", () => {
+  it("shows the native vendor's badge letters for native sub-agent children", () => {
     mockChildTree({
       conv_root: [
-        childInfo({
-          id: "conv_codex",
-          title: "codex:auth-refactor",
-          task_summary: null,
-          tool: "codex",
-          session_name: "auth-refactor",
-          labels: { "omnigent.wrapper": "codex-native-ui" },
-        }),
-        childInfo({
-          id: "conv_opencode",
-          title: "opencode:port-auth-refactor",
-          task_summary: null,
-          tool: "opencode",
-          session_name: "port-auth-refactor",
-          labels: { "omnigent.wrapper": "opencode-native-ui" },
-        }),
+        // Claude Task child: session_name is the opaque correlation id; the
+        // server resolves the Task description into `tool`, which must win as
+        // the row label.
         childInfo({
           id: "conv_claude",
-          title: "claude_code:review-auth-refactor",
+          title: "general-purpose:a09d1dd1d8dbc0151",
           task_summary: null,
-          tool: "claude_code",
-          session_name: "review-auth-refactor",
-          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          tool: "wave-worker-696",
+          session_name: "a09d1dd1d8dbc0151",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
         }),
         childInfo({
-          id: "conv_kiro",
-          title: "kiro:harden-auth",
+          id: "conv_codex",
+          title: "worker:thread-4",
           task_summary: null,
-          tool: "kiro",
-          session_name: "harden-auth",
-          labels: { "omnigent.wrapper": "kiro-native-ui" },
+          tool: "Summarize release notes",
+          session_name: "thread-4",
+          labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
         }),
       ],
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
-
-    const codexRow = childRow(container, "conv_codex");
-    expect(codexRow.querySelector('[data-icon="codex"]')).not.toBeNull();
-    expect(codexRow.querySelector(".lucide-code-2")).toBeNull();
-
-    const opencodeRow = childRow(container, "conv_opencode");
-    expect(opencodeRow.querySelector('[data-icon="opencode"]')).not.toBeNull();
-    expect(opencodeRow.querySelector(".lucide-code-2")).toBeNull();
 
     const claudeRow = childRow(container, "conv_claude");
-    expect(claudeRow.querySelector('[data-icon="claude"]')).not.toBeNull();
-    expect(claudeRow.querySelector(".lucide-code-2")).toBeNull();
-
-    // Kiro renders its own glyph now, not the borrowed Cursor mark (#1137).
-    const kiroRow = childRow(container, "conv_kiro");
-    expect(kiroRow.querySelector('[data-icon="kiro"]')).not.toBeNull();
+    expect(within(claudeRow).getByTestId("rail-agent-badge")).toHaveTextContent("CC");
+    expect(claudeRow).toHaveTextContent("wave-worker-696");
+    expect(
+      within(childRow(container, "conv_codex")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("CX");
   });
 
-  it("gives native sub-agent children role/Otto icons, not the brand logo", () => {
-    // A native session's sub-agents are all the same brand, so the logo
-    // is reserved for full native sessions; sub-agent rows read by role,
-    // with the Otto mascot as the generic fallback.
+  it("resolves the badge vendor from the child's harness or bound agent name", () => {
     mockChildTree({
       conv_root: [
+        childInfo({ id: "conv_harness", tool: "auth-auditor", harness: "codex-native" }),
+        childInfo({ id: "conv_agent", tool: "auth-auditor", agent_name: "claude-native-ui" }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    expect(
+      within(childRow(container, "conv_harness")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("CX");
+    expect(
+      within(childRow(container, "conv_agent")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("CC");
+  });
+
+  it("uses the configured agent badge label, except for bundled members", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_rv: { label: "RV", borderColor: "#123456", textColor: "theme" } },
+      }),
+    );
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "conv_rv", tool: "reviewer", agent_id: "ag_rv" }),
+        // A bundled member's configured row belongs to the bundle, so the
+        // member's own name decides its letters.
         childInfo({
-          id: "conv_generic",
-          title: "claude:tell-a-joke",
-          tool: "claude",
-          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
-        }),
-        childInfo({
-          id: "conv_explore",
-          title: "Explore:find-the-bug",
-          tool: "Explore",
-          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+          id: "conv_member",
+          tool: "reviewer",
+          agent_id: "ag_rv",
+          sub_agent_name: "researcher",
         }),
       ],
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    const genericRow = childRow(container, "conv_generic");
-    expect(genericRow.querySelector('[data-icon="otto"]')).not.toBeNull();
-    expect(genericRow.querySelector('[data-icon="claude"]')).toBeNull();
-
-    const exploreRow = childRow(container, "conv_explore");
-    expect(exploreRow.querySelector(".lucide-search")).not.toBeNull();
-    expect(exploreRow.querySelector('[data-icon="claude"]')).toBeNull();
+    expect(
+      within(childRow(container, "conv_rv")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("RV");
+    expect(
+      within(childRow(container, "conv_member")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("RE");
   });
 
-  it("does not infer native logos from child title or tool names alone", () => {
+  it("uses a user-picked host colour on the badge and an automatic one otherwise", () => {
+    localStorage.setItem("omnigent:host-colors", JSON.stringify({ "host-1": "purple" }));
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "conv_h1", tool: "reviewer", host_id: "host-1" }),
+        childInfo({ id: "conv_h2", tool: "reviewer", host_id: "host-2" }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    expect(within(childRow(container, "conv_h1")).getByTestId("rail-agent-badge")).toHaveStyle({
+      borderColor: "#8250df",
+    });
+    const automatic = within(childRow(container, "conv_h2")).getByTestId("rail-agent-badge");
+    expect(automatic.style.borderColor).not.toBe("");
+    expect(automatic.style.borderColor).not.toBe("rgb(130, 80, 223)");
+  });
+
+  it("does not infer a native vendor from the tool name alone", () => {
     mockChildTree({
       conv_root: [
         childInfo({
@@ -800,49 +816,14 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    const row = childRow(container, "conv_custom");
-    expect(row.querySelector('[data-icon="codex"]')).toBeNull();
-    expect(row.querySelector("svg:not([data-icon]):not(.lucide-corner-down-right)")).not.toBeNull();
+    const badge = within(childRow(container, "conv_custom")).getByTestId("rail-agent-badge");
+    // No wrapper/harness/agent row: the display name is the raw tool, so the
+    // letters are its initials rather than the Codex vendor badge.
+    expect(badge).toHaveTextContent("CO");
+    expect(badge).toHaveAttribute("title", "codex");
   });
 
-  it("uses the pi glyph for pi child rows, matched by exact tool name", () => {
-    mockChildTree({
-      conv_root: [
-        // Scaffold pi worker: no wrapper label by design, so the spawn
-        // title's agent-type head ("pi", surfaced as tool) is the signal.
-        childInfo({
-          id: "conv_pi",
-          title: "pi:review-auth",
-          task_summary: null,
-          tool: "pi",
-          session_name: "review-auth",
-        }),
-        // Near-miss agent name containing "pi" — must stay generic.
-        childInfo({
-          id: "conv_pipeline",
-          title: "pipeline:build",
-          task_summary: null,
-          tool: "pipeline",
-          session_name: "build",
-        }),
-      ],
-    });
-
-    const { container } = renderPanel({ rootSessionId: "conv_root" });
-
-    // The pi glyph proves the row matched the scaffold child by agent name;
-    // a generic bot icon here means the pi branch was dropped or mis-keyed.
-    const piRow = childRow(container, "conv_pi");
-    expect(piRow.querySelector('[data-icon="pi"]')).not.toBeNull();
-
-    // A substring match (e.g. tool.includes("pi")) would wrongly brand this
-    // row; it must fall back to the generic Otto icon.
-    const pipelineRow = childRow(container, "conv_pipeline");
-    expect(pipelineRow.querySelector('[data-icon="pi"]')).toBeNull();
-    expect(pipelineRow.querySelector('[data-icon="otto"]')).not.toBeNull();
-  });
-
-  it("native wrapper labels outrank the pi tool-name match", () => {
+  it("native wrapper labels outrank a tool-name collision", () => {
     mockChildTree({
       conv_root: [
         childInfo({
@@ -851,18 +832,16 @@ describe("SubagentsPanel", () => {
           task_summary: null,
           tool: "pi",
           session_name: "port-fix",
-          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
         }),
       ],
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    // The wrapper label is authoritative identity: a native child keeps its
-    // native glyph even when its tool name collides with "pi".
-    const row = childRow(container, "conv_native_pi");
-    expect(row.querySelector('[data-icon="claude"]')).not.toBeNull();
-    expect(row.querySelector('[data-icon="pi"]')).toBeNull();
+    expect(
+      within(childRow(container, "conv_native_pi")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("CC");
   });
 
   it("fetches child sessions without polling (push-driven via watch-set)", () => {
@@ -1409,7 +1388,7 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "c_done").className.split(/\s+/)).not.toContain("opacity-60");
   });
 
-  it("renders a distinct, role-specific icon per agent type", () => {
+  it("uses the agent name's initials for non-native child rows", () => {
     mockChildTree({
       conv_parent: [
         childInfo({ id: "c_explore", tool: "Explore", busy: true }),
@@ -1419,22 +1398,12 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel();
 
-    // The "all Explore look alike" fix: distinct roles get distinct glyphs,
-    // and the icon is actually wired into the row. (Exact type→icon mapping
-    // is verified by the it.each unit test below.) Comparing class inequality
-    // avoids hardcoding lucide's internal names; if the map regressed to one
-    // icon for all types, the two classes would be equal and this would fail.
-    // Skip the decorative nesting connector (shared by every row) and assert
-    // on the role icon, which is what varies per agent type.
-    const exploreIcon = childRow(container, "c_explore").querySelector(
-      "svg:not(.lucide-corner-down-right)",
+    expect(
+      within(childRow(container, "c_explore")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("EX");
+    expect(within(childRow(container, "c_code")).getByTestId("rail-agent-badge")).toHaveTextContent(
+      "FR",
     );
-    const codeIcon = childRow(container, "c_code").querySelector(
-      "svg:not(.lucide-corner-down-right)",
-    );
-    expect(exploreIcon).not.toBeNull();
-    expect(codeIcon).not.toBeNull();
-    expect(exploreIcon?.getAttribute("class")).not.toEqual(codeIcon?.getAttribute("class"));
   });
 
   it("strips session-scoped search params from rail navigation hrefs", () => {
@@ -1501,12 +1470,6 @@ describe("SubagentsPanel", () => {
 
     const child = screen.getByTestId("subagent-row");
     expect(child.getAttribute("href")).toBe("/c/conv_child_a?debug=1");
-  });
-
-  it.each(ICON_CASES)("maps agent type %s to its category icon", (tool, expected) => {
-    // Substring precedence matters: "code-reviewer" must hit review before
-    // code, "pr-test-analyzer" must hit test — a wrong branch order regresses.
-    expect(iconForAgentType(tool)).toBe(expected);
   });
 
   it("shows instance names for user-added and normal spawned sub-agents", () => {
@@ -1727,5 +1690,279 @@ describe("SubagentsPanel", () => {
 
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
+  });
+
+  it("prefers the child's stored name over the task summary, which becomes the second line", () => {
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "conv_named",
+          title: "researcher:auth",
+          task_summary: "Investigate",
+          tool: "researcher",
+          session_name: "auth",
+        }),
+        // No stored name: the title suffix still wins over the summary.
+        childInfo({
+          id: "conv_suffix",
+          title: "codex:fix-sse",
+          task_summary: "Fix the stream",
+          tool: "codex",
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    const named = childRow(container, "conv_named");
+    expect(within(named).getByText("auth")).toBeInTheDocument();
+    // Line 2 falls back to the task summary when there is no preview.
+    expect(within(named).getByText("Investigate")).toBeInTheDocument();
+    expect(within(childRow(container, "conv_suffix")).getByText("fix-sse")).toBeInTheDocument();
+  });
+
+  it("groups active children by host then cwd, newest first, with counts", () => {
+    hostsState.hosts = [
+      { host_id: "host-1", name: "TMB" },
+      { host_id: "host-2", name: "fn" },
+    ];
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "a",
+          tool: "researcher",
+          host_id: "host-1",
+          cwd: "/p/one",
+          created_at: 10,
+        }),
+        childInfo({
+          id: "b",
+          tool: "researcher",
+          host_id: "host-1",
+          cwd: "/p/two",
+          created_at: 30,
+        }),
+        childInfo({
+          id: "c",
+          tool: "researcher",
+          host_id: "host-2",
+          cwd: "/p/one",
+          created_at: 20,
+        }),
+        childInfo({
+          id: "d",
+          tool: "researcher",
+          host_id: "host-1",
+          cwd: "/p/one",
+          created_at: 40,
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    expect(screen.getByTestId("subagent-active-zone")).toHaveTextContent("Active · 4");
+    // Hosts by newest child: TMB (40) before fn (20), with their counts.
+    expect(screen.getAllByTestId("subagent-host-group").map((node) => node.textContent)).toEqual([
+      "TMB3",
+      "fn1",
+    ]);
+    // Cwds by newest child: TMB's /p/one (40), /p/two (30), then fn's /p/one.
+    const cwdHeaders = screen.getAllByTestId("subagent-cwd-group");
+    expect(cwdHeaders.map((node) => node.textContent)).toEqual(["/p/one", "/p/two", "/p/one"]);
+    // Rows newest-created first inside each cwd group.
+    expect(
+      screen.getAllByTestId("subagent-row").map((row) => row.getAttribute("data-child-session-id")),
+    ).toEqual(["d", "a", "b", "c"]);
+    expect(container.querySelector('[data-testid="subagent-host-dot"]')).not.toBeNull();
+  });
+
+  it("collapses host and cwd groups independently", () => {
+    hostsState.hosts = [{ host_id: "host-1", name: "TMB" }];
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "a",
+          tool: "researcher",
+          host_id: "host-1",
+          cwd: "/p/one",
+          created_at: 10,
+        }),
+        childInfo({
+          id: "b",
+          tool: "researcher",
+          host_id: "host-1",
+          cwd: "/p/two",
+          created_at: 20,
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    // Cwds order newest first: /p/two (b) before /p/one (a).
+    fireEvent.click(screen.getAllByTestId("subagent-cwd-group")[0]);
+    expect(container.querySelector('[data-child-session-id="b"]')).toBeNull();
+    expect(container.querySelector('[data-child-session-id="a"]')).not.toBeNull();
+
+    fireEvent.click(screen.getByTestId("subagent-host-group"));
+    expect(container.querySelector('[data-child-session-id="a"]')).toBeNull();
+    expect(screen.queryByTestId("subagent-cwd-group")).toBeNull();
+
+    // Re-expanding the host restores its cwd groups, with the earlier cwd
+    // collapse still in effect.
+    fireEvent.click(screen.getByTestId("subagent-host-group"));
+    expect(screen.getAllByTestId("subagent-cwd-group")).toHaveLength(2);
+    expect(container.querySelector('[data-child-session-id="b"]')).toBeNull();
+    expect(container.querySelector('[data-child-session-id="a"]')).not.toBeNull();
+  });
+
+  it("renders warm/cold pills and zone counts only when warm_state is present", () => {
+    mockChildTree({
+      conv_parent: [
+        childInfo({ id: "w", tool: "researcher", warm_state: "warm" }),
+        childInfo({ id: "c", tool: "researcher", warm_state: "cold" }),
+        childInfo({ id: "n", tool: "researcher" }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    expect(within(childRow(container, "w")).getByTestId("subagent-warm-state")).toHaveTextContent(
+      "Warm",
+    );
+    expect(within(childRow(container, "c")).getByTestId("subagent-warm-state")).toHaveTextContent(
+      "Cold",
+    );
+    expect(within(childRow(container, "n")).queryByTestId("subagent-warm-state")).toBeNull();
+    expect(screen.getByTestId("subagent-active-zone")).toHaveTextContent("warm 1 · cold 1");
+  });
+
+  it("omits the warm/cold counts when no child reports a warm_state", () => {
+    mockChildTree({ conv_parent: [childInfo({ id: "n", tool: "researcher" })] });
+
+    renderPanel();
+
+    expect(screen.getByTestId("subagent-active-zone")).not.toHaveTextContent("warm");
+  });
+
+  it("shows agent, host, full cwd, branch and task summary in the row tooltip", async () => {
+    hostsState.hosts = [{ host_id: "host-1", name: "TMB" }];
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "conv_tip",
+          title: "researcher:auth",
+          session_name: "auth",
+          tool: "researcher",
+          host_id: "host-1",
+          cwd: "/Users/me/dev/omnigent/fork/rail",
+          git_branch: "feature/scc18",
+          task_summary: "Investigate auth",
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    fireEvent.focus(childRow(container, "conv_tip"));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("researcher · TMB");
+    expect(tooltip).toHaveTextContent("/Users/me/dev/omnigent/fork/rail");
+    expect(tooltip).toHaveTextContent("branch feature/scc18");
+    expect(tooltip).toHaveTextContent("Investigate auth");
+  });
+
+  it("shows a badge on the main row for the root agent", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_root",
+        agentId: "ag_root",
+        agentName: "claude-native-ui",
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    expect(
+      within(screen.getByTestId("subagent-main-row")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("CC");
+  });
+
+  it("keeps the past zone collapsed until expanded, then pages 20 at a time", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    hostsState.hosts = [{ host_id: "host-1", name: "TMB" }];
+    const pastChild = (id: string): ChildSessionInfo =>
+      childInfo({
+        id,
+        title: `researcher:${id}`,
+        session_name: id,
+        tool: "researcher",
+        host_id: "host-1",
+        cwd: "/Users/me/dev/omnigent/fork/rail",
+        archived: true,
+        archived_at: 1_700_000_000,
+      });
+    let loaded: ChildSessionInfo[] = [];
+    pastState.fetchNextPage = vi.fn(() => {
+      loaded = Array.from({ length: 25 }, (_, index) => pastChild(`past-${index}`));
+      pastState.children = loaded;
+      pastState.hasNextPage = false;
+    });
+
+    const view = renderPanel({ rootSessionId: "conv_root" });
+
+    // Collapsed and never fetched: no rows and no count.
+    expect(screen.queryAllByTestId("subagent-past-row")).toHaveLength(0);
+    expect(screen.queryByTestId("subagent-past-load-more")).toBeNull();
+    expect(screen.getByTestId("subagent-past-zone")).toHaveTextContent(/^Past$/);
+
+    // The first page lands as the zone expands.
+    loaded = Array.from({ length: 20 }, (_, index) => pastChild(`past-${index}`));
+    pastState.children = loaded;
+    pastState.hasNextPage = true;
+    fireEvent.click(screen.getByTestId("subagent-past-zone"));
+
+    expect(screen.getAllByTestId("subagent-past-row")).toHaveLength(20);
+    expect(screen.getByTestId("subagent-past-zone")).toHaveTextContent("Past · 20+");
+    const firstPastRow = screen.getAllByTestId("subagent-past-row")[0];
+    expect(firstPastRow).toHaveTextContent("TMB");
+    expect(firstPastRow).toHaveTextContent("~/dev/omnigent/fork/rail");
+    expect(screen.getByTestId("subagent-past-load-more")).toHaveTextContent("Load 20 more");
+
+    fireEvent.click(screen.getByTestId("subagent-past-load-more"));
+    expect(pastState.fetchNextPage).toHaveBeenCalled();
+    view.rerenderPanel();
+
+    expect(screen.getAllByTestId("subagent-past-row")).toHaveLength(25);
+    expect(screen.getByTestId("subagent-past-zone")).toHaveTextContent("Past · 25");
+    expect(screen.queryByTestId("subagent-past-load-more")).toBeNull();
+  });
+
+  it("shortens the cwd group header but keeps the full path in its title", () => {
+    hostsState.hosts = [{ host_id: "host-1", name: "TMB" }];
+    const cwd = "/opt/work/omnigent/fork/omnigent-scc18-agents-rail";
+    mockChildTree({
+      conv_parent: [childInfo({ id: "a", tool: "researcher", host_id: "host-1", cwd })],
+    });
+
+    renderPanel();
+
+    const header = screen.getByTestId("subagent-cwd-group");
+    expect(header).toHaveTextContent(shortenPath(cwd));
+    expect(header).toHaveAttribute("title", cwd);
   });
 });

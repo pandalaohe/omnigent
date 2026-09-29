@@ -9,7 +9,8 @@ export type UserPreferenceNamespace =
   | "agent_pins"
   | "calling_defaults"
   | "calling_last"
-  | "session_collab";
+  | "session_collab"
+  | "host_colors";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -63,6 +64,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     session_collab: {
       storageKey: "omnigent:session-collab",
       eventName: "omnigent:session-collab-changed",
+    },
+    host_colors: {
+      storageKey: "omnigent:host-colors",
+      eventName: "omnigent:host-colors-changed",
     },
   };
 

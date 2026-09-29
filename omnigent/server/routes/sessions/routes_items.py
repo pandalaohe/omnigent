@@ -425,6 +425,7 @@ def register_items_routes(
         tool: str | None = Query(default=None),
         session_name: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
+        zone: str | None = Query(default=None, pattern="^(active|past)$"),
     ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
@@ -461,13 +462,35 @@ def register_items_routes(
             ``"{tool}:{session_name}"`` exactly.
         :param include_archived: When ``False`` (default), archived
             children are excluded. When ``True``, archived children are
-            returned too, each with ``archived: true``.
+            returned too, each with ``archived: true``. Rejected when
+            combined with ``zone``.
+        :param zone: Rail zone filter. ``"active"`` returns
+            non-archived children newest-created first (equal to
+            ``include_archived=False``); ``"past"`` returns only archived
+            children newest-archived first, each with ``archived_at``
+            set. ``None`` (default) keeps the unzoned behaviour driven by
+            ``include_archived``. ``zone`` together with
+            ``include_archived=true`` is rejected as invalid input.
         :returns: A :class:`PaginatedList` of
             :class:`ChildSessionSummary` objects.
         :raises OmnigentError: 403 if the caller lacks READ on
-            ``session_id``; 404 if no session exists there.
+            ``session_id``; 404 if no session exists there; 400 if
+            ``zone`` is combined with ``include_archived=true``.
         """
         user_id = _get_user_id(request, auth_provider)
+        if zone is not None and include_archived:
+            raise OmnigentError(
+                "zone cannot be combined with include_archived=true",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        archived_only = False
+        sort_by = "created_at"
+        if zone == "active":
+            include_archived = False
+        elif zone == "past":
+            archived_only = True
+            include_archived = True
+            sort_by = "archived_at"
         # Require READ on the parent before listing its children (no cross-user enumeration).
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
@@ -488,9 +511,10 @@ def register_items_routes(
             kind="sub_agent",
             parent_conversation_id=session_id,
             order=order,
-            sort_by="created_at",
+            sort_by=sort_by,
             title=title_filter,
             include_archived=include_archived,
+            archived_only=archived_only,
         )
         if (
             (access.level is None or access.level >= LEVEL_OWNER)
@@ -501,6 +525,7 @@ def register_items_routes(
             and before is None
             and tool is None
             and session_name is None
+            and zone != "past"
             and not page.has_more
         ):
             page = await _lazy_reconcile_native_children(

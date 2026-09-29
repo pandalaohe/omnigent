@@ -183,16 +183,33 @@ function applyItemsToCache(
  */
 function collectChildSessionIds(queryClient: QueryClient): Set<string> {
   const ids = new Set<string>();
-  const childEntries = queryClient.getQueriesData<ChildSessionInfo[]>({
+  const childEntries = queryClient.getQueriesData<unknown>({
     queryKey: ["conversation"],
   });
-  for (const [key, childSessions] of childEntries) {
-    // Only ["conversation", <id>, "child_sessions"] entries carry child lists.
-    if (Array.isArray(key) && key[2] === "child_sessions" && Array.isArray(childSessions)) {
-      for (const child of childSessions) ids.add(child.id);
-    }
+  for (const [key, data] of childEntries) {
+    // Only ["conversation", <id>, "child_sessions", ...] entries carry child
+    // lists: the active list is an array, and the past zone's infinite query
+    // nests rows under `pages[].data`.
+    if (!Array.isArray(key) || key[2] !== "child_sessions") continue;
+    const rows = childRowsFromQueryData(data);
+    if (rows === null) continue;
+    for (const child of rows) ids.add(child.id);
   }
   return ids;
+}
+
+function childRowsFromQueryData(data: unknown): ChildSessionInfo[] | null {
+  if (Array.isArray(data)) return data as ChildSessionInfo[];
+  if (!data || typeof data !== "object") return null;
+  const pages = (data as { pages?: unknown }).pages;
+  if (!Array.isArray(pages)) return null;
+  const rows: ChildSessionInfo[] = [];
+  for (const page of pages) {
+    const pageData =
+      page && typeof page === "object" ? (page as { data?: unknown }).data : undefined;
+    if (Array.isArray(pageData)) rows.push(...(pageData as ChildSessionInfo[]));
+  }
+  return rows;
 }
 
 /**

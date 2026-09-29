@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
+import type { ChildSessionLike } from "./subagentRailGroups";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { HeaderProjectTag } from "./HeaderProjectTag";
 import { HeaderTitle } from "./HeaderTitle";
@@ -121,6 +122,13 @@ interface ChatHeaderProps {
    * Add-Agent child bound to its own agent).
    */
   subAgentName?: string | null;
+  /**
+   * The active child's snapshot, normalized for the breadcrumb's badge,
+   * label and placement chip. ``null``/absent while the snapshot loads.
+   */
+  childSession?: ChildSessionLike | null;
+  /** Effective cwd from the child's snapshot (server-computed), for the chip. */
+  childCwd?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -314,6 +322,8 @@ export function ChatHeader({
   onOpenSidebar,
   isChildSession,
   subAgentName,
+  childSession,
+  childCwd,
   conversationId,
   actionConversation = null,
   conversationTitle,
@@ -641,6 +651,8 @@ export function ChatHeader({
             subAgentName={subAgentName}
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
+            childSession={childSession}
+            childCwd={childCwd}
             actions={isMobile ? undefined : (conversationMenu ?? undefined)}
             className="pr-1"
           />

@@ -1,7 +1,7 @@
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
-import { nativeCodingAgentForSubagentWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { childStatus, type AgentActivity } from "./subagentStatus";
+import { childPrimaryLabel } from "./subagentRailGroups";
 
 export type { AgentActivity };
 
@@ -154,24 +154,7 @@ export function buildTree(
             .filter((child) => !visited.has(child.id))
             .map((child) => {
               const status = childActivity(child);
-              // Native sub-agent children (Claude Task, codex/opencode/
-              // antigravity equivalents) carry the server-resolved display
-              // label in `tool`, while their `session_name` is deliberately
-              // the opaque correlation id — so `tool` must win here. Mirrors
-              // `childPrimaryLabel` in SubagentsPanel, including the
-              // user-added "ui:" title carve-out.
-              const isNativeSubagent =
-                nativeCodingAgentForSubagentWrapper(child.labels?.[WRAPPER_LABEL_KEY]) !==
-                undefined;
-              const isUserAdded = child.title?.startsWith("ui:") ?? false;
-              const label =
-                isNativeSubagent && !isUserAdded
-                  ? (child.tool ?? child.title ?? child.id)
-                  : (child.task_summary ??
-                    child.session_name ??
-                    child.title ??
-                    child.tool ??
-                    child.id);
+              const label = childPrimaryLabel(child);
               return buildTree(
                 child.id,
                 label,

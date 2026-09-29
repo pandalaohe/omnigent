@@ -43,10 +43,14 @@ function panelEnvironment({
   activeId,
   session,
   tree,
+  hosts = [],
+  past = [],
 }: {
   activeId: string;
   session: Session;
   tree: Record<string, ChildSessionInfo[]>;
+  hosts?: { host_id: string; name: string; owner: string; status: "online" | "offline" }[];
+  past?: ChildSessionInfo[];
 }): Decorator {
   const referencedIds = new Set(
     Object.values(tree)
@@ -58,12 +62,17 @@ function panelEnvironment({
       route={`/c/${activeId}`}
       seed={(queryClient) => {
         queryClient.setQueryData(["session", session.id], session);
+        queryClient.setQueryData(["hosts", { includeSandbox: false }], hosts);
         for (const [id, children] of Object.entries(tree)) {
           queryClient.setQueryData(childSessionsQueryKey(id), children);
         }
         for (const id of referencedIds) {
           if (!(id in tree)) queryClient.setQueryData(childSessionsQueryKey(id), []);
         }
+        queryClient.setQueryData([...childSessionsQueryKey(session.id), "past"], {
+          pages: [{ data: past, has_more: false, last_id: past.at(-1)?.id ?? null }],
+          pageParams: [null],
+        });
       }}
     >
       <div className="h-[520px] w-[320px] overflow-hidden rounded-lg border bg-card">
@@ -259,5 +268,111 @@ export const BrandIconsCollapsed: Story = {
       ?.querySelector<HTMLElement>('[data-testid="subagent-collapse-toggle"]');
     if (!toggle) throw new Error("Sub-agent collapse toggle not found");
     await userEvent.click(toggle);
+  },
+};
+
+const groupedHosts = [
+  { host_id: "host-tmb", name: "TMB", owner: "u", status: "online" as const },
+  { host_id: "host-fn", name: "fn", owner: "u", status: "online" as const },
+];
+
+const groupedTree = {
+  "conversation-root": [
+    child({
+      id: "group-rail",
+      title: "researcher:rail-shots",
+      tool: "researcher",
+      session_name: "rail-shots",
+      host_id: "host-tmb",
+      cwd: "/opt/work/omnigent/fork/omnigent-scc18-agents-rail",
+      created_at: 5,
+      busy: true,
+      last_message_preview: "Checking the grouped rail layout…",
+    }),
+    child({
+      id: "group-api",
+      title: "codex:api-notes",
+      tool: "codex",
+      session_name: "api-notes",
+      host_id: "host-tmb",
+      cwd: "/opt/work/omnigent/fork/omnigent-scc18-agents-rail",
+      created_at: 4,
+      current_task_status: "completed",
+    }),
+    child({
+      id: "group-async",
+      title: "researcher:async-card",
+      tool: "researcher",
+      session_name: "async-card",
+      host_id: "host-tmb",
+      cwd: "/opt/work/omnigent/fork/omnigent-scc17-async-card",
+      created_at: 3,
+      busy: true,
+      pending_elicitations_count: 1,
+    }),
+    child({
+      id: "group-tests",
+      title: "pr-test-analyzer:suite",
+      tool: "pr-test-analyzer",
+      session_name: "suite",
+      host_id: "host-tmb",
+      cwd: "/opt/work/omnigent/fork/omnigent-scc17-async-card",
+      created_at: 2,
+      warm_state: "warm",
+    }),
+    child({
+      id: "group-fn",
+      title: "researcher:repro",
+      tool: "researcher",
+      session_name: "repro",
+      host_id: "host-fn",
+      cwd: "/root/omnigent-dev",
+      created_at: 1,
+      last_message_preview: "Reproduced on fn.",
+    }),
+  ],
+};
+
+const archivedAt = Math.floor(Date.now() / 1000);
+const groupedPast = [
+  child({
+    id: "past-status",
+    title: "researcher:status",
+    tool: "researcher",
+    session_name: "status",
+    host_id: "host-tmb",
+    cwd: "/opt/work/omnigent/fork/omnigent-scc13-status",
+    archived: true,
+    archived_at: archivedAt - 3600,
+  }),
+  child({
+    id: "past-flow",
+    title: "codex:flow-timer",
+    tool: "codex",
+    session_name: "flow-timer",
+    host_id: "host-fn",
+    cwd: "/root/omnigent-dev",
+    archived: true,
+    archived_at: archivedAt - 86_400,
+  }),
+];
+
+export const GroupedZones: Story = {
+  args: { conversationId: "conversation-root" },
+  decorators: [
+    panelEnvironment({
+      activeId: "conversation-root",
+      session: rootSession({ hostId: "host-tmb" }),
+      hosts: groupedHosts,
+      tree: groupedTree,
+      past: groupedPast,
+    }),
+  ],
+  play: async ({ canvasElement }) => {
+    const pastHeader = canvasElement.querySelector<HTMLElement>(
+      '[data-testid="subagent-past-zone"]',
+    );
+    if (!pastHeader) throw new Error("Past zone header not found");
+    await userEvent.click(pastHeader);
   },
 };

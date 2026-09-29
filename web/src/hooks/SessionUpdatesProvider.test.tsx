@@ -169,6 +169,17 @@ describe("SessionUpdatesProvider watch-set", () => {
     expect(lastWatched()).toEqual(["conv_b", "conv_open"]);
   });
 
+  it("watches ids loaded into the past zone's infinite cache", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    client.setQueryData(["conversation", "conv_a", "child_sessions", "past"], {
+      pages: [{ data: [{ id: "conv_past" }], has_more: false, last_id: "conv_past" }],
+      pageParams: [null],
+    });
+    renderProvider(client, ["/"]);
+    expect(lastWatched()).toEqual(["conv_a", "conv_past"]);
+  });
+
   it("does not send client-only temp ids in the watch-set", () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_real", "temp:12345678"]);
