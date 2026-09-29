@@ -9376,7 +9376,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       });
     });
 
-    it("removes an archived child from the active list and invalidates the prefix key", () => {
+    it("removes an archived child from the active list and invalidates the prefix key", async () => {
       client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
         {
           id: "conv_child1",
@@ -9406,7 +9406,9 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
         [],
       );
-      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
+      await vi.waitFor(() =>
+        expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") }),
+      );
     });
 
     it("cancels an in-flight active refetch that would restore an archived child", async () => {
@@ -9522,6 +9524,9 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       const remounted = new QueryObserver<ChildSessionInfo[]>(client, hookOptions);
       const unsubscribeRemounted = remounted.subscribe(() => {});
       expect(remounted.getCurrentResult().data).toEqual([]);
+      // A cancelled fetch must not leave the rail in its "Failed to load" state.
+      expect(remounted.getCurrentResult().status).toBe("success");
+      expect(remounted.getCurrentResult().error).toBeNull();
       // Refetch-on-mount is off, so the stale response is the only fetch.
       expect(calls).toBe(1);
       unsubscribeRemounted();

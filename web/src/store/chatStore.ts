@@ -7508,12 +7508,15 @@ function applyChildSessionUpdated(
   if (patch.archived === true) {
     // Invalidation cancels only observed queries; an unmounted panel's
     // in-flight fetch would land the archived row again, so cancel it here.
-    queryClient.setQueryData<ChildSessionInfo[]>(
-      key,
-      current.filter((c) => c.id !== childId),
-    );
-    void queryClient.cancelQueries({ queryKey: key, exact: true }, { revert: false });
-    queryClient.invalidateQueries({ queryKey: key });
+    // The cancel reverts to the pre-fetch state, so the removal is re-applied.
+    const client = queryClient;
+    const removeRow = () =>
+      client.setQueryData<ChildSessionInfo[]>(key, (rows) => rows?.filter((c) => c.id !== childId));
+    removeRow();
+    void client.cancelQueries({ queryKey: key, exact: true }).then(() => {
+      removeRow();
+      void client.invalidateQueries({ queryKey: key });
+    });
     return;
   }
   const next = [...current];
