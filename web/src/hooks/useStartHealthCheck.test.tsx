@@ -52,7 +52,11 @@ function settingsData(healthCheck: {
 }
 
 function setTarget(
-  healthCheck = { project_id: "project_1", host_id: "host_1", prompt: "Check it." },
+  healthCheck: Parameters<typeof settingsData>[0] = {
+    project_id: "project_1",
+    host_id: "host_1",
+    prompt: "Check it.",
+  },
 ) {
   mocks.settings.current = { data: settingsData(healthCheck), isError: false };
   mocks.hosts.current = { data: [{ host_id: "host_1", name: "Worker", status: "online" }] };
