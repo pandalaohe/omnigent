@@ -832,7 +832,8 @@ class SysSessionGetInfoTool(Tool):
                                 'Returns {"sessions": [...]} with one item '
                                 "per id — an unknown or inaccessible id "
                                 "yields an error item instead of failing the "
-                                "call. Mutually exclusive with session_id."
+                                "call. Mutually exclusive with session_id; "
+                                "requires session collaboration to be on."
                             ),
                         },
                     },
