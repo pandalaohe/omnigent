@@ -44,9 +44,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
+from omnigent._platform import IS_POSIX
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
+from omnigent.runner.owner_file import write_owner_entry
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +271,21 @@ class TerminalRegistry:
                     conversation_id,
                 )
             raise TerminalExitedDuringLaunch(created.instance)
+
+        if IS_POSIX:
+            # The tmux server daemonizes away from this runner, so the host
+            # sampler can only attribute it through this record.
+            try:
+                pid = await created.instance.server_pid()
+                if pid is not None:
+                    await asyncio.to_thread(
+                        write_owner_entry,
+                        pid=pid,
+                        conversation_id=conversation_id,
+                        kind="tmux",
+                    )
+            except Exception:
+                logger.debug("tmux owner-file write failed", exc_info=True)
 
         with self._lock:
             slot = self._by_conversation.setdefault(conversation_id, {})

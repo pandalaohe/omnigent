@@ -52,8 +52,17 @@ CAP_CODEX_SIDE_CHAT = "codex_side_chat"
 # The server gates ``raw``/``within`` reads on this: an old host ignores unknown params silently.
 CAP_FS_READ_RAW = "fs_read_raw"
 
+# The host samples machine + process-tree resource metrics and answers
+# ``host.resource_sampling`` leases; the server gates fast-mode on this.
+CAP_RESOURCE_SNAPSHOT = "resource_snapshot"
+
 # Every capability THIS build supports; reported verbatim in the hello frame.
-HOST_CAPABILITIES: list[str] = [CAP_CODEX_SIDE_CHAT, CAP_FILESYSTEM_ATTACHMENTS, CAP_FS_READ_RAW]
+HOST_CAPABILITIES: list[str] = [
+    CAP_CODEX_SIDE_CHAT,
+    CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_FS_READ_RAW,
+    CAP_RESOURCE_SNAPSHOT,
+]
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -150,6 +159,8 @@ class HostFrameKind(str, Enum):
     IMPORT_LOCAL_DONE = "host.import_local_done"
     POST_BIND_HOOK = "host.post_bind_hook"
     POST_BIND_HOOK_RESULT = "host.post_bind_hook_result"
+    RESOURCE_SNAPSHOT = "host.resource_snapshot"
+    RESOURCE_SAMPLING = "host.resource_sampling"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -436,6 +447,110 @@ class HostRunnerStatusResultFrame:
 
     request_id: str
     status: str
+
+
+# Process roles the sampler assigns: the roots it starts from, the walked
+# descendants, and the synthetic row folding low-ranked descendants.
+RESOURCE_PROCESS_ROLES = frozenset(
+    {"daemon", "zygote", "runner", "harness", "tmux", "child", "folded"}
+)
+
+
+@dataclass
+class ResourceMachine:
+    """Machine-wide resource metrics for one host snapshot.
+
+    :param cpu_pct: Machine CPU busy percentage since the previous sample,
+        ``0.0`` on the sampler's first sample.
+    :param mem_used: Used physical memory in bytes (total minus available).
+    :param mem_total: Total physical memory in bytes.
+    :param disk_used: Used bytes on the data directory's filesystem.
+    :param disk_total: Total bytes on the data directory's filesystem.
+    :param load1: 1-minute load average on POSIX, ``None`` on Windows or
+        when the load could not be read.
+    """
+
+    cpu_pct: float
+    mem_used: int
+    mem_total: int
+    disk_used: int
+    disk_total: int
+    load1: float | None
+
+
+@dataclass
+class ResourceProcessRow:
+    """One omnigent-owned process in a host snapshot.
+
+    :param pid: OS process id; ``0`` for a folded summary row.
+    :param ppid: Parent OS process id (the nearest kept parent for a
+        folded row).
+    :param name: Process name, or the folded summary label.
+    :param role: One of :data:`RESOURCE_PROCESS_ROLES`.
+    :param session_id: Owning conversation id, inherited from the nearest
+        root; ``None`` for daemon / zygote rows.
+    :param cpu_pct: Process CPU since the previous sample, ``0.0`` on
+        first sighting.
+    :param rss: Resident set size in bytes.
+    """
+
+    pid: int
+    ppid: int
+    name: str
+    role: str
+    session_id: str | None
+    cpu_pct: float
+    rss: int
+
+
+@dataclass
+class HostResourceSnapshotFrame:
+    """Host → server: a sampled resource snapshot of the host.
+
+    One-way report (no result frame). The host samples its own machine and
+    the omnigent process tree (daemon, zygote, runners, and the harness /
+    tmux pids recorded in the runner owner files), attributing every
+    descendant to its session.
+
+    :param sampled_at: ISO-8601 UTC instant of the sample, e.g.
+        ``"2026-09-24T09:25:00+00:00"``.
+    :param interval_s: Sampling interval this snapshot was taken under,
+        e.g. ``60``.
+    :param machine: Machine-wide metrics.
+    :param processes: Capped process rows (roots first, then descendants by
+        CPU, plus folded summary rows).
+    :param runner_count: Live runners on this host, i.e. the number of
+        runner roots in the sample.
+    :param sampler_cpu_ms: CPU milliseconds the sampler spent on the
+        previous sample + encode, measured on its own thread.
+    :param monitor_rss_delta: Daemon RSS delta since the sampler started,
+        in bytes (an upper bound on the monitor's own growth).
+    """
+
+    sampled_at: str
+    interval_s: int
+    machine: ResourceMachine
+    processes: list[ResourceProcessRow]
+    runner_count: int
+    sampler_cpu_ms: float
+    monitor_rss_delta: int
+
+
+@dataclass
+class HostResourceSamplingFrame:
+    """Server → host: switch resource sampling to a fast interval for a lease.
+
+    One-way request (no result frame). Sent while a viewer watches the
+    system-status page; the host reverts to its idle interval when the
+    lease lapses, so a forgetful server never pins a host at fast cadence.
+
+    :param interval_s: Requested sampling interval, e.g. ``10``. The host
+        clamps it to ``[10, 60]``.
+    :param lease_s: Seconds the fast interval stays in effect, e.g. ``40``.
+    """
+
+    interval_s: int
+    lease_s: int
 
 
 @dataclass
@@ -1406,6 +1521,8 @@ HostFrame = (
     | HostImportLocalDoneFrame
     | HostPostBindHookFrame
     | HostPostBindHookResultFrame
+    | HostResourceSnapshotFrame
+    | HostResourceSamplingFrame
 )
 
 
@@ -1962,6 +2079,45 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostResourceSnapshotFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RESOURCE_SNAPSHOT.value,
+                "sampled_at": frame.sampled_at,
+                "interval_s": frame.interval_s,
+                "machine": {
+                    "cpu_pct": frame.machine.cpu_pct,
+                    "mem_used": frame.machine.mem_used,
+                    "mem_total": frame.machine.mem_total,
+                    "disk_used": frame.machine.disk_used,
+                    "disk_total": frame.machine.disk_total,
+                    "load1": frame.machine.load1,
+                },
+                "processes": [
+                    {
+                        "pid": row.pid,
+                        "ppid": row.ppid,
+                        "name": row.name,
+                        "role": row.role,
+                        "session_id": row.session_id,
+                        "cpu_pct": row.cpu_pct,
+                        "rss": row.rss,
+                    }
+                    for row in frame.processes
+                ],
+                "runner_count": frame.runner_count,
+                "sampler_cpu_ms": frame.sampler_cpu_ms,
+                "monitor_rss_delta": frame.monitor_rss_delta,
+            }
+        )
+    if isinstance(frame, HostResourceSamplingFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RESOURCE_SAMPLING.value,
+                "interval_s": frame.interval_s,
+                "lease_s": frame.lease_s,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -2139,6 +2295,10 @@ def _decode_known_host_frame(
             return _decode_post_bind_hook(msg)
         case HostFrameKind.POST_BIND_HOOK_RESULT:
             return _decode_post_bind_hook_result(msg)
+        case HostFrameKind.RESOURCE_SNAPSHOT:
+            return _decode_resource_snapshot(msg)
+        case HostFrameKind.RESOURCE_SAMPLING:
+            return _decode_resource_sampling(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -2950,6 +3110,66 @@ def _decode_post_bind_hook_result(msg: _JsonObject) -> HostPostBindHookResultFra
     )
 
 
+def _decode_resource_snapshot(msg: _JsonObject) -> HostResourceSnapshotFrame:
+    """Decode a host.resource_snapshot report frame."""
+    raw_processes = msg.get("processes")
+    if not isinstance(raw_processes, list):
+        raise ValueError("frame missing required list field: 'processes'")
+    processes: list[ResourceProcessRow] = []
+    for row in raw_processes:
+        if not isinstance(row, dict):
+            raise ValueError("frame field must be a list of objects: 'processes'")
+        processes.append(_decode_resource_process_row(row))
+    return HostResourceSnapshotFrame(
+        sampled_at=_required_str(msg, "sampled_at"),
+        interval_s=_required_int(msg, "interval_s"),
+        machine=_decode_resource_machine(msg),
+        processes=processes,
+        runner_count=_required_int(msg, "runner_count"),
+        sampler_cpu_ms=_required_float(msg, "sampler_cpu_ms"),
+        monitor_rss_delta=_required_int(msg, "monitor_rss_delta"),
+    )
+
+
+def _decode_resource_machine(msg: _JsonObject) -> ResourceMachine:
+    """Decode the nested machine metrics of a resource snapshot."""
+    machine = msg.get("machine")
+    if not isinstance(machine, dict):
+        raise ValueError("frame missing required object field: 'machine'")
+    return ResourceMachine(
+        cpu_pct=_required_float(machine, "cpu_pct"),
+        mem_used=_required_int(machine, "mem_used"),
+        mem_total=_required_int(machine, "mem_total"),
+        disk_used=_required_int(machine, "disk_used"),
+        disk_total=_required_int(machine, "disk_total"),
+        load1=_optional_nullable_float(machine, "load1"),
+    )
+
+
+def _decode_resource_process_row(msg: _JsonObject) -> ResourceProcessRow:
+    """Decode one process row of a resource snapshot."""
+    role = _required_str(msg, "role")
+    if role not in RESOURCE_PROCESS_ROLES:
+        raise ValueError(f"frame field has unsupported value: 'role' = {role!r}")
+    return ResourceProcessRow(
+        pid=_required_int(msg, "pid"),
+        ppid=_required_int(msg, "ppid"),
+        name=_required_str(msg, "name"),
+        role=role,
+        session_id=_optional_nullable_str(msg, "session_id"),
+        cpu_pct=_required_float(msg, "cpu_pct"),
+        rss=_required_int(msg, "rss"),
+    )
+
+
+def _decode_resource_sampling(msg: _JsonObject) -> HostResourceSamplingFrame:
+    """Decode a host.resource_sampling lease frame."""
+    return HostResourceSamplingFrame(
+        interval_s=_required_int(msg, "interval_s"),
+        lease_s=_required_int(msg, "lease_s"),
+    )
+
+
 # ── Field validators ─────────────────────────────────────
 
 
@@ -2979,6 +3199,39 @@ def _required_int(msg: _JsonObject, key: str) -> int:
     if not isinstance(val, int) or isinstance(val, bool):
         raise ValueError(f"frame missing required int field: {key!r}")
     return val
+
+
+def _required_float(msg: _JsonObject, key: str) -> float:
+    """Return a required numeric field as a float.
+
+    JSON has one number type, so an integral payload value (``0``) is a
+    valid float here; booleans are not.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"cpu_pct"``.
+    :returns: The float value.
+    :raises ValueError: If the field is missing or not a number.
+    """
+    val = msg.get(key)
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"frame missing required number field: {key!r}")
+    return float(val)
+
+
+def _optional_nullable_float(msg: _JsonObject, key: str) -> float | None:
+    """Return an optional nullable numeric field as a float.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"load1"``.
+    :returns: The float value, or ``None`` when absent or null.
+    :raises ValueError: If the field is present and not a number or null.
+    """
+    val = msg.get(key)
+    if val is None:
+        return None
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"frame field must be a number or null: {key!r}")
+    return float(val)
 
 
 def _required_bool(msg: _JsonObject, key: str) -> bool:
