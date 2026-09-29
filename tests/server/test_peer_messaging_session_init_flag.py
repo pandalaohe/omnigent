@@ -26,7 +26,6 @@ from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignmentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
@@ -106,7 +105,9 @@ async def test_initializer_sends_constructed_flag() -> None:
 
 def _build_app(db_uri: str, tmp_path: Path, *, enabled: bool) -> FastAPI:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    flags = resolve_feature_flags({"OMNIGENT_FEATURES": "session_peer_messaging"} if enabled else {})
+    flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "session_peer_messaging"} if enabled else {}
+    )
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -120,7 +121,6 @@ def _build_app(db_uri: str, tmp_path: Path, *, enabled: bool) -> FastAPI:
         project_store=SqlAlchemyProjectStore(db_uri),
         project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),
         project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
-        assignment_store=SqlAlchemyAssignmentStore(db_uri),
         feature_flags=flags,
     )
 

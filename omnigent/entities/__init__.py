@@ -2,22 +2,6 @@
 
 from omnigent.entities.account import Account, AccountToken
 from omnigent.entities.agent import Agent, LoadedAgent
-from omnigent.entities.assignment import (
-    LEGAL_TRANSITIONS,
-    NON_TERMINAL_STATES,
-    TERMINAL_STATES,
-    Assignment,
-    AssignmentAttempt,
-    AssignmentInputEntry,
-    AssignmentMessage,
-    AssignmentOutputEntry,
-    AssignmentState,
-    inputs_from_json,
-    inputs_to_json,
-    is_legal_transition,
-    outputs_from_json,
-    outputs_to_json,
-)
 from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.entities.connection import ProviderConnection
 from omnigent.entities.conversation import (
@@ -66,20 +50,11 @@ from omnigent.entities.session_resources import (
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
     "DEFAULT_GENERATED_TITLE_MAX_CHARS",
-    "LEGAL_TRANSITIONS",
     "NON_CONTENT_ITEM_TYPES",
-    "NON_TERMINAL_STATES",
-    "TERMINAL_STATES",
     "USER_SESSION_TITLE_MAX_CHARS",
     "Account",
     "AccountToken",
     "Agent",
-    "Assignment",
-    "AssignmentAttempt",
-    "AssignmentInputEntry",
-    "AssignmentMessage",
-    "AssignmentOutputEntry",
-    "AssignmentState",
     "Comment",
     "CommentsFingerprint",
     "CompactionData",
@@ -117,11 +92,6 @@ __all__ = [
     "TerminalCommandData",
     "filter_resources_by_type",
     "get_resource_by_id",
-    "inputs_from_json",
-    "inputs_to_json",
-    "is_legal_transition",
-    "outputs_from_json",
-    "outputs_to_json",
     "parse_item_data",
     "resolve_terminal_entry_by_resource_id",
     "synthesize_conversation_title",

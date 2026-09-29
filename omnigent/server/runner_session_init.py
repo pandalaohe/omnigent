@@ -89,14 +89,12 @@ class RunnerSessionInitializer:
         registry: TunnelRegistry,
         *,
         server_version: str,
-        project_assignments_enabled: bool = False,
         peer_messaging_enabled: bool = False,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
     ) -> None:
         self._registry = registry
         self._server_version = server_version
-        self._project_assignments_enabled = project_assignments_enabled
         self._peer_messaging_enabled = peer_messaging_enabled
         self._conversation_store = conversation_store
         self._file_store = file_store
@@ -156,7 +154,6 @@ class RunnerSessionInitializer:
                     server_version=self._server_version,
                     suppress_recovery_turn=suppress_recovery_turn,
                     archive_states=effective_archive_states,
-                    project_assignments_enabled=self._project_assignments_enabled,
                     peer_messaging_enabled=self._peer_messaging_enabled,
                     global_instructions=await asyncio.to_thread(current_global_instructions_text),
                     resume_interrupted_turn=resume_interrupted_turn,

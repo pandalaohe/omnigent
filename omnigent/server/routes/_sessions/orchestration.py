@@ -5336,9 +5336,6 @@ async def _ensure_runner_session_initialized(
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
                     archive_states=archive_states,
-                    project_assignments_enabled=resolve_feature_flags().enabled(
-                        Feature.PROJECT_ASSIGNMENTS
-                    ),
                     peer_messaging_enabled=resolve_feature_flags().enabled(
                         Feature.SESSION_PEER_MESSAGING
                     ),

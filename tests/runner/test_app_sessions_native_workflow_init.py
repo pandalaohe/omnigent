@@ -314,7 +314,6 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
                 "server_client",
                 "agent_spec",
                 "ensure_comment_relay",
-                "project_assignments_enabled",
                 "peer_messaging_enabled",
                 "global_instructions",
             },

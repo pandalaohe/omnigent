@@ -24,7 +24,6 @@ vi.mock("@/lib/projectsApi", () => ({
   getProjectHostRoots: vi.fn(),
   listProjectEntries: vi.fn(),
   putProjectEntry: vi.fn(),
-  setProjectCollaborationEnabled: vi.fn(),
   putProjectRepository: vi.fn(),
   deleteProjectRepository: vi.fn(),
   putProjectHostBinding: vi.fn(),
@@ -184,6 +183,7 @@ function renderDialog(projectId: string | null = "p_1", onOpenChangeSpy?: (open:
 beforeEach(() => {
   getProjectMock.mockReset();
   getCollaborationMock.mockReset();
+  getCollaborationMock.mockResolvedValue({ repositories: [], bindings: [], problems: [] });
   getHostRootsMock.mockReset();
   updateMock.mockReset();
   createMock.mockReset();
@@ -899,7 +899,7 @@ describe("ProjectSettingsDialog", () => {
     );
 
     expect(screen.queryByTestId("project-collaboration-section")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("project-collaboration-enabled")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("project-collaboration-repo-open")).not.toBeInTheDocument();
     expect(getCollaborationMock).not.toHaveBeenCalled();
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
     expect(document.getElementById("project-settings-defaults-form")).not.toHaveAttribute("role");
@@ -912,13 +912,6 @@ describe("ProjectSettingsDialog", () => {
       features: { project_assignments: true },
     });
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
-    getCollaborationMock.mockResolvedValue({
-      enabled: false,
-      revision: 1,
-      repositories: [],
-      bindings: [],
-      problems: [],
-    });
     renderDialog();
     const tabs = screen.getAllByRole("tab");
     expect(tabs).toHaveLength(2);
@@ -937,13 +930,6 @@ describe("ProjectSettingsDialog", () => {
       features: { project_assignments: true },
     });
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
-    getCollaborationMock.mockResolvedValue({
-      enabled: false,
-      revision: 1,
-      repositories: [],
-      bindings: [],
-      problems: [],
-    });
     const { rerenderOpen } = renderDialog();
     await waitFor(() =>
       expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
@@ -954,7 +940,7 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-worktree"));
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Collaboration" }), { button: 0 });
     await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-enabled")).toBeInTheDocument(),
+      expect(screen.getByTestId("project-collaboration-repo-open")).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("project-settings-save")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
@@ -983,13 +969,6 @@ describe("ProjectSettingsDialog", () => {
       features: { project_assignments: true },
     });
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
-    getCollaborationMock.mockResolvedValue({
-      enabled: false,
-      revision: 1,
-      repositories: [],
-      bindings: [],
-      problems: [],
-    });
     renderDialog();
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Collaboration" }), { button: 0 });
     await waitFor(() =>

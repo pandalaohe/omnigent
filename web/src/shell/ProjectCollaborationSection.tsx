@@ -15,14 +15,10 @@ import {
   getProjectCollaboration,
   putProjectHostBinding,
   putProjectRepository,
-  setProjectCollaborationEnabled,
   verifyProjectHostBinding,
   type PostBindResult,
   type ProjectCollaborationProblem,
 } from "@/lib/projectsApi";
-
-const CONFLICT_MESSAGE =
-  "Collaboration settings changed elsewhere; the latest settings are shown. Try again.";
 
 /** Hook statuses worth surfacing in the settings section; the rest are silent. */
 const WARNING_HOOK_STATUSES = new Set(["failed", "timed_out", "unreachable"]);
@@ -88,29 +84,6 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
     void queryClient.invalidateQueries({ queryKey });
     void queryClient.invalidateQueries({ queryKey: ["project-host-roots", projectId] });
   };
-
-  const toggleMutation = useMutation({
-    mutationFn: (next: boolean) => {
-      const revision = collaboration.data?.revision ?? 0;
-      return setProjectCollaborationEnabled(projectId, next, revision);
-    },
-    retry: false,
-    onMutate: () => setActionError(null),
-    // A 409 means another writer moved the revision first: show the fixed
-    // notice and refetch so the switch reflects the server's latest state.
-    onError: (error: unknown) => {
-      if ((error as { status?: number }).status === 409) {
-        setActionError({ message: CONFLICT_MESSAGE, source: "other" });
-        invalidate();
-      } else {
-        setActionError({ message: errorMessage(error), source: "other" });
-      }
-    },
-    onSuccess: () => {
-      setActionError(null);
-      invalidate();
-    },
-  });
 
   const repoAddMutation = useMutation({
     mutationFn: () =>
@@ -460,19 +433,11 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
 
   return (
     <div className="flex min-w-0 flex-col gap-6" data-testid="project-collaboration-section">
-      <div className="flex min-w-0 items-start justify-between gap-4">
-        <div className="min-w-0">
-          <span className="font-medium text-ui">Project collaboration</span>
-          <p className="text-sm text-muted-foreground">
-            Share repositories across hosts so an agent on one host can hand work to another.
-          </p>
-        </div>
-        <Switch
-          data-testid="project-collaboration-enabled"
-          checked={data.enabled}
-          onCheckedChange={(next) => toggleMutation.mutate(next)}
-          disabled={toggleMutation.isPending}
-        />
+      <div className="min-w-0">
+        <span className="font-medium text-ui">Project collaboration</span>
+        <p className="text-sm text-muted-foreground">
+          Register repositories and per-host checkouts so sessions open from the right copy.
+        </p>
       </div>
       {actionError &&
         !(

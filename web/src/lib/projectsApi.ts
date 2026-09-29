@@ -287,8 +287,6 @@ export type ProjectCollaborationProblem =
 
 /** Collaboration config plus validation status for a project. */
 export interface ProjectCollaboration {
-  enabled: boolean;
-  revision: number;
   repositories: ProjectRepository[];
   bindings: ProjectHostBinding[];
   problems: ProjectCollaborationProblem[];
@@ -318,20 +316,6 @@ async function readCollaborationJsonOrThrow<T>(res: Response): Promise<T> {
 export async function getProjectCollaboration(id: string): Promise<ProjectCollaboration> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/collaboration`);
   return readCollaborationJsonOrThrow<ProjectCollaboration>(res);
-}
-
-/** Flip the collaboration switch with an optimistic-concurrency revision. */
-export async function setProjectCollaborationEnabled(
-  id: string,
-  enabled: boolean,
-  expectedRevision: number,
-): Promise<{ enabled: boolean; revision: number }> {
-  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/collaboration`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled, expected_revision: expectedRevision }),
-  });
-  return readCollaborationJsonOrThrow<{ enabled: boolean; revision: number }>(res);
 }
 
 /** Register a repository or revise its registration. */

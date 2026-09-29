@@ -689,9 +689,6 @@ def register_core_routes(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
-                    project_assignments_enabled=request.app.state.feature_flags.enabled(
-                        Feature.PROJECT_ASSIGNMENTS
-                    ),
                     peer_messaging_enabled=request.app.state.feature_flags.enabled(
                         Feature.SESSION_PEER_MESSAGING
                     ),

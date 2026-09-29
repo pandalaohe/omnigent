@@ -91,7 +91,6 @@ def _project(*, name: str = "lead-project", host_id: str = _HOST_B, workspace: s
         id=_PROJECT_ID,
         name=name,
         config={"host_id": host_id, "workspace": workspace},
-        collaboration_enabled=False,
     )
 
 

@@ -66,7 +66,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     ),
     FeatureDefinition(
         feature=Feature.PROJECT_ASSIGNMENTS,
-        description="Cross-host project collaboration: host bindings and durable assignments",
+        description="Cross-host project collaboration: project repositories and host bindings",
         owner="server",
         review_by_release="0.16.0",
     ),

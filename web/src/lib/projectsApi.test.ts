@@ -17,7 +17,6 @@ import {
   putProjectHostBinding,
   putProjectRepository,
   renameProject,
-  setProjectCollaborationEnabled,
   updateProjectConfig,
   verifyProjectHostBinding,
 } from "./projectsApi";
@@ -148,26 +147,14 @@ describe("deleteProject", () => {
 describe("getProjectCollaboration", () => {
   it("GETs /v1/projects/{id}/collaboration", async () => {
     fetchMock.mockResolvedValueOnce(
-      mockResponse({ enabled: false, revision: 3, repositories: [], bindings: [], problems: [] }),
+      mockResponse({ repositories: [], bindings: [], problems: [] }),
     );
     const result = await getProjectCollaboration("p_1");
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/projects/p_1/collaboration");
     // No explicit method — fetch defaults to GET; a POST here must fail.
     expect(init.method).toBeUndefined();
-    expect(result.revision).toBe(3);
-  });
-});
-
-describe("setProjectCollaborationEnabled", () => {
-  it("PATCHes the switch with the expected revision", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse({ enabled: true, revision: 4 }));
-    const result = await setProjectCollaborationEnabled("p a", true, 3);
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/v1/projects/p%20a/collaboration");
-    expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body as string)).toEqual({ enabled: true, expected_revision: 3 });
-    expect(result).toEqual({ enabled: true, revision: 4 });
+    expect(result).toEqual({ repositories: [], bindings: [], problems: [] });
   });
 });
 

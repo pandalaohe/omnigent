@@ -424,19 +424,6 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
-# Like _SCHEDULED_TASK_TOOLS, but gated by the session-init flag.
-_ASSIGNMENT_TOOLS = frozenset(
-    {
-        "sys_assignment_dispatch",
-        "sys_assignment_get",
-        "sys_assignment_list",
-        "sys_assignment_send",
-        "sys_assignment_read_messages",
-        "sys_assignment_complete",
-        "sys_assignment_cancel",
-    }
-)
-
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -495,7 +482,6 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
-    | _ASSIGNMENT_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -547,7 +533,6 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
 def build_native_relay_tool_schemas(
     spec: AgentSpec | None,
     *,
-    project_assignments_enabled: bool = False,
     peer_messaging_enabled: bool = False,
 ) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
@@ -566,8 +551,6 @@ def build_native_relay_tool_schemas(
     :param spec: The session's resolved agent spec. ``None`` falls back to the
         always-on read/discovery surface (never the opt-in spawn writes, whose
         gate can't be evaluated without the spec), mirroring the relay.
-    :param project_assignments_enabled: When ``True`` the seven
-        ``sys_assignment_*`` tools join the surface; otherwise none do.
     :param peer_messaging_enabled: When ``True`` a no-spawn spec still
         registers ``sys_session_send`` in by-id mode for peer sends.
     :returns: Flat tool schemas for native bridges.
@@ -609,7 +592,6 @@ def build_native_relay_tool_schemas(
 
         for schema in ToolManager(
             spec,
-            project_assignments_enabled=project_assignments_enabled,
             peer_messaging_enabled=peer_messaging_enabled,
             os_env_schema_only=True,
         ).get_tool_schemas():
@@ -639,32 +621,6 @@ def build_native_relay_tool_schemas(
             function = _string_object_dict(fallback_schema.get("function"))
             if function is not None:
                 _append(function)
-        if project_assignments_enabled:
-            from omnigent.tools.builtins.assignments import (
-                SysAssignmentCancelTool,
-                SysAssignmentCompleteTool,
-                SysAssignmentDispatchTool,
-                SysAssignmentGetTool,
-                SysAssignmentListTool,
-                SysAssignmentReadMessagesTool,
-                SysAssignmentSendTool,
-            )
-
-            for _cls in (
-                SysAssignmentDispatchTool,
-                SysAssignmentGetTool,
-                SysAssignmentListTool,
-                SysAssignmentSendTool,
-                SysAssignmentReadMessagesTool,
-                SysAssignmentCompleteTool,
-                SysAssignmentCancelTool,
-            ):
-                fallback_schema = _string_object_dict(_cls().get_schema())
-                if fallback_schema is None:
-                    continue
-                function = _string_object_dict(fallback_schema.get("function"))
-                if function is not None:
-                    _append(function)
         if peer_messaging_enabled:
             # No-spec fallback mirrors the manager's flag rule: by-id send
             # only, so spec-less native sessions stay peer senders.
@@ -953,7 +909,6 @@ _ALL_LOCAL_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
-    | _ASSIGNMENT_TOOLS
     # The panel tool executes HERE, including on the ``dispatch=None`` path;
     # relaying it upstream would skip the artifacts/open POST.
     | _PANEL_TOOLS
@@ -1006,10 +961,10 @@ def should_dispatch_locally(tool_name: str) -> bool:
 # Granted tool names per live AgentSpec + effective harness, keyed by
 # ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
 # guards against id reuse after the spec is garbage-collected. The session
-# release flags are part of the key: the same spec advertises a different
+# release flag is part of the key: the same spec advertises a different
 # surface under each flag.
 _granted_tool_names_cache: dict[
-    tuple[int, str | None, bool, bool], tuple[weakref.ref[AgentSpec], frozenset[str]]
+    tuple[int, str | None, bool], tuple[weakref.ref[AgentSpec], frozenset[str]]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -1038,7 +993,6 @@ def _granted_tool_names(
     agent_spec: AgentSpec,
     harness: str | None = None,
     *,
-    project_assignments_enabled: bool = False,
     peer_messaging_enabled: bool = False,
 ) -> frozenset[str]:
     """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
@@ -1053,22 +1007,18 @@ def _granted_tool_names(
     :param harness: Canonical harness the session runs, from
         :func:`_effective_harness_name`. Only the native/non-native split
         matters here.
-    :param project_assignments_enabled: The session's cached
-        project-assignments flag; ``True`` adds the ``sys_assignment_*`` tools
-        a spec registers only under the flag, mirroring the turn surface.
     :param peer_messaging_enabled: The session's cached peer-messaging flag;
         ``True`` adds the by-id ``sys_session_send`` a no-spawn spec registers,
         mirroring the turn surface.
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness, project_assignments_enabled, peer_messaging_enabled)
+    cache_key = (id(agent_spec), harness, peer_messaging_enabled)
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
     manager = ToolManager(
         agent_spec,
-        project_assignments_enabled=project_assignments_enabled,
         peer_messaging_enabled=peer_messaging_enabled,
         os_env_schema_only=True,
     )
@@ -1091,7 +1041,6 @@ def _ungranted_tool_reason(
     agent_spec: AgentSpec | None,
     effective_harness: str | None = None,
     *,
-    project_assignments_enabled: bool = False,
     peer_messaging_enabled: bool = False,
 ) -> str | None:
     """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
@@ -1106,9 +1055,6 @@ def _ungranted_tool_reason(
     :param effective_harness: The session's harness override, so a session
         running a harness its spec never declared is judged on the surface it
         was actually advertised. ``None`` falls back to the spec.
-    :param project_assignments_enabled: The session's cached
-        project-assignments flag, so the judged surface matches the one the
-        session advertised.
     :param peer_messaging_enabled: The session's cached peer-messaging flag,
         so the judged surface matches the one the session advertised.
     """
@@ -1120,7 +1066,6 @@ def _ungranted_tool_reason(
         granted = _granted_tool_names(
             agent_spec,
             _effective_harness_name(agent_spec, effective_harness),
-            project_assignments_enabled=project_assignments_enabled,
             peer_messaging_enabled=peer_messaging_enabled,
         )
     except Exception as exc:
@@ -2496,35 +2441,11 @@ class _PeerSendOpts:
     present: bool = False
 
 
-def _project_assignments_enabled_for(conversation_id: str | None) -> bool:
-    """Return the session's cached project-assignments flag, defaulting off.
-
-    Reads the runner's per-session init snapshot cache (seeded from the
-    server's session-init envelope). Importing the runner app module is lazy
-    so unit tests can exercise dispatch standalone.
-
-    :param conversation_id: The caller's session id, or ``None``.
-    :returns: ``True`` when the session initialized with the flag on.
-    """
-    if not conversation_id:
-        return False
-    try:
-        import omnigent.runner.app as _runner_app_mod
-
-        get_flag = getattr(_runner_app_mod, "get_session_project_assignments_enabled", None)
-        if callable(get_flag):
-            return bool(get_flag(conversation_id))
-    except ImportError:  # pragma: no cover — runner always present in prod
-        return False
-    return False
-
-
 def _peer_messaging_enabled_for(conversation_id: str | None) -> bool:
     """Return the session's cached peer-messaging flag, defaulting off.
 
     Reads the runner's per-session init snapshot cache (seeded from the
-    server's session-init envelope, mirroring
-    ``_session_project_assignments_enabled``). Importing the runner app
+    server's session-init envelope). Importing the runner app
     module is lazy so unit tests can exercise dispatch standalone.
 
     :param conversation_id: The caller's session id, or ``None``.
@@ -7622,7 +7543,6 @@ async def execute_tool(
             tool_name,
             agent_spec,
             effective_harness,
-            project_assignments_enabled=_project_assignments_enabled_for(conversation_id),
             peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
         )
         if refusal is not None:
@@ -7850,16 +7770,6 @@ async def execute_tool(
                 arguments,
                 server_client=server_client,
                 conversation_id=conversation_id,
-            )
-        elif tool_name in _ASSIGNMENT_TOOLS:
-            from omnigent.runner.assignment_tools import execute_assignment_tool
-
-            output = await execute_assignment_tool(
-                tool_name,
-                arguments,
-                conversation_id=conversation_id,
-                runner_workspace=runner_workspace,
-                server_client=server_client,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
@@ -9465,7 +9375,6 @@ def _spawn_async_tool(
             target_tool,
             agent_spec,
             effective_harness,
-            project_assignments_enabled=_project_assignments_enabled_for(conversation_id),
             peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
         )
         if refusal is not None:

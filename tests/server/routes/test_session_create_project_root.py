@@ -171,9 +171,6 @@ async def test_resolver_binding_and_host_choices(app: FastAPI, client: httpx.Asy
     )
     app.state.project_host_binding_store = Bindings([_binding(project_id, "h1", "/b")])
     app.state.feature_flags = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
-    app.state.project_store.set_collaboration(
-        project_id, user_id=ALICE, enabled=True, expected_revision=0
-    )
     resolved = await resolve_project_session_create(
         body=ProjectSessionCreateRequest(project_id=project_id, host_id="h1"),
         user_id=ALICE,
@@ -195,7 +192,7 @@ async def test_resolver_binding_and_host_choices(app: FastAPI, client: httpx.Asy
     assert (filled.body.host_id, filled.body.workspace) == ("h1", "/b")
 
 
-async def test_ambiguous_host_fill_and_switch_gate(
+async def test_ambiguous_host_fill_with_binding_roots(
     app: FastAPI, client: httpx.AsyncClient
 ) -> None:
     project_id = await _project(client, "several", {"agent_id": AGENT_ID})
@@ -203,13 +200,6 @@ async def test_ambiguous_host_fill_and_switch_gate(
         [_binding(project_id, "h1", "/one"), _binding(project_id, "h2", "/two")]
     )
     app.state.feature_flags = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
-    no_switch = await client.post(
-        "/v1/sessions", json={"project_id": project_id, "host_id": "h1"}, headers=_headers()
-    )
-    assert no_switch.status_code == 400
-    app.state.project_store.set_collaboration(
-        project_id, user_id=ALICE, enabled=True, expected_revision=0
-    )
     ambiguous = await client.post(
         "/v1/sessions", json={"project_id": project_id}, headers=_headers()
     )
@@ -251,9 +241,6 @@ async def test_deleted_config_host_is_not_replaced_by_binding(
     )
     app.state.project_host_binding_store = Bindings([_binding(project_id, "3" * 32, "/b")])
     app.state.feature_flags = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
-    app.state.project_store.set_collaboration(
-        project_id, user_id=ALICE, enabled=True, expected_revision=0
-    )
     app.state.host_store = HostStore(db_uri)
     response = await client.post(
         "/v1/sessions", json={"project_id": project_id}, headers=_headers()
@@ -283,9 +270,6 @@ async def test_json_filled_host_reaches_launch(
     if use_binding:
         app.state.project_host_binding_store = Bindings([_binding(project_id, host_id, "/b")])
         app.state.feature_flags = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
-        app.state.project_store.set_collaboration(
-            project_id, user_id=ALICE, enabled=True, expected_revision=0
-        )
     expected_workspace = "/b" if use_binding else "/c"
     launched: list[str] = []
     validated: list[str] = []
@@ -469,9 +453,6 @@ async def test_sandbox_config_never_fills_a_bound_host(
     )
     app.state.project_host_binding_store = Bindings([_binding(project_id, "h1", "/b")])
     app.state.feature_flags = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
-    app.state.project_store.set_collaboration(
-        project_id, user_id=ALICE, enabled=True, expected_revision=0
-    )
     response = await client.post(
         "/v1/sessions", json={"project_id": project_id}, headers=_headers()
     )
@@ -533,9 +514,6 @@ async def test_entry_on_another_host_only_refuses_create(
         [_entry(project_id, "h1", "/e")],
     )
     app.state.feature_flags = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
-    app.state.project_store.set_collaboration(
-        project_id, user_id=ALICE, enabled=True, expected_revision=0
-    )
     response = await client.post(
         "/v1/sessions", json={"project_id": project_id, "host_id": "h2"}, headers=_headers()
     )

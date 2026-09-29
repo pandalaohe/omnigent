@@ -2411,7 +2411,6 @@ async def _auto_create_pi_terminal(
     server_client: httpx.AsyncClient | None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
-    project_assignments_enabled: bool = False,
     peer_messaging_enabled: bool = False,
     global_instructions: str | None = None,
 ) -> SessionResourceView:
@@ -2430,8 +2429,6 @@ async def _auto_create_pi_terminal(
     :param global_instructions: The server-held global instructions text for
         this session, or ``None`` when none is set. Staged with the rest of the
         startup text for the first injected message.
-    :param project_assignments_enabled: Gates the assignment tools on the
-        relay surface, from the session's init snapshot.
     :param peer_messaging_enabled: Registers ``sys_session_send`` in
         by-id mode on the relay surface, from the session's init snapshot.
     :returns: Created terminal resource view.
@@ -2503,7 +2500,6 @@ async def _auto_create_pi_terminal(
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
         pi_tools = build_native_relay_tool_schemas(
             spec_for_tools,
-            project_assignments_enabled=project_assignments_enabled,
             peer_messaging_enabled=peer_messaging_enabled,
         )
     except Exception:  # noqa: BLE001 — tool registration is additive
@@ -9272,7 +9268,6 @@ class NativeLaunchContext:
     skills_filter: str | list[str] = "all"
     agent_name: str | None = None
     session_init: RunnerSessionInitEnvelope | None = None
-    project_assignments_enabled: bool = False
     peer_messaging_enabled: bool = False
     global_instructions: str | None = None
     auth_token_factory: Callable[[], str | None] | None = None
@@ -9308,7 +9303,6 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         agent_spec=ctx.agent_spec,
         ensure_comment_relay=ctx.ensure_comment_relay,
-        project_assignments_enabled=ctx.project_assignments_enabled,
         peer_messaging_enabled=ctx.peer_messaging_enabled,
         global_instructions=ctx.global_instructions,
     )

@@ -65,7 +65,6 @@ import {
 import {
   createProject,
   deleteProjectEntry,
-  getProjectCollaboration,
   listProjectEntries,
   putProjectEntry,
   type PostBindResult,
@@ -592,12 +591,6 @@ export function ProjectSettingsDialog({
   const [activeTab, setActiveTab] = useState("defaults");
   const tabsId = useId();
   const { catalogs, ensureCatalog } = useCallingDefaultCatalogs(open);
-  const { data: collaborationStatus } = useQuery({
-    queryKey: ["project-collaboration", projectId],
-    queryFn: () => getProjectCollaboration(projectId!),
-    enabled: open && showCollaboration,
-    retry: false,
-  });
   // The single host-row set. A label-only folder has no stored project yet, so
   // there is nothing to fetch until Save promotes it.
   const {
@@ -1646,11 +1639,6 @@ export function ProjectSettingsDialog({
                   className="flex-none px-2 pb-3"
                 >
                   Collaboration
-                  {collaborationStatus?.enabled && (
-                    <span className="rounded-full bg-primary/10 px-1.5 text-xs text-primary">
-                      On
-                    </span>
-                  )}
                 </TabsTrigger>
               </TabsList>
             </Tabs>
