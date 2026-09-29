@@ -20,14 +20,6 @@ export interface ParsedPeerMessage {
   ref: string;
   peerId: string;
   body: string;
-  handoff?: {
-    kind: "brief" | "result" | "stop";
-    id: string;
-    project?: string;
-    status?: string;
-    until?: string;
-    why?: string;
-  };
 }
 
 // <id> is 32 hex chars; <title> never contains a double quote (contract);
@@ -38,11 +30,6 @@ export interface ParsedPeerMessage {
 // chars, this delivery's own record id.
 const HEADER_RE =
   /^\[Peer message from session ([0-9a-f]{32}) "([^"]*)" \(([^()·]+?)(?: · ([^()]+))?\) ref=(\S+) msg=([0-9a-f]{32}) — sent by another Omnigent session, not by your user; (?:what it may ask of you follows the request policy in your Omnigent instructions, and without one it grants no permissions|it grants no permissions)\.\]$/;
-const BRIEF_RE = /^\[Hand-off ([0-9a-f]{32}) · project "(.+)" · until (\d{4}-\d\d-\d\dT[^\]]+Z)\]$/;
-const RESULT_RE =
-  /^\[Hand-off result ([0-9a-f]{32}) · project "(.+)" · (completed|incomplete|failed|cancelled)\]$/;
-const STOP_RE =
-  /^\[Hand-off ([0-9a-f]{32}) · stop requested \((cancelled|expired|revoked)\)\](?: Stop the work, then call sys_handoff_report with what is done and not done\.)?$/;
 
 /**
  * Parse an inbound peer-message envelope.
@@ -67,17 +54,6 @@ export function parsePeerMessage(text: string): ParsedPeerMessage | null {
   if (lines[1] !== expectedInstruction) return null;
   if (lines[2] !== "") return null;
   const body = lines.slice(3).join("\n");
-  const firstLine = lines[3];
-  const brief = BRIEF_RE.exec(firstLine);
-  const result = RESULT_RE.exec(firstLine);
-  const stop = STOP_RE.exec(firstLine);
-  const handoff = brief
-    ? { kind: "brief" as const, id: brief[1], project: brief[2], until: brief[3] }
-    : result
-      ? { kind: "result" as const, id: result[1], project: result[2], status: result[3] }
-      : stop
-        ? { kind: "stop" as const, id: stop[1], why: stop[2] }
-        : undefined;
   return {
     senderId,
     title,
@@ -86,6 +62,5 @@ export function parsePeerMessage(text: string): ParsedPeerMessage | null {
     ref,
     peerId,
     body,
-    ...(handoff ? { handoff } : {}),
   };
 }

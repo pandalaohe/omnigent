@@ -743,22 +743,7 @@ async def test_deferred_rechecks_owner(harness: _Harness, monkeypatch: pytest.Mo
     assert harness.deliver.calls == []
 
 
-async def test_handoff_pass_awaited_and_failure_does_not_stop_tick(harness: _Harness) -> None:
-    observed: list[int] = []
-
-    async def failing_pass(now: int) -> None:
-        observed.append(now)
-        raise RuntimeError("handoff pass failed")
-
-    harness.sweeper.set_handoff_pass(failing_pass)
-    harness.sweeper._parked["sender"] = ["notice after failure"]
-    await harness.sweeper._tick()
-    await harness.sweeper._tick()
-    assert observed == [harness._now, harness._now]
-    assert harness.post_event.calls[0]["text"] == "notice after failure"
-
-
 async def test_notify_line_uses_sender_notice_path(harness: _Harness) -> None:
-    await harness.sweeper.notify_line("sender", "hand-off result ready")
+    await harness.sweeper.notify_line("sender", "peer result ready")
     assert harness.post_event.calls[0]["session_id"] == "sender"
-    assert harness.post_event.calls[0]["text"] == "hand-off result ready"
+    assert harness.post_event.calls[0]["text"] == "peer result ready"

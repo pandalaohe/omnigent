@@ -55,7 +55,6 @@ from omnigent.entities.project_host_binding import ProjectHostBinding
 from omnigent.entities.project_host_entry import ProjectHostEntry
 from omnigent.entities.project_repository import ProjectRepository
 from omnigent.entities.scheduled_task import ScheduledTask, ScheduledTaskRun
-from omnigent.entities.session_handoff import SessionHandoff
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -110,7 +109,6 @@ __all__ = [
     "RoutingDecisionData",
     "ScheduledTask",
     "ScheduledTaskRun",
-    "SessionHandoff",
     "SessionPeerMessage",
     "SessionPermission",
     "SessionResourceView",

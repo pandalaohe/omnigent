@@ -13,6 +13,7 @@ import asyncio
 import logging
 import secrets
 from dataclasses import dataclass
+from typing import Any
 
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
@@ -286,3 +287,49 @@ async def list_worktrees_on_host(
     if not isinstance(worktrees, list):
         raise WorktreeProxyError("host returned an incomplete worktree list")
     return worktrees
+
+
+def match_worktree_branch(
+    worktrees: list[dict[str, Any]] | None,
+    branch: str | None,
+) -> str | None:
+    """Return the path of the worktree checking out *branch*, or ``None``.
+
+    The branch-match rule for cross-host member placement (F2b): a session's
+    branch maps to the worktree on the target host that has it checked out.
+    ``list_worktrees_and_match_branch`` applies it to a fresh listing.
+
+    :param worktrees: Host worktree rows (``path`` / ``branch`` / …), or
+        ``None`` when the listing was skipped or failed best-effort.
+    :param branch: Branch to match, or ``None`` for no match.
+    :returns: The matching worktree's path, or ``None``.
+    """
+    if not branch or worktrees is None:
+        return None
+    match = next((w for w in worktrees if w.get("branch") == branch), None)
+    return str(match["path"]) if match and match.get("path") is not None else None
+
+
+async def list_worktrees_and_match_branch(
+    *,
+    host_registry: Any,
+    host_conn: Any,
+    repo_path: str,
+    branch: str | None,
+) -> tuple[list[dict[str, object]], str | None]:
+    """List a host repository's worktrees and match *branch* in one step.
+
+    Cross-host member placement (F2b) uses the listing and the branch-match
+    rule together, so both exist once.
+
+    :param host_registry: Server host registry (frame transport).
+    :param host_conn: Live host connection to list on.
+    :param repo_path: Absolute repository path on the host.
+    :param branch: Branch to match, or ``None`` for no match.
+    :returns: ``(worktrees, matched_path)``.
+    :raises WorktreeProxyError: When the host reports a listing failure.
+    """
+    worktrees = await list_worktrees_on_host(
+        host_registry=host_registry, host_conn=host_conn, repo_path=repo_path
+    )
+    return worktrees, match_worktree_branch(worktrees, branch)

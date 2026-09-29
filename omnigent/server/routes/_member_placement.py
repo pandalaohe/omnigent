@@ -22,12 +22,12 @@ from omnigent.server.project_placement import (
     load_entries,
     root_on_host,
 )
+from omnigent.server.routes import _host_worktree
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._host_worktree import (
     WorktreeHostUnavailableError,
     WorktreeProxyError,
 )
-from omnigent.server.routes.sessions.routes_handoff import list_worktrees_and_match_branch
 
 _logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ async def resolve_member_worktree_on_host(
             code=ErrorCode.CONFLICT,
         )
     try:
-        _worktrees, matched = await list_worktrees_and_match_branch(
+        _worktrees, matched = await _host_worktree.list_worktrees_and_match_branch(
             host_registry=host_registry,
             host_conn=host_conn,
             repo_path=repository,

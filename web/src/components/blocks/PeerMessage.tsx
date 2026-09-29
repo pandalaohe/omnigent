@@ -22,13 +22,7 @@ export function PeerMessageView({ message }: PeerMessageViewProps) {
   const badge = [truncateTitle(message.title), message.agent, message.projectId]
     .filter((part): part is string => Boolean(part))
     .join(" · ");
-  const label = message.handoff
-    ? message.handoff.kind === "brief"
-      ? `Hand-off · project ${message.handoff.project} · from ${badge}`
-      : message.handoff.kind === "result"
-        ? `Hand-off result · ${message.handoff.status} · from ${badge}`
-        : `Hand-off · stop requested · from ${badge}`
-    : `From session ${badge}`;
+  const label = `From session ${badge}`;
   return (
     <Message
       from="user"

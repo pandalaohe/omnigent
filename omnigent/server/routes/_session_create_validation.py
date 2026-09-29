@@ -99,7 +99,7 @@ async def resolve_create_calling(
         / ``model_override`` / ``reasoning_effort``.
     :param explicit_fields: The subset of those keys the request supplied.
     :param path_label: The create path named in the library-agent refusal,
-        e.g. ``"hand-off"``.
+        e.g. ``"session_create"``.
     :param parent_session_id: The caller's parent session, named when a child
         has no project and no default agent.
     :returns: The resolved calling triple.
@@ -153,7 +153,7 @@ async def resolve_create_calling_stores(
         / ``model_override`` / ``reasoning_effort``.
     :param explicit_fields: The subset of those keys the request supplied.
     :param path_label: The create path named in the library-agent refusal,
-        e.g. ``"hand-off"``.
+        e.g. ``"session_create"``.
     :param parent_session_id: The caller's parent session, named when a child
         has no project and no default agent.
     :param host_store: Host registrations for the readiness check, or

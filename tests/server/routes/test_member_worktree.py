@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_READ, UnifiedAuthProvider
-from omnigent.server.routes import _member_placement
+from omnigent.server.routes import _host_worktree
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._host_worktree import (
     WorktreeHostUnavailableError,
@@ -130,7 +130,7 @@ async def _resolve(
         match = next((str(w["path"]) for w in rows if w.get("branch") == branch), None)
         return rows, match
 
-    monkeypatch.setattr(_member_placement, "list_worktrees_and_match_branch", _fake_list)
+    monkeypatch.setattr(_host_worktree, "list_worktrees_and_match_branch", _fake_list)
     return await resolve_member_worktree_on_host(
         conversation=conversation,
         host_id=_HOST_B,
@@ -334,7 +334,7 @@ async def member_worktree_app(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> A
         rows = [{"branch": _BRANCH, "path": _WORKTREE}]
         return rows, _WORKTREE
 
-    monkeypatch.setattr(_member_placement, "list_worktrees_and_match_branch", _fake_list)
+    monkeypatch.setattr(_host_worktree, "list_worktrees_and_match_branch", _fake_list)
     return app, lead.id
 
 
@@ -375,7 +375,7 @@ async def test_route_reports_a_missing_worktree(
     async def _no_match(*, host_registry: Any, host_conn: Any, repo_path: str, branch: str) -> Any:
         return [{"branch": "other", "path": "/host-b/repo/.worktrees/other"}], None
 
-    monkeypatch.setattr(_member_placement, "list_worktrees_and_match_branch", _no_match)
+    monkeypatch.setattr(_host_worktree, "list_worktrees_and_match_branch", _no_match)
     response = await _get_member_worktree(app, session_id, _HOST_B)
 
     assert response.status_code == 400, response.text
@@ -426,7 +426,7 @@ async def test_route_refuses_a_foreign_host(db_uri: str, monkeypatch: pytest.Mon
     async def _fail_list(**kwargs: Any) -> Any:
         raise AssertionError("the host must not be contacted for a foreign host")
 
-    monkeypatch.setattr(_member_placement, "list_worktrees_and_match_branch", _fail_list)
+    monkeypatch.setattr(_host_worktree, "list_worktrees_and_match_branch", _fail_list)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"

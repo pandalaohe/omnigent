@@ -48,7 +48,6 @@ from omnigent.tools.builtins import (
     any_skill_has_resources,
     get_builtin_tool,
 )
-from omnigent.tools.builtins.handoff import SysHandoffReportTool, SysSessionHandoffTool
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
 
@@ -529,10 +528,6 @@ class ToolManager:
             self._tools[SysSessionShareTool.name()] = SysSessionShareTool(
                 allow_public=self._spec.agent_session_sharing is SharePolicy.PUBLIC,
             )
-
-        if self._peer_messaging_enabled:
-            self._tools[SysSessionHandoffTool.name()] = SysSessionHandoffTool()
-            self._tools[SysHandoffReportTool.name()] = SysHandoffReportTool()
 
         # send + close: opt-in via declared sub-agents or spawn: true.
         # The peer-messaging flag makes every session a peer sender: with
