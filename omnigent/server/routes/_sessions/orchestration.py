@@ -383,6 +383,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
+from omnigent.server.session_collab import stamp_default_inbound
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -10631,6 +10632,13 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    await asyncio.to_thread(
+        stamp_default_inbound,
+        initial_labels,
+        parent_session_id=body.parent_session_id,
+        prefs_store=getattr(request.app.state, "user_preferences_store", None),
+        owner=user_id,
+    )
     if native_agent is not None:
         initial_labels.update(native_agent.presentation_labels)
     elif (

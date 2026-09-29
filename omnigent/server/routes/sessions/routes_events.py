@@ -3108,6 +3108,12 @@ def register_events_routes(
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                     runner_router=runner_router,
                 )
+        # A flipped collaboration setting re-sends the session-init envelope
+        # before this forward.
+        if not _runner_needs_session_init and body.type in ("message", _SLASH_COMMAND_TYPE):
+            initializer = getattr(request.app.state, "runner_session_initializer", None)
+            if initializer is not None and await initializer.peer_flag_stale(conv, runner_client):
+                _runner_needs_session_init = True
         native_terminal_ready = False
         if _runner_needs_session_init:
             # The runner was unavailable when this request began, so its

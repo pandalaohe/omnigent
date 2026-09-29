@@ -34,6 +34,7 @@ from omnigent.server.routes._session_create_validation import (
     CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
 )
 from omnigent.server.schemas import CreatedSessionResponse, SessionCreateMetadata
+from omnigent.server.session_collab import stamp_default_inbound
 
 # Saved library Agent ids are minted as ``ca_<uuid>`` by the custom-agents
 # route; the web picker keys the same prefix. Nothing else starts with it.
@@ -164,6 +165,7 @@ async def launch_library_agent(
     launch: LibraryAgentLaunch,
     project_config: dict | None = None,
     master: dict | None = None,
+    preferences_store: Any | None = None,
 ) -> CreatedSessionResponse:
     """Create a session-scoped copy of an owner's saved Agent bundle.
 
@@ -184,6 +186,8 @@ async def launch_library_agent(
         supplies unset member values. ``None`` skips the project layers.
     :param master: The owner's ``calling_defaults`` master table. ``None``
         skips the master layer.
+    :param preferences_store: Preferences store holding the owner's
+        session-collaboration settings, or ``None`` for the defaults.
     :returns: The created session and its session-scoped agent id.
     :raises OmnigentError: ``NOT_FOUND`` when the owner's Agent or its bundle
         is gone.
@@ -241,6 +245,13 @@ async def launch_library_agent(
         )
     )
 
+    await asyncio.to_thread(
+        stamp_default_inbound,
+        labels,
+        parent_session_id=None,
+        prefs_store=preferences_store,
+        owner=owner,
+    )
     metadata = SessionCreateMetadata(
         title=launch.title,
         labels=labels,

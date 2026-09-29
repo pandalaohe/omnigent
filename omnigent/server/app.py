@@ -142,6 +142,7 @@ from omnigent.server.schemas import (
     UserPreferenceNamespacePatchRequest,
     UserPreferencesEnvelope,
 )
+from omnigent.server.session_collab import session_peer_enabled
 from omnigent.server.user_preferences_store import (
     USER_PREFERENCE_NAMESPACES,
     USER_PREFERENCES_MAX_BYTES,
@@ -1692,6 +1693,13 @@ def create_app(
         server_version=_server_version(),
         project_assignments_enabled=resolved_feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS),
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
+        peer_messaging_resolver=partial(
+            session_peer_enabled,
+            flag_on=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            prefs_store=user_preferences_store,
+        ),
         conversation_store=conversation_store,
         file_store=file_store,
     )

@@ -230,6 +230,7 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     UpdateSessionRequest,
 )
+from omnigent.server.session_collab import stamp_default_inbound
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -685,6 +686,14 @@ def register_core_routes(
                 # Blocking store read; inside the try so a read failure still
                 # falls back to the id-only body.
                 global_instructions = await asyncio.to_thread(current_global_instructions_text)
+                # Prefer the initializer's owner-aware snapshot; embedded
+                # builds without one keep the deployment flag.
+                initializer = getattr(request.app.state, "runner_session_initializer", None)
+                peer_messaging_enabled = (
+                    await initializer.resolve_peer_messaging(conv)
+                    if initializer is not None
+                    else request.app.state.feature_flags.enabled(Feature.SESSION_PEER_MESSAGING)
+                )
                 init_body = build_runner_session_init_payload(
                     conv,
                     server_version=VERSION,
@@ -692,9 +701,7 @@ def register_core_routes(
                     project_assignments_enabled=request.app.state.feature_flags.enabled(
                         Feature.PROJECT_ASSIGNMENTS
                     ),
-                    peer_messaging_enabled=request.app.state.feature_flags.enabled(
-                        Feature.SESSION_PEER_MESSAGING
-                    ),
+                    peer_messaging_enabled=peer_messaging_enabled,
                     global_instructions=global_instructions,
                 )
             except Exception:
@@ -1193,6 +1200,16 @@ def register_core_routes(
             parsed_metadata = parsed_metadata.model_copy(
                 update={"labels": {**parsed_metadata.labels, **member_labels}}
             )
+        stamped_labels = dict(parsed_metadata.labels or {})
+        await asyncio.to_thread(
+            stamp_default_inbound,
+            stamped_labels,
+            parent_session_id=parsed_metadata.parent_session_id,
+            prefs_store=getattr(request.app.state, "user_preferences_store", None),
+            owner=user_id,
+        )
+        if stamped_labels != (parsed_metadata.labels or {}):
+            parsed_metadata = parsed_metadata.model_copy(update={"labels": stamped_labels})
         with creation_stage("create_persistence_ms"):
             result = await asyncio.to_thread(
                 _create_session_from_bundle,

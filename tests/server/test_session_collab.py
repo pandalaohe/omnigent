@@ -1,0 +1,495 @@
+"""Tests for per-owner session-collaboration settings enforcement (SCC15).
+
+The peer-route cases ride on ``test_peer_messages.py``'s app fixture with a
+real preferences store attached; the initializer cases drive a fake runner
+client counting session-init POSTs; the stamp cases are unit reads against
+a seeded store.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import uuid
+from typing import Any
+
+import httpx
+import pytest
+
+from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.session_collab import (
+    COLLAB_DISABLED_MESSAGE,
+    collab_owner_for,
+    require_collab_enabled,
+    session_peer_enabled,
+    stamp_default_inbound,
+)
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+# Imported so pytest registers the fixture; collab_env requests it by name.
+from tests.server.routes.test_peer_messages import (
+    ALICE,
+    _seed_trigger_depth,
+    peer_env,  # noqa: F401
+)
+
+SESSION_COLLAB = "session_collab"
+
+
+@pytest.fixture()
+def collab_env(request: pytest.FixtureRequest, db_uri: str) -> dict[str, Any]:
+    """Peer-messaging app whose routes read a real preferences store."""
+    env: dict[str, Any] = request.getfixturevalue("peer_env")
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    env["app"].state.user_preferences_store = store
+    env["prefs_store"] = store
+    return env
+
+
+def _conversation(**overrides: Any) -> Conversation:
+    values: dict[str, Any] = {
+        "id": "conv_collab",
+        "created_at": 1,
+        "updated_at": 2,
+        "root_conversation_id": "conv_collab",
+        "agent_id": "agent_collab",
+        "runner_id": "runner_collab",
+    }
+    values.update(overrides)
+    return Conversation(**values)
+
+
+# ── peer route: rows 0 and 2–6 per owner ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_relay_depth_max_is_per_owner(collab_env: dict[str, Any]) -> None:
+    """A stored depth 3 holds the 4th hop; the default would deliver it."""
+    sender, receiver = collab_env["sender"], collab_env["receiver"]
+    collab_env["prefs_store"].patch_namespace(ALICE, SESSION_COLLAB, {"relayDepthMax": 3})
+    _seed_trigger_depth(collab_env, 3)
+
+    result = await collab_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text=f"relay hop {uuid.uuid4().hex}",
+        correlation_id=None,
+    )
+
+    assert result["disposition"] == "held"
+    assert result["reason"] == "relay_limit"
+    held = collab_env["peer_store"].get(result["peer_id"])
+    assert held is not None and held.state == "held" and held.relay_depth == 4
+
+
+@pytest.mark.asyncio
+async def test_defaults_apply_without_a_namespace(collab_env: dict[str, Any]) -> None:
+    """An empty store equals today's constants: depth 30 delivers, 31 holds."""
+    sender, receiver = collab_env["sender"], collab_env["receiver"]
+    _seed_trigger_depth(collab_env, 29)
+    delivered = await collab_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text=f"at limit {uuid.uuid4().hex}",
+        correlation_id=None,
+    )
+    assert delivered["disposition"] == "delivered"
+
+    _seed_trigger_depth(collab_env, 30)
+    held = await collab_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text=f"over limit {uuid.uuid4().hex}",
+        correlation_id=None,
+    )
+    assert held["disposition"] == "held"
+    assert held["reason"] == "relay_limit"
+
+
+@pytest.mark.asyncio
+async def test_pair_rate_count_is_per_owner(collab_env: dict[str, Any]) -> None:
+    """A stored pair budget of 2 queues the third send in the window."""
+    sender, receiver = collab_env["sender"], collab_env["receiver"]
+    collab_env["prefs_store"].patch_namespace(ALICE, SESSION_COLLAB, {"pairRateCount": 2})
+
+    dispositions = []
+    for _ in range(3):
+        result = await collab_env["app"].state.peer_send(
+            sender=sender,
+            receiver_id=receiver.id,
+            text=f"pair {uuid.uuid4().hex}",
+            correlation_id=None,
+        )
+        dispositions.append((result["disposition"], result["reason"]))
+
+    assert dispositions[:2] == [("delivered", None), ("delivered", None)]
+    assert dispositions[2] == ("queued", "rate_delay")
+
+
+@pytest.mark.asyncio
+async def test_undelivered_ttl_is_per_owner(collab_env: dict[str, Any]) -> None:
+    """A busy receiver's queued record expires on the owner's stamp."""
+    sender, receiver = collab_env["sender"], collab_env["receiver"]
+    collab_env["prefs_store"].patch_namespace(
+        ALICE, SESSION_COLLAB, {"undeliveredTtlSeconds": 3600}
+    )
+    sessions_module._session_status_cache[receiver.id] = "running"
+    try:
+        result = await collab_env["app"].state.peer_send(
+            sender=sender,
+            receiver_id=receiver.id,
+            text=f"busy ttl {uuid.uuid4().hex}",
+            correlation_id=None,
+        )
+    finally:
+        sessions_module._session_status_cache.pop(receiver.id, None)
+
+    assert result["disposition"] == "queued"
+    record = collab_env["peer_store"].get(result["peer_id"])
+    assert record is not None
+    assert record.expires_at - record.created_at == 3600
+
+
+@pytest.mark.asyncio
+async def test_master_off_refuses_sends_but_not_system(collab_env: dict[str, Any]) -> None:
+    """A disabled owner gets collab_disabled; a runtime notice still lands."""
+    sender, receiver = collab_env["sender"], collab_env["receiver"]
+    collab_env["prefs_store"].patch_namespace(ALICE, SESSION_COLLAB, {"enabled": False})
+
+    refused = await collab_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text=f"never sent {uuid.uuid4().hex}",
+        correlation_id=None,
+    )
+    assert refused["disposition"] == "refused"
+    assert refused["reason"] == "collab_disabled"
+    assert refused["peer_id"] is None
+    assert refused["receiver"]["id"] == receiver.id
+
+    system = await collab_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text=f"required result {uuid.uuid4().hex}",
+        correlation_id=None,
+        system=True,
+    )
+    assert system["disposition"] == "delivered"
+
+
+# ── session_collab helpers ──────────────────────────────────────────
+
+
+def test_collab_owner_for_prefers_the_grant_then_the_fallback() -> None:
+    """Without a permission store the fallback user or the local user wins."""
+    conversation = _conversation()
+
+    assert collab_owner_for(conversation, None, None) == RESERVED_USER_LOCAL  # type: ignore[arg-type]
+    assert (
+        collab_owner_for(  # type: ignore[arg-type]
+            conversation, None, None, fallback_user="alice@example.com"
+        )
+        == "alice@example.com"
+    )
+
+
+def test_session_peer_enabled_reads_the_owner_switch(db_uri: str) -> None:
+    """The stored master switch governs the snapshot for the local owner."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    conversation = _conversation()
+
+    assert (
+        session_peer_enabled(
+            conversation,
+            flag_on=True,
+            conversation_store=None,  # type: ignore[arg-type]
+            permission_store=None,
+            prefs_store=store,
+        )
+        is True
+    )
+
+    store.patch_namespace(RESERVED_USER_LOCAL, SESSION_COLLAB, {"enabled": False})
+    assert (
+        session_peer_enabled(
+            conversation,
+            flag_on=True,
+            conversation_store=None,  # type: ignore[arg-type]
+            permission_store=None,
+            prefs_store=store,
+        )
+        is False
+    )
+    # The deployment flag off always wins, whatever the store says.
+    assert (
+        session_peer_enabled(
+            conversation,
+            flag_on=False,
+            conversation_store=None,  # type: ignore[arg-type]
+            permission_store=None,
+            prefs_store=store,
+        )
+        is False
+    )
+
+
+def test_session_peer_enabled_fails_open_to_the_flag() -> None:
+    """A store error keeps today's behaviour instead of dropping collaboration."""
+    conversation = _conversation()
+
+    class _RaisingStore:
+        def get(self, user_id: str) -> None:
+            raise RuntimeError("preferences backend down")
+
+    assert (
+        session_peer_enabled(
+            conversation,
+            flag_on=True,
+            conversation_store=None,  # type: ignore[arg-type]
+            permission_store=None,
+            prefs_store=_RaisingStore(),  # type: ignore[arg-type]
+        )
+        is True
+    )
+    assert (
+        session_peer_enabled(
+            conversation,
+            flag_on=False,
+            conversation_store=None,  # type: ignore[arg-type]
+            permission_store=None,
+            prefs_store=_RaisingStore(),  # type: ignore[arg-type]
+        )
+        is False
+    )
+
+
+def test_require_collab_enabled_refuses_with_the_settings_message(db_uri: str) -> None:
+    """The master switch off raises FORBIDDEN naming Settings."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(ALICE, SESSION_COLLAB, {"enabled": False})
+
+    with pytest.raises(OmnigentError) as error:
+        require_collab_enabled(store, ALICE)
+
+    assert error.value.code == ErrorCode.FORBIDDEN
+    assert error.value.message == COLLAB_DISABLED_MESSAGE
+
+    store.patch_namespace(ALICE, SESSION_COLLAB, {"enabled": True})
+    assert require_collab_enabled(store, ALICE).enabled is True
+    assert require_collab_enabled(None, ALICE).enabled is True
+
+
+@pytest.mark.parametrize("disposition", ["hold", "refuse"])
+def test_stamp_default_inbound_stamps_non_accept(db_uri: str, disposition: str) -> None:
+    """hold / refuse become a peer_inbound label on a new top-level create."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(ALICE, SESSION_COLLAB, {"defaultInbound": disposition})
+    labels: dict[str, str] = {"example": "value"}
+
+    stamp_default_inbound(labels, parent_session_id=None, prefs_store=store, owner=ALICE)
+
+    assert labels == {"example": "value", "peer_inbound": disposition}
+
+
+def test_stamp_default_inbound_skips_accept_children_and_explicit_labels(db_uri: str) -> None:
+    """Accept stamps nothing; a child or an explicit label is left alone."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(ALICE, SESSION_COLLAB, {"defaultInbound": "refuse"})
+
+    accept_store = SqlAlchemyUserPreferencesStore(db_uri)
+    accept_store.patch_namespace(ALICE, SESSION_COLLAB, {"defaultInbound": "accept"})
+    accepted: dict[str, str] = {}
+    stamp_default_inbound(accepted, parent_session_id=None, prefs_store=accept_store, owner=ALICE)
+    assert accepted == {}
+
+    child: dict[str, str] = {}
+    stamp_default_inbound(child, parent_session_id="conv_parent", prefs_store=store, owner=ALICE)
+    assert child == {}
+
+    explicit: dict[str, str] = {"peer_inbound": "accept"}
+    stamp_default_inbound(explicit, parent_session_id=None, prefs_store=store, owner=ALICE)
+    assert explicit == {"peer_inbound": "accept"}
+
+    no_store: dict[str, str] = {}
+    stamp_default_inbound(no_store, parent_session_id=None, prefs_store=None, owner=ALICE)
+    assert no_store == {}
+
+    no_owner: dict[str, str] = {}
+    stamp_default_inbound(no_owner, parent_session_id=None, prefs_store=store, owner=None)
+    assert no_owner == {}
+
+
+# ── forward path: a flipped switch re-inits before dispatch ─────────
+
+
+@pytest.mark.asyncio
+async def test_message_forward_reinits_when_peer_flag_is_stale(
+    client: httpx.AsyncClient, app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale snapshot re-sends the init envelope ahead of the forward."""
+    from omnigent.server.routes._sessions.helpers import _SessionEventDispatchResult
+    from omnigent.server.routes.sessions import routes_events as routes_events_module
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(client)
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    order: list[str] = []
+
+    class _Initializer:
+        async def peer_flag_stale(self, conversation: Any, runner_client: Any) -> bool:
+            order.append("stale")
+            return True
+
+    app.state.runner_session_initializer = _Initializer()
+
+    async def _fake_runner_client(*_args: Any, **_kwargs: Any) -> Any:
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={}))
+        )
+
+    async def _fake_ensure_initialized(*_args: Any, **_kwargs: Any) -> bool:
+        order.append("init")
+        return True
+
+    async def _fake_dispatch(*_args: Any, **_kwargs: Any) -> Any:
+        order.append("dispatch")
+        return _SessionEventDispatchResult(item_id=None, pending_id=None)
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _fake_runner_client)
+    monkeypatch.setattr(
+        routes_events_module, "_ensure_runner_session_initialized", _fake_ensure_initialized
+    )
+    monkeypatch.setattr(routes_events_module, "_dispatch_session_event_to_runner", _fake_dispatch)
+
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert order == ["stale", "init", "dispatch"]
+
+
+# ── initializer: applied-flag tracking and stale check ──────────────
+
+
+class _Registry:
+    def __init__(self) -> None:
+        self.connection: object | None = object()
+
+    def get(self, _runner_id: str) -> object | None:
+        return self.connection
+
+
+class _RecordingClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def post(self, _path: str, **kwargs: Any) -> httpx.Response:
+        self.calls.append(kwargs["json"])
+        return httpx.Response(201, json={"status": "initialized"})
+
+
+def _peer_flag(payload: dict[str, Any]) -> bool:
+    return bool(payload["session_init"]["snapshot"]["peer_messaging_enabled"])
+
+
+@pytest.mark.asyncio
+async def test_resolve_peer_messaging_defaults_to_the_static_flag() -> None:
+    """Embedded initializers without a resolver keep the constructed value."""
+    conversation = _conversation()
+    on = RunnerSessionInitializer(_Registry(), server_version="test", peer_messaging_enabled=True)  # type: ignore[arg-type]
+    off = RunnerSessionInitializer(_Registry(), server_version="test")  # type: ignore[arg-type]
+
+    assert await on.resolve_peer_messaging(conversation) is True
+    assert await off.resolve_peer_messaging(conversation) is False
+
+
+@pytest.mark.asyncio
+async def test_initializer_reposts_on_each_peer_flag_flip() -> None:
+    """on → off → on re-posts each time; a matching state hits the memo."""
+    state = {"enabled": True}
+    initializer = RunnerSessionInitializer(
+        _Registry(),  # type: ignore[arg-type]
+        server_version="test",
+        peer_messaging_resolver=lambda _conv: state["enabled"],
+    )
+    conversation = _conversation()
+    client = _RecordingClient()
+
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 1
+    assert _peer_flag(client.calls[0]) is True
+    assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
+
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 1, "a matching state must reuse the memo"
+
+    state["enabled"] = False
+    assert await initializer.peer_flag_stale(conversation, client) is True  # type: ignore[arg-type]
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 2
+    assert _peer_flag(client.calls[1]) is False
+
+    state["enabled"] = True
+    assert await initializer.peer_flag_stale(conversation, client) is True  # type: ignore[arg-type]
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 3
+    assert _peer_flag(client.calls[2]) is True
+    assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_peer_flag_stale_needs_an_applied_value() -> None:
+    """No successful post in this generation — or no runner — is never stale."""
+    initializer = RunnerSessionInitializer(
+        _Registry(),  # type: ignore[arg-type]
+        server_version="test",
+        peer_messaging_resolver=lambda _conv: False,
+    )
+    conversation = _conversation()
+    client = _RecordingClient()
+
+    assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
+
+    initializer.invalidate_session(conversation.id)
+    assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
+
+    unbound = dataclasses.replace(conversation, runner_id=None)
+    assert await initializer.peer_flag_stale(unbound, client) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_invalidation_forgets_the_applied_peer_value() -> None:
+    """Dropped readiness also drops the applied snapshot for that scope."""
+    state = {"enabled": True}
+    initializer = RunnerSessionInitializer(
+        _Registry(),  # type: ignore[arg-type]
+        server_version="test",
+        peer_messaging_resolver=lambda _conv: state["enabled"],
+    )
+    conversation = _conversation()
+    client = _RecordingClient()
+
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert initializer._applied_peer
+
+    initializer.invalidate_runner(conversation.runner_id or "")
+    assert not initializer._applied_peer
+
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    state["enabled"] = False
+    initializer.invalidate_session(conversation.id)
+    assert not initializer._applied_peer
+    assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]

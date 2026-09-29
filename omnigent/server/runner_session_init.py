@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -91,6 +92,7 @@ class RunnerSessionInitializer:
         server_version: str,
         project_assignments_enabled: bool = False,
         peer_messaging_enabled: bool = False,
+        peer_messaging_resolver: Callable[[Conversation], bool] | None = None,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
     ) -> None:
@@ -98,6 +100,7 @@ class RunnerSessionInitializer:
         self._server_version = server_version
         self._project_assignments_enabled = project_assignments_enabled
         self._peer_messaging_enabled = peer_messaging_enabled
+        self._peer_messaging_resolver = peer_messaging_resolver
         self._conversation_store = conversation_store
         self._file_store = file_store
         self._tasks: dict[
@@ -105,6 +108,23 @@ class RunnerSessionInitializer:
             asyncio.Task[httpx.Response],
         ] = {}
         self._recovery_ids: dict[_SessionInitKey, str] = {}
+        # What each successful post carried, per (runner, generation, session):
+        # a resolved value that differs means the init must be re-posted.
+        self._applied_peer: dict[tuple[str, int, str], bool] = {}
+
+    async def resolve_peer_messaging(self, conversation: Conversation) -> bool:
+        """Resolve the peer-messaging snapshot for one session.
+
+        The resolver reads the owner's master switch; a blocking store read,
+        so it runs in a thread. Without a resolver the constructed flag wins
+        (embedded/test transports and flag-off deployments).
+
+        :param conversation: The session being initialized.
+        :returns: Whether the runner should expose peer messaging.
+        """
+        if self._peer_messaging_resolver is None:
+            return self._peer_messaging_enabled
+        return await asyncio.to_thread(self._peer_messaging_resolver, conversation)
 
     async def initialize(
         self,
@@ -126,6 +146,8 @@ class RunnerSessionInitializer:
         # identity fallback keeps embedded/test transports usable without
         # weakening the real tunnel-generation key.
         generation = id(connection) if connection is not None else id(runner_client)
+        peer = await self.resolve_peer_messaging(conversation)
+        pkey = (runner_id, generation, conversation.id)
         effective_archive_states = archive_states or [runner_archive_state(conversation)]
         archive_key = tuple(
             (state.scope_id, state.revision, state.archived) for state in effective_archive_states
@@ -140,6 +162,18 @@ class RunnerSessionInitializer:
             resume_interrupted_turn,
         )
         task = self._tasks.get(key)
+        if (
+            task is not None
+            and task.done()
+            and not task.cancelled()
+            and task.exception() is None
+            and self._applied_peer.get(pkey) is not None
+            and self._applied_peer[pkey] != peer
+        ):
+            # A flipped collaboration switch invalidates the cached success:
+            # drop it so this call posts a fresh envelope.
+            self._tasks.pop(key, None)
+            task = None
         if task is None:
             recovery_id = (
                 self._recovery_ids.setdefault(key, uuid4().hex)
@@ -157,7 +191,7 @@ class RunnerSessionInitializer:
                     suppress_recovery_turn=suppress_recovery_turn,
                     archive_states=effective_archive_states,
                     project_assignments_enabled=self._project_assignments_enabled,
-                    peer_messaging_enabled=self._peer_messaging_enabled,
+                    peer_messaging_enabled=peer,
                     global_instructions=await asyncio.to_thread(current_global_instructions_text),
                     resume_interrupted_turn=resume_interrupted_turn,
                     recovery_id=recovery_id,
@@ -181,13 +215,16 @@ class RunnerSessionInitializer:
                             host_registry=None,
                             tunnel_registry=self._registry,
                         )
-                return await self._post_initialize(
+                response = await self._post_initialize(
                     runner_client,
                     session_id=conversation.id,
                     runner_id=runner_id,
                     payload=payload,
                     timeout=timeout,
                 )
+                if 200 <= response.status_code < 300:
+                    self._applied_peer[pkey] = peer
+                return response
 
             task = asyncio.create_task(
                 post_session_init(),
@@ -227,12 +264,41 @@ class RunnerSessionInitializer:
             self._tasks.pop(key, None)
         return response
 
+    async def peer_flag_stale(
+        self,
+        conversation: Conversation,
+        runner_client: httpx.AsyncClient,
+    ) -> bool:
+        """Whether the current tunnel generation carries an outdated flag.
+
+        Only a successful post in this generation counts: a session whose
+        runner just connected, or whose init is still in flight, reports not
+        stale and picks the value up through its normal initialization.
+
+        :param conversation: The session being initialized.
+        :param runner_client: The runner client this request would post to.
+        :returns: ``True`` when the applied snapshot differs from the
+            currently resolved one.
+        """
+        runner_id = conversation.runner_id
+        if runner_id is None:
+            return False
+        connection = self._registry.get(runner_id)
+        generation = id(connection) if connection is not None else id(runner_client)
+        applied = self._applied_peer.get((runner_id, generation, conversation.id))
+        if applied is None:
+            return False
+        return applied != await self.resolve_peer_messaging(conversation)
+
     def invalidate_session(self, session_id: str) -> None:
         """A new binding needs fresh readiness and a new continuation identity."""
         for key in list(self._tasks.keys() | self._recovery_ids.keys()):
             if key[2] == session_id:
                 self._tasks.pop(key, None)
                 self._recovery_ids.pop(key, None)
+        for pkey in list(self._applied_peer):
+            if pkey[2] == session_id:
+                self._applied_peer.pop(pkey, None)
 
     async def _post_initialize(
         self,
@@ -282,3 +348,6 @@ class RunnerSessionInitializer:
             task = self._tasks.pop(key)
             if not task.done():
                 task.cancel()
+        for pkey in list(self._applied_peer):
+            if pkey[0] == runner_id:
+                self._applied_peer.pop(pkey)

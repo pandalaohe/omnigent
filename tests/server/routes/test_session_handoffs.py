@@ -20,6 +20,7 @@ from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes.sessions.routes_handoff import register_handoff_routes
 from omnigent.server.routes.sessions.routes_peer import register_peer_routes
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
@@ -38,6 +39,21 @@ ALICE = "alice@example.com"
 
 @pytest.fixture()
 def handoff_env(db_uri: str) -> dict[str, Any]:
+    return _build_handoff_env(db_uri, preferences_store=None)
+
+
+@pytest.fixture()
+def handoff_collab_env(db_uri: str) -> dict[str, Any]:
+    """Hand-off app wired with a per-owner session-collaboration store."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    env = _build_handoff_env(db_uri, preferences_store=store)
+    env["prefs_store"] = store
+    return env
+
+
+def _build_handoff_env(
+    db_uri: str, *, preferences_store: SqlAlchemyUserPreferencesStore | None
+) -> dict[str, Any]:
     agents = SqlAlchemyAgentStore(db_uri)
     agent_id = generate_agent_id()
     agents.create(agent_id, "test-agent", "test:///bundle")
@@ -78,6 +94,8 @@ def handoff_env(db_uri: str) -> dict[str, Any]:
     app = FastAPI()
     app.state.peer_message_store = peers
     app.state.host_store = host_store
+    if preferences_store is not None:
+        app.state.user_preferences_store = preferences_store
     bindings_store = SqlAlchemyProjectHostBindingStore(db_uri)
     app.state.project_host_binding_store = bindings_store
     app.state.host_registry = host_registry
@@ -467,6 +485,31 @@ async def test_subagent_cannot_start(handoff_env: dict[str, Any]) -> None:
     assert response.status_code == 200
     assert response.json()["reason"] == "is_subagent"
     assert env["handoffs"].list_for_sender(child.id, 0, 20) == []
+
+
+@pytest.mark.asyncio
+async def test_start_refused_when_collaboration_disabled(
+    handoff_collab_env: dict[str, Any],
+) -> None:
+    """The master switch off turns the start route into a 403 naming Settings."""
+    env = handoff_collab_env
+    env["prefs_store"].patch_namespace(ALICE, "session_collab", {"enabled": False})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=env["app"]), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/handoffs",
+            json={"project": "Target", "task": "Review code"},
+            headers=_headers(env["sender_token"]),
+        )
+    assert response.status_code == 403, response.text
+    assert response.json() == {
+        "error": {
+            "code": "forbidden",
+            "message": "Session collaboration is turned off in Settings > Session collaboration.",
+        }
+    }
+    assert env["handoffs"].list_for_sender(env["sender"].id, 0, 20) == []
 
 
 @pytest.mark.asyncio
