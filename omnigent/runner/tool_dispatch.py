@@ -4670,6 +4670,43 @@ def _open_rate_error(resp: httpx.Response) -> str:
     return json.dumps({"error": "open_rate", "detail": detail})
 
 
+# Placement arguments accepted by ``sys_session_create``'s agent_id mode.
+_PLACEMENT_ARG_KEYS = ("host", "workspace", "project_id", "worktree")
+
+
+async def _child_session_create_refusal(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> str | None:
+    """Return the tool error when the calling session is itself a child (D2).
+
+    Long-lived children are the mother session's job: a child that needs
+    workers uses its harness's own sub-agents, or asks its mother with
+    ``sys_session_send``. The check reads the caller's snapshot (one
+    metadata-only GET) and runs before any create POST; nested named sends
+    create through the server route directly, so they are unaffected.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session id.
+    :returns: The refusal JSON, or ``None`` when the caller is top-level or
+        its snapshot is unreadable (fail open, matching the create path's
+        existing tolerance of a transient lookup hiccup).
+    """
+    snapshot = await _session_snapshot(server_client, conversation_id)
+    if snapshot is None or not _optional_string(snapshot.get("parent_session_id")):
+        return None
+    return json.dumps(
+        {
+            "error": "child_session_create_refused",
+            "message": (
+                "a child session cannot open long-lived child sessions; ask "
+                "your mother session (sys_session_send to your parent) — "
+                "your own harness subagents are unaffected"
+            ),
+        }
+    )
+
+
 async def _execute_session_create(
     args: _JsonObject,
     *,
@@ -4741,6 +4778,25 @@ async def _execute_session_create(
             }
         )
     if has_config_path:
+        # Placement is an agent_id-mode feature: the multipart create carries
+        # only the config bundle and keeps the parent's runner, and its
+        # metadata schema forbids placement extras, so a placement argument
+        # would be silently dropped. Refuse instead.
+        placement_given = sorted(
+            key for key in _PLACEMENT_ARG_KEYS if args.get(key) is not None
+        )
+        if placement_given:
+            return json.dumps(
+                {
+                    "error": "placement_requires_agent_id",
+                    "message": (
+                        "sys_session_create placement arguments "
+                        f"({', '.join(placement_given)}) are supported only with "
+                        "'agent_id'; the 'config_path' create keeps the parent's "
+                        "runner and cannot place the child."
+                    ),
+                }
+            )
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
         if args.get("reasoning_effort") is not None:
@@ -4762,6 +4818,9 @@ async def _execute_session_create(
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
         )
+    refusal = await _child_session_create_refusal(server_client, conversation_id)
+    if refusal is not None:
+        return refusal
     body = _build_session_create_body(
         str(agent_id) if has_agent_id else None,
         conversation_id,
@@ -4934,6 +4993,11 @@ async def _upload_config_bundle(
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
+    # A child caller is refused here, after the local path checks (so a bad
+    # config_path never pays for a server read) and before the create POST.
+    refusal = await _child_session_create_refusal(server_client, conversation_id)
+    if refusal is not None:
+        return refusal
     metadata: _JsonObject = {"parent_session_id": conversation_id}
     title = args.get("title")
     if isinstance(title, str) and title:

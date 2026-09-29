@@ -13122,3 +13122,79 @@ async def test_send_by_session_id_steers_busy_child_without_work_entry(
     assert first.delivered_now is True
     assert second.delivered_now is False
     assert inbox.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_refused_from_a_child_session() -> None:
+    """A child session cannot open long-lived children (D2).
+
+    The refusal is structural and runs before any create POST: a child that
+    needs workers uses its harness's own sub-agents, or asks its mother.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child_caller":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child_caller",
+                    "parent_session_id": "conv_mother",
+                    "agent_id": "ag_x",
+                },
+            )
+        posts.append(request.url.path)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "message": "work"}),
+            server_client=server_client,
+            conversation_id="conv_child_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "child_session_create_refused"
+    assert "ask your mother session" in info["message"]
+    assert posts == [], "a refused child create must not reach the server"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_placement_requires_agent_id(tmp_path: Path) -> None:
+    """Placement arguments with ``config_path`` are refused, not dropped.
+
+    The multipart create keeps the parent's runner and carries no placement
+    fields, so accepting the arguments would silently create the child
+    somewhere other than asked.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: help\n")
+    posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        posts.append(request.url.path)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "workspace": "/srv/ws"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "placement_requires_agent_id"
+    assert "workspace" in info["message"]
+    assert posts == [], "a placement-refused create must not reach the server"
