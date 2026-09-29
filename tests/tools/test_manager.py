@@ -1432,6 +1432,8 @@ def test_session_create_description_discloses_project_membership() -> None:
     assert "`worktree`" in description
     assert "cross-host child on an SDK harness" in description
     assert "never removed automatically" in description
+    # Usage policy lives in Global Instructions, not the tool text.
+    assert "should take its own worktree" not in description
 
 
 def test_session_create_schema_exposes_placement() -> None:
