@@ -4504,7 +4504,14 @@ async def _send_to_descendant_session(
     :param created_by: Human actor, if known.
     :returns: A JSON handle naming the direct parent the result returns to.
     """
-    if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
+    raw_labels = snap_data.get("labels")
+    raw_title = snap_data.get("title")
+    closed_labels = (
+        {key: value for key, value in raw_labels.items() if isinstance(key, str)}
+        if isinstance(raw_labels, dict)
+        else None
+    )
+    if is_session_closed(closed_labels, raw_title if isinstance(raw_title, str) else None):
         return json.dumps(
             {
                 "error": "session_closed",

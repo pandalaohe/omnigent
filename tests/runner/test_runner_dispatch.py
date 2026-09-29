@@ -13985,3 +13985,63 @@ async def test_sys_session_send_descendant_refused_when_switch_off(
 
     assert json.loads(output)["error"] == "session_out_of_tree"
     assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_fast_first_turn_delivers_once_under_its_entry() -> None:
+    """A first turn finishing during the create's message POST delivers once.
+
+    The create registers the work entry before posting the message, so a
+    terminal that lands while the POST is still in flight (modelled by
+    completing the child synchronously in the events handler) maps to that
+    entry: exactly one inbox result, no phantom replacement entry.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id, child_id = "conv_fast_caller", "conv_fast_child"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(
+                201,
+                json={
+                    "id": child_id,
+                    "agent_id": "ag_x",
+                    "agent_name": "worker",
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and path == f"/v1/sessions/{child_id}":
+            return httpx.Response(200, json={"id": child_id, "workspace": "/w"})
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+            # The child completes before the create call regains control.
+            runner_app.mark_subagent_work_terminal(
+                child_id, status="completed", output="fast result"
+            )
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    runner_app._session_inboxes_ref[parent_id] = inbox
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "fast", "message": "go"}),
+                server_client=server_client,
+                conversation_id=parent_id,
+            )
+            entry = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert json.loads(output)["conversation_id"] == child_id
+    assert entry is not None and entry.status == "completed" and entry.delivered
+    assert inbox.qsize() == 1
+    assert inbox.get_nowait()["output"] == "fast result"
