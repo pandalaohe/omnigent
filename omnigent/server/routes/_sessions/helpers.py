@@ -28,7 +28,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass
 from pathlib import PurePath
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, NamedTuple, cast
 
 import httpx
 from fastapi import (
@@ -1746,6 +1746,33 @@ def _ancestor_session_ids(
         seen.add(parent_id)
         current = conv_store.get_conversation(parent_id)
     return ancestors
+
+
+def effective_host_id(
+    conv_store: ConversationStore,
+    conv: Conversation,
+) -> str | None:
+    """
+    Return the first non-null host id at or above *conv*.
+
+    A sub-agent row usually carries no host binding of its own: it runs on
+    the runner its nearest host-bound ancestor is pinned to. Affinity and
+    cross-host decisions must use this effective host rather than the raw
+    row value, or a hostless-row parent under a host-bound root reads as a
+    different host from the child that names that same host.
+
+    :param conv_store: Store used to read conversation ancestor rows.
+    :param conv: Conversation whose effective host is resolved.
+    :returns: The effective host id, or ``None`` when no host is bound at
+        or above *conv* (a hostless local runner).
+    """
+    if conv.host_id is not None:
+        return conv.host_id
+    for ancestor_id in _ancestor_session_ids(conv_store, conv.id):
+        ancestor = conv_store.get_conversation(ancestor_id)
+        if ancestor is not None and ancestor.host_id is not None:
+            return ancestor.host_id
+    return None
 
 
 def _publish_elicitation_request_to_ancestors(
@@ -4994,11 +5021,17 @@ def _publish_child_status_to_parent(session_id: str, status: str | None) -> None
             else:
                 resolved_status = _session_status_cache.get(conv.id) or conv.live_status
         items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
+        from omnigent.runtime._globals import _agent_store
+
+        agent_name, harness = _child_summary_identity(conv, _agent_store, {})
         summary = _child_session_summary_from_conversation(
             conv,
             parent_id,
             _latest_message_preview(items_by_child.get(conv.id, [])),
             cached_status=resolved_status,
+            inherited=_inherited_placement(store, parent_id),
+            agent_name=agent_name,
+            harness=harness,
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -5133,9 +5166,12 @@ def _note_running_edge(session_id: str, previous_status: str | None, status: str
             return
         _session_running_since_cache[session_id] = value
 
-    on_resolved = (
-        _apply if loop is None else lambda value: loop.call_soon_threadsafe(_apply, value)
-    )
+    def on_resolved(value: int) -> None:
+        if loop is None:
+            _apply(value)
+        else:
+            loop.call_soon_threadsafe(_apply, value)
+
     session_live_state.persist_running_since(
         session_id,
         now,
@@ -11303,12 +11339,155 @@ def _child_session_current_task_status_from_cached_status(status: object) -> str
     return None
 
 
+class Placement(NamedTuple):
+    """
+    Effective host / working directory / branch for one session.
+
+    :param host_id: Host that owns the session's working directory, e.g.
+        ``"host_a1b2c3d4"``. ``None`` when neither the session nor any
+        ancestor carries one.
+    :param cwd: Absolute working directory, e.g. ``"/Users/u/project"``.
+        ``None`` when neither the session nor any ancestor carries one.
+    :param git_branch: Branch checked out in :attr:`cwd`'s row. ``None``
+        when that row recorded no branch.
+    """
+
+    host_id: str | None
+    cwd: str | None
+    git_branch: str | None
+
+
+def _inherited_placement(conv_store: ConversationStore, parent_id: str) -> Placement:
+    """
+    Walk a parent chain for the placement one of its rows carries.
+
+    Host and directory resolve independently up the chain: the nearest
+    ancestor with a host supplies the host, the nearest ancestor with a
+    worktree or workspace supplies the directory *and that row's branch
+    together* — a directory never pairs with another row's branch. The
+    visited set stops a corrupted parent pointer from looping.
+
+    :param conv_store: Store used to read the ancestor rows.
+    :param parent_id: The child's parent conversation id, e.g.
+        ``"conv_parent987"``.
+    :returns: The inherited :class:`Placement`; fields stay ``None`` when
+        no ancestor carries them.
+    """
+    host_id: str | None = None
+    cwd: str | None = None
+    git_branch: str | None = None
+    seen: set[str] = set()
+    current_id: str | None = parent_id
+    while current_id and current_id not in seen:
+        if host_id is not None and cwd is not None:
+            break
+        conv = conv_store.get_conversation(current_id)
+        if conv is None:
+            break
+        if host_id is None and conv.host_id:
+            host_id = conv.host_id
+        if cwd is None and (conv.worktree or conv.workspace):
+            cwd = conv.worktree or conv.workspace
+            git_branch = conv.git_branch
+        seen.add(current_id)
+        current_id = conv.parent_conversation_id
+    return Placement(host_id, cwd, git_branch)
+
+
+def _effective_placement(conv: Conversation, inherited: Placement) -> Placement:
+    """
+    Combine a session's own placement with what it inherits.
+
+    The session's own host wins over the inherited host. Its own worktree /
+    workspace wins over the inherited directory, and that directory brings
+    the session's own branch — a directly placed session with no branch
+    reports ``None`` rather than borrowing an ancestor's.
+
+    :param conv: The session whose placement is being resolved.
+    :param inherited: Placement from :func:`_inherited_placement`.
+    :returns: The effective :class:`Placement`.
+    """
+    host_id = conv.host_id or inherited.host_id
+    own_cwd = conv.worktree or conv.workspace
+    if own_cwd:
+        return Placement(host_id, own_cwd, conv.git_branch)
+    return Placement(host_id, inherited.cwd, inherited.git_branch)
+
+
+class _FetchedAgentStore:
+    """
+    Agent store serving one already-fetched row.
+
+    The harness resolver still runs per conversation, but
+    :func:`_child_summary_identity` memoises the bound agent row across one
+    list call; the resolver receives this shim so it reads that row instead
+    of hitting the store once per child.
+    """
+
+    def __init__(self, agent: Agent | None) -> None:
+        self._agent = agent
+
+    def get(self, _agent_id: str) -> Agent | None:
+        return self._agent
+
+
+def _child_summary_identity(
+    conv: Conversation,
+    agent_store: AgentStore | None,
+    memo: dict[str, Agent | None],
+) -> tuple[str | None, str | None]:
+    """
+    Resolve a child's agent name and harness for its rail summary.
+
+    The agent row read is memoised by ``agent_id`` across one list call —
+    many children can share one bound agent. The harness is resolved per
+    conversation because it can differ within one agent row through
+    ``harness_override`` or a bundled sub-agent's own executor; it reads the
+    memoised row so the row fetch does not repeat.
+
+    :param conv: Child conversation row.
+    :param agent_store: Store for the bound agent row; ``None`` falls back
+        to the runtime global, matching :func:`_resolve_harness`.
+    :param memo: Per-call cache mapping ``agent_id`` to its agent row.
+    :returns: ``(agent_name, harness)``; either half is ``None`` when it
+        cannot be resolved. Any resolution failure degrades to
+        ``(None, None)`` rather than failing the list.
+    """
+    try:
+        agent: Agent | None = None
+        if conv.agent_id is not None:
+            if conv.agent_id not in memo:
+                resolved_store = agent_store
+                if resolved_store is None:
+                    from omnigent.runtime._globals import _agent_store
+
+                    resolved_store = _agent_store
+                memo[conv.agent_id] = (
+                    resolved_store.get(conv.agent_id) if resolved_store is not None else None
+                )
+            agent = memo[conv.agent_id]
+        return (
+            agent.name if agent is not None else None,
+            _resolve_harness(conv, agent_store=_FetchedAgentStore(agent)),
+        )
+    except Exception:  # noqa: BLE001 — display fields must not fail the list
+        _logger.debug(
+            "Could not resolve child summary identity",
+            exc_info=True,
+            extra={"session_id": conv.id},
+        )
+        return None, None
+
+
 def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
     last_message_preview: str | None,
     *,
     cached_status: str | None = None,
+    inherited: Placement | None = None,
+    agent_name: str | None = None,
+    harness: str | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -11328,8 +11507,11 @@ def _child_session_summary_from_conversation(
     rows take ``tool`` from their labels instead of the title.
 
     ``busy`` is derived from the relay-fed ``_session_status_cache``
-    (the tasks table has been removed). ``agent_id`` and ``agent_name``
-    are read from the conversation row directly.
+    (the tasks table has been removed). ``agent_id`` is read from the
+    conversation row; ``agent_name`` and ``harness`` come from the
+    caller's identity resolution. Placement fields carry the session's
+    effective host / cwd / branch, combining its own values with what it
+    inherits from its ancestors.
 
     :param conv: A child :class:`Conversation` row
         (``kind="sub_agent"``) from
@@ -11346,6 +11528,13 @@ def _child_session_summary_from_conversation(
         live ``_session_status_cache``; a status-edge publisher passes the
         edge's own value so a burst of transitions fans out one summary per
         edge instead of the latest status repeated.
+    :param inherited: Placement inherited from the parent chain, from
+        :func:`_inherited_placement`. ``None`` means no ancestor
+        placement is known; the session's own values still apply.
+    :param agent_name: Name of the bound agent row, resolved by the
+        caller (memoised per list call). ``None`` when unavailable.
+    :param harness: Canonical harness for this conversation, resolved by
+        the caller per conversation. ``None`` when unavailable.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11382,8 +11571,8 @@ def _child_session_summary_from_conversation(
             # User-added agent: "ui:<agent_name>:<user_label>". Surface the
             # bound agent as ``tool`` and the user's label as ``session_name``
             # so the Agents rail renders it like any other child row.
-            agent_name, _, user_label = tail.partition(":")
-            tool = agent_name
+            title_agent_name, _, user_label = tail.partition(":")
+            tool = title_agent_name
             session_name = user_label
         else:
             tool = head
@@ -11431,6 +11620,7 @@ def _child_session_summary_from_conversation(
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     from omnigent.server.native_subagent_watchdog import native_subagent_activity_unverified
 
+    placement = _effective_placement(conv, inherited or Placement(None, None, None))
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -11441,10 +11631,14 @@ def _child_session_summary_from_conversation(
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         archived=bool(conv.archived),
-        # agent_id comes from the conversation row; agent_name and task_id
-        # are no longer available from the (removed) tasks table.
+        archived_at=conv.archived_at,
         agent_id=conv.agent_id,
-        agent_name=None,
+        agent_name=agent_name,
+        sub_agent_name=conv.sub_agent_name,
+        host_id=placement.host_id,
+        cwd=placement.cwd,
+        git_branch=placement.git_branch,
+        harness=harness,
         current_task_id=None,
         current_task_status=current_task_status,
         busy=busy,
@@ -12342,6 +12536,7 @@ async def _load_model_options_from_host(session_id: str, host_id: str, harness: 
 
 __all__ = [
     "FILE_CONTENT_CACHE_CONTROL",
+    "Placement",
     "SessionLiveness",
     "_HostLaunchAttempt",
     "_NativeTerminalEnsureOutcome",
@@ -12375,6 +12570,7 @@ __all__ = [
     "_canonical_worktree_path",
     "_child_session_current_task_status_from_cached_status",
     "_child_session_summary_from_conversation",
+    "_child_summary_identity",
     "_claude_native_remember_host",
     "_claude_subagent_display_tool",
     "_client_supplied_hook_elicitation_id",
@@ -12395,6 +12591,7 @@ __all__ = [
     "_devin_subagent_labels_from_body",
     "_discovery_key",
     "_dispatch_skill_slash_command_to_runner",
+    "_effective_placement",
     "_emit_server_routing_decision",
     "_error_item_from_sse",
     "_evaluate_output_policy",
@@ -12420,6 +12617,7 @@ __all__ = [
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
     "_if_none_match_matches",
+    "_inherited_placement",
     "_invalidate_runner_backed_snapshot_state",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",
@@ -12582,6 +12780,7 @@ __all__ = [
     "cancel_managed_launch_tasks",
     "cleanup_worktree",
     "configure_elicitation_source_resolver",
+    "effective_host_id",
     "effective_worktree",
     "elicitation_source",
     "prefetch_session_routing_catalogs",

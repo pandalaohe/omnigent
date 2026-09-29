@@ -11,6 +11,7 @@ import {
   readApprovalTimeoutPreferences,
   writeApprovalTimeoutPreferences,
 } from "./approvalTimeoutPreferences";
+import { patchHostColor, readHostColorPreferences } from "./hostColorPreferences";
 
 beforeEach(() => {
   localStorage.clear();
@@ -346,6 +347,89 @@ describe("user preference synchronization", () => {
       expect.objectContaining({
         method: "PATCH",
         body: JSON.stringify({ value: { version: 1, showCodexRateLimits: true } }),
+      }),
+    );
+  });
+
+  it("coalesces host colour picks into one full-map patch with an auto reset", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    patchHostColor("h1", "blue");
+    patchHostColor("h2", "green");
+    await vi.advanceTimersByTimeAsync(251);
+
+    const hostColorPatches = fetcher.mock.calls.filter(
+      ([url]) => url === "/v1/me/preferences/host_colors",
+    );
+    expect(hostColorPatches).toHaveLength(1);
+    expect(fetcher).toHaveBeenLastCalledWith(
+      "/v1/me/preferences/host_colors",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ value: { h1: "blue", h2: "green" } }),
+      }),
+    );
+
+    // A pick then a reset of the same host keeps every key in the map, with
+    // the reset as the "auto" tombstone (a shallow merge cannot delete).
+    patchHostColor("h3", "red");
+    patchHostColor("h3", null);
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(fetcher.mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({
+        body: JSON.stringify({ value: { h1: "blue", h2: "green", h3: "auto" } }),
+      }),
+    );
+  });
+
+  it("never replays an acknowledged host colour after hydration or an account switch", async () => {
+    vi.useFakeTimers();
+    let server: Record<string, string> = {};
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        server = { ...server, ...(JSON.parse(String(init.body)).value as Record<string, string>) };
+        return new Response(null, { status: 200 });
+      }
+      return Response.json({
+        user_id: "alice",
+        preferences: { version: 1, settings: { host_colors: { ...server } } },
+      });
+    });
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    patchHostColor("h1", "blue");
+    patchHostColor("h2", "green");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher.mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({
+        body: JSON.stringify({ value: { h1: "blue", h2: "green" } }),
+      }),
+    );
+
+    // Another client changes h1; the next refresh hydrates the new value.
+    server = { ...server, h1: "red" };
+    await refreshUserPreferencesFromServer();
+    expect(readHostColorPreferences()).toEqual({ h1: "red", h2: "green" });
+
+    patchHostColor("h2", "purple");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher.mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({
+        body: JSON.stringify({ value: { h1: "red", h2: "purple" } }),
+      }),
+    );
+
+    // A different account's scope has no colours; the previous account's
+    // keys must not ride along with the next edit.
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "bob");
+    patchHostColor("h3", "orange");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher.mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({
+        body: JSON.stringify({ value: { h3: "orange" } }),
       }),
     );
   });

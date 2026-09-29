@@ -378,6 +378,20 @@ export interface Session {
    * selector for the clone.
    */
   gitBranch?: string | null;
+  /**
+   * Effective host for placement displays: the session's own host, else the
+   * nearest host-bound ancestor's. Server-computed and filled for child
+   * sessions only; ``null`` when no ancestor is host-bound.
+   */
+  effectiveHostId?: string | null;
+  /**
+   * Effective working directory: own ``worktree ?? workspace`` when set,
+   * else the nearest ancestor's. Placement surfaces (the child header chip)
+   * read this instead of walking the parent chain client-side.
+   */
+  effectiveCwd?: string | null;
+  /** Branch taken from the same row {@link effectiveCwd} came from. */
+  effectiveGitBranch?: string | null;
   items: SessionItem[];
   queuedItems?: SessionEventInput[];
   /** Per-session reasoning-effort override, e.g. ``"high"``. */

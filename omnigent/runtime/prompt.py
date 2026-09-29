@@ -89,6 +89,33 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
     "approval) are routine runtime status messages in the same way."
 )
 
+# A child session's own turns — a timer, a flow, a background wake, a
+# keep-warm check — are not results its mother dispatched. Ending such a
+# turn's output with this exact line lets the runner record the result
+# without an inbox entry or a wake.
+CHILD_QUIET_INSTRUCTION = (
+    "Quiet results: when a turn you started yourself (a timer, a flow, a "
+    "background wake, or a keep-warm check) has nothing your parent session "
+    "needs — no result, no question, no update they must act on — end your "
+    "output with the exact final line `[quiet]`. The runtime then records the "
+    "turn without waking your parent. A turn your parent asked for always "
+    "reports normally."
+)
+
+
+def child_session_framework_instructions(*, has_parent: bool) -> list[str]:
+    """
+    Framework instructions for a session that is itself a child (D9).
+
+    The quiet-result rule only makes sense for a session with a parent to
+    stay quiet toward; top-level sessions get nothing.
+
+    :param has_parent: Whether the session carries a ``parent_session_id``.
+    :returns: The child-only instruction list, empty for a top-level session.
+    """
+    return [CHILD_QUIET_INSTRUCTION] if has_parent else []
+
+
 # A session can launch at a project directory while its git working tree sits
 # elsewhere (a linked worktree inside the project entry). Naming both keeps the
 # model editing and running git in the worktree instead of the shared project

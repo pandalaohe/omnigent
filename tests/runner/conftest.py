@@ -137,16 +137,20 @@ def _clean_subagent_registry() -> Iterator[None]:
         dict(runner_app._subagent_work_by_child),
         {k: set(v) for k, v in runner_app._subagent_work_by_parent.items()},
         dict(runner_app._session_inboxes_ref),
-        set(runner_app._drained_delivered_subagent_children),
+        dict(runner_app._drained_delivered_subagent_results),
         set(runner_app._subagent_recovery_done),
         dict(runner_app._subagent_recovery_locks),
+        dict(runner_app._subagent_work_origins),
+        dict(runner_app._subagent_retained_state_parents),
     )
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
     runner_app._session_inboxes_ref.clear()
-    runner_app._drained_delivered_subagent_children.clear()
+    runner_app._drained_delivered_subagent_results.clear()
     runner_app._subagent_recovery_done.clear()
     runner_app._subagent_recovery_locks.clear()
+    runner_app._subagent_work_origins.clear()
+    runner_app._subagent_retained_state_parents.clear()
     try:
         yield
     finally:
@@ -156,12 +160,16 @@ def _clean_subagent_registry() -> Iterator[None]:
         runner_app._subagent_work_by_parent.update(saved[1])
         runner_app._session_inboxes_ref.clear()
         runner_app._session_inboxes_ref.update(saved[2])
-        runner_app._drained_delivered_subagent_children.clear()
-        runner_app._drained_delivered_subagent_children.update(saved[3])
+        runner_app._drained_delivered_subagent_results.clear()
+        runner_app._drained_delivered_subagent_results.update(saved[3])
         runner_app._subagent_recovery_done.clear()
         runner_app._subagent_recovery_done.update(saved[4])
         runner_app._subagent_recovery_locks.clear()
         runner_app._subagent_recovery_locks.update(saved[5])
+        runner_app._subagent_work_origins.clear()
+        runner_app._subagent_work_origins.update(saved[6])
+        runner_app._subagent_retained_state_parents.clear()
+        runner_app._subagent_retained_state_parents.update(saved[7])
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:

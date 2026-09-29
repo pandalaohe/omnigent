@@ -53,6 +53,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "calling_defaults",
         "calling_last",
         "session_collab",
+        "host_colors",
     }
 )
 

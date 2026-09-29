@@ -1496,7 +1496,7 @@ def create_hosts_router(
                     git_branch = worktree.branch
 
             try:
-                workspace, placed_worktree = await _place_project_session(
+                placed_workspace, placed_worktree = await _place_project_session(
                     host_id=host_id,
                     project_id=target.conv.project_id,
                     entry=entry,
@@ -1504,6 +1504,8 @@ def create_hosts_router(
                     git_used=body.git is not None,
                     entry_boundary=entry_boundary,
                 )
+                # Placement of a given target always yields a directory.
+                workspace = placed_workspace or workspace
             except BaseException:
                 await _rollback_worktree()
                 raise

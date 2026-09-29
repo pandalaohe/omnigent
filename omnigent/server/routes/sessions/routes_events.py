@@ -218,6 +218,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stream_live_events,
     _wait_for_runner_client,
     cleanup_worktree,
+    effective_host_id,
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
 )
@@ -801,10 +802,21 @@ async def _cross_host_subagent_parent(
         ``None``.
     """
     parent_id = conv.parent_conversation_id
-    if conv.kind != "sub_agent" or conv.host_id is None or parent_id is None:
+    if conv.kind != "sub_agent" or parent_id is None:
         return None
     parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
-    if parent is None or parent.host_id == conv.host_id:
+    if parent is None:
+        return None
+    # Compare effective hosts: a hostless-row parent under a host-bound root
+    # shares that root's runner, so a child placed on the same host is not
+    # cross-host and must not be forwarded to a second runner.
+    child_host, parent_host = await asyncio.to_thread(
+        lambda: (
+            effective_host_id(conversation_store, conv),
+            effective_host_id(conversation_store, parent),
+        )
+    )
+    if child_host == parent_host:
         return None
     return parent
 

@@ -1050,12 +1050,22 @@ class SysSessionCreateTool(Tool):
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions); "
-            "it joins your session's project, if any (the result's `project_id`; "
-            "null means No Project), and runs in your working directory and keeps your "
-            "working tree — it cannot target another project or host. "
-            "Returns {conversation_id, agent_id, title, status, project_id}; the "
-            "session runs asynchronously — monitor it with "
+            "session (you cannot create top-level or sibling sessions). "
+            "With agent_id you can place the child anywhere: `host` picks a "
+            "registered host (id or exact name); `workspace` is the absolute "
+            "directory there; `project_id` overrides the parent's project; "
+            "`worktree` {branch, base} cuts a NEW branch worktree (base "
+            "defaults to the workspace's HEAD) and runs the child in it. "
+            "Omit all of them to inherit your host, project and working tree "
+            "(the result's `project_id` is null for No Project). Naming a "
+            "different host requires a workspace or worktree there. A child's "
+            "worktree is never removed automatically. A cross-host child on "
+            "an SDK harness "
+            "(claude-sdk, codex-sdk) does not report its result back — use a "
+            "native harness for remote children. "
+            "Returns {conversation_id, agent_id, title, status, project_id, "
+            "host_id, host_name, workspace, worktree, git_branch, harness}; "
+            "the session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
             "with sys_session_send."
         )
@@ -1149,6 +1159,63 @@ class SysSessionCreateTool(Tool):
                                 "'config_path', and only for harnesses "
                                 "with effort plumbing; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "host": {
+                            "type": "string",
+                            "description": (
+                                "Placement (agent_id mode): a registered "
+                                "host id or its exact name, e.g. 'fn' or "
+                                "'host_a1b2c3'. Unknown names are refused "
+                                "with the registered names. Naming another "
+                                "host requires 'workspace' or 'worktree'. "
+                                "Omit to stay on your own host."
+                            ),
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Placement (agent_id mode): absolute "
+                                "directory the child runs in on the target "
+                                "host, e.g. '/srv/repos/app'. Omit to keep "
+                                "your working directory."
+                            ),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Placement (agent_id mode): project id the "
+                                "child joins, e.g. 'project_abc123'. Omit "
+                                "to use the parent session's project."
+                            ),
+                        },
+                        "worktree": {
+                            "type": "object",
+                            "properties": {
+                                "branch": {
+                                    "type": "string",
+                                    "description": (
+                                        "New branch name for the child's "
+                                        "worktree, e.g. 'fix-auth'."
+                                    ),
+                                },
+                                "base": {
+                                    "type": "string",
+                                    "description": (
+                                        "Commit-ish to cut the worktree "
+                                        "from; defaults to the workspace's "
+                                        "HEAD."
+                                    ),
+                                },
+                            },
+                            "required": ["branch"],
+                            "additionalProperties": False,
+                            "description": (
+                                "Placement (agent_id mode): cut a NEW "
+                                "branch worktree for the child and run it "
+                                "there. Without 'workspace', the worktree "
+                                "is cut from your working directory. The "
+                                "worktree is never removed automatically."
                             ),
                         },
                     },

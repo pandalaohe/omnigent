@@ -87,6 +87,7 @@ UserPreferenceNamespace = Literal[
     "calling_defaults",
     "calling_last",
     "session_collab",
+    "host_colors",
 ]
 
 
@@ -905,15 +906,13 @@ class ChildSessionSummary(BaseModel):
         Archived children are excluded from the default listing; the
         ``include_archived`` query parameter surfaces them so callers
         can tell a freed name from a merely hidden one.
-    :param agent_id: Agent id recorded on the latest task,
-        e.g. ``"ag_abc123"``. ``None`` if the child has no tasks
-        yet (rare — ``_spawn_one`` creates a task atomically with
-        the conversation).
-    :param agent_name: Agent type recorded on the latest task,
-        e.g. ``"researcher"``. Mirrors the ``tool`` prefix in
-        ``title`` and is provided alongside it because the title
-        is a denormalized string while ``agent_name`` is the
-        durable per-task value.
+    :param agent_id: Agent id bound to the child conversation,
+        e.g. ``"ag_abc123"``. ``None`` for legacy rows without an agent
+        binding; unlike ``agent_name`` this is the durable column value,
+        so it survives a deleted agent row.
+    :param agent_name: Name of the agent row bound to the child,
+        e.g. ``"researcher"``. ``None`` for legacy rows without an
+        ``agent_id`` or when the bound agent row cannot be resolved.
     :param current_task_id: Latest task id for the child
         (newest by ``created_at``), e.g. ``"task_abc123"``.
         ``None`` if no tasks exist.
@@ -961,6 +960,25 @@ class ChildSessionSummary(BaseModel):
         ``RoutingDecisionData.decision_id``. Read from the child's
         ``omnigent.routing.decision_id`` label, stamped when routing pins
         the model. ``None`` when the child was not routed.
+    :param host_id: Effective host the child runs on: the child's own
+        ``host_id`` when set, else the nearest ancestor's. ``None`` when
+        neither exists (e.g. a local, hostless session tree).
+    :param cwd: Effective working directory: the child's own
+        ``worktree ?? workspace`` when set, else the nearest ancestor's.
+        ``None`` when neither exists.
+    :param git_branch: Branch taken from the same row that supplied
+        :attr:`cwd` — a directly placed child with no branch stays
+        ``None`` rather than borrowing an ancestor's branch.
+    :param harness: Canonical harness for this child, e.g.
+        ``"codex-native"``. Resolved per conversation, so children that
+        share an agent row but differ by ``harness_override`` or bundled
+        sub-agent report their own. ``None`` when unresolvable.
+    :param archived_at: Unix epoch timestamp when the child was most
+        recently archived. ``None`` while the child is active (or for
+        rows archived before the timestamp existed).
+    :param sub_agent_name: For bundled agents, the sub-agent member name
+        within the parent's spec tree, e.g. ``"researcher"``. ``None``
+        for children bound directly to a whole agent row.
     """
 
     id: str
@@ -988,6 +1006,12 @@ class ChildSessionSummary(BaseModel):
     pending_elicitations_count: int = 0
     routed_model: str | None = None
     routing_decision_id: str | None = None
+    host_id: str | None = None
+    cwd: str | None = None
+    git_branch: str | None = None
+    harness: str | None = None
+    archived_at: int | None = None
+    sub_agent_name: str | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -2145,6 +2169,17 @@ class SessionResponse(BaseModel):
         path resumes the sandbox) versus the terminal ``host_offline``
         dead-end (reconnect from your machine / fork). ``False`` for
         non-managed or non-resumable hosts.
+    :param effective_host_id: For sub-agent sessions, the host the child
+        actually runs on: its own ``host_id`` when set, else the nearest
+        ancestor's. ``None`` for top-level sessions and for a child whose
+        chain carries no host.
+    :param effective_cwd: For sub-agent sessions, the child's own
+        ``worktree ?? workspace`` when set, else the nearest ancestor's.
+        ``None`` when neither exists.
+    :param effective_git_branch: Branch matching :attr:`effective_cwd`,
+        taken from the same row that supplied that directory — an
+        inherited cwd never borrows the child's own branch. ``None`` when
+        that row has no recorded branch.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
@@ -2381,6 +2416,12 @@ class SessionResponse(BaseModel):
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False
+    # Effective placement for a sub-agent session: its own host / directory
+    # when set, else the nearest ancestor's. ``None`` for top-level
+    # sessions, so the child page header reads the same rule as the rail.
+    effective_host_id: str | None = None
+    effective_cwd: str | None = None
+    effective_git_branch: str | None = None
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None

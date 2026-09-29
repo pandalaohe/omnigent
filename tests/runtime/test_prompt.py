@@ -572,3 +572,16 @@ def test_child_question_instruction_without_peers_ends_the_turn() -> None:
     assert "sys_session_send" not in text
     assert "as your final output" in text
     assert "your mother receives it as your result" in text
+
+
+def test_child_session_quiet_instruction_only_for_children() -> None:
+    """The quiet-result rule is child-only and names the exact marker line."""
+    from omnigent.runtime.prompt import (
+        CHILD_QUIET_INSTRUCTION,
+        child_session_framework_instructions,
+    )
+
+    assert child_session_framework_instructions(has_parent=True) == [CHILD_QUIET_INSTRUCTION]
+    assert child_session_framework_instructions(has_parent=False) == []
+    assert "`[quiet]`" in CHILD_QUIET_INSTRUCTION
+    assert "turn you started yourself" in CHILD_QUIET_INSTRUCTION
