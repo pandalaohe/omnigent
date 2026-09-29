@@ -28,10 +28,12 @@ import mimetypes
 import os
 import re
 import tempfile
+import time
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -6347,58 +6349,200 @@ async def _host_harnesses_or_none(
     return readiness if isinstance(readiness, dict) else None
 
 
+# Cap on ``sys_session_get_info``'s ``session_ids`` fan-out; 20 parallel
+# snapshot GETs (each plus best-effort runner/host lookups) is the bound.
+_SESSION_INFO_MAX_IDS = 20
+
+# Per-item transport-failure prefix. The single-session path rewrites it to
+# the legacy ``sys_session_get_info failed: <exc>`` message.
+_SESSION_INFO_LOOKUP_FAILED_PREFIX = "lookup_failed: "
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
     """
-    Return a session's metadata snapshot via ``GET /v1/sessions/{id}``.
+    Return session metadata snapshots via ``GET /v1/sessions/{id}``.
 
-    Resolves the target from ``args["session_id"]`` (falling back to the
-    caller's own ``conversation_id`` when omitted), fetches the session
-    snapshot, and projects the metadata fields — status, title, agent
-    binding, runner binding, host and its reported harness readiness,
-    reasoning effort, effective model,
-    parent linkage, workspace / git branch, persisted last-activity time,
-    and the outstanding approval prompts (the prompts themselves plus a
-    count). Runner connectivity
-    is resolved best-effort via
-    ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
-    the lookup fails or no runner is bound); host readiness is likewise
+    Single-session form: ``args["session_id"]`` (falling back to the caller's
+    own ``conversation_id`` when omitted) describes one session as a flat
+    object, unchanged from before. Multi-session form: ``args["session_ids"]``
+    (1..:data:`_SESSION_INFO_MAX_IDS`, de-duplicated, input order kept)
+    describes each target and always returns ``{"sessions": [...]}`` — even
+    for one id. An inaccessible or unknown id yields its own
+    ``{"session_id", "error"}`` item and never fails the whole call.
+
+    Per item, projects the snapshot fields — status, title, agent binding,
+    runner binding, host and its reported harness readiness, reasoning
+    effort, effective model, parent linkage, workspace / git branch,
+    persisted last-activity time, the outstanding approval prompts, and the
+    snapshot's durations and runtime facts (session age, idle time, current
+    running period, cost, context usage, last error, archive state,
+    last-message excerpt). Durations are derived on the server's clock:
+    ``as_of`` is the response's HTTP ``Date`` header (fallback: the runner's
+    clock), and ``age_seconds`` / ``idle_seconds`` / ``running_seconds`` are
+    ``as_of`` minus the corresponding server-stamped timestamp, floored at 0.
+
+    Runner connectivity is resolved best-effort via
+    ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when the
+    lookup fails or no runner is bound); host readiness is likewise
     best-effort via ``GET /v1/hosts/{id}``. The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
-    (the server denied the read, so from the caller's vantage the target
-    is one it may not see).
+    (the server denied the read, so from the caller's vantage the target is
+    one it may not see).
 
-    :param args: Parsed tool arguments; optional ``session_id``.
-    :param conversation_id: The caller's own session id, used as the
-        default target when ``session_id`` is omitted.
+    :param args: Parsed tool arguments; optional ``session_id`` or
+        ``session_ids`` (mutually exclusive).
+    :param conversation_id: The caller's own session id, used as the default
+        target when ``session_id`` is omitted.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: JSON metadata object, or a JSON error object.
+    :returns: JSON metadata object, or ``{"sessions": [item, ...]}``; a JSON
+        error object on a bad argument combination.
     """
-    raw_target = args.get("session_id") or conversation_id
-    if not isinstance(raw_target, str) or not raw_target:
+    raw_single = args.get("session_id")
+    if "session_ids" not in args:
+        target = raw_single or conversation_id
+        if not isinstance(target, str) or not target:
+            return json.dumps(
+                {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
+            )
+        item = await _session_info_item(target, server_client)
+        error = item.get("error")
+        if error is None:
+            return json.dumps(item)
+        if isinstance(error, str) and error.startswith(_SESSION_INFO_LOOKUP_FAILED_PREFIX):
+            detail = error[len(_SESSION_INFO_LOOKUP_FAILED_PREFIX) :]
+            return json.dumps({"error": f"sys_session_get_info failed: {detail}"})
+        if isinstance(error, str) and error.startswith("sys_session_get_info returned "):
+            return json.dumps({"error": error})
+        return json.dumps({"error": error, "session_id": target})
+
+    if raw_single:
         return json.dumps(
-            {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
+            {"error": "sys_session_get_info: pass session_id or session_ids, not both"}
         )
+    raw_many = args.get("session_ids")
+    invalid_ids_rule = (
+        "sys_session_get_info: 'session_ids' must be a non-empty list of "
+        f"non-empty strings (max {_SESSION_INFO_MAX_IDS})"
+    )
+    if not isinstance(raw_many, list) or not raw_many:
+        return json.dumps({"error": invalid_ids_rule})
+    if len(raw_many) > _SESSION_INFO_MAX_IDS:
+        return json.dumps(
+            {
+                "error": (
+                    f"sys_session_get_info: 'session_ids' accepts at most "
+                    f"{_SESSION_INFO_MAX_IDS} entries"
+                )
+            }
+        )
+    targets: list[str] = []
+    for value in raw_many:
+        if not isinstance(value, str) or not value:
+            return json.dumps({"error": invalid_ids_rule})
+        if value not in targets:
+            targets.append(value)
+    items = await asyncio.gather(
+        *(_session_info_item(target, server_client) for target in targets)
+    )
+    return json.dumps({"sessions": list(items)})
+
+
+def _session_info_duration(as_of: int, value: object) -> int | None:
+    """
+    Seconds between a server-stamped timestamp and the server's ``as_of``.
+
+    :param as_of: Server clock (epoch seconds) at snapshot time.
+    :param value: The stamped timestamp; non-integers (including ``bool``)
+        yield ``None``.
+    :returns: ``max(0, as_of - value)`` seconds, or ``None`` when *value* is
+        not an int.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(0, as_of - value)
+    return None
+
+
+def _session_info_as_of(resp: httpx.Response) -> int:
+    """
+    Read the server clock from a snapshot response's HTTP ``Date`` header.
+
+    :param resp: The ``GET /v1/sessions/{id}`` response.
+    :returns: The header as epoch seconds; the runner's own clock when the
+        header is absent or unparsable.
+    """
+    raw_date = resp.headers.get("date")
+    if raw_date:
+        try:
+            return int(parsedate_to_datetime(raw_date).timestamp())
+        except (TypeError, ValueError):
+            pass
+    return int(time.time())
+
+
+def _session_info_context_fraction(tokens: object, window: object) -> float | None:
+    """
+    Token occupancy as a fraction of the model's context window.
+
+    :param tokens: Snapshot ``last_total_tokens``.
+    :param window: Snapshot ``context_window``.
+    :returns: ``round(tokens / window, 3)`` (unclamped) when *tokens* is a
+        non-negative int and *window* a positive int, else ``None``. Zero
+        tokens is a valid reading (``0.0``), not a missing one.
+    """
+    if (
+        isinstance(tokens, int)
+        and not isinstance(tokens, bool)
+        and tokens >= 0
+        and isinstance(window, int)
+        and not isinstance(window, bool)
+        and window > 0
+    ):
+        return round(tokens / window, 3)
+    return None
+
+
+async def _session_info_item(target: str, server_client: httpx.AsyncClient) -> _JsonObject:
+    """
+    Project one session's snapshot into a ``sys_session_get_info`` item.
+
+    :param target: Session/conversation id to describe.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The metadata item, or an ``{"error", "session_id"}`` object
+        (``session_not_found`` / ``access_denied`` / ``lookup_failed: …`` /
+        non-200 status).
+    """
     try:
         resp = await server_client.get(
-            f"/v1/sessions/{raw_target}",
-            params={"include_items": "false", "include_liveness": "false"},
+            f"/v1/sessions/{target}",
+            params={
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_preview": "true",
+            },
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_get_info failed: {exc}"})
+        return {
+            "error": f"{_SESSION_INFO_LOOKUP_FAILED_PREFIX}{exc}",
+            "session_id": target,
+        }
     if resp.status_code == 404:
-        return json.dumps({"error": "session_not_found", "session_id": raw_target})
+        return {"error": "session_not_found", "session_id": target}
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "session_id": raw_target})
+        return {"error": "access_denied", "session_id": target}
     if resp.status_code != 200:
-        return json.dumps({"error": f"sys_session_get_info returned {resp.status_code}"})
+        return {
+            "error": f"sys_session_get_info returned {resp.status_code}",
+            "session_id": target,
+        }
     snap: _JsonObject = resp.json()
+    as_of = _session_info_as_of(resp)
     pending_value = snap.get("pending_elicitations")
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
@@ -6408,44 +6552,61 @@ async def _session_get_info_via_rest(
         _runner_online_or_none(snap_runner_id, server_client),
         _host_harnesses_or_none(snap_host_id, server_client),
     )
-    return json.dumps(
-        {
-            "session_id": snap.get("id"),
-            "status": snap.get("status"),
-            # Persisted conversation activity is distinct from lifecycle
-            # status: repeated polls with an unchanged value let an
-            # orchestrator detect a running session that is not advancing.
-            "last_activity_at": snap.get("updated_at"),
-            "title": snap.get("title"),
-            "agent_id": snap.get("agent_id"),
-            # Present the public agent name: a native-UI wrapper session
-            # (e.g. ``pi-native-ui``) reports its clean display name (``Pi``)
-            # so the internal ``-native-ui`` wrapper name never leaks to the
-            # model answering "what agent are you?". Non-wrapper names are
-            # unchanged.
-            "agent_name": public_agent_name(snap_agent_name),
-            "runner_id": snap.get("runner_id"),
-            "runner_online": runner_online,
-            "host_id": snap.get("host_id"),
-            "configured_harnesses": configured_harnesses,
-            "parent_session_id": snap.get("parent_session_id"),
-            "sub_agent_name": snap.get("sub_agent_name"),
-            "reasoning_effort": snap.get("reasoning_effort"),
-            # Effective model: a per-session override wins over the
-            # agent spec's default; both may be None when unset.
-            "model": snap.get("model_override") or snap.get("llm_model"),
-            "workspace": snap.get("workspace"),
-            "worktree": snap.get("worktree"),
-            "git_branch": snap.get("git_branch"),
-            # The outstanding approval prompts themselves (original
-            # elicitation-request event dicts), plus a count for quick
-            # status checks. Surfacing the prompts — not just a tally —
-            # lets the orchestrator see what each blocked session is
-            # waiting on.
-            "pending_elicitations": pending,
-            "pending_elicitation_count": len(pending),
-        }
-    )
+    context_tokens = snap.get("last_total_tokens")
+    context_window = snap.get("context_window")
+    return {
+        "session_id": snap.get("id"),
+        "status": snap.get("status"),
+        # Persisted conversation activity is distinct from lifecycle
+        # status: repeated polls with an unchanged value let an
+        # orchestrator detect a running session that is not advancing.
+        "last_activity_at": snap.get("updated_at"),
+        "title": snap.get("title"),
+        "agent_id": snap.get("agent_id"),
+        # Present the public agent name: a native-UI wrapper session
+        # (e.g. ``pi-native-ui``) reports its clean display name (``Pi``)
+        # so the internal ``-native-ui`` wrapper name never leaks to the
+        # model answering "what agent are you?". Non-wrapper names are
+        # unchanged.
+        "agent_name": public_agent_name(snap_agent_name),
+        "runner_id": snap.get("runner_id"),
+        "runner_online": runner_online,
+        "host_id": snap.get("host_id"),
+        "configured_harnesses": configured_harnesses,
+        "parent_session_id": snap.get("parent_session_id"),
+        "sub_agent_name": snap.get("sub_agent_name"),
+        "reasoning_effort": snap.get("reasoning_effort"),
+        # Effective model: a per-session override wins over the
+        # agent spec's default; both may be None when unset.
+        "model": snap.get("model_override") or snap.get("llm_model"),
+        "workspace": snap.get("workspace"),
+        "worktree": snap.get("worktree"),
+        "git_branch": snap.get("git_branch"),
+        # The outstanding approval prompts themselves (original
+        # elicitation-request event dicts), plus a count for quick
+        # status checks. Surfacing the prompts — not just a tally —
+        # lets the orchestrator see what each blocked session is
+        # waiting on.
+        "pending_elicitations": pending,
+        "pending_elicitation_count": len(pending),
+        "created_at": snap.get("created_at"),
+        # Durations are computed against the server's own clock (the HTTP
+        # Date header), never the runner's, so a remote runner can't skew
+        # them.
+        "age_seconds": _session_info_duration(as_of, snap.get("created_at")),
+        "idle_seconds": _session_info_duration(as_of, snap.get("updated_at")),
+        "running_since": snap.get("running_since"),
+        "running_seconds": _session_info_duration(as_of, snap.get("running_since")),
+        "as_of": as_of,
+        "last_message_preview": snap.get("last_message_preview"),
+        "archived": snap.get("archived"),
+        "archived_at": snap.get("archived_at"),
+        "total_cost_usd": snap.get("total_cost_usd"),
+        "context_tokens": context_tokens,
+        "context_window": context_window,
+        "context_used_fraction": _session_info_context_fraction(context_tokens, context_window),
+        "last_error": snap.get("last_task_error"),
+    }
 
 
 def _omnigent_error_message(resp: httpx.Response) -> str | None:

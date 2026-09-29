@@ -670,17 +670,19 @@ def test_both_grants_compose() -> None:
 
 def test_session_get_info_schema_has_optional_session_id() -> None:
     """
-    ``sys_session_get_info`` advertises a single optional ``session_id``
-    parameter (omitting it defaults to the caller's own session). If
-    ``session_id`` became required, an agent inspecting its own session
-    would be forced to look up its own id first.
+    ``sys_session_get_info`` advertises two optional targets: ``session_id``
+    (omitting it defaults to the caller's own session) and ``session_ids``
+    (many sessions in one call, capped at 20). If either became required,
+    an agent inspecting its own session would be forced to look up its own
+    id first.
     """
     mgr = ToolManager(_make_spec([]))
     schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_session_get_info"
     )
     params = schema["function"]["parameters"]
-    assert set(params["properties"]) == {"session_id"}
+    assert set(params["properties"]) == {"session_id", "session_ids"}
+    assert params["properties"]["session_ids"]["maxItems"] == 20
     # No required fields — session_id is optional by design.
     assert params["required"] == []
 
