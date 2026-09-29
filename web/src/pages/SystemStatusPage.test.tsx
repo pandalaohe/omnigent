@@ -23,6 +23,15 @@ vi.mock("@/hooks/useSystemStatus", () => ({
 
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => true }));
 
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({
+    data: {
+      pages: [{ data: [{ id: "conv_hot", title: "Fix login timeout" }] }],
+    },
+    isLoading: false,
+  }),
+}));
+
 import { SystemStatusPage } from "./SystemStatusPage";
 
 const MB = 1024 * 1024;
@@ -228,9 +237,7 @@ describe("SystemStatusPage", () => {
     const harnessRow = within(tree).getByText("harness").closest("tr");
     expect(harnessRow).toHaveAttribute("data-depth", "1");
     expect(within(tree).getByText("2 other processes")).toBeInTheDocument();
-    expect(within(tree).getByRole("link", { name: "conv_hot" })).toHaveAttribute(
-      "href",
-      "/c/conv_hot",
-    );
+    const sessionLink = within(tree).getByRole("link", { name: "Fix login timeout" });
+    expect(sessionLink).toHaveAttribute("href", "/c/conv_hot");
   });
 });

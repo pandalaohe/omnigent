@@ -42,13 +42,15 @@ FLUSH_EVERY_TICKS = 5
 # How long sampler-cost samples feed the footer's host CPU estimate.
 _OVERHEAD_WINDOW_S = 10 * 60.0
 
-_CPU_SUSTAIN_POINTS = 10
 _MEM_CONSECUTIVE_POINTS = 2
 _SERVER_5XX_WINDOW_POINTS = 5
 _SERVER_5XX_MIN_REQUESTS = 20
 
+_CPU_SUSTAIN_MIN_RANGE = (1, 1440)
+
 _DEFAULT_SETTINGS: dict[str, float] = {
     "cpu_pct": 85.0,
+    "cpu_sustain_min": 10,
     "mem_pct": 90.0,
     "disk_pct": 90.0,
     "server_5xx_pct": 5.0,
@@ -402,10 +404,11 @@ class SystemStatusHub:
         findings: list[dict[str, Any]] = []
         points = entry.points
         target = entry.host_id
+        cpu_sustain_min = int(self._settings["cpu_sustain_min"])
 
-        if len(points) >= _CPU_SUSTAIN_POINTS and all(
+        if len(points) >= cpu_sustain_min and all(
             float(point.get("cpu_avg", 0.0)) > self._settings["cpu_pct"]
-            for point in points[-_CPU_SUSTAIN_POINTS:]
+            for point in points[-cpu_sustain_min:]
         ):
             findings.append(
                 {
@@ -415,8 +418,7 @@ class SystemStatusHub:
                     "level": "amber",
                     "since": _carry_since(previous, entry.workspace_id, f"{target}:cpu", now),
                     "detail": (
-                        f"cpu above {self._settings['cpu_pct']:g}% for "
-                        f"{_CPU_SUSTAIN_POINTS} minutes"
+                        f"cpu above {self._settings['cpu_pct']:g}% for {cpu_sustain_min} minutes"
                     ),
                     "top_session": _top_session(points[-1]),
                 }
@@ -691,19 +693,13 @@ class SystemStatusHub:
         """Validate, store and return the thresholds.
 
         :param payload: Partial or full settings mapping.
-        :raises ValueError: On an unknown key, a non-number, or a number
-            outside ``(0, 100]``.
+        :raises ValueError: On an unknown key, a non-number, or a value
+            outside the key's range: ``(0, 100]`` for the ``*_pct`` keys,
+            whole minutes in ``[1, 1440]`` for ``cpu_sustain_min``.
         """
         settings = dict(self._settings)
         for key, value in payload.items():
-            if key not in _DEFAULT_SETTINGS:
-                raise ValueError(f"unknown system-status setting {key!r}")
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"system-status setting {key!r} must be a number")
-            numeric = float(value)
-            if not 0.0 < numeric <= 100.0:
-                raise ValueError(f"system-status setting {key!r} must be in (0, 100]")
-            settings[key] = numeric
+            settings[key] = _coerce_setting(key, value)
         self._settings = settings
         self._write_settings()
         return dict(settings)
@@ -714,13 +710,10 @@ class SystemStatusHub:
         if not isinstance(payload, dict):
             return settings
         for key, value in payload.items():
-            if key not in _DEFAULT_SETTINGS:
+            try:
+                settings[key] = _coerce_setting(key, value)
+            except ValueError:
                 continue
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                continue
-            numeric = float(value)
-            if 0.0 < numeric <= 100.0:
-                settings[key] = numeric
         return settings
 
     def _write_settings(self) -> None:
@@ -809,6 +802,29 @@ class SystemStatusHub:
 def _points_fresh(points: list[dict[str, Any]], cutoff: float) -> list[dict[str, Any]]:
     """Drop points whose ``t`` is older than *cutoff*."""
     return [point for point in points if float(point.get("t", 0.0)) >= cutoff]
+
+
+def _coerce_setting(key: str, value: Any) -> float:
+    """Return one validated settings value.
+
+    :raises ValueError: On an unknown key, a non-number, a fractional
+        ``cpu_sustain_min``, or a value outside the key's range.
+    """
+    if key not in _DEFAULT_SETTINGS:
+        raise ValueError(f"unknown system-status setting {key!r}")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"system-status setting {key!r} must be a number")
+    numeric = float(value)
+    if key == "cpu_sustain_min":
+        if not numeric.is_integer():
+            raise ValueError(f"system-status setting {key!r} must be a whole number of minutes")
+        low, high = _CPU_SUSTAIN_MIN_RANGE
+        if not low <= int(numeric) <= high:
+            raise ValueError(f"system-status setting {key!r} must be in [{low}, {high}]")
+        return int(numeric)
+    if not 0.0 < numeric <= 100.0:
+        raise ValueError(f"system-status setting {key!r} must be in (0, 100]")
+    return numeric
 
 
 def _mem_pct(point: dict[str, Any]) -> float:

@@ -2144,6 +2144,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "setup",
         "start",
         "stop",
+        "system",
         "uninstall",
         "update",
         "upgrade",

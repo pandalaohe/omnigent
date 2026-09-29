@@ -6,11 +6,12 @@
 // receives `server: null` and only their own hosts — the page just renders
 // what the permission-filtered response contains.
 
-import { Fragment, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Sparkline } from "@/components/Sparkline";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 import {
   useSystemHistory,
   useSystemStatus,
@@ -67,12 +68,19 @@ function StatePill({ state }: { state: SystemHostState }) {
   );
 }
 
+/** Session title when the sidebar has loaded the row, else the raw id. */
+function sessionLabel(sessionId: string, sessionTitles: Map<string, string>): string {
+  return sessionTitles.get(sessionId) || sessionId;
+}
+
 function FindingsBanner({
   findings,
   hostNames,
+  sessionTitles,
 }: {
   findings: SystemStatusFinding[];
   hostNames: Map<string, string>;
+  sessionTitles: Map<string, string>;
 }) {
   if (findings.length === 0) {
     return (
@@ -112,7 +120,7 @@ function FindingsBanner({
               <>
                 {" · "}
                 <Link to={`/c/${finding.top_session}`} className="underline">
-                  {finding.top_session}
+                  {sessionLabel(finding.top_session, sessionTitles)}
                 </Link>
               </>
             )}
@@ -214,7 +222,15 @@ function buildProcessTree(processes: SystemProcessRow[]): ProcessNode[] {
   return roots;
 }
 
-function ProcessRows({ nodes, depth = 0 }: { nodes: ProcessNode[]; depth?: number }) {
+function ProcessRows({
+  nodes,
+  sessionTitles,
+  depth = 0,
+}: {
+  nodes: ProcessNode[];
+  sessionTitles: Map<string, string>;
+  depth?: number;
+}) {
   return (
     <>
       {nodes.map((node) => (
@@ -226,7 +242,7 @@ function ProcessRows({ nodes, depth = 0 }: { nodes: ProcessNode[]; depth?: numbe
             <td className="py-1 pr-3 text-xs text-muted-foreground">
               {node.row.session_id !== null ? (
                 <Link to={`/c/${node.row.session_id}`} className="underline">
-                  {node.row.session_id}
+                  {sessionLabel(node.row.session_id, sessionTitles)}
                 </Link>
               ) : (
                 "—"
@@ -235,14 +251,22 @@ function ProcessRows({ nodes, depth = 0 }: { nodes: ProcessNode[]; depth?: numbe
             <td className="py-1 pr-3 text-right tabular-nums">{formatPct(node.cpu)}</td>
             <td className="py-1 text-right tabular-nums">{formatBytes(node.rss)}</td>
           </tr>
-          {node.children.length > 0 && <ProcessRows nodes={node.children} depth={depth + 1} />}
+          {node.children.length > 0 && (
+            <ProcessRows nodes={node.children} sessionTitles={sessionTitles} depth={depth + 1} />
+          )}
         </Fragment>
       ))}
     </>
   );
 }
 
-function ProcessTree({ processes }: { processes: SystemProcessRow[] }) {
+function ProcessTree({
+  processes,
+  sessionTitles,
+}: {
+  processes: SystemProcessRow[];
+  sessionTitles: Map<string, string>;
+}) {
   const roots = buildProcessTree(processes);
   return (
     <table className="w-full" data-testid="process-tree">
@@ -255,13 +279,21 @@ function ProcessTree({ processes }: { processes: SystemProcessRow[] }) {
         </tr>
       </thead>
       <tbody>
-        <ProcessRows nodes={roots} />
+        <ProcessRows nodes={roots} sessionTitles={sessionTitles} />
       </tbody>
     </table>
   );
 }
 
-function HostCard({ host, threshold }: { host: SystemStatusHost; threshold: number | null }) {
+function HostCard({
+  host,
+  threshold,
+  sessionTitles,
+}: {
+  host: SystemStatusHost;
+  threshold: number | null;
+  sessionTitles: Map<string, string>;
+}) {
   const history = useSystemHistory(host.host_id);
   const [processesOpen, setProcessesOpen] = useState(false);
   const snapshot = host.last_snapshot;
@@ -334,7 +366,7 @@ function HostCard({ host, threshold }: { host: SystemStatusHost; threshold: numb
               <p className="mb-1 text-xs text-muted-foreground">
                 omnigent processes · parent rows include their children · sorted by CPU
               </p>
-              <ProcessTree processes={snapshot.processes} />
+              <ProcessTree processes={snapshot.processes} sessionTitles={sessionTitles} />
             </div>
           )}
         </div>
@@ -369,6 +401,15 @@ export function SystemStatusPage() {
   const status = useSystemStatus({ live: true });
   // The thresholds are admin-only; members never see the bytes line.
   const settings = useSystemStatusSettings({ enabled: isAdmin });
+  // Titles ride the sidebar's already-loaded rows; no extra request.
+  const { data: conversationsData } = useLoadedConversations();
+  const sessionTitles = useMemo(() => {
+    const titles = new Map<string, string>();
+    for (const conversation of conversationsData?.pages.flatMap((page) => page.data) ?? []) {
+      if (conversation.title) titles.set(conversation.id, conversation.title);
+    }
+    return titles;
+  }, [conversationsData]);
 
   if (status.isLoading) {
     return (
@@ -403,7 +444,11 @@ export function SystemStatusPage() {
         </p>
       </div>
 
-      <FindingsBanner findings={data.findings} hostNames={hostNames} />
+      <FindingsBanner
+        findings={data.findings}
+        hostNames={hostNames}
+        sessionTitles={sessionTitles}
+      />
 
       {data.server !== null && (
         <div className="mt-4">
@@ -417,7 +462,12 @@ export function SystemStatusPage() {
       ) : (
         <div className="grid gap-3 lg:grid-cols-2">
           {data.hosts.map((host) => (
-            <HostCard key={host.host_id} host={host} threshold={threshold} />
+            <HostCard
+              key={host.host_id}
+              host={host}
+              threshold={threshold}
+              sessionTitles={sessionTitles}
+            />
           ))}
         </div>
       )}

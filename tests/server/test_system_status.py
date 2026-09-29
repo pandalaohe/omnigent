@@ -280,6 +280,28 @@ def test_cpu_finding_needs_ten_sustained_minutes(tmp_path: Path) -> None:
     assert finding["id"] == "host_a:cpu"
 
 
+def test_cpu_finding_honors_custom_sustain_minutes(tmp_path: Path) -> None:
+    """``cpu_sustain_min`` decides how many hot points the CPU finding needs."""
+    hub = SystemStatusHub(tmp_path, None)
+    hub.put_settings({"cpu_sustain_min": 3})
+    _connect(hub, host_id="host_a", now=0.0)
+    for minute in range(2):
+        hub.ingest(
+            host_id="host_a",
+            workspace_id=0,
+            frame=_frame(cpu_pct=90.0),
+            now=minute * 60.0 + 1,
+        )
+        assert hub.tick((minute + 1) * 60.0) is False
+    assert (0, "host_a:cpu") not in hub._findings
+
+    hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(cpu_pct=90.0), now=2 * 60.0 + 1)
+    assert hub.tick(3 * 60.0) is True
+    finding = hub._findings[(0, "host_a:cpu")]
+    assert finding["level"] == "amber"
+    assert finding["detail"] == "cpu above 85% for 3 minutes"
+
+
 def test_revision_bumps_only_when_the_finding_set_changes(tmp_path: Path) -> None:
     """Revision stays put while the same findings hold across ticks."""
     hub = SystemStatusHub(tmp_path, None)
@@ -508,16 +530,26 @@ def test_settings_round_trip_and_validation(tmp_path: Path) -> None:
     hub = SystemStatusHub(tmp_path, None)
     assert hub.get_settings() == {
         "cpu_pct": 85.0,
+        "cpu_sustain_min": 10,
         "mem_pct": 90.0,
         "disk_pct": 90.0,
         "server_5xx_pct": 5.0,
     }
 
-    updated = hub.put_settings({"cpu_pct": 70})
+    updated = hub.put_settings({"cpu_pct": 70, "cpu_sustain_min": 3.0})
     assert updated["cpu_pct"] == 70.0
+    assert updated["cpu_sustain_min"] == 3
     assert updated["mem_pct"] == 90.0
     reloaded = SystemStatusHub(tmp_path, None)
     assert reloaded.get_settings()["cpu_pct"] == 70.0
+    assert reloaded.get_settings()["cpu_sustain_min"] == 3
+
+    (tmp_path / "system-status" / "settings.json").write_text(
+        json.dumps({"cpu_sustain_min": 0, "cpu_pct": 70})
+    )
+    repaired = SystemStatusHub(tmp_path, None)
+    assert repaired.get_settings()["cpu_sustain_min"] == 10
+    assert repaired.get_settings()["cpu_pct"] == 70.0
 
     bad_settings: list[dict[str, object]] = [
         {"nope": 1},
@@ -525,6 +557,11 @@ def test_settings_round_trip_and_validation(tmp_path: Path) -> None:
         {"cpu_pct": 0},
         {"cpu_pct": 101},
         {"cpu_pct": "x"},
+        {"cpu_sustain_min": 0},
+        {"cpu_sustain_min": 1441},
+        {"cpu_sustain_min": 2.5},
+        {"cpu_sustain_min": True},
+        {"cpu_sustain_min": "3"},
     ]
     for bad in bad_settings:
         try:

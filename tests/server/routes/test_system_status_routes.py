@@ -198,18 +198,25 @@ def test_settings_admin_only_with_validation(tmp_path: Path) -> None:
     updated = client.put(
         "/v1/system/settings",
         headers={"X-Test-User": "admin@example.com"},
-        json={"cpu_pct": 70},
+        json={"cpu_pct": 70, "cpu_sustain_min": 3},
     )
     assert updated.status_code == 200
     assert updated.json()["cpu_pct"] == 70.0
+    assert updated.json()["cpu_sustain_min"] == 3
     assert updated.json()["mem_pct"] == 90.0
 
-    bad = client.put(
-        "/v1/system/settings",
-        headers={"X-Test-User": "admin@example.com"},
-        json={"cpu_pct": 150},
-    )
-    assert bad.status_code == 400
+    for payload in (
+        {"cpu_pct": 150},
+        {"cpu_sustain_min": 0},
+        {"cpu_sustain_min": 1441},
+        {"cpu_sustain_min": 2.5},
+    ):
+        bad = client.put(
+            "/v1/system/settings",
+            headers={"X-Test-User": "admin@example.com"},
+            json=payload,
+        )
+        assert bad.status_code == 400, payload
 
 
 def test_single_user_mode_without_permission_store(tmp_path: Path) -> None:

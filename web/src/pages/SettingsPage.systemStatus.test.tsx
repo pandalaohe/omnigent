@@ -22,7 +22,13 @@ function mockResponse(body: unknown, status = 200): Response {
   } as unknown as Response;
 }
 
-const SETTINGS = { cpu_pct: 85, mem_pct: 90, disk_pct: 90, server_5xx_pct: 5 };
+const SETTINGS = {
+  cpu_pct: 85,
+  cpu_sustain_min: 10,
+  mem_pct: 90,
+  disk_pct: 90,
+  server_5xx_pct: 5,
+};
 
 function renderSection() {
   const client = new QueryClient({
@@ -53,6 +59,7 @@ describe("SystemStatusSettingsSection", () => {
     renderSection();
 
     expect(await screen.findByLabelText(/CPU threshold/)).toHaveValue(85);
+    expect(screen.getByLabelText(/Sustained window/)).toHaveValue(10);
     expect(screen.getByLabelText(/Memory threshold/)).toHaveValue(90);
     expect(screen.getByLabelText(/Disk threshold/)).toHaveValue(90);
     expect(screen.getByLabelText(/Server 5xx failure rate/)).toHaveValue(5);
@@ -65,6 +72,9 @@ describe("SystemStatusSettingsSection", () => {
 
     fireEvent.change(await screen.findByLabelText(/CPU threshold/), {
       target: { value: "80" },
+    });
+    fireEvent.change(screen.getByLabelText(/Sustained window/), {
+      target: { value: "3" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -82,6 +92,7 @@ describe("SystemStatusSettingsSection", () => {
     expect(JSON.parse(String(putInit?.body))).toEqual({
       ...SETTINGS,
       cpu_pct: 80,
+      cpu_sustain_min: 3,
     });
   });
 

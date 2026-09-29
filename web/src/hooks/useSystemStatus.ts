@@ -156,6 +156,7 @@ export type SystemHistoryPoint = SystemHostHistoryPoint | SystemServerHistoryPoi
 /** `GET|PUT /v1/system/settings` threshold mapping. */
 export interface SystemStatusSettings {
   cpu_pct: number;
+  cpu_sustain_min: number;
   mem_pct: number;
   disk_pct: number;
   server_5xx_pct: number;

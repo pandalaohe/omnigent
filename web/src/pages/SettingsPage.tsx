@@ -408,11 +408,11 @@ export function SettingsPage() {
 /**
  * Admin thresholds for the resource monitor (``/settings/system-status``).
  *
- * Mirrors the server's settings mapping exactly: the four percentages the hub
- * evaluates. The sustained windows ("10 minutes" for CPU, "2 minutes" for
- * memory, "5 minutes" for the 5xx ratio) are server constants, shown as text
- * rather than editable fields. Non-admins see a permission message; the
- * endpoints 403 regardless.
+ * Mirrors the server's settings mapping exactly: the percentages the hub
+ * evaluates, plus the CPU sustained window. The memory ("2 minutes") and 5xx
+ * ("5 minutes") windows stay server constants, shown as text rather than
+ * editable fields. Non-admins see a permission message; the endpoints 403
+ * regardless.
  */
 
 type SystemStatusSettingsDraft = Record<keyof SystemStatusSettings, string>;
@@ -421,11 +421,17 @@ const SYSTEM_STATUS_THRESHOLD_FIELDS: {
   key: keyof SystemStatusSettings;
   label: string;
   hint: string;
+  /** Optional integer companion rendered beside the field (CPU minutes). */
+  companion?: { key: keyof SystemStatusSettings; label: string };
 }[] = [
   {
     key: "cpu_pct",
     label: "CPU threshold (%)",
-    hint: "Alert when above this for 10 consecutive minutes.",
+    hint: "Alert when CPU stays above the threshold for the whole window.",
+    companion: {
+      key: "cpu_sustain_min",
+      label: "Sustained window (minutes)",
+    },
   },
   {
     key: "mem_pct",
@@ -447,6 +453,7 @@ const SYSTEM_STATUS_THRESHOLD_FIELDS: {
 function toSettingsDraft(settings: SystemStatusSettings): SystemStatusSettingsDraft {
   return {
     cpu_pct: String(settings.cpu_pct),
+    cpu_sustain_min: String(settings.cpu_sustain_min),
     mem_pct: String(settings.mem_pct),
     disk_pct: String(settings.disk_pct),
     server_5xx_pct: String(settings.server_5xx_pct),
@@ -456,6 +463,7 @@ function toSettingsDraft(settings: SystemStatusSettings): SystemStatusSettingsDr
 function fromSettingsDraft(draft: SystemStatusSettingsDraft): SystemStatusSettings {
   return {
     cpu_pct: Number(draft.cpu_pct),
+    cpu_sustain_min: Number(draft.cpu_sustain_min),
     mem_pct: Number(draft.mem_pct),
     disk_pct: Number(draft.disk_pct),
     server_5xx_pct: Number(draft.server_5xx_pct),
@@ -496,13 +504,15 @@ export function SystemStatusSettingsSection() {
   const savedDraft = settings.data !== undefined ? toSettingsDraft(settings.data) : null;
   const unchanged =
     draft !== null && savedDraft !== null && JSON.stringify(draft) === JSON.stringify(savedDraft);
+  const setField = (key: keyof SystemStatusSettings, value: string) =>
+    setDraft((current) => (current === null ? current : { ...current, [key]: value }));
 
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       <div className="mb-6">
         <h1 className="text-2xl font-semibold">System status</h1>
         <p className="mt-1 text-ui text-muted-foreground">
-          Thresholds for the resource monitor's findings, in percent.
+          Thresholds for the resource monitor's findings.
         </p>
       </div>
 
@@ -516,24 +526,40 @@ export function SystemStatusSettingsSection() {
             update.mutate(fromSettingsDraft(draft));
           }}
         >
-          {SYSTEM_STATUS_THRESHOLD_FIELDS.map((field) => (
-            <label key={field.key} className="flex flex-col gap-1">
-              <span className="text-sm font-medium">{field.label}</span>
-              <Input
-                type="number"
-                min={0}
-                max={100}
-                step="any"
-                value={draft[field.key]}
-                onChange={(event) =>
-                  setDraft((current) =>
-                    current === null ? current : { ...current, [field.key]: event.target.value },
-                  )
-                }
-              />
-              <span className="text-xs text-muted-foreground">{field.hint}</span>
-            </label>
-          ))}
+          {SYSTEM_STATUS_THRESHOLD_FIELDS.map((field) => {
+            const companion = field.companion;
+            return (
+              <div key={field.key} className="flex flex-col gap-1">
+                <div className="flex items-end gap-3">
+                  <label className="flex flex-1 flex-col gap-1">
+                    <span className="text-sm font-medium">{field.label}</span>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step="any"
+                      value={draft[field.key]}
+                      onChange={(event) => setField(field.key, event.target.value)}
+                    />
+                  </label>
+                  {companion !== undefined && (
+                    <label className="flex w-44 flex-col gap-1">
+                      <span className="text-sm font-medium">{companion.label}</span>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={1440}
+                        step={1}
+                        value={draft[companion.key]}
+                        onChange={(event) => setField(companion.key, event.target.value)}
+                      />
+                    </label>
+                  )}
+                </div>
+                <span className="text-xs text-muted-foreground">{field.hint}</span>
+              </div>
+            );
+          })}
           <div className="flex items-center gap-2">
             <Button
               type="submit"
