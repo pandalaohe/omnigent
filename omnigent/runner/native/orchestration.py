@@ -599,6 +599,9 @@ class _CodexNativeLaunchConfig:
         pinned into the private ``config.toml`` at launch so the thread (and
         the TUI footer) start at it instead of the shared config's default.
         ``None`` leaves Codex's configured effort in place.
+    :param parent_session_id: The conversation's parent when this session is
+        a child, e.g. ``"conv_mother987"``. ``None`` for a top-level session;
+        a child gets the child-role prompt line in its developer instructions.
     """
 
     workspace: Path
@@ -614,6 +617,7 @@ class _CodexNativeLaunchConfig:
     routing_enabled: bool = False
     turn_routing: bool = False
     reasoning_effort: str | None = None
+    parent_session_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1249,6 +1253,11 @@ async def _codex_native_launch_config(
         not isinstance(external_session_id, str) or not external_session_id
     ):
         raise RuntimeError(f"Invalid external_session_id for Codex session {session_id!r}.")
+    parent_session_id = snapshot.get("parent_session_id")
+    if parent_session_id is not None and (
+        not isinstance(parent_session_id, str) or not parent_session_id
+    ):
+        raise RuntimeError(f"Invalid parent_session_id for Codex session {session_id!r}.")
     from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS, validate_effort
 
     reasoning_effort = snapshot.get("reasoning_effort")
@@ -1325,6 +1334,7 @@ async def _codex_native_launch_config(
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
         reasoning_effort=reasoning_effort,
+        parent_session_id=parent_session_id,
     )
 
 
@@ -5294,8 +5304,9 @@ async def _auto_create_codex_terminal(
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
     from omnigent.runner.app import get_session_peer_messaging_enabled
-    from omnigent.runtime.prompt import PEER_SESSION_GRANT
+    from omnigent.runtime.prompt import PEER_SESSION_GRANT, child_session_question_instruction
 
+    _peer_messaging_enabled = get_session_peer_messaging_enabled(session_id)
     _codex_developer_instructions = (
         "\n\n".join(
             x
@@ -5304,7 +5315,10 @@ async def _auto_create_codex_terminal(
                     agent_spec, global_instructions=global_instructions
                 ),
                 _codex_routing_note,
-                PEER_SESSION_GRANT if get_session_peer_messaging_enabled(session_id) else None,
+                PEER_SESSION_GRANT if _peer_messaging_enabled else None,
+                child_session_question_instruction(_peer_messaging_enabled)
+                if launch_config.parent_session_id
+                else None,
             ]
             if x
         )
@@ -8632,6 +8646,14 @@ async def _auto_create_claude_terminal(
         launch_metadata.auto_harness,
         router_started=subagent_router_dir is not None,
     )
+    from omnigent.runner.app import get_session_peer_messaging_enabled
+    from omnigent.runtime.prompt import child_session_question_instruction
+
+    # Child role, not a tool limit: a child's question goes to its mother, so
+    # it loses AskUserQuestion. A top-level session keeps today's argv.
+    is_child_session = (
+        session_init is not None and session_init.snapshot.parent_session_id is not None
+    )
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -8650,11 +8672,15 @@ async def _auto_create_claude_terminal(
                     agent_spec, global_instructions=global_instructions
                 ),
                 routed_spawn_note,
+                child_session_question_instruction(get_session_peer_messaging_enabled(session_id))
+                if is_child_session
+                else None,
             ]
             if x
         )
         or None,
         allowed_tools=routed_spawn_tools,
+        disallowed_tools=("AskUserQuestion",) if is_child_session else (),
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,

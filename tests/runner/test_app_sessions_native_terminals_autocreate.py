@@ -69,7 +69,10 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    child_session_question_instruction,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -1481,6 +1484,107 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
         + EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
         + "\n\nG"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer_messaging_enabled", [False, True], ids=["peers-off", "peers-on"])
+@pytest.mark.parametrize("parent_session_id", [None, "conv_mother"], ids=["top-level", "child"])
+async def test_auto_create_claude_terminal_child_question_policy(
+    parent_session_id: str | None,
+    peer_messaging_enabled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Claude child gets the child-question line and no AskUserQuestion; a
+    top-level session keeps today's argv (no line, no denylist flag).
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    session_id = "c4d5e6f708192a3b4c5d6e7f8091a2b3"
+    monkeypatch.setitem(
+        runner_app._session_peer_messaging_enabled_ref, session_id, peer_messaging_enabled
+    )
+    session_init = RunnerSessionInitEnvelope.model_validate(
+        {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": "agent",
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(tmp_path),
+                "labels": {},
+                "parent_session_id": parent_session_id,
+            },
+        }
+    )
+
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        session_init=session_init,
+    )
+
+    args = captured["spec"].args
+    child_line = child_session_question_instruction(peer_messaging_enabled)
+    prompt = (
+        args[args.index("--append-system-prompt") + 1] if "--append-system-prompt" in args else ""
+    )
+    if parent_session_id is not None:
+        assert "AskUserQuestion" in args[args.index("--disallowedTools") + 1].split(",")
+        assert child_line in prompt
+    else:
+        assert "--disallowedTools" not in args
+        assert child_line not in prompt
+
+    await fake_client.aclose()
 
 
 @pytest.mark.asyncio

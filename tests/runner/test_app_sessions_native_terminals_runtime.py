@@ -39,7 +39,11 @@ from omnigent.runner.resource_registry import (
     CODEX_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, PEER_SESSION_GRANT
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    PEER_SESSION_GRANT,
+    child_session_question_instruction,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -831,6 +835,77 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert codex_native_bridge.read_bridge_startup_timeout(bridge_dir) is None
     assert "bridge state is preloaded" in caplog.text
     assert "no bridge-state wait extension is needed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer_messaging_enabled", [False, True], ids=["peers-off", "peers-on"])
+@pytest.mark.parametrize("parent_session_id", [None, "conv_mother"], ids=["top-level", "child"])
+async def test_auto_create_codex_terminal_child_question_line(
+    parent_session_id: str | None,
+    peer_messaging_enabled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Codex child's developer instructions carry the child-question line with
+    the wording matching its peer-messaging state; a top-level session's do not.
+    """
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    import omnigent.runner.native.orchestration as orchestration_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.native.orchestration import _CodexNativeLaunchConfig
+
+    session_id = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setitem(
+        runner_app_mod._session_peer_messaging_enabled_ref, session_id, peer_messaging_enabled
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> Any:
+        return _CodexNativeLaunchConfig(
+            workspace=tmp_path / "workspace",
+            policy_server_url="http://ap.example",
+            terminal_launch_args=None,
+            model_override=None,
+            external_session_id=None,
+            fork_source_id=None,
+            fork_source_external_id=None,
+            fork_carry_history=False,
+            bypass_sandbox=False,
+            parent_session_id=parent_session_id,
+        )
+
+    monkeypatch.setattr(orchestration_mod, "_codex_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        """Stops the launch once the app-server kwargs are captured."""
+
+    def _fake_build_codex_native_server(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr(
+        codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
+    )
+
+    with pytest.raises(_Sentinel):
+        await _auto_create_codex_terminal(
+            session_id,
+            None,  # type: ignore[arg-type]
+            lambda _sid, _event: None,
+        )
+
+    instructions = captured.get("developer_instructions") or ""
+    child_line = child_session_question_instruction(peer_messaging_enabled)
+    if parent_session_id is not None:
+        assert child_line in instructions
+    else:
+        assert child_line not in instructions
 
 
 @pytest.mark.asyncio

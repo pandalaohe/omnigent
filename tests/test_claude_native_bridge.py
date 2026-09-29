@@ -4260,6 +4260,22 @@ def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> Non
     assert disallowed == ["Bash", "Edit"]
 
 
+def test_augment_claude_args_merges_disallowed_tools_into_the_user_flag(
+    tmp_path: Path,
+) -> None:
+    """A caller-supplied denylist joins the user's flag instead of adding a second."""
+    args = augment_claude_args(
+        ("--disallowedTools", "Bash,Edit"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        disallowed_tools=("AskUserQuestion",),
+    )
+
+    flag_indices = [i for i, arg in enumerate(args) if arg == "--disallowedTools"]
+    assert len(flag_indices) == 1
+    assert args[flag_indices[0] + 1].split(",") == ["Bash", "Edit", "AskUserQuestion"]
+
+
 def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(
     tmp_path: Path,
 ) -> None:
