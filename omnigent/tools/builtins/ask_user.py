@@ -28,14 +28,12 @@ class AskUserAsyncTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Ask the user one or more questions on a card. This tool returns "
-            "immediately and does not block the session: the user's answers "
-            "arrive later as a new user message. Use it when the session must "
-            "keep working while the user decides, or when the user is away. "
-            "Put any context the user needs (report paths, links, which "
-            "session or file the question is about) in ``context``. Each "
-            "question may offer selectable ``options``; without options it is "
-            "answered as free text."
+            "Show the user a card with one or more questions in this session. "
+            "The tool returns immediately and does not block the session: the "
+            "user's answers arrive later as a new user message. ``context`` is "
+            "optional markdown shown above the questions. Each question may "
+            "offer selectable ``options``; without options it is answered as "
+            "free text."
         )
 
     def get_schema(self) -> dict[str, Any]:
