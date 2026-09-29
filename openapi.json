@@ -8520,6 +8520,18 @@
             "title": "Labels",
             "type": "object"
           },
+          "last_message_preview": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "One-line excerpt of the session's newest visible message. Filled only when the request asked with `include_preview=true` (default `false`, and never for callers that don't ask); `None` otherwise or when the session has no visible messages.",
+            "title": "Last Message Preview"
+          },
           "last_task_error": {
             "anyOf": [
               {
@@ -8707,6 +8719,19 @@
             ],
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. This is the sole reachability signal: `True` means the client can chat normally. It does **not** fold in host-relaunch optimism (a dead runner on a live host reads `False` here, not `True`) \u2014 the open-session view pairs it with `host_online` to decide what to show. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
+          },
+          "running_since": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds at which the current running period began, as the server observed the status edge that opened it; `None` whenever the snapshot status is not `\"running\"`. The server's observation, not a harness turn id: for a session whose harness owns the status directly (relay / SDK / codex-native / claude-native with its status file) it is the turn start, while a claude-native session on the PTY fallback reports a quiet lull as `\"idle\"` and restarts this stamp when activity resumes. The in-memory stamp wins; the persisted `omnigent.running_since` label is the fallback after a server restart or on a replica without the runner tunnel.",
+            "title": "Running Since"
           },
           "sandbox_status": {
             "anyOf": [
@@ -15914,6 +15939,17 @@
             "schema": {
               "default": true,
               "title": "Include Usage",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "When `True`, fill `last_message_preview` with an excerpt of the session's newest visible message (one batched items read). The web chat never sets it; orchestrating callers use it to peek at a peer session without fetching the transcript.",
+            "in": "query",
+            "name": "include_preview",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Preview",
               "type": "boolean"
             }
           }
