@@ -4364,14 +4364,16 @@ async def _send_to_existing_session(
             f"Error: session {target_session_id!r} is still starting its turn; "
             "retry the send in a moment"
         )
-    # A running/waiting child, or one the server reports busy, is steered into
-    # its in-flight turn on the in-flight path — reusing (or adopting) the one
-    # work entry instead of replacing it, so the running turn's single
-    # completion is never orphaned. The fresh continuation below is only for a
-    # genuinely idle child, where the post starts a new turn.
+    # A running/waiting child — tracked locally or reported by the server's
+    # session status — is steered into its in-flight turn on the in-flight
+    # path, reusing (or adopting) the one work entry instead of replacing it,
+    # so the running turn's single completion is never orphaned. The fresh
+    # continuation below is only for a genuinely idle child, where the post
+    # starts a new turn.
+    _snap_status = snap_data.get("status")
     _by_id_in_flight = (
         existing_work is not None and existing_work.status in ("running", "waiting")
-    ) or snap_data.get("busy") is True
+    ) or _snap_status in ("running", "waiting")
     if _by_id_in_flight:
         return await _send_to_in_flight_child(
             target_session_id,

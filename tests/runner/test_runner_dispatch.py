@@ -4543,7 +4543,7 @@ async def test_sys_session_send_by_id_rejects_closed_child(
                     "title": "researcher:auth",
                     "parent_session_id": "conv_parent",
                     "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
-                    "busy": False,
+                    "status": "idle",
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_closed/events":
@@ -4667,7 +4667,7 @@ async def test_sys_session_send_by_id_names_child_from_snapshot(
                     "sub_agent_name": sub_agent_name,
                     "parent_session_id": "conv_parent_by_id",
                     "labels": {},
-                    "busy": False,
+                    "status": "idle",
                 },
             )
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_by_id_child":
@@ -12990,7 +12990,7 @@ async def test_send_by_session_id_reuses_running_child_without_restamp() -> None
                     "id": "conv_byid_coder",
                     "parent_session_id": "conv_parent_byid",
                     "title": "claude:merge-task",
-                    "busy": False,
+                    "status": "idle",
                 },
             )
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_byid_coder":
@@ -13041,3 +13041,84 @@ async def test_send_by_session_id_reuses_running_child_without_restamp() -> None
     assert len(event_posts) == 1
     assert event_posts[0]["created_by"] == "alice@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
+
+
+@pytest.mark.asyncio
+async def test_send_by_session_id_steers_busy_child_without_work_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-reported running child is steered in flight, not treated as idle.
+
+    The busy signal must come from the session's ``status`` (a SessionResponse
+    has no ``busy`` field). Sending to a running child with no local work entry
+    (post-restart, or a child this runner has not tracked) must take the
+    in-flight path: post into the live turn and adopt exactly one running entry,
+    so the turn's single completion is delivered exactly once.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id, child_id = "conv_parent_busy_by_id", "conv_child_busy_by_id"
+    event_posts: list[dict[str, Any]] = []
+    stamped: list[str] = []
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "title": "worker:busy-task",
+                    "status": "running",
+                },
+            )
+        if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
+            labels = json.loads(request.content)["labels"]
+            stamped.append(labels[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    runner_app._session_inboxes_ref[parent_id] = inbox
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": child_id, "args": "report where you are"}),
+                server_client=server_client,
+                conversation_id=parent_id,
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=inbox,
+            )
+            work = runner_app.get_subagent_work(child_id)
+            work_status = work.status if work is not None else None
+            work_id = work.work_id if work is not None else None
+            first = runner_app.mark_subagent_work_terminal(
+                child_id, status="completed", output="done"
+            )
+            second = runner_app.mark_subagent_work_terminal(
+                child_id, status="completed", output="done"
+            )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    assert payload["conversation_id"] == child_id
+    assert len(event_posts) == 1
+    assert work_status == "running"
+    assert work_id == stamped[0]
+    assert first.delivered_now is True
+    assert second.delivered_now is False
+    assert inbox.qsize() == 1
