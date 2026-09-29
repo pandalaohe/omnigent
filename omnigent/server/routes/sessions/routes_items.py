@@ -11,6 +11,7 @@ from fastapi import (
     Request,
 )
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities.pagination import PagedList
 from omnigent.errors import ErrorCode, OmnigentError
@@ -60,7 +61,6 @@ from omnigent.server.schemas import (
     PaginatedList,
     SessionItemsWindow,
 )
-from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -424,6 +424,7 @@ def register_items_routes(
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         tool: str | None = Query(default=None),
         session_name: str | None = Query(default=None),
+        include_archived: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
@@ -458,6 +459,9 @@ def register_items_routes(
         :param session_name: When set alongside ``tool``, only
             return children whose title matches
             ``"{tool}:{session_name}"`` exactly.
+        :param include_archived: When ``False`` (default), archived
+            children are excluded. When ``True``, archived children are
+            returned too, each with ``archived: true``.
         :returns: A :class:`PaginatedList` of
             :class:`ChildSessionSummary` objects.
         :raises OmnigentError: 403 if the caller lacks READ on
@@ -486,6 +490,7 @@ def register_items_routes(
             order=order,
             sort_by="created_at",
             title=title_filter,
+            include_archived=include_archived,
         )
         if (
             (access.level is None or access.level >= LEVEL_OWNER)

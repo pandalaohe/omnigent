@@ -34,6 +34,7 @@ from omnigent.tools.builtins import (
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
     SysScheduledTaskUpdateTool,
+    SysSessionArchiveTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
@@ -42,6 +43,7 @@ from omnigent.tools.builtins import (
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
+    SysSessionUnarchiveTool,
     SysTimerCancelTool,
     SysTimerSetTool,
     UpdateCommentTool,
@@ -540,6 +542,10 @@ class ToolManager:
         if self._peer_messaging_enabled:
             self._tools[SysSessionHandoffTool.name()] = SysSessionHandoffTool()
             self._tools[SysHandoffReportTool.name()] = SysHandoffReportTool()
+            # Archive / unarchive reach any session the user owns, so they
+            # ride the collaboration flag rather than the spawn grant.
+            self._tools[SysSessionArchiveTool.name()] = SysSessionArchiveTool()
+            self._tools[SysSessionUnarchiveTool.name()] = SysSessionUnarchiveTool()
 
         # send + close: opt-in via declared sub-agents or spawn: true.
         # The peer-messaging flag makes every session a peer sender: with

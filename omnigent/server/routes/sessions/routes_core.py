@@ -3199,6 +3199,15 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
+        # Only a real archive transition carries the idle deferral; passing it
+        # through the store keeps the label write in the same commit. Spread
+        # conditionally so fakes with explicit signatures see only the kwargs
+        # they define.
+        archive_stop_when_idle_kwargs: dict[str, Any] = (
+            {"archive_stop_when_idle": True}
+            if body.archived is True and body.stop_when_idle
+            else {}
+        )
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -3219,6 +3228,7 @@ def register_core_routes(
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
             close_cli_on_archive=close_on_archive,
+            **archive_stop_when_idle_kwargs,
         )
         if updated is None:
             raise _session_not_found()
@@ -3254,6 +3264,8 @@ def register_core_routes(
             # archived-flag re-check covers a cross-replica Undo.
             _cancel_pending_archive_stop(session_id)
             if conv.archived:
+                # The transition above deleted the idle-deferral marker in the
+                # same commit; the revision bump already voided it.
                 # Clear the runner-side archive fence for the newer revision.
                 _spawn_archive_unfence(
                     session_id,

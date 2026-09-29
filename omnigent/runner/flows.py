@@ -26,6 +26,7 @@ import json
 import logging
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -56,6 +57,7 @@ FLOW_TIMER_OFF_ERROR = (
     "flow timer is turned off in Settings > Session collaboration (flow_timer_enabled)"
 )
 _SUPPRESSED = "[Result suppressed by policy]"
+_FAILED_PEER_DISPOSITIONS = frozenset({"refused", "dropped", "failed"})
 
 # The runner process's MCP manager, set by ``create_runner_app``. Runner tools
 # reach ``execute_tool`` without it (the /mcp/execute route passes
@@ -125,10 +127,18 @@ class _FlowRun:
     dropped: int = 0
     last_tick: list[_StepResult] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
+    # Children a step dispatched work to; their completions while the flow runs
+    # land in the inbox without a wake and are counted for the end summary.
+    children: set[str] = field(default_factory=set)
+    held_child_results: int = 0
 
 
 # session_id → flow_id → run. Entries leave when the flow task finishes.
 _session_flows: dict[str, dict[str, _FlowRun]] = {}
+
+# The flow whose step is running in this task, so child work the step
+# dispatches is attributed to that flow.
+_step_run: ContextVar[_FlowRun | None] = ContextVar("flow_step_run", default=None)
 
 
 # ── Settings row 8 ────────────────────────────────────────────
@@ -249,7 +259,49 @@ def _step_error(output: str) -> str | None:
             error = parsed.get("error")
             if error:
                 return str(error)[:500]
+            # A peer send the server refused, dropped or failed carries no ``error`` key.
+            disposition = parsed.get("disposition")
+            if parsed.get("peer") is True and disposition in _FAILED_PEER_DISPOSITIONS:
+                reason = parsed.get("reason")
+                return f"peer send {disposition}" + (f": {reason}" if reason else "")
     return None
+
+
+def note_child_dispatch(
+    parent_session_id: str, child_session_id: str, *, release: bool = True
+) -> None:
+    """
+    Record which flow, if any, dispatched work to a child.
+
+    Called whenever child work is registered or steered: inside a flow step the
+    child joins that flow; any other dispatch releases it from the parent's
+    flows, so the parent's own sends wake it as usual.
+
+    :param release: ``False`` only attributes (a steer before its post; the
+        release waits for the post to succeed).
+    """
+    run = _step_run.get()
+    if run is not None and run.ctx.conversation_id == parent_session_id:
+        run.children.add(child_session_id)
+        return
+    if not release:
+        return
+    for other in _session_flows.get(parent_session_id, {}).values():
+        other.children.discard(child_session_id)
+
+
+def hold_child_wake(parent_session_id: str, child_session_id: str) -> bool:
+    """
+    Whether a child's completion wake is held by a running flow.
+
+    A held result stays in the parent's inbox and is reported by the flow's one
+    end wake; once the flow has ended, child completions wake as usual.
+    """
+    for run in _session_flows.get(parent_session_id, {}).values():
+        if run.reason is None and child_session_id in run.children:
+            run.held_child_results += 1
+            return True
+    return False
 
 
 # ── Start / list / cancel ─────────────────────────────────────
@@ -420,23 +472,27 @@ async def _run_step(run: _FlowRun, index: int, args: dict[str, Any]) -> str:
         return await manager.call_tool(
             ctx.agent_spec, step.tool, args, session_id=ctx.conversation_id
         )
-    return await execute_tool(
-        tool_name=step.tool,
-        arguments=json.dumps(args),
-        server_client=ctx.server_client,
-        terminal_registry=ctx.terminal_registry,
-        resource_registry=ctx.resource_registry,
-        agent_spec=ctx.agent_spec,
-        conversation_id=ctx.conversation_id,
-        task_id=ctx.task_id,
-        agent_id=ctx.agent_id,
-        agent_name=ctx.agent_name,
-        runner_workspace=ctx.runner_workspace,
-        local_tool_workdir=ctx.local_tool_workdir,
-        mcp_manager=None,
-        filesystem_registry=ctx.filesystem_registry,
-        effective_harness=ctx.effective_harness,
-    )
+    token = _step_run.set(run)
+    try:
+        return await execute_tool(
+            tool_name=step.tool,
+            arguments=json.dumps(args),
+            server_client=ctx.server_client,
+            terminal_registry=ctx.terminal_registry,
+            resource_registry=ctx.resource_registry,
+            agent_spec=ctx.agent_spec,
+            conversation_id=ctx.conversation_id,
+            task_id=ctx.task_id,
+            agent_id=ctx.agent_id,
+            agent_name=ctx.agent_name,
+            runner_workspace=ctx.runner_workspace,
+            local_tool_workdir=ctx.local_tool_workdir,
+            mcp_manager=None,
+            filesystem_registry=ctx.filesystem_registry,
+            effective_harness=ctx.effective_harness,
+        )
+    finally:
+        _step_run.reset(token)
 
 
 def _retain(run: _FlowRun, result: _StepResult) -> None:
@@ -646,7 +702,7 @@ async def _summary(run: _FlowRun) -> dict[str, Any]:
             }
         )
     rendered.reverse()
-    return {
+    summary: dict[str, Any] = {
         "flow_id": run.flow_id,
         "reason": run.reason,
         "detail": run.detail,
@@ -656,6 +712,9 @@ async def _summary(run: _FlowRun) -> dict[str, Any]:
         "results": rendered,
         "dropped_results": run.dropped + len(picked) - len(rendered),
     }
+    if run.held_child_results:
+        summary["child_results_in_inbox"] = run.held_child_results
+    return summary
 
 
 async def _post_wake(run: _FlowRun) -> None:
@@ -669,6 +728,11 @@ async def _post_wake(run: _FlowRun) -> None:
     text = f"[System: flow {run.flow_id} ended: {run.reason}]"
     if run.plan.note:
         text += f"\nnote: {run.plan.note!r}"
+    if run.held_child_results:
+        text += (
+            f"\n{run.held_child_results} sub-agent result(s) from this flow's sends are in your"
+            " inbox; call sys_read_inbox to collect them."
+        )
     text += "\n" + json.dumps(summary, ensure_ascii=False)
     ctx = run.ctx
     try:

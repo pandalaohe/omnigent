@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -21,7 +22,10 @@ from omnigent.server.cli_retention import (
     CliRetentionHostLeaseBusy,
     CliRetentionHostLeaseLost,
 )
-from omnigent.stores.conversation_store import ConversationArchiveClosingError
+from omnigent.stores.conversation_store import (
+    ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    ConversationArchiveClosingError,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 
@@ -1229,3 +1233,269 @@ async def test_archive_intent_completes_when_runner_acks_stop(db_uri: str) -> No
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_expand_archive_root_honours_the_idle_deferral_label(db_uri: str) -> None:
+    """A matching deferral label makes expansion await the idle wait once."""
+    conversations = SqlAlchemyConversationStore(db_uri)
+    intents = CliReleaseIntentStore(db_uri)
+    deferred = conversations.create_conversation()
+    deferred_archived = conversations.update_conversation(
+        deferred.id,
+        archived=True,
+        close_cli_on_archive=True,
+        archive_stop_when_idle=True,
+    )
+    assert deferred_archived is not None
+    assert deferred_archived.labels[ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY] == str(
+        deferred_archived.archive_revision
+    )
+    plain = conversations.create_conversation()
+    plain_archived = conversations.update_conversation(
+        plain.id, archived=True, close_cli_on_archive=True
+    )
+    assert plain_archived is not None
+    conversations.set_labels(plain.id, {ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: "999"})
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    waited: list[tuple[str, int, object]] = []
+
+    async def _recording_wait(session_id: str, revision: int, store: object) -> None:
+        waited.append((session_id, revision, store))
+
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_UnconnectedRunnerRouter(),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+    with patch.object(sessions_facade, "_wait_for_archive_idle", _recording_wait):
+        await coordinator._expand_archive_root((current_workspace_id(), deferred.id))
+        await coordinator._expand_archive_root((current_workspace_id(), plain.id))
+
+    # Only the root whose label names its own current revision waited, and the
+    # wait is bound to that exact revision.
+    assert waited == [(deferred.id, deferred_archived.archive_revision, conversations)]
+    for root in (deferred, plain):
+        settled = conversations.get_conversation(root.id)
+        assert settled is not None
+        assert settled.archive_close_completed_revision == settled.archive_revision
+
+
+class _RowsStore:
+    """Root-row store whose reads can be scripted to fail from a call number."""
+
+    def __init__(self, row: object | None) -> None:
+        self._row = row
+        self.calls = 0
+        self.fail_from: int | None = None
+        self.failed = asyncio.Event()
+
+    def get_conversation(self, _session_id: str) -> object | None:
+        self.calls += 1
+        if self.fail_from is not None and self.calls >= self.fail_from:
+            self.failed.set()
+            raise RuntimeError("transient row read failure")
+        return self._row
+
+
+def _deferred_row(revision: int) -> SimpleNamespace:
+    """A row that is archived and whose label names ``revision``."""
+    return SimpleNamespace(
+        archived=True,
+        archive_revision=revision,
+        archived_at=time.time(),
+        labels={ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: str(revision)},
+    )
+
+
+@pytest.mark.asyncio
+async def test_wait_for_archive_idle_root_read_failure_is_never_idle() -> None:
+    """A failed root read counts as busy and restarts the settle window."""
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import orchestration as _orchestration_mod
+
+    session_id = "conv_root_read_failure"
+    store = _RowsStore(_deferred_row(1))
+    store.fail_from = 2  # every poll after the first fails
+
+    async def _no_descendants(_store: object, _root: str) -> list[str]:
+        return []
+
+    _orchestration_mod._session_status_cache[session_id] = "idle"
+    try:
+        with (
+            patch.object(sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.15),
+            patch.object(sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 30.0),
+            patch.object(
+                _orchestration_mod,
+                "_collect_descendant_conversation_ids",
+                _no_descendants,
+            ),
+        ):
+            task = asyncio.create_task(
+                _orchestration_mod._wait_for_archive_idle(session_id, 1, store)
+            )
+            await asyncio.wait_for(store.failed.wait(), timeout=5.0)
+            # Idle status is not evidence while the row cannot be read: the
+            # wait must still be pending well past the settle window.
+            await asyncio.sleep(0.3)
+            assert not task.done()
+            # ...and it keeps polling rather than parking on the failure.
+            calls_before = store.calls
+            await asyncio.sleep(0.05)
+            assert store.calls > calls_before
+            store.fail_from = None
+            await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        _orchestration_mod._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_archive_idle_descendant_lookup_failure_keeps_tree_busy() -> None:
+    """A failed descendant lookup keeps the tree busy until it succeeds."""
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import orchestration as _orchestration_mod
+
+    session_id = "conv_root_lookup_failure"
+    child_id = "conv_child"
+    store = _RowsStore(_deferred_row(1))
+    lookup_state = {"fail": True, "calls": 0}
+
+    async def _flaky_descendants(_store: object, _root: str) -> list[str]:
+        lookup_state["calls"] += 1
+        if lookup_state["fail"]:
+            raise RuntimeError("transient descendant lookup failure")
+        return [child_id]
+
+    _orchestration_mod._session_status_cache[session_id] = "idle"
+    _orchestration_mod._session_status_cache[child_id] = "running"
+    try:
+        with (
+            patch.object(sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.15),
+            patch.object(sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 30.0),
+            patch.object(
+                _orchestration_mod,
+                "_collect_descendant_conversation_ids",
+                _flaky_descendants,
+            ),
+        ):
+            task = asyncio.create_task(
+                _orchestration_mod._wait_for_archive_idle(session_id, 1, store)
+            )
+            # The idle root alone cannot release while the tree is unknown.
+            await asyncio.sleep(0.3)
+            assert not task.done()
+            assert lookup_state["calls"] > 1  # retried every poll
+
+            # A successful lookup finds a running child: still busy.
+            lookup_state["fail"] = False
+            await asyncio.sleep(0.3)
+            assert not task.done()
+
+            # Only the whole tree going idle releases it.
+            _orchestration_mod._session_status_cache[child_id] = "idle"
+            await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        _orchestration_mod._session_status_cache.pop(session_id, None)
+        _orchestration_mod._session_status_cache.pop(child_id, None)
+
+
+@pytest.mark.asyncio
+async def test_stop_after_grace_sustained_read_failure_never_stops() -> None:
+    """The coordinator-less fallback never stops on an unreadable row."""
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import orchestration as _orchestration_mod
+
+    session_id = "conv_unreadable"
+    store = _RowsStore(None)
+    store.fail_from = 1  # every read fails
+    attempted: list[str] = []
+
+    async def _recording_archive_stop(*_args: object, **_kwargs: object) -> bool:
+        attempted.append(session_id)
+        return True
+
+    with (
+        patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0),
+        patch.object(_orchestration_mod, "_ARCHIVE_STOP_LOOKUP_ATTEMPTS", 2),
+        patch.object(_orchestration_mod, "_ARCHIVE_STOP_LOOKUP_RETRY_S", 0.0),
+        patch.object(_orchestration_mod, "_archive_stop", _recording_archive_stop),
+    ):
+        _orchestration_mod._spawn_archive_stop(session_id, store, None, None)
+        task = _orchestration_mod._pending_archive_stops[session_id]
+        await asyncio.wait_for(task, timeout=5.0)
+
+    # The row read was retried, and a sustained failure skipped the stop.
+    assert store.calls == 2
+    assert attempted == []
+
+
+@pytest.mark.asyncio
+async def test_stop_after_grace_rewaits_a_mid_wait_rearchive() -> None:
+    """A re-archive during a wait gets its own idle wait before the stop."""
+    from omnigent.server.routes._sessions import orchestration as _orchestration_mod
+
+    session_id = "conv_rearchive_mid_wait"
+    row = _deferred_row(1)
+    store = _RowsStore(row)
+    events: list[tuple[str, int | None]] = []
+
+    async def _rearchiving_wait(_session_id: str, revision: int, _store: object) -> None:
+        events.append(("wait", revision))
+        if revision == 1:
+            # A cross-replica unarchive + re-archive: new revision, new label.
+            row.archive_revision = 3
+            row.labels[ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY] = "3"
+
+    async def _recording_archive_stop(*_args: object, **_kwargs: object) -> bool:
+        events.append(("stop", None))
+        return True
+
+    with (
+        patch.object(_orchestration_mod, "_wait_for_archive_idle", _rearchiving_wait),
+        patch.object(_orchestration_mod, "_archive_stop", _recording_archive_stop),
+    ):
+        _orchestration_mod._spawn_archive_stop(session_id, store, None, None)
+        task = _orchestration_mod._pending_archive_stops[session_id]
+        await asyncio.wait_for(task, timeout=5.0)
+
+    # Revision 3's idle wait ran before the single teardown.
+    assert events == [("wait", 1), ("wait", 3), ("stop", None)]
+
+
+@pytest.mark.asyncio
+async def test_stop_after_grace_skips_when_unarchived_during_wait() -> None:
+    """An unarchive during the wait is honoured by the re-read, never stopped."""
+    from omnigent.server.routes._sessions import orchestration as _orchestration_mod
+
+    session_id = "conv_unarchived_mid_wait"
+    row = _deferred_row(1)
+    store = _RowsStore(row)
+    waited: list[int] = []
+    stopped: list[str] = []
+
+    async def _unarchiving_wait(_session_id: str, revision: int, _store: object) -> None:
+        waited.append(revision)
+        row.archived = False
+
+    async def _recording_archive_stop(*_args: object, **_kwargs: object) -> bool:
+        stopped.append(session_id)
+        return True
+
+    with (
+        patch.object(_orchestration_mod, "_wait_for_archive_idle", _unarchiving_wait),
+        patch.object(_orchestration_mod, "_archive_stop", _recording_archive_stop),
+    ):
+        _orchestration_mod._spawn_archive_stop(session_id, store, None, None)
+        task = _orchestration_mod._pending_archive_stops[session_id]
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert waited == [1]
+    assert stopped == []

@@ -36,6 +36,21 @@ describe("formatToolTitle", () => {
     });
   });
 
+  it("formats sys_session_archive/unarchive with the target session", () => {
+    expect(formatToolTitle("sys_session_archive", { session_id: "conv_a" })).toEqual({
+      verb: "Archive session:",
+      body: "conv_a",
+    });
+    expect(formatToolTitle("sys_session_archive", {})).toEqual({
+      verb: "Archive this session",
+      body: "",
+    });
+    expect(formatToolTitle("sys_session_unarchive", { session_id: "conv_a" })).toEqual({
+      verb: "Unarchive session:",
+      body: "conv_a",
+    });
+  });
+
   it("formats sys_session_get_history with the conversation_id as body", () => {
     expect(formatToolTitle("sys_session_get_history", { conversation_id: "conv_abc123" })).toEqual({
       verb: "Get session history:",

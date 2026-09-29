@@ -1264,6 +1264,12 @@
             "description": "Agent type recorded on the latest task, e.g. `\"researcher\"`. Mirrors the `tool` prefix in `title` and is provided alongside it because the title is a denormalized string while `agent_name` is the durable per-task value.",
             "title": "Agent Name"
           },
+          "archived": {
+            "default": false,
+            "description": "`True` when the child session is archived. Archived children are excluded from the default listing; the `include_archived` query parameter surfaces them so callers can tell a freed name from a merely hidden one.",
+            "title": "Archived",
+            "type": "boolean"
+          },
           "busy": {
             "default": false,
             "description": "`True` when the child's session loop is live. Mirrors the algorithm used by `GET /v1/sessions/{id}` to compute `status`: read the live in-memory cache first (`\"running\"`/`\"waiting\"` \u2192 busy), and fall back to the latest task's status on cache miss (`\"queued\"` / `\"in_progress\"` \u2192 busy). For NO_DBOS sessions the tasks table is not populated during active runs, so the cache consult is what keeps the rail's \"Working\" badge correct.",
@@ -10442,6 +10448,12 @@
             "title": "Silent",
             "type": "boolean"
           },
+          "stop_when_idle": {
+            "default": false,
+            "description": "Only meaningful alongside `archived: true`. When `True` the archive teardown, after the undo window, also waits (bounded) until the session tree leaves the running state. Set by an agent archiving its own session or an ancestor, whose turn would otherwise be cut. Default `False` keeps the web archive's timing.",
+            "title": "Stop When Idle",
+            "type": "boolean"
+          },
           "subagent_routing_override": {
             "anyOf": [
               {
@@ -16600,6 +16612,17 @@
                 }
               ],
               "title": "Session Name"
+            }
+          },
+          {
+            "description": "When `False` (default), archived children are excluded. When `True`, archived children are returned too, each with `archived: true`.",
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
             }
           }
         ],
