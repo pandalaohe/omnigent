@@ -712,6 +712,13 @@ def register_hooks_routes(
             and tool_input
         ):
             extras["exit_plan_mode"] = tool_input
+        # The full Bash command rides along so the parent's wake notice can
+        # name the exact action instead of the truncated content_preview.
+        # Codex already stamps the same ``command`` extra on its cards.
+        if tool_name == "Bash" and isinstance(tool_input, dict):
+            command = tool_input.get("command")
+            if isinstance(command, str) and command:
+                extras["command"] = command
         asking_name = native_agent.display_name if native_agent is not None else hook_label
         asking_vendor = (
             _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)

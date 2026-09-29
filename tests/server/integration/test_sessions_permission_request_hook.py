@@ -368,6 +368,46 @@ async def test_permission_request_hook_bash_cancel_interrupts_claude(
     }
 
 
+async def test_permission_request_hook_bash_carries_full_command(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A Bash permission card carries the full command for the mother notice.
+
+    ``content_preview`` is hard-capped, so the hook stamps the verbatim
+    command as the ``command`` extra; a non-Bash tool gets no such extra
+    even when its ``tool_input`` happens to carry a ``command`` field.
+    """
+    agent = await create_test_agent(client, "test-permission-bash-command")
+    session_id = await _create_session(client, agent["id"])
+
+    command = "pnpm exec vitest run " + "x" * 1500
+    payload = await _claude_permission_payload("Bash")
+    payload["tool_input"] = {"command": command}
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert event["params"]["command"] == command
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    assert (await hook_task).status_code == 200
+
+    write_payload = await _claude_permission_payload("Write")
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=write_payload)
+    )
+    event = await drain_task
+    assert "command" not in event["params"]
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    assert (await hook_task).status_code == 200
+
+
 @pytest.mark.parametrize("tool_name", ["Bash", "Write", "AskUserQuestion", "ExitPlanMode"])
 @pytest.mark.parametrize("action", ["accept", "decline"])
 @pytest.mark.parametrize(

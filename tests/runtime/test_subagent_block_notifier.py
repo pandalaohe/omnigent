@@ -28,7 +28,9 @@ from omnigent.runtime.subagent_block_notifier import (
     SubagentBlockNotifier,
     _block_reason,
     _child_label,
+    _format_block_notice,
 )
+from omnigent.server.routes._sessions import helpers as session_helpers
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -282,13 +284,13 @@ async def test_observe_wakes_immediate_parent_for_blocked_child(
     await _wait_for_calls(dispatch, expected=1)
 
     # Exactly one dispatch — the immediate parent is the wake target,
-    # and the notice carries the agent label + prompt reason so the
-    # parent agent can decide what to do without re-fetching.
+    # and the notice carries the child's resolved label + prompt reason
+    # so the parent agent can decide what to do without re-fetching.
     assert len(dispatch.calls) == 1
     call = dispatch.calls[0]
     assert call.parent_id == parent.id
     assert call.child_id == child.id
-    assert "codex/auth-fix" in call.notice
+    assert "sub-agent auth-fix is blocked awaiting human approval" in call.notice
     assert "Codex wants to run 'date'" in call.notice
     assert call.notice.startswith("[System:")
 
@@ -1067,7 +1069,7 @@ async def test_failed_dispatch_releases_arm_so_republish_re_fires(
     assert dispatch.calls[1].parent_id == parent.id
     # The redelivered notice still names the child + carries the approval
     # reason — proving the re-fire carried the real payload, not an empty wake.
-    assert "codex/retry" in dispatch.calls[1].notice
+    assert "sub-agent retry is blocked awaiting human approval" in dispatch.calls[1].notice
     assert "git fetch" in dispatch.calls[1].notice
     # Arm now HELD: the second dispatch confirmed delivery (returned True), so
     # the success debounce is intact — a third publish of this id would be
@@ -1246,3 +1248,122 @@ def test_child_label_falls_back_to_id_for_titleless_session() -> None:
     """
     conv = _make_conv(id="fd996830e1375c7af31f7164fdab4de0", title="")
     assert _child_label(conv) == "fd996830e1375c7af31f7164fdab4de0"
+
+
+def test_format_block_notice_lists_all_questions_and_options() -> None:
+    """
+    A question-card block notice carries every question and its options.
+
+    The parent must see the real choices the human is deciding between;
+    the full list rides the notice, with no 200-char cut.
+    """
+    conv = _make_conv(id="8af356d908005a65f872c246158c6293", title="codex:quiz")
+    long_question = (
+        "Which database should the worker target for the nightly backfill job in production?"
+    )
+    event = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_quiz",
+        "params": {
+            "mode": "form",
+            "message": "Claude wants to call **AskUserQuestion**",
+            "tool_name": "AskUserQuestion",
+            "ask_user_question": {
+                "questions": [
+                    {
+                        "question": long_question,
+                        "header": "Database",
+                        "options": [{"label": "postgres"}, {"label": "sqlite"}],
+                        "multiSelect": False,
+                    },
+                    {
+                        "question": "Which region?",
+                        "header": "",
+                        "options": [{"label": "us-east"}, {"label": "eu-west"}],
+                        "multiSelect": True,
+                    },
+                ]
+            },
+        },
+    }
+
+    notice = _format_block_notice(conv, event)
+
+    assert f"{long_question} (postgres / sqlite)" in notice
+    assert "Which region? (us-east / eu-west)" in notice
+    assert "…" not in notice
+
+
+def test_block_reason_prefers_the_full_command_over_the_preview() -> None:
+    """
+    A command approval's action is the verbatim command, not the preview.
+
+    ``content_preview`` is hard-capped by the producer; the notice must
+    carry the whole command so the parent sees the exact gated action.
+    """
+    long_command = "pnpm exec vitest run " + "x" * 1500
+    event = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_cmd",
+        "params": {
+            "message": "Claude wants to call **Bash**",
+            "tool_name": "Bash",
+            "content_preview": f'Bash({{"command":"{long_command[:100]}…"}})',
+            "command": long_command,
+        },
+    }
+
+    assert _block_reason(event) == long_command
+
+
+def test_format_block_notice_deferred_approval_wording() -> None:
+    """
+    A deferred approval's notice says it is waiting, not blocking.
+
+    The parent must not treat the child as stopped: the card is the
+    human's to answer and the child keeps working meanwhile.
+    """
+    conv = _make_conv(id="8af356d908005a65f872c246158c6293", title="claude_code:auth-fix")
+    event = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_deferred",
+        "params": {
+            "mode": "form",
+            "message": "Claude wants to call **Bash**",
+            "async_kind": "approval",
+            "approval_ref": "a123456",
+            "command": "pnpm vitest run",
+        },
+    }
+
+    assert _format_block_notice(conv, event) == (
+        "[System: sub-agent auth-fix has an approval waiting for the user (#a123456): "
+        "pnpm vitest run. It is not blocked; surface it to the human.]"
+    )
+
+
+def test_format_block_notice_annotates_source_with_agent_host_and_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The notice names the child's resolved agent, host and cwd.
+
+    The notifier is armed with the child's original (unstamped) event, so
+    it resolves the source itself; the resolver's agent and host join the
+    child label, and the action's cwd is appended.
+    """
+    monkeypatch.setattr(
+        session_helpers,
+        "_elicitation_source_resolver",
+        lambda conv: {"agent": "Claude Code", "host": "laptop"},
+    )
+    conv = _make_conv(id="8af356d908005a65f872c246158c6293", title="codex:auth-fix")
+    event = _request_event("elicit_source", "Run the tests")
+    event["params"]["cwd"] = "/repo/worktree"
+
+    notice = _format_block_notice(conv, event)
+
+    assert (
+        "sub-agent auth-fix (Claude Code @ laptop, /repo/worktree) is blocked "
+        "awaiting human approval: Run the tests." in notice
+    )

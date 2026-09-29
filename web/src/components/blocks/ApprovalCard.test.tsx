@@ -1770,3 +1770,68 @@ describe("ApprovalCard — prompt expired", () => {
     expect(screen.queryByTestId("approval-card")).toBeNull();
   });
 });
+
+describe("ApprovalCard — mirrored source line", () => {
+  const props = {
+    elicitationId: "elic_child",
+    message: "Claude wants to call **Bash**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+  const source = {
+    sessionId: "child1",
+    label: "auth-fix",
+    agent: "Claude Code",
+    host: "laptop",
+    cwd: "/repo/worktrees/auth-fix",
+  };
+
+  it("names the child, agent, host and cwd on a mirrored card", () => {
+    render(<ApprovalCard {...props} targetSessionId="child1" source={source} />);
+
+    const line = screen.getByTestId("approval-card-source");
+    expect(line.textContent).toBe(
+      "来自子会话 auth-fix· Claude Code @ laptop· /repo/worktrees/auth-fix",
+    );
+    // The cwd keeps its full path in a tooltip for narrow cards.
+    expect(screen.getByTitle("/repo/worktrees/auth-fix").textContent).toBe(
+      "/repo/worktrees/auth-fix",
+    );
+  });
+
+  it("shows no source line on a top-level card even when a source rides along", () => {
+    render(<ApprovalCard {...props} source={source} />);
+
+    expect(screen.queryByTestId("approval-card-source")).toBeNull();
+  });
+
+  it("omits every unresolved provenance part", () => {
+    render(
+      <ApprovalCard
+        {...props}
+        targetSessionId="child1"
+        source={{ sessionId: "child1", label: "worker" }}
+      />,
+    );
+
+    expect(screen.getByTestId("approval-card-source").textContent).toBe("来自子会话 worker");
+  });
+
+  it("keeps the source line on a responded mirrored card", () => {
+    render(
+      <ApprovalCard
+        {...props}
+        status="responded"
+        response={{ action: "accept" }}
+        targetSessionId="child1"
+        source={source}
+      />,
+    );
+
+    expect(screen.getByTestId("approval-card-source").textContent).toContain("来自子会话 auth-fix");
+  });
+});

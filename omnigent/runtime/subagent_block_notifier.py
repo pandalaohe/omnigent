@@ -37,7 +37,8 @@ _REQUEST_TYPE = "response.elicitation_request"
 _RESOLVED_TYPE = "response.elicitation_resolved"
 _STALE_TYPE = "response.elicitation_stale"
 
-# Max length of the elicitation prompt echoed into the parent's notice.
+# Max length of the legacy prompt message echoed into the parent's notice.
+# Full commands and question lists are deliberately uncapped.
 _REASON_MAX_CHARS = 200
 
 # MCP ElicitResult verdicts a resolution event may carry.
@@ -300,7 +301,9 @@ class SubagentBlockNotifier:
             # Top-level session: no parent; the resolve event clears the arm.
             return
         parent_id = child.parent_conversation_id
-        notice = _format_block_notice(child, event)
+        # Formatting resolves the child's source through the server stores,
+        # so keep that work off the event loop.
+        notice = await asyncio.to_thread(_format_block_notice, child, event)
         # Register the resolve signal before dispatching so a resolve that
         # lands while the wake is in flight is never missed; the arm check
         # and registration share one critical section, so a resolve landing
@@ -406,26 +409,66 @@ def _format_block_notice(child: Conversation, event: dict[str, Any]) -> str:
     (``_format_subagent_wake_notice``). Describes the situation and asks
     the parent to surface it — it does not prescribe a specific tool.
 
-    :param child: The blocked child :class:`Conversation`, used for its
-        ``<agent>:<title>`` label.
+    The child is named from the shared source resolver rather than the
+    event, because this runs on the child's original (unstamped) event.
+
+    :param child: The blocked child :class:`Conversation`.
     :param event: The ``response.elicitation_request`` event dict; its
-        ``params.message`` (when present) is echoed as the reason.
+        ``params`` supply the action and the card's source fields.
     :returns: A one-line ``[System: …]`` notice, e.g. ``"[System:
-        sub-agent codex/auth-refactor is blocked awaiting human
-        approval: Codex wants to run 'git fetch'. Its approval prompt
-        is mirrored into this conversation but has gone unanswered —
+        sub-agent auth-refactor (Claude Code @ laptop, /repo) is blocked
+        awaiting human approval: pnpm test. Its approval prompt is
+        mirrored into this conversation but has gone unanswered —
         surface the situation to the human and do not wait silently. It
         cannot continue until the request is resolved.]"``.
     """
-    label = _child_label(child)
-    reason = _block_reason(event)
-    detail = f": {reason}" if reason else ""
+    from omnigent.server.routes._sessions.helpers import elicitation_source
+
+    params = event.get("params")
+    param_dict = params if isinstance(params, dict) else {}
+    label = _source_label(elicitation_source(child, param_dict))
+    action = _block_reason(event)
+    detail = f": {action}" if action else ""
+    if param_dict.get("async_kind") == "approval":
+        ref = param_dict.get("approval_ref")
+        ref_clause = f" (#{ref})" if isinstance(ref, str) and ref else ""
+        return (
+            f"[System: sub-agent {label} has an approval waiting for the user"
+            f"{ref_clause}{detail}. It is not blocked; surface it to the human.]"
+        )
     return (
         f"[System: sub-agent {label} is blocked awaiting human approval{detail}. "
         "Its approval prompt is mirrored into this conversation but has gone "
         "unanswered — surface the situation to the human and do not wait "
         "silently. It cannot continue until the request is resolved.]"
     )
+
+
+def _source_label(source: dict[str, str]) -> str:
+    """
+    Render the notice's child label with its resolved provenance.
+
+    Format: ``<label> (<agent> @ <host>, <cwd>)``, dropping every part
+    that could not be resolved.
+
+    :param source: The :func:`elicitation_source` mapping.
+    :returns: The annotated label, e.g.
+        ``"auth-refactor (Claude Code @ laptop, /repo)"``.
+    """
+    parts: list[str] = []
+    agent = source.get("agent")
+    host = source.get("host")
+    if agent and host:
+        parts.append(f"{agent} @ {host}")
+    elif agent:
+        parts.append(agent)
+    elif host:
+        parts.append(host)
+    cwd = source.get("cwd")
+    if cwd:
+        parts.append(cwd)
+    label = source.get("label") or source.get("session_id") or "sub-agent"
+    return f"{label} ({', '.join(parts)})" if parts else label
 
 
 def _format_resolution_notice(child: Conversation, action: str | None) -> str:
@@ -516,16 +559,34 @@ def _child_label(child: Conversation) -> str:
 
 def _block_reason(event: dict[str, Any]) -> str | None:
     """
-    Extract a short human reason from an elicitation request event.
+    Extract the action a blocked elicitation is waiting on.
+
+    Preference order: the full command (Codex command approvals and
+    Claude Bash), the question list for a question card, the tool name
+    plus its content preview (already capped at 1024 by the producer),
+    then the legacy prompt message with the 200-char cap.
 
     :param event: The ``response.elicitation_request`` event dict; reads
-        the nested ``params.message``.
-    :returns: The trimmed/truncated prompt text, or ``None`` when the
-        event carried no message.
+        the nested ``params``.
+    :returns: The action text, or ``None`` when the event carried none.
     """
     params = event.get("params")
     if not isinstance(params, dict):
         return None
+    command = params.get("command")
+    if isinstance(command, str) and command.strip():
+        return command
+    questions = _questions_action(params.get("ask_user_question"))
+    if questions is not None:
+        return questions
+    tool_name = params.get("tool_name")
+    preview = params.get("content_preview")
+    if isinstance(tool_name, str) and tool_name:
+        if isinstance(preview, str) and preview:
+            return f"{tool_name}: {preview}"
+        return tool_name
+    if isinstance(preview, str) and preview:
+        return preview
     message = params.get("message")
     if not isinstance(message, str):
         return None
@@ -535,3 +596,45 @@ def _block_reason(event: dict[str, Any]) -> str | None:
     if len(message) > _REASON_MAX_CHARS:
         return message[: _REASON_MAX_CHARS - 1].rstrip() + "…"
     return message
+
+
+def _questions_action(payload: Any) -> str | None:
+    """
+    Render an AskUserQuestion payload as one action line.
+
+    Lists every question with its option labels. The harness bounds the
+    payload at 4 questions × 4 options, so nothing is truncated here —
+    the parent gets the same choices the human sees.
+
+    :param payload: The ``params.ask_user_question`` value, e.g.
+        ``{"questions": [{"question": "Which DB?", "options":
+        [{"label": "postgres"}]}]}``.
+    :returns: A ``"question (opt / opt); question"`` summary, or ``None``
+        when no usable questions are present.
+    """
+    if not isinstance(payload, dict):
+        return None
+    questions = payload.get("questions")
+    if not isinstance(questions, list):
+        return None
+    rendered: list[str] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        text = question.get("question")
+        if not isinstance(text, str) or not text:
+            continue
+        options = question.get("options")
+        labels = (
+            [
+                option["label"]
+                for option in options
+                if isinstance(option, dict)
+                and isinstance(option.get("label"), str)
+                and option["label"]
+            ]
+            if isinstance(options, list)
+            else []
+        )
+        rendered.append(f"{text} ({' / '.join(labels)})" if labels else text)
+    return "; ".join(rendered) if rendered else None

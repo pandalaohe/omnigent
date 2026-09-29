@@ -1774,12 +1774,20 @@ def create_app(
         # fresh app instance doesn't inherit a prior run's observer (matters
         # for multi-app test setups).
         from omnigent.server.routes.sessions import (
+            configure_elicitation_source_resolver,
             configure_subagent_block_notifier,
         )
 
         _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
             conversation_store,
             runner_router,
+        )
+        # Name the child, agent, host and cwd on cards mirrored into an
+        # ancestor's stream/snapshot (and in the parent's wake notice).
+        configure_elicitation_source_resolver(
+            agent_store,
+            host_store,
+            agent_cache,
         )
 
         from omnigent.runner.resource_registry import (

@@ -28,7 +28,8 @@ import type { CommentInbox } from "@/hooks/useCommentInbox";
 // Minimal ApprovalCard stub: renders the message and an Accept button that
 // forwards to the page's submit handler. The real card's form/preview UX is
 // out of scope here — we only need to exercise `makeSubmit` → `approve`.
-// A timed-out response hides the card, as the real card does.
+// A timed-out response hides the card, as the real card does. The mirrored-
+// card props are echoed so the page's prop mapping is observable.
 vi.mock("@/components/blocks/ApprovalCard", () => ({
   ApprovalCard: ({
     elicitationId,
@@ -36,6 +37,9 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
     status,
     response,
     allowAutoMode,
+    asyncKind,
+    source,
+    approvalRef,
     onSubmit,
   }: {
     elicitationId: string;
@@ -43,11 +47,16 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
     status: string;
     response: { reason?: string } | null;
     allowAutoMode?: boolean;
+    asyncKind?: string | null;
+    source?: { label?: string } | null;
+    approvalRef?: string | null;
     onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
   }) =>
     status === "responded" && response?.reason === "timed_out" ? null : (
-      <div data-testid="approval-card" data-status={status}>
+      <div data-testid="approval-card" data-status={status} data-async-kind={asyncKind ?? ""}>
         <span>{message}</span>
+        {source?.label && <span data-testid="stub-source">{source.label}</span>}
+        {approvalRef && <span data-testid="stub-approval-ref">{approvalRef}</span>}
         <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
           Stub Accept
         </button>
@@ -380,17 +389,24 @@ describe("InboxPage approval items", () => {
 
   it("routes the verdict to the child session when the prompt is mirrored", async () => {
     // WHY: a mirrored child prompt carries target_session_id; the resolve POST
-    // must target that session, not the row it surfaced under.
+    // must target that session, not the row it surfaced under. The child's
+    // source stamp rides through to the card so the Inbox shows its origin.
     const row = conversation({ id: "parent" });
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
       pendingElicitations: [
-        rawElicitation("eli_child", "Child approval?", { target_session_id: "child" }),
+        rawElicitation("eli_child", "Child approval?", {
+          target_session_id: "child",
+          async_kind: "approval",
+          approval_ref: "a123456",
+          source: { session_id: "child", label: "worker" },
+        }),
       ],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
     renderPage();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+    expect((await screen.findByTestId("stub-source")).textContent).toBe("worker");
+    fireEvent.click(screen.getByRole("button", { name: "Stub Accept" }));
     await waitFor(() =>
       expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", { action: "accept" }),
     );

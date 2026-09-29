@@ -69,6 +69,38 @@ import {
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 
 /**
+ * Provenance line for a card mirrored from a child session:
+ * `来自子会话 <label> · <agent> @ <host> · <cwd>`, dropping the parts
+ * that could not be resolved. The cwd is monospace and carries the full
+ * path in its `title` so a narrow card can truncate visually.
+ */
+function ElicitationSourceLine({ source }: { source: ElicitationSource }) {
+  const provenance: string[] = [];
+  if (source.agent && source.host) provenance.push(`${source.agent} @ ${source.host}`);
+  else if (source.agent) provenance.push(source.agent);
+  else if (source.host) provenance.push(source.host);
+  return (
+    <p
+      data-testid="approval-card-source"
+      className="flex flex-wrap items-baseline gap-x-1.5 text-sm text-muted-foreground"
+    >
+      <span>来自子会话 {source.label}</span>
+      {provenance.map((part) => (
+        <span key={part}>· {part}</span>
+      ))}
+      {source.cwd && (
+        <span>
+          ·{" "}
+          <code className="font-mono" title={source.cwd}>
+            {source.cwd}
+          </code>
+        </span>
+      )}
+    </p>
+  );
+}
+
+/**
  * Extract the answer-option labels from an AskUserQuestion-shaped
  * ``requestedSchema``. Returns an empty array for any other schema.
  *
@@ -234,12 +266,17 @@ export function ApprovalCard({
   asyncKind,
   context,
   approvalRef,
+  targetSessionId,
+  source,
   onSubmit,
 }: ApprovalCardProps) {
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
   const scopedConversationId = useContext(ConversationScopeContext);
+  // Mirrored child cards carry a source stamp; show it only when the card
+  // is actually a mirror (targetSessionId set), never on a top-level card.
+  const showSource = Boolean(targetSessionId && source);
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content, meta) => {
@@ -611,6 +648,7 @@ export function ApprovalCard({
     // for the same reason: purposeful content instead of the raw ask.
     const showGatingMessage = !isCodexCommandApproval && !isAskUserQuestion && !isExitPlanMode;
     const hasBody =
+      showSource ||
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
@@ -630,6 +668,7 @@ export function ApprovalCard({
         </AlertTitle>
         {hasBody && (
           <AlertDescription className="flex flex-col gap-1 text-sm">
+            {showSource && source && <ElicitationSourceLine source={source} />}
             {isCodexCommandApproval ? (
               <>
                 {codexCommand.reason && <span>{codexCommand.reason}</span>}
@@ -716,6 +755,7 @@ export function ApprovalCard({
         )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
+        {showSource && source && <ElicitationSourceLine source={source} />}
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>

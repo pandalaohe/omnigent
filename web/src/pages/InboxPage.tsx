@@ -342,6 +342,13 @@ export function InboxPage() {
                   allowAutoMode={item.elicitation.allowAutoMode}
                   rememberScope={item.elicitation.rememberScope}
                   codexPersistModes={item.elicitation.codexPersistModes}
+                  targetSessionId={item.elicitation.targetSessionId}
+                  asyncKind={item.elicitation.asyncKind}
+                  context={item.elicitation.context}
+                  approvalRef={item.elicitation.approvalRef}
+                  source={item.elicitation.source}
+                  toolName={item.elicitation.toolName}
+                  cwd={item.elicitation.cwd}
                   onSubmit={makeSubmit(item)}
                 />
               )}

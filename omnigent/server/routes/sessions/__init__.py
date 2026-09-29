@@ -547,6 +547,8 @@ from omnigent.server.routes._sessions.helpers import (
     announce_hosts_changed as announce_hosts_changed,
     announce_projects_changed as announce_projects_changed,
     cancel_managed_launch_tasks as cancel_managed_launch_tasks,
+    configure_elicitation_source_resolver as configure_elicitation_source_resolver,
+    elicitation_source as elicitation_source,
     prefetch_session_routing_catalogs as prefetch_session_routing_catalogs,
 )
 
