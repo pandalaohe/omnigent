@@ -5900,6 +5900,7 @@ async def _handle_compact_summary_item_unlocked(
             seq,
         )
         return False
+    durable_summary_id: str | None = None
     try:
         durable_summary_id, compacted_messages = await asyncio.to_thread(
             _read_native_compaction_snapshot,

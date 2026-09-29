@@ -876,7 +876,7 @@ def register_resources_routes(
         if host_conn is None:
             return None
         default_workspace = (
-            effective_worktree(conversation)
+            effective_worktree(conversation) or conversation.workspace
             if op in _GITROOT_HOST_FALLBACK_OPS
             else conversation.workspace
         )
@@ -938,7 +938,7 @@ def register_resources_routes(
                 host_registry=host_registry,
                 host_conn=host_conn,
                 op=op,
-                workspace=effective_worktree(conversation),
+                workspace=effective_worktree(conversation) or conversation.workspace,
                 session_id=session_id,
                 params=host_params,
             )
