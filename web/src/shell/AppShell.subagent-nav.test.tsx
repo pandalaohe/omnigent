@@ -65,9 +65,20 @@ vi.mock("@/hooks/useGithub", () => ({
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
   // cachedTreeContains (which reads the query cache seeded below) stay
-  // genuine; only the hook is replaced.
+  // genuine; only the hooks are replaced.
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
+  usePastChildSessions: vi.fn(() => ({
+    children: [],
+    isLoading: false,
+    error: null,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  })),
+}));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: () => ({ data: [] }),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // useRootSessionId stays real: with the snapshot mocked to a

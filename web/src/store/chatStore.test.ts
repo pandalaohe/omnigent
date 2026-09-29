@@ -17,7 +17,7 @@
 
 import type * as IdentityModule from "@/lib/identity";
 
-import { type InfiniteData, QueryClient } from "@tanstack/react-query";
+import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type {
@@ -9077,31 +9077,22 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       ...overrides,
     });
 
-    it("upserts a new child into the cached list", () => {
+    it("does not insert an unknown child from a delta, and refetches the list", () => {
+      // Membership is the server's call: a partial patch would materialize a
+      // row missing every field it did not carry, and a status edge for an
+      // archived child would resurrect it.
       client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      const spy = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({
         type: "session_child_session_updated",
         conversationId: "conv_parent",
         childSessionId: "conv_child1",
         child: child(),
       });
-      const cached = client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"));
-      expect(cached).toEqual([
-        {
-          id: "conv_child1",
-          title: "researcher:auth",
-          task_summary: null,
-          tool: "researcher",
-          session_name: "auth",
-          labels: {},
-          current_task_status: "in_progress",
-          last_task_error: null,
-          busy: true,
-          last_message_preview: "looking…",
-          // Insert path defaults the count to 0 when the delta omits it.
-          pending_elicitations_count: 0,
-        },
-      ]);
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
     });
 
     it("merges an existing child in place on a status change", () => {
@@ -9296,19 +9287,16 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(row?.last_task_error).toBeNull();
     });
 
-    it("initializes a cold child-sessions cache from a full delta", () => {
-      // Snapshot-on-connect / spawn deltas carry full rows, so a cold
-      // cache is seeded (lets child status update without a mounted hook).
+    it("invalidates instead of seeding a cold child-sessions cache from a delta", () => {
+      const spy = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({
         type: "session_child_session_updated",
         conversationId: "conv_parent",
         childSessionId: "conv_child1",
         child: child(),
       });
-      const cached = client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"));
-      expect(cached).toHaveLength(1);
-      expect(cached?.[0].id).toBe("conv_child1");
-      expect(cached?.[0].busy).toBe(true);
+      expect(client.getQueryData(childSessionsQueryKey("conv_parent"))).toBeUndefined();
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
     });
 
     it("refetches the parent's child list when a child goes idle without a preview", () => {
@@ -9326,9 +9314,9 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
     });
 
-    it("does NOT refetch when the idle delta already carries a preview", () => {
-      // In-process harnesses include the preview in the delta — the in-place
-      // patch suffices, so no refetch is triggered.
+    it("refetches for an unknown child even when the idle delta carries a preview", () => {
+      // An in-process harness delta with a preview is still only a delta: an
+      // unknown row must come from the server, not from the patch.
       client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
       const spy = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({
@@ -9337,7 +9325,243 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         childSessionId: "conv_child1",
         child: { id: "conv_child1", busy: false, last_message_preview: "done." },
       });
-      expect(spy).not.toHaveBeenCalled();
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
+    });
+
+    it("merges the new placement and agent fields onto an existing row", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          task_summary: null,
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "in_progress",
+          busy: true,
+          last_message_preview: "digging",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          host_id: "host-1",
+          cwd: "/work/rail",
+          git_branch: "feature/scc18",
+          harness: "codex-native",
+          agent_id: "ag_1",
+          agent_name: "codex",
+          sub_agent_name: "researcher",
+          warm_state: "warm",
+          archived_at: null,
+        },
+      });
+      expect(
+        client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))?.[0],
+      ).toMatchObject({
+        host_id: "host-1",
+        cwd: "/work/rail",
+        git_branch: "feature/scc18",
+        harness: "codex-native",
+        agent_id: "ag_1",
+        agent_name: "codex",
+        sub_agent_name: "researcher",
+        warm_state: "warm",
+        archived_at: null,
+        // Untouched fields survive the partial merge.
+        last_message_preview: "digging",
+      });
+    });
+
+    it("removes an archived child from the active list and invalidates the prefix key", async () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          task_summary: null,
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "completed",
+          busy: false,
+          last_message_preview: "done",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          archived: true,
+          archived_at: 1_700_000_000,
+          busy: false,
+          last_message_preview: "done",
+        },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      await vi.waitFor(() =>
+        expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") }),
+      );
+    });
+
+    it("cancels an in-flight active refetch that would restore an archived child", async () => {
+      // The list query may already be refetching when the archive delta
+      // arrives; that response still holds the child. Prefix invalidation
+      // cancels it and refetches from the server (which has moved the child
+      // to the past zone), instead of letting the stale pages land last.
+      const key = childSessionsQueryKey("conv_parent");
+      const staleRow: ChildSessionInfo = {
+        id: "conv_child1",
+        title: "researcher:auth",
+        task_summary: null,
+        tool: "researcher",
+        session_name: "auth",
+        current_task_status: "completed",
+        busy: false,
+        last_message_preview: "done",
+        pending_elicitations_count: 0,
+      };
+      let calls = 0;
+      let resolveFirst!: (rows: ChildSessionInfo[]) => void;
+      const queryFn = vi.fn(() => {
+        calls += 1;
+        if (calls === 1) {
+          return new Promise<ChildSessionInfo[]>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+        // Server truth after the archive: the child is gone from active.
+        return Promise.resolve([]);
+      });
+      const observer = new QueryObserver<ChildSessionInfo[]>(client, { queryKey: key, queryFn });
+      const unsubscribe = observer.subscribe(() => {});
+      await vi.waitFor(() => expect(calls).toBe(1));
+      client.setQueryData<ChildSessionInfo[]>(key, [staleRow]);
+
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          archived: true,
+          archived_at: 1_700_000_000,
+          busy: false,
+          last_message_preview: "done",
+        },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(key)).toEqual([]);
+
+      resolveFirst([staleRow]);
+      await vi.waitFor(() => expect(calls).toBe(2));
+      expect(client.getQueryData<ChildSessionInfo[]>(key)).toEqual([]);
+      unsubscribe();
+    });
+
+    it("keeps an archived child out when its list query lost every observer mid-fetch", async () => {
+      // The Agents panel unmounts while the active list is refetching, so
+      // default invalidation would not cancel that unobserved request; its
+      // stale response would land the archived row and a remount inside the
+      // staleTime window would show it without fetching.
+      const key = childSessionsQueryKey("conv_parent");
+      const staleRow: ChildSessionInfo = {
+        id: "conv_child1",
+        title: "researcher:auth",
+        task_summary: null,
+        tool: "researcher",
+        session_name: "auth",
+        current_task_status: "completed",
+        busy: false,
+        last_message_preview: "done",
+        pending_elicitations_count: 0,
+      };
+      let calls = 0;
+      let resolveFirst!: (rows: ChildSessionInfo[]) => void;
+      // The same options `useChildSessions` passes to useQuery.
+      const hookOptions = {
+        queryKey: key,
+        queryFn: () => {
+          calls += 1;
+          return new Promise<ChildSessionInfo[]>((resolve) => {
+            resolveFirst = resolve;
+          });
+        },
+        staleTime: 60_000,
+        retry: false,
+        refetchOnMount: false,
+      };
+      client.setQueryData<ChildSessionInfo[]>(key, [staleRow]);
+      const observer = new QueryObserver<ChildSessionInfo[]>(client, hookOptions);
+      const unsubscribe = observer.subscribe(() => {});
+      const pending = observer.refetch();
+      await vi.waitFor(() => expect(calls).toBe(1));
+
+      unsubscribe();
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          archived: true,
+          archived_at: 1_700_000_000,
+          busy: false,
+          last_message_preview: "done",
+        },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(key)).toEqual([]);
+
+      resolveFirst([staleRow]);
+      await pending;
+
+      const remounted = new QueryObserver<ChildSessionInfo[]>(client, hookOptions);
+      const unsubscribeRemounted = remounted.subscribe(() => {});
+      expect(remounted.getCurrentResult().data).toEqual([]);
+      // A cancelled fetch must not leave the rail in its "Failed to load" state.
+      expect(remounted.getCurrentResult().status).toBe("success");
+      expect(remounted.getCurrentResult().error).toBeNull();
+      // Refetch-on-mount is off, so the stale response is the only fetch.
+      expect(calls).toBe(1);
+      unsubscribeRemounted();
+    });
+
+    it("does not resurrect an archived child on a later status delta", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: { id: "conv_child1", busy: true, current_task_status: "in_progress" },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
+    });
+
+    it("invalidates the prefix key when an absent row is unarchived", () => {
+      // Prefix matching refreshes both zones, so the past row disappears from
+      // the archive list and reappears in the active list in one refetch.
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: { id: "conv_child1", archived: false },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
     });
   });
 

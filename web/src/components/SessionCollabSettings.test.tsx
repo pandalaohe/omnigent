@@ -1,9 +1,19 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 
+import { readHostColorPreferences } from "@/lib/hostColorPreferences";
 import { readSessionCollabPreferences } from "@/lib/sessionCollabPreferences";
 import { SessionCollabSettings } from "./SessionCollabSettings";
+
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: () => ({
+    data: [
+      { host_id: "host-1", name: "TMB", owner: "u", status: "online" },
+      { host_id: "host-2", name: "fn", owner: "u", status: "online" },
+    ],
+  }),
+}));
 
 const LABELS = [
   "Enable session collaboration",
@@ -83,5 +93,34 @@ describe("SessionCollabSettings", () => {
     expect(readSessionCollabPreferences().relayDepthMax).toBe(30);
     fireEvent.blur(input);
     expect(input).toHaveValue(30);
+  });
+
+  it("renders a colour row per host, automatic until a swatch is picked", () => {
+    renderSettings();
+
+    const rows = screen.getAllByTestId("host-color-row");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("TMB");
+    expect(rows[0]).toHaveTextContent("Automatic");
+    // Eight palette swatches per host.
+    expect(within(rows[0]).getAllByRole("button")).toHaveLength(8);
+    expect(screen.queryByRole("button", { name: "Reset to automatic" })).toBeNull();
+  });
+
+  it("picks one host colour and resets it to automatic", () => {
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "TMB colour: purple" }));
+
+    expect(readHostColorPreferences()).toEqual({ "host-1": "purple" });
+    expect(screen.getByRole("button", { name: "Reset to automatic" })).toBeInTheDocument();
+    // The other host stays automatic.
+    expect(screen.getAllByTestId("host-color-row")[1]).toHaveTextContent("Automatic");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset to automatic" }));
+
+    expect(readHostColorPreferences()).toEqual({ "host-1": "auto" });
+    expect(screen.queryByRole("button", { name: "Reset to automatic" })).toBeNull();
+    expect(screen.getAllByTestId("host-color-row")[0]).toHaveTextContent("Automatic");
   });
 });
