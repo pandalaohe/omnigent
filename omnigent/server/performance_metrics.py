@@ -588,6 +588,10 @@ class ServerPerformanceMetrics:
         self._route_counts: dict[str, int] = {}
         self._last_snapshot_wall = clock()
         self._last_snapshot_cpu = process_time_fn()
+        # Most recent snapshot, written by the metrics publisher only. Other
+        # components read this cached value because calling snapshot() also
+        # resets the process-CPU baseline.
+        self.last_snapshot: ServerMetricsSnapshot | None = None
 
     def request_started(self) -> float:
         """
@@ -1132,7 +1136,9 @@ async def publish_server_metrics_periodically(
     """
     while True:
         await asyncio.sleep(interval_seconds)
-        otel_publisher.publish(metrics.snapshot())
+        snapshot = metrics.snapshot()
+        metrics.last_snapshot = snapshot
+        otel_publisher.publish(snapshot)
 
 
 def _load_average() -> SystemLoadAverage | None:

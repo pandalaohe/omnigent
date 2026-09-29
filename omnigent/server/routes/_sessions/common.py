@@ -46,6 +46,7 @@ from omnigent.server.schemas import (
     SandboxStatus,
     ServerStreamEvent,
 )
+from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
 from omnigent.spec.types import (
     StateUpdate,
 )
@@ -326,6 +327,13 @@ _LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
 
 
 _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
+
+
+# Epoch-seconds start of a session's current running period, as the server
+# observed the status edge. Written by
+# ``session_live_state.persist_running_since``; read back as the restart
+# fallback for ``SessionResponse.running_since``.
+_RUNNING_SINCE_LABEL_KEY: str = RUNNING_SINCE_LABEL_KEY
 
 
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
@@ -648,6 +656,11 @@ _runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None
 
 
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+# Epoch-seconds start of each session's current running period, stamped by
+# ``_note_running_edge``; the synchronous read path for ``running_since``.
+_session_running_since_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
@@ -1178,6 +1191,7 @@ __all__ = [
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
     "_RUNNER_SESSION_INIT_TIMEOUT_S",
+    "_RUNNING_SINCE_LABEL_KEY",
     "_SERVER_STREAM_EVENT_ADAPTER",
     "_SESSION_STREAM_HEARTBEAT_INTERVAL_S",
     "_SESSION_UPDATES_HEARTBEAT_INTERVAL_S",
@@ -1232,6 +1246,7 @@ __all__ = [
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_mcp_startup_cache",
+    "_session_running_since_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",

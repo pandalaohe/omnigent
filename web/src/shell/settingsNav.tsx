@@ -8,6 +8,7 @@
 
 import { useEffect } from "react";
 import {
+  ActivityIcon,
   ArchiveIcon,
   BotIcon,
   ArrowLeftIcon,
@@ -54,6 +55,7 @@ export type SettingsSectionId =
   | "policies"
   | "global-instructions"
   | "sharing"
+  | "system-status"
   | "archived"
   | "cli"
   | "updates";
@@ -83,6 +85,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "policies",
   "global-instructions",
   "sharing",
+  "system-status",
   "archived",
   "cli",
   "updates",
@@ -198,6 +201,7 @@ export function settingsNavGroups(
       label: "Global instructions",
       icon: FileTextIcon,
     });
+    adminItems.push({ id: "system-status", label: "System status", icon: ActivityIcon });
     if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });
     groups.push({ title: "Admin", items: adminItems });
   }

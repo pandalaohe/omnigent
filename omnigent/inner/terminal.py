@@ -2475,6 +2475,19 @@ class TerminalInstance:
             return False
         return None
 
+    async def server_pid(self) -> int | None:
+        """Return the tmux server's OS pid, or ``None`` when unreadable.
+
+        The tmux server is shared by the instance's sessions and may have
+        daemonized away from its creator; the resource monitor attributes it
+        through the runner's owner file, which needs this pid.
+        """
+        try:
+            output = await self._tmux_output("display-message", "-p", "#{pid}")
+            return int(output.strip())
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            return None
+
     async def kill_server(self) -> None:
         """Kill this instance's tmux server without cleaning up its socket."""
         proc = None

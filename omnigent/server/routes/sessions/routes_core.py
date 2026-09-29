@@ -1463,6 +1463,7 @@ def register_core_routes(
         include_liveness: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
         include_usage: bool = Query(default=True),
+        include_preview: bool = Query(default=False),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -1493,6 +1494,11 @@ def register_core_routes(
             stale AP-process caches. Browser reload/bind requests use
             this to recover from fixed bugs without restarting the AP
             server.
+        :param include_preview: When ``True``, fill
+            ``last_message_preview`` with an excerpt of the session's
+            newest visible message (one batched items read). The web
+            chat never sets it; orchestrating callers use it to peek at
+            a peer session without fetching the transcript.
         :returns: The matching :class:`SessionResponse`.
         :raises OmnigentError: 404 if no session exists.
         """
@@ -1506,7 +1512,7 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             access.level,
@@ -1523,6 +1529,10 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
+        if include_preview:
+            previews = await _message_previews_for([session_id])
+            snapshot.last_message_preview = previews.get(session_id)
+        return snapshot
 
     @router.get(
         "/sessions/{session_id}/labels",
@@ -2449,6 +2459,17 @@ def register_core_routes(
                         except Exception:
                             _logger.warning(
                                 "projects-changed push failed; client converges on next load",
+                                exc_info=True,
+                            )
+                elif evt_type == "system_status_changed":
+                    async with emit_lock:
+                        try:
+                            await _send({"type": "system_status_changed"})
+                        except WebSocketDisconnect:
+                            raise
+                        except Exception:
+                            _logger.warning(
+                                "system-status-changed push failed; client converges on next load",
                                 exc_info=True,
                             )
 

@@ -232,6 +232,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_mcp_startup_cache,
+    _session_running_since_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -698,6 +699,20 @@ def announce_projects_changed(user_id: str | None) -> None:
         single-user mode.
     """
     user_session_stream.publish(_discovery_key(user_id), {"type": "projects_changed"})
+
+
+def announce_system_status_changed() -> None:
+    """
+    Push a payload-free ``system_status_changed`` event to every subscriber
+    in the current workspace.
+
+    Called when the hub's finding set changes so open clients refetch the
+    summary (which the server filters per user). No data rides the event —
+    over-delivery leaks nothing — and it is a no-op with no subscribers.
+
+    Call inside :func:`omnigent.db.db_models.workspace_scope`.
+    """
+    user_session_stream.publish_all({"type": "system_status_changed"})
 
 
 def _native_ask_gate_lock(conversation_id: str, deciding_policy: str) -> asyncio.Lock:
@@ -4921,6 +4936,72 @@ def _failure_log_detail(error: ErrorDetail | None) -> str:
     return f"{message[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
 
 
+def _note_running_edge(session_id: str, previous_status: str | None, status: str) -> None:
+    """
+    Stamp the start of a session's running period on the edge into it.
+
+    The single stamping site for ``SessionResponse.running_since``, called
+    from :func:`_publish_status` and from the runner-status probe — the two
+    writers that can move a session into running. An edge into
+    running/waiting from a non-running status stamps ``now``; an idle/failed
+    edge drops the stamp. Everything else (including
+    ``activity_unverified`` and a transition already inside running/waiting)
+    is a no-op, so a mid-turn republish can never restart the clock.
+
+    With a known previous status the in-memory cache is written
+    synchronously — a snapshot must never pair the new status with an older
+    stamp — and the label write is enqueued behind it. With an unknown
+    previous status (server restart, or the probe on a freshly bound
+    session) only the enqueue happens: the worker keeps the row's carried-over
+    label when the turn continued across the restart, or writes ``now`` and
+    reports the resolved stamp back into the cache. The report is handed back
+    onto the caller's event loop (``call_soon_threadsafe`` when one is
+    running), where it lands only if the session still reads running/waiting
+    and no synchronous stamp from a later known edge has since won; a
+    resolution arriving after the period ended is dropped.
+
+    :param session_id: Session/conversation identifier.
+    :param previous_status: The status the caller observed before *status*,
+        or ``None`` when it has no cached observation.
+    :param status: The incoming status.
+    """
+    if status in ("idle", "failed"):
+        _session_running_since_cache.pop(session_id, None)
+        return
+    if status not in ("running", "waiting") or previous_status in ("running", "waiting"):
+        return
+    now = int(time.time())
+    if previous_status is not None:
+        _session_running_since_cache[session_id] = now
+        session_live_state.persist_running_since(
+            session_id, now, previous_known=True, on_resolved=lambda _value: None
+        )
+        return
+
+    loop: asyncio.AbstractEventLoop | None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    def _apply(value: int) -> None:
+        if _session_status_cache.get(session_id) not in ("running", "waiting"):
+            return
+        if session_id in _session_running_since_cache:
+            return
+        _session_running_since_cache[session_id] = value
+
+    on_resolved = (
+        _apply if loop is None else lambda value: loop.call_soon_threadsafe(_apply, value)
+    )
+    session_live_state.persist_running_since(
+        session_id,
+        now,
+        previous_known=False,
+        on_resolved=on_resolved,
+    )
+
+
 def _publish_status(
     session_id: str,
     status: str,
@@ -4984,6 +5065,7 @@ def _publish_status(
         _session_active_response_cache.pop(session_id, None)
         return
     previous_status = _session_status_cache.get(session_id)
+    _note_running_edge(session_id, previous_status, status)
     _session_status_cache[session_id] = status
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
@@ -12218,6 +12300,7 @@ __all__ = [
     "_native_terminal_ensure_transport_error",
     "_native_terminal_failure_from_runner_response",
     "_native_terminal_name_for_harness",
+    "_note_running_edge",
     "_notify_runner_of_bundled_child",
     "_owner_from_grants",
     "_parse_external_assistant_message",

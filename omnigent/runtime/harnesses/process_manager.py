@@ -45,6 +45,7 @@ from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.runner.owner_file import write_owner_entry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
@@ -1484,6 +1485,14 @@ class HarnessProcessManager:
                         else None
                     ),
                 ),
+            )
+            # The zygote forks this harness, so its command line carries no
+            # conversation id; record the ownership while both are in hand.
+            await asyncio.to_thread(
+                write_owner_entry,
+                pid=process.pid,
+                conversation_id=conversation_id,
+                kind="harness",
             )
 
             # ``base_url`` is required for relative-URL routing; the
