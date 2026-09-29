@@ -12,17 +12,18 @@ defence-in-depth boundary for non-HTTP callers.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import zstandard
 from sqlalchemy import LargeBinary, delete, select, type_coerce
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
@@ -34,6 +35,8 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
+
+logger = logging.getLogger(__name__)
 
 USER_PREFERENCE_VERSION = 1
 USER_PREFERENCES_MAX_BYTES = 64 * 1024
@@ -49,6 +52,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "agent_pins",
         "calling_defaults",
         "calling_last",
+        "session_collab",
     }
 )
 
@@ -136,6 +140,129 @@ def read_approval_timeout(
     raw_stop = value.get("stopTurn")
     stop_turn = raw_stop if isinstance(raw_stop, bool) else True
     return ApprovalTimeout(timeout_s=timeout_s, stop_turn=stop_turn)
+
+
+SESSION_COLLAB_NAMESPACE = "session_collab"
+
+# Mirrors the per-session ``peer_inbound`` label's three dispositions.
+InboundDisposition: TypeAlias = Literal["accept", "hold", "refuse"]
+_INBOUND_CHOICES: tuple[InboundDisposition, ...] = ("accept", "hold", "refuse")
+
+
+@dataclass(frozen=True)
+class CollabSettings:
+    """
+    Resolved session-collaboration settings for one session owner.
+
+    :param enabled: Whether session collaboration features are on.
+    :param open_rate_count: Sessions one owner may open (open + child create) per window.
+    :param open_rate_window_s: Open-rate window in seconds.
+    :param relay_depth_max: Maximum relay hops before a message is parked.
+    :param pair_rate_count: Messages allowed between one sender/receiver session pair per window.
+    :param pair_rate_window_s: Pair-rate window in seconds.
+    :param sender_rate_count: Messages one sender session may send per window.
+    :param sender_rate_window_s: Sender-rate window in seconds.
+    :param duplicate_window_s: Window for suppressing duplicate payloads.
+    :param undelivered_ttl_s: Lifetime of undelivered messages in seconds.
+    :param default_inbound: Inbound peer-message disposition for new sessions.
+    :param flow_timer_enabled: Whether collaboration flow timers are on.
+    """
+
+    enabled: bool = True
+    open_rate_count: int = 5
+    open_rate_window_s: int = 60
+    relay_depth_max: int = 30
+    pair_rate_count: int = 6
+    pair_rate_window_s: int = 60
+    sender_rate_count: int = 60
+    sender_rate_window_s: int = 600
+    duplicate_window_s: int = 600
+    undelivered_ttl_s: int = 86400
+    default_inbound: InboundDisposition = "accept"
+    flow_timer_enabled: bool = True
+
+
+_CollabFieldKind: TypeAlias = Literal["bool", "positive_int", "inbound"]
+
+# Stored JSON keys are camelCase because the web client writes them. The third
+# entry names how the stored value is read: ``bool`` takes a JSON boolean,
+# ``positive_int`` an int of at least 1 (never a bool), and ``inbound`` one of
+# the three peer-inbound dispositions. One table keeps all twelve mappings in
+# a single place.
+_COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
+    ("enabled", "enabled", "bool"),
+    ("openRateCount", "open_rate_count", "positive_int"),
+    ("openRateWindowSeconds", "open_rate_window_s", "positive_int"),
+    ("relayDepthMax", "relay_depth_max", "positive_int"),
+    ("pairRateCount", "pair_rate_count", "positive_int"),
+    ("pairRateWindowSeconds", "pair_rate_window_s", "positive_int"),
+    ("senderRateCount", "sender_rate_count", "positive_int"),
+    ("senderRateWindowSeconds", "sender_rate_window_s", "positive_int"),
+    ("duplicateWindowSeconds", "duplicate_window_s", "positive_int"),
+    ("undeliveredTtlSeconds", "undelivered_ttl_s", "positive_int"),
+    ("defaultInbound", "default_inbound", "inbound"),
+    ("flowTimerEnabled", "flow_timer_enabled", "bool"),
+)
+
+
+def _parse_collab_value(kind: _CollabFieldKind, raw: Any) -> Any | None:
+    """Return *raw* when it matches the field's kind, else ``None``."""
+    match kind:
+        case "bool":
+            return raw if isinstance(raw, bool) else None
+        case "positive_int":
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+                return raw
+            return None
+        case "inbound":
+            return raw if raw in _INBOUND_CHOICES else None
+
+
+def read_collab_settings(
+    store: SqlAlchemyUserPreferencesStore | None,
+    owner: str | None,
+) -> CollabSettings:
+    """
+    Read one owner's session-collaboration settings, defaulting on any gap.
+
+    The collaboration path must never fail on a malformed preference row: a
+    missing store / owner / namespace, a non-object value, an invalid field,
+    a row that fails store validation, or a database error all resolve to the
+    fail-safe defaults. A boolean field accepts only a JSON boolean; an integer
+    field accepts only an integer (not a bool) of at least 1; an inbound field
+    accepts only ``accept``/``hold``/``refuse``. Unknown keys are ignored.
+
+    :param store: Preferences store, or ``None`` when the server has no
+        synced preferences.
+    :param owner: Session owner whose settings apply, or ``None`` when the
+        session has no resolvable owner.
+    :returns: The owner's :class:`CollabSettings`, or the defaults.
+    """
+    if store is None or owner is None:
+        return CollabSettings()
+    try:
+        envelope = store.get(owner)
+    except UserPreferencesValidationError:
+        return CollabSettings()
+    except SQLAlchemyError:
+        logger.warning(
+            "Failed to read session collaboration preferences for %s", owner, exc_info=True
+        )
+        return CollabSettings()
+    if not isinstance(envelope, dict):
+        return CollabSettings()
+    settings = envelope.get("settings")
+    if not isinstance(settings, dict):
+        return CollabSettings()
+    value = settings.get(SESSION_COLLAB_NAMESPACE)
+    if not isinstance(value, dict):
+        return CollabSettings()
+    resolved: dict[str, Any] = {}
+    for json_key, field_name, kind in _COLLAB_SETTING_FIELDS:
+        parsed = _parse_collab_value(kind, value.get(json_key))
+        if parsed is not None:
+            resolved[field_name] = parsed
+    return CollabSettings(**resolved)
 
 
 def _validate_json(value: Any, *, depth: int = 0) -> None:

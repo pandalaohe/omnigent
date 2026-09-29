@@ -187,7 +187,8 @@ async def test_timer_delivery_logs_http_error_status(caplog: pytest.LogCaptureFi
             # Let the one-shot loop finish after the failed POST.
             await asyncio.sleep(0.05)
 
-    assert len(responder.posts) == 1
+    # The settings read (GET collab-settings) also hits the transport.
+    assert len([post for post in responder.posts if post["method"] == "POST"]) == 1
     assert any(
         "firing persist failed" in record.getMessage()
         and result["timer_id"] in record.getMessage()
