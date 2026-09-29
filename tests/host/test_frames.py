@@ -993,6 +993,7 @@ def test_resource_snapshot_frame_round_trip() -> None:
                 session_id=None,
                 cpu_pct=0.5,
                 rss=10,
+                started_at=1_700_000_000.0,
             ),
             ResourceProcessRow(
                 pid=200,
@@ -1002,6 +1003,7 @@ def test_resource_snapshot_frame_round_trip() -> None:
                 session_id="conv_a",
                 cpu_pct=2.0,
                 rss=20,
+                started_at=1_700_000_100.5,
             ),
             ResourceProcessRow(
                 pid=0,
@@ -1046,6 +1048,42 @@ def test_resource_snapshot_frame_round_trip_without_load() -> None:
 
     assert decoded == original
     assert decoded.machine.load1 is None
+
+
+def test_resource_snapshot_frame_without_started_at_decodes_none() -> None:
+    """An older host's row without ``started_at`` decodes it as ``None``."""
+    payload = {
+        "kind": "host.resource_snapshot",
+        "sampled_at": "2026-09-24T09:25:00+00:00",
+        "interval_s": 60,
+        "machine": {
+            "cpu_pct": 0.0,
+            "mem_used": 0,
+            "mem_total": 0,
+            "disk_used": 0,
+            "disk_total": 0,
+            "load1": None,
+        },
+        "processes": [
+            {
+                "pid": 1,
+                "ppid": 0,
+                "name": "omnigent",
+                "role": "daemon",
+                "session_id": None,
+                "cpu_pct": 0.0,
+                "rss": 0,
+            }
+        ],
+        "runner_count": 0,
+        "sampler_cpu_ms": 0.0,
+        "monitor_rss_delta": 0,
+    }
+
+    decoded = decode_host_frame(json.dumps(payload))
+
+    assert isinstance(decoded, HostResourceSnapshotFrame)
+    assert decoded.processes[0].started_at is None
 
 
 def test_resource_snapshot_frame_rejects_unknown_process_role() -> None:

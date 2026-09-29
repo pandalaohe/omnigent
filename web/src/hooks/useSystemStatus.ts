@@ -60,6 +60,8 @@ export interface SystemProcessRow {
   session_id: string | null;
   cpu_pct: number;
   rss: number;
+  /** Epoch seconds when the process started; absent from older hosts. */
+  started_at?: number | null;
 }
 
 /** `host.resource_snapshot` as stored by the hub. */

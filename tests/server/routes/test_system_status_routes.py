@@ -10,7 +10,12 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
-from omnigent.host.frames import CAP_RESOURCE_SNAPSHOT
+from omnigent.host.frames import (
+    CAP_RESOURCE_SNAPSHOT,
+    HostResourceSnapshotFrame,
+    ResourceMachine,
+    ResourceProcessRow,
+)
 from omnigent.server.routes.system_status import create_system_status_router
 from omnigent.server.system_status import SystemStatusHub
 from omnigent.stores.host_store import Host
@@ -129,6 +134,51 @@ def test_status_member_sees_only_own_hosts_and_no_server(tmp_path: Path) -> None
     assert set(by_id) == {"host_b", "host_c"}
     assert by_id["host_c"]["state"] == "offline"
     assert by_id["host_c"]["last_snapshot"] is None
+
+
+def test_status_exposes_process_start_time(tmp_path: Path) -> None:
+    """A stored snapshot keeps each row's ``started_at`` for the uptime column."""
+    client, hub = _build(tmp_path)
+    _seed(hub)
+    hub.ingest(
+        host_id="host_a",
+        workspace_id=0,
+        frame=HostResourceSnapshotFrame(
+            sampled_at="2026-09-29T09:25:00+00:00",
+            interval_s=60,
+            machine=ResourceMachine(
+                cpu_pct=1.0,
+                mem_used=1,
+                mem_total=2,
+                disk_used=3,
+                disk_total=4,
+                load1=0.5,
+            ),
+            processes=[
+                ResourceProcessRow(
+                    pid=100,
+                    ppid=1,
+                    name="python",
+                    role="runner",
+                    session_id=None,
+                    cpu_pct=0.0,
+                    rss=10,
+                    started_at=1_700_000_000.0,
+                )
+            ],
+            runner_count=1,
+            sampler_cpu_ms=0.5,
+            monitor_rss_delta=0,
+        ),
+        now=1.0,
+    )
+
+    resp = client.get("/v1/system/status", headers={"X-Test-User": "admin@example.com"})
+
+    assert resp.status_code == 200
+    by_id = {host["host_id"]: host for host in resp.json()["hosts"]}
+    row = by_id["host_a"]["last_snapshot"]["processes"][0]
+    assert row["started_at"] == 1_700_000_000.0
 
 
 def test_status_live_records_a_viewer_lease(tmp_path: Path) -> None:

@@ -70,6 +70,8 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
 def test_runner_descendants_inherit_the_runner_session(tmp_path: Path) -> None:
     """A runner's child is a ``child`` row attributed to the runner's session."""
     parent, child_pid = _spawn_runner_with_child()
+    parent_create_time = psutil.Process(parent.pid).create_time()
+    child_create_time = psutil.Process(child_pid).create_time()
     try:
         sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())
         frame = sampler.sample(
@@ -85,6 +87,8 @@ def test_runner_descendants_inherit_the_runner_session(tmp_path: Path) -> None:
     assert by_pid[parent.pid].session_id == "conv_r"
     assert by_pid[child_pid].role == "child"
     assert by_pid[child_pid].session_id == "conv_r"
+    assert by_pid[parent.pid].started_at == parent_create_time
+    assert by_pid[child_pid].started_at == child_create_time
 
 
 def test_owner_file_root_wins_over_inherited_session(
@@ -267,6 +271,7 @@ def _row(
     rss: int = 0,
     role: str = "child",
     session_id: str | None = None,
+    started_at: float | None = None,
 ) -> ResourceProcessRow:
     return ResourceProcessRow(
         pid=pid,
@@ -276,6 +281,7 @@ def _row(
         session_id=session_id,
         cpu_pct=cpu_pct,
         rss=rss,
+        started_at=started_at,
     )
 
 
@@ -317,11 +323,13 @@ def test_payload_cap_keeps_ancestors_of_kept_rows() -> None:
 
 def test_payload_cap_folds_remaining_rows_under_nearest_kept_parent() -> None:
     """One folded row per kept parent sums the dropped descendants."""
-    rows = [_row(1, 0, 0.0, role="daemon")]
-    rows.extend(_row(pid, 1, float(pid), rss=pid) for pid in range(2, 205))
+    rows = [_row(1, 0, 0.0, role="daemon", started_at=123.0)]
+    rows.extend(_row(pid, 1, float(pid), rss=pid, started_at=456.0) for pid in range(2, 205))
 
     capped = _apply_payload_cap(rows, root_pids={1})
 
+    (daemon_row,) = [row for row in capped if row.pid == 1]
+    assert daemon_row.started_at == 123.0
     folded = [row for row in capped if row.role == "folded"]
     assert len(folded) == 1
     (summary,) = folded
@@ -331,3 +339,4 @@ def test_payload_cap_folds_remaining_rows_under_nearest_kept_parent() -> None:
     assert summary.session_id is None
     assert summary.cpu_pct == 14.0
     assert summary.rss == 14
+    assert summary.started_at is None

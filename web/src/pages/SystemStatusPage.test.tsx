@@ -1,6 +1,6 @@
 // Rendering contract for /system: findings, the admin-only server card, host
-// state variants, the expandable process tree with subtree totals, and the
-// measured monitor-overhead footer.
+// state variants, the expandable process tree with subtree totals and role
+// labels, and the measured monitor-overhead footer.
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -37,6 +37,7 @@ import { SystemStatusPage } from "./SystemStatusPage";
 const MB = 1024 * 1024;
 
 function hostSnapshot() {
+  const now = Date.now() / 1000;
   return {
     sampled_at: "2026-09-29T09:25:00+00:00",
     interval_s: 60,
@@ -52,20 +53,22 @@ function hostSnapshot() {
       {
         pid: 100,
         ppid: 999,
-        name: "runner",
+        name: "python3.12",
         role: "runner",
         session_id: "conv_hot",
         cpu_pct: 5,
         rss: 100 * MB,
+        started_at: now - (2 * 3600 + 30 * 60),
       },
       {
         pid: 101,
         ppid: 100,
-        name: "harness",
+        name: "claude",
         role: "harness",
         session_id: null,
         cpu_pct: 10,
         rss: 200 * MB,
+        started_at: now - (3 * 86400 + 5 * 3600),
       },
       {
         pid: 0,
@@ -75,15 +78,36 @@ function hostSnapshot() {
         session_id: null,
         cpu_pct: 1,
         rss: 10 * MB,
+        started_at: null,
       },
       {
         pid: 1,
         ppid: 0,
-        name: "host daemon",
+        name: "python3.12",
         role: "daemon",
         session_id: null,
         cpu_pct: 1,
         rss: 50 * MB,
+      },
+      {
+        pid: 2,
+        ppid: 1,
+        name: "python3.12",
+        role: "zygote",
+        session_id: null,
+        cpu_pct: 0.5,
+        rss: 20 * MB,
+        started_at: now - 90,
+      },
+      {
+        pid: 3,
+        ppid: 1,
+        name: "tmux",
+        role: "tmux",
+        session_id: "conv_hot",
+        cpu_pct: 0.2,
+        rss: 5 * MB,
+        started_at: now - 30,
       },
     ],
     runner_count: 1,
@@ -237,7 +261,56 @@ describe("SystemStatusPage", () => {
     const harnessRow = within(tree).getByText("harness").closest("tr");
     expect(harnessRow).toHaveAttribute("data-depth", "1");
     expect(within(tree).getByText("2 other processes")).toBeInTheDocument();
-    const sessionLink = within(tree).getByRole("link", { name: "Fix login timeout" });
+    const sessionLink = within(runnerRow as HTMLElement).getByRole("link", {
+      name: "Fix login timeout",
+    });
     expect(sessionLink).toHaveAttribute("href", "/c/conv_hot");
+  });
+
+  it("labels process rows by role and keeps the OS name and pid in the title", () => {
+    mocks.status.current = {
+      data: makeView({ server: false }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "View processes" }));
+
+    expect(screen.getByText("host daemon")).toHaveAttribute("title", "python3.12 · pid 1");
+    expect(screen.getByText("runner zygote")).toHaveAttribute("title", "python3.12 · pid 2");
+    expect(screen.getByText("runner")).toHaveAttribute("title", "python3.12 · pid 100");
+    expect(screen.getByText("harness")).toHaveAttribute("title", "claude · pid 101");
+    expect(screen.getByText("tmux")).toHaveAttribute("title", "tmux · pid 3");
+    expect(screen.getByText("2 other processes")).toHaveAttribute("title", "2 other processes");
+  });
+
+  it("renders each row's uptime and names hosts in the overhead footer", () => {
+    mocks.status.current = {
+      data: makeView({ server: false }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "View processes" }));
+    const tree = screen.getByTestId("process-tree");
+    const rowFor = (label: string) => within(tree).getByText(label).closest("tr") as HTMLElement;
+    const uptimeCell = (label: string) =>
+      rowFor(label).querySelector("td:last-child") as HTMLElement;
+
+    expect(uptimeCell("runner")).toHaveTextContent("2h 30m");
+    expect(uptimeCell("harness")).toHaveTextContent("3d 5h");
+    expect(uptimeCell("runner zygote")).toHaveTextContent("1m");
+    expect(uptimeCell("tmux")).toHaveTextContent("<1m");
+    // A null start time (folded row) and a missing one (older host) both show "—".
+    expect(uptimeCell("2 other processes")).toHaveTextContent("—");
+    expect(uptimeCell("host daemon")).toHaveTextContent("—");
+
+    const overhead = screen.getByTestId("system-status-overhead");
+    expect(overhead).toHaveTextContent("Laptop");
+    expect(overhead).not.toHaveTextContent("host_1");
   });
 });

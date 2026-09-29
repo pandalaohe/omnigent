@@ -36,6 +36,33 @@ function formatLoad(load1: number | null): string {
   return load1 === null ? "—" : load1.toFixed(1);
 }
 
+function formatUptime(startedAt: number | null | undefined): string {
+  if (startedAt === null || startedAt === undefined) return "—";
+  const seconds = Date.now() / 1000 - startedAt;
+  if (seconds >= 86_400) {
+    return `${Math.floor(seconds / 86_400)}d ${Math.floor((seconds % 86_400) / 3_600)}h`;
+  }
+  if (seconds >= 3_600) {
+    return `${Math.floor(seconds / 3_600)}h ${Math.floor((seconds % 3_600) / 60)}m`;
+  }
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}m`;
+  return "<1m";
+}
+
+// The OS process name is "python" for most rows; show the role instead so the
+// daemon, zygote, runner, harness and tmux rows stay distinguishable.
+const PROCESS_ROLE_LABELS: Record<string, string> = {
+  daemon: "host daemon",
+  zygote: "runner zygote",
+  runner: "runner",
+  harness: "harness",
+  tmux: "tmux",
+};
+
+function processLabel(row: SystemProcessRow): string {
+  return PROCESS_ROLE_LABELS[row.role] ?? row.name;
+}
+
 function Metric({ label, value }: { label: string; value: string }) {
   return (
     <div>
@@ -237,7 +264,16 @@ function ProcessRows({
         <Fragment key={node.key}>
           <tr data-depth={depth}>
             <td className="py-1 pr-3" style={{ paddingLeft: `${depth * 16 + 4}px` }}>
-              <span className="font-mono text-xs">{node.row.name}</span>
+              <span
+                className="font-mono text-xs"
+                title={
+                  node.row.role === "folded"
+                    ? node.row.name
+                    : `${node.row.name} · pid ${node.row.pid}`
+                }
+              >
+                {processLabel(node.row)}
+              </span>
             </td>
             <td className="py-1 pr-3 text-xs text-muted-foreground">
               {node.row.session_id !== null ? (
@@ -249,7 +285,10 @@ function ProcessRows({
               )}
             </td>
             <td className="py-1 pr-3 text-right tabular-nums">{formatPct(node.cpu)}</td>
-            <td className="py-1 text-right tabular-nums">{formatBytes(node.rss)}</td>
+            <td className="py-1 pr-3 text-right tabular-nums">{formatBytes(node.rss)}</td>
+            <td className="py-1 text-right tabular-nums">
+              {formatUptime(node.row.started_at)}
+            </td>
           </tr>
           {node.children.length > 0 && (
             <ProcessRows nodes={node.children} sessionTitles={sessionTitles} depth={depth + 1} />
@@ -275,7 +314,8 @@ function ProcessTree({
           <th className="py-1 pr-3 text-left font-medium">Process</th>
           <th className="py-1 pr-3 text-left font-medium">Session</th>
           <th className="py-1 pr-3 text-right font-medium">CPU</th>
-          <th className="py-1 text-right font-medium">Memory</th>
+          <th className="py-1 pr-3 text-right font-medium">Memory</th>
+          <th className="py-1 text-right font-medium">Uptime</th>
         </tr>
       </thead>
       <tbody>
@@ -375,7 +415,13 @@ function HostCard({
   );
 }
 
-function MonitorOverheadFooter({ overhead }: { overhead: SystemMonitorOverhead }) {
+function MonitorOverheadFooter({
+  overhead,
+  hostNames,
+}: {
+  overhead: SystemMonitorOverhead;
+  hostNames: Map<string, string>;
+}) {
   return (
     <div
       className="mt-6 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border bg-muted/30 px-4 py-3 text-sm"
@@ -388,8 +434,8 @@ function MonitorOverheadFooter({ overhead }: { overhead: SystemMonitorOverhead }
       </span>
       {Object.entries(overhead.hosts).map(([hostId, cost]) => (
         <span key={hostId}>
-          {hostId} {formatPct(cost.cpu_pct, 2)} CPU · {formatBytes(cost.rss_delta)} resident
-          increase (upper bound)
+          {hostNames.get(hostId) ?? hostId} {formatPct(cost.cpu_pct, 2)} CPU ·{" "}
+          {formatBytes(cost.rss_delta)} resident increase (upper bound)
         </span>
       ))}
     </div>
@@ -472,7 +518,7 @@ export function SystemStatusPage() {
         </div>
       )}
 
-      <MonitorOverheadFooter overhead={data.monitor_overhead} />
+      <MonitorOverheadFooter overhead={data.monitor_overhead} hostNames={hostNames} />
     </PageScroll>
   );
 }

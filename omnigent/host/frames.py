@@ -492,6 +492,9 @@ class ResourceProcessRow:
     :param cpu_pct: Process CPU since the previous sample, ``0.0`` on
         first sighting.
     :param rss: Resident set size in bytes.
+    :param started_at: Process create time in epoch seconds; ``None`` for
+        folded rows or when the host does not know it; absent from older
+        hosts' frames.
     """
 
     pid: int
@@ -501,6 +504,7 @@ class ResourceProcessRow:
     session_id: str | None
     cpu_pct: float
     rss: int
+    started_at: float | None = None
 
 
 @dataclass
@@ -2102,6 +2106,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                         "session_id": row.session_id,
                         "cpu_pct": row.cpu_pct,
                         "rss": row.rss,
+                        "started_at": row.started_at,
                     }
                     for row in frame.processes
                 ],
@@ -3159,6 +3164,7 @@ def _decode_resource_process_row(msg: _JsonObject) -> ResourceProcessRow:
         session_id=_optional_nullable_str(msg, "session_id"),
         cpu_pct=_required_float(msg, "cpu_pct"),
         rss=_required_int(msg, "rss"),
+        started_at=_optional_nullable_float(msg, "started_at"),
     )
 
 

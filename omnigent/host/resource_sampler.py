@@ -293,6 +293,7 @@ class ResourceSampler:
                 session_id=session_id,
                 cpu_pct=cpu_pct,
                 rss=process.memory_info().rss,
+                started_at=create_time,
             )
         except Exception:  # noqa: BLE001 — skip the pid, keep the sample
             _logger.debug("resource sampler skipped pid %s", pid, exc_info=True)
