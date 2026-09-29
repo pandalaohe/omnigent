@@ -44,8 +44,10 @@ import {
   useRef,
   useState,
 } from "react";
+import { useQuery } from "@tanstack/react-query";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
+import { useAgents } from "@/hooks/useAgents";
 import { useComments } from "@/hooks/useComments";
 import { bulkCommentsDeleteLine, unhandledCommentsDeleteLine } from "@/lib/comments";
 import {
@@ -96,11 +98,13 @@ import {
 } from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import {
   useSystemStatusSettings,
   useUpdateSystemStatusSettings,
   type SystemStatusSettings,
+  type SystemStatusThresholds,
 } from "@/hooks/useSystemStatus";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
@@ -143,6 +147,7 @@ import {
   writeSessionNavigationPreferences,
 } from "@/lib/sessionNavigationPreferences";
 import { changePassword, logout } from "@/lib/accountsApi";
+import { resolveCallingDefaults } from "@/lib/callingDefaultsApi";
 import { withBasePath } from "@/lib/basePath";
 import {
   beginGithubConnect,
@@ -415,14 +420,14 @@ export function SettingsPage() {
  * regardless.
  */
 
-type SystemStatusSettingsDraft = Record<keyof SystemStatusSettings, string>;
+type SystemStatusSettingsDraft = Record<keyof SystemStatusThresholds, string>;
 
 const SYSTEM_STATUS_THRESHOLD_FIELDS: {
-  key: keyof SystemStatusSettings;
+  key: keyof SystemStatusThresholds;
   label: string;
   hint: string;
   /** Optional integer companion rendered beside the field (CPU minutes). */
-  companion?: { key: keyof SystemStatusSettings; label: string };
+  companion?: { key: keyof SystemStatusThresholds; label: string };
 }[] = [
   {
     key: "cpu_pct",
@@ -460,7 +465,7 @@ function toSettingsDraft(settings: SystemStatusSettings): SystemStatusSettingsDr
   };
 }
 
-function fromSettingsDraft(draft: SystemStatusSettingsDraft): SystemStatusSettings {
+function fromSettingsDraft(draft: SystemStatusSettingsDraft): SystemStatusThresholds {
   return {
     cpu_pct: Number(draft.cpu_pct),
     cpu_sustain_min: Number(draft.cpu_sustain_min),
@@ -504,7 +509,7 @@ export function SystemStatusSettingsSection() {
   const savedDraft = settings.data !== undefined ? toSettingsDraft(settings.data) : null;
   const unchanged =
     draft !== null && savedDraft !== null && JSON.stringify(draft) === JSON.stringify(savedDraft);
-  const setField = (key: keyof SystemStatusSettings, value: string) =>
+  const setField = (key: keyof SystemStatusThresholds, value: string) =>
     setDraft((current) => (current === null ? current : { ...current, [key]: value }));
 
   return (
@@ -520,6 +525,7 @@ export function SystemStatusSettingsSection() {
         <p className="text-ui text-muted-foreground">Loading...</p>
       ) : (
         <form
+          data-testid="system-status-thresholds-form"
           className="flex max-w-xl flex-col gap-4"
           onSubmit={(event) => {
             event.preventDefault();
@@ -591,7 +597,251 @@ export function SystemStatusSettingsSection() {
           {update.error.message}
         </div>
       )}
+
+      {settings.data !== undefined && (
+        <div className="mt-10 max-w-xl border-t pt-6">
+          <h2 className="text-ui font-semibold">Health check</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Opens a session on this project and host and sends the prompt below with a monitor
+            snapshot as its first message.
+          </p>
+          <HealthCheckSettingsForm settings={settings.data} />
+        </div>
+      )}
     </PageScroll>
+  );
+}
+
+// Radix Select values must be non-empty strings, so unset maps to sentinels.
+const HEALTH_CHECK_PROJECT_UNSET = "__health_check_project_unset__";
+const HEALTH_CHECK_HOST_UNSET = "__health_check_host_unset__";
+
+interface HealthCheckDraft {
+  projectId: string;
+  hostId: string;
+  prompt: string;
+}
+
+function toHealthCheckDraft(settings: SystemStatusSettings): HealthCheckDraft {
+  return {
+    projectId: settings.health_check.project_id ?? "",
+    hostId: settings.health_check.host_id ?? "",
+    prompt: settings.health_check.prompt ?? settings.default_health_check_prompt,
+  };
+}
+
+/** The shipped default is stored as null, so text equal to it is sent as null. */
+function healthCheckPromptPayload(text: string, defaultPrompt: string): string | null {
+  const trimmed = text.trim();
+  if (trimmed === "" || trimmed === defaultPrompt.trim()) return null;
+  return trimmed;
+}
+
+function HealthCheckSettingsForm({ settings }: { settings: SystemStatusSettings }) {
+  const projects = useProjects();
+  const hosts = useHosts();
+  // Session-discovered agents only: the resolved id falls back to itself when
+  // the default isn't among them.
+  const agents = useAgents();
+  const update = useUpdateSystemStatusSettings();
+  const [draft, setDraft] = useState<HealthCheckDraft>(() => toHealthCheckDraft(settings));
+  const lastSynced = useRef(JSON.stringify(toHealthCheckDraft(settings)));
+
+  useEffect(() => {
+    const next = toHealthCheckDraft(settings);
+    setDraft((current) => (JSON.stringify(current) === lastSynced.current ? next : current));
+    lastSynced.current = JSON.stringify(next);
+  }, [settings]);
+
+  const { projectId, hostId } = draft;
+  // Resolving refuses an unlaunchable default (a saved joint agent, a harness
+  // that is not ready, …); the problems are shown before anyone clicks.
+  const resolve = useQuery({
+    queryKey: ["calling-defaults", "resolve", projectId, hostId],
+    queryFn: () => resolveCallingDefaults({ projectId, hostId }),
+    enabled: projectId !== "" && hostId !== "",
+    staleTime: 30_000,
+  });
+
+  const projectOptions = (projects.data ?? []).flatMap((project) =>
+    project.id === null ? [] : [{ id: project.id, name: project.name }],
+  );
+  const hostOptions = hosts.data ?? [];
+  const resolvedAgentId = resolve.data?.agent_id ?? null;
+  const resolvedAgentName =
+    resolvedAgentId === null
+      ? null
+      : (agents.data?.find((agent) => agent.id === resolvedAgentId)?.display_name ??
+        resolvedAgentId);
+  const savedDraft = toHealthCheckDraft(settings);
+  const unchanged = JSON.stringify(draft) === JSON.stringify(savedDraft);
+
+  return (
+    <form
+      data-testid="health-check-form"
+      className="mt-4 flex flex-col gap-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        update.mutate({
+          health_check: {
+            project_id: projectId === "" ? null : projectId,
+            host_id: hostId === "" ? null : hostId,
+            prompt: healthCheckPromptPayload(draft.prompt, settings.default_health_check_prompt),
+          },
+        });
+      }}
+    >
+      <div className="flex flex-col gap-1.5">
+        <label htmlFor="health-check-project" className="text-sm font-medium">
+          Ops project
+        </label>
+        <Select
+          value={projectId === "" ? HEALTH_CHECK_PROJECT_UNSET : projectId}
+          onValueChange={(value) =>
+            setDraft((current) => ({
+              ...current,
+              projectId: value === HEALTH_CHECK_PROJECT_UNSET ? "" : value,
+            }))
+          }
+        >
+          <SelectTrigger
+            id="health-check-project"
+            data-testid="health-check-project-trigger"
+            className="w-full"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent position="popper" align="start">
+            <SelectItem value={HEALTH_CHECK_PROJECT_UNSET}>No project</SelectItem>
+            {projectOptions.map((project) => (
+              <SelectItem key={project.id} value={project.id}>
+                {project.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-sm text-muted-foreground">
+          Sessions opened by the check are filed in this project.
+        </p>
+      </div>
+
+      <div className="flex flex-col gap-1.5">
+        <label htmlFor="health-check-host" className="text-sm font-medium">
+          Ops host
+        </label>
+        <Select
+          value={hostId === "" ? HEALTH_CHECK_HOST_UNSET : hostId}
+          onValueChange={(value) =>
+            setDraft((current) => ({
+              ...current,
+              hostId: value === HEALTH_CHECK_HOST_UNSET ? "" : value,
+            }))
+          }
+        >
+          <SelectTrigger
+            id="health-check-host"
+            data-testid="health-check-host-trigger"
+            className="w-full"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent position="popper" align="start">
+            <SelectItem value={HEALTH_CHECK_HOST_UNSET}>No host</SelectItem>
+            {hostOptions.map((host) => (
+              <SelectItem key={host.host_id} value={host.host_id}>
+                {host.status === "offline" ? `${host.name} (offline)` : host.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-sm text-muted-foreground">
+          The check opens a session as you, in this project on this host; both must be yours.
+        </p>
+      </div>
+
+      {projectId !== "" && hostId !== "" && (
+        <div className="flex flex-col gap-1">
+          <span className="text-sm font-medium">Agent</span>
+          {resolve.data === undefined ? (
+            resolve.isError ? (
+              <span className="text-sm text-destructive">{resolve.error.message}</span>
+            ) : (
+              <span className="text-sm text-muted-foreground">Resolving…</span>
+            )
+          ) : (
+            <>
+              {resolvedAgentName !== null ? (
+                <span className="text-ui">{resolvedAgentName}</span>
+              ) : (
+                <span className="text-sm text-amber-600 dark:text-amber-400">
+                  No default agent is set for this project on this host. Set the project's default
+                  agent for this host in the project's settings.
+                </span>
+              )}
+              {resolve.data.problems.length > 0 && (
+                <ul className="flex flex-col gap-1 text-sm text-amber-600 dark:text-amber-400">
+                  {resolve.data.problems.map((problem) => (
+                    <li key={`${problem.field}:${problem.setting}:${problem.message}`}>
+                      {problem.message}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-center justify-between gap-3">
+          <label htmlFor="health-check-prompt" className="text-sm font-medium">
+            Prompt
+          </label>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() =>
+              setDraft((current) => ({
+                ...current,
+                prompt: settings.default_health_check_prompt,
+              }))
+            }
+          >
+            Reset to default
+          </Button>
+        </div>
+        <Textarea
+          id="health-check-prompt"
+          value={draft.prompt}
+          rows={10}
+          onChange={(event) =>
+            setDraft((current) => ({ ...current, prompt: event.target.value }))
+          }
+        />
+        <span className="text-xs text-muted-foreground">
+          Sent as the first message, followed by the monitor snapshot.
+        </span>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <Button type="submit" loading={update.isPending} disabled={unchanged || update.isPending}>
+          Save
+        </Button>
+        <span className="text-xs text-muted-foreground">
+          The project's default agent on this host runs the check.
+        </span>
+      </div>
+
+      {update.isError && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+        >
+          {update.error.message}
+        </div>
+      )}
+    </form>
   );
 }
 

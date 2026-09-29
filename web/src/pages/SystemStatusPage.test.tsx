@@ -9,6 +9,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   status: { current: undefined as unknown },
   history: new Map<string, unknown[]>(),
+  isAdmin: { current: true },
+  healthCheck: {
+    current: { start: vi.fn(), pending: false, notice: null } as {
+      start: ReturnType<typeof vi.fn>;
+      pending: boolean;
+      notice: unknown;
+    },
+  },
 }));
 
 vi.mock("@/hooks/useSystemStatus", () => ({
@@ -21,7 +29,11 @@ vi.mock("@/hooks/useSystemStatus", () => ({
   useSystemStatusSettings: () => ({ data: null }),
 }));
 
-vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => true }));
+vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.isAdmin.current }));
+
+vi.mock("@/hooks/useStartHealthCheck", () => ({
+  useStartHealthCheck: () => mocks.healthCheck.current,
+}));
 
 vi.mock("@/hooks/useSidebarData", () => ({
   useLoadedConversations: () => ({
@@ -197,6 +209,8 @@ beforeEach(() => {
   mocks.history.clear();
   mocks.history.set("host_1", [{ t: 0, cpu_avg: 10 }]);
   mocks.history.set("server", [{ t: 0, cpu: 12 }]);
+  mocks.isAdmin.current = true;
+  mocks.healthCheck.current = { start: vi.fn(), pending: false, notice: null };
 });
 
 afterEach(cleanup);
@@ -312,5 +326,23 @@ describe("SystemStatusPage", () => {
     const overhead = screen.getByTestId("system-status-overhead");
     expect(overhead).toHaveTextContent("Laptop");
     expect(overhead).not.toHaveTextContent("host_1");
+  });
+
+  it("offers Run health check to admins only", () => {
+    mocks.status.current = {
+      data: makeView({ server: true }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+
+    mocks.isAdmin.current = false;
+    const member = renderPage();
+    expect(screen.queryByRole("button", { name: "Run health check" })).toBeNull();
+    member.unmount();
+
+    mocks.isAdmin.current = true;
+    renderPage();
+    expect(screen.getAllByRole("button", { name: "Run health check" })).toHaveLength(2);
   });
 });

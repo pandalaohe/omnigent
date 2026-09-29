@@ -1,13 +1,20 @@
-// The admin "System status" settings section: loads the four server
-// thresholds, saves an edit via PUT, and surfaces a server validation error
-// inline.
+// The admin "System status" settings section: loads the server thresholds,
+// saves an edit via PUT, surfaces a server validation error inline, and (in
+// the health-check sub-form) resolves the ops default agent, lists resolve
+// problems and stores a reset prompt in the shipped-default form.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => true }));
+
+vi.mock("@/hooks/useAgents", () => ({
+  useAgents: () => ({
+    data: [{ id: "ca_joint_1", name: "joint", display_name: "Ops joint" }],
+  }),
+}));
 
 import { SystemStatusSettingsSection } from "./SettingsPage";
 
@@ -28,7 +35,41 @@ const SETTINGS = {
   mem_pct: 90,
   disk_pct: 90,
   server_5xx_pct: 5,
+  health_check: { project_id: null, host_id: null, prompt: null },
+  default_health_check_prompt: "Default prompt.",
 };
+
+const PROJECTS = [{ id: "project_1", name: "Ops" }];
+
+const HOSTS = {
+  hosts: [
+    { host_id: "host_1", name: "Worker", owner: "alice", status: "online" },
+    { host_id: "host_2", name: "Old Mac", owner: "alice", status: "offline" },
+  ],
+};
+
+const RESOLVE = {
+  agent_id: "ca_joint_1",
+  harness: "claude-native",
+  model: "claude-sonnet",
+  effort: null,
+  sources: {},
+  problems: [
+    {
+      field: "agent",
+      setting: "default_agent",
+      message: "A saved joint agent cannot be launched without an agent id.",
+    },
+  ],
+};
+
+function defaultFetch(input: RequestInfo | URL, _init?: RequestInit): Response {
+  const url = String(input);
+  if (url === "/v1/system/settings") return mockResponse(SETTINGS);
+  if (url === "/v1/sessions/projects") return mockResponse(PROJECTS);
+  if (url === "/v1/hosts") return mockResponse(HOSTS);
+  return mockResponse({}, 404);
+}
 
 function renderSection() {
   const client = new QueryClient({
@@ -43,8 +84,23 @@ function renderSection() {
   );
 }
 
+function openSelect(testId: string) {
+  const trigger = screen.getByTestId(testId);
+  fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+  fireEvent.click(trigger);
+}
+
+function settingsPutCall() {
+  return fetchMock.mock.calls.find(
+    ([input, init]) =>
+      String(input) === "/v1/system/settings" &&
+      (init as RequestInit | undefined)?.method === "PUT",
+  );
+}
+
 beforeEach(() => {
   fetchMock.mockReset();
+  fetchMock.mockImplementation(defaultFetch);
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -53,9 +109,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("SystemStatusSettingsSection", () => {
+describe("SystemStatusSettingsSection thresholds", () => {
   it("loads the server thresholds into the form", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse(SETTINGS));
     renderSection();
 
     expect(await screen.findByLabelText(/CPU threshold/)).toHaveValue(85);
@@ -67,7 +122,6 @@ describe("SystemStatusSettingsSection", () => {
   });
 
   it("saves an edited threshold with PUT", async () => {
-    fetchMock.mockResolvedValue(mockResponse(SETTINGS));
     renderSection();
 
     fireEvent.change(await screen.findByLabelText(/CPU threshold/), {
@@ -76,43 +130,78 @@ describe("SystemStatusSettingsSection", () => {
     fireEvent.change(screen.getByLabelText(/Sustained window/), {
       target: { value: "3" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const form = screen.getByTestId("system-status-thresholds-form");
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
 
-    await waitFor(() => {
-      expect(
-        fetchMock.mock.calls.some(
-          ([, init]) => (init as RequestInit | undefined)?.method === "PUT",
-        ),
-      ).toBe(true);
-    });
-    const putCall = fetchMock.mock.calls.find(
-      ([, init]) => (init as RequestInit | undefined)?.method === "PUT",
-    );
-    const putInit = putCall === undefined ? undefined : (putCall[1] as RequestInit);
-    expect(JSON.parse(String(putInit?.body))).toEqual({
-      ...SETTINGS,
+    await waitFor(() => expect(settingsPutCall()).toBeDefined());
+    const putInit = settingsPutCall()?.[1] as RequestInit;
+    expect(JSON.parse(String(putInit.body))).toEqual({
       cpu_pct: 80,
       cpu_sustain_min: 3,
+      mem_pct: 90,
+      disk_pct: 90,
+      server_5xx_pct: 5,
     });
   });
 
   it("shows a server validation error inline", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse(SETTINGS));
-    fetchMock.mockResolvedValueOnce(
-      mockResponse(
-        { error: { message: "system-status setting 'cpu_pct' must be in (0, 100]" } },
-        400,
-      ),
-    );
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/v1/system/settings" && init?.method === "PUT") {
+        return mockResponse(
+          { error: { message: "system-status setting 'cpu_pct' must be in (0, 100]" } },
+          400,
+        );
+      }
+      return defaultFetch(input, init);
+    });
     renderSection();
 
     fireEvent.change(await screen.findByLabelText(/CPU threshold/), {
       target: { value: "0" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const form = screen.getByTestId("system-status-thresholds-form");
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "system-status setting 'cpu_pct' must be in (0, 100]",
     );
+  });
+});
+
+describe("HealthCheckSettingsForm", () => {
+  it("resolves the agent, lists resolve problems, and saves a reset prompt as null", async () => {
+    const stored = {
+      ...SETTINGS,
+      health_check: { project_id: null, host_id: null, prompt: "Old custom prompt" },
+    };
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/v1/system/settings" && init?.method !== "PUT") return mockResponse(stored);
+      if (url.startsWith("/v1/calling-defaults/resolve")) return mockResponse(RESOLVE);
+      return defaultFetch(input, init);
+    });
+    renderSection();
+
+    expect(await screen.findByLabelText("Prompt")).toHaveValue("Old custom prompt");
+
+    openSelect("health-check-project-trigger");
+    fireEvent.click(await screen.findByRole("option", { name: "Ops" }));
+    openSelect("health-check-host-trigger");
+    fireEvent.click(await screen.findByRole("option", { name: "Worker" }));
+
+    expect(await screen.findByText("Ops joint")).toBeInTheDocument();
+    expect(
+      screen.getByText("A saved joint agent cannot be launched without an agent id."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+    const form = screen.getByTestId("health-check-form");
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(settingsPutCall()).toBeDefined());
+    const putInit = settingsPutCall()?.[1] as RequestInit;
+    expect(JSON.parse(String(putInit.body))).toEqual({
+      health_check: { project_id: "project_1", host_id: "host_1", prompt: null },
+    });
   });
 });

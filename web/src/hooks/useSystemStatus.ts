@@ -155,14 +155,35 @@ export interface SystemServerHistoryPoint {
 /** The history endpoint returns target-specific points (see the two above). */
 export type SystemHistoryPoint = SystemHostHistoryPoint | SystemServerHistoryPoint;
 
-/** `GET|PUT /v1/system/settings` threshold mapping. */
+/** Ops target for the one-click health check; a null `prompt` means the shipped default. */
+export interface HealthCheckSettings {
+  project_id: string | null;
+  host_id: string | null;
+  prompt: string | null;
+}
+
+/** `GET|PUT /v1/system/settings` mapping. */
 export interface SystemStatusSettings {
   cpu_pct: number;
   cpu_sustain_min: number;
   mem_pct: number;
   disk_pct: number;
   server_5xx_pct: number;
+  health_check: HealthCheckSettings;
+  /** Shipped prompt to show when `health_check.prompt` is null. */
+  default_health_check_prompt: string;
 }
+
+/** The numeric fields, edited together by the thresholds form. */
+export type SystemStatusThresholds = Pick<
+  SystemStatusSettings,
+  "cpu_pct" | "cpu_sustain_min" | "mem_pct" | "disk_pct" | "server_5xx_pct"
+>;
+
+/** A partial settings PUT body; the server merges the groups it receives. */
+export type SystemStatusSettingsUpdate = Partial<
+  SystemStatusThresholds & { health_check: HealthCheckSettings }
+>;
 
 const SUMMARY_QUERY_KEY = ["system-status", "summary"] as const;
 const FULL_QUERY_KEY = ["system-status", "full"] as const;
@@ -297,11 +318,11 @@ export function useSystemStatusSettings(options: { enabled?: boolean } = {}) {
   });
 }
 
-/** PUT /v1/system/settings — validate and store thresholds. */
+/** PUT /v1/system/settings — validate and store the fields present in the body. */
 export function useUpdateSystemStatusSettings() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (settings: SystemStatusSettings): Promise<SystemStatusSettings> => {
+    mutationFn: async (settings: SystemStatusSettingsUpdate): Promise<SystemStatusSettings> => {
       const res = await authenticatedFetch("/v1/system/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
