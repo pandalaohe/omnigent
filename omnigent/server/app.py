@@ -1899,12 +1899,22 @@ def create_app(
                 HostResourceSamplingFrame,
                 encode_host_frame,
             )
+            from omnigent.server.system_status import FLUSH_EVERY_TICKS, write_history
 
             async def _system_status_tick_loop() -> None:
+                ticks = 0
                 while True:
                     await asyncio.sleep(60.0)
                     try:
-                        system_status_hub.tick(time.time())
+                        server_disk_pct = await asyncio.to_thread(system_status_hub.disk_usage_pct)
+                        system_status_hub.tick(time.time(), server_disk_pct=server_disk_pct)
+                        ticks += 1
+                        if ticks % FLUSH_EVERY_TICKS == 0:
+                            await asyncio.to_thread(
+                                write_history,
+                                system_status_hub.history_path,
+                                system_status_hub.history_payload(),
+                            )
                     except Exception:
                         _logger.exception("system-status tick failed; continuing")
 
@@ -2057,7 +2067,13 @@ def create_app(
                 with suppress(asyncio.CancelledError):
                     await system_status_fast_task
             if system_status_hub is not None:
-                system_status_hub.flush()
+                from omnigent.server.system_status import write_history
+
+                await asyncio.to_thread(
+                    write_history,
+                    system_status_hub.history_path,
+                    system_status_hub.history_payload(),
+                )
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the

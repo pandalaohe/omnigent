@@ -46,6 +46,13 @@ _MEM_CONSECUTIVE_POINTS = 2
 _SERVER_5XX_WINDOW_POINTS = 5
 _SERVER_5XX_MIN_REQUESTS = 20
 
+# A resource finding needs a fresh, contiguous observation window: the newest
+# point no older than ``_FINDING_FRESH_S``, and N points spanning at most
+# ``(N - 1) * 60 s + _WINDOW_SLACK_S``.
+_FINDING_FRESH_S = 150.0
+_POINT_INTERVAL_S = 60.0
+_WINDOW_SLACK_S = 90.0
+
 _CPU_SUSTAIN_MIN_RANGE = (1, 1440)
 
 _DEFAULT_SETTINGS: dict[str, float] = {
@@ -90,8 +97,9 @@ class _HostEntry:
 class SystemStatusHub:
     """Inventory, history, findings and persistence for the system-status view.
 
-    All methods run on the server's event loop; the in-memory structures are
-    not locked.
+    Mutating methods run on the server's event loop; the in-memory structures
+    are not locked. Blocking work does not: ``disk_usage_pct`` and the
+    module-level ``write_history`` / ``write_settings`` run on worker threads.
 
     :param data_dir: Directory holding the ``system-status/`` state files.
     :param metrics: Server metrics tracker whose ``last_snapshot`` (written by
@@ -103,8 +111,8 @@ class SystemStatusHub:
         self._data_dir = data_dir
         self._metrics = metrics
         self._state_dir = data_dir / "system-status"
-        self._history_path = self._state_dir / "history.json"
-        self._settings_path = self._state_dir / "settings.json"
+        self.history_path = self._state_dir / "history.json"
+        self.settings_path = self._state_dir / "settings.json"
         self._started_at = time.time()
         self._entries: dict[tuple[int, str], _HostEntry] = {}
         self._server_points: list[dict[str, Any]] = []
@@ -112,7 +120,6 @@ class SystemStatusHub:
         self._viewer_leases: dict[tuple[int, str], float] = {}
         self._settings = self._read_settings()
         self._revision = 0
-        self._tick_count = 0
         self._hub_cpu_ms = 0.0
         self._last_server_counters: tuple[int, int] | None = None
 
@@ -156,6 +163,16 @@ class SystemStatusHub:
                 )
                 self._entries[(workspace_id, host_id)] = entry
             if owner is not None:
+                if entry.owner is not None and owner != entry.owner:
+                    # Re-registering a host id under a new owner must not
+                    # expose the previous owner's telemetry or findings.
+                    self._reset_telemetry(entry)
+                    for key in [
+                        key
+                        for key in self._findings
+                        if key[0] == workspace_id and key[1].startswith(f"{host_id}:")
+                    ]:
+                        del self._findings[key]
                 entry.owner = owner
             if name:
                 entry.name = name
@@ -217,18 +234,19 @@ class SystemStatusHub:
 
     # ── Tick ─────────────────────────────────────────────────────
 
-    def tick(self, now: float) -> bool:
+    def tick(self, now: float, *, server_disk_pct: float) -> bool:
         """Roll one minute forward: points, trim, findings, nudge.
 
         :param now: Current wall-clock time.
+        :param server_disk_pct: Data-dir disk usage, read by the caller off
+            the event loop; this method does no blocking I/O.
         :returns: ``True`` when the set of ``(finding id, level)`` changed, so
             the caller knows a nudge was published.
         """
         started = time.thread_time()
         try:
-            self._tick_count += 1
             if self._metrics is not None and self._metrics.last_snapshot is not None:
-                self._append_server_point(now, self._metrics.last_snapshot)
+                self._append_server_point(now, self._metrics.last_snapshot, server_disk_pct)
             for entry in self._entries.values():
                 self._close_minute(entry, now)
                 self._prune_overhead(entry, now)
@@ -248,13 +266,13 @@ class SystemStatusHub:
             if changed is not None:
                 self._revision += 1
                 self._announce(changed)
-            if self._tick_count % FLUSH_EVERY_TICKS == 0:
-                self.flush()
             return changed is not None
         finally:
             self._accumulate_cpu(started)
 
-    def _append_server_point(self, now: float, snapshot: ServerMetricsSnapshot) -> None:
+    def _append_server_point(
+        self, now: float, snapshot: ServerMetricsSnapshot, disk_pct: float
+    ) -> None:
         req = 0
         err = 0
         if self._last_server_counters is not None:
@@ -271,11 +289,15 @@ class SystemStatusHub:
                 "req": req,
                 "err": err,
                 "load1": snapshot.load_average_1m,
-                "disk_pct": self._disk_pct(),
+                "disk_pct": disk_pct,
             }
         )
 
-    def _disk_pct(self) -> float:
+    def disk_usage_pct(self) -> float:
+        """Disk usage percentage of the data dir; ``0.0`` when unreadable.
+
+        Blocking; the tick loop reads it on a worker thread.
+        """
         try:
             import psutil
 
@@ -406,7 +428,7 @@ class SystemStatusHub:
         target = entry.host_id
         cpu_sustain_min = int(self._settings["cpu_sustain_min"])
 
-        if len(points) >= cpu_sustain_min and all(
+        if _fresh_window(points, cpu_sustain_min, now) and all(
             float(point.get("cpu_avg", 0.0)) > self._settings["cpu_pct"]
             for point in points[-cpu_sustain_min:]
         ):
@@ -425,7 +447,7 @@ class SystemStatusHub:
             )
 
         recent = points[-_MEM_CONSECUTIVE_POINTS:]
-        if len(recent) >= _MEM_CONSECUTIVE_POINTS and all(
+        if _fresh_window(points, _MEM_CONSECUTIVE_POINTS, now) and all(
             _mem_pct(point) > self._settings["mem_pct"] for point in recent
         ):
             findings.append(
@@ -443,7 +465,9 @@ class SystemStatusHub:
                 }
             )
 
-        if points and float(points[-1].get("disk_pct", 0.0)) > self._settings["disk_pct"]:
+        if _fresh_window(points, 1, now) and (
+            float(points[-1].get("disk_pct", 0.0)) > self._settings["disk_pct"]
+        ):
             findings.append(
                 {
                     "id": f"{target}:disk",
@@ -690,7 +714,10 @@ class SystemStatusHub:
         return dict(self._settings)
 
     def put_settings(self, payload: dict[str, Any]) -> dict[str, float]:
-        """Validate, store and return the thresholds.
+        """Validate and store the thresholds, returning the payload to persist.
+
+        The caller writes the returned mapping off the event loop; this
+        method does no file I/O.
 
         :param payload: Partial or full settings mapping.
         :raises ValueError: On an unknown key, a non-number, or a value
@@ -701,11 +728,10 @@ class SystemStatusHub:
         for key, value in payload.items():
             settings[key] = _coerce_setting(key, value)
         self._settings = settings
-        self._write_settings()
         return dict(settings)
 
     def _read_settings(self) -> dict[str, float]:
-        payload = _read_json(self._settings_path)
+        payload = _read_json(self.settings_path)
         settings = dict(_DEFAULT_SETTINGS)
         if not isinstance(payload, dict):
             return settings
@@ -716,17 +742,11 @@ class SystemStatusHub:
                 continue
         return settings
 
-    def _write_settings(self) -> None:
-        try:
-            _atomic_write_json(self._settings_path, dict(self._settings))
-        except OSError:
-            _logger.warning("system-status settings write failed", exc_info=True)
-
     # ── Persistence ──────────────────────────────────────────────
 
     def load(self) -> None:
         """Load history at startup, dropping points older than 24 h."""
-        payload = _read_json(self._history_path)
+        payload = _read_json(self.history_path)
         if not isinstance(payload, dict):
             return
         now = time.time()
@@ -769,24 +789,24 @@ class SystemStatusHub:
                 points=points,
             )
 
-    def flush(self) -> None:
-        """Write history atomically; a failure is logged and ignored."""
-        payload = {
+    def history_payload(self) -> dict[str, Any]:
+        """Build the JSON-able history payload from copies of the point lists.
+
+        Runs on the event loop; the point dicts are never mutated after
+        append, so the returned payload can be serialized on a worker thread.
+        """
+        return {
             "version": 1,
-            "server": self._server_points,
+            "server": list(self._server_points),
             "hosts": {
                 f"{workspace_id}:{host_id}": {
                     "owner": entry.owner,
                     "name": entry.name,
-                    "points": entry.points,
+                    "points": list(entry.points),
                 }
                 for (workspace_id, host_id), entry in self._entries.items()
             },
         }
-        try:
-            _atomic_write_json(self._history_path, payload)
-        except OSError:
-            _logger.warning("system-status history write failed", exc_info=True)
 
     # ── Self-cost ────────────────────────────────────────────────
 
@@ -797,6 +817,29 @@ class SystemStatusHub:
         if entry.state != state:
             entry.state = state
             entry.since = now
+
+    def _reset_telemetry(self, entry: _HostEntry) -> None:
+        entry.last_snapshot = None
+        entry.last_runner_count = 0
+        entry.points = []
+        entry.minute_buffer = []
+        entry.overhead_samples.clear()
+
+
+def write_history(path: Path, payload: dict[str, Any]) -> None:
+    """Write a history payload atomically; a failure is logged and ignored."""
+    try:
+        _atomic_write_json(path, payload)
+    except OSError:
+        _logger.warning("system-status history write failed", exc_info=True)
+
+
+def write_settings(path: Path, payload: dict[str, float]) -> None:
+    """Write a settings payload atomically; a failure is logged and ignored."""
+    try:
+        _atomic_write_json(path, payload)
+    except OSError:
+        _logger.warning("system-status settings write failed", exc_info=True)
 
 
 def _points_fresh(points: list[dict[str, Any]], cutoff: float) -> list[dict[str, Any]]:
@@ -839,6 +882,22 @@ def _machine_disk_pct(machine: dict[str, Any]) -> float:
     if total <= 0:
         return 0.0
     return float(machine.get("disk_used", 0.0)) / total * 100.0
+
+
+def _fresh_window(points: list[dict[str, Any]], count: int, now: float) -> bool:
+    """Whether the last *count* points are a fresh, contiguous minute window.
+
+    Empty minutes add no point, so a host sampled hours apart must not read as
+    "above threshold for N minutes".
+    """
+    if len(points) < count:
+        return False
+    window = points[-count:]
+    newest = float(window[-1].get("t", 0.0))
+    if now - newest > _FINDING_FRESH_S:
+        return False
+    oldest = float(window[0].get("t", 0.0))
+    return newest - oldest <= (count - 1) * _POINT_INTERVAL_S + _WINDOW_SLACK_S
 
 
 def _top_session(point: dict[str, Any]) -> str | None:

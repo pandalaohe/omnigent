@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -204,6 +205,9 @@ def test_settings_admin_only_with_validation(tmp_path: Path) -> None:
     assert updated.json()["cpu_pct"] == 70.0
     assert updated.json()["cpu_sustain_min"] == 3
     assert updated.json()["mem_pct"] == 90.0
+    written = json.loads((tmp_path / "system-status" / "settings.json").read_text())
+    assert written["cpu_pct"] == 70.0
+    assert written["cpu_sustain_min"] == 3
 
     for payload in (
         {"cpu_pct": 150},

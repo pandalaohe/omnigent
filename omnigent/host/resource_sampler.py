@@ -258,8 +258,11 @@ class ResourceSampler:
                     continue
                 seen.add(child)
                 row = self._build_row(child, "child", session_id)
-                if row is not None:
-                    rows[child] = row
+                if row is None or row.ppid != parent:
+                    # A cached parent/child edge can be stale after pid reuse;
+                    # a row whose real parent differs is not that child.
+                    continue
+                rows[child] = row
                 queue.append((child, session_id))
         return list(rows.values())
 

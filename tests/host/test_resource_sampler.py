@@ -209,6 +209,43 @@ def test_fallback_tree_used_when_child_pids_is_unsupported(
     assert by_pid[child_pid].role == "child"
 
 
+def test_fallback_edge_with_a_reused_pid_is_not_attributed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached child whose real ppid moved elsewhere is skipped entirely."""
+    monkeypatch.setattr(sampler_mod, "child_pids", lambda pid: None)
+    parent, _child_pid = _spawn_runner_with_child()
+    other_parent, other_child_pid = _spawn_runner_with_child()
+    sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())
+    monkeypatch.setattr(
+        sampler,
+        "_fallback_children_map",
+        lambda: {parent.pid: [other_child_pid]},
+    )
+    queried: list[int] = []
+    children_of = sampler._children_of
+
+    def _spy(pid: int) -> list[int]:
+        queried.append(pid)
+        return children_of(pid)
+
+    monkeypatch.setattr(sampler, "_children_of", _spy)
+    try:
+        frame = sampler.sample(
+            runner_sessions={parent.pid: "conv_r"},
+            zygote_pid=None,
+            interval_s=60,
+        )
+    finally:
+        _kill_tree(parent)
+        _kill_tree(other_parent)
+
+    by_pid = {row.pid: row for row in frame.processes}
+    assert parent.pid in by_pid
+    assert other_child_pid not in by_pid
+    assert other_child_pid not in queried, "a mismatched child must not be walked"
+
+
 def test_sample_skips_a_failing_pid(tmp_path: Path) -> None:
     """A missing runner / zygote pid is skipped, not raised."""
     sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())

@@ -1,10 +1,10 @@
 """Budget guard: the system-status hub must cost almost nothing.
 
 Runs the approved server workload in a child process — 10 hosts x 60
-snapshots (40 process rows each), 10 ticks, one flush and 60 admin views —
-and asserts the measured process CPU and RSS growth stay inside the
-approved budget (0.5 % of one core over 600 s; 20 MB RSS). The test fails
-when either number is exceeded.
+snapshots (40 process rows each), 10 ticks, one history payload build +
+write and 60 admin views — and asserts the measured process CPU and RSS
+growth stay inside the approved budget (0.5 % of one core over 600 s; 20 MB
+RSS). The test fails when either number is exceeded.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from omnigent.host.frames import (
     ResourceMachine,
     ResourceProcessRow,
 )
-from omnigent.server.system_status import SystemStatusHub
+from omnigent.server.system_status import SystemStatusHub, write_history
 
 GIB = 1024 * 1024 * 1024
 
@@ -94,8 +94,8 @@ def main():
                     frame=frame(host_index, step),
                     now=now,
                 )
-        hub.tick(base + 60.0)
-    hub.flush()
+        hub.tick(base + 60.0, server_disk_pct=0.0)
+    write_history(hub.history_path, hub.history_payload())
     for _ in range(60):
         hub.view(
             user_id="admin",

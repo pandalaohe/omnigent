@@ -7,6 +7,8 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from omnigent.host.frames import (
     CAP_RESOURCE_SNAPSHOT,
     HostResourceSnapshotFrame,
@@ -75,6 +77,11 @@ def _connect(hub: SystemStatusHub, *, host_id: str, now: float, workspace_id: in
     )
 
 
+def _tick(hub: SystemStatusHub, now: float) -> bool:
+    """Run one tick; the server tick loop reads disk usage off-loop."""
+    return hub.tick(now, server_disk_pct=0.0)
+
+
 def test_host_changed_tracks_connect_disconnect_and_needs_update(tmp_path: Path) -> None:
     """State transitions restamp ``since`` only when the state changes."""
     hub = SystemStatusHub(tmp_path, None)
@@ -141,6 +148,59 @@ def test_host_changed_tracks_connect_disconnect_and_needs_update(tmp_path: Path)
     assert entry.last_snapshot == snapshot, "a disconnect keeps the last snapshot"
 
 
+def test_owner_change_resets_telemetry_and_findings(tmp_path: Path) -> None:
+    """A new owner must not see the previous owner's points or findings."""
+    hub = SystemStatusHub(tmp_path, None)
+    now = time.time()
+    _connect(hub, host_id="host_a", now=now)
+    for minute in range(10):
+        hub.ingest(
+            host_id="host_a",
+            workspace_id=0,
+            frame=_frame(cpu_pct=95.0),
+            now=now + minute * 60.0 + 1,
+        )
+        _tick(hub, now + (minute + 1) * 60.0)
+    assert (0, "host_a:cpu") in hub._findings
+    entry = hub._entries[(0, "host_a")]
+    assert entry.points and entry.last_snapshot is not None
+
+    hub.host_changed(
+        host_id="host_a",
+        workspace_id=0,
+        owner="bob",
+        name="bob-laptop",
+        conn_capabilities=[CAP_RESOURCE_SNAPSHOT],
+        now=now + 650.0,
+    )
+    assert entry.owner == "bob"
+    assert entry.points == []
+    assert entry.minute_buffer == []
+    assert entry.last_snapshot is None
+    assert entry.last_runner_count == 0
+    assert not any(finding_id.startswith("host_a:") for _ws, finding_id in hub._findings)
+
+    _tick(hub, now + 700.0)
+    assert not any(finding_id.startswith("host_a:") for _ws, finding_id in hub._findings), (
+        "the next evaluation must not resurrect the old findings"
+    )
+
+    view = hub.view(
+        user_id="bob",
+        is_admin=False,
+        own_host_ids=set(),
+        own_offline_hosts=[],
+        workspace_id=0,
+        summary=False,
+    )
+    assert view["findings"] == []
+    assert view["hosts"][0]["last_snapshot"] is None
+    assert (
+        hub.history("host_a", user_id="bob", is_admin=False, own_host_ids=set(), workspace_id=0)
+        == []
+    )
+
+
 def test_tick_closes_a_minute_point_with_top_sessions(tmp_path: Path) -> None:
     """A minute of snapshots becomes one point with the top 3 sessions."""
     hub = SystemStatusHub(tmp_path, None)
@@ -158,7 +218,7 @@ def test_tick_closes_a_minute_point_with_top_sessions(tmp_path: Path) -> None:
         now=40.0,
     )
 
-    assert hub.tick(60.0) is False
+    assert _tick(hub, 60.0) is False
     (point,) = hub._entries[(0, "host_a")].points
     assert point["t"] == 60.0
     assert point["cpu_avg"] == 30.0
@@ -169,7 +229,7 @@ def test_tick_closes_a_minute_point_with_top_sessions(tmp_path: Path) -> None:
     assert point["load1"] == 0.5
     assert point["top"] == [["conv_b", 6.0], ["conv_a", 3.0]]
 
-    assert hub.tick(120.0) is False
+    assert _tick(hub, 120.0) is False
     assert len(hub._entries[(0, "host_a")].points) == 1, "an empty minute adds no point"
 
 
@@ -178,7 +238,7 @@ def test_tick_trims_and_drops_a_stale_offline_target(tmp_path: Path) -> None:
     hub = SystemStatusHub(tmp_path, None)
     _connect(hub, host_id="host_a", now=0.0)
     hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(), now=1.0)
-    hub.tick(60.0)
+    _tick(hub, 60.0)
     assert len(hub._entries[(0, "host_a")].points) == 1
 
     hub.host_changed(
@@ -189,7 +249,7 @@ def test_tick_trims_and_drops_a_stale_offline_target(tmp_path: Path) -> None:
         conn_capabilities=None,
         now=120.0,
     )
-    hub.tick(26 * 60 * 60.0)
+    _tick(hub, 26 * 60 * 60.0)
 
     assert (0, "host_a") not in hub._entries
     view = hub.view(
@@ -217,16 +277,16 @@ def test_offline_with_runners_is_red_after_two_minutes(tmp_path: Path) -> None:
         now=100.0,
     )
 
-    assert hub.tick(160.0) is False, "under 120 s offline there is no finding"
+    assert _tick(hub, 160.0) is False, "under 120 s offline there is no finding"
     (entry,) = hub._entries.values()
     assert entry.points, "the point established before the disconnect survives"
 
-    assert hub.tick(221.0) is True
+    assert _tick(hub, 221.0) is True
     findings = hub._findings[(0, "host_a:offline")]
     assert findings["level"] == "red"
     assert findings["since"] == 220.0
 
-    assert hub.tick(280.0) is False, "a still-holding finding does not re-announce"
+    assert _tick(hub, 280.0) is False, "a still-holding finding does not re-announce"
     assert hub._findings[(0, "host_a:offline")]["since"] == 220.0
 
 
@@ -243,7 +303,7 @@ def test_offline_without_runners_is_not_a_finding(tmp_path: Path) -> None:
         conn_capabilities=None,
         now=100.0,
     )
-    assert hub.tick(1000.0) is False
+    assert _tick(hub, 1000.0) is False
     assert hub._findings == {}
 
     hub.host_changed(
@@ -254,7 +314,7 @@ def test_offline_without_runners_is_not_a_finding(tmp_path: Path) -> None:
         conn_capabilities=[],
         now=1001.0,
     )
-    assert hub.tick(2000.0) is False
+    assert _tick(hub, 2000.0) is False
     assert hub._findings == {}
 
 
@@ -269,11 +329,11 @@ def test_cpu_finding_needs_ten_sustained_minutes(tmp_path: Path) -> None:
             frame=_frame(cpu_pct=90.0),
             now=minute * 60.0 + 1,
         )
-        assert hub.tick((minute + 1) * 60.0) is False
+        assert _tick(hub, (minute + 1) * 60.0) is False
     assert (0, "host_a:cpu") not in hub._findings
 
     hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(cpu_pct=90.0), now=9 * 60.0 + 1)
-    assert hub.tick(10 * 60.0) is True
+    assert _tick(hub, 10 * 60.0) is True
     finding = hub._findings[(0, "host_a:cpu")]
     assert finding["level"] == "amber"
     assert finding["kind"] == "cpu"
@@ -292,14 +352,69 @@ def test_cpu_finding_honors_custom_sustain_minutes(tmp_path: Path) -> None:
             frame=_frame(cpu_pct=90.0),
             now=minute * 60.0 + 1,
         )
-        assert hub.tick((minute + 1) * 60.0) is False
+        assert _tick(hub, (minute + 1) * 60.0) is False
     assert (0, "host_a:cpu") not in hub._findings
 
     hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(cpu_pct=90.0), now=2 * 60.0 + 1)
-    assert hub.tick(3 * 60.0) is True
+    assert _tick(hub, 3 * 60.0) is True
     finding = hub._findings[(0, "host_a:cpu")]
     assert finding["level"] == "amber"
     assert finding["detail"] == "cpu above 85% for 3 minutes"
+
+
+def test_cpu_finding_needs_contiguous_minutes(tmp_path: Path) -> None:
+    """Ten hot points an hour apart are not ten sustained minutes."""
+    hub = SystemStatusHub(tmp_path, None)
+    _connect(hub, host_id="host_a", now=0.0)
+    for hour in range(10):
+        hub.ingest(
+            host_id="host_a",
+            workspace_id=0,
+            frame=_frame(cpu_pct=95.0),
+            now=hour * 3600.0 + 1,
+        )
+        _tick(hub, (hour + 1) * 3600.0)
+    assert (0, "host_a:cpu") not in hub._findings
+
+
+@pytest.mark.parametrize(
+    "conn_capabilities", [None, ["something_else"]], ids=["offline", "needs_update"]
+)
+def test_stale_points_clear_every_resource_finding(
+    tmp_path: Path, conn_capabilities: list[str] | None
+) -> None:
+    """Hot points older than the freshness window raise no finding."""
+    hub = SystemStatusHub(tmp_path, None)
+    _connect(hub, host_id="host_a", now=0.0)
+    for minute in range(10):
+        hub.ingest(
+            host_id="host_a",
+            workspace_id=0,
+            frame=_frame(
+                cpu_pct=95.0,
+                mem_used=15 * _GIB,
+                mem_total=16 * _GIB,
+                disk_used=95,
+                disk_total=100,
+            ),
+            now=minute * 60.0 + 1,
+        )
+        _tick(hub, (minute + 1) * 60.0)
+    assert {(0, "host_a:cpu"), (0, "host_a:mem"), (0, "host_a:disk")} <= set(hub._findings)
+
+    hub.host_changed(
+        host_id="host_a",
+        workspace_id=0,
+        owner="alice",
+        name=None,
+        conn_capabilities=conn_capabilities,
+        now=650.0,
+    )
+    _tick(hub, 1000.0)
+
+    assert (0, "host_a:cpu") not in hub._findings
+    assert (0, "host_a:mem") not in hub._findings
+    assert (0, "host_a:disk") not in hub._findings
 
 
 def test_revision_bumps_only_when_the_finding_set_changes(tmp_path: Path) -> None:
@@ -307,9 +422,9 @@ def test_revision_bumps_only_when_the_finding_set_changes(tmp_path: Path) -> Non
     hub = SystemStatusHub(tmp_path, None)
     _connect(hub, host_id="host_a", now=0.0)
     hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(runner_count=1), now=1.0)
-    assert hub.tick(60.0) is False
+    assert _tick(hub, 60.0) is False
     assert hub._revision == 0
-    assert hub.tick(120.0) is False
+    assert _tick(hub, 120.0) is False
     assert hub._revision == 0
 
     hub.host_changed(
@@ -320,9 +435,9 @@ def test_revision_bumps_only_when_the_finding_set_changes(tmp_path: Path) -> Non
         conn_capabilities=None,
         now=130.0,
     )
-    assert hub.tick(260.0) is True, "a new red finding bumps the revision"
+    assert _tick(hub, 260.0) is True, "a new red finding bumps the revision"
     assert hub._revision == 1
-    assert hub.tick(320.0) is False
+    assert _tick(hub, 320.0) is False
     assert hub._revision == 1
 
 
@@ -347,7 +462,7 @@ def test_view_visibility_for_admin_and_member(tmp_path: Path) -> None:
     )
     hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(), now=1.0)
     hub.ingest(host_id="host_b", workspace_id=0, frame=_frame(), now=1.0)
-    hub.tick(60.0)
+    _tick(hub, 60.0)
 
     admin = hub.view(
         user_id="admin",
@@ -405,7 +520,7 @@ def test_view_findings_are_filtered_by_visibility(tmp_path: Path) -> None:
         conn_capabilities=None,
         now=100.0,
     )
-    hub.tick(300.0)
+    _tick(hub, 300.0)
     assert hub._findings[(0, "host_a:offline")]["level"] == "red"
 
     member = hub.view(
@@ -506,7 +621,7 @@ def test_load_drops_points_older_than_24_hours(tmp_path: Path) -> None:
 
 
 def test_corrupt_history_file_is_ignored(tmp_path: Path) -> None:
-    """A corrupt history file is logged, ignored, and replaced on flush."""
+    """A corrupt history file is logged, ignored, and replaced on write."""
     state_dir = tmp_path / "system-status"
     state_dir.mkdir(parents=True)
     (state_dir / "history.json").write_text("{not json")
@@ -518,11 +633,24 @@ def test_corrupt_history_file_is_ignored(tmp_path: Path) -> None:
 
     _connect(hub, host_id="host_a", now=0.0)
     hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(), now=1.0)
-    hub.tick(60.0)
-    hub.flush()
+    _tick(hub, 60.0)
+    system_status.write_history(hub.history_path, hub.history_payload())
     payload = json.loads((state_dir / "history.json").read_text())
     assert payload["version"] == 1
     assert set(payload["hosts"]) == {"0:host_a"}
+
+
+def test_history_payload_snapshots_the_point_lists(tmp_path: Path) -> None:
+    """The payload owns copies, so a worker can serialize it without racing."""
+    hub = SystemStatusHub(tmp_path, None)
+    _connect(hub, host_id="host_a", now=0.0)
+    hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(), now=1.0)
+    _tick(hub, 60.0)
+
+    payload = hub.history_payload()
+    hub._entries[(0, "host_a")].points.clear()
+
+    assert payload["hosts"]["0:host_a"]["points"], "the payload owns a copy"
 
 
 def test_settings_round_trip_and_validation(tmp_path: Path) -> None:
@@ -540,6 +668,7 @@ def test_settings_round_trip_and_validation(tmp_path: Path) -> None:
     assert updated["cpu_pct"] == 70.0
     assert updated["cpu_sustain_min"] == 3
     assert updated["mem_pct"] == 90.0
+    system_status.write_settings(hub.settings_path, updated)
     reloaded = SystemStatusHub(tmp_path, None)
     assert reloaded.get_settings()["cpu_pct"] == 70.0
     assert reloaded.get_settings()["cpu_sustain_min"] == 3
