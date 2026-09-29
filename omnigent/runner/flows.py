@@ -267,17 +267,24 @@ def _step_error(output: str) -> str | None:
     return None
 
 
-def note_child_dispatch(parent_session_id: str, child_session_id: str) -> None:
+def note_child_dispatch(
+    parent_session_id: str, child_session_id: str, *, release: bool = True
+) -> None:
     """
     Record which flow, if any, dispatched work to a child.
 
     Called whenever child work is registered or steered: inside a flow step the
     child joins that flow; any other dispatch releases it from the parent's
     flows, so the parent's own sends wake it as usual.
+
+    :param release: ``False`` only attributes (a steer before its post; the
+        release waits for the post to succeed).
     """
     run = _step_run.get()
     if run is not None and run.ctx.conversation_id == parent_session_id:
         run.children.add(child_session_id)
+        return
+    if not release:
         return
     for other in _session_flows.get(parent_session_id, {}).values():
         other.children.discard(child_session_id)

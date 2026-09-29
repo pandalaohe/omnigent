@@ -285,6 +285,42 @@ async def test_steering_the_agents_running_child_joins_the_flow_before_the_post(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("post_status", [200, 503])
+async def test_the_agents_own_steer_releases_a_flow_child_only_when_posted(
+    server: _FakeServer, scripted: list[str], post_status: int
+) -> None:
+    from omnigent.runner.tool_dispatch import _send_to_in_flight_child
+
+    child = "conv_child"
+    scripted.append("x")
+    async with _client(server) as client:
+        started = await _start(client, {"steps": _STEP, "start_after_s": 30})
+        run = flows._session_flows[_SESSION][started["flow_id"]]
+        run.children.add(child)
+
+        def _child_post(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(post_status, json={})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_child_post), base_url="http://server"
+        ) as child_client:
+            out = await _send_to_in_flight_child(
+                child,
+                "more",
+                server_client=child_client,
+                conversation_id=_SESSION,
+                agent="a",
+                title="t",
+                child_display_title="t",
+                wrapper_label=None,
+            )
+        owned = child in run.children
+        await flows.cancel_flow(_SESSION, started["flow_id"])
+    assert out.startswith("Error:") is (post_status == 503)
+    assert owned is (post_status == 503)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("disposition", ["delivered", "queued", "held", "pending"])
 async def test_send_step_to_a_peer_is_a_normal_step(
     server: _FakeServer, inbox: None, disposition: str

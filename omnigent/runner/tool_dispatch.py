@@ -1784,8 +1784,9 @@ async def _send_to_in_flight_child(
     """
     from omnigent.runner import app as _runner_app
 
-    # A flow step owns the steered turn before the child can complete it.
-    flows.note_child_dispatch(conversation_id, child_session_id)
+    # A flow step owns the steered turn before the child can complete it; the
+    # agent's own steer releases the child only once its post has landed.
+    flows.note_child_dispatch(conversation_id, child_session_id, release=False)
     # Post first — before any register/stamp — so a failure leaves the live
     # turn's tracking untouched (nothing to roll back, never a teardown).
     try:
@@ -1806,6 +1807,7 @@ async def _send_to_in_flight_child(
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
 
+    flows.note_child_dispatch(conversation_id, child_session_id)
     async with _runner_app.in_flight_send_lock(child_session_id):
         entry = _runner_app.get_subagent_work(child_session_id)
         if entry is not None and entry.status in ("running", "waiting"):
