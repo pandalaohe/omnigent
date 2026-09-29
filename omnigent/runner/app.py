@@ -3499,6 +3499,10 @@ def create_runner_app(
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
+    # Flow MCP steps dispatch through this process's MCP manager.
+    from omnigent.runner.flows import set_runner_mcp_manager
+
+    set_runner_mcp_manager(mcp_manager)
     # session_id → the session's startup extras from the init snapshot: the
     # worktree line (when the session records one) followed by the server-held
     # global text. Read by the launch and composition points, never from the
