@@ -599,23 +599,45 @@ def test_validation_defaults() -> None:
     assert plan.stop_when is None
 
 
+def _timer_spec(spec_timers: bool) -> Any:
+    """``timers: true`` spec (upstream's switch) or none (timers via the collab flag)."""
+    from omnigent.spec import AgentSpec
+
+    return AgentSpec(spec_version=1, timers=True) if spec_timers else None
+
+
 @pytest.mark.asyncio
-async def test_timer_set_refused_when_row8_off(server: _FakeServer) -> None:
+@pytest.mark.parametrize("spec_timers", [False, True])
+async def test_timer_set_follows_collab_settings_only_without_spec_timers(
+    server: _FakeServer, spec_timers: bool
+) -> None:
     server.flow_timer_enabled = False
+    server.collab_enabled = False
     async with _client(server) as client:
         output = json.loads(
             await execute_tool(
                 tool_name="sys_timer_set",
-                arguments=json.dumps({"seconds": 0}),
+                arguments=json.dumps({"seconds": 30}),
                 server_client=client,
+                agent_spec=_timer_spec(spec_timers),
                 conversation_id=_SESSION,
             )
         )
-    assert "flow_timer_enabled" in output["error"]
+    if spec_timers:
+        assert output["status"] == "scheduled"
+        assert not any(path.endswith("/collab-settings") for _m, path in server.requests)
+        from omnigent.runner import app as runner_app
+
+        runner_app.cancel_timer(_SESSION, output["timer_id"])
+    else:
+        assert "flow_timer_enabled" in output["error"]
 
 
 @pytest.mark.asyncio
-async def test_timer_firing_skipped_after_row8_turns_off(server: _FakeServer) -> None:
+@pytest.mark.parametrize("spec_timers", [False, True])
+async def test_timer_firing_stops_on_row8_off_only_without_spec_timers(
+    server: _FakeServer, spec_timers: bool
+) -> None:
     from omnigent.runner import app as runner_app
 
     async with _client(server) as client:
@@ -624,13 +646,16 @@ async def test_timer_firing_skipped_after_row8_turns_off(server: _FakeServer) ->
                 tool_name="sys_timer_set",
                 arguments=json.dumps({"seconds": 0.05, "repeat": True}),
                 server_client=client,
+                agent_spec=_timer_spec(spec_timers),
                 conversation_id=_SESSION,
             )
         )
         server.flow_timer_enabled = False
         await asyncio.sleep(0.15)
-    assert server.wakes == []
-    assert output["timer_id"] not in runner_app._session_timers.get(_SESSION, {})
+        running = output["timer_id"] in runner_app._session_timers.get(_SESSION, {})
+        runner_app.cancel_timer(_SESSION, output["timer_id"])
+    assert running is spec_timers
+    assert (len(server.wakes) >= 2) is spec_timers
 
 
 @pytest.mark.asyncio
