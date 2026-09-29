@@ -7084,7 +7084,11 @@ def system_status(as_json: bool, server: str | None) -> None:
             if isinstance(mem_used, (int, float)) and mem_total
             else "-"
         )
-        click.echo(f"  {host.get('host_id')}  {host.get('state')}  cpu {cpu_text}  mem {mem_text}")
+        name = host.get("name") or host.get("host_id")
+        click.echo(
+            f"  {name}  {host.get('state')}  cpu {cpu_text}  mem {mem_text}  "
+            f"({host.get('host_id')})"
+        )
 
 
 # Fields on an exported item that belong to the store/envelope, not the typed

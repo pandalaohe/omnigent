@@ -84,6 +84,7 @@ def test_system_status_text_summarises_level_findings_and_hosts() -> None:
     assert result.exit_code == 0, result.output
     assert "level: amber" in result.output
     assert "host_a:cpu" in result.output
+    assert "  laptop  online  cpu 91%  mem 50%  (host_a)" in result.output
     assert "host_a" in result.output
     assert "online" in result.output
     assert "cpu 91%" in result.output
