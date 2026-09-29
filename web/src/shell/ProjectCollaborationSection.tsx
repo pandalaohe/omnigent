@@ -579,7 +579,7 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
                 }}
                 disabled={repoAddMutation.isPending}
               />
-              <p className="text-sm text-muted-foreground">Short name used in assignments</p>
+              <p className="text-sm text-muted-foreground">Short name for this repository</p>
             </div>
             <div className="space-y-1">
               <label htmlFor={`${formId}-branch`} className="block font-medium">

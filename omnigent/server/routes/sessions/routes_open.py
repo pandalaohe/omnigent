@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from omnigent.db.db_models import uuid_to_bytes
 from omnigent.errors import OmnigentError
@@ -74,6 +74,14 @@ class SessionOpenRequest(BaseModel):
     from_ref: str | None = None
     wait_for_host: bool = False
     title: str | None = Field(default=None, max_length=200)
+
+    @field_validator("from_ref")
+    @classmethod
+    def _blank_from_ref_is_none(cls, value: str | None) -> str | None:
+        """:returns: ``None`` for a blank or whitespace-only ``from_ref``."""
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 def _problem(
@@ -183,6 +191,9 @@ class PendingOpens:
     def entries_for(self, host_id: str, root_workspace: str) -> list[_PendingOpen]:
         """Return pending opens occupying *root_workspace* on *host_id*.
 
+        A pending open with ``from_ref`` lands in its own branch worktree,
+        not the root, so it does not occupy the directory.
+
         :param host_id: Target host.
         :param root_workspace: Target root directory.
         :returns: Matching entries (for the directory-in-use check).
@@ -191,6 +202,7 @@ class PendingOpens:
             entry
             for entry in self._entries.values()
             if entry.host_id == host_id
+            and entry.body.from_ref is None
             and same_canonical_path(entry.root_workspace, root_workspace)
         ]
 
@@ -517,33 +529,30 @@ def register_open_routes(
                 "agent_not_found",
                 "The agent belongs to another user's session.",
             )
-        occupied = await _occupied_sessions(
-            owner=entry.owner,
-            host_id=entry.host_id,
-            root_workspace=root.workspace,
-        )
-        pending = entry_registry.entries_for(entry.host_id, root.workspace)
-        if occupied or pending:
-            return _problem(
-                "failed",
-                "directory_in_use",
-                _directory_message(occupied, pending, root.workspace),
-                _occupancy_candidates(occupied, pending),
+        async with _lock_for(entry.owner):
+            refusal = await _directory_refusal(
+                state="failed",
+                owner=entry.owner,
+                host_id=entry.host_id,
+                root_workspace=root.workspace,
+                from_ref=entry.body.from_ref,
             )
-        return await _open_now(
-            sid=entry.sid,
-            owner=entry.owner,
-            create_user_id=entry.create_user_id,
-            sender=sender,
-            project=project,
-            host=host,
-            host_id=entry.host_id,
-            root=root,
-            agent=agent,
-            agent_name=public_agent_name(agent.name) or agent.name,
-            body=entry.body,
-            request=_synthetic_request(entry.sid),
-        )
+            if refusal is not None:
+                return refusal
+            return await _open_now(
+                sid=entry.sid,
+                owner=entry.owner,
+                create_user_id=entry.create_user_id,
+                sender=sender,
+                project=project,
+                host=host,
+                host_id=entry.host_id,
+                root=root,
+                agent=agent,
+                agent_name=public_agent_name(agent.name) or agent.name,
+                body=entry.body,
+                request=_synthetic_request(entry.sid),
+            )
 
     async def _occupied_sessions(*, owner: str, host_id: str, root_workspace: str) -> list[Any]:
         """Non-closed top-level sessions sitting in *root_workspace*.
@@ -610,6 +619,41 @@ def register_open_routes(
         entry_registry = PendingOpens(app_state, open_entry=open_pending)
         if app_state is not None:
             app_state.pending_session_opens = entry_registry
+
+    async def _directory_refusal(
+        *,
+        state: str,
+        owner: str,
+        host_id: str,
+        root_workspace: str,
+        from_ref: str | None,
+    ) -> dict[str, Any] | None:
+        """Refuse a root-directory open another session or pending open holds.
+
+        A ``from_ref`` open lands in a fresh branch worktree, so it never
+        occupies the root and is always admitted.
+
+        :param state: ``"refused"`` or ``"failed"``.
+        :param owner: Session owner whose sessions and pending opens count.
+        :param host_id: Target host.
+        :param root_workspace: Target root directory.
+        :param from_ref: Branch worktree base, or ``None`` for the root.
+        :returns: The refusal dict, or ``None`` when the root is free.
+        """
+        if from_ref is not None:
+            return None
+        occupied = await _occupied_sessions(
+            owner=owner, host_id=host_id, root_workspace=root_workspace
+        )
+        pending = entry_registry.entries_for(host_id, root_workspace)
+        if not occupied and not pending:
+            return None
+        return _problem(
+            state,
+            "directory_in_use",
+            _directory_message(occupied, pending, root_workspace),
+            _occupancy_candidates(occupied, pending),
+        )
 
     @router.post("/sessions/{sender_id}/open", include_in_schema=False, response_model=None)
     async def open_session(
@@ -779,18 +823,15 @@ def register_open_routes(
             )
         agent_name = public_agent_name(agent.name) or agent.name
         async with _lock_for(owner):
-            if body.from_ref is None:
-                occupied = await _occupied_sessions(
-                    owner=owner, host_id=host_id, root_workspace=root.workspace
-                )
-                pending = entry_registry.entries_for(host_id, root.workspace)
-                if occupied or pending:
-                    return _problem(
-                        "refused",
-                        "directory_in_use",
-                        _directory_message(occupied, pending, root.workspace),
-                        _occupancy_candidates(occupied, pending),
-                    )
+            refusal = await _directory_refusal(
+                state="refused",
+                owner=owner,
+                host_id=host_id,
+                root_workspace=root.workspace,
+                from_ref=body.from_ref,
+            )
+            if refusal is not None:
+                return refusal
             refusal_text = await asyncio.to_thread(admit_open, app_state, owner)
             if refusal_text is not None:
                 return _problem("refused", "open_rate", refusal_text)

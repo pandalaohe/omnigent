@@ -521,6 +521,43 @@ async def test_changed_open_rate_setting_applies_to_child_creates(
         session_open_rate._OPEN_TIMESTAMPS.clear()
 
 
+async def test_child_create_authorizes_the_parent_before_charging_rate(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    """A forged parent link is refused without spending the owner's window."""
+    session_open_rate._OPEN_TIMESTAMPS.clear()
+    prefs = _Preferences({"openRateCount": 1})
+    app.state.user_preferences_store = prefs
+    bob = "bob@example.com"
+    try:
+        project_id = await _project(client, "forged-rate", {"agent_id": AGENT_ID})
+        parent = await client.post(
+            "/v1/sessions", json={"project_id": project_id}, headers=_headers()
+        )
+        assert parent.status_code == 201, parent.text
+        parent_id = parent.json()["id"]
+        forged = await client.post(
+            "/v1/sessions",
+            json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
+            headers=_headers(bob),
+        )
+        assert forged.status_code == 404, forged.text
+        admitted = await client.post(
+            "/v1/sessions",
+            json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
+            headers=_headers(),
+        )
+        assert admitted.status_code == 201, admitted.text
+        refused = await client.post(
+            "/v1/sessions",
+            json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
+            headers=_headers(),
+        )
+        assert refused.status_code == 429, refused.text
+    finally:
+        session_open_rate._OPEN_TIMESTAMPS.clear()
+
+
 async def test_child_does_not_inherit_foreign_or_unfiled_project(
     app: FastAPI, client: httpx.AsyncClient
 ) -> None:

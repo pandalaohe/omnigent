@@ -9,6 +9,7 @@ route's owner locks).
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from typing import Any
@@ -16,7 +17,12 @@ from typing import Any
 from omnigent.server.user_preferences_store import read_collab_settings
 
 # owner → monotonic timestamps of admitted opens inside the window.
+# custom-lint: disable-next=workspace-scoped-cache -- owner-keyed; a collision only shares a window
 _OPEN_TIMESTAMPS: dict[str, deque[float]] = {}
+
+# Serializes prune/check/append per process so two threads cannot both
+# admit the last open of one owner's window.
+_ADMISSION_LOCK = threading.Lock()
 
 
 def _window_text(window_s: int) -> str:
@@ -50,13 +56,14 @@ def admit_open(app_state: Any, owner: str) -> str | None:
     count = settings.open_rate_count
     window_s = settings.open_rate_window_s
     now = time.monotonic()
-    stamps = _OPEN_TIMESTAMPS.setdefault(owner, deque())
-    while stamps and stamps[0] <= now - window_s:
-        stamps.popleft()
-    if len(stamps) >= count:
-        return (
-            f"Opening sessions too fast (setting: {count} per "
-            f"{_window_text(window_s)}; Settings > General > Session collaboration)"
-        )
-    stamps.append(now)
+    with _ADMISSION_LOCK:
+        stamps = _OPEN_TIMESTAMPS.setdefault(owner, deque())
+        while stamps and stamps[0] <= now - window_s:
+            stamps.popleft()
+        if len(stamps) >= count:
+            return (
+                f"Opening sessions too fast (setting: {count} per "
+                f"{_window_text(window_s)}; Settings > General > Session collaboration)"
+            )
+        stamps.append(now)
     return None

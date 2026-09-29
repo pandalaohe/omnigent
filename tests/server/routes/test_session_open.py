@@ -425,6 +425,28 @@ async def test_closed_session_does_not_occupy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("from_ref", ["", "   "])
+async def test_blank_from_ref_counts_as_no_ref(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, from_ref: str
+) -> None:
+    """A blank ``from_ref`` does not dodge the directory check."""
+    env = open_env
+    holder = env["conversations"].create_conversation(
+        agent_id=env["agent_id"],
+        title="holder",
+        host_id=HOST_ID,
+        workspace="/repo",
+        runner_id=token_bound_runner_id(secrets.token_hex(16)),
+    )
+    env["permissions"].grant(ALICE, holder.id, LEVEL_OWNER)
+    _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], from_ref=from_ref)
+    assert data["state"] == "refused"
+    assert data["reason"] == "directory_in_use"
+
+
+@pytest.mark.asyncio
 async def test_rate_limits_the_sixth_open(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -587,6 +609,94 @@ async def test_waiting_open_fires_on_host_trigger(
     env["app"].state.pending_session_opens.trigger(HOST_ID)
     assert await _wait_for(lambda: len(lines) == 1)
     assert lines == [f"[System: session {sid} opened on host {HOST_NAME}]"]
+
+
+@pytest.mark.asyncio
+async def test_pending_from_ref_fires_despite_an_occupied_root(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A waiting ``from_ref`` open opens although a session holds the root."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    holder = env["conversations"].create_conversation(
+        agent_id=env["agent_id"],
+        title="holder",
+        host_id=HOST_ID,
+        workspace="/repo",
+        runner_id=token_bound_runner_id(secrets.token_hex(16)),
+    )
+    env["permissions"].grant(ALICE, holder.id, LEVEL_OWNER)
+    env["online"]["on"] = False
+    lines: list[str] = []
+
+    async def notify_line(_sender_id: str, line: str) -> None:
+        lines.append(line)
+
+    monkeypatch.setattr(env["app"].state.peer_sweeper, "notify_line", notify_line)
+    _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        waiting = await _post(
+            client, env["sender"].id, env["sender_token"], from_ref="main", wait_for_host=True
+        )
+    assert waiting["state"] == "waiting_for_host"
+    sid = waiting["session_id"]
+    env["online"]["on"] = True
+    env["app"].state.pending_session_opens.trigger(HOST_ID)
+    assert await _wait_for(lambda: len(lines) == 1)
+    assert lines == [f"[System: session {sid} opened on host {HOST_NAME}]"]
+
+
+@pytest.mark.asyncio
+async def test_pending_without_from_ref_fails_when_the_root_fills(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A waiting no-ref open fails ``directory_in_use`` on fire re-check."""
+    env = open_env
+    env["online"]["on"] = False
+    lines: list[str] = []
+
+    async def notify_line(_sender_id: str, line: str) -> None:
+        lines.append(line)
+
+    monkeypatch.setattr(env["app"].state.peer_sweeper, "notify_line", notify_line)
+    _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        waiting = await _post(client, env["sender"].id, env["sender_token"], wait_for_host=True)
+    sid = waiting["session_id"]
+    holder = env["conversations"].create_conversation(
+        agent_id=env["agent_id"],
+        title="holder",
+        host_id=HOST_ID,
+        workspace="/repo",
+        runner_id=token_bound_runner_id(secrets.token_hex(16)),
+    )
+    env["permissions"].grant(ALICE, holder.id, LEVEL_OWNER)
+    env["online"]["on"] = True
+    env["app"].state.pending_session_opens.trigger(HOST_ID)
+    assert await _wait_for(lambda: len(lines) == 1)
+    assert lines == [
+        f"[System: session {sid} could not open on host {HOST_NAME}: directory_in_use]"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pending_from_ref_does_not_block_an_immediate_root_open(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A waiting ``from_ref`` entry leaves the root free for a no-ref open."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    env["online"]["on"] = False
+    async with await _client(env) as client:
+        waiting = await _post(
+            client, env["sender"].id, env["sender_token"], from_ref="main", wait_for_host=True
+        )
+        assert waiting["state"] == "waiting_for_host"
+        env["online"]["on"] = True
+        _patch_create(env, monkeypatch)
+        data = await _post(client, env["sender"].id, env["sender_token"])
+    assert data["state"] == "opened"
+    assert data["session_id"] != waiting["session_id"]
 
 
 @pytest.mark.asyncio

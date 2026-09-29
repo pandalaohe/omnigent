@@ -2192,9 +2192,10 @@ class SqlAssignment(OmnigentBase):
     """
     SQLAlchemy model for the ``assignments`` table.
 
-    One unit of work handed to one ``(host, agent)`` destination. Artifacts
-    and context move by git; the row stores pointers, addressing and state,
-    never file content.
+    The assignment feature is retired; the table is retained for its
+    existing rows. One unit of work handed to one ``(host, agent)``
+    destination. Artifacts and context move by git; the row stores
+    pointers, addressing and state, never file content.
 
     :param id: Caller-generated UUID primary key (see :class:`Uuid16`),
         stable across retries so a retried create is recognised.
@@ -2242,8 +2243,8 @@ class SqlAssignment(OmnigentBase):
         comparison is made on.
     :param state: Lifecycle state — ``preparing``/``waiting``/``starting``/
         ``running``/``publishing``/``stopping``/``succeeded``/``failed``/
-        ``cancelled``/``expired``/``interrupted``. See
-        ``omnigent.entities.assignment.is_legal_transition``.
+        ``cancelled``/``expired``/``interrupted``. The transition helper
+        module was deleted with the retired assignment feature.
     :param wait_reason: The visible reason while ``waiting``.
     :param next_check_at: Unix epoch seconds when the coordinator may look
         at this row again, or ``None``.
@@ -2351,8 +2352,9 @@ class SqlAssignmentAttempt(OmnigentBase):
     """
     SQLAlchemy model for the ``assignment_attempts`` table.
 
-    One execution attempt of an assignment. At most one ``active`` attempt
-    per assignment; liveness is observed server-side via
+    The assignment feature is retired; the table is retained for its
+    existing rows. One execution attempt of an assignment. At most one
+    ``active`` attempt per assignment; liveness is observed server-side via
     ``lease_expires_at``, which the coordinator writes.
 
     :param id: UUID primary key (see :class:`Uuid16`), surfaced as a bare
@@ -2432,9 +2434,10 @@ class SqlAssignmentMessage(OmnigentBase):
     """
     SQLAlchemy model for the ``assignment_messages`` table.
 
-    Append-only, assignment-scoped messages: the cross-tree channel between
-    the sending and receiving sessions. Reads are cursor-based and
-    repeatable; reading never consumes.
+    The assignment feature is retired; the table is retained for its
+    existing rows. Append-only, assignment-scoped messages: the cross-tree
+    channel between the sending and receiving sessions. Reads are
+    cursor-based and repeatable; reading never consumes.
 
     :param id: UUID primary key (see :class:`Uuid16`), surfaced as a bare
         32-char hex string (no dashes).

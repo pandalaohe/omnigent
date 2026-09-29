@@ -734,6 +734,17 @@ def register_core_routes(
         """
         if parent_session_id is None or sub_agent_name is not None:
             return
+        # Authorize the caller on the parent before charging its owner's
+        # window: a forged parent link must not spend the real owner's
+        # budget, and must be refused before the rate can mask the 403/404.
+        if permission_store is not None:
+            await _require_access(
+                user_id,
+                parent_session_id,
+                LEVEL_READ,
+                permission_store,
+                conversation_store,
+            )
         owner: str | None = None
         if permission_store is not None:
             owner = await asyncio.to_thread(
@@ -1054,14 +1065,6 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
-        # The multipart shape has no sub_agent_name, so any child bundle
-        # create is an open and spends the parent owner's rate budget.
-        await _admit_child_create(
-            request,
-            user_id=user_id,
-            parent_session_id=parsed_metadata.parent_session_id,
-            sub_agent_name=None,
-        )
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -1112,6 +1115,16 @@ def register_core_routes(
                     parsed_metadata = parsed_metadata.model_copy(
                         update={"project_id": parent_project_id}
                     )
+
+        # The multipart shape has no sub_agent_name, so any child bundle
+        # create is an open and spends the parent owner's rate budget. The
+        # parent is authorized above, so a forged link cannot charge it.
+        await _admit_child_create(
+            request,
+            user_id=user_id,
+            parent_session_id=parsed_metadata.parent_session_id,
+            sub_agent_name=None,
+        )
 
         bundle_bytes = await bundle.read()
         # Validate the bundle BEFORE any row exists: the external-host
