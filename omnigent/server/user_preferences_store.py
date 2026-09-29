@@ -87,10 +87,14 @@ class ApprovalTimeout:
     :param timeout_s: Wait budget in seconds, e.g. ``3000.0``.
     :param stop_turn: Whether the deadline stops the turn instead of
         falling back to the harness's native timeout behaviour.
+    :param async_approvals: Whether an eligible approval is deferred
+        ("deny now, approve later") instead of parking the turn. The
+        timeout fields above do not apply while it is on.
     """
 
     timeout_s: float
     stop_turn: bool
+    async_approvals: bool = True
 
 
 def read_approval_timeout(
@@ -103,9 +107,10 @@ def read_approval_timeout(
     The hook path must never fail on a malformed preference row: a
     missing store / owner / namespace, a non-object value, an invalid
     field, or a row that fails store validation all resolve to the
-    50-minute, stop-enabled default. ``timeoutMinutes`` is clamped to
-    1..1380 so the server always answers before the host-side client
-    budgets give up.
+    default. ``timeoutMinutes`` is clamped to 1..1380 so the server
+    always answers before the host-side client budgets give up;
+    ``asyncApprovals`` takes any non-bool (including absence) as the
+    default, which is on.
 
     :param store: Preferences store, or ``None`` when the server has no
         synced preferences.
@@ -139,7 +144,13 @@ def read_approval_timeout(
         timeout_s = default.timeout_s
     raw_stop = value.get("stopTurn")
     stop_turn = raw_stop if isinstance(raw_stop, bool) else True
-    return ApprovalTimeout(timeout_s=timeout_s, stop_turn=stop_turn)
+    raw_async = value.get("asyncApprovals")
+    async_approvals = raw_async if isinstance(raw_async, bool) else True
+    return ApprovalTimeout(
+        timeout_s=timeout_s,
+        stop_turn=stop_turn,
+        async_approvals=async_approvals,
+    )
 
 
 SESSION_COLLAB_NAMESPACE = "session_collab"

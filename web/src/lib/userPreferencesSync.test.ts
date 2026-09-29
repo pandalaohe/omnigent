@@ -85,7 +85,7 @@ describe("user preference synchronization", () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
 
-    const preferences = { timeoutMinutes: 10, stopTurn: false };
+    const preferences = { timeoutMinutes: 10, stopTurn: false, asyncApprovals: false };
     writeApprovalTimeoutPreferences(preferences);
     await vi.advanceTimersByTimeAsync(251);
     expect(collectLocalUserPreferences().settings.approval_timeout).toEqual(preferences);
@@ -97,7 +97,7 @@ describe("user preference synchronization", () => {
       }),
     );
 
-    writeApprovalTimeoutPreferences({ timeoutMinutes: 50, stopTurn: true });
+    writeApprovalTimeoutPreferences({ timeoutMinutes: 50, stopTurn: true, asyncApprovals: true });
     await vi.advanceTimersByTimeAsync(500);
     expect(localStorage.getItem("omnigent:approval-timeout")).toBeNull();
     expect(fetcher).toHaveBeenLastCalledWith(
@@ -111,7 +111,11 @@ describe("user preference synchronization", () => {
       vi.fn(),
       "alice",
     );
-    expect(readApprovalTimeoutPreferences()).toEqual({ timeoutMinutes: 5, stopTurn: false });
+    expect(readApprovalTimeoutPreferences()).toEqual({
+      timeoutMinutes: 5,
+      stopTurn: false,
+      asyncApprovals: true,
+    });
   });
 
   it("collects and hydrates the Agent pins namespace", async () => {

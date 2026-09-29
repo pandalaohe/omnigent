@@ -10,13 +10,14 @@ import { ApprovalTimeoutSettings } from "./ApprovalTimeoutSettings";
 describe("ApprovalTimeoutSettings", () => {
   beforeEach(() => localStorage.clear());
 
-  it("defaults to 50 min with the turn stop on", () => {
+  it("defaults to 50 min, the turn stop on, and non-blocking approvals on", () => {
     render(<ApprovalTimeoutSettings />);
 
     expect(screen.getByLabelText("Timeout")).toHaveValue(50);
     expect(
       screen.getByRole("switch", { name: "Stop the turn when the timeout expires" }),
     ).toBeChecked();
+    expect(screen.getByRole("switch", { name: "审批不挡路" })).toBeChecked();
     expect(localStorage.getItem(APPROVAL_TIMEOUT_STORAGE_KEY)).toBeNull();
   });
 
@@ -40,6 +41,20 @@ describe("ApprovalTimeoutSettings", () => {
     await waitFor(() => expect(readApprovalTimeoutPreferences().stopTurn).toBe(false));
   });
 
+  it("persists switching non-blocking approvals off", async () => {
+    render(<ApprovalTimeoutSettings />);
+    const toggle = screen.getByRole("switch", { name: "审批不挡路" });
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(readApprovalTimeoutPreferences().asyncApprovals).toBe(false));
+    expect(JSON.parse(localStorage.getItem(APPROVAL_TIMEOUT_STORAGE_KEY) ?? "null")).toEqual({
+      timeoutMinutes: 50,
+      stopTurn: true,
+      asyncApprovals: false,
+    });
+  });
+
   it("removes the stored key when every value is back at its default", async () => {
     localStorage.setItem(
       APPROVAL_TIMEOUT_STORAGE_KEY,
@@ -52,6 +67,10 @@ describe("ApprovalTimeoutSettings", () => {
     fireEvent.click(screen.getByRole("switch", { name: "Stop the turn when the timeout expires" }));
 
     await waitFor(() => expect(localStorage.getItem(APPROVAL_TIMEOUT_STORAGE_KEY)).toBeNull());
-    expect(readApprovalTimeoutPreferences()).toEqual({ timeoutMinutes: 50, stopTurn: true });
+    expect(readApprovalTimeoutPreferences()).toEqual({
+      timeoutMinutes: 50,
+      stopTurn: true,
+      asyncApprovals: true,
+    });
   });
 });

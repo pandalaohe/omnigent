@@ -45,6 +45,8 @@ from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.app import create_app
+from omnigent.server.routes import sessions as sessions_route
+from omnigent.server.user_preferences_store import ApprovalTimeout
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -60,6 +62,25 @@ from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _blocking_approvals_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the blocking park; deferral has its own suite.
+
+    The server default is on, which would turn the eligible Bash and Codex
+    command calls here into deferred parks. Pin the setting off so this
+    module keeps asserting one parked request → one resolved verdict.
+    """
+    monkeypatch.setattr(
+        sessions_route,
+        "read_approval_timeout",
+        lambda store, owner: ApprovalTimeout(
+            timeout_s=3000.0,
+            stop_turn=True,
+            async_approvals=False,
+        ),
+    )
 
 
 # ── Policy callable used by public /policies/evaluate coverage ─────

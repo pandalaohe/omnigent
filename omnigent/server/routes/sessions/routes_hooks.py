@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from collections.abc import Awaitable, Callable
 from typing import Any, NamedTuple
 
@@ -63,9 +64,17 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
-from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_request
+from omnigent.server.routes._codex_elicitation import (
+    CodexElicitationRequest,
+    parse_codex_elicitation_request,
+)
 from omnigent.server.routes._content_type import (
     require_json_content_type,
+)
+from omnigent.server.routes._sessions.approval_grants import (
+    approval_grants,
+    claude_grant_key,
+    codex_command_grant_key,
 )
 from omnigent.server.routes._sessions.common import (
     _EVALUATE_HOOK_ELICITATION_ID_RE,
@@ -305,6 +314,413 @@ def _create_route_decision_id(
     return None
 
 
+#: Codex app-server methods whose command approval may be deferred.
+#: File-change / apply-patch / permissions requests carry no content a
+#: re-issue can be matched on, so they stay blocking.
+_CODEX_DEFERRABLE_APPROVAL_METHODS: frozenset[str] = frozenset(
+    {
+        "item/commandExecution/requestApproval",
+        "execCommandApproval",
+    }
+)
+
+#: Tools that never defer: AskUserQuestion and ExitPlanMode need
+#: ``updatedInput`` on the verdict and are questions / reviews, not actions.
+_DEFERRED_APPROVAL_EXCLUDED_TOOLS: frozenset[str] = frozenset({"AskUserQuestion", "ExitPlanMode"})
+
+#: Lifetime of the one-shot grant a deferred approval's accept writes.
+_APPROVAL_GRANT_TTL_S = 86400.0
+
+#: Deny reason Claude / Codex see while a deferred card waits for a verdict.
+_APPROVAL_PENDING_TEXT = (
+    "Approval pending (#{aid}): {action} has NOT run — it waits for the user's "
+    "approval. This is not a refusal. Continue with work that does not depend on "
+    'it, or end your turn. You will receive "[System: approval #{aid} ...]" when '
+    "the user decides; if approved, re-run the exact same call and it will run "
+    "without another prompt."
+)
+
+#: System message posted once the user approves a deferred card.
+_APPROVAL_GRANTED_TEXT = (
+    "[System: approval #{aid} granted: re-run {action} exactly as before; "
+    "it will run without another prompt.]"
+)
+
+#: System message posted once the user denies a deferred card. The card's
+#: stop control is not offered for deferred cards, so a cancel lands here too.
+_APPROVAL_DENIED_TEXT = (
+    "[System: approval #{aid} denied by the user: do not run {action}.{feedback}]"
+)
+
+#: Strong refs to background pending-text deliveries until they settle.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_pending_delivery_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _approval_action_label(tool_name: str, preview: str) -> str:
+    """
+    Format the ``<tool>(<preview>)`` clause shared by the deferred texts.
+
+    :param tool_name: Display tool, e.g. ``"Bash"`` or ``"shell"``.
+    :param preview: Preview text; capped at 200 chars.
+    :returns: The formatted action, e.g. ``'Bash({"command":"ls"})'``.
+    """
+    return f"{tool_name}({preview[:200]})"
+
+
+def _approval_feedback_clause(result: ElicitationResult) -> str:
+    """
+    Render the denied text's ``Feedback: …`` clause from the verdict.
+
+    :param result: The decline / cancel verdict from the web card.
+    :returns: ``" Feedback: <text>"`` when the card carried feedback,
+        else an empty string.
+    """
+    content = result.content
+    if isinstance(content, dict):
+        feedback = content.get("feedback")
+        if isinstance(feedback, str) and feedback.strip():
+            return f" Feedback: {feedback}"
+    return ""
+
+
+def _deferred_approval_callback(
+    *,
+    session_id: str,
+    grant_key: tuple[str, ...],
+    aid: str,
+    action: str,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> Callable[[ElicitationResult | None], Awaitable[None]]:
+    """
+    Build the verdict handler for one deferred approval card.
+
+    An accept stores the one-shot grant BEFORE the message is delivered,
+    so a lost or retried delivery never loses the approval itself. A
+    decline or cancel posts the denial text; ``None`` (expiry / restart)
+    posts nothing.
+
+    :param session_id: Session that owns the deferred card.
+    :param grant_key: Match key a re-issued call must carry.
+    :param aid: Card's short correlation id, e.g. ``"a1a2b3c"``.
+    :param action: Preformatted ``<tool>(<preview>)`` action clause.
+    :param conversation_store: Store used to reach the runner.
+    :param runner_router: Router used to resolve the runner.
+    :returns: The ``on_result`` coroutine for the detached park.
+    """
+
+    async def _on_result(result: ElicitationResult | None) -> None:
+        """
+        Deliver the card's verdict to the session.
+
+        :param result: Web verdict, or ``None`` on expiry / restart.
+        :returns: None.
+        """
+        if result is None:
+            return
+        if result.action == "accept":
+            approval_grants.put(session_id, grant_key, result, _APPROVAL_GRANT_TTL_S)
+            text = _APPROVAL_GRANTED_TEXT.format(aid=aid, action=action)
+        else:
+            text = _APPROVAL_DENIED_TEXT.format(
+                aid=aid,
+                action=action,
+                feedback=_approval_feedback_clause(result),
+            )
+        await _deliver_with_retry(
+            session_id,
+            text,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+        )
+
+    return _on_result
+
+
+def _start_background_delivery(
+    session_id: str,
+    text: str,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> None:
+    """
+    Post one system message after the current response, off its path.
+
+    Used by the Codex hook, whose forwarder must relay the JSON-RPC
+    result before the pending text steers the model. The task is held in
+    a module-level set so it can't be garbage-collected mid-retry.
+
+    :param session_id: Session to deliver into.
+    :param text: The ``[System: …]`` message.
+    :param conversation_store: Store used to resolve the runner.
+    :param runner_router: Router used to resolve the runner.
+    :returns: None.
+    """
+    task = asyncio.create_task(
+        _deliver_with_retry(
+            session_id,
+            text,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+        )
+    )
+    _pending_delivery_tasks.add(task)
+    task.add_done_callback(_pending_delivery_tasks.discard)
+
+
+def _permission_decision(
+    result: ElicitationResult,
+    *,
+    is_claude: bool,
+    tool_name: str,
+    tool_input: Any,
+    permission_mode: str | None,
+) -> dict[str, Any]:
+    """
+    Build Claude Code's PermissionRequest ``decision`` from a web verdict.
+
+    Shared by the blocking path and by a one-shot grant hit, so the
+    stored verdict's remember / allow-all-edits / auto-mode choices apply
+    identically on a re-issued call. Every updatedInput / updatedPermissions
+    branch re-derives eligibility server-side.
+
+    :param result: Web verdict (or the verdict a grant stored).
+    :param is_claude: Whether the caller is the Claude-native hook;
+        the Kimi / Devin bridges skip Claude's input / permission updates.
+    :param tool_name: Gated tool from the payload.
+    :param tool_input: Gated tool input from the payload.
+    :param permission_mode: Claude's permission mode, or ``None``.
+    :returns: The ``hookSpecificOutput.decision`` mapping.
+    """
+    behavior = "allow" if result.action == "accept" else "deny"
+    decision: dict[str, Any] = {"behavior": behavior}
+    if is_claude and result.action == "cancel" and (result.meta or {}).get("interrupt") is True:
+        decision["interrupt"] = True
+    # A decline can carry feedback typed into the web card (the
+    # ExitPlanMode "Reject with feedback" flow). Claude's
+    # PermissionRequest decision contract surfaces it via
+    # ``decision.message`` — the model sees it as the denial
+    # reason, so for a rejected plan Claude stays in plan mode
+    # and revises toward the feedback instead of guessing why
+    # the plan was refused.
+    if behavior == "deny" and isinstance(result.content, dict):
+        feedback = result.content.get("feedback")
+        if isinstance(feedback, str) and feedback.strip():
+            decision["message"] = feedback
+    if not is_claude:
+        # These bridges consume the verdict without Claude's input/permission updates.
+        return decision
+    # When the gated tool is AskUserQuestion AND the user accepted
+    # with selections, propagate those selections back to Claude
+    # via ``decision.updatedInput``. Claude reads
+    # ``tool_input.answers`` and skips its TUI picker, returning
+    # the supplied selections as the tool result the LLM sees.
+    #
+    # ``result.content`` is MCP-shaped (a flat ``{[field]: value}``
+    # map) — exactly the shape ``tool_input.answers`` expects on
+    # AskUserQuestion. Single-select values are strings,
+    # multi-select are ``list[str]``; both ride through verbatim.
+    if (
+        behavior == "allow"
+        and tool_name == "AskUserQuestion"
+        and isinstance(tool_input, dict)
+        and isinstance(result.content, dict)
+        and result.content
+    ):
+        decision["updatedInput"] = {**tool_input, "answers": result.content}
+    # ExitPlanMode is a requiresUserInteraction tool: Claude Code coerces a
+    # bare PermissionRequest allow back to an interactive prompt unless the
+    # decision also carries ``updatedInput``. The plan needs no change, so
+    # echo the model's own input verbatim — its presence, not its content,
+    # is what lets a web-UI approval proceed without a TUI keystroke.
+    if (
+        behavior == "allow"
+        and tool_name == "ExitPlanMode"
+        and isinstance(tool_input, dict)
+        and tool_input
+    ):
+        decision["updatedInput"] = tool_input
+    if (
+        behavior == "allow"
+        and isinstance(result.content, dict)
+        and result.content.get("allow_auto_mode") is True
+        and _allow_auto_mode_eligible(tool_name, permission_mode)
+    ):
+        decision["updatedPermissions"] = [
+            {"type": "setMode", "mode": "auto", "destination": "session"}
+        ]
+    # "Accept & allow all edits" — the user approved this edit AND
+    # asked to auto-accept future edits. Echo a ``setMode`` permission
+    # update so Claude Code switches this session into ``acceptEdits``
+    # mode, exactly as the native shift+tab toggle does. The
+    # ``updatedPermissions`` shape matches the Agent SDK's
+    # ``PermissionUpdate`` union (``{type, mode, destination}`` for
+    # ``setMode``); ``destination: "session"`` scopes it to this
+    # session, so it resets on the next one.
+    #
+    # Re-check eligibility server-side rather than trusting the
+    # client's ``content.allow_all_edits`` flag alone: the flag is
+    # only meaningful for the edit-tool / prompting-mode prompts the
+    # affordance was offered for. Without this, a client could send
+    # the flag on e.g. a Bash prompt and flip the session into
+    # ``acceptEdits`` — a mode switch it was never offered.
+    elif (
+        behavior == "allow"
+        and isinstance(result.content, dict)
+        and result.content.get("allow_all_edits") is True
+        and _allow_all_edits_eligible(tool_name, permission_mode)
+    ):
+        decision["updatedPermissions"] = [
+            {
+                "type": "setMode",
+                # The plan card's "Yes, and use auto mode" switches the
+                # session into Claude's ``auto`` mode; the edit-tool
+                # "Accept & allow all edits" keeps the narrower
+                # ``acceptEdits`` (auto-approve edits only).
+                "mode": "auto" if tool_name == "ExitPlanMode" else "acceptEdits",
+                "destination": "session",
+            }
+        ]
+    elif behavior == "allow" and tool_name == "ExitPlanMode":
+        # Plan approved WITHOUT auto mode — the card's "Yes,
+        # manually approve edits". Pin the session to the prompting
+        # ``default`` mode instead of trusting whatever mode
+        # Claude's plan-exit restores, so every subsequent edit
+        # prompts exactly as the button promised. De-escalation
+        # only (most restrictive prompting mode), so no eligibility
+        # gate is needed.
+        decision["updatedPermissions"] = [
+            {"type": "setMode", "mode": "default", "destination": "session"}
+        ]
+    # "Approve & don't ask again" — the user approved this non-edit
+    # tool AND asked to stop prompting for the same scope. Echo an
+    # ``addRules`` permission update so Claude Code installs a
+    # session-scoped allow rule, exactly as the native TUI's "don't
+    # ask again" option does. The shape matches the Agent SDK's
+    # ``PermissionUpdate`` union (``addRules``): ``rules`` is a list
+    # of ``{toolName, ruleContent?}`` — ``ruleContent`` omitted means
+    # the whole tool; ``destination: "session"`` scopes it to this
+    # session so it resets on the next one. The claude-native hook
+    # forwards this decision verbatim to Claude Code.
+    #
+    # The host is re-derived server-side from the gated tool's input
+    # rather than trusting any client-supplied rule, and gated by the
+    # same ``_allow_remember_eligible`` predicate the button was
+    # offered under — so a forged ``remember`` flag on an ineligible
+    # tool (e.g. an edit tool, which takes the setMode path) can't
+    # smuggle in an allow rule.
+    elif (
+        behavior == "allow"
+        and isinstance(result.content, dict)
+        and result.content.get("remember") is True
+        and _allow_remember_eligible(tool_name, permission_mode)
+    ):
+        rule: dict[str, Any] = {"toolName": tool_name}
+        remember_host = _claude_native_remember_host(tool_name, tool_input)
+        if remember_host is not None:
+            rule["ruleContent"] = f"domain:{remember_host}"
+        decision["updatedPermissions"] = [
+            {
+                "type": "addRules",
+                "rules": [rule],
+                "behavior": "allow",
+                "destination": "session",
+            }
+        ]
+    return decision
+
+
+def _permission_hook_response(decision: dict[str, Any], *, is_claude: bool) -> Response:
+    """
+    Wrap a PermissionRequest ``decision`` in its hook response envelope.
+
+    Claude's contract requires ``hookEventName``; the Kimi / Devin bridges
+    consume the verdict without it.
+
+    :param decision: The ``decision`` mapping to return.
+    :param is_claude: Whether the caller is the Claude-native hook.
+    :returns: The JSON hook response.
+    """
+    hook_specific_output: dict[str, Any] = {"decision": decision}
+    if is_claude:
+        hook_specific_output = {
+            "hookEventName": "PermissionRequest",
+            "decision": decision,
+        }
+    return Response(
+        content=json.dumps({"hookSpecificOutput": hook_specific_output}),
+        media_type="application/json",
+    )
+
+
+def _defer_codex_command_approval(
+    codex_request: CodexElicitationRequest,
+    *,
+    session_id: str,
+    cwd: str | None,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> Response:
+    """
+    Park a Codex command approval detached and decline the request now.
+
+    The immediate response is Codex's usual decline — its model sees the
+    fixed "rejected by user". The pending notice is posted in a
+    background task after the response so the forwarder relays the
+    JSON-RPC result first. The park mints its own id, independent of the
+    Codex request id, so the forwarder's native-resolution tracking can
+    never resolve it; the web verdict arrives via the detached callback.
+
+    :param codex_request: Parsed command approval request.
+    :param session_id: Session the request belongs to.
+    :param cwd: Request cwd, or ``None``.
+    :param conversation_store: Store used for the ancestor mirror.
+    :param runner_router: Router used to deliver the pending notice.
+    :returns: The decline response.
+    """
+    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    aid = "a" + elicitation_id.removeprefix("elicit_")[:6]
+    command = getattr(codex_request.params, "command", "")
+    if not isinstance(command, str):
+        command = ""
+    action = _approval_action_label("shell", command)
+    params = ElicitationRequestParams.model_validate(
+        {
+            **codex_request.params.model_dump(),
+            "async_kind": "approval",
+            "approval_ref": aid,
+        }
+    )
+    grant_key = codex_command_grant_key(codex_request.codex_params.get("command"), cwd)
+    start_detached_elicitation(
+        session_id,
+        params,
+        conversation_store=conversation_store,
+        on_result=_deferred_approval_callback(
+            session_id=session_id,
+            grant_key=grant_key,
+            aid=aid,
+            action=action,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+        ),
+        elicitation_id=elicitation_id,
+    )
+    _start_background_delivery(
+        session_id,
+        _APPROVAL_PENDING_TEXT.format(aid=aid, action=action),
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+    )
+    body = codex_request.build_response(ElicitationResult(action="decline"))
+    return Response(
+        content=json.dumps(body),
+        media_type="application/json",
+    )
+
+
 def register_hooks_routes(
     router: APIRouter,
     *,
@@ -518,11 +934,15 @@ def register_hooks_routes(
         a card; legacy sessions without native metadata retain compatibility.
 
         Receives Claude Code's PermissionRequest hook payload (tool
-        name + input the user would otherwise see a TUI prompt for),
-        publishes a ``response.elicitation_request`` SSE event on the
-        session stream so the web UI's :file:`ApprovalCard` renders
-        inline, and long-polls until the verdict arrives via the
-        session ``approval`` event path.
+        name + input the user would otherwise see a TUI prompt for).
+        With the owner's async-approvals setting off, it publishes a
+        ``response.elicitation_request`` SSE event on the session stream
+        so the web UI's :file:`ApprovalCard` renders inline and
+        long-polls until the verdict arrives via the session ``approval``
+        event path. With it on, an eligible call is parked detached and
+        answered at once with a deny and the pending notice: the model
+        re-issues the call later, and a one-shot grant approves it without
+        a second card. A live grant short-circuits both.
 
         Response shape follows Claude Code's PermissionRequest hook
         contract: ``hookSpecificOutput.decision.behavior`` is
@@ -631,11 +1051,38 @@ def register_hooks_routes(
                 f"{native_agent.display_name} harness.",
                 code=ErrorCode.CONFLICT,
             )
-        approval_timeout: ApprovalTimeout | None = (
-            await _approval_timeout_for_session(session_id) if is_claude else None
-        )
+        # The async-approval switch applies to every vendor on this hook
+        # (Kimi / Devin share it). The timeout fields stay Claude-only:
+        # those bridges keep their hardcoded fallback budgets below.
+        approval_timeout = await _approval_timeout_for_session(session_id)
         # Check ownership after the metadata awaits, without yielding before registration.
         elicitation_id = _client_supplied_hook_elicitation_id(payload, session_id)
+        # A re-issued call the user already granted runs without a second
+        # card; consume before anything is built or published. The decision
+        # comes from the stored verdict, so remember / allow-all-edits /
+        # auto-mode chosen on the deferred card still apply.
+        grant_key = claude_grant_key(tool_name, tool_input, cwd)
+        granted = approval_grants.consume(session_id, grant_key)
+        if granted is not None:
+            decision = _permission_decision(
+                granted,
+                is_claude=is_claude,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                permission_mode=permission_mode,
+            )
+            return _permission_hook_response(decision, is_claude=is_claude)
+        # Deferred approval: eligible when the setting is on and the tool is
+        # an action. AskUserQuestion / ExitPlanMode need ``updatedInput`` on
+        # the verdict and have their own cards, so they stay blocking.
+        deferrable = (
+            approval_timeout.async_approvals and tool_name not in _DEFERRED_APPROVAL_EXCLUDED_TOOLS
+        )
+        deferred_elicitation_id: str | None = None
+        deferred_aid: str | None = None
+        if deferrable:
+            deferred_elicitation_id = f"elicit_{secrets.token_hex(16)}"
+            deferred_aid = "a" + deferred_elicitation_id.removeprefix("elicit_")[:6]
 
         try:
             preview_str = json.dumps(tool_input or {}, ensure_ascii=False)
@@ -655,8 +1102,9 @@ def register_hooks_routes(
         extras: dict[str, Any] = {"tool_name": tool_name}
         # Only Claude's PermissionRequest contract can end the turn from the
         # deny itself (``decision.interrupt``); the web offers its abort
-        # control only where this is stamped.
-        if is_claude:
+        # control only where this is stamped. A deferred card never offers
+        # it: the deny is the deferral itself, not a turn stop.
+        if is_claude and not deferrable:
             extras["interruptible"] = True
         if cwd is not None:
             extras["cwd"] = cwd
@@ -719,6 +1167,12 @@ def register_hooks_routes(
             command = tool_input.get("command")
             if isinstance(command, str) and command:
                 extras["command"] = command
+        deferred_action = ""
+        if deferrable:
+            assert deferred_aid is not None
+            extras["async_kind"] = "approval"
+            extras["approval_ref"] = deferred_aid
+            deferred_action = _approval_action_label(tool_name, preview_str)
         asking_name = native_agent.display_name if native_agent is not None else hook_label
         asking_vendor = (
             _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
@@ -735,15 +1189,44 @@ def register_hooks_routes(
             content_preview=f"{tool_name}({preview_str})",
             **extras,
         )
+        if deferrable:
+            assert deferred_elicitation_id is not None and deferred_aid is not None
+            # Mirrored to ancestors so a parent page can answer the child's
+            # approval; ``tool_name`` / ``tool_input`` stay unset because the
+            # tool never ran, so no terminal result can resolve the park.
+            start_detached_elicitation(
+                session_id,
+                params,
+                conversation_store=conversation_store,
+                on_result=_deferred_approval_callback(
+                    session_id=session_id,
+                    grant_key=grant_key,
+                    aid=deferred_aid,
+                    action=deferred_action,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router,
+                ),
+                elicitation_id=deferred_elicitation_id,
+            )
+            return _permission_hook_response(
+                {
+                    "behavior": "deny",
+                    "message": _APPROVAL_PENDING_TEXT.format(
+                        aid=deferred_aid,
+                        action=deferred_action,
+                    ),
+                },
+                is_claude=is_claude,
+            )
         # Claude waits on the owner's configured timeout. The two hardcoded
         # budgets stay for Kimi / Devin below: their AskUserQuestion-named tool
-        # keeps its shorter fallback, and neither reads the setting.
+        # keeps its shorter fallback, and neither consumes the timeout fields.
         timeout_policy: HarnessTimeoutPolicy | None = (
             HarnessTimeoutPolicy(
                 timeout_s=approval_timeout.timeout_s,
                 stop=_claude_timeout_stop if approval_timeout.stop_turn else None,
             )
-            if approval_timeout is not None
+            if is_claude
             else None
         )
         result = await _publish_and_wait_for_harness_elicitation(
@@ -777,158 +1260,14 @@ def register_hooks_routes(
             # defers to its built-in TUI prompt (fail-ask).
             return Response(status_code=status.HTTP_200_OK)
 
-        behavior = "allow" if result.action == "accept" else "deny"
-        decision: dict[str, Any] = {"behavior": behavior}
-        if (
-            is_claude
-            and result.action == "cancel"
-            and (result.meta or {}).get("interrupt") is True
-        ):
-            decision["interrupt"] = True
-        # A decline can carry feedback typed into the web card (the
-        # ExitPlanMode "Reject with feedback" flow). Claude's
-        # PermissionRequest decision contract surfaces it via
-        # ``decision.message`` — the model sees it as the denial
-        # reason, so for a rejected plan Claude stays in plan mode
-        # and revises toward the feedback instead of guessing why
-        # the plan was refused.
-        if behavior == "deny" and isinstance(result.content, dict):
-            feedback = result.content.get("feedback")
-            if isinstance(feedback, str) and feedback.strip():
-                decision["message"] = feedback
-        if not is_claude:
-            # These bridges consume the verdict without Claude's input/permission updates.
-            return Response(
-                content=json.dumps({"hookSpecificOutput": {"decision": decision}}),
-                media_type="application/json",
-            )
-        # When the gated tool is AskUserQuestion AND the user accepted
-        # with selections, propagate those selections back to Claude
-        # via ``decision.updatedInput``. Claude reads
-        # ``tool_input.answers`` and skips its TUI picker, returning
-        # the supplied selections as the tool result the LLM sees.
-        #
-        # ``result.content`` is MCP-shaped (a flat ``{[field]: value}``
-        # map) — exactly the shape ``tool_input.answers`` expects on
-        # AskUserQuestion. Single-select values are strings,
-        # multi-select are ``list[str]``; both ride through verbatim.
-        if (
-            behavior == "allow"
-            and tool_name == "AskUserQuestion"
-            and isinstance(tool_input, dict)
-            and isinstance(result.content, dict)
-            and result.content
-        ):
-            decision["updatedInput"] = {**tool_input, "answers": result.content}
-        # ExitPlanMode is a requiresUserInteraction tool: Claude Code coerces a
-        # bare PermissionRequest allow back to an interactive prompt unless the
-        # decision also carries ``updatedInput``. The plan needs no change, so
-        # echo the model's own input verbatim — its presence, not its content,
-        # is what lets a web-UI approval proceed without a TUI keystroke.
-        if (
-            behavior == "allow"
-            and tool_name == "ExitPlanMode"
-            and isinstance(tool_input, dict)
-            and tool_input
-        ):
-            decision["updatedInput"] = tool_input
-        if (
-            behavior == "allow"
-            and isinstance(result.content, dict)
-            and result.content.get("allow_auto_mode") is True
-            and _allow_auto_mode_eligible(tool_name, permission_mode)
-        ):
-            decision["updatedPermissions"] = [
-                {"type": "setMode", "mode": "auto", "destination": "session"}
-            ]
-        # "Accept & allow all edits" — the user approved this edit AND
-        # asked to auto-accept future edits. Echo a ``setMode`` permission
-        # update so Claude Code switches this session into ``acceptEdits``
-        # mode, exactly as the native shift+tab toggle does. The
-        # ``updatedPermissions`` shape matches the Agent SDK's
-        # ``PermissionUpdate`` union (``{type, mode, destination}`` for
-        # ``setMode``); ``destination: "session"`` scopes it to this
-        # session, so it resets on the next one.
-        #
-        # Re-check eligibility server-side rather than trusting the
-        # client's ``content.allow_all_edits`` flag alone: the flag is
-        # only meaningful for the edit-tool / prompting-mode prompts the
-        # affordance was offered for. Without this, a client could send
-        # the flag on e.g. a Bash prompt and flip the session into
-        # ``acceptEdits`` — a mode switch it was never offered.
-        elif (
-            behavior == "allow"
-            and isinstance(result.content, dict)
-            and result.content.get("allow_all_edits") is True
-            and _allow_all_edits_eligible(tool_name, permission_mode)
-        ):
-            decision["updatedPermissions"] = [
-                {
-                    "type": "setMode",
-                    # The plan card's "Yes, and use auto mode" switches the
-                    # session into Claude's ``auto`` mode; the edit-tool
-                    # "Accept & allow all edits" keeps the narrower
-                    # ``acceptEdits`` (auto-approve edits only).
-                    "mode": "auto" if tool_name == "ExitPlanMode" else "acceptEdits",
-                    "destination": "session",
-                }
-            ]
-        elif behavior == "allow" and tool_name == "ExitPlanMode":
-            # Plan approved WITHOUT auto mode — the card's "Yes,
-            # manually approve edits". Pin the session to the prompting
-            # ``default`` mode instead of trusting whatever mode
-            # Claude's plan-exit restores, so every subsequent edit
-            # prompts exactly as the button promised. De-escalation
-            # only (most restrictive prompting mode), so no eligibility
-            # gate is needed.
-            decision["updatedPermissions"] = [
-                {"type": "setMode", "mode": "default", "destination": "session"}
-            ]
-        # "Approve & don't ask again" — the user approved this non-edit
-        # tool AND asked to stop prompting for the same scope. Echo an
-        # ``addRules`` permission update so Claude Code installs a
-        # session-scoped allow rule, exactly as the native TUI's "don't
-        # ask again" option does. The shape matches the Agent SDK's
-        # ``PermissionUpdate`` union (``addRules``): ``rules`` is a list
-        # of ``{toolName, ruleContent?}`` — ``ruleContent`` omitted means
-        # the whole tool; ``destination: "session"`` scopes it to this
-        # session so it resets on the next one. The claude-native hook
-        # forwards this decision verbatim to Claude Code.
-        #
-        # The host is re-derived server-side from the gated tool's input
-        # rather than trusting any client-supplied rule, and gated by the
-        # same ``_allow_remember_eligible`` predicate the button was
-        # offered under — so a forged ``remember`` flag on an ineligible
-        # tool (e.g. an edit tool, which takes the setMode path) can't
-        # smuggle in an allow rule.
-        elif (
-            behavior == "allow"
-            and isinstance(result.content, dict)
-            and result.content.get("remember") is True
-            and _allow_remember_eligible(tool_name, permission_mode)
-        ):
-            rule: dict[str, Any] = {"toolName": tool_name}
-            remember_host = _claude_native_remember_host(tool_name, tool_input)
-            if remember_host is not None:
-                rule["ruleContent"] = f"domain:{remember_host}"
-            decision["updatedPermissions"] = [
-                {
-                    "type": "addRules",
-                    "rules": [rule],
-                    "behavior": "allow",
-                    "destination": "session",
-                }
-            ]
-        body = {
-            "hookSpecificOutput": {
-                "hookEventName": "PermissionRequest",
-                "decision": decision,
-            },
-        }
-        return Response(
-            content=json.dumps(body),
-            media_type="application/json",
+        decision = _permission_decision(
+            result,
+            is_claude=is_claude,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            permission_mode=permission_mode,
         )
+        return _permission_hook_response(decision, is_claude=is_claude)
 
     # ── Proto event-type → validation schema, as ONE total mapping ────
     #
@@ -1508,6 +1847,12 @@ def register_hooks_routes(
         ``PermissionRequest`` hook so pending badges and disconnect
         handling stay consistent across native harnesses.
 
+        With the owner's async-approvals setting on, an eligible command
+        approval is parked detached and answered at once with Codex's
+        decline (no interrupt); the pending notice steers the model after
+        the response, and a one-shot grant approves the re-issued command
+        without a second card. A live grant short-circuits both.
+
         :param request: FastAPI request carrying the Codex JSON-RPC
             request envelope.
         :param session_id: Omnigent conversation id from the URL path.
@@ -1535,12 +1880,31 @@ def register_hooks_routes(
         codex_request = parse_codex_elicitation_request(payload)
         from omnigent.server.routes import sessions as _sf
 
+        raw_cwd = codex_request.codex_params.get("cwd")
+        cwd = raw_cwd if isinstance(raw_cwd, str) else None
+        is_command_approval = codex_request.method in _CODEX_DEFERRABLE_APPROVAL_METHODS
+        # A re-issued command the user already granted runs without a
+        # second card. The key keeps the raw protocol command (argv
+        # boundaries included), never the space-joined display preview.
+        if is_command_approval:
+            granted = approval_grants.consume(
+                session_id,
+                codex_command_grant_key(codex_request.codex_params.get("command"), cwd),
+            )
+            if granted is not None:
+                return Response(
+                    content=json.dumps(
+                        codex_request.build_response(ElicitationResult(action="accept"))
+                    ),
+                    media_type="application/json",
+                )
         # Async questions are answered outside the turn that asked them
         # (BUG12 contract), so they keep the day-long budget and never stop.
         is_async_question = bool(codex_request.codex_params.get("omnigentAsyncQuestion"))
         if is_async_question:
             timeout_policy: HarnessTimeoutPolicy | None = None
             timeout_s = _sf._CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S
+            async_approvals = False
         else:
             timeout_setting = await _approval_timeout_for_session(session_id)
             timeout_policy = HarnessTimeoutPolicy(
@@ -1548,6 +1912,15 @@ def register_hooks_routes(
                 stop=_codex_timeout_stop(session_id) if timeout_setting.stop_turn else None,
             )
             timeout_s = timeout_policy.timeout_s
+            async_approvals = timeout_setting.async_approvals
+        if is_command_approval and async_approvals:
+            return _defer_codex_command_approval(
+                codex_request,
+                session_id=session_id,
+                cwd=cwd,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+            )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
@@ -1571,10 +1944,10 @@ def register_hooks_routes(
             # abort an unrelated turn. A timeout stop already interrupted on
             # its way here, so its replay must not interrupt a second time.
             if not is_async_question and not (result.meta or {}).get("omnigent_timeout"):
-                # Explicit user decline: interrupt Codex before returning the
-                # deny response, same as the Claude-native path. The await
-                # ensures the abort signal reaches Codex before it processes
-                # the decline result and lets the LLM continue.
+                # Explicit user decline. Codex's response has no deny-with-
+                # interrupt (unlike Claude's ``decision.interrupt``), so the
+                # stop is a runner interrupt awaited before the decline result
+                # reaches the model; a plain decline would let the turn go on.
                 await _forward_session_change_to_runner(
                     session_id,
                     get_server_runner_router(),

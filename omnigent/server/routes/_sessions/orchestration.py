@@ -1077,6 +1077,7 @@ def start_detached_elicitation(
     conversation_store: ConversationStore | None,
     on_result: Callable[[ElicitationResult | None], Awaitable[None]],
     timeout_s: float = 86400.0,
+    elicitation_id: str | None = None,
 ) -> str:
     """
     Park an elicitation with no HTTP request attached and return immediately.
@@ -1096,9 +1097,13 @@ def start_detached_elicitation(
         when the wait expired / was severed without one.
     :param timeout_s: Maximum wait in seconds before
         ``on_result(None)``; defaults to one day.
-    :returns: The minted elicitation id, e.g. ``"elicit_abc123"``.
+    :param elicitation_id: Server-minted correlation id the caller
+        already stamped into ``params`` (a card that must name its own
+        reference). ``None`` mints one.
+    :returns: The elicitation id, e.g. ``"elicit_abc123"``.
     """
-    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    if elicitation_id is None:
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
 
     async def _park_and_report() -> None:
         result = await _publish_and_wait_for_harness_elicitation(
