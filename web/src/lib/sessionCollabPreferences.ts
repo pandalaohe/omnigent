@@ -48,7 +48,7 @@ export const SESSION_COLLAB_BOUNDS: Record<
 
 export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   enabled: true,
-  openRateCount: 5,
+  openRateCount: 10,
   openRateWindowSeconds: 60,
   relayDepthMax: 30,
   pairRateCount: 6,

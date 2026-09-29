@@ -17,7 +17,9 @@ afterEach(() => {
 
 describe("session collab preferences", () => {
   it("defaults to the server defaults with nothing stored", () => {
+    expect(SESSION_COLLAB_DEFAULTS.openRateCount).toBe(10);
     expect(readSessionCollabPreferences()).toEqual(SESSION_COLLAB_DEFAULTS);
+    expect(readSessionCollabPreferences().openRateCount).toBe(10);
     expect(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY)).toBeNull();
   });
 

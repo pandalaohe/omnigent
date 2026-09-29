@@ -164,7 +164,7 @@ class CollabSettings:
     """
 
     enabled: bool = True
-    open_rate_count: int = 5
+    open_rate_count: int = 10
     open_rate_window_s: int = 60
     relay_depth_max: int = 30
     pair_rate_count: int = 6

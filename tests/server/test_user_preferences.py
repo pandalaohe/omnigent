@@ -627,7 +627,10 @@ def test_read_collab_settings_defaults_on_missing_store_owner_or_namespace(
     default = CollabSettings()
     assert read_collab_settings(None, "alice@example.com") == default
     assert read_collab_settings(store, None) == default
-    assert read_collab_settings(store, "alice@example.com") == default
+    empty = read_collab_settings(store, "alice@example.com")
+    assert empty == default
+    assert empty.open_rate_count == 10
+    assert empty.open_rate_window_s == 60
 
     store.patch_namespace("alice@example.com", "agent_badges", {"enabled": False})
     assert read_collab_settings(store, "alice@example.com") == default
