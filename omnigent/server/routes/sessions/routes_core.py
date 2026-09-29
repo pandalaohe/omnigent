@@ -235,7 +235,6 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_LOCK_LABEL_KEY,
-    ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     CONTINUED_TO_LABEL_KEY,
     DELETION_CLAIM_STALE_AFTER_S,
     PINNED_LABEL_KEY,
@@ -3173,6 +3172,15 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
+        # Only a real archive transition carries the idle deferral; passing it
+        # through the store keeps the label write in the same commit. Spread
+        # conditionally so fakes with explicit signatures see only the kwargs
+        # they define.
+        archive_stop_when_idle_kwargs: dict[str, Any] = (
+            {"archive_stop_when_idle": True}
+            if body.archived is True and body.stop_when_idle
+            else {}
+        )
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -3193,6 +3201,7 @@ def register_core_routes(
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
             close_cli_on_archive=close_on_archive,
+            **archive_stop_when_idle_kwargs,
         )
         if updated is None:
             raise _session_not_found()
@@ -3213,25 +3222,6 @@ def register_core_routes(
                 close_on_archive
                 and updated.archive_close_requested_revision == updated.archive_revision
             ):
-                # The deferral marker is written before the stop is spawned so a
-                # recovery-scan or reconnect re-entry finds it durably; it names
-                # the revision whose teardown waits for the tree to go idle.
-                if body.stop_when_idle:
-                    try:
-                        await asyncio.to_thread(
-                            conversation_store.set_labels,
-                            session_id,
-                            {ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: str(updated.archive_revision)},
-                        )
-                    except Exception:
-                        # The archive is committed; without the marker the
-                        # teardown keeps the web timing rather than being lost.
-                        _logger.warning(
-                            "Could not record the archive idle deferral for %s",
-                            session_id,
-                            exc_info=True,
-                            extra={"session_id": session_id},
-                        )
                 _spawn_archive_stop(
                     session_id,
                     conversation_store,
@@ -3247,21 +3237,8 @@ def register_core_routes(
             # archived-flag re-check covers a cross-replica Undo.
             _cancel_pending_archive_stop(session_id)
             if conv.archived:
-                # Drop the idle-deferral marker: the revision bump already
-                # voids it, deletion is the tidy-up. Best-effort.
-                try:
-                    await asyncio.to_thread(
-                        conversation_store.delete_label,
-                        session_id,
-                        ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
-                    )
-                except Exception:
-                    _logger.debug(
-                        "Could not delete the archive idle-deferral label for %s",
-                        session_id,
-                        exc_info=True,
-                        extra={"session_id": session_id},
-                    )
+                # The transition above deleted the idle-deferral marker in the
+                # same commit; the revision bump already voided it.
                 # Clear the runner-side archive fence for the newer revision.
                 _spawn_archive_unfence(
                     session_id,

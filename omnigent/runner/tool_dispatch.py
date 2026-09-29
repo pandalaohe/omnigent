@@ -7288,7 +7288,7 @@ _ARCHIVE_LINEAGE_MAX_HOPS = 32
 
 
 def _archive_error(tool_name: str, resp: httpx.Response, session_id: str) -> str:
-    """Map a non-2xx session GET / PATCH to the archive tools' typed errors."""
+    """Map a non-2xx session PATCH to the archive tools' typed errors."""
     if resp.status_code == 404:
         return json.dumps({"error": "session_not_found", "session_id": session_id})
     if resp.status_code in (401, 403):
@@ -7361,7 +7361,10 @@ async def _session_archive_via_rest(
     Same route and owner gate as the web archive: the server requires owner
     access, applies the 8-second undo window and the Host's stop-on-archive
     policy. A target that is the caller or its ancestor is archived with
-    ``stop_when_idle`` so the teardown waits for the caller's turn to end.
+    ``stop_when_idle`` so the teardown waits for the caller's turn to end;
+    the server applies it only on a real archive transition, so the intent is
+    sent on every archive PATCH rather than decided from a snapshot that a
+    concurrent unarchive could make stale.
 
     :param tool_name: ``"sys_session_archive"`` or ``"sys_session_unarchive"``.
     :param args: Parsed tool arguments; ``session_id`` (optional for archive,
@@ -7382,27 +7385,13 @@ async def _session_archive_via_rest(
     if not isinstance(raw_target, str) or not raw_target:
         return json.dumps({"error": f"{tool_name} requires a non-empty 'session_id' string"})
     target_id = raw_target
-    try:
-        snap = await server_client.get(
-            f"/v1/sessions/{target_id}",
-            params={"include_items": "false", "include_liveness": "false"},
-            timeout=30.0,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"{tool_name} failed: {exc}"})
-    if snap.status_code != 200:
-        return _archive_error(tool_name, snap, target_id)
-    body = _string_object_dict(snap.json())
-    if body is None:
-        return json.dumps({"error": f"{tool_name} returned malformed session data"})
-    # Already in the requested state still PATCHes: a same-value write changes
-    # nothing, but the PATCH is the owner gate, so a non-owner is refused.
-    already = bool(body.get("archived")) == archive
+    # The PATCH is the owner gate and maps 404/401/403, so no snapshot read is
+    # needed. The deferral intent is always recomputed from the caller lineage
+    # and always sent: a GET's archived flag could have gone stale before the
+    # PATCH, and the intent must never be dropped on that interleaving.
     patch_body: _JsonObject = {"archived": archive}
-    stop_when_idle = (
-        archive
-        and not already
-        and await _caller_lineage_contains(target_id, conversation_id, server_client)
+    stop_when_idle = archive and await _caller_lineage_contains(
+        target_id, conversation_id, server_client
     )
     if stop_when_idle:
         patch_body["stop_when_idle"] = True
@@ -7415,9 +7404,7 @@ async def _session_archive_via_rest(
     if resp.status_code != 200:
         return _archive_error(tool_name, resp, target_id)
     result: _JsonObject = {"archived": archive, "session_id": target_id}
-    if already:
-        result["already_archived" if archive else "already_unarchived"] = True
-    elif archive:
+    if archive:
         # The Host policy is applied server-side and not echoed back, so the
         # stop is stated as conditional rather than promised.
         result["runner_stop"] = (

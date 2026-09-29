@@ -1124,72 +1124,82 @@ def _archive_idle_deferred(conv: Any) -> bool:
 
 async def _wait_for_archive_idle(
     session_id: str,
+    revision: int,
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Wait until an archived tree is idle (or its leak guard expires).
+    Wait until one archive revision's tree is idle (or its leak guard expires).
 
     Used by the archive teardown for a ``stop_when_idle`` archive: the
     caller's turn ends with the closing reply, so tearing the runner down
-    before the whole tree reads idle would cut it. The tree is collected
-    once; each poll re-reads the root so an unarchive or re-archive stops
-    the wait, and checks the in-memory status cache so a quiet pane inside
-    the settle window does not release it. Bounded by
-    ``_ARCHIVE_IDLE_MAX_WAIT_S`` from the archive time.
+    before the whole tree reads idle would cut it. Every poll re-reads the
+    root and returns as soon as a successful read shows the row is no longer
+    archived, its revision differs from ``revision``, or its deferral label
+    no longer names ``revision`` — an unarchive or re-archive voids the wait
+    and the new revision is evaluated afresh. A failed read (root or
+    descendants) is never evidence of idleness: that poll counts as busy and
+    the settle clock restarts. Bounded by ``_ARCHIVE_IDLE_MAX_WAIT_S`` from
+    the ``archived_at`` of this revision.
 
     :param session_id: Root session/conversation identifier.
+    :param revision: The archive revision whose teardown is deferred.
     :param conversation_store: Store for the root row and descendant lookups.
     """
     # Resolve through the facade so a test's monkeypatch of the constants is
     # honored here.
     from omnigent.server.routes import sessions as _facade
 
-    try:
-        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
-        tree = [session_id, *descendant_ids]
-    except Exception:  # noqa: BLE001 - the root alone is the conservative tree.
-        _logger.debug(
-            "Archive idle descendant lookup failed for %s; waiting on the root only",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        tree = [session_id]
+    first_call = time.time()
     deadline: float | None = None
-    try:
-        root = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    except Exception:  # noqa: BLE001 - an unreadable root waits out the bound.
-        _logger.debug(
-            "Archive idle root lookup failed for %s; waiting out the leak guard",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-    else:
-        deadline = (root.archived_at or time.time()) if root is not None else None
-    if deadline is None:
-        deadline = time.time() + _facade._ARCHIVE_IDLE_MAX_WAIT_S
-    else:
-        deadline = deadline + _facade._ARCHIVE_IDLE_MAX_WAIT_S
-
     idle_since: float | None = None
+    # The tree is collected once and reused; a failed lookup is retried on
+    # every poll, and until it succeeds the tree counts as busy.
+    tree: list[str] | None = None
     while True:
         now = time.time()
-        if now >= deadline:
-            return
+        if tree is None:
+            try:
+                descendant_ids = await _collect_descendant_conversation_ids(
+                    conversation_store, session_id
+                )
+            except Exception:  # noqa: BLE001 - a failed lookup is not idleness.
+                _logger.debug(
+                    "Archive idle descendant lookup failed for %s; tree stays busy",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+            else:
+                tree = [session_id, *descendant_ids]
+        root_ok = False
         try:
             root = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        except Exception:  # noqa: BLE001 - keep waiting this poll.
+        except Exception:  # noqa: BLE001 - a failed read is not idleness.
             _logger.debug(
-                "Archive idle root re-read failed for %s; retrying",
+                "Archive idle root re-read failed for %s; poll counts as busy",
                 session_id,
                 exc_info=True,
                 extra={"session_id": session_id},
             )
         else:
-            if not _archive_idle_deferred(root):
+            root_ok = True
+            if (
+                root is None
+                or not _archive_idle_deferred(root)
+                or root.archive_revision != revision
+            ):
                 return
-        busy = any(_session_status_cache.get(sid) in ("running", "waiting") for sid in tree)
+            if deadline is None:
+                deadline = (root.archived_at or now) + _facade._ARCHIVE_IDLE_MAX_WAIT_S
+        if deadline is None:
+            # No successful read at this revision yet: bound the wait from the
+            # first call rather than trusting an unreadable row.
+            deadline = first_call + _facade._ARCHIVE_IDLE_MAX_WAIT_S
+        if now >= deadline:
+            return
+        busy = tree is None or not root_ok
+        if not busy:
+            busy = any(_session_status_cache.get(sid) in ("running", "waiting") for sid in tree)
         if busy:
             idle_since = None
         elif idle_since is None:
@@ -1557,20 +1567,29 @@ def _spawn_archive_stop(
                 await asyncio.shield(archive_close_coordinator.trigger(session_id))
             return
         # Coordinator-less fallback (tests / in-process setups): honour the
-        # durable deferral marker ourselves. A failed re-read skips the wait —
-        # the stop re-reads the row again and the grace already passed.
-        try:
-            row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        except Exception:  # noqa: BLE001
-            _logger.debug(
-                "Archive deferral lookup failed for %s; skipping the idle wait",
-                session_id,
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
-        else:
-            if _archive_idle_deferred(row):
-                await _wait_for_archive_idle(session_id, conversation_store)
+        # durable deferral marker ourselves. A failed re-read is not evidence
+        # of idleness, so retry a transient blip; a sustained failure returns
+        # without stopping — never kill a session whose state we could not
+        # read, a later lifecycle event reaps it.
+        row: Any = None
+        for _attempt in range(_ARCHIVE_STOP_LOOKUP_ATTEMPTS):
+            try:
+                row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                break
+            except Exception:  # noqa: BLE001
+                if _attempt + 1 >= _ARCHIVE_STOP_LOOKUP_ATTEMPTS:
+                    _logger.warning(
+                        "Archive deferral lookup failed for %s after %d attempts; "
+                        "leaving the runner (reaped by a later lifecycle event)",
+                        session_id,
+                        _ARCHIVE_STOP_LOOKUP_ATTEMPTS,
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+                    return
+                await asyncio.sleep(_ARCHIVE_STOP_LOOKUP_RETRY_S)
+        if _archive_idle_deferred(row):
+            await _wait_for_archive_idle(session_id, row.archive_revision, conversation_store)
         _archive_close_intents.add(session_id)
         try:
             await _archive_stop(session_id, conversation_store, runner_router, host_registry)

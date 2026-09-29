@@ -108,8 +108,6 @@ async def test_archive_other_session_patches_archived_without_idle_deferral() ->
     patch_bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_other":
-            return httpx.Response(200, json={"id": "conv_other", "archived": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_other":
@@ -135,8 +133,6 @@ async def test_archive_other_owner_maps_403_to_access_denied() -> None:
     """A shared-but-not-owned target is refused by the owner gate."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_shared":
-            return httpx.Response(200, json={"id": "conv_shared", "archived": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_shared":
@@ -154,13 +150,16 @@ async def test_archive_other_owner_maps_403_to_access_denied() -> None:
 
 
 @pytest.mark.asyncio
-async def test_archive_self_patches_stop_when_idle() -> None:
-    """Self-archive defers the teardown until the caller's turn ends."""
+async def test_archive_self_patches_stop_when_idle_without_snapshot() -> None:
+    """Self-archive defers unconditionally, without reading the target.
+
+    A snapshot's ``archived`` flag can go stale before the PATCH (a
+    concurrent unarchive), so the deferral intent is sent on every archive
+    PATCH and the server applies it only on a real transition.
+    """
     patch_bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_self":
-            return httpx.Response(200, json={"id": "conv_self", "archived": False})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_self":
             patch_bodies.append(json.loads(request.content))
             return httpx.Response(200, json={"id": "conv_self"})
@@ -170,6 +169,7 @@ async def test_archive_self_patches_stop_when_idle() -> None:
         out = await _archive(client, args={}, conversation_id="conv_self")
     assert patch_bodies == [{"archived": True, "stop_when_idle": True}]
     assert out["archived"] is True
+    assert "already_archived" not in out
     assert "current turn" in out["runner_stop"]
 
 
@@ -179,8 +179,6 @@ async def test_archive_ancestor_patches_stop_when_idle() -> None:
     patch_bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent":
-            return httpx.Response(200, json={"id": "conv_parent", "archived": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
             return httpx.Response(
                 200, json={"id": "conv_child", "parent_session_id": "conv_parent"}
@@ -201,37 +199,35 @@ async def test_archive_ancestor_patches_stop_when_idle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_archive_already_archived_still_patches() -> None:
-    """An already-archived target still PATCHes so the owner gate answers."""
-    patch_bodies: list[dict[str, Any]] = []
+async def test_archive_patch_404_maps_to_session_not_found() -> None:
+    """A PATCH 404 is the missing-target answer now that no GET runs."""
+    patch_urls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_other":
-            return httpx.Response(200, json={"id": "conv_other", "archived": True})
-        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_other":
-            patch_bodies.append(json.loads(request.content))
-            return httpx.Response(200, json={"id": "conv_other"})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_gone":
+            patch_urls.append(request.url.path)
+            return httpx.Response(404, json={"error": {"message": "no such session"}})
         raise AssertionError(f"unexpected {request.method} {request.url.path}")
 
     async with _client(handler) as client:
         out = await _archive(
             client,
-            args={"session_id": "conv_other"},
+            args={"session_id": "conv_gone"},
             conversation_id="conv_caller",
         )
-    assert patch_bodies == [{"archived": True}]
-    assert out["already_archived"] is True
-    assert "stop_when_idle" not in patch_bodies[0]
+    assert patch_urls == ["/v1/sessions/conv_gone"]
+    assert out["error"] == "session_not_found"
+    assert out["session_id"] == "conv_gone"
 
 
 @pytest.mark.asyncio
-async def test_unarchive_patches_archived_false() -> None:
-    """Unarchive always PATCHes the false flag."""
+async def test_unarchive_patches_archived_false_without_snapshot() -> None:
+    """Unarchive always PATCHes the false flag and reads no snapshot."""
     patch_bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_other":
-            return httpx.Response(200, json={"id": "conv_other", "archived": True})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_other":
             patch_bodies.append(json.loads(request.content))
             return httpx.Response(200, json={"id": "conv_other"})
@@ -245,8 +241,7 @@ async def test_unarchive_patches_archived_false() -> None:
             conversation_id="conv_caller",
         )
     assert patch_bodies == [{"archived": False}]
-    assert out["archived"] is False
-    assert "already_unarchived" not in out
+    assert out == {"archived": False, "session_id": "conv_other"}
 
 
 @pytest.mark.asyncio
