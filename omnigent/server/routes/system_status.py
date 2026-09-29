@@ -22,7 +22,7 @@ from fastapi import APIRouter, Body, Request
 from omnigent.db.db_models import current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
-from omnigent.server.routes._auth_helpers import get_user_id
+from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.system_status import DEFAULT_HEALTH_CHECK_PROMPT, SystemStatusHub
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -51,7 +51,7 @@ def create_system_status_router(
         """Whether the caller may see the server card and all hosts."""
         if permission_store is None:
             return True
-        user_id = get_user_id(request, auth_provider)
+        user_id = require_user(request, auth_provider)
         if user_id is None:
             return False
         return await asyncio.to_thread(permission_store.is_admin, user_id)
@@ -69,7 +69,7 @@ def create_system_status_router(
         request: Request,
     ) -> tuple[str | None, bool, set[str], list[dict[str, Any]]]:
         """Resolve identity, admin flag, and the caller's host-store rows."""
-        user_id = get_user_id(request, auth_provider)
+        user_id = require_user(request, auth_provider)
         is_admin = await _is_admin(request)
         own = await asyncio.to_thread(host_store.list_hosts, user_id or "local")
         own_host_ids = {host.host_id for host in own}

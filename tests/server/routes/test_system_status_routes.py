@@ -233,6 +233,18 @@ def test_history_visibility_and_404(tmp_path: Path) -> None:
     assert member_server.status_code == 404
 
 
+def test_anonymous_requests_get_401(tmp_path: Path) -> None:
+    """Multi-user mode: an anonymous caller is rejected on every route."""
+    client, _hub = _build(tmp_path)
+
+    assert client.get("/v1/system/status").status_code == 401
+    assert client.get("/v1/system/status?summary=1").status_code == 401
+    assert client.get("/v1/system/history?target=server").status_code == 401
+    assert client.get("/v1/system/brief").status_code == 401
+    assert client.get("/v1/system/settings").status_code == 401
+    assert client.put("/v1/system/settings", json={"cpu_pct": 70}).status_code == 401
+
+
 def test_settings_admin_only_with_validation(tmp_path: Path) -> None:
     """Thresholds are admin-only; PUT validates and returns the stored set."""
     client, _hub = _build(tmp_path)
